@@ -661,12 +661,16 @@ class TurnPilot:
     # junction isn't known. Said for as long as it lasts, never a silent hold (skeptic G4)
     stray = tc is not None and tc.held and not held
     scene = self.scene
+    # DESIGN G4 go condition 5: never a go while another of TurnPilot's stops holds the car at or before the junction (a
+    # signal's red, a stop sign), nor at a signal whose light isn't read green (unprotected_left.py: SIGNAL_NEEDS_GREEN)
+    stop_d = self.map_controls.stop_ahead()
     inp = LeftInput(mode, rf.maneuver_id, upcoming.side, rf.distance, v_ego, held or stray, raw, objects, self.approach_yaw_deg,
                     upcoming.opposing_speed or None, upcoming.opposing_lanes or None, self.left_range_m,
                     scene_clear=scene.junction is None and not scene.carried,
                     junction_uncertain=rf.junction_spread > UNCERTAIN_M or stray,
                     go_withdrawn=self.go_withdrawn, committed=rf.maneuver_id in (scene.committed_id, scene.released_id),
-                    spread_m=rf.junction_spread)
+                    spread_m=rf.junction_spread, other_hold=stop_d is not None and stop_d <= rf.distance + PROTECT_PAST_M,
+                    light=self.map_controls.turn_light(int(turn[0]), turn[1]))
     d = self.left_now = self.left.update(inp, DT_MDL)
     return LeftCommand(mode, d.go, d.creep_m, d.state == 'undecided', d.reason)
 

@@ -2,7 +2,7 @@
 route, model and scene of test_turnpilotd, raw road camera runs of the oncoming cars, a point-mass car following the plan."""
 import math
 
-from openpilot.cereal import log
+from openpilot.cereal import log, messaging
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.scene.tracker import RawBox, RawFrame
@@ -11,7 +11,8 @@ from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of, nav_instr
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Sim
 from openpilot.selfdrive.turnpilot.turn_speed import POST_GO_PROFILES
 from openpilot.selfdrive.turnpilot.turnpilotd import GO_LINE_M, LEFT_NO_MOVE_S, TurnPilot, auto_left_for, left_range_for
-from openpilot.selfdrive.turnpilot.unprotected_left import CLEAR_WINDOW_S, CREEP_STALL_S, ROAD_RANGE_M, STALE_UNDECIDED_S, r_req, t_req
+from openpilot.selfdrive.turnpilot.unprotected_left import (CLEAR_WINDOW_S, CREEP_STALL_S, LIGHT_UNKNOWN_S, ROAD_RANGE_M, STALE_UNDECIDED_S,
+                                                           r_req, t_req)
 
 Desire = log.Desire
 V_25 = 11.18
@@ -421,3 +422,89 @@ def test_a_go_after_a_nearer_reading_is_still_withdrawn_when_the_car_doesnt_move
   after = plans[go:]
   withdrawn = next(i for i, p in enumerate(after) if str(p.controlPrompt) == 'cantStartTakeControl')
   assert withdrawn * DT_MDL <= LEFT_NO_MOVE_S + 0.2 and after[-1].shouldStop and sim.s < LINE + 1.
+
+
+def signal_sim(red_until=None, oracle=True, line=JUNCTION - 8.5):
+  """LEFT_25 with a mapped signal at line (the hold line's), its light from the sim oracle (accepted): red until red_until s
+  (None: always), green after; oracle False: no light source at all. An empty band."""
+  sim = Sim(LEFT_25, controls=[(line, 'signal')])
+  sim.tp.auto_left, sim.go_taps = 'auto', False
+  sim.tp.oracle_ok = oracle
+
+  def lights(sim):
+    state = 'red' if red_until is None or sim.t < red_until else 'green'
+    msg = messaging.new_message('turnpilotLights')
+    msg.turnpilotLights.source = 'simOracle'
+    msg.turnpilotLights.lights = [{'state': state, 'distance': line - sim.s, 'instance': 'trafficLight 1'}]
+    return msg.as_reader().turnpilotLights
+  sim.lights = lights if oracle else None
+  sim.raw = road_runs()
+  return sim
+
+
+def run_objects(sim, seconds, objects=lambda sim: ()):
+  plans = []
+  for _ in range(int(round(seconds / DT_MDL))):
+    turning = sim.tp.desires.started and abs(JUNCTION - sim.s) < 12. and sim.v > 0.3
+    plans.append(sim.step(objects(sim), engaged=True, yaw_rate=sim.v / 8. if turning else 0.))
+  return plans
+
+
+def test_a_red_at_the_junction_never_gets_a_go():
+  # skeptic G4 (blocker 2), DESIGN G4 go condition 5: a left on a green ball counts as unprotected, so it stands at its line
+  # under the red with the band empty (the opposing traffic stopped at its own red). It sent leftGo at 31.75 s and stood in
+  # 'go' through the red. Now it waits, silently, and never pulses
+  sim = signal_sim()
+  plans = run_objects(sim, 60.)
+  assert not any(str(p.controlPrompt) == 'leftGo' or p.desire == Desire.turnLeft for p in plans)
+  assert sim.s < LINE + 1. and str(plans[-1].unprotectedLeft.state) == 'waitGap'
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+
+
+def test_after_the_red_the_go_waits_for_a_fresh_window_and_the_exit_crosswalk():
+  # skeptic G4 (blocker 2): a walker came into the exit crosswalk at 40 s, late in the red; at the green the car drove off on
+  # the stale go and committed at 47.4 s with the walker still in it. Now: no go before the green, none while the walker is
+  # in the crosswalk, and the go after it has left, from the line
+  def walker(sim):
+    if sim.t < 40. or sim.t > 40. + (9. - 2.9) / 0.3:  # in the crosswalk from 40 s, slowly, and out of it onto the corner
+      return ()
+    return ({'cls': 'pedestrian', 'x': JUNCTION + 4. - sim.s, 'y': 9. - 0.3 * (sim.t - 40.), 'vx': 0., 'vy': -0.3, 'age': 40,
+             'trackId': 9, 'conf': 0.8, 'camera': 'road'},)
+  sim = signal_sim(red_until=45.)
+  plans = run_objects(sim, 75., walker)
+  go = next(i for i, p in enumerate(plans) if str(p.controlPrompt) == 'leftGo')
+  left_crosswalk = 40. + (9. - 3.) / 0.3  # its y under the exit crosswalk's near edge
+  assert go * DT_MDL > left_crosswalk + CLEAR_WINDOW_S - 0.2
+  assert not any(str(p.unprotectedLeft.state) == 'committed' for p in plans[:go])
+  assert all(s < LINE + 1. for s, _, _ in sim.trace[:go]) and sim.s > JUNCTION + 10.
+
+
+def test_a_hold_after_the_go_withdraws_it_and_the_car_waits_for_a_fresh_go():
+  # skeptic G4 (blocker 2): any hold after the go (a walker in the path) left a stale go that ran when the hold let go. Now
+  # the go is withdrawn while it can be, the car stands, and it goes again only on a fresh window after the hold
+  st = {'go_t': None}
+
+  def ped(sim):
+    if st['go_t'] is None and sim.tp.left_now is not None and sim.tp.left_now.state == 'go':
+      st['go_t'] = sim.t
+    if st['go_t'] is not None and sim.t < st['go_t'] + 3.:
+      return ({'cls': 'pedestrian', 'x': 6., 'y': 0., 'vx': 0., 'vy': 0., 'age': 40, 'trackId': 5, 'conf': 0.8, 'inPath': True,
+               'camera': 'road'},)
+    return ()
+  sim = left_sim()
+  plans = run_objects(sim, 60., ped)
+  gos = [i for i, p in enumerate(plans) if str(p.controlPrompt) == 'leftGo' and str(plans[i - 1].controlPrompt) != 'leftGo']
+  assert len(gos) >= 2 and gos[1] * DT_MDL >= st['go_t'] + 3. + CLEAR_WINDOW_S - 0.2
+  assert all(v < 0.3 for _, v, _ in sim.trace[gos[0] + 2:gos[1]])  # never ran on the first go
+  assert sim.s > JUNCTION + 10.
+
+
+def test_a_signal_whose_light_nothing_reads_is_handed_back_never_gone():
+  # a left at a mapped signal with no light read (no source, or the camera's reader can't see the head): it can't tell red
+  # from green, so it never goes; said out loud after LIGHT_UNKNOWN_S at its line
+  sim = signal_sim(oracle=False)
+  plans = run_objects(sim, 50.)
+  held = next(i for i, p in enumerate(plans) if p.shouldStop and p.mapControl.kind == 'unprotectedTurn')
+  und = next(i for i, p in enumerate(plans) if str(p.controlPrompt) == 'leftUndecidedTakeControl')
+  assert (und - held) * DT_MDL <= LIGHT_UNKNOWN_S + 1. and plans[und].reason == "Can't read the light: take control"
+  assert not any(p.desire == Desire.turnLeft for p in plans) and sim.s < LINE + 1.

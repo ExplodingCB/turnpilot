@@ -278,9 +278,14 @@ junction at 4, 6, 8 and 10 s headways from the car's stand at its line, then an 
 (`scenarios/score.py`) fails a post-encroachment time under 2 s, a false go, a stall or an unmoving go, a missed turn, and
 undecided after a gap of tReq was offered, and counts missed gaps.
 
+The junction is signalized and mapped, so the left goes only on a read green (`unprotected_left.SIGNAL_NEEDS_GREEN`: it
+doesn't check the cross traffic). Run it with the light oracle (`TURNPILOT_LIGHT_ORACLE=1` on the launch, `--light-oracle`
+on the bridge; without `--signals` the game's lights are held green, so it reads green), or the left waits at its line and
+hands back on the light it can't read ("Can't read the light: take control").
+
 ```sh
 for h in 4 6 8 10; do
-  python -m openpilot.tools.sim.bridge.beamng.scenarios.run unprotected_left_gap$h --runs 3 -- <bridge args>
+  python -m openpilot.tools.sim.bridge.beamng.scenarios.run unprotected_left_gap$h --runs 3 -- --light-oracle <bridge args>
 done
 ```
 

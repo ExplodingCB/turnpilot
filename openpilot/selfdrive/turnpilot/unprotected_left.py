@@ -29,7 +29,13 @@ route time (turn_skip: unprotectedRange, chimed, navd reroutes) and it is undeci
 short of its line (the latch reaches LATCH_NEAR_M short), where the longer crossing puts R_req past the range, the car rolls
 up to the line first (ROLL_UP_M; undecided only after ROLL_UP_STALL_S standing in it).
 The window (CLEAR_WINDOW_S) counts only road camera runs, from the hold (hold, then judge: never carried from the approach):
-a run gap over ROAD_FRESH_S, or the scene's holds, start it over.
+a run gap over ROAD_FRESH_S, the scene's holds, an exit crosswalk or view not clear, another of TurnPilot's stops holding the
+car at or before the junction (a signal's red, a stop sign: other_hold), or its junction's signal not read green, start it
+over (DESIGN G4 go condition 5; skeptic G4). At a signal (map_controls.turn_light: every source, the camera's in shadow too,
+since keeping the car where it stands never brakes it) the go needs a green (SIGNAL_NEEDS_GREEN): the left doesn't check the
+cross traffic, and a model that ran the red leaves the car at its line in the junction with the oncoming lanes empty at their
+own red. No read for LIGHT_UNKNOWN_S, a red past LIGHT_RED_MAX_S, or the light changing from the green it waited on (the car
+in the junction as it does, which it can't finish the turn from) are faults.
 
 The view is blocked by an occluder: a velocity-trusted vehicle track standing still in the junction (the opposing
 left-turner, a parked truck) whose box hides the oncoming lanes beyond it out to R_req. Its own box isn't traffic (it
@@ -47,10 +53,12 @@ while held, for the exit crosswalk). Until the car can no longer stop short of t
 (scene_policy.committed_past_line), every road run is checked again for the remaining clear time, and at its first motion
 (STANDSTILL_SPEED: CRITIQUE REQUIRED 4) with the latency gone: a car in the band then withdraws the go, the car stops
 where the comfortable curve can (oncomingHolding, a chime) and waits again; standing where it was held, it can always
-stay. It is committed only by its own go and motion, never by a reading while it stands (a scene commit before its go,
-with the car held, is a 'position' fault). Committed, nothing here ever stops the car (a pedestrian in the path still
-does: scene_policy). A go the car hasn't moved on within turnpilotd's LEFT_NO_MOVE_S is
-withdrawn and handed back there (the model holding the car; G5's bounded go is the remedy).
+stay. So does anything else the go was certified on no longer holding (the exit crosswalk, the view, another hold, the
+light gone red or yellow): a go never outlives them to run stale when they let go. It is committed only by its own go and
+motion, never by a reading while it stands (a scene commit before its go, with the car held, is a 'position' fault).
+Committed, nothing here ever stops the car (a pedestrian in the path still does: scene_policy). A go the car hasn't moved
+on within turnpilotd's LEFT_NO_MOVE_S is withdrawn and handed back there (the model holding the car; G5's bounded go is the
+remedy).
 """
 import math
 from dataclasses import dataclass, field
@@ -107,6 +115,13 @@ EXIT_Y_NEAR_M, EXIT_Y_FAR_M = 3., 18.  # the exit crosswalk, to the turn side, C
 BOX_X_BEFORE_M, BOX_X_AFTER_M = ONCOMING_PAST_M, 8.  # the junction box a vehicle mustn't be in...
 BOX_Y_RIGHT_M, BOX_Y_LEFT_M = 12., 18.               # ...from this far to the other side to this far to the turn side
 
+# DESIGN G4 go condition 5 (skeptic G4 blocker 2): at a signal (map_controls.turn_light) the go needs its light read green by
+# some source, the camera's in shadow too (keeping the car where it stands never brakes it): a model that ran the red leaves
+# the car at its line in the junction, the oncoming lanes empty at their own red, the cross traffic going, which nothing here
+# checks. False: only a red or yellow read keeps it waiting (unknown goes on the band alone)
+SIGNAL_NEEDS_GREEN = True
+LIGHT_UNKNOWN_S = 8.       # s at its line at a signal with no read of its light: can't tell red from green, a fault
+LIGHT_RED_MAX_S = 150.     # s at its line under a red: longer than a cycle (a red read that never ends), a fault
 GO_PROMPT_S = 1.5          # leftGo is shown this long
 ALERT_S = 2.               # oncomingHolding
 VIEW_FROM_M = 60.          # the road camera from this far out (the window starts on the approach)
@@ -134,6 +149,10 @@ class LeftInput:
   go_withdrawn: bool = False     # turnpilotd withdrew the go (not moving): its handback
   committed: bool = False        # the scene committed to (or was released into) this junction
   spread_m: float = 0.           # m between the furthest and the nearest of navd's readings of the junction (route follower)
+  other_hold: bool = False       # another of TurnPilot's stops holds the car at or before the junction (a signal's red, a
+                                 # stop sign: map_controls.stop_ahead), last frame
+  light: str = 'none'            # its junction's signal's light (map_controls.turn_light): none (no signal), red, yellow, green,
+                                 # unknown
 
 
 @dataclass
@@ -296,7 +315,10 @@ class UnprotectedLeft:
     self.why = ''
     self.verdict = ''
     self.hold_here = False        # its own hold, after a withdrawn go
+    self.hold_reason = WITHDRAWN_REASON['band']  # ...and what it says
     self.roll_stall = 0.          # s standing in a roll-up to the line
+    self.light_s = 0.             # s at its line with its signal's light not green (unknown, or red and yellow)
+    self.saw_green = False        # it stood at its line on a green
 
   def update(self, inp: LeftInput, dt: float) -> LeftDecision:
     if inp.mode not in (AUTO, ANNOUNCE):
@@ -332,7 +354,13 @@ class UnprotectedLeft:
     blocked_view = view_blocked(occ, inp.heading_deg, side, rreq)
     if blocked_view:
       self.clear_s = 0.  # the lanes behind the occluder weren't seen: the window counts only with the view open
+    light_go = inp.light in ('none', 'green') or (inp.light == 'unknown' and not SIGNAL_NEEDS_GREEN)
+    held_else = inp.other_hold or not light_go  # something else keeps it where it is: no go, no creep
+    if held_else:
+      self.clear_s = 0.  # the window counts only from where nothing else holds it (hold, then judge: a fresh one at the green)
     crosswalk = exit_clear(inp.objects, inp.heading_deg, side, inp.distance, occ, inp.spread_m)
+    if not crosswalk:
+      self.clear_s = 0.  # everything the go is certified on holds for the whole window (DESIGN G4), not on one frame
     out = LeftDecision(t_req=treq, r_req=rreq, v_limit=v_limit, clear_s=self.clear_s, view_blocked=blocked_view,
                        crosswalk_clear=crosswalk, blockers=len(raw_blockers or ()))
     self.alert_t = max(self.alert_t - dt, 0.)
@@ -357,7 +385,9 @@ class UnprotectedLeft:
       return self._undecided(out, 'position')
 
     if self.went:
-      return self._after_go(inp, out, raw_blockers, dt)
+      why = 'band' if raw_blockers else 'crosswalk' if not crosswalk else 'view' if blocked_view else \
+        'hold' if inp.other_hold or not inp.scene_clear else 'light' if inp.light in ('red', 'yellow') else ''
+      return self._after_go(inp, out, why, len(raw_blockers or ()), dt)
 
     if not standing:
       out.state = self.state = 'approach'
@@ -367,7 +397,7 @@ class UnprotectedLeft:
       # held at the line: the window starts here (hold, then judge), never carried over from the approach
       self.latch_d, self.clear_s = inp.distance, 0.
       out.clear_s = 0.
-    certified = self.clear_s >= CLEAR_WINDOW_S - 1e-6 and not blocked_view and crosswalk and inp.scene_clear
+    certified = self.clear_s >= CLEAR_WINDOW_S - 1e-6 and not blocked_view and crosswalk and inp.scene_clear and not held_else
     out.view = 'roadAndWide'
     if inp.junction_uncertain:  # where the car is isn't known: before anything is judged from it (a roll-up included)
       return self._undecided(out, 'position')
@@ -388,6 +418,18 @@ class UnprotectedLeft:
       return self._undecided(out, 'stale')
     if abs(inp.heading_deg) > YAW_UNDECIDED_DEG:
       return self._undecided(out, 'yaw')
+    if inp.light != 'none':
+      if inp.light == 'green':
+        self.saw_green, self.light_s = True, 0.
+      elif inp.light in ('red', 'yellow') and self.saw_green:
+        # stood at its line on a green, the light changes: the car is in the junction as it does, which the turn can't be
+        # finished from with no cross-traffic check. Handed back at once, as the oncoming traffic stops
+        return self._undecided(out, 'lightChange')
+      else:
+        self.light_s += dt
+        if self.light_s >= (LIGHT_RED_MAX_S if inp.light in ('red', 'yellow') else LIGHT_UNKNOWN_S) - 1e-6 and \
+           (SIGNAL_NEEDS_GREEN or inp.light != 'unknown'):
+          return self._undecided(out, 'light')
 
     if inp.mode == ANNOUNCE:
       verdict = 'go' if certified else 'wait'
@@ -403,7 +445,7 @@ class UnprotectedLeft:
     creep_max = min(CREEP_MAX_M, max(self.latch_d - (ONCOMING_ENTRY_M + CREEP_SHORT_M), 0.))
     if certified:
       return self._go(inp, out, rreq)
-    if blocked_view and not self.blocked and not self.hold_here:
+    if blocked_view and not self.blocked and not self.hold_here and not held_else:
       self.creep_to = creep_max
       done = crept >= creep_max - CREEP_DONE_M
       standing = inp.v_ego < 0.3
@@ -424,7 +466,7 @@ class UnprotectedLeft:
     out.state = self.state = 'waitGap'
     out.prompt, out.reason, out.creep_m = 'waitingForGap', "Waiting for a gap", self.creep_to
     if self.hold_here:
-      out.stops = [stop(inp.v_ego, 0., "Oncoming, holding", confirmed=False)]
+      out.stops = [stop(inp.v_ego, 0., self.hold_reason, confirmed=False)]
     return out
 
   def _go(self, inp: LeftInput, out: LeftDecision, rreq: float) -> LeftDecision:
@@ -435,9 +477,12 @@ class UnprotectedLeft:
     out.go, out.view, out.prompt, out.reason = True, 'road', 'leftGo', "Turning"
     return out
 
-  def _after_go(self, inp: LeftInput, out: LeftDecision, raw_blockers, dt: float) -> LeftDecision:
-    """Gone, not committed: the road camera only, and the band checked on every road run for the remaining clear time; at
-    the first motion with the latency gone (module docstring)."""
+  def _after_go(self, inp: LeftInput, out: LeftDecision, why: str, blockers: int, dt: float) -> LeftDecision:
+    """Gone, not committed: the road camera only, and on every frame until the commit what the go was certified on checked
+    again (why: what no longer holds, '' if it all does): the band on every road run for the remaining clear time (at the
+    first motion with the latency gone), the exit crosswalk, the view, nothing else holding the car, the light not gone red
+    or yellow (skeptic G4: a go that stood through a red and a walker in the crosswalk ran stale when they let go). Any of
+    them withdraws it while the car can stop short of the oncoming lanes: its own hold, a fresh window (module docstring)."""
     self.go_t += dt
     out.state, out.view = 'go', 'road'
     if self.go_t < GO_PROMPT_S:
@@ -446,20 +491,23 @@ class UnprotectedLeft:
       return out
     first_motion = not self.moved and inp.v_ego >= 0.3
     self.moved = self.moved or first_motion
-    if not raw_blockers:
+    if not why:
       return out
     stop_m = inp.v_ego ** 2 / (2. * STOP_DECEL)
     if self.moved and stop_m >= inp.distance - ONCOMING_ENTRY_M:
       return out  # can't stop short of the oncoming lanes: on (committed_past_line commits it next). Not yet moved, it stands
                   # where it was held: it can always stay (a reading nearer than the line never makes it go on)
-    cloudlog.event("turnpilot.left_go_withdrawn", error=True, first_motion=first_motion, distance=round(inp.distance, 1),
-                   v=round(inp.v_ego, 2), blockers=len(raw_blockers), r_req=round(out.r_req, 1))
-    self.went, self.moved, self.hold_here, self.clear_s = False, False, True, 0.
-    self.alert_t = ALERT_S
+    reason = WITHDRAWN_REASON[why]
+    cloudlog.event("turnpilot.left_go_withdrawn", error=True, why=why, first_motion=first_motion, distance=round(inp.distance, 1),
+                   v=round(inp.v_ego, 2), blockers=blockers, r_req=round(out.r_req, 1))
+    self.went, self.moved, self.hold_here, self.clear_s, self.hold_reason = False, False, True, 0., reason
     self.latch_d = inp.distance
     out.state = self.state = 'waitGap'
-    out.alert, out.prompt, out.reason, out.view, out.clear_s = 'oncomingHolding', 'waitingForGap', "Oncoming, holding", 'roadAndWide', 0.
-    out.stops = [stop(inp.v_ego, stop_m, "Oncoming, holding", confirmed=False)]
+    out.prompt, out.reason, out.view, out.clear_s = 'waitingForGap', reason, 'roadAndWide', 0.
+    if why == 'band':
+      self.alert_t = ALERT_S
+      out.alert = 'oncomingHolding'
+    out.stops = [stop(inp.v_ego, stop_m, reason, confirmed=False)]
     return out
 
   def _undecided(self, out: LeftDecision, why: str) -> LeftDecision:
@@ -469,9 +517,17 @@ class UnprotectedLeft:
     out.state, out.why, out.view = 'undecided', why, 'roadAndWide'
     out.prompt, out.reason = 'leftUndecidedTakeControl', UNDECIDED_REASON.get(why, "Can't judge oncoming traffic: take control")
     if self.hold_here:
-      out.stops = [stop(0., 0., "Oncoming, holding", confirmed=False)]
+      out.stops = [stop(0., 0., self.hold_reason, confirmed=False)]
     return out
 
+
+WITHDRAWN_REASON = {
+  'band': "Oncoming, holding",
+  'crosswalk': "Crosswalk not clear, holding",
+  'view': "View of oncoming traffic blocked, holding",
+  'hold': "Holding",
+  'light': "Light changing, holding",
+}
 
 UNDECIDED_REASON = {
   'range': "Oncoming traffic too fast to judge: take control",
@@ -480,6 +536,8 @@ UNDECIDED_REASON = {
   'yaw': "Not facing oncoming traffic: take control",
   'blocked': "View of oncoming traffic blocked: take control",
   'creepStall': "Can't creep for a view: take control",
+  'light': "Can't read the light: take control",
+  'lightChange': "Light changing: take control",
 }
 
 

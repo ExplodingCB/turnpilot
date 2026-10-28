@@ -311,6 +311,8 @@ class MapControlPolicy:
     self._camera_unmapped: tuple = ()  # the unmapped camera states last logged
     self._camera_off_said = False
     self._camera_off_t = 0.  # s of the reader's off line still to say; it runs down only while shown (never masks)
+    self._lights = NO_LIGHTS  # the last update's lights (turn_light)
+    self._signal_turn_id: int | None = None  # the unprotected turn a signal at its junction was seen for (turn_light)
 
   def stop_ahead(self) -> float | None:
     """m to the nearest stop sign or signal the car is going to stop at, or None: a stop sign not released, a signal only
@@ -328,6 +330,24 @@ class MapControlPolicy:
     """The unprotected turn of this maneuver is engaged (stopping for it, held at it, or released from it)."""
     tc = self.turn
     return tc is not None and tc.key == (UNPROTECTED_ROUTE, int(maneuver_id)) and tc.engaged
+
+  def turn_light(self, maneuver_id: int, distance: float) -> str:
+    """The light of the signal at the junction of the unprotected turn maneuver_id, distance m ahead, for the autonomous
+    left's go (unprotected_left.py: DESIGN G4 go condition 5): 'none' with no signal there (one from PROTECT_BEFORE_M
+    before it to PROTECT_PAST_M past it, once seen the junction's for good: it drops out 15 m behind the car); else what
+    every source reads around the junction (PROTECT_BEFORE_M before it to CAMERA_ASSOC_PAST_M past it), the camera's in
+    shadow too: it only ever keeps the car where it stands, never brakes it. Red over yellow over green; 'unknown' with no
+    read. The last update's lights."""
+    if any(c.kind == 'signal' and distance - PROTECT_BEFORE_M <= c.d <= distance + PROTECT_PAST_M for c in self.tracker.controls.values()):
+      self._signal_turn_id = maneuver_id
+    if self._signal_turn_id != maneuver_id:
+      return 'none'
+    lo, hi = distance - PROTECT_BEFORE_M, distance + CAMERA_ASSOC_PAST_M
+    lights = self._lights
+    states = {st for st, d in (lights.lights or []) if lo <= d <= hi}
+    if lights.camera is not None:
+      states |= {st for st, d in lights.camera.heads if lo <= d <= hi}
+    return next((st for st in ('red', 'yellow', 'green') if st in states), 'unknown')
 
   def held_stops(self) -> list:
     """The latch alone, for a faulted plan whose map update failed: a held car stays held."""
@@ -428,6 +448,7 @@ class MapControlPolicy:
     gasPressed; lights: light_input()'s; turn: (maneuver id, m to its junction, 'left' or 'right') of the route's
     unprotected_turn() the car is taking, or None; left: the unprotected left's command for its latch (None: off)."""
     self.left = left if left is not None else LeftCommand()
+    self._lights = lights
     v = max(v_ego, 0.)
     controls = self.tracker.update(nav, updated, valid, v, dt)
     if self.held is not None and all(c.key != self.held for c in controls) and \

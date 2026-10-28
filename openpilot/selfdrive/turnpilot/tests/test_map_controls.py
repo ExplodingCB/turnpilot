@@ -6,8 +6,8 @@ import pytest
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_ACCEL_MIN, plan_accel
 from openpilot.selfdrive.turnpilot.map_controls import (STOP_SIGN_HANDBACK_S, GREEN_STEADY_S, LIGHT_STALE_S, MAP_DECEL_MAX, NO_LIGHTS,
-                                                         OFF_ROUTE_REASON, OFF_ROUTE_SPEED, T_LAT, UNPROTECTED, YIELD_SPEED, Lights,
-                                                         MapControlPolicy, engage_distance, light_input, unprotected_turn)
+                                                         OFF_ROUTE_REASON, OFF_ROUTE_SPEED, T_LAT, UNPROTECTED, YIELD_SPEED, CameraLights,
+                                                         Lights, MapControlPolicy, engage_distance, light_input, unprotected_turn)
 from openpilot.selfdrive.turnpilot.route_follower import make_maneuver
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, NO_ACCEL_CAP, ScenePolicy, decide
 from openpilot.selfdrive.turnpilot.tests.synthetic import nav_instruction
@@ -842,3 +842,30 @@ def test_announce_and_off_hand_back_at_the_line_as_before():
     assert out.prompt == 'unprotectedTurnTakeControl' and dec.reason == reason and out.shown.action == 'awaitingDriver'
     out, dec, _ = car.policy_step(left_cmd('announce', go=True) if cmd is not None else None)
     assert held(out, dec)  # announce never goes
+
+
+def test_the_turn_light_is_the_signal_at_the_lefts_junction_from_any_source():
+  # the autonomous left's go needs its junction's light (unprotected_left.py; skeptic G4 blocker 2): 'none' without a signal
+  # there; otherwise every source's reads around the junction, the camera's in shadow too (a veto never brakes), red over
+  # yellow over green, unknown with no read. A signal seen there stays the junction's after it drops out behind the car
+  car = left_car()
+  car.run(1.)
+  assert car.policy.turn_light(7, 250. - car.s) == 'none'
+  car = left_car([(250. - 11., 'signal')])
+  car.run(1., lights=lambda car: lights('green', 239. - car.s))
+  assert car.policy.turn_light(7, 250. - car.s) == 'green'
+  car.run(0.1, lights=lambda car: lights('red', 239. - car.s))
+  assert car.policy.turn_light(7, 250. - car.s) == 'red'
+  car.run(0.1)
+  assert car.policy.turn_light(7, 250. - car.s) == 'unknown'
+  shadow = Lights(None, 'none', camera=CameraLights([('red', 250. + 20. - car.s)], shadow=True))
+  car.run(0.1, lights=shadow)
+  assert car.policy.turn_light(7, 250. - car.s) == 'red'
+  both = Lights([('green', 239. - car.s)], 'simOracle', camera=CameraLights([('yellow', 270. - car.s)], shadow=True))
+  car.run(0.1, lights=both)
+  assert car.policy.turn_light(7, 250. - car.s) == 'yellow'
+  # a light past the junction's window (the next junction on) isn't its
+  car.run(0.1, lights=Lights(None, 'none', camera=CameraLights([('red', 250. + 60. - car.s)], shadow=True)))
+  assert car.policy.turn_light(7, 250. - car.s) == 'unknown'
+  # another maneuver's junction isn't this one's
+  assert car.policy.turn_light(8, 400.) == 'none'

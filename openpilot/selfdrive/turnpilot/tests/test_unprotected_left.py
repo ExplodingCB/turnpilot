@@ -7,7 +7,7 @@ from openpilot.selfdrive.turnpilot.route_follower import LEFT
 from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M, VEL_TRUST_HITS
 from openpilot.selfdrive.turnpilot.tests.synthetic import scene
 from openpilot.selfdrive.turnpilot.unprotected_left import (BLOCKED_UNDECIDED_S, CLEAR_WINDOW_S, CREEP_MAX_M, CREEP_SHORT_M, CREEP_STALL_S,
-                                                           PET_S, RAW_CONF,
+                                                           LIGHT_RED_MAX_S, LIGHT_UNKNOWN_S, PET_S, RAW_CONF,
                                                            ROAD_FRESH_S, SPEED_MARGIN, STALE_UNDECIDED_S, LeftInput, RawBox, RawFrame,
                                                            UnprotectedLeft, band_blockers, r_req, t_clear, t_req)
 
@@ -423,3 +423,79 @@ def test_a_commit_while_standing_held_before_any_go_is_a_fault_never_a_freeze():
   assert d.state == 'go'
   d = j.step(v=0.6, distance=ONCOMING_ENTRY_M - 0.6, committed=True)
   assert d.state == 'committed'
+
+
+def test_never_a_go_while_anything_else_holds_the_car_or_its_light_isnt_green():
+  # skeptic G4 (blocker 2), DESIGN G4 go condition 5: with a red at the junction (accepted: the map's signal stop, other_hold;
+  # or any source, the camera in shadow too: light) the band empty, it never goes; the window counts only from the green
+  for kw in ({'other_hold': True}, {'light': 'red'}, {'light': 'yellow'}, {'light': 'unknown'}):
+    j = Junction()
+    d = j.wait(LIGHT_UNKNOWN_S - 0.5, **kw)
+    assert not any(x.go for x in j.decisions) and d.state == 'waitGap', kw
+    d = j.wait(CLEAR_WINDOW_S - 0.3, light='green')
+    assert not any(x.go for x in j.decisions), kw  # the window started at the green
+    j.wait(0.5, light='green')
+    assert any(x.go for x in j.decisions), kw
+  # no signal at the junction: as before
+  j = Junction()
+  j.wait(CLEAR_WINDOW_S + 0.2, light='none')
+  assert any(x.go for x in j.decisions)
+  # a blocked view under a red: no creep past the line into the junction, it waits
+  turner = oncoming(HOLD_D + 12., 3.6, vx=0., trackId=7, box=[0.5, 0.4, 0.6, 0.5], camera='road')
+  box = raw(HOLD_D + 12., 3.6)
+  box = RawBox(box.camera, box.cls, box.conf, box.bearing_deg, box.span_deg, box.xy, box.near_m, (0.5, 0.4, 0.6, 0.5))
+  j = Junction()
+  d = j.wait(2., boxes=[box], objects=[turner], light='red')
+  assert d.state == 'waitGap' and d.creep_m == 0.
+
+
+def test_a_light_it_cant_read_or_that_changes_while_it_waits_is_handed_back():
+  # no read of the junction's light for LIGHT_UNKNOWN_S: it can't tell red from green, out loud
+  j = Junction()
+  d = j.wait(LIGHT_UNKNOWN_S + 0.2, light='unknown')
+  assert d.state == 'undecided' and d.why == 'light' and d.prompt == 'leftUndecidedTakeControl'
+  # a red is waited through (no gap is taken under it) up to LIGHT_RED_MAX_S
+  j = Junction()
+  d = j.wait(LIGHT_RED_MAX_S - 1., light='red')
+  assert d.state == 'waitGap'
+  d = j.wait(1.5, light='red')
+  assert d.state == 'undecided' and d.why == 'light'
+  # waiting at the line on a green, the light goes yellow: the car is in the junction as the light changes, which it can't
+  # finish the turn on (no cross-traffic check): handed back at once
+  j = Junction()
+  j.wait(1., boxes=[raw(90., 3.6)], light='green')
+  d = j.step(boxes=[raw(90., 3.6)], light='yellow')
+  assert d.state == 'undecided' and d.why == 'lightChange' and not any(x.go for x in j.decisions)
+
+
+def test_a_go_never_outlives_another_hold_or_a_change_before_its_commit():
+  # skeptic G4 (blocker 2): the go stayed 'go' through a red that held the car 14 s, and through a walker who came into the
+  # exit crosswalk, and ran on the stale go when that hold let go. Before its commit, another hold, a light gone red or
+  # yellow, the exit crosswalk or the view no longer clear withdraw the go: its own hold, waiting again, a fresh window
+  walker = ped(HOLD_D + 4., 9.)
+  turner = oncoming(HOLD_D + 12., 3.6, vx=0., trackId=7, box=[0.5, 0.4, 0.6, 0.5], camera='road')
+  for kw in ({'other_hold': True}, {'scene_clear': False}, {'light': 'red'}, {'objects': [walker]}, {'objects': [turner]}):
+    j = Junction()
+    j.wait(CLEAR_WINDOW_S + 0.2, light='green')
+    assert any(x.go for x in j.decisions)
+    j.held = False
+    d = j.step(**{'light': 'green', **kw})
+    assert d.state == 'waitGap' and not d.go and d.stops and d.stops[0].should_stop, kw
+    n = len(j.decisions)
+    d = j.wait(CLEAR_WINDOW_S - 0.3, light='green')
+    assert not any(x.go for x in j.decisions[n:]), kw  # a fresh window from where the hold let go
+    j.wait(0.5, light='green')
+    assert any(x.go for x in j.decisions[n:]), kw
+  # rolling, it withdraws only where it can stop short of the oncoming lanes; past that it's on (never stopped in them)
+  j = Junction()
+  j.wait(CLEAR_WINDOW_S + 0.2)
+  j.held = False
+  j.step(v=0.5, distance=HOLD_D - 0.1)
+  d = j.step(v=1.5, distance=HOLD_D - 0.5, objects=[walker])
+  assert d.state == 'waitGap' and d.stops and d.stops[0].accel_cap >= -2.0
+  j = Junction()
+  j.wait(CLEAR_WINDOW_S + 0.2)
+  j.held = False
+  j.step(v=0.5, distance=HOLD_D - 0.1)
+  d = j.step(v=3.5, distance=ONCOMING_ENTRY_M + 2., objects=[walker])
+  assert d.state in ('go', 'committed') and not d.stops
