@@ -95,6 +95,7 @@ class Control:
   osm_node: int = 0    # the OSM junction node the sidecar says it governs; 0 none
   junction_status: str = 'ok'  # 'failed' for a stop or yield when the OSM sidecar was missing or stale (STOP_SIGNS.md N7;
                                # MapJunction.status, SG1b)
+  edge: int = -1       # the trace edge whose end it is at (route_audit.py)
 
 
 def decode6(s: str) -> list[tuple[float, float]]:
@@ -498,12 +499,12 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
       if m <= end_m - CONTROL_LINE_M:
         line_m, mapped, source = m, True, 'osm'
     failed = osm is not None and not osm_ok and kind in ('stop', 'yield')
-    found.append((line_m - MAP_MARGIN_M, kind, mapped, junction, cross_suspect, instance, source, osm_node, 'failed' if failed else 'ok'))
+    found.append((line_m - MAP_MARGIN_M, kind, mapped, junction, cross_suspect, instance, source, osm_node, 'failed' if failed else 'ok', a))
   controls = []
-  for i, (s, kind, mapped, junction, suspect, instance, source, osm_node, jstatus) in enumerate(sorted(found, key=lambda c: c[0])):
+  for i, (s, kind, mapped, junction, suspect, instance, source, osm_node, jstatus, a) in enumerate(sorted(found, key=lambda c: c[0])):
     step_idx, along, route_m = to_step(starts, max(s, 0.))
     controls.append(Control(i, kind, route_m, step_idx, along, mapped, junction, suspect, instance, line_source=source, osm_node=osm_node,
-                            junction_status=jstatus))
+                            junction_status=jstatus, edge=a))
   side = 'none expected' if osm is None else osm.status
   cloudlog.info(f"turnpilot controls: {len(controls)} on the route ({status}), {unmatched}/{len(edges)} edges unmatched, OSM sidecar {side}")
   return controls, status
