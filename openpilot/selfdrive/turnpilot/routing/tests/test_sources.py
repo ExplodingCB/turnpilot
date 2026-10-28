@@ -216,7 +216,7 @@ class RouterCase(unittest.TestCase):
 class TestMapRouter(RouterCase):
   def test_routes_on_the_downloaded_corridor(self):
     self.assertEqual(self.router.route(START, DESTINATION, 90, 'en'), STEPS)
-    self.assertEqual(self.server.corridor_requests(), [{'start': list(START), 'destination': list(DESTINATION)}])
+    self.assertEqual(self.server.corridor_requests(), [{'start': list(START), 'destination': list(DESTINATION), 'osm_controls': True}])
     (source,) = self.built
     pack = Path(source.tiles)
     self.assertEqual(pack.parent, self.maps / PACKS_DIR)
@@ -250,7 +250,7 @@ class TestMapRouter(RouterCase):
     self.server.corridor = (200, make_pack({level2_tile(*START): b'tile', level2_tile(*outside): b'more'}), 'application/x-tar')
     self.params.writes.clear()
     self.assertEqual(self.router.route(outside, DESTINATION, 0, 'en'), STEPS)
-    self.assertEqual(self.server.corridor_requests()[-1], {'start': list(outside), 'destination': list(DESTINATION)})
+    self.assertEqual(self.server.corridor_requests()[-1], {'start': list(outside), 'destination': list(DESTINATION), 'osm_controls': True})
     self.assertEqual(self.built[-1].calls, [(outside, DESTINATION, 0, 'en')])
     self.assertEqual(self.states(), ['downloading', 'downloading', 'ready'])  # the driver sees the new download
     self.assertEqual(self.status()['destination'], list(DESTINATION))
@@ -279,7 +279,7 @@ class TestMapRouter(RouterCase):
   def test_routes_from_where_the_car_is_once_the_download_is_done(self):
     later = (-86.165, 39.771)
     self.assertEqual(self.router.route(START, DESTINATION, 90, 'en', position=lambda: (later, 45)), STEPS)
-    self.assertEqual(self.server.corridor_requests(), [{'start': list(START), 'destination': list(DESTINATION)}])
+    self.assertEqual(self.server.corridor_requests(), [{'start': list(START), 'destination': list(DESTINATION), 'osm_controls': True}])
     self.assertEqual(self.built[0].calls, [(later, DESTINATION, 45, 'en')])
 
   def test_a_cancelled_download_stops_quietly(self):
