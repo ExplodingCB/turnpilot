@@ -94,6 +94,24 @@ def test_camera_light_reader_off_is_said_once():
   assert out.alert == 'none'  # once for the drive, not a status line for the rest of it
 
 
+@pytest.mark.parametrize("prior", ['cannotStopComfortably', 'stopOverrun', 'proceedingOnYellow', 'mapControlsUnavailable'])
+def test_camera_light_reader_off_never_masks_a_live_alert(prior):
+  """The reader going off at a signal (large heads, the slow device CPU) is the moment overrun and turn-line alerts fire:
+  its status line waits for them and is still said, never in their place."""
+  car = Car([(300., 'signal')])
+  car.step()
+  car.policy._transient(prior)
+  off = Lights(camera=CameraLights([], True, 'disabled'))
+  out, _, _ = car.step(lights=off)
+  assert out.alert == prior
+  alerts = [car.step(lights=off)[0].alert for _ in range(int(6. / DT_MDL))]
+  assert alerts[0] == prior and 'lightSourceRejected' in alerts and alerts[-1] == 'none'
+  first = alerts.index('lightSourceRejected')
+  assert all(a == prior for a in alerts[:first])  # never in place of it
+  shown = alerts.count('lightSourceRejected')
+  assert shown * DT_MDL >= map_controls.ABORT_HOLD_S - 2 * DT_MDL  # said in full once the prior alert is done
+
+
 def test_a_camera_source_is_never_rejected():
   car = Car([(300., 'signal')])
   out, dec, _ = car.step(lights=Lights(camera=camera('red', 40.)))
@@ -167,7 +185,8 @@ def lockstep(seed: int, add_only: bool, seconds: float = 30.):
 def test_shadow_camera_never_changes_a_plan(seed):
   for _, a, _, b, _ in lockstep(seed, add_only=False):
     assert a.stops == b.stops and a.prompt == b.prompt and a.released_stopped == b.released_stopped
-    assert b.alert in (a.alert, 'lightSourceRejected')  # the reader's loud off, once
+    # the reader's loud off, once, only where nothing else is said: never in place of a take-control or overrun alert
+    assert b.alert == a.alert or (a.alert == 'none' and b.alert == 'lightSourceRejected'), (a.alert, b.alert)
 
 
 @pytest.mark.parametrize("seed", range(40))

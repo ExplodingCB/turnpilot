@@ -43,7 +43,8 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   line to CAMERA_ASSOC_PAST_M past it is that signal's, the last line before it winning) and what it would do is logged
   on every change (turnpilot.camera_light_shadow; turnpilot.camera_light_unmapped for a red or yellow with no mapped
   signal: no synthetic control, CRITIQUE cut), and nothing it reads reaches a stop, a cap, a prompt or a release. Its
-  reader turned off for the drive is said once (lightSourceRejected, "Camera light reader off for this drive"). Add-only
+  reader turned off for the drive is said once (lightSourceRejected, "Camera light reader off for this drive"), on its
+  own hold and only where no other alert is said, so it never mutes a take-control, overrun or yellow alert. Add-only
   needs both keys, modeld's message not shadow and turnpilotd's own TurnPilotCameraLights addOnly: then a camera red
   raises a signal's light to red, and a camera yellow to yellow only while a yellow stop at it is still feasible (a
   yellow too late to stop for would commit the signal to go, and a commit outlasts a later red: a removed stop). A
@@ -287,6 +288,7 @@ class MapControlPolicy:
     self._camera_would: dict = {}  # signal key -> what the camera would have it do, as last logged
     self._camera_unmapped: tuple = ()  # the unmapped camera states last logged
     self._camera_off_said = False
+    self._camera_off_t = 0.  # s of the reader's off line still to say; it runs down only while shown (never masks)
 
   def stop_ahead(self) -> float | None:
     """m to the nearest stop sign or signal the car is going to stop at, or None: a stop sign not released, a signal only
@@ -422,7 +424,7 @@ class MapControlPolicy:
     camera = lights.camera
     if camera is not None and camera.status == 'disabled' and not self._camera_off_said:
       self._camera_off_said = True
-      self._transient('lightSourceRejected')
+      self._camera_off_t = ABORT_HOLD_S  # its own hold, never _transient: it must not overwrite a live one-shot alert
       cloudlog.event("turnpilot.camera_lights_off", error=True)
     live_signals = [c for c in controls if c.kind == 'signal' and not (c.state is not None and c.state.done)]
     for c in controls:
@@ -471,8 +473,13 @@ class MapControlPolicy:
       out.alert = 'mapControlsUnavailable'
     elif lights.rejected:
       out.alert = 'lightSourceRejected'
-    if out.alert == 'lightSourceRejected' and self._camera_off_said and not lights.rejected and not out.reason:
-      out.reason = CAMERA_OFF_REASON
+    elif self._camera_off_t > 0.:
+      # a shadow component's status line: said only where nothing else is, held back (not lost) behind a take-control,
+      # overrun or yellow alert, and said in full once that one is done
+      out.alert = 'lightSourceRejected'
+      self._camera_off_t = max(self._camera_off_t - dt, 0.)
+      if not out.reason:
+        out.reason = CAMERA_OFF_REASON
     live = [c for c in controls if c.state is not None and not c.state.done]
     pick = next((c for c in live if c.held), None) or next((c for c in live if c.engaged), None) or \
       next((c for c in live if c.d > -OVERRUN_PAST_M), None)
