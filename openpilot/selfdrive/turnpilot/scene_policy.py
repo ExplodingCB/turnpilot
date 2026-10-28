@@ -279,11 +279,35 @@ def leaving_crosswalk(obj, distance: float, side: int) -> bool:
   return on_past or down_cross_street
 
 
+class RoadFrame:
+  """A tracked object seen in the road's frame: the car's calibrated frame turned back by the car's heading change toward the
+  turn (x along the approach, y left of it). Every other field is the object's own."""
+  __slots__ = ('obj', 'x', 'y', 'vx', 'vy')
+
+  def __init__(self, obj, a: float):
+    c, s = math.cos(a), math.sin(a)
+    self.obj = obj
+    self.x, self.y = obj.x * c - obj.y * s, obj.x * s + obj.y * c
+    self.vx, self.vy = obj.vx * c - obj.vy * s, obj.vx * s + obj.vy * c
+
+  def __getattr__(self, name):
+    return getattr(self.obj, name)
+
+
+def road_frame(objects, heading_deg: float, side: int) -> list:
+  """objects in the road's frame, for a car that has turned heading_deg toward side (LEFT positive) since its approach: the
+  oncoming lanes are the road's, whichever way the car stands (DESIGN phase 4 section 2: standing 30 deg into a left, an
+  oncoming car 50 m up the road is 22 m to the car's right)."""
+  a = math.radians(heading_deg) * side
+  return list(objects) if a == 0. else [RoadFrame(obj, a) for obj in objects]
+
+
 def junction_stops(objects, maneuver, distance, v_ego, right_hand_traffic, is_walker=crosswalk_walker,
-                   may_leave=confirmed_track, may_harden=confirmed_track) -> list[Stop]:
+                   may_leave=confirmed_track, may_harden=confirmed_track, heading_deg: float = 0.) -> list[Stop]:
   """Holds at the hold line before a turn: the crosswalk of a curb-side turn, oncoming traffic across a far-side one.
   may_leave: whether a walker's velocity is trusted to let it go when it is leaving the crosswalk; may_harden: whether a
-  walker's or an oncoming vehicle's track is confirmed, to brake harder than the curve for it."""
+  walker's or an oncoming vehicle's track is confirmed, to brake harder than the curve for it. heading_deg: the car's
+  heading change toward the turn since its approach; the oncoming band is the road's frame (road_frame)."""
   far_side = far_side_turn(maneuver, right_hand_traffic)
   if not hold_line_stop(maneuver, distance, v_ego, "", far_side):
     return []
@@ -299,7 +323,7 @@ def junction_stops(objects, maneuver, distance, v_ego, right_hand_traffic, is_wa
     walker = min(walkers, key=lambda obj: (not may_harden(obj), obj.x))
     return hold_line_stop(maneuver, distance, v_ego, "pedestrian in crosswalk", far_side, may_harden(walker), track_evidence(walker))
   holds = []
-  for obj in objects:
+  for obj in road_frame(objects, heading_deg, side):
     # a new track's vx is range noise, its sign included (VEL_TRUST_HITS): taken as coming, never as going away. Taken so,
     # it holds on the comfortable curve only: a hard stop needs a track whose existence and motion are both trusted (a
     # parked car or a ghost of a few frames otherwise brakes the car at the planner's emergency floor)
@@ -326,11 +350,13 @@ def decide(stops: list[Stop], v_ego: float) -> SceneDecision:
 
 
 def scene_policy(objects, available: bool, maneuver, distance: float, v_ego: float,
-                 right_hand_traffic: bool = True) -> SceneDecision:
+                 right_hand_traffic: bool = True, heading_deg: float = 0.) -> SceneDecision:
   """One frame on its own: evidence from this frame's tracks alone, no ramp, no gas release, nothing carried through a
-  gap. objects: tracked objects (ignored when not available); maneuver: RouteFollower.upcoming or None."""
+  gap. objects: tracked objects (ignored when not available); maneuver: RouteFollower.upcoming or None; heading_deg: the
+  car's heading change toward its turn since the approach (junction_stops)."""
   objects = list(objects) if available else []
-  stops = pedestrian_stops(objects, v_ego) + junction_stops(objects, maneuver, distance, v_ego, right_hand_traffic)
+  stops = pedestrian_stops(objects, v_ego) + junction_stops(objects, maneuver, distance, v_ego, right_hand_traffic,
+                                                            heading_deg=heading_deg)
   return decide(stops, v_ego)
 
 
@@ -387,10 +413,11 @@ class ScenePolicy:
     return [self.fault_junction]
 
   def update(self, objects, available: bool, maneuver, distance: float, v_ego: float, right_hand_traffic: bool = True,
-             maneuver_id: int | None = None, gas_pressed: bool = False, dt: float = DT_MDL, extra_stops=()) -> SceneDecision:
+             maneuver_id: int | None = None, gas_pressed: bool = False, dt: float = DT_MDL, extra_stops=(),
+             heading_deg: float = 0.) -> SceneDecision:
     """As scene_policy(), plus maneuver_id (RouteFollower.maneuver_id), once per frame dt apart. gas_pressed: the driver
     taking over (turnpilotd: carState.gasPressed with openpilot disengaged), never a go. extra_stops: the map's stop signs
-    and signals (map_controls.py), composed with the scene's like any other stop."""
+    and signals (map_controls.py), composed with the scene's like any other stop. heading_deg: as scene_policy()'s."""
     far_side = far_side_turn(maneuver, right_hand_traffic)
     self.t += dt
     if available:
@@ -403,7 +430,7 @@ class ScenePolicy:
       peds = pedestrian_stops(objects, v_ego, lambda obj: self.tracks[obj.trackId].confirmed)
       junction = junction_stops(objects, maneuver, distance, v_ego, right_hand_traffic, lambda obj: self.tracks[obj.trackId].walker,
                                 lambda obj: self.tracks[obj.trackId].confirmed and self.tracks[obj.trackId].leaving >= CROSSWALK_LEAVING_FRAMES,
-                                lambda obj: self.tracks[obj.trackId].confirmed)
+                                lambda obj: self.tracks[obj.trackId].confirmed, heading_deg)
       self.carried = peds
       self.carried_junction = (maneuver_id, junction[0]) if junction else None
     else:

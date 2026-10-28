@@ -1,3 +1,4 @@
+import math
 from unittest import mock
 
 from openpilot.common.realtime import DT_MDL
@@ -106,6 +107,39 @@ def test_new_tracks_velocity_is_taken_as_approaching():
   # ScenePolicy takes the same rule
   sp = ScenePolicy()
   d = sp.update(scene([car(30., 5., vx=5.5, age=12)]).objects, True, LEFT_TURN, HOLD_LINE_M + 0.5, 0., maneuver_id=1)
+  assert d.should_stop and d.reason == "waiting for oncoming"
+
+
+def yawed(x_road, y_road, vx_road, vy_road, yaw_deg):
+  """A road-frame point and velocity (x along the approach, y left) as the car, yawed yaw_deg left, sees them."""
+  a = math.radians(yaw_deg)
+  def rot(x, y):
+    return x * math.cos(a) + y * math.sin(a), -x * math.sin(a) + y * math.cos(a)
+  return (*rot(x_road, y_road), *rot(vx_road, vy_road))
+
+
+def test_oncoming_band_is_in_the_road_frame_with_the_car_yawed_into_the_turn():
+  # DESIGN phase 4 section 2: standing 30 deg into a left at its hold line (BeamNG V1 at a 10 m hold stood 30-45 deg in), an
+  # oncoming car 50 m up the road in the first oncoming lane is about 22 m to the car's right in its own frame: outside a
+  # car-frame band (y left 1.5-20 m), never counted. The band is the road's: the car's frame turned back by its yaw
+  x, y, vx, vy = yawed(50., 3.6, -12., 0., 30.)
+  assert y < -20.
+  oncoming = scene([car(x, y, vx=vx, vy=vy, age=VEL_TRUST_HITS)]).objects
+  d = scene_policy(oncoming, True, LEFT_TURN, HOLD_LINE_M + 0.5, 0., heading_deg=30.)
+  assert d.should_stop and d.reason == "waiting for oncoming"
+  d = ScenePolicy().update(oncoming, True, LEFT_TURN, HOLD_LINE_M + 0.5, 0., maneuver_id=1, heading_deg=30.)
+  assert d.should_stop and d.reason == "waiting for oncoming"
+  # and the other way: a car in the car's own lane ahead (road y 0), going away, which the yawed car sees to its right, and
+  # one on the cross street far to the right, aren't oncoming
+  for road in ((50., 0., 12., 0.), (5., -12., 0., 10.)):
+    x, y, vx, vy = yawed(*road, 30.)
+    assert not scene_policy(scene([car(x, y, vx=vx, vy=vy, age=VEL_TRUST_HITS)]).objects, True, LEFT_TURN, HOLD_LINE_M + 0.5, 0.,
+                            heading_deg=30.).holding
+  # a right on the left-hand side of the road (its far side) turns the other way
+  right_on_left = Maneuver(*classify("turn", "right"), "turn", "right", NOMINAL_ANGLE_DEG["right"])
+  x, y, vx, vy = yawed(50., -3.6, -12., 0., -30.)
+  d = scene_policy(scene([car(x, y, vx=vx, vy=vy, age=VEL_TRUST_HITS)]).objects, True, right_on_left, HOLD_LINE_M + 0.5, 0.,
+                   right_hand_traffic=False, heading_deg=30.)
   assert d.should_stop and d.reason == "waiting for oncoming"
 
 

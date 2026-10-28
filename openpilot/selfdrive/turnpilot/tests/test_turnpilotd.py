@@ -1569,6 +1569,27 @@ def test_unprotected_left_stops_before_the_hold_line_and_hands_back():
   assert sim.s > 320.
 
 
+def test_the_oncoming_hold_counts_a_car_up_the_road_with_the_car_yawed_into_the_left():
+  # DESIGN phase 4 section 2 (the road-frame band): the car stands at its hold line 30 deg into the left (yawed there on the
+  # approach); an oncoming car 50 m up the road is 22 m to its right in its own frame. turnpilotd turns the scene back by
+  # the car's heading change toward the turn since TURN_DESIRE_LEAD_M, so it still holds
+  sim = Sim(TURNS_AHEAD)
+  sim.go_taps = False
+  while sim.distance() > TURN_DESIRE_LEAD_M + 5.:
+    sim.step()
+  yaw_rate = math.radians(30.) / (sim.distance() / sim.v)  # 30 deg left by the junction at this speed
+  while sim.v > 0.05 or sim.distance() > HOLD_LINE_M + 5.:
+    sim.step(yaw_rate=yaw_rate if sim.tp.approach_yaw_deg < 30. else 0.)
+  assert abs(sim.tp.approach_yaw_deg - 30.) < 1.
+  a = math.radians(30.)
+  x_road, y_road = 50., 3.6
+  car_frame = {'cls': 'car', 'x': x_road * math.cos(a) + y_road * math.sin(a), 'y': -x_road * math.sin(a) + y_road * math.cos(a),
+               'vx': -12. * math.cos(a), 'vy': 12. * math.sin(a), 'inPath': False, 'age': 30}
+  assert car_frame['y'] < -20.
+  sim.step([car_frame])
+  assert sim.tp.scene.junction is not None and sim.tp.scene.junction.reason == "waiting for oncoming"
+
+
 def test_left_without_junction_data_is_unprotected():
   sim = Sim([(300., "turn", "left"), (1500., "turn", "right")])
   sim.go_taps = False
