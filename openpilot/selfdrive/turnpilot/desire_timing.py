@@ -12,8 +12,10 @@ The model forgets a pulse 132 frames after it (6.6 s at 20 Hz, its desire histor
 approach took longer than that, it planned the turn and then dropped it 10 m out, and a late retry pulse brought
 the turn back at once. So a turn desire is pulsed again every REPULSE_S on the approach, and once more ENTRY_M
 before the junction, so the last pulse is fresh for the whole turn: at 4 m/s a turn outlasts one pulse, and the
-model let go of it halfway round. None once the car has turned TURN_STARTED_DEG (by its yaw rate): pulses during
-the turn turned the car on past the exit road, into the curb. That holds for a repeat and one on engaging. One as the car
+model let go of it halfway round. Crossing ENTRY_M within ENTRY_GAP_S of a repeat, the entry pulse goes once that gap is
+past (it used to be used up then, and never went); a pulse that itself goes inside ENTRY_M is the entry pulse.
+None once the car has turned TURN_STARTED_DEG (by its yaw rate): pulses during the turn turned the car on past the exit
+road, into the curb. That holds for a repeat and one on engaging. One as the car
 pulls away after a standstill (STANDSTILL_REARM_S) goes while it has turned less than STANDSTILL_REPULSE_MAX_DEG: waiting
 in the junction for oncoming traffic, 15-25 degrees into a left, longer than the model's queue, the turn would lapse
 (H2, below: with the pulse gone at 5-16 degrees the model gave up 3 turns of 3); further round (stopped halfway for a
@@ -245,6 +247,7 @@ class DesireTiming:
         if self.active:
           self._gap, self._since_pulse = PULSE_GAP_FRAMES, 0.
           self.pulses += 1
+          self.entry = self.entry or distance < ENTRY_M
       elif self._stopped_t > STANDSTILL_REARM_S:
         self.active = False  # the model has forgotten the pulse by now; send it again once the car moves
         self._rearmed = True
@@ -259,7 +262,8 @@ class DesireTiming:
     if self.active and turn:
       self._since_pulse += dt
       entry = not self.entry and distance < ENTRY_M and self._since_pulse >= ENTRY_GAP_S
-      self.entry = self.entry or distance < ENTRY_M
+      # used up once it can go: crossing ENTRY_M within ENTRY_GAP_S of a repeat, it waits out the gap and then goes
+      self.entry = self.entry or entry
       if (entry or (self._since_pulse >= REPULSE_S and distance > ENTRY_M)) and self.turned_deg < TURN_STARTED_DEG and \
          self.pulses < MAX_PULSES and may_start:
         self._gap, self._since_pulse = PULSE_GAP_FRAMES, 0.
@@ -275,6 +279,8 @@ class DesireTiming:
       if turn and not self.started and distance < 0.:
         return Desire.none  # a first pulse past the junction turns the car into the curb (turn_skip.py skips it)
       self.active = self.started = True
+      if turn and distance < ENTRY_M:
+        self.entry = True  # a pulse inside ENTRY_M (on engaging, pulling away) is the entry pulse
       self._held = self._rearmed = False
       self._held_none = 0
       self.pulses += 1

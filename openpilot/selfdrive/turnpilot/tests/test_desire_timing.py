@@ -1,6 +1,6 @@
 from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.turnpilot.desire_timing import (CLEAR_FRAMES, CLEAR_MARGIN_DEG, CLEAR_MIN_DEG, CLEAR_WAIT_S, ENTRY_M,
+from openpilot.selfdrive.turnpilot.desire_timing import (CLEAR_FRAMES, CLEAR_MARGIN_DEG, CLEAR_MIN_DEG, CLEAR_WAIT_S, ENTRY_GAP_S, ENTRY_M,
                                                          PULSE_GAP_FRAMES, REPULSE_S, STANDSTILL_REARM_S, TURN_DESIRE_LEAD_M,
                                                          DesireTiming, keep_lead)
 from openpilot.selfdrive.turnpilot.hooks import CLEAR_DESIRE
@@ -139,7 +139,8 @@ def test_pulse_again_after_a_standstill():
     return 8. if t < 185. / 8. else (0. if t < 185. / 8. + 10. else 5.)
   trace = drive([(200., "turn", "left"), (900., "turn", "right")], seconds=50., speed_profile=speed)
   edges = rising_edges(trace, Desire.turnLeft)
-  assert abs(edges[-1][0] - 185.) < 1.  # a pulse goes as the car pulls away
+  assert abs(edges[-2][0] - 185.) < 1.  # a pulse goes as the car pulls away, 15 m out...
+  assert 0. < edges[-1][1] < ENTRY_M and edges[-1][0] - edges[-2][0] >= ENTRY_GAP_S * 5. - 0.5  # ...and the entry pulse after it
   stopped = [desire for s, d, desire in trace if abs(s - 185.) < 0.5]
   assert stopped.count(Desire.none) >= int((10. - STANDSTILL_REARM_S) / DT_MDL) - 2
 
@@ -444,3 +445,17 @@ def test_held_standing_the_turn_drops_to_none_so_the_go_is_an_edge_at_once():
     out = [dt_.update(LEFT_TURN, 10., 1, False, 0., 0., True, True, DT_MDL, 0., go=k == 0) for k in range(6)]
     first = out.index(Desire.turnLeft)
     assert first == max(PULSE_GAP_FRAMES - held_frames, 0) and set(out[first:]) == {Desire.turnLeft}, held_frames
+
+
+def test_entry_pulse_goes_once_the_gap_after_a_late_repulse_has_passed():
+  # at 4 m/s the pulses go at 40, 26 and 12 m: the car crosses ENTRY_M 0.5 s after that last repeat, inside ENTRY_GAP_S.
+  # The entry pulse waits out the gap and then goes, so the last pulse is fresh for the whole turn; it is never used up
+  # by crossing ENTRY_M while it couldn't go
+  v = 4.
+  trace = drive([(200., "turn", "left"), (900., "turn", "right")], v=v, turns_at=None, seconds=60.)
+  edges = rising_edges(trace, Desire.turnLeft)
+  late = [d for _, d in edges if ENTRY_M < d < ENTRY_M + ENTRY_GAP_S * v]
+  assert late, edges  # the case: a repeat within ENTRY_GAP_S of the entry
+  entry = [d for _, d in edges if 0. < d < ENTRY_M]
+  assert len(entry) == 1, edges
+  assert late[-1] - entry[0] >= ENTRY_GAP_S * v - 0.5, edges
