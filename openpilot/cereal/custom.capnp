@@ -252,6 +252,25 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     why @10 :Text;             # undecided: its fault; announce: go or wait
   }
   unprotectedLeft @31 :UnprotectedLeftStatus;
+  # TurnPilot's certified go (selfdrive/turnpilot/go_override.py; DESIGN phase 4 decision 1, G5): asserted on every frame of
+  # the go, from the go until it ends (GO_WINDOW_S at most) or is withdrawn. plannerd lifts the e2e model's hold on the car
+  # for it, bounded: +0.5 m/s^2 at most, 3 s at most, under 3 m/s, only while nothing else holds the car. One go at a time,
+  # each a new id; clearing it (cause none) ends the lift that frame
+  struct GoCertified {
+    enum Cause {
+      none @0;
+      turnRelease @1;      # a turn TurnPilot's hold let go of at a standstill (its walker cleared, its light went green)
+      unprotectedLeft @2;  # the autonomous unprotected left's gap certified (unprotected_left.py)
+      stopSign @3;         # a stop sign's cross traffic certified clear from the line, also a yield that became a stop
+      rollUp @4;           # rolling up to the stop line after a queue
+      creep @5;            # one creep step
+      clearBox @6;         # stalled past the in-lane point after the commit
+    }
+    cause @0 :Cause;
+    id @1 :UInt32;     # a new one for every go (never repeated in a drive): plannerd gives each go its own window
+    t @2 :Float32;     # s since the go
+  }
+  goCertified @32 :GoCertified;
 }
 
 struct TurnpilotDetections @0xaedffd8f31e7b55d {

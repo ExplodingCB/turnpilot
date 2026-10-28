@@ -1261,6 +1261,10 @@ struct LongitudinalPlan @0xe00b5b3eba12876c {
   allowThrottle @38: Bool;
   allowBrake @39: Bool;
   accelBoost @40 :Float32;
+  # TurnPilot's bounded go (selfdrive/turnpilot/go_override.py): the e2e candidate lifted this frame for turnpilotPlan's
+  # certified go, and why the last go's lift ended ('' while it lifts, or before any go)
+  turnpilotGoLift @41 :Bool;
+  turnpilotGoEnd @42 :Text;
 
 
   solverExecutionTime @35 :Float32;
