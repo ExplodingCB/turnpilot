@@ -161,6 +161,16 @@ def r_req(v_limit: float, t: float, distance: float) -> float:
   return v_limit * SPEED_MARGIN * t + max(distance, 0.) + CONFLICT_PAST_M
 
 
+LINE_D = 9.                # m from the hold line to the maneuver point (map_controls: HOLD_LINE_M + MAP_MARGIN_M)
+
+
+def reach_at_line(v_limit: float | None, lanes: int | None) -> float:
+  """R_req for a go from the hold line, the opposing road's mapped limit (DEFAULT_OPPOSING_SPEED when unknown): what route time
+  checks against the detector's proven range (turnpilotd: turn_skip's unprotectedRange)."""
+  v = v_limit if v_limit is not None and v_limit > 0. else DEFAULT_OPPOSING_SPEED
+  return r_req(v, t_req(LINE_D, lanes), LINE_D)
+
+
 def turn_bearing(bearing_deg: float, heading_deg: float, side: int) -> float:
   """A car-frame bearing in the road's frame, positive toward the turn."""
   return bearing_deg * side + heading_deg

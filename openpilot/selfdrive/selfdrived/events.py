@@ -302,7 +302,9 @@ def turnpilot_too_fast_to_turn_alert(CP: car.CarParams, CS: car.CarState, sm: me
   plan = shown_plan(sm)
   lane = plan is not None and str(plan.laneChangeWait) == 'unreachable'
   missed = plan is not None and plan.turnMissed
-  return Alert("Turn Missed" if missed else "Can't Reach Turn Lane" if lane else "Too Fast to Turn", "Rerouting",
+  blind = plan is not None and str(plan.unprotectedLeft.state) == 'skipped'  # oncoming too fast for the detector's range
+  return Alert("Turn Missed" if missed else "Can't Reach Turn Lane" if lane else "Can't See Far Enough to Turn" if blind else
+               "Too Fast to Turn", "Rerouting",
                AlertStatus.userPrompt, AlertSize.mid,
                Priority.LOW, VisualAlert.none, AudibleAlert.tpTooFastTurn, 3.)
 

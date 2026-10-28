@@ -198,8 +198,7 @@ def test_off_and_announce_hand_back_at_the_line():
 
 
 def test_a_left_past_the_proven_range_is_never_taken_from_its_line():
-  # 45 mph mapped: R_req past the road camera's range. Route time skips it (turn_skip, a later commit); should it reach its
-  # line, it is undecided, never a go
+  # 45 mph mapped: R_req past the road camera's range: skipped at route time (below), never a go from its line
   sim = Sim([(JUNCTION, "turn", "left", (0., 270., 2, 'present', 20.1, 1)), (1500., "turn", "right", junction_of("right"))])
   sim.tp.auto_left, sim.go_taps, sim.raw = 'auto', False, road_runs()
   assert r_req(20.1, t_req(HOLD_LINE_M + 1., 1), HOLD_LINE_M + 1.) > ROAD_RANGE_M
@@ -223,3 +222,30 @@ def test_main_reads_the_auto_left_and_its_range():
   assert left_range_for(Params({'TurnPilotLeftRangeM': 'x'})) == ROAD_RANGE_M
   assert left_range_for(Params({'TurnPilotLeftRangeM': 1e4})) <= 400.
   assert TurnPilot().auto_left == 'auto'
+
+
+def test_a_left_the_detector_cant_see_far_enough_for_is_skipped_at_route_time():
+  # the mapped opposing speed sets R_req; past the detector's proven range the left is never attempted: skipped as soon as
+  # it is the route's maneuver (chimed as a skip, navd reroutes), before any lane change toward it, and driven straight on
+  for junction in ((0., 270., 2, 'present', 20.1, 1), (0., 270., 2, 'present')):  # 45 mph, and unknown (taken as 45)
+    sim = Sim([(600., "turn", "left", junction), (2000., "turn", "right", junction_of("right"))])
+    sim.tp.auto_left, sim.go_taps, sim.raw = 'auto', False, road_runs()
+    plans, reasons = [], set()
+    while sim.s < 650.:
+      plans += drive(sim, DT_MDL, yaw=False)
+      reasons.add(sim.tp.skip.reason)
+      assert sim.t < 120.
+    first = plans[2]
+    assert first.tooFastToTurn and str(first.unprotectedLeft.state) == 'skipped' and first.maneuverDistance > 500.
+    assert first.unprotectedLeft.rReq > first.unprotectedLeft.rangeM
+    assert not any(p.shouldStop or p.desire != Desire.none or str(p.laneChange) != 'none' for p in plans)
+    assert 'unprotectedRange' in reasons
+  # within range (TurnPilotLeftRangeM measured further): taken
+  sim = Sim([(600., "turn", "left", (0., 270., 2, 'present', 20.1, 1)), (2000., "turn", "right", junction_of("right"))])
+  sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps, sim.raw = 'auto', 300., False, road_runs()
+  plans = drive(sim, 5.)
+  assert not any(p.tooFastToTurn for p in plans)
+  # off: the line's handback, as G1's, never skipped for range
+  sim = Sim([(600., "turn", "left", (0., 270., 2, 'present', 20.1, 1)), (2000., "turn", "right", junction_of("right"))])
+  sim.tp.auto_left, sim.go_taps = 'off', False
+  assert not any(p.tooFastToTurn for p in drive(sim, 5.))

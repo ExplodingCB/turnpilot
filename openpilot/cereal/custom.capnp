@@ -237,6 +237,7 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
       committed @5;
       undecided @6;  # a fault: handed back (leftUndecidedTakeControl)
       announce @7;   # TurnPilotAutoLeft announce: held and handed back, saying whether it would go
+      skipped @8;    # its R_req past the detector's proven range: skipped at route time (tooFastToTurn), navd reroutes
     }
     state @0 :State;
     tReq @1 :Float32;          # s the oncoming lanes must stay clear

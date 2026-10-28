@@ -33,7 +33,9 @@ the car is NAVD_ADVANCE_M past that step, at whatever distance it then has: one 
 certain to be skipped tooLate then, which for a turn 10 m or less past the step is at or past its junction. So the skip
 is announced (SkipState.ahead_skipped) from the moment the turn ahead is that close, before the junction.
 The autonomous unprotected left (unprotected_left.py) sends no pulse before its hold line, its go being its first
-(pulse_at_go): it is never skipped tooLate.
+(pulse_at_go): it is never skipped tooLate. One whose required clear range (the opposing road's mapped speed) is past the
+detector's proven range is never attempted blind: skipped as soon as it is the maneuver (out_of_range, unprotectedRange),
+before the lane change into its lane, and driven straight on while navd reroutes.
 An unprotected turn (map_controls.py) is taken from a stop at its hold line, so it is also too fast when that stop can't
 be made at the map stops' -2.0 m/s^2 when it is first seen (stop_infeasible: turnpilotd, a stop not yet engaged): skipped
 the same way, after the same confirming frames, never braked for at the floor.
@@ -80,6 +82,7 @@ class TurnSkip:
   def __init__(self):
     self.maneuver_id = -1
     self.skipped = False
+    self.reason = ''  # why it was skipped
     self._infeasible = 0
     self._ahead_logged = -1  # the maneuver_id of the NONE step whose turn ahead was announced skipped
 
@@ -87,24 +90,30 @@ class TurnSkip:
     """Skip this maneuver for good now, for reason: as when it is too fast to make (turnpilotd: a turn whose desire was
     dropped while TurnPilot had handed back, with too little road left for a fresh pulse to be taken; too late for its
     first pulse)."""
-    self.maneuver_id, self.skipped, self._infeasible = maneuver_id, True, 0
+    self.maneuver_id, self.skipped, self._infeasible, self.reason = maneuver_id, True, 0, reason
     cloudlog.event("turnpilot_turn_skipped", error=True, reason=reason, type=maneuver.type, modifier=maneuver.modifier,
                    angle_deg=round(maneuver.angle_deg, 1), geometry=maneuver.geometry, distance=round(distance, 1),
                    v_ego=round(v_ego, 2))
 
   def update(self, maneuver, distance: float, maneuver_id: int, v_ego: float, desire_out: bool,
              right_hand_traffic: bool = True, lat_active: bool = True, ahead=None, ahead_distance: float = float('inf'),
-             stop_d: float | None = None, stop_infeasible: bool = False, pulse_at_go: bool = False) -> SkipState:
+             stop_d: float | None = None, stop_infeasible: bool = False, pulse_at_go: bool = False,
+             out_of_range: bool = False) -> SkipState:
     """maneuver: RouteFollower.upcoming; desire_out: this maneuver's desire has gone out (DesireTiming.started);
     lat_active: carControl.latActive; ahead, ahead_distance: RouteFollower.ahead past a NONE step, and the distance to it;
     stop_d: m to the map stop sign or signal the car will stop at next (MapControlPolicy.stop_ahead), or None. One within
     STOP_BEFORE_TURN_M before the junction means the turn is taken from a stop: never too fast (the stop itself brakes at
     no more than -2.0, and says so when it can't make it). stop_infeasible: the turn is unprotected and its hold-line stop,
     not yet engaged, can't be made at -2.0 (module docstring). pulse_at_go: the turn's first pulse is its hold line's go (the
-    autonomous unprotected left: no pulse on its approach), so it is never too late for one."""
+    autonomous unprotected left: no pulse on its approach), so it is never too late for one. out_of_range: an autonomous
+    unprotected left whose required clear range is past the detector's proven range: skipped now (unprotectedRange), unless
+    its desire went out."""
     if maneuver_id != self.maneuver_id:
-      self.maneuver_id, self.skipped, self._infeasible = maneuver_id, False, 0
+      self.maneuver_id, self.skipped, self._infeasible, self.reason = maneuver_id, False, 0, ''
     if self.skipped:
+      return SkipState(True, False)
+    if out_of_range and maneuver is not None and maneuver.kind == TURN and not desire_out:
+      self.skip(maneuver, distance, maneuver_id, v_ego, 'unprotectedRange')
       return SkipState(True, False)
     if maneuver is None or maneuver.kind != TURN:
       self._infeasible = 0
@@ -130,7 +139,7 @@ class TurnSkip:
       return SkipState(False, False)
     self._infeasible += 1
     if self._infeasible >= SKIP_CONFIRM_FRAMES:
-      self.skipped = True
+      self.skipped, self.reason = True, 'unprotectedStop' if stop_infeasible else 'tooFast'
       cloudlog.event("turnpilot_turn_skipped", error=True, reason='unprotectedStop' if stop_infeasible else 'tooFast',
                      type=maneuver.type, modifier=maneuver.modifier,
                      angle_deg=round(maneuver.angle_deg, 1), geometry=maneuver.geometry, distance=round(distance, 1),

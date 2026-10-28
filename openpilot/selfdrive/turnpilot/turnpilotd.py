@@ -128,7 +128,8 @@ from openpilot.selfdrive.turnpilot.scene.tracker import STALE_S, SceneTracker, d
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, NO_ACCEL_CAP, ScenePolicy
 from openpilot.selfdrive.turnpilot.turn_skip import TurnSkip, can_make_turn
 from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
-from openpilot.selfdrive.turnpilot.unprotected_left import AUTO, OFF, ROAD_RANGE_M, LeftInput, UnprotectedLeft, left_mode_for
+from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, OFF, ROAD_RANGE_M, LeftInput, UnprotectedLeft,
+                                                           left_mode_for, reach_at_line)
 
 Desire = log.Desire
 State = custom.TurnpilotPlan.State
@@ -480,9 +481,13 @@ class TurnPilot:
 
     # too fast to make the turn: skipped, so nothing below acts on it (no desire, no cap, no turn holds or lane changes)
     desire_out = self.desires.maneuver_id == rf.maneuver_id and self.desires.started
+    # an autonomous left the detector can't see far enough for (its R_req from the opposing road's mapped speed past
+    # TurnPilotLeftRangeM): never attempted, skipped as soon as it is the maneuver and rerouted (turn_skip.py)
+    out_of_range = acting and self.auto_left == AUTO and unprotected_turn(upcoming, right_hand_traffic) and \
+      reach_at_line(upcoming.opposing_speed, upcoming.opposing_lanes or None) > self.left_range_m
     skip = self.skip.update(upcoming, rf.distance, rf.maneuver_id, v_ego, desire_out, right_hand_traffic, lat_active,
                             rf.ahead, rf.ahead_distance, stop_d=self.map_controls.stop_ahead(), stop_infeasible=stop_infeasible,
-                            pulse_at_go=pulse_at_go)
+                            pulse_at_go=pulse_at_go, out_of_range=out_of_range)
     maneuver = None if skip.skipped else upcoming
     # navd reroutes on it and selfdrived alerts: only while TurnPilot is driving the route (handback outranks it). A turn
     # just past a bend that will be skipped once it is the maneuver is announced now, before its junction (turn_skip.py)
@@ -573,6 +578,11 @@ class TurnPilot:
       (NO_JUNCTION_DATA_REASON if no_junction_data else "")
     fill_map_control(plan, mapd)
     self.fill_left(plan, decision)
+    if skip.skipped and self.skip.reason == 'unprotectedRange' and upcoming is not None:
+      ul = plan.unprotectedLeft
+      ul.state, ul.rangeM = 'skipped', float(self.left_range_m)
+      ul.vLimit = float(upcoming.opposing_speed or DEFAULT_OPPOSING_SPEED)
+      ul.rReq = float(reach_at_line(upcoming.opposing_speed, upcoming.opposing_lanes or None))
     if decision.hard_brake:  # a confirmed track's hard stop outranks the map's alerts (scene_policy.py)
       plan.controlAlert = 'hardBrake'
     stalled = self.stalled_in_turn(sm, cs, v_ego, acting, decision, mapd)

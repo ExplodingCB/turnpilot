@@ -241,3 +241,11 @@ def test_the_detector_view_and_the_lefts_status_are_in_the_plan():
   ul = msg.turnpilotPlan.unprotectedLeft
   ul.state, ul.rReq, ul.tReq, ul.clearS, ul.why = 'waitGap', 134., 8.4, 1.2, ''
   assert str(msg.as_reader().turnpilotPlan.unprotectedLeft.state) == 'waitGap'
+
+
+def test_a_left_skipped_for_the_detectors_range_says_so():
+  msg = messaging.new_message('turnpilotPlan')
+  msg.turnpilotPlan.tooFastToTurn = True
+  msg.turnpilotPlan.unprotectedLeft.state = 'skipped'
+  a, = alerts(EventName.turnpilotTooFastToTurn, FakeSM(msg.as_reader().turnpilotPlan))
+  assert a.alert_text_1 == "Can't See Far Enough to Turn" and a.alert_text_2 == 'Rerouting' and a.audible_alert == AudibleAlert.tpTooFastTurn
