@@ -60,7 +60,7 @@ After a reroute or a jump navd's distance to the junction can stay off by that m
 turn read as passed, before the car gets there. So from then on that junction is held, while the turn is committed and
 after it while navd is still on its step (by its bearings), and never taken up again as a new maneuver.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from openpilot.common.swaglog import cloudlog
 
@@ -116,6 +116,8 @@ class Maneuver:
   bearing_side: int = 0   # LEFT or RIGHT as the bearings turn, 0 without them or under SIDE_MIN_DEG
   bearings: tuple = ()    # (bearing_before, bearing_after) with geometry
   opposing: str = 'unknown'  # NavInstruction.Opposing: a road straight ahead whose traffic a far-side turn crosses
+  opposing_speed: float = 0.  # m/s, that road's mapped limit (maneuverOpposingSpeed), 0 unknown
+  opposing_lanes: int = 0     # its lanes toward the junction, 0 unknown
 
   @property
   def ramp(self) -> bool:
@@ -154,15 +156,16 @@ def turn_angle(bearing_before: float, bearing_after: float) -> float:
 
 
 def maneuver_from_instruction(instruction) -> Maneuver:
-  return make_maneuver(instruction.maneuverType, instruction.maneuverModifier, lanes_from_instruction(instruction),
-                       instruction.maneuverGeometryValid, instruction.maneuverBearingBefore, instruction.maneuverBearingAfter,
-                       instruction.maneuverBranches, str(instruction.maneuverOpposing))
+  return replace(make_maneuver(instruction.maneuverType, instruction.maneuverModifier, lanes_from_instruction(instruction),
+                               instruction.maneuverGeometryValid, instruction.maneuverBearingBefore, instruction.maneuverBearingAfter,
+                               instruction.maneuverBranches, str(instruction.maneuverOpposing)),
+                 opposing_speed=float(instruction.maneuverOpposingSpeed), opposing_lanes=int(instruction.maneuverOpposingLanes))
 
 
 def maneuver_from_ahead(ahead) -> Maneuver:
   """A Maneuver from a NavInstruction.Maneuver (allManeuvers), which has no lanes."""
-  return make_maneuver(ahead.type, ahead.modifier, (), ahead.geometryValid, ahead.bearingBefore, ahead.bearingAfter, ahead.branches,
-                       str(ahead.opposing))
+  return replace(make_maneuver(ahead.type, ahead.modifier, (), ahead.geometryValid, ahead.bearingBefore, ahead.bearingAfter, ahead.branches,
+                               str(ahead.opposing)), opposing_speed=float(ahead.opposingSpeed), opposing_lanes=int(ahead.opposingLanes))
 
 
 def make_maneuver(mtype: str, modifier: str, lanes: tuple, geometry_valid: bool, bearing_before: float, bearing_after: float,

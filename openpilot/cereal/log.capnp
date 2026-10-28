@@ -2487,6 +2487,11 @@ struct NavInstruction {
   # lookup of a spell off the route, else the lookup's status: zero controls with a status other than ok is never "clear".
   offRouteControls @23 :List(MapControl);
   offRouteControlsStatus @24 :ControlsStatus;
+  # TurnPilot: the opposing road's mapped speed limit (m/s, 0 when not mapped) and its lanes toward the junction (0 when not
+  # known), for an unprotected left's required clear range (turnpilot/unprotected_left.py: R_req); from a verbose locate on
+  # the road straight across the junction (routing/controls.py: opposing_legs)
+  maneuverOpposingSpeed @25 :Float32;
+  maneuverOpposingLanes @26 :UInt8;
 
   enum Opposing {
     unknown @0;  # no intersection data for the junction (or a navd from before the field)
@@ -2547,6 +2552,8 @@ struct NavInstruction {
     bearingAfter @5 :Float32;
     branches @6 :UInt8;
     opposing @7 :Opposing;
+    opposingSpeed @8 :Float32;  # as maneuverOpposingSpeed and maneuverOpposingLanes
+    opposingLanes @9 :UInt8;
   }
 }
 
