@@ -25,7 +25,7 @@ from openpilot.selfdrive.turnpilot.lane_planner import LANE_WIDTH, lane_change_w
 from openpilot.selfdrive.turnpilot.map_controls import MAP_STOP_DECEL, PROTECT_BEFORE_M, engage_distance
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M
 from openpilot.tools.sim.bridge.beamng.roadgraph import RoadGraph, wrap
-from openpilot.tools.sim.bridge.beamng.scenarios.timing import WALK_SPEED, arc_lengths, oncoming_release_delay, point_at
+from openpilot.tools.sim.bridge.beamng.scenarios.timing import WALK_SPEED, arc_lengths, oncoming_release_delay, point_at, travel_time
 
 DATA_JSON = os.path.join(os.path.dirname(__file__), "lane_change_junctions.json")
 SIGNALS_JSON = os.path.join(os.path.dirname(os.path.dirname(__file__)), "wcusa_map_node_signals.json")
@@ -37,6 +37,7 @@ CROSSWALK_PAST_EDGE_M = 2.5  # the crosswalk across the exit road, this far past
 WALK_AWAY_M = 10.        # after crossing, the walker goes this far along the far sidewalk, out of the crosswalk zone
 PACER_END_BEFORE_M = 50.  # the pacer's lane ends this far before the junction
 CLEAR_OF_JUNCTION_M = 25.  # a spawn this close to another junction moves up the approach
+QUEUE_GAP_M = 8.         # a gap stream's cars stand this far apart, front to front (a queue)
 ROAD_MARGIN_M = 150.     # the road model covers the box around spawn, junction and destination, this much bigger
 ROLL_FRACTION = 0.8      # the driver rolls up to this much of the set speed before engaging, as gate1 does (run.py)
 ROLL_ACCEL = 1.0         # m/s^2 of that roll (bridge.ROLLING_START_ACCEL)
@@ -69,6 +70,11 @@ class Entry:
   oncoming_speed: float = 11.     # m/s
   oncoming_accel: float = 2.5     # m/s^2
   arrive_after_s: float = 3.5     # the first oncoming car reaches the junction this long after the car's go there
+  # a gap stream (the autonomous unprotected left's gate, G6): the oncoming cars queue across the junction QUEUE_GAP_M apart
+  # from oncoming_start_m, and each is released on its own timer from the car's stand at its line (never on its go), so
+  # the first reaches the junction stream_first_s after the stand and each one after it stream_headway_s later; 0: none
+  stream_headway_s: float = 0.
+  stream_first_s: float = 6.
   pace_block_s: float = 6.        # the pacer keeps the target lane occupied this long into the lane change window
   end_on_stop_s: float = 0.       # end the run once the car has stood this long after moving
   spawn: tuple = ()               # route: (x, y, z), heading_deg, destination (x, y, z)
@@ -87,6 +93,13 @@ SCENARIOS = {
   # junction from the south-east, up a gentle grade, with the arm across rising about 3 m over its first 85 m.
   'unprotected_left_visible': Entry('turn', junction=(-650.1, 481.7), turn='left', from_heading_deg=137., actor='oncoming',
                                     arrive_after_s=3.5, timeout_s=150.),
+  # the autonomous left's gate (CRITIQUE REQUIRED 5: a 9 m hold, no approach pulse, a stand of 10 s or more, a cold go
+  # pulse): the visible approach, a queue of cars at the mapped 25 mph through the junction at 4, 6, 8 and 10 s headways,
+  # then an empty road. Its R_req (133 m) is past the 106 m straight arm, so every gap here is under what it may take: it
+  # stands through the stream and goes after the last car (a missed gap is counted, never failed: score.py)
+  **{f'unprotected_left_gap{h}': Entry('turn', junction=(-650.1, 481.7), turn='left', from_heading_deg=137., actor='oncoming',
+                                       oncoming=4 if h < 10 else 3, oncoming_start_m=40., oncoming_speed=11.18,
+                                       stream_headway_s=float(h), timeout_s=150. + 10. * h) for h in (4, 6, 8, 10)},
   # gate1's approach: eastbound on the 140 m straight from the bridge's default spawn
   'ped_in_path': Entry('straight', junction=(-768.9, 661.4), turn='right', from_heading_deg=0., actor='standing', end_on_stop_s=4.,
                        timeout_s=90.),
@@ -446,6 +459,21 @@ def _turn_plan(name: str, e: Entry, graph: RoadGraph) -> Plan:
   elif e.actor == 'standing':
     p, _ = lane_pose(jn.approach, e.ped_before_m, lanes, radius, ego_lane(e.turn))
     actors.append(Actor(f"{PREFIX}ped", 'walker', 'setup', [list(p)], 0., heading=wrap(heading + math.pi)))
+  elif e.actor == 'oncoming' and e.stream_headway_s:
+    # a queue across the junction, each released on its own timer from the car's stand: at its headway (Entry)
+    paths = oncoming_paths(graph, jn, e.oncoming, e.oncoming_start_m, QUEUE_GAP_M)
+    if len(paths) < e.oncoming:
+      raise ValueError(f"{name}: only {len(paths)} of {e.oncoming} queued cars fit on the arm across {jn.node}")
+    for k, path in enumerate(paths):
+      s_k = e.oncoming_start_m + k * QUEUE_GAP_M
+      delay = e.stream_first_s + k * e.stream_headway_s - travel_time(s_k, e.oncoming_speed, e.oncoming_accel)
+      if delay < 0.:
+        raise ValueError(f"{name}: car {k} {s_k:.0f} m out can't reach the junction {e.stream_first_s + k * e.stream_headway_s:.1f} s " +
+                         "after the stand: start the stream later")
+      actors.append(Actor(f"{PREFIX}car{k}", 'car', 'oncoming', path.tolist(), e.oncoming_speed, e.oncoming_accel, heading_of(path[0], path[1]),
+                          params={'start_m': s_k, 'release_after_stop_s': round(delay, 2), 'timed': True,
+                                  'headway_s': e.stream_headway_s}))
+    notes['stream'] = {'headway_s': e.stream_headway_s, 'first_s': e.stream_first_s, 'cars': len(paths)}
   elif e.actor == 'oncoming':
     # all released together, a fixed time after the car stands at its hold at the junction (timing.oncoming_release_delay)
     delay = oncoming_release_delay(e.oncoming_start_m, e.oncoming_speed, e.oncoming_accel, e.arrive_after_s)

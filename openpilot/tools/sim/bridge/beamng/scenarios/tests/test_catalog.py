@@ -109,7 +109,7 @@ def test_unprotected_lefts_give_the_car_3_to_4_s_after_its_go_before_the_oncomin
   # a fixed time after the stand, reaches the junction 3-4 s after that go, as the car pulls away toward its lanes
   from openpilot.tools.sim.bridge.beamng.driver import STOPPED_TAP_S
   from openpilot.tools.sim.bridge.beamng.scenarios.timing import travel_time
-  lefts = {n: e for n, e in catalog.SCENARIOS.items() if e.actor == 'oncoming'}
+  lefts = {n: e for n, e in catalog.SCENARIOS.items() if e.actor == 'oncoming' and not e.stream_headway_s}
   assert set(lefts) >= {'unprotected_left', 'unprotected_left_visible'}
   for n, e in lefts.items():
     car = catalog.build(n, graph).actors[0]
@@ -207,3 +207,23 @@ def test_the_road_models_junctions_carry_their_farthest_mapped_stop_line(graph):
   j = min(plan.road['junctions'], key=lambda j: math.hypot(j[0] - plan.junction[0], j[1] - plan.junction[1]))
   assert len(j) == 4 and 12.0 < j[3] < 16.0  # trafficLight 46 at 12.5 m, 49 at 13.0 m, and the junction's others
   assert all(len(k) == 4 and k[3] >= 0. for k in plan.road['junctions'])
+
+
+def test_gap_streams_queue_across_the_junction_and_come_at_their_headway(graph):
+  # G6 for G4's gate (CRITIQUE REQUIRED 5): a queue standing in the oncoming lane across the junction, the car arriving to
+  # it, so it stands at its line; released car by car on timers from the car's stand (never on its go), each reaches the
+  # junction its headway after the one before, the first STREAM_FIRST_S after the stand; after the last, an empty road
+  from openpilot.tools.sim.bridge.beamng.scenarios.timing import travel_time
+  streams = {n: e for n, e in catalog.SCENARIOS.items() if e.stream_headway_s}
+  assert {e.stream_headway_s for e in streams.values()} == {4., 6., 8., 10.}
+  for n, e in streams.items():
+    plan = catalog.build(n, graph)
+    cars = [a for a in plan.actors if a.trigger == 'oncoming']
+    assert len(cars) == e.oncoming >= 3, n
+    starts = [c.params['start_m'] for c in cars]
+    assert starts == sorted(starts) and min(b - a for a, b in zip(starts, starts[1:], strict=False)) >= catalog.QUEUE_GAP_M - 1e-6
+    arrive = [c.params['release_after_stop_s'] + travel_time(c.params['start_m'], c.speed, c.accel) for c in cars]
+    assert arrive[0] == pytest.approx(e.stream_first_s, abs=0.05), n
+    assert all(b - a == pytest.approx(e.stream_headway_s, abs=0.05) for a, b in zip(arrive, arrive[1:], strict=False)), n
+    assert all(c.params['timed'] and c.params['release_after_stop_s'] >= 0. for c in cars)
+    assert all(c.speed == pytest.approx(11.18, abs=0.01) for c in cars)  # the mapped 25 mph

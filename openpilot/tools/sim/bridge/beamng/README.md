@@ -268,6 +268,30 @@ never), and standing engaged with nothing held. Never while TurnPilot hands back
 plan is stale: a prompt left up then is no go. `light_oracle.py` and `probe_signals.py` haven't been run against the
 game yet: check the published states against the HUD first.
 
+## Unprotected left gate
+
+The autonomous unprotected left (`selfdrive/turnpilot/unprotected_left.py`, DESIGN phase 4 G4) is gated on its own cell
+(CRITIQUE REQUIRED 5): a 9 m hold, no approach pulse, a stand of 10 s or more, a cold go pulse, 12 runs or more, no
+misses and no stalls. The four gap-stream scenarios are that cell: the visible approach to (-650.1, 481.7), mapped 25 mph
+across (R_req 133 m, inside the provisional `TurnPilotLeftRangeM` of 150 m), a queue of oncoming cars released through the
+junction at 4, 6, 8 and 10 s headways from the car's stand at its line, then an empty road. No gas tap anywhere; the score
+(`scenarios/score.py`) fails a post-encroachment time under 2 s, a false go, a stall or an unmoving go, a missed turn, and
+undecided after a gap of tReq was offered, and counts missed gaps.
+
+```sh
+for h in 4 6 8 10; do
+  python -m openpilot.tools.sim.bridge.beamng.scenarios.run unprotected_left_gap$h --runs 3 -- <bridge args>
+done
+```
+
+| param | values | default |
+| --- | --- | --- |
+| `TurnPilotAutoLeft` | `off` (hand back at the line, G1), `announce` (hold, say whether it would go, hand back), `auto` | `auto` |
+| `TurnPilotLeftRangeM` | m, 0 to 400: the detector's proven range for oncoming traffic; a left whose R_req is past it is skipped at route time | `150.0` (provisional, unmeasured) |
+
+Without G5's bounded go the model may hold the car at its go (G0: 14 of 24 tapless goes stood); then the go is withdrawn
+after 1.0 s and handed back (`cantStartTakeControl`), which the score fails as a stall.
+
 ## Post-go profile sweep
 
 A turn TurnPilot lets go of at a standstill is driven under a post-go profile from the go (`turn_speed.py`, DESIGN phase 4

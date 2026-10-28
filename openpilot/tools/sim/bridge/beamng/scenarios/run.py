@@ -272,7 +272,8 @@ class Runner:
       if a.trigger == 'walk':
         go, job = w.went, (d.walk, a.name)
       elif a.trigger == 'oncoming':
-        go = w.went or (w.held_t is not None and r['t'] - w.held_t >= a.params['release_after_stop_s'])
+        # a gap stream's car only on its own timer (catalog: timed); the others at the car's go too
+        go = (w.went and not a.params.get('timed')) or (w.held_t is not None and r['t'] - w.held_t >= a.params['release_after_stop_s'])
         job = (d.release, a.name)
       elif a.trigger == 'pace':
         go, job = True, (d.release_pacer, a.name, (r['x'], r['y']), r['v'])
