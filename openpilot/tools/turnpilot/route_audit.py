@@ -15,6 +15,12 @@ direct is shown dropped), the sidecar's entries (kind, evidence, stop=all|minor|
 (sim: the sim's controls.json; default: the node less 10 m), where the OSM stop node is (the sign: data only, it never
 moves the stop point in SG1a), the OSM junction node, and the control navd sends (its kind and stop point). An
 internal-intersection edge's row says which junction's control it joined.
+
+Then every OSM stop and give_way node within RAW_M of the route that no row covers: neither the sidecar placed it on the
+edge it lies on nor Valhalla flagged that edge with its kind. Each says who the sidecar has it for: ours (keyed to our
+edge but not placed on it), the other direction of our way (often right, but a reversed direction tag looks the same),
+another way, or no approach (unplaced: on no drivable way, or a stop=minor with no lower approach). The car stops for
+none of them; the auditor checks each.
 """
 import argparse
 import json
@@ -23,7 +29,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from openpilot.selfdrive.turnpilot.routing import osm_sidecar
-from openpilot.selfdrive.turnpilot.routing.controls import MARKER, route_controls, route_shape
+from openpilot.selfdrive.turnpilot.routing.controls import MARKER, cumulative, nearest, route_controls, route_shape
+
+RAW_M = 5.           # m from the route an OSM stop or give_way node is listed within
+M_PER_DEG = 111195.
 
 
 @dataclass
@@ -41,12 +50,25 @@ class Row:
 
 
 @dataclass
+class Sign:
+  route_m: float       # m along the route (its shape) of the node's nearest point on it
+  off_m: float         # m off the route
+  node: int            # the OSM node id (0 for a shard without it)
+  kind: str            # 'stop' or 'yield'
+  tags: str            # its direction and stop tags
+  holder: str          # who the sidecar has it for: 'ours', 'other direction', 'way <keys>', 'no approach (<why>)'
+  edge: str            # the route edge it lies on, '-' for none
+  to_node_m: float     # m before that edge's end node
+
+
+@dataclass
 class Report:
   status: str          # navInstruction.controlsStatus
   sidecar: str         # the sidecar's status and why
   rows: list[Row] = field(default_factory=list)
   controls: list = field(default_factory=list)
   route_m: float = 0.
+  signs: list[Sign] = field(default_factory=list)  # OSM stop and give_way nodes near the route that no row covers
 
 
 def audit(call, steps, tiles_dir, sidecar_dir) -> Report:
@@ -58,6 +80,8 @@ def audit(call, steps, tiles_dir, sidecar_dir) -> Report:
   by_edge = {c.edge: c for c in controls}
   rows = []
   for e in edges:
+    if not (e['osm'] or e['phantom'] or 'stop' in e['valhalla'] or 'yield' in e['valhalla']):
+      continue
     valhalla = ' '.join(e['valhalla'] + [f"{k} (phantom: dropped)" for k in e['phantom']]) or '-'
     sidecar = ', '.join(f"{h['kind']} ({h['evidence']}, stop={h['stop_tag']})" for h in e['osm']) or '-' if checked else 'not checked'
     c = by_edge.get(e['anchor'])
@@ -67,7 +91,57 @@ def audit(call, steps, tiles_dir, sidecar_dir) -> Report:
                     f"{c.kind} at {c.route_m:.0f} m" if c is not None else '-', e['anchor'] if e['internal'] else -1, sign_m))
   detail = 'none expected' if side is None else side.status + (f" ({side.detail})" if side.detail else '')
   total = sum(float(s.get('distance', 0.)) for s in steps)
-  return Report(status, detail, rows, controls, total)
+  return Report(status, detail, rows, controls, total, uncovered(side, route_shape(steps), edges) if checked else [])
+
+
+def signs_of(side) -> list[tuple[int, str, tuple[float, float], str, set[str], str]]:
+  """Every OSM stop and give_way node the sidecar holds, once: (node, kind, (lat, lon), tags, the keys it is held
+  under, why it is unplaced or '')."""
+  out = {}
+  for k, entries in side.controls.items():
+    for x in entries:
+      pos = tuple(x['line']) if x.get('line') else side.junction_pos(x.get('junction_node', 0))
+      if pos is None:
+        continue
+      ident = x.get('node') or (round(pos[0], 7), round(pos[1], 7), x.get('kind'))
+      tags = f"{x.get('evidence', '')}, stop={x.get('stop_tag', 'none')}"
+      out.setdefault(ident, [int(x.get('node') or 0), x.get('kind', ''), (float(pos[0]), float(pos[1])), tags, set(), ''])[4].add(k)
+  for u in side.unplaced:
+    tags = f"direction={u.get('direction') or '-'}, stop={u.get('stop_tag', 'none')}"
+    out.setdefault(u['node'], [int(u['node']), u.get('kind', ''), (float(u['lat']), float(u['lon'])), tags, set(), u.get('why', '')])
+  return [tuple(v) for v in out.values()]
+
+
+def uncovered(side, pts, edges) -> list[Sign]:
+  """The OSM stop and give_way nodes within RAW_M of the route shape pts that no row covers (module docstring)."""
+  if len(pts) < 2:
+    return []
+  cum = cumulative(pts)
+  pad = RAW_M / M_PER_DEG * 2.
+  lat_lo, lat_hi = min(p[0] for p in pts) - pad, max(p[0] for p in pts) + pad
+  lon_lo, lon_hi = min(p[1] for p in pts) - pad * 2., max(p[1] for p in pts) + pad * 2.
+  out = []
+  for node, kind, pos, tags, keys, why in signs_of(side):
+    if not (lat_lo <= pos[0] <= lat_hi and lon_lo <= pos[1] <= lon_hi):
+      continue
+    hit = nearest(pts, cum, pos, 0., cum[-1])
+    if hit is None or hit[1] > RAW_M:
+      continue
+    m, off = hit
+    e = next((e for e in edges if e['begin_m'] < m <= e['end_m'] + 1.), None)
+    if e is not None and (any(node and h.get('node') == node for h in e['osm']) or kind in e['valhalla'] or kind in e['phantom']):
+      continue  # its edge's row has it
+    if why:
+      holder = f"no approach ({why})"
+    elif e is not None and e['key'] in keys:
+      holder = 'ours'
+    elif e is not None and f"{e['key'][:-1]}{'b' if e['key'].endswith('f') else 'f'}" in keys:
+      holder = 'other direction'
+    else:
+      holder = 'way ' + ' '.join(sorted(keys))
+    out.append(Sign(round(m, 1), round(off, 1), node, kind, tags, holder, e['key'] if e is not None else '-',
+                    round(e['end_m'] - m, 1) if e is not None else 0.))
+  return sorted(out, key=lambda s: s.route_m)
 
 
 def lines(report: Report) -> list[str]:
@@ -81,11 +155,18 @@ def lines(report: Report) -> list[str]:
     out.append("(no stop or yield approach on the route)")
   out.append(f"{len(report.rows)} stop/yield approaches; navd sends {len(report.controls)} controls: " +
              ', '.join(f"{c.kind} {c.route_m:.0f} m" for c in report.controls))
+  out.append(f"OSM stop/give_way nodes within {RAW_M:.0f} m of the route that no row covers (the car stops for none of them): " +
+             f"{len(report.signs)}")
+  if report.signs:
+    out.append(f"{'route m':>8}  {'node':>12}  {'kind':<6} {'tags':<32} {'held for':<40} {'edge':<16} {'to its node':>11}")
+  for g in report.signs:
+    out.append(f"{g.route_m:>8.1f}  {g.node or '-':>12}  {g.kind:<6} {g.tags:<32} {g.holder:<40} {g.edge:<16} {g.to_node_m:>9.1f} m")
   return out
 
 
 def as_json(report: Report) -> dict:
   return {'status': report.status, 'sidecar': report.sidecar, 'route_m': report.route_m, 'rows': [asdict(r) for r in report.rows],
+          'signs': [asdict(g) for g in report.signs],
           'controls': [{'kind': c.kind, 'route_m': round(c.route_m, 1), 'line_source': c.line_source, 'osm_node': c.osm_node,
                         'osm_sign_m': None if c.osm_sign_m is None else round(c.osm_sign_m, 1), 'junction_status': c.junction_status}
                        for c in report.controls]}

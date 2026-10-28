@@ -78,7 +78,7 @@ def test_a_directed_mid_way_stop_is_its_approach_with_the_real_line():
   m.node_tags[3] = {'highway': 'stop', 'direction': 'forward', 'stop': 'minor'}
   side = m.build()
   assert side['controls'] == {'10:f': [{'kind': 'stop', 'line': [round(x, 7) for x in m.nodes[3]], 'junction_node': 4,
-                                        'stop_tag': 'minor', 'evidence': 'mid_directed'}]}
+                                        'stop_tag': 'minor', 'evidence': 'mid_directed', 'node': 3}]}
   junction = side['junctions'][4]
   assert junction['pos'] == [round(m.nodes[4][0], 7), round(m.nodes[4][1], 7)]
   approaches = {(a['way_id'], a['dir']): a for a in junction['approaches']}
@@ -118,7 +118,7 @@ def test_a_stop_on_the_junction_node_is_on_its_approaches_with_no_line(stop_tag,
   evidence = {'all': 'node_all', 'minor': 'node_minor'}.get(stop_tag.get('stop'), 'node_untagged')
   for key in approaches:
     assert side['controls'][key] == [{'kind': 'stop', 'line': None, 'junction_node': 4, 'stop_tag': stop_tag.get('stop', 'none'),
-                                      'evidence': evidence}]
+                                      'evidence': evidence, 'node': 4}]
   stops = {f"{a['way_id']}:{a['dir']}" for a in side['junctions'][4]['approaches'] if a['stops']}
   assert stops == approaches
 
@@ -132,11 +132,81 @@ def test_give_way_is_a_yield_and_level_crossings_are_kept():
   assert side['rail'] == [{'lat': round(m.nodes[2][0], 7), 'lon': round(m.nodes[2][1], 7), 'ways': [10]}]
 
 
-def test_a_stop_with_no_junction_near_it_is_left_out_and_counted():
+def test_b3_a_stop_with_no_junction_near_it_is_kept_at_its_own_line_with_no_junction():
+  """A stop the walk ties to no junction within MAXD (a mid-block trail or rail crossing, a dead end) is still a stop
+  for its approach: it is emitted with junction_node 0 at its own line, so the car's union has it (and its phantom check
+  sees it, C14), and counted. Directed: its direction; both: each; undirected: each direction its way allows."""
   m = crossroads()
-  m.node_tags[1] = {'highway': 'stop', 'direction': 'backward'}  # its way ends there: no junction that way
+  m.node_tags[1] = {'highway': 'stop', 'direction': 'backward'}  # its way ends there (a dead end): no junction that way
   side = m.build()
-  assert side['controls'] == {} and side['stats']['no_junction_within_maxd'] == 1
+  line = [round(x, 7) for x in m.nodes[1]]
+  assert side['controls'] == {'10:b': [{'kind': 'stop', 'line': line, 'junction_node': 0, 'stop_tag': 'none', 'evidence': 'mid_directed',
+                                        'node': 1}]}
+  assert side['stats']['no_junction_within_maxd'] == 1
+  m = crossroads()
+  m.node(5, -100., 0.)
+  m.ways[0] = (10, [5, 1, 2, 3, 4], {'highway': 'residential'})
+  m.node_tags[1] = {'highway': 'give_way'}  # undirected, 100 m from node 4 and a dead end the other way
+  assert {k: [(e['kind'], e['junction_node'], e['evidence']) for e in v] for k, v in m.build()['controls'].items()} == \
+    {'10:f': [('yield', 0, 'mid_undirected')], '10:b': [('yield', 0, 'mid_undirected')]}
+  m.ways[0] = (10, [5, 1, 2, 3, 4], {'highway': 'residential', 'oneway': 'yes'})
+  assert set(m.build()['controls']) == {'10:f'}  # a oneway's only arrival
+
+
+def continuation(first_id, second_id, stop_at, **stop):
+  """Way first_id runs north from node 1 to node 3 at 30 m, where way second_id carries on (a way split, a 2-leg node,
+  not a junction) to node 4 at 40 m, a junction with way 20 (tertiary) across it. The OPL lists way `second_id` first
+  when it is the lower id, as osmium does."""
+  m = Map()
+  for nid, north in ((1, 0.), (2, 20.), (3, 30.), (4, 40.), (31, 90.)):
+    m.node(nid, north, 0.)
+  m.node(21, 40., -50.)
+  m.node(22, 40., 50.)
+  ways = [(first_id, [1, 2, 3]), (second_id, [3, 4, 31])]
+  for wid, nids in sorted(ways):
+    m.way(wid, nids, highway='residential')
+  m.way(20, [21, 4, 22], highway='tertiary')
+  m.node_tags[stop_at] = {'highway': 'stop', **stop}
+  return m
+
+
+@pytest.mark.parametrize('first_id, second_id', [(15, 16), (16, 15)])
+@pytest.mark.parametrize('stop_at', [2, 3])
+def test_b3_the_walk_carries_on_across_a_way_split_to_the_junction(first_id, second_id, stop_at):
+  """Grant Street (Evanston IL, stop node 11351528025, the last node of way 320636666, the junction a few metres on
+  along way 1485056109): the walk to the junction crosses a 2-leg continuation node onto the way carrying on, whether
+  the stop is mid-way or on the split node itself. The entry is keyed to the way arriving at the stop (its line is on
+  that edge, where the car looks for it), and the junction lists the approach it arrives on as stopping."""
+  m = continuation(first_id, second_id, stop_at, direction='forward')
+  side = m.build()
+  assert side['controls'] == {f'{first_id}:f': [{'kind': 'stop', 'line': [round(x, 7) for x in m.nodes[stop_at]], 'junction_node': 4,
+                                                 'stop_tag': 'none', 'evidence': 'mid_directed', 'node': stop_at}]}
+  stops = {(a['way_id'], a['dir']) for a in side['junctions'][4]['approaches'] if a['stops']}
+  assert stops == {(second_id, 'f')} and side['stats'].get('no_junction_within_maxd', 0) == 0
+  # the other direction's walk from the split node runs back down the first way: no junction, kept with none
+  side = continuation(first_id, second_id, 3, direction='backward').build()
+  assert {k: [e['junction_node'] for e in v] for k, v in side['controls'].items()} == {f'{second_id}:b': [0]}
+
+
+def test_b3_signs_no_approach_takes_are_listed_unplaced():
+  """Every stop and give_way node is somewhere in the sidecar, so route_audit can list one near a route that no control
+  placed: one on no drivable way (a sign mapped beside the road, a footway's), and a stop=minor on a junction whose
+  approaches are all of the top class, go in 'unplaced' with why."""
+  m = crossroads()
+  m.node(40, 60., 5., highway='stop', direction='forward')  # beside way 10, on no way
+  m.node(41, 70., 8.)
+  m.way(41, [40, 41], highway='footway')
+  side = m.build()
+  assert side['controls'] == {}
+  assert side['unplaced'] == [{'node': 40, 'kind': 'stop', 'lat': round(m.nodes[40][0], 7), 'lon': round(m.nodes[40][1], 7),
+                               'direction': 'forward', 'stop_tag': 'none', 'why': 'not_on_a_drivable_way'}]
+  m = crossroads(highway='stop', stop='minor')
+  m.ways[0] = (10, [1, 2, 3, 4], {'highway': 'tertiary'})
+  m.ways[2] = (30, [4, 31, 32], {'highway': 'tertiary'})
+  side = m.build()
+  assert side['controls'] == {} and [(u['node'], u['why']) for u in side['unplaced']] == [(4, 'no_lower_approach')]
+  cell = osm_controls.level2_index(LON0, LAT0)
+  assert osm_controls.shards(side, {cell}, '2026-10-26T21:24:46Z')[cell]['unplaced'] == side['unplaced']
 
 
 def test_shards_on_the_level2_grid_stamped_one_per_tile():
@@ -146,7 +216,7 @@ def test_shards_on_the_level2_grid_stamped_one_per_tile():
   out = osm_controls.shards(side, {cell, empty}, '2026-10-26T21:24:46Z')
   assert set(out) == {cell, empty}
   assert out[empty] == {'version': osm_controls.VERSION, 'osm_timestamp': '2026-10-26T21:24:46Z', 'tile': empty, 'controls': {},
-                        'junctions': {}, 'rail': []}
+                        'junctions': {}, 'rail': [], 'unplaced': []}
   assert out[cell]['osm_timestamp'] == '2026-10-26T21:24:46Z' and set(out[cell]['controls']) == {'10:f', '20:f', '20:b', '30:b'}
   assert set(out[cell]['junctions']) == {'4'}  # JSON keys: the node id as text
 

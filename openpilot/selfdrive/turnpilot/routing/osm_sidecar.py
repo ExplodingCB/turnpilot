@@ -4,9 +4,11 @@ tools/turnpilot/mapserver/osm_controls.py writes, beside a region's tiles, osm_c
 level-2 tile, stamped with the osm_timestamp of the OSM data the tiles were built from. A corridor carries the shards of its
 own tiles (maps/corridor.py) and the region's osm_timestamp in its manifest.json; a region's or the sim tiles' directory
 (TurnPilotValhallaTiles) has it in meta.json. Each shard holds
-  controls: {"<way_id>:<f|b>": [{kind stop|yield, line [lat, lon] or null, junction_node, stop_tag, evidence}, ...]}
+  controls: {"<way_id>:<f|b>": [{kind stop|yield, line [lat, lon] or null, junction_node (0: none), stop_tag, evidence,
+                                 node}, ...]}
   junctions: {"<osm node id>": {pos [lat, lon], approaches [...]}}
   rail: [{lat, lon, ways}]
+  unplaced: [{node, kind, lat, lon, direction, stop_tag, why}]: the stop and give_way nodes no approach takes (route_audit)
 routing/controls.py unions its stops and yields with Valhalla's flags (STOP_SIGNS.md, SG1a).
 
 load() reads the shards of every level-2 tile a route's shape passes through (each must be there: the build writes one per
@@ -42,6 +44,7 @@ class OsmSidecar:
   controls: dict[str, list[dict]] = field(default_factory=dict)
   junctions: dict[int, dict] = field(default_factory=dict)
   rail: list[dict] = field(default_factory=list)
+  unplaced: list[dict] = field(default_factory=list)
 
   def entries(self, key: str) -> list[dict]:
     return self.controls.get(key, [])
@@ -135,6 +138,7 @@ def load(sidecar_dir, points) -> OsmSidecar:
     for node, j in (shard.get('junctions') or {}).items():
       out.junctions[int(node)] = j
     out.rail.extend(shard.get('rail') or [])
+    out.unplaced.extend(shard.get('unplaced') or [])
   if absent:
     out.status, out.detail = 'missing', f"no shard for tile {absent[0]}" + (f" and {len(absent) - 1} more" if len(absent) > 1 else '')
   elif stamp is None:

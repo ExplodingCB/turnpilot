@@ -12,13 +12,16 @@ PBF, so the way ids match the tiles; build_sim_tiles.sh runs it on the sim level
 Writes <out_dir>/osm_controls/<level-2 tile index>.json for EVERY level-2 tile under --tiles (empty or not), so on the car
 a missing shard is never mistaken for a tile with no stops. Each shard:
   {"version", "osm_timestamp" (the tiles' own stamp: the car refuses, out loud, a shard whose stamp differs), "tile",
-   "controls": {"<way_id>:<f|b>": [{kind stop|yield, line [lat, lon] or null, junction_node, stop_tag all|minor|none,
-                                    evidence}, ...]},
+   "controls": {"<way_id>:<f|b>": [{kind stop|yield, line [lat, lon] or null, junction_node (0: none), stop_tag
+                                    all|minor|none, evidence, node (the sign's OSM node)}, ...]},
    "junctions": {"<osm node id>": {pos [lat, lon], approaches [{way_id, dir f|b, bearing_deg, class, maxspeed, oneway,
                                    stops, kind, evidence, line}, ...]}},
-   "rail": [{lat, lon, ways [way_id, ...]}]}
+   "rail": [{lat, lon, ways [way_id, ...]}],
+   "unplaced": [{node, kind, lat, lon, direction, stop_tag, why}]}
 f: traffic travelling along the way's node order (Valhalla's edge.forward), b: against it. A control sits in the shard of
-its line (of its junction when it has no line), a junction and a crossing in the shard of their position.
+its line (of its junction when it has no line), a junction, a crossing and an unplaced sign in the shard of their
+position. Every stop and give_way node is in a shard once, as a control or unplaced, so route_audit can list one near a
+route that no control placed.
 
 The junction model (from stopsigns/scripts/allway_osm.py):
 - drivable ways: DRIVABLE highway classes, not area=yes, not closed to motor vehicles. A junction is a node with at least
@@ -28,9 +31,14 @@ The junction model (from stopsigns/scripts/allway_osm.py):
   without), or with stop=minor only to the approaches of a lower class than the junction's top one (node_minor, as
   Valhalla does); it has no line (null): the node is the junction's middle, not where anyone stops.
 - anywhere else (mid-way, or on a node shared only with a footway or a way's continuation) it governs the first junction
-  within MAXD m along its own way: direction=forward the one ahead along the way (mid_directed), backward the one behind,
-  both each of them (mid_both), and with no or another direction the nearest (mid_undirected, by proximity). Its node is
-  the line. A stop with no junction within MAXD along its way is left out and counted (stats).
+  within MAXD m along its way, the walk carrying on across a way split (a 2-leg node where the way ends and one other
+  drivable way starts or ends) onto the way carrying on, CARRY_ON_PASSES splits at most: direction=forward the one ahead
+  along the way (mid_directed), backward the one behind, both each of them (mid_both), and with no or another direction
+  the nearest (mid_undirected, by proximity). Its node is the line, and it is keyed to the way its traffic arrives at it
+  on (the way ending there when the sign is on a split). A stop with no junction within MAXD still stops its approach:
+  it is kept with junction_node 0 (each direction its way allows when undirected) and counted (no_junction_within_maxd).
+- a sign no approach takes is unplaced, with why: not_on_a_drivable_way (mapped beside the road, on a footway), or
+  no_lower_approach (stop=minor on a junction whose approaches are all of its top class).
 - an approach's bearing_deg is the bearing of the leg leaving the junction (deg from north, as Valhalla's begin_heading),
   over BEARING_M of it; maxspeed is m/s from the way's maxspeed tag ("25 mph", "40", "40 km/h"), null when untagged or
   unreadable; stops/kind/evidence/line the control on that approach, if any (a mid-way line before a node's).
@@ -66,6 +74,7 @@ RANK = {'motorway': 0, 'trunk': 1, 'primary': 2, 'secondary': 3, 'tertiary': 4, 
         'residential': 6, 'living_street': 6, 'service': 7}
 EVIDENCE_ORDER = ('mid_directed', 'mid_both', 'mid_undirected', 'node_all', 'node_minor', 'node_untagged')
 MAXD = 60.      # m along a way from a mid-way stop node to the junction it governs
+CARRY_ON_PASSES = 2  # way splits a walk carries on across (each one more pass over the ways)
 BEARING_M = 15.  # m of a leg its bearing is taken over (Valhalla's kMinMetersOffsetForHeading)
 EARTH_R = 6371000.
 MPH = 0.44704
@@ -150,8 +159,8 @@ def key(way: int, step: int) -> str:
 
 def build_sidecar(control_lines: Iterable[str], way_lines: Callable[[], Iterable[str]]) -> dict:
   """The sidecar from osmium OPL: control_lines the stop, give_way and level-crossing nodes; way_lines() a fresh pass
-  over the highway ways with their node locations (it is called twice). {'controls', 'junctions' (by int node id),
-  'rail', 'stats'}."""
+  over the highway ways with their node locations (it is called twice, and once more per way split the walks carry on
+  across, CARRY_ON_PASSES at most). {'controls', 'junctions' (by int node id), 'rail', 'unplaced', 'stats'}."""
   controls_in = {}  # node id -> (lat, lon, tags)
   rail_pos = {}     # node id -> (lat, lon)
   for line in control_lines:
@@ -184,26 +193,35 @@ def build_sidecar(control_lines: Iterable[str], way_lines: Callable[[], Iterable
   # pass B: every ingested way's occurrences of those nodes; the geometry of the drivable ways touching them
   occ = defaultdict(list)  # node -> [(way, index, way length in nodes, drivable)]
   W = {}                   # way -> (tags, [(node id, lat, lon)])
-  for line in way_lines():
-    if not line.startswith('w'):
-      continue
-    f = fields(line)
-    t = parse_tags(f.get('T', ''))
-    hw = t.get('highway', '')
-    if not hw or hw in NOT_INGESTED:
-      continue
-    nf = f.get('N', '')
-    ids = [int(x) for x in NODE_ID.findall(nf)]
-    hit = [i for i, n in enumerate(ids) if n in C]
-    if not hit:
-      continue
-    d = drivable(t)
-    wid = int(f['w'])
-    for i in hit:
-      occ[ids[i]].append((wid, i, len(ids), d))
-    if d:
-      nodes = [(int(n), float(y) if y else math.nan, float(x) if x else math.nan) for n, x, y in NODE.findall(nf)]
-      W[wid] = ({k: t[k] for k in ('highway', 'oneway', 'junction', 'service', 'maxspeed') if k in t}, nodes)
+  gathered = set()         # the nodes occ is complete for
+
+  def gather(nodes):
+    new = set(nodes) - gathered
+    if not new:
+      return
+    gathered.update(new)
+    for line in way_lines():
+      if not line.startswith('w'):
+        continue
+      f = fields(line)
+      t = parse_tags(f.get('T', ''))
+      hw = t.get('highway', '')
+      if not hw or hw in NOT_INGESTED:
+        continue
+      nf = f.get('N', '')
+      ids = [int(x) for x in NODE_ID.findall(nf)]
+      hit = [i for i, n in enumerate(ids) if n in new]
+      if not hit:
+        continue
+      d = drivable(t)
+      wid = int(f['w'])
+      for i in hit:
+        occ[ids[i]].append((wid, i, len(ids), d))
+      if d and wid not in W:
+        nodes = [(int(n), float(y) if y else math.nan, float(x) if x else math.nan) for n, x, y in NODE.findall(nf)]
+        W[wid] = ({k: t[k] for k in ('highway', 'oneway', 'junction', 'service', 'maxspeed') if k in t}, nodes)
+
+  gather(C)
 
   def legs_at(n):
     out = []
@@ -235,65 +253,130 @@ def build_sidecar(control_lines: Iterable[str], way_lines: Callable[[], Iterable
       out.append((wid, step, rank(W[wid][0]['highway']), i))
     return out
 
-  def walk(wid, i, step):
-    """(junction node, m along) for the first junction from index i along the way in direction step within MAXD"""
-    nodes = W[wid][1]
-    d, j = 0., i
-    while 0 <= j + step < len(nodes):
-      a, b = nodes[j], nodes[j + step]
-      d += dist(a[1:], b[1:])
-      j += step
-      if d > MAXD:
+  def carry_on(wid, end):
+    """(way, index of end in it, step along it) for the one other drivable way at end, where wid ends and it does (a way
+    split: two legs, no junction), or None"""
+    legs = legs_at(end)
+    others = {w for w, _, _ in legs if w != wid}
+    if len(legs) != 2 or len(others) != 1:
+      return None
+    nxt = others.pop()
+    nodes = W[nxt][1]
+    if nodes[0][0] == end:
+      return nxt, 0, +1
+    return (nxt, len(nodes) - 1, -1) if nodes[-1][0] == end else None
+
+  def walk(wid, i, step, need=None):
+    """(junction node, m along, the way and step arriving there) for the first junction from index i of way wid in
+    direction step within MAXD, across a way split onto the way carrying on (carry_on), or None. need: a set the nodes
+    of a way the walk would carry on along are added to while occ isn't complete for them (it stops there)."""
+    d, seen = 0., {wid}
+    while True:
+      nodes = W[wid][1]
+      j = i
+      while 0 <= j + step < len(nodes):
+        a, b = nodes[j], nodes[j + step]
+        d += dist(a[1:], b[1:])
+        j += step
+        if d > MAXD:
+          return None
+        if junction(b[0]):
+          return b[0], d, wid, step
+      nxt = carry_on(wid, nodes[j][0])
+      if nxt is None or nxt[0] in seen:
         return None
-      if junction(b[0]):
-        return b[0], d
-    return None
+      if any(n not in gathered for n, *_ in W[nxt[0]][1]):
+        if need is not None:
+          need.update(n for n, *_ in W[nxt[0]][1])
+        return None
+      wid, i, step = nxt
+      seen.add(wid)
+
+  def arriving(wid, i, step):
+    """(way, step) of the traffic going `step` along way wid that arrives at its index i: wid's own unless i is where
+    that traffic leaves wid's first or last node, which a way split's other way arrives at"""
+    if (step > 0 and i > 0) or (step < 0 and i < len(W[wid][1]) - 1):
+      return wid, step
+    nxt = carry_on(wid, W[wid][1][i][0])
+    return (wid, step) if nxt is None else (nxt[0], -nxt[2])
+
+  def mid_way(sid):
+    """(way, index) of a mid-way stop node on a drivable way, or None for one on a junction node or on none"""
+    dways = [(w, i) for w, i, _, d in occ.get(sid, []) if d and w in W]
+    return dways[0] if dways and not junction(sid) else None
+
+  # the ways the walks carry on along, a split at a time (CARRY_ON_PASSES more passes at most)
+  for _ in range(CARRY_ON_PASSES):
+    need = set()
+    for sid in controls_in:
+      if (at := mid_way(sid)) is not None:
+        walk(*at, +1, need)
+        walk(*at, -1, need)
+    if not need - gathered:
+      break
+    gather(need)
 
   stats = Counter()
   controls = defaultdict(list)                # key -> [entry]
   on_approach = defaultdict(dict)             # junction -> {(way, step): entry}
+  unplaced = []                               # the signs no approach takes
   for sid, (la, lo, t) in sorted(controls_in.items()):
     kind = KINDS[t['highway']]
     stop_tag = t.get('stop' if kind == 'stop' else 'give_way', '')
     stop_tag = stop_tag if stop_tag in ('all', 'minor') else 'none'
+    sign = {'node': sid, 'kind': kind, 'lat': round(la, 7), 'lon': round(lo, 7), 'direction': t.get('direction', ''), 'stop_tag': stop_tag}
     dways = [(w, i) for w, i, _, d in occ.get(sid, []) if d and w in W]
     if not dways:
       stats['not_on_a_drivable_way'] += 1
+      unplaced.append(sign | {'why': 'not_on_a_drivable_way'})
       continue
     if junction(sid):
       stats['junction_node'] += 1
       apps = approaches(sid)
       top = min((r for *_, r, _ in apps), default=8)
       evidence = 'node_minor' if stop_tag == 'minor' else 'node_all' if stop_tag == 'all' else 'node_untagged'
+      placed = False
       for w, step, r, _ in apps:
         if stop_tag == 'minor' and r <= top:
           continue
-        entry = {'kind': kind, 'line': None, 'junction_node': sid, 'stop_tag': stop_tag, 'evidence': evidence}
+        entry = {'kind': kind, 'line': None, 'junction_node': sid, 'stop_tag': stop_tag, 'evidence': evidence, 'node': sid}
         controls[key(w, step)].append(entry)
         on_approach[sid].setdefault((w, step), entry)
+        placed = True
+      if not placed:
+        stats['no_lower_approach'] += 1
+        unplaced.append(sign | {'why': 'no_lower_approach'})
       continue
     w, i = dways[0]
     direction = t.get('direction', '')
-    fwd, bwd = walk(w, i, +1), walk(w, i, -1)
+    walks = {+1: walk(w, i, +1), -1: walk(w, i, -1)}
     if direction == 'forward':
-      targets, evidence = [(fwd, +1)] if fwd else [], 'mid_directed'
+      steps, evidence = [+1], 'mid_directed'
     elif direction in ('backward', 'reverse'):
-      targets, evidence = [(bwd, -1)] if bwd else [], 'mid_directed'
+      steps, evidence = [-1], 'mid_directed'
     elif direction == 'both':
-      targets, evidence = [x for x in ((fwd, +1), (bwd, -1)) if x[0]], 'mid_both'
+      steps, evidence = [+1, -1], 'mid_both'
     else:
-      near = [x for x in ((fwd, +1), (bwd, -1)) if x[0]]
-      targets, evidence = ([min(near, key=lambda x: x[0][1])] if near else []), 'mid_undirected'
-    if not targets:
+      near = [st for st in (+1, -1) if walks[st]]
+      steps, evidence = ([min(near, key=lambda st: walks[st][1])] if near else [+1, -1]), 'mid_undirected'
+    if not any(walks[st] for st in steps):
       stats['no_junction_within_maxd'] += 1
-      continue
-    stats[evidence] += 1
-    for (jn, _), step in targets:
-      entry = {'kind': kind, 'line': rounded((la, lo)), 'junction_node': jn, 'stop_tag': stop_tag, 'evidence': evidence}
-      controls[key(w, step)].append(entry)
-      prev = on_approach[jn].get((w, step))
-      if prev is None or prev['line'] is None:  # a mid-way line before a node's
-        on_approach[jn][(w, step)] = entry
+    else:
+      stats[evidence] += 1
+    for step in steps:
+      aw, astep = arriving(w, i, step)
+      found = walks[step]
+      if found is None and evidence == 'mid_undirected' and (oneway(W[aw][0]) * astep) < 0:
+        continue  # a oneway's illegal arrival
+      # a stop tied to no junction within MAXD (a mid-block trail or rail crossing, a dead end) still stops its approach
+      entry = {'kind': kind, 'line': rounded((la, lo)), 'junction_node': found[0] if found else 0, 'stop_tag': stop_tag,
+               'evidence': evidence, 'node': sid}
+      controls[key(aw, astep)].append(entry)
+      if found is not None:
+        jn, _, jw, jstep = found
+        prev = on_approach[jn].get((jw, jstep))
+        if prev is None or prev['line'] is None:  # a mid-way line before a node's
+          on_approach[jn][(jw, jstep)] = entry
 
   junctions = {}
   for jn, governed in on_approach.items():
@@ -320,12 +403,12 @@ def build_sidecar(control_lines: Iterable[str], way_lines: Callable[[], Iterable
     ways = sorted({w for w, _, _, d in occ.get(rid, []) if d and w in W})
     if ways:  # a crossing on a drivable road
       rail.append({'lat': round(la, 7), 'lon': round(lo, 7), 'ways': ways})
-  return {'controls': dict(sorted(controls.items())), 'junctions': junctions, 'rail': rail, 'stats': dict(stats)}
+  return {'controls': dict(sorted(controls.items())), 'junctions': junctions, 'rail': rail, 'unplaced': unplaced, 'stats': dict(stats)}
 
 
 def shards(sidecar: dict, cells: set[int], osm_timestamp: str) -> dict[int, dict]:
   """{level-2 tile: shard} for every tile in cells; what falls in no tile there is left out (counted in the stats)."""
-  out = {c: {'version': VERSION, 'osm_timestamp': osm_timestamp, 'tile': c, 'controls': {}, 'junctions': {}, 'rail': []}
+  out = {c: {'version': VERSION, 'osm_timestamp': osm_timestamp, 'tile': c, 'controls': {}, 'junctions': {}, 'rail': [], 'unplaced': []}
          for c in sorted(cells)}
   dropped = 0
   junctions = sidecar['junctions']
@@ -343,12 +426,13 @@ def shards(sidecar: dict, cells: set[int], osm_timestamp: str) -> dict[int, dict
       out[cell]['junctions'][str(jn)] = j
     else:
       dropped += 1
-  for r in sidecar['rail']:
-    cell = level2_index(r['lon'], r['lat'])
-    if cell in out:
-      out[cell]['rail'].append(r)
-    else:
-      dropped += 1
+  for what in ('rail', 'unplaced'):
+    for r in sidecar.get(what, []):
+      cell = level2_index(r['lon'], r['lat'])
+      if cell in out:
+        out[cell][what].append(r)
+      else:
+        dropped += 1
   sidecar.setdefault('stats', {})['outside_the_tiles'] = dropped
   return out
 

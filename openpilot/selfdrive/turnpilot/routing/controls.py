@@ -317,8 +317,8 @@ def route_controls(call, steps, tiles_dir=None, sidecar_dir=None, audit: list | 
   tiles_dir: the local tiles' directory, for the controls_built marker and the sim sidecar; None for tiles built from
   real OSM, which carry their own controls. sidecar_dir: the directory holding the OSM sidecar (osm_controls/) and the
   tiles' stamp (a corridor pack, a region's or the sim tiles' directory), osm_sidecar.NO_DIRECTORY when one is expected
-  but the tiles have no directory, None when none is (module docstring). audit: a list each edge with a stop or yield
-  from either source is appended to, as a dict (route_audit.py)."""
+  but the tiles have no directory, None when none is (module docstring). audit: a list every trace edge is appended to,
+  as a dict with its span on the route and both sources' stops and yields there (route_audit.py)."""
   try:
     if tiles_dir is not None and not (Path(tiles_dir) / MARKER).exists():
       return [], 'unsupported'
@@ -479,9 +479,9 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
           phantoms.append(kind)
           cloudlog.info(f"turnpilot controls: Valhalla's {kind} on {key} at {end_m:.0f} m is a phantom: the OSM sidecar's is " +
                         f"directed {other}, on the edge's end node")
-    if audit is not None and (hits or phantoms or 'stop' in valhalla or 'yield' in valhalla):
-      audit.append({'edge': i, 'key': key, 'internal': internal, 'anchor': anchor, 'end_m': end_m, 'valhalla': list(valhalla),
-                    'phantom': phantoms, 'osm': [dict(entry, m=m) for entry, m in hits]})
+    if audit is not None:
+      audit.append({'edge': i, 'key': key, 'internal': internal, 'anchor': anchor, 'begin_m': end_m - span, 'end_m': end_m,
+                    'valhalla': list(valhalla), 'phantom': phantoms, 'osm': [dict(entry, m=m) for entry, m in hits]})
     kinds = at.setdefault(anchor, {}) if valhalla or hits else None
     for kind in valhalla:
       kinds.setdefault(kind, []).append((i, None, None))

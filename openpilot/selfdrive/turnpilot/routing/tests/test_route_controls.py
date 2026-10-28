@@ -233,13 +233,15 @@ def test_sidecar_line_is_projected(tmp_path):
 
 # --- the OSM sidecar (osm_controls/ shards, routing/osm_sidecar.py; STOP_SIGNS.md SG1a) ---
 
-def entry(kind, m, junction=900, evidence='mid_directed', stop_tag='none', east=0.):
-  """A sidecar control whose line is m along the stub route (and east m off it), or None for a junction-node one."""
+def entry(kind, m, junction=900, evidence='mid_directed', stop_tag='none', east=0., node=None):
+  """A sidecar control whose line is m along the stub route (and east m off it), or None for a junction-node one; node:
+  the sign's OSM node id, which shards carry (route_audit)."""
   line = None if m is None else [pt(m)[0], LON0 + east / (M_PER_DEG * 0.7687)]
-  return {'kind': kind, 'line': line, 'junction_node': junction, 'stop_tag': stop_tag, 'evidence': evidence}
+  return {'kind': kind, 'line': line, 'junction_node': junction, 'stop_tag': stop_tag, 'evidence': evidence} | \
+    ({} if node is None else {'node': node})
 
 
-def osm_dir(path, controls=None, junctions=None, stamp=STAMP, tiles_stamp=STAMP, meta=True, shards=True):
+def osm_dir(path, controls=None, junctions=None, stamp=STAMP, tiles_stamp=STAMP, meta=True, shards=True, unplaced=None):
   """A directory with the sidecar's shard for the stub route's level-2 tile, stamped stamp, and the tiles' own stamp
   (meta.json, as a region's or the sim tiles' directory has; a corridor's manifest.json has it too)."""
   path.mkdir(parents=True, exist_ok=True)
@@ -249,7 +251,8 @@ def osm_dir(path, controls=None, junctions=None, stamp=STAMP, tiles_stamp=STAMP,
     cell = level2_index(LON0, LAT0)
     (path / 'osm_controls').mkdir(exist_ok=True)
     (path / 'osm_controls' / f'{cell}.json').write_text(json.dumps({'version': 1, 'osm_timestamp': stamp, 'tile': cell,
-                                                                    'controls': controls or {}, 'junctions': junctions or {}, 'rail': []}))
+                                                                    'controls': controls or {}, 'junctions': junctions or {}, 'rail': [],
+                                                                    'unplaced': unplaced or []}))
   return path
 
 
@@ -345,6 +348,17 @@ def test_b2_an_osm_stop_node_never_moves_the_stop_point(tmp_path, kind, sign_m):
   controls, _ = route_controls(v, steps(), sidecar_dir=osm_dir(tmp_path, {'77:f': [entry(kind, sign_m, junction=900)]}))
   assert [(c.kind, round(c.route_m, 1), c.line_mapped, c.line_source, c.osm_node, round(c.osm_sign_m, 1)) for c in controls] == \
     [(kind, 100. - OFF, False, 'default', 900, sign_m)]
+
+
+def test_b3_a_sidecar_stop_tied_to_no_junction_is_still_a_stop(tmp_path):
+  """The sidecar keeps a stop it ties to no junction within 60 m (a mid-block trail or rail crossing) with junction_node
+  0: where Valhalla doesn't flag it either, the union is the car's only source for it. It stops at its edge's default
+  stop point, with no OSM junction node, its sign carried as data."""
+  v = StubValhalla([(0., 100., {}), (100., 180., {'way_id': 77}), (180., 400., {})])
+  controls, status = route_controls(v, steps(), sidecar_dir=osm_dir(tmp_path, {'77:f': [entry('stop', 140., junction=0)]}))
+  assert status == 'ok'
+  assert [(c.kind, round(c.route_m, 1), c.osm_node, c.line_source, round(c.osm_sign_m, 1)) for c in controls] == \
+    [('stop', 180. - OFF, 0, 'default', 140.)]
 
 
 def test_a_junction_node_stop_from_the_sidecar_is_on_the_edge_ending_there(tmp_path):
