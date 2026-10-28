@@ -14,7 +14,7 @@ from openpilot.selfdrive.turnpilot.desire_timing import TURN_DESIRE_LEAD_M
 from openpilot.selfdrive.turnpilot.turn_skip import MIN_FIRST_PULSE_M
 from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP, V_TURN_MIN
 from openpilot.selfdrive.turnpilot.turnpilotd import (CAR_UNKNOWN_REASON, DETECTOR_DEADLINE_S, DETECTOR_START_DEADLINE_S, NO_LONG_REASON,
-                                                       STOPPED_LEAD_M, STOPPED_PROMPT_S, STOPPED_REASON,
+                                                       STALL_PROMPT_S, STALLED_REASON, STOPPED_LEAD_M, STOPPED_PROMPT_S, STOPPED_REASON,
                                                        TURN_MISSED_REASON, WAITING_REASON, TurnPilot, long_control_for)
 from openpilot.selfdrive.turnpilot.handback import Handback
 from openpilot.selfdrive.turnpilot.scene.tracker import STALE_S
@@ -1928,3 +1928,50 @@ def test_a_turn_from_a_standstill_driven_straight_past_its_junction_is_missed_ou
     turned = max(turned, sim.tp.desires.turned_deg)
   assert turned > 75. and not any(p.turnMissed for p in plans)
 
+
+def test_stalled_in_the_junction_after_the_go_asks_for_the_drivers_go_and_never_goes():
+  """BeamNG standstill sweep, 2026-10-28: 2 of 21 turns released from a stop stood 20 s mid-junction, 46-78 deg round,
+  with nothing said: the stop line it was released from is within 30 m, so the empty-road prompt (carStoppedGo) never came.
+  Standing more than 3 s after the go, 20-80 deg into the turn, with no TurnPilot hold and no close lead, the plan asks for
+  the driver's go and says why. It never goes itself."""
+  def into_the_turn(sim, deg):
+    go_from_the_hold(sim)
+    while sim.tp.desires.turned_deg < deg:
+      sim.step(engaged=True, yaw_rate=0.5)
+      assert sim.t < 120.
+
+  def stand(sim, seconds, **kw):
+    plans = []
+    for _ in range(int(round(seconds / DT_MDL))):
+      sim.v = 0.  # the model stands the car: nothing in the plan does
+      plans.append(sim.step(engaged=True, **kw))
+    return plans
+
+  sim = Sim(TURNS_AHEAD)
+  into_the_turn(sim, 45.)
+  plans = stand(sim, STALL_PROMPT_S - 0.2)
+  assert all(p.controlPrompt == 'none' for p in plans)
+  before = plans[-1]
+  p = stand(sim, 0.4)[-1]
+  assert p.controlPrompt == 'carStoppedGo' and p.reason == STALLED_REASON
+  assert not p.shouldStop and p.accelCap == NO_ACCEL_CAP and p.speedCap >= before.speedCap - 1e-3  # asks, never pushes
+  assert p.desire == Desire.none
+  sim.step(engaged=True, gas=True)  # the driver's tap: the prompt goes, and its wait starts over
+  assert all(p.controlPrompt == 'none' for p in stand(sim, STALL_PROMPT_S - 0.2))
+  assert stand(sim, 0.4)[-1].controlPrompt == 'carStoppedGo'
+
+  # not with a lead close ahead, nor under 20 deg into the turn (the model may still be waiting to start it)
+  sim = Sim(TURNS_AHEAD)
+  into_the_turn(sim, 45.)
+  sim.model_kw = {'lead_prob': 0.9, 'lead_x': STOPPED_LEAD_M - 5.}
+  assert all(p.controlPrompt == 'none' for p in stand(sim, STALL_PROMPT_S + 1.))
+  sim = Sim(TURNS_AHEAD)
+  into_the_turn(sim, 10.)
+  assert all(p.controlPrompt == 'none' for p in stand(sim, STALL_PROMPT_S + 1.))
+
+  # nor while TurnPilot holds the car: a pedestrian in the turn's path
+  sim = Sim(TURNS_AHEAD)
+  into_the_turn(sim, 45.)
+  walker = ({'cls': 'pedestrian', 'x': 4., 'y': 0.1, 'vx': 0., 'vy': 0., 'inPath': True},)
+  plans = stand(sim, STALL_PROMPT_S + 1., objects=walker)
+  assert any(p.shouldStop for p in plans) and all(p.controlPrompt == 'none' for p in plans if p.shouldStop)

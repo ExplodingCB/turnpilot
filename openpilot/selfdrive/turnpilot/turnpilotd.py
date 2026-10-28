@@ -49,7 +49,9 @@ half driven (_take_up_dropped).
 A turn the car pulls away into from a standstill (a hold's go, the turn's pulse in that frame) is unverified: in BeamNG it
 was taken about half the time (2026-10-28). Past its junction (the follower's pass) having turned under MISSED_TURN_DEG,
 it was missed: turnMissed for MISSED_HOLD_S, which selfdrived chimes as a skip ("Turn Missed", "Rerouting") and on which
-navd reroutes at once. Nothing brakes for it.
+navd reroutes at once. Nothing brakes for it. Standing more than STALL_PROMPT_S after the go, STALL_MIN_DEG to
+STALL_MAX_DEG into the turn, with no hold of TurnPilot's and no lead within STOPPED_LEAD_M, it stalled in the junction:
+the plan asks for the driver's go (carStoppedGo, STALLED_REASON), and never goes itself.
 Standing engaged STOPPED_PROMPT_S with nothing of TurnPilot's holding the car (no shouldStop, no cap biting), no lead from
 the model within STOPPED_LEAD_M (one further on doesn't hold a standing car), no map control within STOPPED_CONTROL_M,
 gas and brake off, the model stopped on its own: the plan asks for the driver's go (controlPrompt carStoppedGo, "Car
@@ -133,6 +135,16 @@ STOPPED_REASON = "Car stopped — tap gas to continue"
 MISSED_TURN_DEG = 15.  # past its junction (the follower's pass) turned less than this, it was missed: said and rerouted
 MISSED_HOLD_S = 3.     # turnMissed is held this long, for the alert and for navd (1 Hz) to see it
 TURN_MISSED_REASON = "Turn missed — rerouting"
+STALL_PROMPT_S = 3.    # standing this long after the go, STALL_MIN_DEG to STALL_MAX_DEG into the turn, nothing holding it:
+STALL_MIN_DEG = 20.    # the driver is asked for the go (the stop line it left is within STOPPED_CONTROL_M, so the
+STALL_MAX_DEG = 80.    # empty-road prompt never comes; the sweep's stalls stood 20 s at 46-78 deg)
+STALLED_REASON = "Stalled in the turn — tap gas to continue"
+
+
+def close_lead(model) -> bool:
+  """modelV2 has a lead within STOPPED_LEAD_M: what holds a standing car (one further on doesn't)."""
+  return len(model.leadsV3) > 0 and model.leadsV3[0].prob > STOPPED_LEAD_PROB and len(model.leadsV3[0].x) > 0 and \
+    model.leadsV3[0].x[0] < STOPPED_LEAD_M
 
 
 class ErrorLog:
@@ -185,6 +197,7 @@ class TurnPilot:
       self.disengaged_s = 0.       # ...of it with openpilot disengaged
       self.engaged_wait_s = 0.     # time since the first engaged frame, before the first detection
     self.stopped_s = 0.            # standing engaged with nothing holding the car (carStoppedGo)
+    self.stall_s = 0.              # standing in the turn after its go, nothing holding the car (carStoppedGo)
     self.missed_t = 0.             # turnMissed is held while this counts down
     if not keep_turn:
       # maneuver ids never repeat: the scene kept through a fault holds ids (its commitment, a gas release, a carried hold)
@@ -199,7 +212,7 @@ class TurnPilot:
       self.turn_cap_id: int | None = None  # ...whose turn speed cap stays, its desire having gone out
       self.turn_held_id: int | None = None  # ...whose turn desire was out: held to its clear, never cancelled
       self.skip_cap_id: int | None = None  # a dropped turn skipped on taking it up: its cap stays until it is passed
-      self.go_id: int | None = None  # the turn a hold let go of at standstill: checked for a miss
+      self.go_id: int | None = None  # the turn a hold let go of at standstill: checked for a miss and a stall
     else:
       self.desires.hold_off()  # the disabled plan dropped the desire: as on re-engaging, a fresh pulse only before the turn
     self.lanes = LanePlanner()
@@ -418,7 +431,7 @@ class TurnPilot:
     self._yaw_ticked = True
     d = self.desires
     if self.release_go and d.maneuver_id == rf.maneuver_id and d.started and d.side != 0 and not d.done:
-      self.go_id = rf.maneuver_id
+      self.go_id, self.stall_s = rf.maneuver_id, 0.
     if held and desire not in (Desire.none, CLEAR_DESIRE) and desire != self.last_desire:
       desire = Desire.none  # held: the desire out stays out, but never a new rising edge (a repeat pulse under way)
     plan.desire = self.last_desire = desire
@@ -461,8 +474,9 @@ class TurnPilot:
     plan.reason = decision.reason or (TURN_MISSED_REASON if plan.turnMissed else "") or lane_reason or mapd.reason or \
       (NO_JUNCTION_DATA_REASON if no_junction_data else "")
     fill_map_control(plan, mapd)
-    if self.stopped_unheld(sm, cs, v_ego, acting, decision, mapd):
-      plan.controlPrompt, plan.reason = 'carStoppedGo', STOPPED_REASON
+    stalled = self.stalled_in_turn(sm, cs, v_ego, acting, decision, mapd)
+    if self.stopped_unheld(sm, cs, v_ego, acting, decision, mapd) or stalled:
+      plan.controlPrompt, plan.reason = 'carStoppedGo', STALLED_REASON if stalled else STOPPED_REASON
     # an unprotected turn's hold line is at the nearest of navd's readings of its junction (route_follower.py): readings
     # that far apart, it may be well short of the line, said out loud rather than guessed (never over the infeasible stop)
     if isinstance(turn, tuple) and self.turn_committed and rf.junction_spread > UNCERTAIN_M and \
@@ -511,11 +525,25 @@ class TurnPilot:
       cloudlog.event("turnpilot_turn_missed", error=True, turned_deg=round(d.turned_deg, 1), v_ego=round(v_ego, 2),
                      distance=round(rf.distance, 1))
 
+  def stalled_in_turn(self, sm, cs, v_ego: float, acting: bool, decision, mapd) -> bool:
+    """The car has stood STALL_PROMPT_S in the turn a hold let go of, with nothing holding it (module docstring): ask for
+    the driver's go. The stop line it left is close behind it, so stopped_unheld never asks."""
+    d, rf = self.desires, self.follower
+    in_turn = self.go_id is not None and self.go_id == d.maneuver_id == rf.maneuver_id and \
+      STALL_MIN_DEG <= d.turned_deg <= STALL_MAX_DEG
+    stalled = acting and in_turn and sm['carControl'].enabled and v_ego < STANDSTILL_SPEED and not decision.should_stop and \
+      not decision.holding and not close_lead(sm['modelV2']) and not cs.gasPressed and not cs.brakePressed and \
+      mapd.prompt == 'none'
+    was = self.stall_s > STALL_PROMPT_S
+    self.stall_s = self.stall_s + DT_MDL if stalled else 0.
+    now = self.stall_s > STALL_PROMPT_S
+    if now and not was:
+      cloudlog.event("turnpilot.stalled_in_turn", error=True, stood_s=round(self.stall_s, 1), turned_deg=round(d.turned_deg, 1))
+    return now
+
   def stopped_unheld(self, sm, cs, v_ego: float, acting: bool, decision, mapd) -> bool:
     """The car has stood engaged STOPPED_PROMPT_S with nothing holding it (module docstring): ask for the driver's go."""
-    model = sm['modelV2']
-    lead = len(model.leadsV3) > 0 and model.leadsV3[0].prob > STOPPED_LEAD_PROB and len(model.leadsV3[0].x) > 0 and \
-      model.leadsV3[0].x[0] < STOPPED_LEAD_M
+    lead = close_lead(sm['modelV2'])
     near = [c for c in list(self.map_controls.tracker.controls.values()) + [self.map_controls.turn]
             if c is not None and abs(c.d) < STOPPED_CONTROL_M]
     unheld = acting and sm['carControl'].enabled and v_ego < STANDSTILL_SPEED and not decision.should_stop and \
