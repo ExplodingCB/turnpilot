@@ -50,6 +50,7 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.turnpilot.scene_policy import (CROSSWALK_X_AFTER_M, CROSSWALK_X_BEFORE_M, ONCOMING_ENTRY_M, ONCOMING_PAST_M,
                                                         ONCOMING_Y_FAR_M, ONCOMING_Y_NEAR_M, STOP_DECEL, VEHICLES, box_overlap,
                                                         committed_past_line, stop, velocity_trusted)
+from openpilot.selfdrive.turnpilot.scene.tracker import RawBox, RawFrame
 
 # T_req: the left's post-go profile (turn_speed.py: 'left'), the path from the line through the oncoming lanes
 A_GO = 1.5                 # m/s^2
@@ -98,25 +99,6 @@ VIEW_FROM_M = 60.          # the road camera from this far out (the window start
 
 OFF, AUTO, ANNOUNCE = 'off', 'auto', 'announce'
 MODES = (OFF, ANNOUNCE, AUTO)
-
-
-@dataclass(frozen=True)
-class RawBox:
-  camera: str              # 'road' or 'wide'
-  cls: str                 # TurnpilotScene.ObjectClass name
-  conf: float
-  bearing_deg: float       # the box's bottom centre, left of the calibrated forward axis
-  span_deg: tuple          # (right edge, left edge) bearings
-  xy: tuple | None         # ground point (x forward, y left), None unranged
-  near_m: float | None     # nearest plausible range (the box bottom NEAR_PX lower), None unranged
-  box: tuple = ()          # x0, y0, x1, y1 normalized in its camera's frame
-
-
-@dataclass
-class RawFrame:
-  boxes: list
-  camera: str
-  t: float                 # the run's camera time, s
 
 
 @dataclass

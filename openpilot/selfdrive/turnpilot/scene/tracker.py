@@ -5,6 +5,9 @@ detections match tracks by box IoU first, the rest get a second, stricter IoU pa
 start tracks. Two TurnPilot additions: detections alternate between the road and wide cameras, whose boxes can't be
 compared, so a third pass matches what's left by ground position; and a constant-velocity Kalman filter on ground
 position, with the car's own motion taken out in the predict step, so velocities are over the ground, not relative.
+Every run's boxes also come out as they are (raw, raw_new: RawFrame), tracked or not, with their bearing and ground range
+uncapped, for the unprotected left's gap rule: a distant car that never scores NEW_TRACK_CONF never becomes a track, so
+track absence certifies nothing (CRITIQUE REQUIRED 2).
 """
 import time
 from dataclasses import dataclass, field
@@ -12,6 +15,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from openpilot.cereal import custom
+from openpilot.common.swaglog import cloudlog
 from openpilot.common.transformations.camera import DeviceCameraConfig
 from openpilot.selfdrive.turnpilot.detector.decoder import BICYCLE, BUS, CAR, MAX_DETECTIONS, MOTORCYCLE, PERSON, TRUCK
 from openpilot.selfdrive.turnpilot.scene.ranging import Lens, calib_from_view, camera_height, ground_point, road_lens, wide_lens
@@ -20,6 +24,7 @@ ObjectClass = custom.TurnpilotScene.ObjectClass
 Camera = custom.TurnpilotDetections.Camera
 OBJECT_CLASS = {PERSON: ObjectClass.pedestrian, BICYCLE: ObjectClass.cyclist, CAR: ObjectClass.car,
                 MOTORCYCLE: ObjectClass.motorcycle, BUS: ObjectClass.bus, TRUCK: ObjectClass.truck}
+OBJECT_CLASS_NAME = {PERSON: 'pedestrian', BICYCLE: 'cyclist', CAR: 'car', MOTORCYCLE: 'motorcycle', BUS: 'bus', TRUCK: 'truck'}
 # classes YOLO confuses with each other match as one
 CLASS_GROUP = {PERSON: 0, BICYCLE: 1, MOTORCYCLE: 1, CAR: 2, BUS: 2, TRUCK: 2}
 
@@ -51,6 +56,9 @@ MIN_PERSON_ASPECT = 1.0  # box h/w: the overpass pillar and bush read 0.45-0.52,
 MAX_PERSON_GROUND_HEIGHT = 12.  # m, ground range x box height / focal length: pedestrians with visible feet read 1.5-2.8 m, the
                                 # cyclist, whose box ends a few px under the horizon, 7.6-9.8 m, the pillar 14-33 m. No lower bound:
                                 # there's no example of a too-short person box to set one from
+# every run's boxes, tracked or not, for the unprotected left's gap rule (unprotected_left.py; CRITIQUE REQUIRED 2): a box's
+# nearest plausible range is its ground range with the box bottom this many pixels lower (about 1.5 px at the YOLO input)
+NEAR_PX = 3.
 ACCEL_STD = 3.0          # m/s^2, the filter's process noise
 VEL_STD0 = 5.0           # m/s, a new track's velocity uncertainty
 
@@ -83,6 +91,38 @@ def greedy_match(score: np.ndarray, min_score: float) -> list[tuple[int, int]]:
     pairs.append((int(i), int(j)))
     s[i, :] = -np.inf
     s[:, j] = -np.inf
+
+
+@dataclass(frozen=True)
+class RawBox:
+  camera: str              # 'road' or 'wide'
+  cls: str                 # TurnpilotScene.ObjectClass name
+  conf: float
+  bearing_deg: float       # the box's bottom centre, left of the calibrated forward axis
+  span_deg: tuple          # (right edge, left edge) bearings at its bottom
+  xy: tuple | None         # ground point (x forward, y left), not capped at ranging.MAX_RANGE; None unranged
+  near_m: float | None     # nearest plausible range (the box bottom NEAR_PX lower), None unranged
+  box: tuple = ()          # x0, y0, x1, y1 normalized in its camera's frame
+
+
+@dataclass
+class RawFrame:
+  boxes: list              # [RawBox]: every detection of a road user in one detector run
+  camera: str
+  t: float                 # the run's camera time, s
+
+
+def ground_xy(lens: Lens, rot: np.ndarray, height: float, u: float, v: float) -> tuple[float, float] | None:
+  """As ranging.ground_point, with no range cap."""
+  ray = rot @ lens.ray(u, v)
+  if ray[2] <= 1e-6 or ray[0] <= 0.:
+    return None
+  return float(ray[0] * height / ray[2]), float(-ray[1] * height / ray[2])
+
+
+def bearing_deg(lens: Lens, rot: np.ndarray, u: float, v: float) -> float:
+  ray = rot @ lens.ray(u, v)
+  return float(np.degrees(np.arctan2(-ray[1], ray[0])))
 
 
 @dataclass
@@ -162,6 +202,8 @@ class SceneTracker:
     self.last_t: float | None = None     # camera time of the latest detections, s
     self.last_recv: float | None = None  # the caller's clock when they arrived
     self.available = False
+    self.raw: RawFrame | None = None     # the latest run's boxes (raw_frame)
+    self.raw_new = False                 # ...which arrived in the last update()
 
   def measure(self, det, camera: str, calibration) -> Measurement:
     box = np.array([det.x0, det.y0, det.x1, det.y1], dtype=np.float64)
@@ -284,9 +326,15 @@ class SceneTracker:
     default_yaw_rate()). Returns the tracks to publish."""
     now = time.monotonic() if now is None else now
     key = (str(detections.camera), detections.frameId, detections.timestampEof) if detections is not None else None
+    self.raw_new = False
     if key is not None and key != self.last_key and detections.timestampEof > 0:
       self.last_key, self.last_recv = key, now
       t = detections.timestampEof * 1e-9
+      try:
+        self.raw, self.raw_new = self.raw_frame(detections, 'wide' if str(detections.camera) == 'wide' else 'road', calibration, t), True
+      except Exception:
+        cloudlog.exception("turnpilot tracker: raw boxes failed")  # the left then has no fresh road run: never clear
+        self.raw = None
       v_ego = float(car_state.vEgo) if car_state is not None else 0.0
       if yaw_rate is None:
         yaw_rate = default_yaw_rate(car_state, model_v2)
@@ -307,6 +355,29 @@ class SceneTracker:
       self.update_in_path(model_v2)
     self.available = self.last_recv is not None and now - self.last_recv <= STALE_S
     return self.published()
+
+  def raw_frame(self, detections, camera: str, calibration, t: float) -> RawFrame:
+    """Every road user's box in this run, ranged where its bottom is below the horizon (RawBox), tracked or not."""
+    boxes = []
+    calibrated = calibration is not None and len(calibration.rpyCalib) == 3
+    lens, (w, h) = self.lenses[camera], self.sizes[camera]
+    rot = None
+    if calibrated:
+      wide_euler = list(calibration.wideFromDeviceEuler) if camera == 'wide' and len(calibration.wideFromDeviceEuler) == 3 else None
+      rot = calib_from_view(list(calibration.rpyCalib), wide_euler)
+    height = camera_height(calibration)
+    for d in detections.detections:
+      cls = int(d.cls)
+      if cls not in OBJECT_CLASS or rot is None:
+        continue
+      u = (d.x0 + d.x1) / 2
+      xy = ground_xy(lens, rot, height, u, d.y1)
+      near = ground_xy(lens, rot, height, u, d.y1 + NEAR_PX) if xy is not None else None
+      boxes.append(RawBox(camera, OBJECT_CLASS_NAME[cls], float(d.conf), bearing_deg(lens, rot, u, d.y1),
+                          (bearing_deg(lens, rot, d.x1, d.y1), bearing_deg(lens, rot, d.x0, d.y1)), xy,
+                          float(np.hypot(*near)) if near is not None else None,
+                          (float(d.x0 / w), float(d.y0 / h), float(d.x1 / w), float(d.y1 / h))))
+    return RawFrame(boxes, camera, t)
 
   def update_in_path(self, model_v2) -> None:
     path_x, path_y = predicted_path(model_v2)

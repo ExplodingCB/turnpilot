@@ -383,3 +383,41 @@ def test_vectorized_tracker_keeps_the_old_ids():
 
   old = drive(lambda self, meas, camera: pairwise_associate(self.tracks, meas, camera))
   assert drive(SceneTracker.associate) == old and sum(map(len, old)) > 2000
+
+
+def test_raw_boxes_of_every_run_with_bearing_and_range():
+  # the unprotected left's gap rule reads every run's boxes, tracked or not (CRITIQUE REQUIRED 2): a car 120 m up the
+  # oncoming lane at 0.36 (under NEW_TRACK_CONF: never a track) is there with its bearing, its ground point and its nearest
+  # plausible range (the box bottom NEAR_PX lower)
+  trk = SceneTracker(CAMS, 'mici')
+  cal = calibration()
+  d = detections(trk, 'road', 1.0, [(CAR, 120., 3.6, 0.36)])
+  assert trk.update(d, cal, car_state(), now=1.0) == []
+  raw = trk.raw
+  assert raw is not None and trk.raw_new and raw.camera == 'road' and raw.t == 1.0 and len(raw.boxes) == 1
+  b = raw.boxes[0]
+  assert b.camera == 'road' and b.cls == 'car' and abs(b.conf - 0.36) < 1e-6
+  assert abs(b.bearing_deg - np.degrees(np.arctan2(3.6, 120.))) < 0.1
+  assert b.span_deg[0] < b.bearing_deg < b.span_deg[1]
+  assert b.xy is not None and abs(b.xy[0] - 120.) < 2. and abs(b.xy[1] - 3.6) < 0.3
+  assert b.near_m is not None and 60. < b.near_m < np.hypot(*b.xy)
+  assert all(0. <= v <= 1. for v in b.box) and len(b.box) == 4
+  # no new run: the same frame, not new
+  trk.update(d, cal, car_state(), now=1.05)
+  assert not trk.raw_new and trk.raw is raw
+  # far past ranging.MAX_RANGE, still ranged here (the band reads its nearest plausible range, never the cap)
+  d = detections(trk, 'road', 1.1, [(CAR, 260., 3.6, 0.5)], frame_id=1)
+  trk.update(d, cal, car_state(), now=1.1)
+  b = trk.raw.boxes[0]
+  assert trk.raw_new and b.xy is not None and b.xy[0] > 200. and b.near_m is not None and b.near_m < b.xy[0]
+  # the box bottom above the horizon: unranged, with its bearing
+  rows = np.array([[600., 100., 640., 130., 0.6, CAR]], dtype=np.float32)
+  msg = messaging.new_message('turnpilotDetections')
+  fill_detections(msg.turnpilotDetections, rows, 2, int(1.2e9), 'road', 0.005)
+  trk.update(msg.as_reader().turnpilotDetections, cal, car_state(), now=1.2)
+  b = trk.raw.boxes[0]
+  assert b.xy is None and b.near_m is None and np.isfinite(b.bearing_deg)
+  # the wide camera's run is the wide camera's
+  d = detections(trk, 'wide', 1.3, [(CAR, 20., 3.6, 0.5)], frame_id=3)
+  trk.update(d, cal, car_state(), now=1.3)
+  assert trk.raw.camera == 'wide' and trk.raw.boxes[0].camera == 'wide' and abs(trk.raw.boxes[0].xy[0] - 20.) < 1.5
