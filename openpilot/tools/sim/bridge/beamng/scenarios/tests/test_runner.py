@@ -189,6 +189,54 @@ CASES = [
 ]
 
 
+class FakeParams:
+  def __init__(self, clock):
+    self.clock, self.writes = clock, []
+
+  def put_bool(self, key, value):
+    self.writes.append((round(self.clock.t, 2), key, value))
+
+
+def test_each_run_starts_turnpilot_afresh(tmp_path, monkeypatch):
+  # BeamNG unprotected_left_gap6 (2026-10-28): the teleport back to the spawn left turnpilotd's route follower dead-reckoning
+  # the last run's junction (gaps are dead-reckoned through), so the left's hold latched 13 m early. Each run turns TurnPilot
+  # off at its start and on again RESET_S later, before its destination goes out: a fresh follower, latch and left
+  clock = Clock()
+  plan = catalog.build('unprotected_left')
+  world = World(plan, clock)
+  monkeypatch.setattr(run, 'time', SimpleNamespace(monotonic=clock.monotonic, strftime=lambda *a: 'now'))
+  monkeypatch.setattr(run, 'wall', clock.wall)
+  monkeypatch.setattr(run, 'Director', FakeDirector)
+  monkeypatch.setattr(FakeDirector, 'clock', clock)
+  monkeypatch.setattr(run, 'web_call', world.web)
+  monkeypatch.setattr(run.messaging, 'SubMaster', lambda services: FakeSM(world))
+  params = FakeParams(clock)
+  runner = run.Runner(plan, 2, str(tmp_path), 'http://127.0.0.1:8088', 'tok', 'host', 0, params=params)
+  b = bridge()
+  b.world.teleport = lambda pos, rot: (b.teleports.append(pos), setattr(world, 's', 0.0), setattr(world, 'hold', None))
+  b.simulator_state.position, b.simulator_state.bearing, b.simulator_state.wheel_speed = SimpleNamespace(x=0, y=0, z=0), 0.0, 0.0
+  posts = []
+  web = world.web
+
+  def recording_web(url, token, method, body=None):
+    posts.append((round(clock.t, 2), method))
+    return web(url, token, method, body)
+  monkeypatch.setattr(run, 'web_call', recording_web)
+  for _ in range(int(200 / DT)):
+    world.step(b)
+    if runner(b):
+      break
+    b.rk_frame += 1
+    clock.t += DT
+  offs = [t for t, k, v in params.writes if k == 'TurnPilotEnabled' and not v]
+  ons = [t for t, k, v in params.writes if k == 'TurnPilotEnabled' and v]
+  assert len(offs) == len(ons) == 2
+  for off, on in zip(offs, ons, strict=True):
+    assert on - off >= run.TP_RESET_S - 1e-6
+    post = next(t for t, m in posts if m == 'POST' and t >= off)
+    assert on <= post
+
+
 @pytest.mark.parametrize("name,runs,trigger,failure", CASES)
 def test_runs_end_to_end(tmp_path, monkeypatch, name, runs, trigger, failure):
   clock = Clock()

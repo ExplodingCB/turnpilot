@@ -46,6 +46,10 @@ from openpilot.tools.sim.bridge.beamng.scenarios.timing import GoWatch
 
 SETTLE_S = 4.         # after the teleport: the car is back in D and the GPS has caught up
 CLEAR_TIMEOUT_S = 5.  # wait this long for navd to drop the old route
+# TurnPilot is turned off at each run's start and on again this long after (turnpilotd reads TurnPilotEnabled once a second),
+# before the destination goes out: the teleport back would leave its route follower dead-reckoning the last run's junction
+# (gaps are dead-reckoned through) and its latch and left on it (BeamNG unprotected_left_gap6: a hold 13 m early)
+TP_RESET_S = 2.5
 ROUTE_TIMEOUT_S = 30.
 ENGAGE_TIMEOUT_S = 30.
 
@@ -84,11 +88,15 @@ class Runner:
   """The scenario, run in the bridge process at 100 Hz (BeamNGBridge scenario hook). Built in the parent and pickled into
   the bridge process, so everything live (SubMaster, the director thread and its client) starts on the first call."""
 
-  def __init__(self, plan: Plan, runs: int, out_dir: str, web_url: str, token: str, host: str, port: int, signal_tap: bool = True):
+  def __init__(self, plan: Plan, runs: int, out_dir: str, web_url: str, token: str, host: str, port: int, signal_tap: bool = True,
+               params=None):
+    """params: Params, for TurnPilot's reset between runs (TP_RESET_S); None leaves TurnPilot be."""
     if plan.road is None:
       raise ValueError(f"scenario {plan.name} has no road model: its runs could not be checked for the oncoming lane")
     self.plan, self.runs, self.out_dir, self.web_url, self.token = plan, runs, out_dir, web_url, token
     self.signal_tap = signal_tap
+    self.params = params
+    self.tp_off_t: float | None = None  # when this run turned TurnPilot off (TP_RESET_S)
     self.host, self.port = host, port
     self.sm = self.director = None
     self.results: list[dict] = []
@@ -140,7 +148,10 @@ class Runner:
         return True
       self.start_run(b)
     elif self.phase == 'settle':
-      if now - self.t0 > SETTLE_S and self.setup.done():
+      if now - self.t0 > max(SETTLE_S, TP_RESET_S) and self.setup.done():
+        if self.tp_off_t is not None:  # TurnPilot back on, a fresh one, before the destination goes out (TP_RESET_S)
+          self.params.put_bool('TurnPilotEnabled', True)
+          self.tp_off_t = None
         if self.setup.exception() is not None:
           self.end_run(b, 'error', f"setup: {self.setup.exception()!r}")
         elif plan.dest is None:
@@ -197,6 +208,9 @@ class Runner:
     self.end_check = score.EndCheck(plan.timeout_s, plan.end_on_stop_s)
     self.taps = GasTaps(self.signal_tap)
     self.watch = GoWatch()
+    if self.params is not None:
+      self.params.put_bool('TurnPilotEnabled', False)
+      self.tp_off_t = time.monotonic()
 
   def engage(self, b):
     b.set_speed_kph, b.rolling_start_kph, b.auto_engage = self.plan.speed_kph, self.plan.speed_kph * ROLL_FRACTION, True
@@ -398,7 +412,7 @@ def main():
   ui = start_ui_recording(os.path.join(run_dir, 'ui.mp4')) if args.record and not args.no_ui else None
   q: Queue = Queue()
   bridge = BeamNGBridge(cfg, scenario=Runner(plan, args.runs, run_dir, args.web.rstrip('/'), token, bargs.host, bargs.port,
-                                             signal_tap=args.signal_tap == 'on'))
+                                             signal_tap=args.signal_tap == 'on', params=params))
   with light_oracle(bargs):
     drive(bridge, q, ui, bargs)
   result = os.path.join(run_dir, 'result.json')
