@@ -299,6 +299,29 @@ def test_c14_a_phantom_far_end_flag_is_overruled_by_the_sidecars_direction(tmp_p
   assert [(c.kind, round(c.route_m, 1), c.osm_node) for c in controls] == [('stop', 100. - OFF, 901)]
 
 
+@pytest.mark.parametrize('case', ['beside the node', 'mid-edge', 'ours an orphan', 'ours a yield', 'ours undirected'])
+def test_b1_a_missing_sidecar_entry_for_us_never_drops_a_real_stop(tmp_path, case):
+  """Augusta Way (Highland Park IL, way 550724913 westbound): a mid-block footway crossing with a directed stop each side
+  of it, both inside our one Valhalla edge, which ends where the way does 30 m on (mid-edge). Ours has no junction
+  within 60 m along its own way, so a sidecar built without orphans has no entry for it; the other direction's governs a
+  junction and lies inside our edge. Valhalla's flag for us is the real stop. A missing entry for us doesn't prove there
+  is no stop for us: only the other direction's directed stop ON our edge's end node, with nothing of ours (any kind,
+  any direction tag, junction or none) on the edge, is the phantom (C14). Every other case keeps the flag (an extra stop
+  is cheap)."""
+  edges = [(0., 100., {}), (100., 150., {'stop': True, 'way_id': 77, 'forward': False}), (150., 400., {})]
+  side = {'beside the node': {'77:f': [entry('stop', 152.3, junction=900)]},
+          'mid-edge': {'77:f': [entry('stop', 120., junction=900)]},
+          # on our end node, but ours is there too: an orphan (no junction within 60 m), a yield, an undirected stop
+          'ours an orphan': {'77:f': [entry('stop', 150., junction=900)], '77:b': [entry('stop', 146., junction=0)]},
+          'ours a yield': {'77:f': [entry('stop', 150., junction=900)], '77:b': [entry('yield', 146., junction=0)]},
+          'ours undirected': {'77:f': [entry('stop', 150., junction=900), entry('stop', 140., junction=902, evidence='mid_undirected')]},
+          }[case]
+  with patch.object(controls_module, 'cloudlog') as log:
+    controls, status = route_controls(StubValhalla(edges, every=2.), steps(every=2.), sidecar_dir=osm_dir(tmp_path, side))
+  assert status == 'ok' and [(c.kind, round(c.route_m, 1)) for c in controls] == [('stop', 150. - OFF)]
+  assert not any('phantom' in str(c.args[0]) for c in log.info.call_args_list)
+
+
 def test_the_sidecar_entry_for_an_edge_is_the_one_whose_line_is_inside_it(tmp_path):
   """A way passes several junctions: its key has a list, and each edge takes the entry whose line projects inside its
   own span, within a few metres of the route (never one off to the side)."""

@@ -12,10 +12,13 @@ quarter of the OSM-mapped stop approaches (research_allway.md section 0). Its en
 ("<way_id>:<f|b>", a list, since a way passes several junctions) are the edge's when the entry's line, the OSM stop node,
 projects inside the edge's span on the route within LINE_TOL_M of it (past SPAN_START_M from its start, which is the
 previous edge's end), or, for a stop on the junction node (no line), when that node is within NODE_TOL_M of the edge's
-end. The edge's stops and yields are the union of both. One exception: a stop or yield Valhalla flags that the sidecar
-doesn't map for this direction, while it maps one for the other direction inside this edge with an explicit direction tag,
-is the phantom Valhalla makes of a stop it can't direct (its far-end flag): dropped, and logged. An undirected stop's
-other end may be its real junction, so there Valhalla's flag stays.
+end. The edge's stops and yields are the union of both. One exception: Valhalla flags both directions of a stop on a
+graph node it can't direct (a crosswalk's, shared with a footway), so the other direction's directed stop sitting ON the
+edge's end node (within PHANTOM_NODE_M) makes a phantom of our flag of its kind there: dropped, and logged, but only when
+the sidecar has nothing of ours on the edge (any kind, directed, both-ways, undirected, with a junction or none) and no
+undirected or both-ways one keyed the other way inside it (phantom()). A missing entry for us proves nothing by itself
+(the sidecar may not have tied the stop to a junction), so every other case keeps Valhalla's flag: an extra stop is
+cheap, a dropped real one isn't.
 Internal-intersection edges (inside a divided road's junction) are searched too; a control on one is the preceding
 junction's (the end of the last edge before them), so a stop mapped in a median stops the car before the first
 carriageway. One edge end is one node, and its kinds are one control, the signal over the stop over the yield; controls at
@@ -56,6 +59,7 @@ MAP_MARGIN_M = 1.       # m short of the line the car stops
 PARTIAL_UNMATCHED = 0.10
 LINE_TOL_M = 5.         # m: a sidecar line further than this from the route isn't on it
 NODE_TOL_M = 5.         # m: a junction-node control's node this close to an edge's end is that end
+PHANTOM_NODE_M = 1.     # m: the other direction's directed stop this close to an edge's end node is on that node (C14)
 SPAN_START_M = 0.5      # m: a line this close past an edge's start is on the node it shares with the edge before
 EDGE_END_M = 1.         # m: a line this far past an edge's end still projects onto it
 LOCATE_BACK_M = 1.      # m back from an edge's end the locate point goes, so it is on the edge, not the junction node
@@ -403,6 +407,22 @@ def osm_at(osm, entry: dict, pts, cum, begin_m: float, end_m: float, end_point) 
   return end_m if pos is not None and haversine(pos, end_point) <= NODE_TOL_M else None
 
 
+def phantom(osm, kind: str, other: str, hits, pts, cum, begin_m: float, end_m: float, end_point) -> bool:
+  """Valhalla's `kind` on an edge is the phantom it makes of a stop on a graph node it can't direct (C14): only when the
+  sidecar has the other direction's directed `kind` ON the edge's end node (within PHANTOM_NODE_M) and nothing of ours
+  on the edge, whatever its kind (hits), nor an undirected or both-ways one keyed to the other direction there. The
+  sidecar leaving our direction out proves nothing by itself (a stop it can't tie to a junction, an old shard), so every
+  other case keeps the flag: an extra stop is cheap, a dropped real one isn't."""
+  if hits:
+    return False
+  entries = osm.entries(other)
+  if any(x.get('evidence') in ('mid_undirected', 'mid_both') and x.get('kind') in ('stop', 'yield') and
+         osm_at(osm, x, pts, cum, begin_m, end_m, end_point) is not None for x in entries):
+    return False
+  return any(x.get('kind') == kind and x.get('evidence') == 'mid_directed' and x.get('line') and
+             haversine((float(x['line'][0]), float(x['line'][1])), end_point) <= PHANTOM_NODE_M for x in entries)
+
+
 def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = False, audit: list | None = None) -> tuple[list[Control], str]:
   """ahead: the road ahead of the car (controls_ahead), not a route: its end is no destination."""
   pts = route_shape(steps)
@@ -451,12 +471,11 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
           hits.append((entry, m))
       other = f"{e.get('way_id')}:{'b' if e.get('forward') else 'f'}"
       for kind in ('stop', 'yield'):
-        if kind in valhalla and not any(h[0]['kind'] == kind for h in hits) and \
-           any(x.get('kind') == kind and x.get('evidence') == 'mid_directed' and x.get('line') and
-               osm_at(osm, x, pts, cum, end_m - span, end_m, tpts[end_i]) is not None for x in osm.entries(other)):
+        if kind in valhalla and phantom(osm, kind, other, hits, pts, cum, end_m - span, end_m, tpts[end_i]):
           valhalla.remove(kind)
           phantoms.append(kind)
-          cloudlog.info(f"turnpilot controls: Valhalla's {kind} on {key} at {end_m:.0f} m is a phantom: the OSM sidecar's is directed {other}")
+          cloudlog.info(f"turnpilot controls: Valhalla's {kind} on {key} at {end_m:.0f} m is a phantom: the OSM sidecar's is " +
+                        f"directed {other}, on the edge's end node")
     if audit is not None and (hits or phantoms or 'stop' in valhalla or 'yield' in valhalla):
       audit.append({'edge': i, 'key': key, 'internal': internal, 'anchor': anchor, 'end_m': end_m, 'valhalla': list(valhalla),
                     'phantom': phantoms, 'osm': [dict(entry, m=m) for entry, m in hits]})
