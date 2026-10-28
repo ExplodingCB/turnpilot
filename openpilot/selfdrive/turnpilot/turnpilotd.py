@@ -74,6 +74,16 @@ that comes and goes meanwhile (a walker crossing) is no new go. The turn isn't c
 driver drives it. A go in the junction (a walker's hold released partway round) is never withdrawn: stopping there is worse
 than finishing the turn, so TurnPilot never holds the car in it; it keeps the post-go caps, which only lower speed, and the
 stall's handback without a hold.
+The route's unprotected left (map_controls.unprotected_turn) is driven by unprotected_left.py (DESIGN phase 4 G4) under
+TurnPilotAutoLeft: auto (the default: Kellen, 2026-10-28, "No it has to ship taking the turn"), announce or off (G1's
+handback at the line). Each frame it is fed the hold line's latch and the scene from the last frame, this frame's raw
+detector run (main(): SceneTracker.raw), the car's yaw toward the turn (track_yaw) and the opposing road's mapped speed and
+lanes, and checked against TurnPilotLeftRangeM (the detector's proven range, provisional: ROAD_RANGE_M). Its command goes to
+the latch (map_controls.LeftCommand: hold, creep, go, or a fault's handback), its own hold after a withdrawn go joins the
+scene's stops, and no turn pulse goes on its approach (may_start off; turn_skip's pulse_at_go): its go from the line is the
+first. It asks modeld for the road camera (turnpilotPlan.detectorView) and publishes its state (unprotectedLeft); its wait
+is silent (waitingForGap, creepingForView), its go a chime, and it hands back (leftUndecidedTakeControl) only for a fault.
+Its go is TurnPilot's like any hold's: the left's post-go profile and LEFT_NO_MOVE_S below.
 Standing engaged with nothing of TurnPilot's holding the car (no shouldStop, no cap biting), no lead from the model within
 STOPPED_LEAD_M (one further on doesn't hold a standing car), gas and brake off, the model stopped on its own: said on the
 status line after STOPPED_NOTE_S (STOPPED_NOTE), and handed back loudly (controlPrompt carStoppedTakeControl) after
@@ -108,7 +118,7 @@ from openpilot.selfdrive.turnpilot.handback import Handback
 from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, CLEAR_DESIRE, CONTROL_STATUS_ALERTS, TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.detector.light_state import LIGHT_MODE_DEFAULT, camera_lights_mode
 from openpilot.selfdrive.turnpilot.map_controls import (CAMERA_STALE_S, KEEP_TURN, LATCH_PAST_M, MAP_MARGIN_M, PROTECT_PAST_M, YELLOW_DECEL,
-                                                         YELLOW_DECEL_MAX, MapControlPolicy, camera_light_input, light_input,
+                                                         YELLOW_DECEL_MAX, LeftCommand, MapControlPolicy, camera_light_input, light_input,
                                                          turn_stop_feasible, unprotected_turn)
 from openpilot.selfdrive.turnpilot.lane_planner import (OPENPILOT_SIGNALS_BRANDS, LanePlanner, lane_change_window, lane_mismatch,
                                                          model_lanes_from_msg)
@@ -118,6 +128,7 @@ from openpilot.selfdrive.turnpilot.scene.tracker import STALE_S, SceneTracker, d
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, NO_ACCEL_CAP, ScenePolicy
 from openpilot.selfdrive.turnpilot.turn_skip import TurnSkip, can_make_turn
 from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
+from openpilot.selfdrive.turnpilot.unprotected_left import AUTO, OFF, ROAD_RANGE_M, LeftInput, UnprotectedLeft, left_mode_for
 
 Desire = log.Desire
 State = custom.TurnpilotPlan.State
@@ -186,6 +197,8 @@ NO_MOVE_REASON = "Can't start the turn: take control"
 # scene not committed to the junction nor the driver having taken over into it. Nearer, the car is in the junction: never
 # held there, the stall's handback covers it (skeptic G3: a walker's hold released 40-50 deg in froze the car there)
 GO_LINE_M = HOLD_LINE_M + MAP_MARGIN_M - LATCH_PAST_M
+LEFT_RANGE_MAX_M = 400.  # TurnPilotLeftRangeM is clamped to 0..this
+LEFT_HOLDS_PULSE = ('approach', 'waitGap', 'creep', 'undecided', 'announce')  # the left's states with no turn pulse yet
 # the junction rules' road frame (scene_policy.road_frame): the car's heading change toward its turn, counted from this far
 # out (the road is taken as straight over its last TURN_DESIRE_LEAD_M, where the turn's first pulse would go)
 YAW_FROM_M = TURN_DESIRE_LEAD_M
@@ -229,6 +242,9 @@ class TurnPilot:
     self.post_go_profile = POST_GO_DEFAULT  # TurnPilotPostGoProfile (main()): a standstill turn's post-go profile
     self.left_go_profile = LEFT_GO_PROFILE  # TurnPilotLeftGoProfile (main()): an unprotected turn's
     self.no_move_s = NO_MOVE_S  # TurnPilotNoMoveS (main()): a standstill turn's no-move limit (an unprotected turn's is fixed)
+    self.auto_left = AUTO  # TurnPilotAutoLeft (main()): the unprotected left's mode (unprotected_left.py)
+    self.left_range_m = ROAD_RANGE_M  # TurnPilotLeftRangeM (main()): the detector's proven range its R_req is checked against
+    self.left_now = None  # this frame's unprotected left decision (unprotected_left.LeftDecision), once update() has made it
     self._rf_ticked = self._yaw_ticked = False  # update() dead-reckoned the route, and counted the yaw, this frame
     self.reset()
 
@@ -251,6 +267,7 @@ class TurnPilot:
       self.waited_s = 0.           # how long modeld has run since TurnPilot was turned on, before the first detection
       self.disengaged_s = 0.       # ...of it with openpilot disengaged
       self.engaged_wait_s = 0.     # time since the first engaged frame, before the first detection
+      self.left = UnprotectedLeft()  # the autonomous unprotected left (unprotected_left.py); kept through a fault, as its latch
     self.stopped_s = 0.            # standing engaged with nothing holding the car (carStoppedTakeControl)
     self.stall_s = 0.              # standing in the turn after its go, nothing holding the car (stalledTakeControl)
     self.missed_t = 0.             # turnMissed is held while this counts down
@@ -379,11 +396,11 @@ class TurnPilot:
       plan.laneChangeAbort = self.stop_abort
 
   def update(self, sm, scene, enabled: bool, shadow: bool, driver_signals: bool = True, right_hand_traffic: bool = True, paint=(),
-             paint_rule: bool = True, inputs_valid: bool = True):
+             paint_rule: bool = True, inputs_valid: bool = True, raw=None):
     """A turnpilotPlan message from sm's carState, navInstruction and modelV2, a TurnpilotScene, and the lane paint of
     modelV2's four lane lines (empty when unknown). paint_rule: TurnPilotLanePaintActive; inputs_valid: carState and
-    modelV2 pass their checks."""
-    self.handback_now = self.scene_now = self.map_now = None
+    modelV2 pass their checks; raw: the detector run that arrived this frame (scene.tracker.RawFrame), or None."""
+    self.handback_now = self.scene_now = self.map_now = self.left_now = None
     msg = messaging.new_message('turnpilotPlan')
     plan = msg.turnpilotPlan
     plan.shadow = shadow
@@ -453,13 +470,19 @@ class TurnPilot:
         stop_infeasible = True
     elif engaged and upcoming is None:
       turn = KEEP_TURN  # the route gone with the handback: it carries on, dead-reckoned
-    mapd = self.map_update(sm, v_ego, cs.gasPressed, turn)
+    left_cmd = self.unprotected_left(turn, upcoming, rf, v_ego, acting, objects, raw)
+    mapd = self.map_update(sm, v_ego, cs.gasPressed, turn, left_cmd)
     took_over = cs.gasPressed and not sm['carControl'].enabled  # the driver driving, never a go (module docstring)
+    # the autonomous left holds its turn's pulse until its go from the line (unprotected_left.py: approach), so its first pulse
+    # is that go, never too late (turn_skip.py: pulse_at_go)
+    hold_pulse = self.left_now is not None and self.left_now.state in LEFT_HOLDS_PULSE
+    pulse_at_go = self.left_now is not None and self.left_now.state != 'off'
 
     # too fast to make the turn: skipped, so nothing below acts on it (no desire, no cap, no turn holds or lane changes)
     desire_out = self.desires.maneuver_id == rf.maneuver_id and self.desires.started
     skip = self.skip.update(upcoming, rf.distance, rf.maneuver_id, v_ego, desire_out, right_hand_traffic, lat_active,
-                            rf.ahead, rf.ahead_distance, stop_d=self.map_controls.stop_ahead(), stop_infeasible=stop_infeasible)
+                            rf.ahead, rf.ahead_distance, stop_d=self.map_controls.stop_ahead(), stop_infeasible=stop_infeasible,
+                            pulse_at_go=pulse_at_go)
     maneuver = None if skip.skipped else upcoming
     # navd reroutes on it and selfdrived alerts: only while TurnPilot is driving the route (handback outranks it). A turn
     # just past a bend that will be skipped once it is the maneuver is announced now, before its junction (turn_skip.py)
@@ -473,8 +496,9 @@ class TurnPilot:
       cap_on = upcoming  # the skipped turn's pulse may have been taken before it was cleared: never sped up into it
 
     # the scene's holds only ever brake, so they keep the real maneuver through a handback
+    left_stops = self.left_now.stops if self.left_now is not None else []
     decision = self.scene_now = self.scene.update(objects, available, maneuver, rf.distance, v_ego, right_hand_traffic, rf.maneuver_id,
-                                                 took_over, extra_stops=mapd.stops, heading_deg=self.approach_yaw_deg)
+                                                 took_over, extra_stops=mapd.stops + left_stops, heading_deg=self.approach_yaw_deg)
     # a hold let go with the car standing (the walker cleared, a stop's go): the model won't pull away on its own, and the
     # turn's pulse is long forgotten, so it goes again in this very plan, the one that lets the car go: held, the desire
     # was dropped to none, so it is a fresh edge (desire_timing.py). BeamNG: let go a frame before its pulse, the car drove
@@ -488,7 +512,7 @@ class TurnPilot:
     desire = self.desires.update(desire_on, rf.distance, rf.maneuver_id, rf.passed, v_ego, cs.steeringAngleDeg,
                                  lanes.keep_left_ok, lanes.keep_right_ok, DT_MDL, default_yaw_rate(cs, model),
                                  lat_active=lat_active, replaced=rf.replaced,
-                                 may_start=skip.feasible_now and not held, go=self.release_go,
+                                 may_start=skip.feasible_now and not held and not hold_pulse, go=self.release_go,
                                  holding=decision.should_stop or withdrawn)
     self._yaw_ticked = True
     d = self.desires
@@ -548,6 +572,7 @@ class TurnPilot:
     plan.reason = decision.reason or (TURN_MISSED_REASON if plan.turnMissed else "") or lane_reason or mapd.reason or \
       (NO_JUNCTION_DATA_REASON if no_junction_data else "")
     fill_map_control(plan, mapd)
+    self.fill_left(plan, decision)
     if decision.hard_brake:  # a confirmed track's hard stop outranks the map's alerts (scene_policy.py)
       plan.controlAlert = 'hardBrake'
     stalled = self.stalled_in_turn(sm, cs, v_ego, acting, decision, mapd)
@@ -608,6 +633,40 @@ class TurnPilot:
       self.post_go = None  # missed straight on: not held to the profile's speed down the road
       cloudlog.event("turnpilot_turn_missed", error=True, turned_deg=round(d.turned_deg, 1), v_ego=round(v_ego, 2),
                      distance=round(rf.distance, 1))
+
+  def unprotected_left(self, turn, upcoming, rf, v_ego: float, acting: bool, objects, raw) -> LeftCommand | None:
+    """This frame's autonomous unprotected left (unprotected_left.py; left_now) for the route's unprotected turn the car is
+    taking (turn, map_controls' tuple), and its command for the hold line's latch. TurnPilotAutoLeft off, or TurnPilot not
+    acting (handed back): off, the latch handed back as G1's. Fed the last frame's latch and scene (whether they held)."""
+    mode = self.auto_left if acting else OFF
+    if not isinstance(turn, tuple) or mode == OFF:
+      self.left.update(LeftInput(OFF, rf.maneuver_id, 0, 0., v_ego, False, None, [], 0., None, None), DT_MDL)
+      return None if not isinstance(turn, tuple) else LeftCommand(OFF)
+    tc = self.map_controls.turn
+    held = tc is not None and tc.held and tc.key[1] == int(turn[0])
+    scene = self.scene
+    inp = LeftInput(mode, rf.maneuver_id, upcoming.side, rf.distance, v_ego, held, raw, objects, self.approach_yaw_deg,
+                    upcoming.opposing_speed or None, upcoming.opposing_lanes or None, self.left_range_m,
+                    scene_clear=scene.junction is None and not scene.carried, junction_uncertain=rf.junction_spread > UNCERTAIN_M,
+                    go_withdrawn=self.go_withdrawn, committed=rf.maneuver_id in (scene.committed_id, scene.released_id))
+    d = self.left_now = self.left.update(inp, DT_MDL)
+    return LeftCommand(mode, d.go, d.creep_m, d.state == 'undecided', d.reason)
+
+  def fill_left(self, plan, decision) -> None:
+    """turnpilotPlan.detectorView and unprotectedLeft, and the left's own prompt and alert where the map's say nothing."""
+    d = self.left_now
+    if d is None:
+      return
+    plan.detectorView = d.view if d.view != 'none' else 'auto'
+    ul = plan.unprotectedLeft
+    ul.state, ul.tReq, ul.rReq, ul.vLimit, ul.rangeM = d.state, float(d.t_req), float(d.r_req), float(d.v_limit), float(self.left_range_m)
+    ul.clearS, ul.blockers, ul.viewBlocked, ul.crosswalkClear = float(d.clear_s), min(d.blockers, 255), d.view_blocked, d.crosswalk_clear
+    ul.creepM, ul.why = float(d.creep_m), d.why or d.verdict
+    if str(plan.controlPrompt) == 'none' and d.prompt != 'none':
+      plan.controlPrompt = d.prompt
+      plan.reason = decision.reason or d.reason
+    if d.alert != 'none' and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS:
+      plan.controlAlert = d.alert
 
   def track_yaw(self, maneuver, rf, yaw_rate: float) -> None:
     """approach_yaw_deg: how far the car has turned toward the route's turn since it came within YAW_FROM_M of it, for the
@@ -698,9 +757,9 @@ class TurnPilot:
                      near=[c.kind for c in near])
     return SIGNAL_STOPPED_REASON if any(c.kind == 'signal' for c in near) else STOPPED_REASON
 
-  def map_update(self, sm, v_ego: float, gas_pressed: bool, turn=None):
-    """This frame's MapControlPolicy decision, from navInstruction's controls and turnpilotLights (once a frame), and the
-    route's unprotected turn (MapControlPolicy.update's turn)."""
+  def map_update(self, sm, v_ego: float, gas_pressed: bool, turn=None, left: LeftCommand | None = None):
+    """This frame's MapControlPolicy decision, from navInstruction's controls and turnpilotLights (once a frame), the
+    route's unprotected turn (MapControlPolicy.update's turn) and the unprotected left's command for it."""
     if self.map_now is not None:
       return self.map_now
     data = getattr(sm, 'data', {})
@@ -712,7 +771,7 @@ class TurnPilot:
     lights.camera = self.camera_lights(sm, data)
     self.map_controls.yellow_decel = self.yellow_decel
     self.map_now = self.map_controls.update(sm['navInstruction'], sm.updated['navInstruction'], sm.valid['navInstruction'], v_ego,
-                                            gas_pressed, lights, DT_MDL, turn=turn)
+                                            gas_pressed, lights, DT_MDL, turn=turn, left=left)
     return self.map_now
 
   def camera_lights(self, sm, data):
@@ -902,6 +961,35 @@ def post_go_profile_for(params, key: str, default: str) -> str:
   return value
 
 
+def auto_left_for(params) -> str:
+  """TurnPilotAutoLeft: off, announce or auto (unprotected_left.py); auto if unset, unknown (said) or unknown to this build."""
+  try:
+    value = params.get("TurnPilotAutoLeft")
+  except UnknownKeyName:
+    log_error(f"turnpilotd: TurnPilotAutoLeft unknown to this build's params, {AUTO}; run scons")
+    return AUTO
+  mode = left_mode_for(value)
+  raw = value.decode() if isinstance(value, bytes) else value
+  if raw is not None and raw != mode:
+    log_error(f"turnpilotd: TurnPilotAutoLeft {raw!r} is no mode (off, announce, auto), {AUTO} instead")
+  return mode
+
+
+def left_range_for(params) -> float:
+  """TurnPilotLeftRangeM, the detector's proven range for oncoming traffic, clamped to 0..LEFT_RANGE_MAX_M; ROAD_RANGE_M (the
+  provisional, unmeasured value) if unset, not a number (said) or unknown to this build."""
+  try:
+    value = params.get("TurnPilotLeftRangeM")
+  except UnknownKeyName:
+    log_error("turnpilotd: TurnPilotLeftRangeM unknown to this build's params; run scons")
+    return ROAD_RANGE_M
+  try:
+    return min(max(float(value), 0.), LEFT_RANGE_MAX_M) if value is not None else ROAD_RANGE_M
+  except (TypeError, ValueError):
+    log_error(f"turnpilotd: TurnPilotLeftRangeM {value!r} isn't a number, {ROAD_RANGE_M} m instead")
+    return ROAD_RANGE_M
+
+
 def no_move_for(params) -> float:
   """TurnPilotNoMoveS, clamped to NO_MOVE_S..NO_MOVE_MAX_S; NO_MOVE_S if unset, unreadable or unknown to this build."""
   try:
@@ -993,6 +1081,8 @@ def main():
       tp.post_go_profile = post_go_profile_for(params, "TurnPilotPostGoProfile", POST_GO_DEFAULT)
       tp.left_go_profile = post_go_profile_for(params, "TurnPilotLeftGoProfile", LEFT_GO_PROFILE)
       tp.no_move_s = no_move_for(params)
+      tp.auto_left = auto_left_for(params)
+      tp.left_range_m = left_range_for(params)
       if params.get("ChestnutActive") is False:  # None: no big model expected this drive
         tp.big_model_failed(enabled)
 
@@ -1014,8 +1104,9 @@ def main():
     paint = lane_paint_from_msg(sm['turnpilotDetections'].lanePaint) if scene.available and sm.seen['turnpilotDetections'] else ()
     # the lane planner takes this frame's checks (an offered change aborts at once); the plan's valid has a grace
     valid = sm.all_checks(['carState', 'modelV2'])
+    raw = tracker.raw if tracker is not None and tracker.raw_new else None  # this frame's run, for the unprotected left
     msg = tp.plan(sm, scene, enabled, shadow, driver_signals, right_hand_traffic, paint, paint_rule, valid, long_control=long_control,
-                  disengage_on_accel=disengage_on_accel)
+                  disengage_on_accel=disengage_on_accel, raw=raw)
     invalid_frames = 0 if valid else invalid_frames + 1
     msg.valid = invalid_frames < PLAN_INPUT_GRACE_FRAMES
     pm.send('turnpilotPlan', msg)

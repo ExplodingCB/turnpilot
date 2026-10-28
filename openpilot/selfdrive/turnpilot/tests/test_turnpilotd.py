@@ -57,6 +57,10 @@ class Sim:
   def __init__(self, maneuvers, cruise=13., nav_lanes=None, model_lanes=(0, 0), shadow=False, driver_signals=False, paint=(),
                paint_rule=True, long_control=True, controls=(), controls_status=None, disengage_on_accel=True):
     self.navd, self.tp, self.sm = FakeNavd(maneuvers, nav_lanes, controls=controls, controls_status=controls_status), TurnPilot(), FakeSM()
+    # the hold line's handback at an unprotected left (G1's), for the tests here; the autonomous left (TurnPilotAutoLeft auto,
+    # the default) is test_turnpilotd_left's
+    self.tp.auto_left = 'off'
+    self.raw = None  # the detector's raw boxes (scene.tracker.RawFrame) of this frame's run, a function of the sim, or None
     self.lights = None  # turnpilotLights to send each frame, a function of the sim
     self.paint, self.paint_rule, self.inputs_valid = paint, paint_rule, True
     self.s, self.v, self.cruise, self.t = 0., cruise, cruise, 0.
@@ -97,7 +101,7 @@ class Sim:
     if self.lights is not None:
       self.sm.put('turnpilotLights', self.lights(self))
     plan = self.tp.plan(self.sm, scene(objects, available), True, self.shadow, self.driver_signals, paint=self.paint,
-                        paint_rule=self.paint_rule, inputs_valid=self.inputs_valid,
+                        paint_rule=self.paint_rule, inputs_valid=self.inputs_valid, raw=self.raw(self) if self.raw is not None else None,
                         long_control=self.long_control, disengage_on_accel=self.disengage_on_accel).as_reader().turnpilotPlan
     a = min(plan_accel(plan.accelCap, plan.speedCap, self.v), (self.cruise - self.v) / 2., 1.5)
     if plan.shouldStop:
