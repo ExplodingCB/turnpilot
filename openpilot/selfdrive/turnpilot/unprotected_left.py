@@ -27,11 +27,13 @@ A left whose R_req is past the detector's proven range (TurnPilotLeftRangeM) is 
 route time (turn_skip: unprotectedRange, chimed, navd reroutes) and it is undecided here should it reach its hold. Held
 short of its line (the latch reaches LATCH_NEAR_M short), where the longer crossing puts R_req past the range, the car rolls
 up to the line first (ROLL_UP_M; undecided only after ROLL_UP_STALL_S standing in it).
-The window (CLEAR_WINDOW_S) counts only road camera runs: a run gap over ROAD_FRESH_S, or the scene's holds, start it over.
+The window (CLEAR_WINDOW_S) counts only road camera runs, from the hold (hold, then judge: never carried from the approach):
+a run gap over ROAD_FRESH_S, or the scene's holds, start it over.
 
 The view is blocked by an occluder: a velocity-trusted vehicle track standing still in the junction (the opposing
 left-turner, a parked truck) whose box hides the oncoming lanes beyond it out to R_req. Its own box isn't traffic (it
-would never clear). Blocked, with the band otherwise clear, the car creeps (map_controls: CREEP_SPEED, CREEP_ACCEL) up to
+would never clear): the raw box overlapping its box in the same camera, or within MATCH_LATERAL_M of it across the ray.
+Blocked, with the band otherwise clear, the car creeps (map_controls: CREEP_SPEED, CREEP_ACCEL) up to
 CREEP_MAX_M past its line, never nearer than CREEP_SHORT_M short of the oncoming lanes (ONCOMING_ENTRY_M), and stops
 creeping where the view clears or a vehicle comes into the band. The exit crosswalk and the junction box (a car standing
 in the exit lane would leave the car in the oncoming lanes) must be clear too, and the scene holding nothing.
@@ -85,8 +87,9 @@ OCCLUDER_Y_FAR_M = 12.     # ...and this far to the turn side
 OCCLUDER_WIDTH_M = 2.
 LANE_NEAR_M, LANE_FAR_M = 1.8, 9.   # the oncoming lanes it may hide, to the turn side
 MATCH_IOU = 0.3            # a raw box is a track's in the same camera at this overlap...
-MATCH_GATE_M = 2.          # ...or within this (plus MATCH_GATE_FRAC of its range) of its ground position
+MATCH_GATE_M = 2.          # ...or within this (plus MATCH_GATE_FRAC of its range) of its ground position along the ray,
 MATCH_GATE_FRAC = 0.15
+MATCH_LATERAL_M = 1.       # and this across it: a car passing in the lane beside a standing turner is traffic
 
 CREEP_MAX_M = 4.           # past the line
 CREEP_SHORT_M = 1.         # never nearer the oncoming lanes (ONCOMING_ENTRY_M) than this
@@ -230,7 +233,11 @@ def matches(b: RawBox, obj) -> bool:
     return True
   if b.xy is None:
     return False
-  return math.hypot(b.xy[0] - obj.x, b.xy[1] - obj.y) <= MATCH_GATE_M + MATCH_GATE_FRAC * math.hypot(*b.xy)
+  rng = math.hypot(*b.xy)
+  ux, uy = b.xy[0] / max(rng, 1e-6), b.xy[1] / max(rng, 1e-6)
+  dx, dy = obj.x - b.xy[0], obj.y - b.xy[1]
+  along, across = dx * ux + dy * uy, -dx * uy + dy * ux  # mono range error is along the ray; across it, a lane is 3.6 m
+  return abs(along) <= MATCH_GATE_M + MATCH_GATE_FRAC * rng and abs(across) <= MATCH_LATERAL_M
 
 
 def view_blocked(occ, heading_deg: float, side: int, reach_m: float) -> bool:
@@ -338,14 +345,16 @@ class UnprotectedLeft:
     if self.went:
       return self._after_go(inp, out, raw_blockers, dt)
 
-    certified = self.clear_s >= CLEAR_WINDOW_S - 1e-6 and not blocked_view and crosswalk and inp.scene_clear
     standing = inp.held or self.hold_here
     if not standing:
       out.state = self.state = 'approach'
       out.view = 'road' if inp.distance <= VIEW_FROM_M else 'none'
       return out
     if self.latch_d is None:
-      self.latch_d = inp.distance
+      # held at the line: the window starts here (hold, then judge), never carried over from the approach
+      self.latch_d, self.clear_s = inp.distance, 0.
+      out.clear_s = 0.
+    certified = self.clear_s >= CLEAR_WINDOW_S - 1e-6 and not blocked_view and crosswalk and inp.scene_clear
     out.view = 'roadAndWide'
     # held short of its line (the latch reaches LATCH_NEAR_M short of it), where the longer crossing puts R_req past the
     # range: rolled up to the line first (the latch's creep), where it is judged (BeamNG: held 16 m out, R_req 164 m)

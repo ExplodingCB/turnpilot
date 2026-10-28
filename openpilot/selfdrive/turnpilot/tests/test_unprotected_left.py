@@ -346,3 +346,29 @@ def test_held_short_of_its_line_it_rolls_up_before_judging_the_reach():
   j = Junction()
   d = j.wait(ROLL_UP_STALL_S + 0.5, distance=16., v=0.)
   assert d.state == 'undecided' and d.why == 'range'
+
+
+def test_the_window_starts_at_the_hold_line():
+  # DESIGN's flow is hold, then judge: the clear window the approach ran up never carries into the hold, so the car stands
+  # at its line CLEAR_WINDOW_S at least before a go, never going on the frame it latches
+  j = Junction()
+  j.held = False
+  j.wait(CLEAR_WINDOW_S + 1., distance=30., v=5.)
+  j.held = True
+  d = j.step(distance=HOLD_D, v=0.)
+  assert not d.go and d.clear_s < 0.1
+  j.wait(CLEAR_WINDOW_S - 0.2, distance=HOLD_D)
+  assert not any(x.go for x in j.decisions)
+  j.wait(0.4, distance=HOLD_D)
+  assert any(x.go for x in j.decisions)
+
+
+def test_only_an_occluders_own_box_is_exempt():
+  # a car passing in the through lane beside a standing opposing left-turner is traffic, not the turner's box: the ground
+  # gate alone (2 m + 15% of range) would take one 3.6 m across for it
+  turner = oncoming(HOLD_D + 12., 3.6, vx=0., trackId=7, box=[0.5, 0.4, 0.6, 0.5], camera='road')
+  passing = raw(HOLD_D + 12., 7.2)
+  from openpilot.selfdrive.turnpilot.unprotected_left import matches
+  assert not matches(passing, scene([turner]).objects[0])
+  same = raw(HOLD_D + 12.5, 3.9)
+  assert matches(same, scene([turner]).objects[0])
