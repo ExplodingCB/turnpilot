@@ -24,8 +24,10 @@ of straight ahead, break the clear window. It is velocity-free (one pixel of box
           + EXTRA_LANE_S per opposing lane past the first (unknown: two)
   R_req = v_limit x SPEED_MARGIN x T_req + the conflict point's distance (the maneuver point + CONFLICT_PAST_M)
 v_limit is the opposing road's mapped limit (navInstruction maneuverOpposingSpeed), DEFAULT_OPPOSING_SPEED when unknown.
-A left whose R_req is past the detector's proven range (TurnPilotLeftRangeM) is never attempted: turnpilotd skips it at
-route time (turn_skip: unprotectedRange, chimed, navd reroutes) and it is undecided here should it reach its hold. Held
+A left whose R_req is past the detector's proven range (TurnPilotLeftRangeM; unset, unmeasured: none, so every left) is
+never attempted: turnpilotd skips it at route time (turn_skip: unprotectedRange, chimed, navd reroutes) and it is undecided
+here should it reach its hold. Nothing here checks the junction's own sightline (a curve or crest short of R_req): the
+demo junction is chosen by eye for a clear sightline of R_req or more. Held
 short of its line (the latch reaches LATCH_NEAR_M short), where the longer crossing puts R_req past the range, the car rolls
 up to the line first (ROLL_UP_M; undecided only after ROLL_UP_STALL_S standing in it).
 The window (CLEAR_WINDOW_S) counts only road camera runs, from the hold (hold, then judge: never carried from the approach):
@@ -80,10 +82,13 @@ UNKNOWN_LANES = 2          # opposing lanes when the map doesn't say
 SPEED_MARGIN = 1.3         # x the mapped limit (CRITIQUE REQUIRED 4: 15 mph over a 35 mph limit needs ~1.4)
 DEFAULT_OPPOSING_SPEED = 20.1  # m/s (45 mph) when the opposing road's limit isn't mapped
 CONFLICT_PAST_M = 3.       # the first oncoming lane's conflict point, past the maneuver point
-# the detector's proven range for oncoming traffic on the road camera at the YOLO input (TurnPilotLeftRangeM). PROVISIONAL
-# and unmeasured on real comma frames: a car 1.8 m wide is ~6.5 px at the 640x384 input at 150 m. It takes a 25 mph left
-# (R_req 134-141 m) and no faster one; 35 mph needs ~190 m (the far crop, or a measured range)
-ROAD_RANGE_M = 150.
+# the detector's proven range for oncoming traffic on the road camera (TurnPilotLeftRangeM): unmeasured, so none (skeptic G4,
+# CRITIQUE SEV2): every autonomous left is past it, skipped at route time and rerouted, never attempted blind. A drive sets
+# the param from a measurement of vehicle recall against range on this car's real frames (DESIGN section 6's replays: the
+# range where recall is 95% or more). PROVISIONAL_RANGE_M is only pixel arithmetic (a car 1.8 m wide is ~6.5 px at the
+# 640x384 input at 150 m), never a default: 25 mph needs R_req 134-141 m, 35 mph ~190 m (the far crop)
+ROAD_RANGE_M = 0.
+PROVISIONAL_RANGE_M = 150.
 
 RAW_CONF = 0.35            # a raw box at the decoder's floor confidence counts (CRITIQUE REQUIRED 2)
 BAND_TOL_DEG = 2.          # the band's near edge widens with range by this (heading error, the road's curve)

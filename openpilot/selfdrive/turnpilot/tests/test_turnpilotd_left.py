@@ -20,6 +20,8 @@ JUNCTION = 300.
 # a left at JUNCTION across a 25 mph road with one lane each way, mapped (navd: maneuverOpposingSpeed, Lanes)
 LEFT_25 = [(JUNCTION, "turn", "left", (0., 270., 2, 'present', V_25, 1)), (1500., "turn", "right", junction_of("right"))]
 LINE = JUNCTION - HOLD_LINE_M - 1.  # the map's hold line (MAP_MARGIN_M short of the scene's)
+# TurnPilotLeftRangeM as a drive that measured it would set it (the default is unmeasured, 0: no left is attempted)
+TEST_RANGE_M = 150.
 
 
 def raw_box(x, y, conf=0.6):
@@ -44,7 +46,7 @@ def road_runs(cars=lambda sim: ()):
 
 def left_sim(cars=lambda sim: (), runs=True, sim_cls=Sim):
   sim = sim_cls(LEFT_25)
-  sim.tp.auto_left = 'auto'
+  sim.tp.auto_left, sim.tp.left_range_m = 'auto', TEST_RANGE_M
   sim.go_taps = False
   sim.raw = road_runs(cars) if runs else None
   return sim
@@ -77,7 +79,7 @@ def test_an_empty_road_goes_from_the_line_with_no_pulse_before_it():
   assert str(plans[go].detectorView) == 'road' and str(plans[go + 5].detectorView) == 'road'
   assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
   assert plans[go].unprotectedLeft.rReq > 100. and abs(plans[go].unprotectedLeft.vLimit - V_25) < 1e-3
-  assert plans[go].unprotectedLeft.rangeM == ROAD_RANGE_M
+  assert plans[go].unprotectedLeft.rangeM == TEST_RANGE_M
   # committed through the oncoming lanes, and the turn taken (no missed alert)
   assert any(str(p.unprotectedLeft.state) == 'committed' for p in plans[go:])
   assert not any(p.turnMissed for p in plans)
@@ -201,8 +203,8 @@ def test_off_and_announce_hand_back_at_the_line():
 def test_a_left_past_the_proven_range_is_never_taken_from_its_line():
   # 45 mph mapped: R_req past the road camera's range: skipped at route time (below), never a go from its line
   sim = Sim([(JUNCTION, "turn", "left", (0., 270., 2, 'present', 20.1, 1)), (1500., "turn", "right", junction_of("right"))])
-  sim.tp.auto_left, sim.go_taps, sim.raw = 'auto', False, road_runs()
-  assert r_req(20.1, t_req(HOLD_LINE_M + 1., 1), HOLD_LINE_M + 1.) > ROAD_RANGE_M
+  sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps, sim.raw = 'auto', TEST_RANGE_M, False, road_runs()
+  assert r_req(20.1, t_req(HOLD_LINE_M + 1., 1), HOLD_LINE_M + 1.) > TEST_RANGE_M
   plans = drive(sim, 60.)
   assert not any(p.desire == Desire.turnLeft for p in plans if p.maneuverDistance > 0.)
 
@@ -230,7 +232,7 @@ def test_a_left_the_detector_cant_see_far_enough_for_is_skipped_at_route_time():
   # it is the route's maneuver (chimed as a skip, navd reroutes), before any lane change toward it, and driven straight on
   for junction in ((0., 270., 2, 'present', 20.1, 1), (0., 270., 2, 'present')):  # 45 mph, and unknown (taken as 45)
     sim = Sim([(600., "turn", "left", junction), (2000., "turn", "right", junction_of("right"))])
-    sim.tp.auto_left, sim.go_taps, sim.raw = 'auto', False, road_runs()
+    sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps, sim.raw = 'auto', TEST_RANGE_M, False, road_runs()
     plans, reasons = [], set()
     while sim.s < 650.:
       plans += drive(sim, DT_MDL, yaw=False)
@@ -325,7 +327,7 @@ def test_a_creep_for_a_view_the_car_never_makes_is_never_silent():
   # skeptic G4 (blocker 4): a standing opposing left-turner blocks the view, the car is asked to creep and never moves (the
   # model holding it): 270 s in 'creep' with only the visual creepingForView. Now a loud handback, the car held
   sim = HeldSim(LEFT_25)
-  sim.tp.auto_left, sim.go_taps = 'auto', False
+  sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps = 'auto', TEST_RANGE_M, False
 
   def objects(sim):
     return ({'cls': 'car', 'x': JUNCTION + 6. - sim.s, 'y': 3.6, 'vx': 0., 'vy': 0., 'age': 40, 'trackId': 7,
@@ -428,7 +430,7 @@ def signal_sim(red_until=None, oracle=True, line=JUNCTION - 8.5):
   """LEFT_25 with a mapped signal at line (the hold line's), its light from the sim oracle (accepted): red until red_until s
   (None: always), green after; oracle False: no light source at all. An empty band."""
   sim = Sim(LEFT_25, controls=[(line, 'signal')])
-  sim.tp.auto_left, sim.go_taps = 'auto', False
+  sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps = 'auto', TEST_RANGE_M, False
   sim.tp.oracle_ok = oracle
 
   def lights(sim):
@@ -508,3 +510,21 @@ def test_a_signal_whose_light_nothing_reads_is_handed_back_never_gone():
   und = next(i for i, p in enumerate(plans) if str(p.controlPrompt) == 'leftUndecidedTakeControl')
   assert (und - held) * DT_MDL <= LIGHT_UNKNOWN_S + 1. and plans[und].reason == "Can't read the light: take control"
   assert not any(p.desire == Desire.turnLeft for p in plans) and sim.s < LINE + 1.
+
+
+def test_an_unmeasured_detector_range_attempts_no_left_blind():
+  # skeptic G4 (blocker 6): TurnPilotLeftRangeM defaulted to 150 m, pixel arithmetic never measured on real comma frames
+  # (CRITIQUE SEV2: even a 25 mph R_req of 134-141 m is past the uncropped detector at 6.5-8 px), so 25 mph lefts were
+  # attempted on an unmeasured range. Unset, the range is unmeasured (0): every autonomous left is past it, skipped at route
+  # time out loud and rerouted, never taken from its line. A drive sets it from a measurement (TEST_RANGE_M here)
+  assert ROAD_RANGE_M == 0.
+  sim = Sim(LEFT_25)
+  assert sim.tp.left_range_m == ROAD_RANGE_M
+  sim.tp.auto_left, sim.go_taps, sim.raw = 'auto', False, road_runs()
+  plans, reasons = [], set()
+  for _ in range(int(40. / DT_MDL)):
+    plans += drive(sim, DT_MDL, yaw=False)
+    reasons.add(sim.tp.skip.reason)
+  assert any(p.tooFastToTurn for p in plans) and 'unprotectedRange' in reasons
+  assert not any(p.shouldStop or p.desire != Desire.none for p in plans)
+  assert all(str(p.unprotectedLeft.state) == 'skipped' for p in plans[2:] if p.maneuverDistance > 0. and str(p.maneuverModifier) == 'left')

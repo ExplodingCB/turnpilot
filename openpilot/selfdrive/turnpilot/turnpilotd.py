@@ -78,7 +78,8 @@ The route's unprotected left (map_controls.unprotected_turn) is driven by unprot
 TurnPilotAutoLeft: auto (the default: Kellen, 2026-10-28, "No it has to ship taking the turn"), announce or off (G1's
 handback at the line). Each frame it is fed the hold line's latch and the scene from the last frame, this frame's raw
 detector run (main(): SceneTracker.raw), the car's yaw toward the turn (track_yaw) and the opposing road's mapped speed and
-lanes, and checked against TurnPilotLeftRangeM (the detector's proven range, provisional: ROAD_RANGE_M). Its command goes to
+lanes, and checked against TurnPilotLeftRangeM (the detector's proven range; unset: unmeasured, ROAD_RANGE_M 0, so every
+left is skipped and rerouted). Its command goes to
 the latch (map_controls.LeftCommand: hold, creep, go, or a fault's handback), its own hold after a withdrawn go joins the
 scene's stops, and no turn pulse goes on its approach (may_start off; turn_skip's pulse_at_go): its go from the line is the
 first. It asks modeld for the road camera (turnpilotPlan.detectorView) and publishes its state (unprotectedLeft); its wait
@@ -1006,8 +1007,8 @@ def auto_left_for(params) -> str:
 
 
 def left_range_for(params) -> float:
-  """TurnPilotLeftRangeM, the detector's proven range for oncoming traffic, clamped to 0..LEFT_RANGE_MAX_M; ROAD_RANGE_M (the
-  provisional, unmeasured value) if unset, not a number (said) or unknown to this build."""
+  """TurnPilotLeftRangeM, the detector's proven range for oncoming traffic, clamped to 0..LEFT_RANGE_MAX_M; ROAD_RANGE_M
+  (unmeasured: 0, no autonomous left) if unset, not a number (said) or unknown to this build."""
   try:
     value = params.get("TurnPilotLeftRangeM")
   except UnknownKeyName:
