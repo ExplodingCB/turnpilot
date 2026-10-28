@@ -5,8 +5,9 @@ Kellen, 2026-10-28: "No it has to ship taking the turn", and for this version no
 the junction it waits at the hold line for a gap it can certify, however long the traffic takes, as a careful driver does,
 and never hands back for ordinary waiting. A handback (UNDECIDED: leftUndecidedTakeControl, the handback chime, the car
 held) is only for a fault: road camera frames stale, the junction's position unknown, its reach past the detector's proven
-range (route time should have rerouted it: turnpilotd), the car standing yawed past YAW_UNDECIDED_DEG, or the view still
-blocked BLOCKED_UNDECIDED_S after the full creep. A missing frame is never clear.
+range (route time should have rerouted it: turnpilotd), the car standing yawed past YAW_UNDECIDED_DEG, the view still
+blocked BLOCKED_UNDECIDED_S after the full creep, or a creep the car hasn't made after standing CREEP_STALL_S in it with
+nothing else holding it (the model holding a standstill). A missing frame is never clear.
 
 TurnPilotAutoLeft (turnpilotd) picks the mode: auto (the default), announce (the car stops at the hold line and says
 whether it would go, then hands back as before: debugging only), or off (the hold line's handback, G1's).
@@ -95,6 +96,8 @@ CREEP_MAX_M = 4.           # past the line
 CREEP_SHORT_M = 1.         # never nearer the oncoming lanes (ONCOMING_ENTRY_M) than this
 CREEP_DONE_M = 0.3         # crept to within this of its target: the full creep
 BLOCKED_UNDECIDED_S = 15.  # the view still blocked this long after the full creep: a fault
+CREEP_STALL_S = 10.        # standing this long in a creep it hasn't made, nothing else holding the car (the model holding a
+                           # standstill: G0's tapless stand): a fault, never a silent stand
 ROLL_UP_M = 1.5            # held further short of the line than this with R_req past the range: rolled up to it first
 ROLL_UP_STALL_S = 10.      # standing that long in the roll-up: undecided on the reach
 
@@ -283,6 +286,7 @@ class UnprotectedLeft:
     self.latch_d: float | None = None  # m to the maneuver point where the hold latched
     self.creep_to = 0.
     self.blocked_s = 0.           # the view blocked with the full creep done
+    self.creep_stall = 0.         # s standing in a creep not yet made, nothing else holding the car
     self.went = False             # gone (not withdrawn since)
     self.moved = False            # ...and moved
     self.go_t = 0.
@@ -393,14 +397,20 @@ class UnprotectedLeft:
     if blocked_view and not self.blocked and not self.hold_here:
       self.creep_to = creep_max
       done = crept >= creep_max - CREEP_DONE_M
-      self.blocked_s = self.blocked_s + dt if done and inp.v_ego < 0.3 else 0.
+      standing = inp.v_ego < 0.3
+      self.blocked_s = self.blocked_s + dt if done and standing else 0.
+      # asked to creep and standing short of it with nothing else holding the car: the model won't pull away (skeptic G4: 270 s
+      # in 'creep', visual only)
+      self.creep_stall = self.creep_stall + dt if not done and standing and inp.scene_clear else 0.
       if self.blocked_s >= BLOCKED_UNDECIDED_S - 1e-6:
         return self._undecided(out, 'blocked')
+      if self.creep_stall >= CREEP_STALL_S - 1e-6:
+        return self._undecided(out, 'creepStall')
       out.state = self.state = 'creep'
       out.prompt, out.reason, out.creep_m = 'creepingForView', "Creeping for a view", self.creep_to
       return out
     # waiting: crept no further than it has (a car in the band stops the creep where it is)
-    self.blocked_s = 0.
+    self.blocked_s = self.creep_stall = 0.
     self.creep_to = min(self.creep_to, max(crept, 0.))
     out.state = self.state = 'waitGap'
     out.prompt, out.reason, out.creep_m = 'waitingForGap', "Waiting for a gap", self.creep_to
@@ -459,6 +469,7 @@ UNDECIDED_REASON = {
   'stale': "Camera not seeing oncoming traffic: take control",
   'yaw': "Not facing oncoming traffic: take control",
   'blocked': "View of oncoming traffic blocked: take control",
+  'creepStall': "Can't creep for a view: take control",
 }
 
 

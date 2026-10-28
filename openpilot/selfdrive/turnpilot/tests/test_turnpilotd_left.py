@@ -11,7 +11,7 @@ from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Sim
 from openpilot.selfdrive.turnpilot.turn_speed import POST_GO_PROFILES
 from openpilot.selfdrive.turnpilot.turnpilotd import LEFT_NO_MOVE_S, TurnPilot, auto_left_for, left_range_for
-from openpilot.selfdrive.turnpilot.unprotected_left import CLEAR_WINDOW_S, ROAD_RANGE_M, STALE_UNDECIDED_S, r_req, t_req
+from openpilot.selfdrive.turnpilot.unprotected_left import CLEAR_WINDOW_S, CREEP_STALL_S, ROAD_RANGE_M, STALE_UNDECIDED_S, r_req, t_req
 
 Desire = log.Desire
 V_25 = 11.18
@@ -301,3 +301,44 @@ def test_a_standing_car_never_counts_yaw():
   assert plans[-1].desire == Desire.turnLeft and sim.tp.approach_yaw_deg == 0.
   plans = drive(sim, 0.5)  # moving on the go, turning at the sim's 8 m radius: counted
   assert sim.tp.approach_yaw_deg > 0.
+
+
+class HeldSim(Sim):
+  """The model holding the car at a standstill once it has stood at the left's line (G0: the tapless go stood): it never
+  moves again, whatever the plan allows."""
+  stood = False
+
+  def step(self, *a, **k):
+    plan = super().step(*a, **k)
+    ln = self.tp.left_now
+    if ln is not None and ln.state in ('waitGap', 'creep') and self.v < 0.3:
+      self.stood = True
+    if self.stood:
+      self.s -= self.v * DT_MDL
+      self.v = 0.
+      self.trace[-1] = (self.s, self.v, plan)
+    return plan
+
+
+def test_a_creep_for_a_view_the_car_never_makes_is_never_silent():
+  # skeptic G4 (blocker 4): a standing opposing left-turner blocks the view, the car is asked to creep and never moves (the
+  # model holding it): 270 s in 'creep' with only the visual creepingForView. Now a loud handback, the car held
+  sim = HeldSim(LEFT_25)
+  sim.tp.auto_left, sim.go_taps = 'auto', False
+
+  def objects(sim):
+    return ({'cls': 'car', 'x': JUNCTION + 6. - sim.s, 'y': 3.6, 'vx': 0., 'vy': 0., 'age': 40, 'trackId': 7,
+             'conf': 0.8, 'camera': 'road'},)
+  frame = [0]
+
+  def raw(sim):
+    frame[0] += 1
+    return None if frame[0] % 2 else RawFrame([raw_box(JUNCTION + 6. - sim.s, 3.6)], 'road', sim.t)
+  sim.raw = raw
+  plans = [sim.step(objects(sim), engaged=True) for _ in range(int(60. / DT_MDL))]
+  creep = next(i for i, p in enumerate(plans) if str(p.unprotectedLeft.state) == 'creep')
+  first = next((i for i, p in enumerate(plans) if str(p.controlPrompt) in TAKE_CONTROL_PROMPTS), None)
+  assert first is not None, "stood creeping for a view it never got, silently"
+  assert str(plans[first].controlPrompt) == 'leftUndecidedTakeControl' and plans[first].reason == "Can't creep for a view: take control"
+  assert (first - creep) * DT_MDL <= CREEP_STALL_S + 1. and plans[first].shouldStop
+  assert not any(p.desire == Desire.turnLeft for p in plans)

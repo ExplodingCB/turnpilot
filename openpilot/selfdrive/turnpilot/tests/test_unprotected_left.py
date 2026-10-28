@@ -6,7 +6,8 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.route_follower import LEFT
 from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M, VEL_TRUST_HITS
 from openpilot.selfdrive.turnpilot.tests.synthetic import scene
-from openpilot.selfdrive.turnpilot.unprotected_left import (BLOCKED_UNDECIDED_S, CLEAR_WINDOW_S, CREEP_MAX_M, CREEP_SHORT_M, PET_S, RAW_CONF,
+from openpilot.selfdrive.turnpilot.unprotected_left import (BLOCKED_UNDECIDED_S, CLEAR_WINDOW_S, CREEP_MAX_M, CREEP_SHORT_M, CREEP_STALL_S,
+                                                           PET_S, RAW_CONF,
                                                            ROAD_FRESH_S, SPEED_MARGIN, STALE_UNDECIDED_S, LeftInput, RawBox, RawFrame,
                                                            UnprotectedLeft, band_blockers, r_req, t_clear, t_req)
 
@@ -372,3 +373,25 @@ def test_only_an_occluders_own_box_is_exempt():
   assert not matches(passing, scene([turner]).objects[0])
   same = raw(HOLD_D + 12.5, 3.9)
   assert matches(same, scene([turner]).objects[0])
+
+
+def test_a_creep_the_car_never_makes_is_handed_back():
+  # skeptic G4 (blocker 4): the view blocked, the band clear, the creep asked for, and the car never moves (the model holding
+  # a standstill: G0's tapless stand). The full-creep timer never started (blocked_s counts only once crept), so it stood in
+  # 'creep' for minutes with only the visual creepingForView. Standing CREEP_STALL_S in a creep it hasn't made: handed back
+  turner = oncoming(HOLD_D + 12., 3.6, vx=0., trackId=7, box=[0.5, 0.4, 0.6, 0.5], camera='road')
+  box = raw(HOLD_D + 12., 3.6)
+  box = RawBox(box.camera, box.cls, box.conf, box.bearing_deg, box.span_deg, box.xy, box.near_m, (0.5, 0.4, 0.6, 0.5))
+  j = Junction()
+  d = j.wait(CREEP_STALL_S - 0.5, boxes=[box], objects=[turner], v=0.)
+  assert d.state == 'creep' and d.prompt == 'creepingForView'
+  d = j.wait(1., boxes=[box], objects=[turner], v=0.)
+  assert d.state == 'undecided' and d.prompt == 'leftUndecidedTakeControl' and d.why == 'creepStall'
+  assert d.reason == "Can't creep for a view: take control" and not any(x.go for x in j.decisions)
+  # a creep that moves isn't stalled; nor one held by something else (a walker crossing in front)
+  j = Junction()
+  d = j.wait(CREEP_STALL_S + 2., boxes=[box], objects=[turner], v=0.5, distance=HOLD_D - 1.)
+  assert d.state == 'creep'
+  j = Junction()
+  d = j.wait(CREEP_STALL_S + 2., boxes=[box], objects=[turner], v=0., scene_clear=False)
+  assert d.state == 'creep'
