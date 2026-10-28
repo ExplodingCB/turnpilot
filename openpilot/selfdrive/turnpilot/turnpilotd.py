@@ -658,7 +658,8 @@ class TurnPilot:
     inp = LeftInput(mode, rf.maneuver_id, upcoming.side, rf.distance, v_ego, held, raw, objects, self.approach_yaw_deg,
                     upcoming.opposing_speed or None, upcoming.opposing_lanes or None, self.left_range_m,
                     scene_clear=scene.junction is None and not scene.carried, junction_uncertain=rf.junction_spread > UNCERTAIN_M,
-                    go_withdrawn=self.go_withdrawn, committed=rf.maneuver_id in (scene.committed_id, scene.released_id))
+                    go_withdrawn=self.go_withdrawn, committed=rf.maneuver_id in (scene.committed_id, scene.released_id),
+                    spread_m=rf.junction_spread)
     d = self.left_now = self.left.update(inp, DT_MDL)
     return LeftCommand(mode, d.go, d.creep_m, d.state == 'undecided', d.reason)
 

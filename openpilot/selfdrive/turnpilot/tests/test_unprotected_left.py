@@ -312,3 +312,18 @@ def test_off_does_nothing():
   j = Junction(mode='off')
   d = j.wait(CLEAR_WINDOW_S + 0.5)
   assert d.state == 'off' and not d.go and d.view == 'none' and d.prompt == 'none'
+
+
+def test_its_geometry_takes_the_furthest_reading_of_the_junction():
+  # BeamNG unprotected_left_gap6 (2026-10-28): the hold latched at the nearest of navd's readings of the junction (route
+  # follower: 9 m), with navd's own reading and the junction itself 22 m away, and the left certified for a 17 m path that
+  # was 30 m. Its clear time and reach take the furthest reading (the follower's spread), never the nearest
+  near = t_req(HOLD_D, 1)
+  j = Junction()
+  d = j.step(spread_m=13.)
+  assert d.t_req > near + 2.5 and abs(d.t_req - t_req(HOLD_D + 13., 1)) < 1e-6
+  assert abs(d.r_req - r_req(V_25, t_req(HOLD_D + 13., 1), HOLD_D + 13.)) < 1e-6
+  # a walker in the exit crosswalk of the junction where it really is, 13 m further than the nearest reading put it
+  j = Junction()
+  j.wait(CLEAR_WINDOW_S + 1., objects=[ped(HOLD_D + 13. + 10., 8.)], spread_m=13.)
+  assert not any(x.go for x in j.decisions)

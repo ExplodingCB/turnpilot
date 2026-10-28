@@ -34,6 +34,8 @@ CREEP_MAX_M past its line, never nearer than CREEP_SHORT_M short of the oncoming
 creeping where the view clears or a vehicle comes into the band. The exit crosswalk and the junction box (a car standing
 in the exit lane would leave the car in the oncoming lanes) must be clear too, and the scene holding nothing.
 
+The hold line is at the nearest of navd's readings of the junction (route_follower: JunctionSpan); the path, the conflict
+point and the exit zones take the furthest (spread_m), so a car stopped early never certifies a shorter crossing than it has.
 The go (map_controls releases its latch, cause gap; turnpilotd pulses the turn and drives it under the left's post-go
 profile): the road camera only from the go to the commit (CRITIQUE REQUIRED 3; the wide camera one run in WIDE_EVERY
 while held, for the exit crosswalk). Until the car can no longer stop short of the oncoming lanes on the comfortable curve
@@ -119,6 +121,7 @@ class LeftInput:
   junction_uncertain: bool = False
   go_withdrawn: bool = False     # turnpilotd withdrew the go (not moving): its handback
   committed: bool = False        # the scene committed to (or was released into) this junction
+  spread_m: float = 0.           # m between the furthest and the nearest of navd's readings of the junction (route follower)
 
 
 @dataclass
@@ -239,15 +242,18 @@ def view_blocked(occ, heading_deg: float, side: int, reach_m: float) -> bool:
   return False
 
 
-def exit_clear(objects, heading_deg: float, side: int, distance: float, occ) -> bool:
-  """No pedestrian in the exit crosswalk, and no vehicle but an occluder in the junction box (module docstring)."""
+def exit_clear(objects, heading_deg: float, side: int, distance: float, occ, spread_m: float = 0.) -> bool:
+  """No pedestrian in the exit crosswalk, and no vehicle but an occluder in the junction box (module docstring), each zone
+  stretched over the readings of the junction (spread_m past the nearest)."""
   ids = {o.trackId for o in occ}
+  spread = max(spread_m, 0.)
   for obj in objects:
     x, y = road_xy(obj, heading_deg, side)
     rel = x - distance
-    if str(obj.cls) == 'pedestrian' and -CROSSWALK_X_BEFORE_M <= rel <= CROSSWALK_X_AFTER_M and EXIT_Y_NEAR_M <= y <= EXIT_Y_FAR_M:
+    if str(obj.cls) == 'pedestrian' and -CROSSWALK_X_BEFORE_M <= rel <= CROSSWALK_X_AFTER_M + spread and \
+       EXIT_Y_NEAR_M <= y <= EXIT_Y_FAR_M:
       return False
-    if str(obj.cls) in VEHICLES and obj.trackId not in ids and -BOX_X_BEFORE_M <= rel <= BOX_X_AFTER_M and \
+    if str(obj.cls) in VEHICLES and obj.trackId not in ids and -BOX_X_BEFORE_M <= rel <= BOX_X_AFTER_M + spread and \
        -BOX_Y_RIGHT_M <= y <= BOX_Y_LEFT_M:
       return False
   return True
@@ -284,8 +290,11 @@ class UnprotectedLeft:
     side = inp.side
     v_limit = inp.v_limit if inp.v_limit is not None and inp.v_limit > 0. else DEFAULT_OPPOSING_SPEED
     latency = not self.moved
-    treq = t_req(inp.distance, inp.opposing_lanes, latency)
-    rreq = r_req(v_limit, treq, inp.distance)
+    # the path and the conflict point at the furthest reading of the junction: the hold line is at the nearest (BeamNG: 13 m
+    # apart, the car 22 m out certifying a 9 m line's path)
+    d_far = inp.distance + max(inp.spread_m, 0.)
+    treq = t_req(d_far, inp.opposing_lanes, latency)
+    rreq = r_req(v_limit, treq, d_far)
     occ = occluders(inp.objects, inp.heading_deg, side, inp.distance)
     self.road_age += dt
     raw_blockers = None
@@ -305,7 +314,7 @@ class UnprotectedLeft:
     blocked_view = view_blocked(occ, inp.heading_deg, side, rreq)
     if blocked_view:
       self.clear_s = 0.  # the lanes behind the occluder weren't seen: the window counts only with the view open
-    crosswalk = exit_clear(inp.objects, inp.heading_deg, side, inp.distance, occ)
+    crosswalk = exit_clear(inp.objects, inp.heading_deg, side, inp.distance, occ, inp.spread_m)
     out = LeftDecision(t_req=treq, r_req=rreq, v_limit=v_limit, clear_s=self.clear_s, view_blocked=blocked_view,
                        crosswalk_clear=crosswalk, blockers=len(raw_blockers or ()))
     self.alert_t = max(self.alert_t - dt, 0.)
