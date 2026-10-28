@@ -319,7 +319,7 @@ struct TurnpilotLights @0xda96579883444c35 {
     conf @3 :Float32;      # the detector's class-9 confidence
     box @4 :List(Float32); # x0, y0, x1, y1 normalized 0-1 in the road camera's frame
     bearing @5 :Float32;   # deg left of the calibrated forward axis
-    votes @6 :UInt8;       # of the last LIGHT_VOTE_M reads of this head, how many read this state
+    votes @6 :UInt8;       # of the last VOTE_M reads of this head (light_state.py), how many read this state
     governs @7 :Bool;      # its bearing lies over the car's lane (within GOVERN_BEARING_DEG)
   }
   source @0 :Source;
