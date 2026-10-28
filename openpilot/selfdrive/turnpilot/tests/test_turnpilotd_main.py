@@ -199,3 +199,15 @@ def test_main_reads_the_no_move_limit(value, limit):
   with mock.patch.object(turnpilotd, 'TurnPilot', side_effect=make):
     run_main(frames=3, TurnPilotNoMoveS=value)
   assert made[0].no_move_s == limit
+
+
+@pytest.mark.parametrize("value,on", [(None, True), (True, True), (False, False), ('0', False)])
+def test_main_reads_the_go_override(value, on):
+  """TurnPilotGoOverride (go_override.py, G5), read once a second: unset is on."""
+  made, real = [], turnpilotd.TurnPilot
+  def make():
+    made.append(real())
+    return made[-1]
+  with mock.patch.object(turnpilotd, 'TurnPilot', side_effect=make):
+    run_main(frames=3, TurnPilotGoOverride=value)
+  assert made[0].go_override is on

@@ -85,6 +85,15 @@ scene's stops, and no turn pulse goes on its approach (may_start off; turn_skip'
 first. It asks modeld for the road camera (turnpilotPlan.detectorView) and publishes its state (unprotectedLeft); its wait
 is silent (waitingForGap, creepingForView), its go a chime, and it hands back (leftUndecidedTakeControl) only for a fault.
 Its go is TurnPilot's like any hold's: the left's post-go profile and LEFT_NO_MOVE_S below.
+TurnPilot's go from a standstill (any of the above: a turn its hold let go of, at the line or in the junction, or the left's)
+is certified for plannerd's bounded lift (go_override.py; DESIGN phase 4 decision 1, G5) under TurnPilotGoOverride (on by
+default): turnpilotPlan.goCertified, cause turnRelease or unprotectedLeft, asserted on every frame of the go. Not while the
+driver is on a pedal or disengaged, the scene isn't live, a hold of TurnPilot's is in force, the model has a lead within
+GO_CLEAR_M, or a road user is in the path within it (path_blocker: a track, or a raw box of this frame's run); any of them
+coming during the go, TurnPilot handing back, or the left withdrawing its own go withdraws it that frame (withdraw_go), and
+it ends on its own at GO_WINDOW_S, GO_END_SPEED or the model's takeover (go_override.GoCertifier). plannerd then lifts the
+model's hold, +0.5 m/s^2 at most, while the model alone holds the car. Uncertified (the param off, a blocker), the go is
+as before: the model pulls away, or the no-move handback below comes.
 Standing engaged with nothing of TurnPilot's holding the car (no shouldStop, no cap biting), no lead from the model within
 STOPPED_LEAD_M (one further on doesn't hold a standing car), gas and brake off, the model stopped on its own: said on the
 status line after STOPPED_NOTE_S (STOPPED_NOTE), and handed back loudly (controlPrompt carStoppedTakeControl) after
@@ -115,6 +124,7 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.selfdrive.turnpilot.desire_timing import ENTRY_M, TURN_STARTED_DEG, DesireTiming
 from openpilot.selfdrive.turnpilot.control_text import STOPPED_NOTE
+from openpilot.selfdrive.turnpilot.go_override import GO_CLEAR_M, GoCertifier
 from openpilot.selfdrive.turnpilot.handback import Handback
 from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, CLEAR_DESIRE, CONTROL_STATUS_ALERTS, TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.detector.light_state import LIGHT_MODE_DEFAULT, camera_lights_mode
@@ -126,7 +136,7 @@ from openpilot.selfdrive.turnpilot.lane_planner import (OPENPILOT_SIGNALS_BRANDS
 from openpilot.selfdrive.turnpilot.route_follower import KEEP, LEFT, TURN, UNCERTAIN_M, RouteFollower
 from openpilot.selfdrive.turnpilot.scene.lane_paint import lane_paint_from_msg
 from openpilot.selfdrive.turnpilot.scene.tracker import STALE_S, SceneTracker, default_yaw_rate
-from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, NO_ACCEL_CAP, ScenePolicy
+from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, NO_ACCEL_CAP, PATH_HALF_WIDTH_M, ScenePolicy, in_path
 from openpilot.selfdrive.turnpilot.turn_skip import TurnSkip, can_make_turn
 from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
 from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, OFF, ROAD_RANGE_M, LeftInput, UnprotectedLeft,
@@ -206,6 +216,27 @@ LEFT_HOLDS_PULSE = ('approach', 'waitGap', 'creep', 'undecided', 'announce')  # 
 # G4: a 6 deg bend away from the turn over the last 40 m turned the band off the oncoming lane), and only moving (a standing
 # car doesn't yaw; a biased yaw rate over minutes at the line would)
 YAW_MIN_SPEED = STANDSTILL_SPEED
+# TurnPilotGoOverride (main()): TurnPilot's go from a standstill certified for plannerd's bounded lift (go_override.py; DESIGN
+# phase 4 decision 1, G5). On by default: the autonomous left and the stop sign's go depend on it (Kellen, 2026-10-28)
+GO_OVERRIDE_DEFAULT = True
+LEFT_GO_STATES = ('go', 'committed')  # the unprotected left's states its certified go stays out in
+
+
+def path_blocker(objects, raw, limit_m: float = GO_CLEAR_M) -> str:
+  """A road user in the car's path within limit_m, '' if none: a track by scene_policy.in_path, or a box of this frame's
+  detector run (scene.tracker.RawFrame, tracked or not, at any confidence the decoder keeps) whose bottom spans the corridor
+  ahead (PATH_HALF_WIDTH_M either side). What blocks TurnPilot's certified go (go_override.py), and withdraws one out."""
+  for obj in objects:
+    if 0. < obj.x <= limit_m and in_path(obj):
+      return f"track {obj.trackId} {obj.cls} at {obj.x:.1f} m"
+  for b in (raw.boxes if raw is not None else ()):
+    if b.xy is None or not 0. < b.xy[0] <= limit_m:
+      continue
+    rng = math.hypot(*b.xy)
+    lats = sorted(rng * math.sin(math.radians(e)) for e in b.span_deg)
+    if lats[0] < PATH_HALF_WIDTH_M and lats[-1] > -PATH_HALF_WIDTH_M:
+      return f"{b.camera} box {b.cls} at {b.xy[0]:.1f} m"
+  return ''
 
 
 def close_lead(model) -> bool:
@@ -250,6 +281,8 @@ class TurnPilot:
     self.left_range_m = ROAD_RANGE_M  # TurnPilotLeftRangeM (main()): the detector's proven range its R_req is checked against
     self.left_now = None  # this frame's unprotected left decision (unprotected_left.LeftDecision), once update() has made it
     self._rf_ticked = self._yaw_ticked = False  # update() dead-reckoned the route, and counted the yaw, this frame
+    self.go_override = GO_OVERRIDE_DEFAULT  # TurnPilotGoOverride (main())
+    self.go_cert = GoCertifier()  # the go certified for plannerd's lift (go_override.py): its ids never repeat while this runs
     self.reset()
 
   def reset(self, detector: bool = True, keep_turn: bool = False):
@@ -272,6 +305,7 @@ class TurnPilot:
       self.disengaged_s = 0.       # ...of it with openpilot disengaged
       self.engaged_wait_s = 0.     # time since the first engaged frame, before the first detection
       self.left = UnprotectedLeft()  # the autonomous unprotected left (unprotected_left.py); kept through a fault, as its latch
+    self.go_cert.withdraw('reset')  # a disabled plan carries no go
     self.stopped_s = 0.            # standing engaged with nothing holding the car (carStoppedTakeControl)
     self.stall_s = 0.              # standing in the turn after its go, nothing holding the car (stalledTakeControl)
     self.missed_t = 0.             # turnMissed is held while this counts down
@@ -294,6 +328,7 @@ class TurnPilot:
       self.go_wait_s: float | None = None  # s stood since TurnPilot's go, nothing else holding the car; None: moved, or no go
       self.go_withdrawn = False            # the go withdrawn: the car held standing, handed back (cantStartTakeControl)
       self.go_in_junction = False          # the go came with the car in the junction (go_at_line): never withdrawn
+      self.go_lifted = False               # ...certified for plannerd's lift (certify_go)
       self.approach_yaw_deg = 0.           # the car's heading change toward the route's turn since its first pulse (track_yaw)
       self._yaw_id: int | None = None      # ...for this maneuver
     else:
@@ -513,7 +548,12 @@ class TurnPilot:
     # straight across the junction
     self.release_go = self.was_stopping and not decision.should_stop and v_ego < STANDSTILL_SPEED
     self.was_stopping = decision.should_stop
+    # the certified go out, a frame on (its window, the model's takeover), and withdrawn the frame what it rests on goes
+    self.go_cert.update(model, v_ego, DT_MDL)
+    self.withdraw_go(sm, cs, acting, available, objects, raw, decision, took_over)
     withdrawn = self.no_move(sm, cs, v_ego, acting, decision)
+    if withdrawn:
+      self.go_cert.withdraw('noMove')
     self.release_go = self.release_go and not withdrawn  # handed back: a hold that comes and goes is no new go
 
     lanes = model_lanes_from_msg(model)
@@ -529,6 +569,7 @@ class TurnPilot:
       self.go_in_junction = not self.go_at_line(rf.distance)
       if sm['carControl'].enabled and not took_over:  # TurnPilot's go; the driver driving off a hold is the driver's
         self.start_post_go(upcoming, rf.distance, d.turned_deg, right_hand_traffic)
+        self.certify_go(sm, cs, available, objects, raw, decision, took_over, rf.distance)
     elif self.post_go is not None:
       self.post_go.update(v_ego, default_yaw_rate(cs, model), DT_MDL)
     if held and desire not in (Desire.none, CLEAR_DESIRE) and desire != self.last_desire:
@@ -581,6 +622,8 @@ class TurnPilot:
       (NO_JUNCTION_DATA_REASON if no_junction_data else "")
     fill_map_control(plan, mapd)
     self.fill_left(plan, decision)
+    if acting:
+      self.go_cert.fill(plan)
     if skip.skipped and self.skip.reason == 'unprotectedRange' and upcoming is not None:
       ul = plan.unprotectedLeft
       ul.state, ul.rangeM = 'skipped', float(self.left_range_m)
@@ -729,6 +772,49 @@ class TurnPilot:
     self.go_wait_s = 0. if at_line else None  # in the junction: never withdrawn, the stall's handback covers it
     cloudlog.event("turnpilot.post_go", profile=name, unprotected=left, turned_deg=round(turned_deg, 1), distance=round(distance, 1),
                    at_line=at_line)
+
+  def go_blocked(self, sm, cs, available: bool, objects, raw, decision, took_over: bool) -> str:
+    """Why TurnPilot's go can't be certified for plannerd's lift now, '' if it can (go_override.py): the driver on a pedal or
+    disengaged, no live scene to see the path by, a hold of TurnPilot's in force (a walker's, a map stop's), a lead within
+    GO_CLEAR_M, or a road user in the path within it (path_blocker)."""
+    if not sm['carControl'].enabled or took_over or cs.gasPressed or cs.brakePressed:
+      return 'driver'
+    if not available:
+      return 'scene'
+    if decision.should_stop or decision.holding:
+      return 'hold'
+    if close_lead(sm['modelV2']):
+      return 'lead'
+    return 'inPath' if path_blocker(objects, raw) else ''
+
+  def certify_go(self, sm, cs, available: bool, objects, raw, decision, took_over: bool, distance: float) -> None:
+    """TurnPilot's go from a standstill (start_post_go's, at the hold line or in the junction: finishing a turn beats standing
+    in it) certified for plannerd's bounded lift (turnpilotPlan.goCertified), cause unprotectedLeft for the autonomous left's,
+    turnRelease for any other turn released from TurnPilot's hold; or, TurnPilotGoOverride off or go_blocked, not, logged with
+    why. Uncertified, the go is as before G5: the model pulls away or the no-move handback comes."""
+    self.go_lifted = False
+    cause = 'unprotectedLeft' if self.left_now is not None and self.left_now.go else 'turnRelease'
+    why = 'param' if not self.go_override else self.go_blocked(sm, cs, available, objects, raw, decision, took_over)
+    if why:
+      cloudlog.event("turnpilot.go_not_certified", cause=cause, why=why, blocker=path_blocker(objects, raw) if why == 'inPath' else '',
+                     distance=round(distance, 1))
+      return
+    self.go_lifted = self.go_cert.start(cause, distance=round(distance, 1), at_line=self.go_wait_s is not None,
+                                        turned_deg=round(self.desires.turned_deg, 1))
+
+  def withdraw_go(self, sm, cs, acting: bool, available: bool, objects, raw, decision, took_over: bool) -> None:
+    """The certified go out withdrawn this frame, plannerd's lift with it, once anything it was certified on stops holding
+    (go_blocked), TurnPilot stops acting (a handback), or the autonomous left withdraws its own go (left out of its go)."""
+    gc = self.go_cert
+    if not gc.active:
+      return
+    why = 'handback' if not acting else self.go_blocked(sm, cs, available, objects, raw, decision, took_over)
+    if not why and gc.cause == 'unprotectedLeft' and (self.left_now is None or self.left_now.state not in LEFT_GO_STATES):
+      why = 'left'
+    if why:
+      if why == 'inPath':
+        cloudlog.event("turnpilot.go_path_blocked", go_id=gc.id, blocker=path_blocker(objects, raw))
+      gc.withdraw(why)
 
   def no_move(self, sm, cs, v_ego: float, acting: bool, decision) -> bool:
     """TurnPilot's go from the hold line (go_at_line) is withdrawn: the car not at STANDSTILL_SPEED no_move_limit after it,
@@ -1037,6 +1123,22 @@ def no_move_for(params) -> float:
     return NO_MOVE_S
 
 
+def go_override_for(params) -> bool:
+  """TurnPilotGoOverride: whether TurnPilot's go is certified for plannerd's bounded lift (go_override.py); GO_OVERRIDE_DEFAULT
+  (on) if unset or unknown to this build's params (said)."""
+  try:
+    value = params.get("TurnPilotGoOverride")
+  except UnknownKeyName:
+    log_error(f"turnpilotd: TurnPilotGoOverride unknown to this build's params, {'on' if GO_OVERRIDE_DEFAULT else 'off'}; run scons")
+    return GO_OVERRIDE_DEFAULT
+  if value is None:
+    return GO_OVERRIDE_DEFAULT
+  if isinstance(value, (bytes, str)):
+    value = value.decode() if isinstance(value, bytes) else value
+    return value.strip() == '1'
+  return bool(value)
+
+
 def disabled_plan(shadow: bool, reason: str, fault=Fault.none, handback=Handback.none):
   """A plan nothing acts on: no desire, no lane change, no limits. handback: a model fallback, which selfdrived still
   raises through a disabled plan (hooks.fresh_plan)."""
@@ -1116,6 +1218,7 @@ def main():
       tp.no_move_s = no_move_for(params)
       tp.auto_left = auto_left_for(params)
       tp.left_range_m = left_range_for(params)
+      tp.go_override = go_override_for(params)
       if params.get("ChestnutActive") is False:  # None: no big model expected this drive
         tp.big_model_failed(enabled)
 

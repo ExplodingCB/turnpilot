@@ -68,6 +68,7 @@ class Sim:
     self.disengage_on_accel = disengage_on_accel
     self.big = False
     self.model_kw = {}  # synthetic.road() keywords for the model's lanes
+    self.model_holds = False  # the model holds the car (stand()): its shouldStop, no motion planned; otherwise it drives on
     self.model_running = True  # modeld publishing modelV2 (it doesn't while it loads the detector)
     self.nav_filter = None  # (sim, instruction) -> (instruction, valid): what navd sends instead
     # the driver takes over TAKE_OVER_S after TurnPilot stops the car at an unprotected turn and hands back (no gas go:
@@ -97,7 +98,7 @@ class Sim:
     self.sm.put('carState', car_state(self.v, steer, left_blinker=blinker, yaw_rate=yaw_rate, gas_pressed=gas))
     self.sm.put('carControl', car_control(lat_active, engaged))
     if self.model_running:
-      self.sm.put('modelV2', model_v2(*self.model_lanes, big=self.big, **self.model_kw))
+      self.sm.put('modelV2', model_v2(*self.model_lanes, big=self.big, holds=self.model_holds, **self.model_kw))
     if self.lights is not None:
       self.sm.put('turnpilotLights', self.lights(self))
     plan = self.tp.plan(self.sm, scene(objects, available), True, self.shadow, self.driver_signals, paint=self.paint,
@@ -1812,13 +1813,16 @@ def test_tiles_without_controls_are_said_out_loud():
 
 
 def stand(sim, seconds, **kw):
-  """The model holds the car standing for seconds, engaged (nothing in the plan does). lead_prob, lead_x: its lead."""
+  """The model holds the car standing for seconds, engaged (nothing in the plan does): its shouldStop, no motion planned.
+  lead_prob, lead_x: its lead."""
   lead, lead_x = kw.pop('lead_prob', None), kw.pop('lead_x', 30.)
   plans = []
+  sim.model_holds = True
   for _ in range(int(round(seconds / DT_MDL))):
     sim.model_kw = {} if lead is None else {'lead_prob': lead, 'lead_x': lead_x}
     sim.v = 0.
     plans.append(sim.step(engaged=True, **kw))
+  sim.model_holds = False
   return plans
 
 
