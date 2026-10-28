@@ -31,12 +31,16 @@ def run_gaps(det, pm, frames: int, model_time: float) -> list[int]:
 
 
 class FakeParams:
-  def __init__(self, enabled=False):
-    self.enabled = enabled
+  def __init__(self, enabled=False, lights=None):
+    self.enabled, self.lights = enabled, lights
 
   def get_bool(self, key):
     assert key == "TurnPilotEnabled"
     return self.enabled
+
+  def get(self, key):
+    assert key == "TurnPilotCameraLights"
+    return self.lights
 
 
 class FakeLoad:
@@ -76,24 +80,6 @@ class TestDetectorRecovery(OpenpilotTestCase):
     assert FORCE_RUN_FRAMES * 0.05 <= FORCE_RUN_S + 1e-9  # at modeld's 20 Hz, the frame count comes first
 
 
-@pytest.mark.parametrize("hz", [20., 18., 12., 6.])
-def test_slow_model_still_runs_inside_the_deadline(monkeypatch, hz):
-  # a loaded host runs the driving model below 20 Hz: the forced run goes by the clock, not by frames, so the gap
-  # between runs stays inside turnpilotd's deadline whatever the rate
-  clock = SimpleNamespace(t=1000.)
-  monkeypatch.setattr(modeld_detector, 'time', SimpleNamespace(monotonic=lambda: clock.t, perf_counter=lambda: clock.t))
-  det, pm = make_detector(), PM()
-  runs = []
-  for _ in range(int(60 * hz)):
-    clock.t += 1. / hz
-    n = len(pm.sent)
-    det.step(pm, det.model_state, STEP_BUDGET_S + 0.005, 0.0, log.Desire.none, METAS)
-    if len(pm.sent) > n:
-      runs.append(clock.t)
-  gaps = [b - a for a, b in zip(runs, runs[1:], strict=False)]
-  assert len(runs) > 30 and max(gaps) <= FORCE_RUN_S + 1. / hz + 1e-6
-  assert max(gaps) < DETECTOR_DEADLINE_S - STALE_S
-
   def test_failure_retries_with_backoff(self):
     det, pm = make_detector(), PM()
     det.run.fail = True
@@ -123,6 +109,20 @@ def test_slow_model_still_runs_inside_the_deadline(monkeypatch, hz):
     assert len(pm.sent) == 2
     big_det, small_det = (d for _, d in host.detectors)
     assert len(big_det.run.calls) == 1 and len(small_det.run.calls) == 1
+
+  def test_host_passes_the_light_mode(self):
+    model, params, pm = object(), FakeParams(True, 'off'), PM()
+    host = DetectorHost(params, 1344, 760, False, True, [model], load_fn=FakeLoad({model}))
+    host.load()
+    host.step(pm, model, 0.010, 0.0, log.Desire.none, METAS, True)
+    (_, det), = host.detectors
+    assert det.light_mode == 'off'
+    params.lights, host.next_check = 'addOnly', 0.  # read again with TurnPilotEnabled, once a second
+    host.step(pm, model, 0.010, 0.0, log.Desire.none, METAS, True)
+    assert det.light_mode == 'addOnly'
+    params.lights, host.next_check = None, 0.
+    host.step(pm, model, 0.010, 0.0, log.Desire.none, METAS, True)
+    assert det.light_mode == 'shadow'
 
   def test_host_without_a_detector_for_the_fallback(self):
     big, small = object(), object()
@@ -167,3 +167,22 @@ def test_slow_model_still_runs_inside_the_deadline(monkeypatch, hz):
     for _ in range(RUN_EVERY):
       host.step(pm, model, 0.010, 0.0, log.Desire.none, METAS, False)
     assert host.enabled and host.failures == 0 and len(pm.sent) == 1
+
+
+@pytest.mark.parametrize("hz", [20., 18., 12., 6.])
+def test_slow_model_still_runs_inside_the_deadline(monkeypatch, hz):
+  # a loaded host runs the driving model below 20 Hz: the forced run goes by the clock, not by frames, so the gap
+  # between runs stays inside turnpilotd's deadline whatever the rate
+  clock = SimpleNamespace(t=1000.)
+  monkeypatch.setattr(modeld_detector, 'time', SimpleNamespace(monotonic=lambda: clock.t, perf_counter=lambda: clock.t))
+  det, pm = make_detector(), PM()
+  runs = []
+  for _ in range(int(60 * hz)):
+    clock.t += 1. / hz
+    n = len(pm.sent)
+    det.step(pm, det.model_state, STEP_BUDGET_S + 0.005, 0.0, log.Desire.none, METAS)
+    if len(pm.sent) > n:
+      runs.append(clock.t)
+  gaps = [b - a for a, b in zip(runs, runs[1:], strict=False)]
+  assert len(runs) > 30 and max(gaps) <= FORCE_RUN_S + 1. / hz + 1e-6
+  assert max(gaps) < DETECTOR_DEADLINE_S - STALE_S

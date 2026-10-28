@@ -1,8 +1,8 @@
 import numpy as np
 
 from openpilot.common.test import OpenpilotTestCase
-from openpilot.selfdrive.turnpilot.detector.light_state import GOVERN_BEARING_DEG, HEAD_MIN_H_PX, MIN_ELEVATION_DEG, VOTE_M, VOTE_N, \
-  HeadVoter, LightReader, read_head
+from openpilot.selfdrive.turnpilot.detector.light_state import GOVERN_BEARING_DEG, HEAD_MIN_H_PX, MAX_READ_HEADS, MIN_ELEVATION_DEG, VOTE_M, \
+  VOTE_N, HeadVoter, LightReader, read_head
 from openpilot.selfdrive.turnpilot.scene.ranging import Lens
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 
@@ -170,3 +170,10 @@ class TestReader(OpenpilotTestCase):
     frame, boxes = scene([head(0, 'red', y0=500)])  # well below the horizon
     assert reader.read(0., frame, STRIDE, Y_HEIGHT, LEVEL, 1.22, boxes) == []
     assert reader.gate_counts['belowHorizon'] == 1
+
+  def test_at_most_max_read_heads_a_frame(self):
+    # the read's time stays bounded however many heads the junction has: the most confident first, the rest counted
+    reader = LightReader(LENS)
+    frame, boxes = scene([head(0, 'red', x0=100 + 60 * i) for i in range(MAX_READ_HEADS + 4)])
+    assert len(reader.read(0., frame, STRIDE, Y_HEIGHT, LEVEL, 1.22, boxes)) == MAX_READ_HEADS
+    assert reader.gate_counts['overCap'] == 4

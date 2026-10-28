@@ -53,6 +53,7 @@ VOTE_M, VOTE_N = 5, 4       # a state takes VOTE_N of a head's last VOTE_M reads
 MATCH_HEIGHTS = 1.5         # a read is the same head when its box centre is within this many box heights
 HEAD_DROP_S = 0.6           # a head not seen this long is forgotten
 GOVERN_BEARING_DEG = 10.    # a head within this of the lane's bearing governs it
+MAX_READ_HEADS = 8          # heads read a frame, the most confident first (decode_lights' order): the read's time stays bounded
 STATES = ('red', 'yellow', 'green')
 
 
@@ -261,6 +262,9 @@ class LightReader:
     """boxes: decode_lights() rows; path: (x, y left) of the lane ahead (tracker.predicted_path), None for straight."""
     reads = []
     for box in boxes:
+      if len(reads) >= MAX_READ_HEADS:
+        self.gate_counts['overCap'] += 1
+        continue
       r = read_head(nv12, stride, y_height, self.lens, rpy_calib, cam_height, box)
       if r.gated:
         self.gate_counts[r.reason] += 1

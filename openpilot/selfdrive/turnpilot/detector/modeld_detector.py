@@ -9,6 +9,12 @@ unmasked, a white car over a yellow line reads as broken white paint. It costs a
 measures it) and has its own budget: a read slower than PAINT_BUDGET_S (median) turns the paint off for the drive, loudly,
 and the detector, which the pedestrian holds need, keeps running.
 
+The traffic lights are read the same way (DESIGN phase 4 G2, detector/light_state.py): on road camera runs, from the host
+copy of the frame, on the detector's class-9 boxes (decode_lights, never in the detections), with the frame's calibration
+and modelV2 off the bus, into the message's lights (source camera, shadow unless TurnPilotCameraLights is addOnly). Its
+own budget too: a failure, or a median read slower than LIGHT_BUDGET_S, turns the lights off for the drive
+(lightStatus disabled, which turnpilotd raises once), and the detector keeps running. TurnPilotCameraLights off reads none.
+
 Nothing here runs unless TurnPilotEnabled is set and the compiled pkl for this device and camera size exists
 (compile_detector.py builds it; the pkls are not in git).
 
@@ -26,10 +32,13 @@ import numpy as np
 from openpilot.cereal import custom, log, messaging
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
-from openpilot.selfdrive.turnpilot.detector.decoder import decode, fill_detections
+from openpilot.common.params import UnknownKeyName
+from openpilot.selfdrive.turnpilot.detector.decoder import decode, decode_lights, fill_detections
 from openpilot.selfdrive.turnpilot.detector.graph import detector_pkl_path, letterbox
+from openpilot.selfdrive.turnpilot.detector.light_state import LightHead, LightReader
 from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN, LanePaintClassifier, LinePaint, fill_lane_paint
-from openpilot.selfdrive.turnpilot.scene.ranging import road_lens
+from openpilot.selfdrive.turnpilot.scene.ranging import camera_height, road_lens
+from openpilot.selfdrive.turnpilot.scene.tracker import predicted_path
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 
 # chestnut, 2026-10-27, yolo26n at 1344x760: big model 25-27 ms, detector 7.9 ms in modeld (5.9 ms alone). Every frame
@@ -52,7 +61,22 @@ RETRY_S = 1.0              # a failed run is retried after this, doubled for eac
 RETRY_MAX_S = 60.          # ...to this
 PARAM_CHECK_S = 1.0        # TurnPilotEnabled is read this often
 PAINT_BUDGET_S = 0.005     # the lane paint read's median over TIME_WINDOW reads above this turns it off for the drive
+LIGHT_BUDGET_S = 0.004     # the light read's median over TIME_WINDOW reads above this turns the lights off for the drive
+LIGHT_MODES = ('off', 'shadow', 'addOnly')  # TurnPilotCameraLights
+LIGHT_MODE_DEFAULT = 'shadow'  # read and logged, never acted on (CRITIQUE: no stop authority until the replay gate passes)
 LanePaintStatus = custom.TurnpilotDetections.LanePaintStatus
+LightStatus = custom.TurnpilotDetections.LightStatus
+
+
+def camera_lights_mode(params) -> str:
+  """TurnPilotCameraLights: off, shadow (the default, and anything unknown) or addOnly."""
+  try:
+    value = params.get("TurnPilotCameraLights")
+  except UnknownKeyName:
+    cloudlog.error("turnpilot detector: TurnPilotCameraLights unknown to this build's params, lights in shadow; run scons")
+    return LIGHT_MODE_DEFAULT
+  value = value.decode() if isinstance(value, bytes) else value
+  return value if value in LIGHT_MODES else LIGHT_MODE_DEFAULT
 
 
 def frame_view(model_state, index: int):
@@ -65,11 +89,15 @@ def frame_view(model_state, index: int):
   return Tensor(UOp.from_buffer(view, dtypes.uint8))
 
 
+def frame_bus():
+  return messaging.SubMaster(['modelV2', 'extrinsicsCalibration', 'deviceState', 'narrowRoadCameraState'])
+
+
 class LanePaintReader:
   """Lane paint on the road camera's frame: modelV2 and calibration for that very frame come back off the bus (modeld has
   just sent the modelV2), and the lens from the device type."""
-  def __init__(self, cam_w: int, cam_h: int):
-    self.sm = messaging.SubMaster(['modelV2', 'extrinsicsCalibration', 'deviceState', 'narrowRoadCameraState'])
+  def __init__(self, cam_w: int, cam_h: int, sm=None):
+    self.sm = sm if sm is not None else frame_bus()
     self.stride, self.y_height, _, _ = get_nv12_info(cam_w, cam_h)
     self.classifier: LanePaintClassifier | None = None
 
@@ -92,10 +120,48 @@ class LanePaintReader:
                                   lines, list(model.laneLineProbs), boxes), LanePaintStatus.read
 
 
+class CameraLightReader:
+  """The lights on the road camera's frame (light_state.py), with the lane paint's bus: calibration for the horizon, and
+  modelV2 for the lane's bearing when it is this very frame's."""
+  def __init__(self, sm):
+    self.sm = sm
+    self.reader: LightReader | None = None
+
+  def read(self, frame: np.ndarray, meta, boxes: np.ndarray) -> tuple[list[LightHead], int]:
+    sm = self.sm
+    sm.update(0)
+    if self.reader is None:
+      if not (sm.seen['deviceState'] and sm.seen['narrowRoadCameraState']):
+        return [], LightStatus.noCalibration
+      cam = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['narrowRoadCameraState'].sensor))]
+      self.reader = LightReader(road_lens(cam.narrow_road))
+      self.stride, self.y_height, _, _ = get_nv12_info(cam.narrow_road.width, cam.narrow_road.height)
+    cal = sm['extrinsicsCalibration']
+    if not (sm.seen['extrinsicsCalibration'] and cal.calStatus == log.ExtrinsicsCalibration.Status.calibrated):
+      return [], LightStatus.noCalibration
+    model = sm['modelV2']
+    path = predicted_path(model) if sm.seen['modelV2'] and model.frameId == meta.frame_id % 2**32 else None
+    heads = self.reader.read(meta.timestamp_eof * 1e-9, frame, self.stride, self.y_height, list(cal.rpyCalib), camera_height(cal),
+                             boxes, path)
+    return heads, LightStatus.read
+
+
+def fill_lights(tl, heads: list[LightHead], shadow: bool) -> None:
+  """A TurnpilotLights builder from the camera's heads."""
+  tl.source, tl.shadow = custom.TurnpilotLights.Source.camera, shadow
+  out = tl.init('lights', len(heads))
+  for o, h in zip(out, heads, strict=True):
+    o.state, o.distance, o.instance = h.state, float(h.distance), f"head{h.id}"
+    o.conf, o.box, o.bearing, o.votes, o.governs = float(h.conf), [float(b) for b in h.box], float(h.bearing), int(h.votes), h.governs
+
+
 class ModeldDetector:
   failures = 0                    # failed runs in a row
   retry_at = 0.0                  # time.monotonic() a failed detector waits for
   last_run_t: float | None = None  # time.monotonic() of the last run (None: none yet)
+  light_mode = LIGHT_MODE_DEFAULT  # TurnPilotCameraLights, set by DetectorHost
+  lights: CameraLightReader | None = None  # None: no road camera, or failed (lights_failed)
+  lights_failed = False
 
   def __init__(self, model_state, cam_w: int, cam_h: int, cameras: dict[str, int]):
     """cameras: 'road' and/or 'wide' -> index of its frame in modeld's packed input."""
@@ -112,13 +178,16 @@ class ModeldDetector:
     self.frames = {cam: frame_view(model_state, i) for cam, i in cameras.items()}
     self.times: deque[float] = deque(maxlen=TIME_WINDOW)
     self.paint_times: deque[float] = deque(maxlen=TIME_WINDOW)
+    self.light_times: deque[float] = deque(maxlen=TIME_WINDOW)
     for _ in range(3):  # warm up, and a first time estimate
       t0 = time.perf_counter()
       self.run(input_frame=self.frames[next(iter(self.frames))]).numpy()
       self.times.append(time.perf_counter() - t0)
     self.since_run, self.last_run_t = RUN_EVERY, time.monotonic()
     self.wide_until = -1.0
-    self.lane_paint = LanePaintReader(cam_w, cam_h) if 'road' in cameras else None
+    bus = frame_bus() if 'road' in cameras else None
+    self.lane_paint = LanePaintReader(cam_w, cam_h, bus) if 'road' in cameras else None
+    self.lights = CameraLightReader(bus) if 'road' in cameras else None
 
   def choose_camera(self, desired_curvature: float, desire: int, now: float) -> str:
     if abs(desired_curvature) >= WIDE_CURVATURE or desire in TURN_DESIRES:
@@ -133,6 +202,8 @@ class ModeldDetector:
     estimate = float(np.median(self.times)) if self.times else 0.
     if self.lane_paint is not None and self.paint_times:
       estimate += float(np.median(self.paint_times))
+    if self.lights is not None and self.light_mode != 'off' and self.light_times:
+      estimate += float(np.median(self.light_times))
     if model_execution_time + estimate <= STEP_BUDGET_S:
       return True
     waited_s = time.monotonic() - self.last_run_t if self.last_run_t is not None else 0.
@@ -164,8 +235,10 @@ class ModeldDetector:
       self.times.append(dt)
       if cam == 'road':
         self.read_lane_paint(msg.turnpilotDetections, model_state, metas, dets)
+        self.read_lights(msg.turnpilotDetections, model_state, metas, raw)
       else:
         msg.turnpilotDetections.lanePaintStatus = LanePaintStatus.wideCamera if 'road' in self.cameras else LanePaintStatus.disabled
+        msg.turnpilotDetections.lightStatus = self.light_status() if self.light_status() != LightStatus.read else LightStatus.wideCamera
       pm.send('turnpilotDetections', msg)
       self.failures = 0
     except Exception:
@@ -199,6 +272,37 @@ class ModeldDetector:
       self.lane_paint = None
 
 
+  def light_status(self) -> int:
+    """What a run without a read says: disabled after a failure, off with the param off or no road camera, else read."""
+    if self.lights_failed:
+      return LightStatus.disabled
+    return LightStatus.off if self.lights is None or self.light_mode == 'off' else LightStatus.read
+
+  def read_lights(self, td, model_state, metas: list, raw: np.ndarray) -> None:
+    """Fill td.lights, lightStatus and lightTime from the road camera's frame and this run's class-9 boxes. A failure, or
+    reads over LIGHT_BUDGET_S, turn only the lights off, for the drive, said in lightStatus (disabled) and the log."""
+    status = self.light_status()
+    if status != LightStatus.read:
+      td.lightStatus = status
+      return
+    t0 = time.perf_counter()
+    try:
+      i = self.cameras['road']
+      heads, status = self.lights.read(model_state.frames[i], metas[i], decode_lights(raw, self.lb))
+    except Exception:
+      cloudlog.exception("turnpilot lights failed, off for this drive")
+      self.lights, self.lights_failed = None, True
+      td.lightStatus = LightStatus.disabled
+      return
+    dt = time.perf_counter() - t0
+    fill_lights(td.lights, heads, self.light_mode != 'addOnly')
+    td.lightStatus, td.lightTime = status, dt
+    self.light_times.append(dt)
+    if len(self.light_times) == TIME_WINDOW and float(np.median(self.light_times)) > LIGHT_BUDGET_S:
+      cloudlog.error(f"turnpilot lights over budget ({np.median(self.light_times) * 1e3:.1f} ms), off for this drive")
+      self.lights, self.lights_failed = None, True
+
+
 def load(model_state, cam_w: int, cam_h: int, main_wide_camera: bool, use_extra_client: bool) -> ModeldDetector | None:
   """The detector for one driving model's device, or None. DetectorHost only calls this with TurnPilotEnabled set."""
   try:
@@ -230,6 +334,7 @@ class DetectorHost:
     self.load_fn = load_fn or load
     self.detectors: list[tuple] | None = None  # (driving model, its detector or None), once loaded
     self.enabled = False
+    self.light_mode = LIGHT_MODE_DEFAULT  # TurnPilotCameraLights, read with TurnPilotEnabled
     self.next_check = 0.0
     self.missing = None  # the driving model last reported as having no detector
     self.failures = 0    # host failures in a row
@@ -238,6 +343,7 @@ class DetectorHost:
     if now >= self.next_check:
       self.next_check = now + PARAM_CHECK_S
       self.enabled = self.params.get_bool("TurnPilotEnabled")
+      self.light_mode = camera_lights_mode(self.params)
     return self.enabled
 
   def load(self) -> None:
@@ -260,6 +366,7 @@ class DetectorHost:
           self.missing = model_state
           cloudlog.warning("turnpilot detector: none for the driving model modeld is running, detector off")
         return
+      det.light_mode = self.light_mode
       det.step(pm, model_state, model_execution_time, desired_curvature, desire, metas)
       self.failures = 0
     except Exception:
