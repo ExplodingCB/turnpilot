@@ -41,9 +41,15 @@ for region in "$@"; do
   for f in fence.geojson meta.json index.json tiles.tar; do
     [ -e "$src/$f" ] || { echo "$src/$f is missing; build the region first" >&2; exit 1; }
   done
+  # the OSM stop-sign sidecar: without it the cars miss the stops Valhalla doesn't flag, and say so on every route
+  if ! [ -d "$src/osm_controls" ] || ! grep -q '"osm_controls/' "$src/index.json"; then
+    echo "$src has no OSM stop-sign sidecar in its index; run: build_region.py $region --sidecar-only" >&2
+    exit 1
+  fi
   echo "== $region"
   rsync -a --delete -e "ssh -i $KEY" --include='/fence.geojson' --include='/meta.json' --include='/index.json' \
-    --include='/tiles.tar' --include='/tiles/***' --exclude='*' "$src/" "$HOST:/srv/turnpilot-maps/staging/$region/"
+    --include='/tiles.tar' --include='/tiles/***' --include='/osm_controls/***' --exclude='*' \
+    "$src/" "$HOST:/srv/turnpilot-maps/staging/$region/"
   "${SSH[@]}" "bash /opt/turnpilot-maps/swap_region.sh /srv/turnpilot-maps/regions /srv/turnpilot-maps/staging $region"
 done
 

@@ -1,6 +1,12 @@
-"""The OSM stop-sign sidecar (osm_controls.py): its junction model on a few synthetic OSM ways (OPL, no osmium), and its
-shards."""
+"""The OSM stop-sign sidecar (osm_controls.py): its junction model on a few synthetic OSM ways (OPL, no osmium), its shards,
+and build_region.py --sidecar-only on a tiny region (with osmium, when the build machine has it)."""
+import hashlib
+import json
 import math
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -8,6 +14,7 @@ from tools.turnpilot.mapserver import osm_controls
 
 LAT0, LON0 = 39.77, -86.16
 M_PER_DEG = 111195.
+MAPSERVER = Path(osm_controls.__file__).parent
 
 
 def ll(north, east):
@@ -149,3 +156,51 @@ def test_tile_cells_are_the_level2_tiles(tmp_path):
     (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
     (tmp_path / rel).write_bytes(b'x')
   assert osm_controls.tile_cells(tmp_path / 'tiles') == {756425, 756426}
+
+
+# --- build_region.py --sidecar-only, with osmium ---
+
+HAVE_OSMIUM = shutil.which('osmium') is not None
+
+
+def osm_xml(m: Map) -> str:
+  lines = ["<?xml version='1.0' encoding='UTF-8'?>", "<osm version='0.6' generator='test'>"]
+  for nid, (lat, lon) in sorted(m.nodes.items()):
+    t = ''.join(f"<tag k='{k}' v='{v}'/>" for k, v in m.node_tags.get(nid, {}).items())
+    lines.append(f"<node id='{nid}' version='1' lat='{lat:.7f}' lon='{lon:.7f}'>{t}</node>")
+  for wid, nids, t in sorted(m.ways):
+    nds = ''.join(f"<nd ref='{n}'/>" for n in nids)
+    tt = ''.join(f"<tag k='{k}' v='{v}'/>" for k, v in t.items())
+    lines.append(f"<way id='{wid}' version='1'>{nds}{tt}</way>")
+  lines.append('</osm>')
+  return '\n'.join(lines)
+
+
+@pytest.mark.skipif(not HAVE_OSMIUM, reason="no osmium (brew install osmium-tool)")
+def test_sidecar_only_rebuilds_the_shards_stamped_with_the_regions_timestamp(tmp_path):
+  m = crossroads()
+  m.node_tags[3] = {'highway': 'stop', 'direction': 'forward'}
+  region = tmp_path / 'indianapolis'
+  region.mkdir()
+  (tmp_path / 'region.osm').write_text(osm_xml(m))
+  subprocess.run(['osmium', 'cat', '-O', '-o', region / 'indianapolis.osm.pbf', tmp_path / 'region.osm'], check=True)
+  cell = osm_controls.level2_index(LON0, LAT0)
+  digits = f"{cell:09d}"
+  tile = f"tiles/2/{digits[:3]}/{digits[3:6]}/{digits[6:]}.gph"
+  (region / tile).parent.mkdir(parents=True)
+  (region / tile).write_bytes(b'tile')
+  meta = {'id': 'indianapolis', 'osm_timestamp': '2026-10-26T21:24:46Z', 'built_at': '2026-10-27T23:49:49Z'}
+  (region / 'meta.json').write_text(json.dumps(meta))
+  stale = {'osm_controls/1.json': [2, 1, '0' * 64, 3]}
+  (region / 'index.json').write_text(json.dumps({tile: [2, cell, hashlib.sha256(b'tile').hexdigest(), 4], **stale}))
+
+  subprocess.run([sys.executable, MAPSERVER / 'build_region.py', 'indianapolis', '--sidecar-only', '--out', tmp_path], check=True)
+
+  shard = json.loads((region / f'osm_controls/{cell}.json').read_text())
+  assert shard['osm_timestamp'] == meta['osm_timestamp'] and [e['junction_node'] for e in shard['controls']['10:f']] == [4]
+  assert json.loads((region / 'meta.json').read_text()) == meta  # the region's stamp and build time stay
+  index = json.loads((region / 'index.json').read_text())
+  data = (region / f'osm_controls/{cell}.json').read_bytes()
+  assert index == {tile: [2, cell, hashlib.sha256(b'tile').hexdigest(), 4],
+                   f'osm_controls/{cell}.json': [2, cell, hashlib.sha256(data).hexdigest(), len(data)]}
+  assert (region / 'controls_built').exists()  # the region's tiles come from its .pbf, which carries its controls
