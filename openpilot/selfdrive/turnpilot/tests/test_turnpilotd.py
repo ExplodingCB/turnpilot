@@ -13,7 +13,8 @@ from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, NO_ACCEL_CAP
 from openpilot.selfdrive.turnpilot.tests.synthetic import FakeNavd, car_control, car_state, junction_of, model_v2, nav_instruction, scene
 from openpilot.selfdrive.turnpilot.desire_timing import TURN_DESIRE_LEAD_M
 from openpilot.selfdrive.turnpilot.turn_skip import MIN_FIRST_PULSE_M
-from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP, V_TURN_MIN
+from openpilot.selfdrive.turnpilot.route_follower import Maneuver, classify
+from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP, POST_GO_PROFILES, V_TURN_MIN
 from openpilot.selfdrive.turnpilot.turnpilotd import (CAR_UNKNOWN_REASON, DETECTOR_DEADLINE_S, DETECTOR_START_DEADLINE_S, NO_LONG_REASON,
                                                        GAS_DISENGAGE_REASON, NEAR_CONTROL_STAND_S, SIGNAL_STOPPED_REASON, STALL_PROMPT_S, STALLED_REASON,
                                                        STOPPED_HANDBACK_S, STOPPED_LEAD_M, STOPPED_NOTE, STOPPED_NOTE_S, STOPPED_REASON,
@@ -1921,8 +1922,9 @@ def test_a_turn_from_a_standstill_driven_straight_past_its_junction_is_missed_ou
   missed = [p for p in plans[passed:] if p.turnMissed]
   assert 2.5 <= len(missed) * DT_MDL <= 3.5 and all(p.reason == TURN_MISSED_REASON for p in missed)
   assert not any(p.tooFastToTurn for p in plans)  # navd's skip match is for a turn ahead, never one already passed
-  # never braked for: no stop, no accel cap, and no speed cap under the turn's own while it is said
-  assert all(not p.shouldStop and p.accelCap == NO_ACCEL_CAP for p in plans)
+  # never braked for: no stop, no accel cap under the post-go profile's (positive), and no speed cap under the turn's own
+  # while it is said (the profile's ends at the pass)
+  assert all(not p.shouldStop and p.accelCap >= 1.0 for p in plans)
   assert all(p.speedCap >= plans[passed - 1].speedCap - 1e-3 for p in missed)
   assert not any(p.turnMissed for p in [sim.step(engaged=True) for _ in range(int(10. / DT_MDL))])  # said once
 
@@ -2097,3 +2099,126 @@ def test_a_gas_press_while_engaged_is_never_a_go_through_the_detectors_hold():
   assert all(p.shouldStop and p.reason == "waiting for oncoming" for p in plans) and sim.tp.scene.released_id is None
   plan = sim.step(car(sim), gas=True, engaged=False)
   assert not plan.shouldStop and sim.tp.scene.released_id is not None
+
+
+def test_the_go_from_a_standstill_drives_the_graduated_post_go_profile():
+  """DESIGN phase 4 section 3 (G3): from the go a turn let go of at standstill is capped by the heading it has turned,
+  DesireTiming.turned_deg: accel 1.0 m/s^2 until 45 deg, speed 3.0 m/s until 15 deg ramping to 4.3 at 45, blended into the
+  corner cap by 60, then nothing. It only lowers speed: no stop, no braking past -2.0."""
+  sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
+  go = go_from_the_hold(sim)
+  assert go.accelCap == 1.0 and math.isclose(go.speedCap, 3.0) and not go.shouldStop
+  rows = []
+  while sim.tp.post_go is not None:
+    v0, pg = sim.v, sim.tp.post_go
+    p = sim.step(engaged=True, yaw_rate=0.3 if sim.v > 0.5 else 0.)
+    d, turned = sim.tp.desires, pg.turned_deg
+    if d.maneuver_id == sim.tp.follower.maneuver_id and d.started and not d.done:
+      assert math.isclose(turned, d.turned_deg, abs_tol=1e-6)  # keyed on DesireTiming's heading while it tracks the turn
+    rows.append((turned, p, (sim.v - v0) / DT_MDL))
+    assert sim.t < 200.
+  for turned, p, a in rows:
+    assert not p.shouldStop and plan_accel(p.accelCap, p.speedCap, sim.v) >= -2.0
+    if turned < 45.:
+      assert p.accelCap == 1.0 and a <= 1.0 + 1e-6, turned
+    else:
+      assert p.accelCap == NO_ACCEL_CAP, turned
+    if turned < 15.:
+      assert p.speedCap <= 3.0 + 1e-6, turned
+    elif turned < 45.:
+      assert p.speedCap <= 3.0 + 1.3 * (turned - 15.) / 30. + 0.03, turned
+  assert any(math.isclose(t, 30., abs_tol=1.) and math.isclose(p.speedCap, 3.65, abs_tol=0.05) for t, p, _ in rows)
+  assert max(t for t, _, _ in rows) >= 60.  # it ended at its blend's end, not before
+  p = sim.step(engaged=True)
+  assert p.accelCap == NO_ACCEL_CAP and p.speedCap > 4.3
+
+
+def test_post_go_profiles_by_param_for_the_sweep():
+  """TurnPilotPostGoProfile picks the standstill turn's profile (turnpilotd main()), so the BeamNG sweep's four columns need
+  no code edit: none (V1 tapless) leaves the turn's own corner cap alone; flat3, graduated and flat43 cap it from the go."""
+  caps = {}
+  for name in ('none', 'flat3', 'graduated', 'flat43'):
+    sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
+    sim.tp.post_go_profile = name
+    go = go_from_the_hold(sim)
+    while sim.tp.post_go is not None and sim.tp.post_go.turned_deg < 30.:
+      p = sim.step(engaged=True, yaw_rate=0.3 if sim.v > 0.5 else 0.)
+      assert sim.t < 200.
+    caps[name] = (go.accelCap, round(go.speedCap, 2), round(p.speedCap, 2) if name != 'none' else None)
+  assert caps['none'][0] == NO_ACCEL_CAP and caps['none'][1] > 4.0  # the corner cap only (V_CORNER)
+  assert caps['flat3'] == (1.0, 3.0, 3.0)
+  assert caps['graduated'][:2] == (1.0, 3.0) and math.isclose(caps['graduated'][2], 3.65, abs_tol=0.05)
+  assert caps['flat43'][:2] == (1.0, 4.3) and caps['flat43'][2] <= 4.3
+
+
+def test_no_post_go_profile_without_a_standstill_go():
+  """A turn driven through without stopping (signals pass through: no light source, no stop) keeps its own caps only."""
+  sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
+  plans = []
+  while sim.s < 340.:
+    plans.append(sim.step(engaged=True, yaw_rate=0.4 if 300. - sim.s < 10. and sim.tp.desires.turned_deg < 85. else 0.))
+    assert sim.tp.post_go is None
+  assert all(p.accelCap == NO_ACCEL_CAP and not p.shouldStop for p in plans)
+
+
+def test_a_go_missed_straight_on_drops_its_post_go_cap_at_the_pass():
+  """A turn from a standstill driven straight past its junction is missed (turnMissed, rerouted): its 3.0 m/s post-go cap
+  ends there and doesn't hold the car on the road after it."""
+  sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
+  go_from_the_hold(sim)
+  plans = []
+  while not (plans and plans[-1].turnMissed):
+    plans.append(sim.step(engaged=True))
+    assert sim.t < 200.
+  assert all(p.speedCap <= 3.0 + 1e-6 for p in plans[:-1])
+  assert sim.tp.post_go is None and plans[-1].speedCap > 3.0 and plans[-1].accelCap == NO_ACCEL_CAP
+
+
+def test_a_hold_reached_already_into_the_turn_starts_the_ramp_where_it_is():
+  """G0: a 10 m hold was reached 39-49 deg into the turn. The profile is keyed on DesireTiming.turned_deg itself, so a go
+  40 deg in starts at 4.08 m/s (the ramp at 40 deg), with the accel cap, not back at 3.0."""
+  sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
+  sim.go_taps = False
+  sim.tp.oracle_ok = True
+  light = {'state': 'red'}
+
+  def lights(sim):
+    msg = messaging.new_message('turnpilotLights')
+    msg.turnpilotLights.source = 'simOracle'
+    msg.turnpilotLights.lights = [{'state': light['state'], 'distance': 290. - sim.s, 'instance': 'trafficLight 1'}]
+    return msg.as_reader().turnpilotLights
+  sim.lights = lights
+  stop_at(sim, 290.)
+  sim.run(1.)
+  sim.tp.desires.turned_deg = 40.  # crept into the turn on the way to the line
+  light['state'] = 'green'
+  while sim.trace[-1][2].shouldStop:
+    sim.step(engaged=True)
+    assert sim.t < 120.
+  go = sim.trace[-1][2]
+  assert sim.tp.post_go is not None and go.accelCap == 1.0
+  assert math.isclose(go.speedCap, 3.0 + 1.3 * 25. / 30., abs_tol=1e-3)
+
+
+def test_the_unprotected_left_takes_its_own_post_go_profile():
+  """A go into an unprotected left (G4's autonomous go; today it hands back at its line) takes the left's profile, 1.5 m/s^2
+  and 4.3 m/s to 45 deg (DESIGN section 2), or TurnPilotLeftGoProfile's. Any other turn takes TurnPilotPostGoProfile's."""
+  left = Maneuver(*classify("turn", "left"), "turn", "left", 90., geometry=True, opposing='present')
+  t_left = Maneuver(*classify("turn", "left"), "turn", "left", 90., geometry=True, opposing='none')
+  right = Maneuver(*classify("turn", "right"), "turn", "right", 90., geometry=True, opposing='present')
+  tp = TurnPilot()
+  tp.start_post_go(left, 9., 0., True)
+  assert tp.post_go.profile == POST_GO_PROFILES['left']
+  assert tp.post_go.caps(0.) == (1.5, 4.3)
+  for m in (t_left, right):
+    tp.start_post_go(m, 9., 0., True)
+    assert tp.post_go.profile == POST_GO_PROFILES['graduated']
+  tp.start_post_go(left, 9., 0., False)  # traffic keeping left: the right is the unprotected one
+  assert tp.post_go.profile == POST_GO_PROFILES['graduated']
+  tp.start_post_go(right, 9., 0., False)
+  assert tp.post_go.profile == POST_GO_PROFILES['left']
+  tp.left_go_profile, tp.post_go_profile = 'graduated', 'flat43'
+  tp.start_post_go(left, 9., 0., True)
+  assert tp.post_go.profile == POST_GO_PROFILES['graduated']
+  tp.start_post_go(t_left, 9., 0., True)
+  assert tp.post_go.profile == POST_GO_PROFILES['flat43']

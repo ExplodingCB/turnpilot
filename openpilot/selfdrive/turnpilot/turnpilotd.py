@@ -57,6 +57,11 @@ it was missed: turnMissed for MISSED_HOLD_S, which selfdrived chimes as a skip (
 navd reroutes at once. Nothing brakes for it. Standing more than STALL_PROMPT_S after the go, STALL_MIN_DEG to
 STALL_MAX_DEG into the turn, with no hold of TurnPilot's and no lead within STOPPED_LEAD_M, it stalled in the junction:
 handed back loudly (controlPrompt stalledTakeControl, STALLED_REASON), and TurnPilot never goes itself.
+From the go such a turn is driven under its post-go profile (turn_speed.py: PostGo; DESIGN phase 4 section 3): accel and
+speed capped by the heading it has turned, DesireTiming.turned_deg at the go and the car's yaw after, until 60 deg or
+POST_GO_MAX_M on, and dropped at the pass of a turn missed straight on. TurnPilotPostGoProfile names the profile
+(graduated by default; none, flat3, flat43 for the BeamNG sweep), and an unprotected turn's go (unprotected_turn: a left
+across the oncoming road) takes TurnPilotLeftGoProfile's (left: 1.5 m/s^2, 4.3 m/s). The caps only lower speed.
 Standing engaged with nothing of TurnPilot's holding the car (no shouldStop, no cap biting), no lead from the model within
 STOPPED_LEAD_M (one further on doesn't hold a standing car), gas and brake off, the model stopped on its own: said on the
 status line after STOPPED_NOTE_S (STOPPED_NOTE), and handed back loudly (controlPrompt carStoppedTakeControl) after
@@ -99,7 +104,7 @@ from openpilot.selfdrive.turnpilot.scene.lane_paint import lane_paint_from_msg
 from openpilot.selfdrive.turnpilot.scene.tracker import STALE_S, SceneTracker, default_yaw_rate
 from openpilot.selfdrive.turnpilot.scene_policy import NO_ACCEL_CAP, ScenePolicy
 from openpilot.selfdrive.turnpilot.turn_skip import TurnSkip, can_make_turn
-from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP, turn_speed_cap
+from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
 
 Desire = log.Desire
 State = custom.TurnpilotPlan.State
@@ -194,6 +199,8 @@ class TurnPilot:
     self.yellow_decel = YELLOW_DECEL  # TurnPilotYellowDecel (main())
     self.camera_mode = LIGHT_MODE_DEFAULT  # TurnPilotCameraLights (main()): the camera's lights, shadow unless addOnly
     self.map_now = None  # this frame's map control decision, once update() has made it
+    self.post_go_profile = POST_GO_DEFAULT  # TurnPilotPostGoProfile (main()): a standstill turn's post-go profile
+    self.left_go_profile = LEFT_GO_PROFILE  # TurnPilotLeftGoProfile (main()): an unprotected turn's
     self._rf_ticked = self._yaw_ticked = False  # update() dead-reckoned the route, and counted the yaw, this frame
     self.reset()
 
@@ -233,6 +240,7 @@ class TurnPilot:
       self.turn_held_id: int | None = None  # ...whose turn desire was out: held to its clear, never cancelled
       self.skip_cap_id: int | None = None  # a dropped turn skipped on taking it up: its cap stays until it is passed
       self.go_id: int | None = None  # the turn a hold let go of at standstill: checked for a miss and a stall
+      self.post_go: PostGo | None = None  # ...and driven under its post-go profile (start_post_go)
     else:
       self.desires.hold_off()  # the disabled plan dropped the desire: as on re-engaging, a fresh pulse only before the turn
     self.lanes = LanePlanner()
@@ -447,8 +455,12 @@ class TurnPilot:
                                  holding=decision.should_stop)
     self._yaw_ticked = True
     d = self.desires
-    if self.release_go and d.maneuver_id == rf.maneuver_id and d.started and d.side != 0 and not d.done:
+    if self.release_go and d.maneuver_id == rf.maneuver_id and d.started and d.side != 0 and not d.done and upcoming is not None:
       self.go_id, self.stall_s = rf.maneuver_id, 0.
+      if sm['carControl'].enabled and not took_over:  # TurnPilot's go; the driver driving off a hold is the driver's
+        self.start_post_go(upcoming, rf.distance, d.turned_deg, right_hand_traffic)
+    elif self.post_go is not None:
+      self.post_go.update(v_ego, default_yaw_rate(cs, model), DT_MDL)
     if held and desire not in (Desire.none, CLEAR_DESIRE) and desire != self.last_desire:
       desire = Desire.none  # held: the desire out stays out, but never a new rising edge (a repeat pulse under way)
     plan.desire = self.last_desire = desire
@@ -484,6 +496,11 @@ class TurnPilot:
     plan.speedCap = min(decision.speed_cap, turn_speed_cap(cap_on, rf.distance, v_ego, right_hand_traffic), ahead_cap,
                         NO_SPEED_CAP if self.hold_v is None else self.hold_v)
     plan.shouldStop = decision.should_stop
+    if self.post_go is not None and self.post_go.over:
+      self.post_go = None
+    if self.post_go is not None:  # only ever lowers: a positive accel cap, a speed cap braking at -2.0 at most
+      go_accel, go_speed = self.post_go.caps(v_ego)
+      plan.accelCap, plan.speedCap = min(plan.accelCap, go_accel), min(plan.speedCap, go_speed)
     self.limits = (plan.accelCap, plan.speedCap, plan.shouldStop)
     no_junction_data = maneuver is not None and maneuver.kind in (TURN, KEEP) and not maneuver.geometry
     plan.turnMissed = acting and self.missed_t > 0.
@@ -546,8 +563,17 @@ class TurnPilot:
     self.go_id = None
     if acting and not d.done and d.turned_deg < MISSED_TURN_DEG:  # done before the pass: cleared at its angle, taken
       self.missed_t = MISSED_HOLD_S
+      self.post_go = None  # missed straight on: not held to the profile's speed down the road
       cloudlog.event("turnpilot_turn_missed", error=True, turned_deg=round(d.turned_deg, 1), v_ego=round(v_ego, 2),
                      distance=round(rf.distance, 1))
+
+  def start_post_go(self, maneuver, distance: float, turned_deg: float, right_hand_traffic: bool = True) -> None:
+    """The go of a turn from a standstill: its post-go profile from now (module docstring), the unprotected turn's own for a
+    turn across the oncoming road."""
+    left = unprotected_turn(maneuver, right_hand_traffic)
+    name = self.left_go_profile if left else self.post_go_profile
+    self.post_go = PostGo(POST_GO_PROFILES[name], maneuver, distance, turned_deg, right_hand_traffic)
+    cloudlog.event("turnpilot.post_go", profile=name, unprotected=left, turned_deg=round(turned_deg, 1), distance=round(distance, 1))
 
   def stalled_in_turn(self, sm, cs, v_ego: float, acting: bool, decision, mapd) -> bool:
     """The car has stood STALL_PROMPT_S in the turn a hold let go of, with nothing holding it (module docstring): hand
