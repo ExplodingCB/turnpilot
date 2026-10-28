@@ -158,3 +158,33 @@ def test_main_reads_the_camera_lights_mode(value, mode):
   with mock.patch.object(turnpilotd, 'TurnPilot', side_effect=make):
     run_main(frames=3, TurnPilotCameraLights=value)
   assert made[0].camera_mode == mode
+
+
+@pytest.mark.parametrize("value,profile", [(None, 'graduated'), ('none', 'none'), ('flat3', 'flat3'), ('flat43', 'flat43'),
+                                           ('graduated', 'graduated'), ('left', 'left'), ('bogus', 'graduated'), (b'flat3', 'flat3')])
+def test_main_reads_the_post_go_profiles(value, profile):
+  """TurnPilotPostGoProfile and TurnPilotLeftGoProfile pick the post-go profiles by name (turn_speed.POST_GO_PROFILES), so the
+  BeamNG sweep sets them without a code edit; unset or unknown is the default (graduated, left), logged."""
+  made, real = [], turnpilotd.TurnPilot
+  def make():
+    made.append(real())
+    return made[-1]
+  with mock.patch.object(turnpilotd, 'TurnPilot', side_effect=make):
+    run_main(frames=3, TurnPilotPostGoProfile=value, TurnPilotLeftGoProfile=value)
+  assert made[0].post_go_profile == profile
+  assert made[0].left_go_profile == (profile if value not in (None, 'bogus') else 'left')
+
+
+def test_post_go_profile_unknown_to_the_build_is_the_default():
+  class Old(FakeParams):
+    def get(self, key):
+      if key in ('TurnPilotPostGoProfile', 'TurnPilotLeftGoProfile'):
+        raise turnpilotd.UnknownKeyName(key)
+      return super().get(key)
+  with mock.patch.object(turnpilotd, 'log_error') as log_error:
+    assert turnpilotd.post_go_profile_for(Old(), 'TurnPilotPostGoProfile', 'graduated') == 'graduated'
+    assert turnpilotd.post_go_profile_for(Old(), 'TurnPilotLeftGoProfile', 'left') == 'left'
+  assert log_error.call_count == 2
+  with mock.patch.object(turnpilotd, 'log_error') as log_error:
+    assert turnpilotd.post_go_profile_for(FakeParams(TurnPilotPostGoProfile='nope'), 'TurnPilotPostGoProfile', 'graduated') == 'graduated'
+  assert log_error.call_count == 1

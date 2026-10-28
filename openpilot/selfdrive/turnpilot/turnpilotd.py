@@ -841,6 +841,23 @@ def yellow_decel_for(params) -> float:
     return YELLOW_DECEL
 
 
+def post_go_profile_for(params, key: str, default: str) -> str:
+  """TurnPilotPostGoProfile or TurnPilotLeftGoProfile: a turn_speed.POST_GO_PROFILES name; default if unset, unknown (said
+  out loud) or unknown to this build's params."""
+  try:
+    value = params.get(key)
+  except UnknownKeyName:
+    log_error(f"turnpilotd: {key} unknown to this build's params, post-go profile {default}; run scons")
+    return default
+  value = value.decode() if isinstance(value, bytes) else value
+  if value is None:
+    return default
+  if value not in POST_GO_PROFILES:
+    log_error(f"turnpilotd: {key} {value!r} is no post-go profile ({', '.join(POST_GO_PROFILES)}), {default} instead")
+    return default
+  return value
+
+
 def disabled_plan(shadow: bool, reason: str, fault=Fault.none, handback=Handback.none):
   """A plan nothing acts on: no desire, no lane change, no limits. handback: a model fallback, which selfdrived still
   raises through a disabled plan (hooks.fresh_plan)."""
@@ -915,6 +932,8 @@ def main():
       tp.oracle_ok = oracle_accepted(os.environ, read_bool(params, "TurnPilotSimLightOracle", False))
       tp.yellow_decel = yellow_decel_for(params)
       tp.camera_mode = camera_lights_mode(params)
+      tp.post_go_profile = post_go_profile_for(params, "TurnPilotPostGoProfile", POST_GO_DEFAULT)
+      tp.left_go_profile = post_go_profile_for(params, "TurnPilotLeftGoProfile", LEFT_GO_PROFILE)
       if params.get("ChestnutActive") is False:  # None: no big model expected this drive
         tp.big_model_failed(enabled)
 

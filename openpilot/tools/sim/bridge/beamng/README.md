@@ -268,6 +268,30 @@ never), and standing engaged with nothing held. Never while TurnPilot hands back
 plan is stale: a prompt left up then is no go. `light_oracle.py` and `probe_signals.py` haven't been run against the
 game yet: check the published states against the HUD first.
 
+## Post-go profile sweep
+
+A turn TurnPilot lets go of at a standstill is driven under a post-go profile from the go (`turn_speed.py`, DESIGN phase 4
+section 3). Two params pick it by name, read once a second, so the sweep's columns need no code edit:
+
+| param | values | default |
+| --- | --- | --- |
+| `TurnPilotPostGoProfile` | `none` (V1 tapless, no cap), `flat3` (3.0 m/s to 45 deg), `graduated` (3.0 m/s to 15 deg, 4.3 at 45), `flat43` (4.3 m/s to 45 deg), `left` | `graduated` |
+| `TurnPilotLeftGoProfile` | the same names, for a go into an unprotected turn (a left across the oncoming road) | `left` (1.5 m/s^2, 4.3 m/s to 45 deg) |
+
+The capped profiles other than `left` cap the accel at 1.0 m/s^2 until 45 deg, and all of them blend into the turn's own
+corner cap between 45 and 60 deg. An unset or unknown value is the default, logged. Set one for a run with the stack's
+prefix, after `scons` in the main checkout has built the keys into the params library (an older build logs the key as
+unknown and uses the default):
+
+```sh
+OPENPILOT_PREFIX=tpsim python -c "from openpilot.common.params import Params; Params().put('TurnPilotPostGoProfile', 'flat3')"
+```
+
+Whatever the profile, a go the car hasn't pulled away on (0.3 m/s) within 2.0 s, 1.0 s into an unprotected turn
+(`turnpilotd.NO_MOVE_S`, `LEFT_NO_MOVE_S`), is withdrawn and handed back (`cantStartTakeControl`). The car is then held
+standing until openpilot disengages, so a tapless pull-away measured past 2 s needs those constants raised in the harness
+copy. turnpilotd logs `turnpilot.post_go` (the profile chosen) at each go and `turnpilot.go_not_moving` at a withdrawal.
+
 ## Chase view
 
 A live chase camera (`--capture`) costs the driving cameras 6 to 9 pairs a second at any frame rate, and the model's
