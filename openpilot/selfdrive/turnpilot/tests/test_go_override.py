@@ -2,7 +2,10 @@
 e2e model's hold on a standing car only for a go turnpilotd certifies, at most +0.5 m/s^2, for at most 3 s, under 3 m/s,
 and only while nothing else holds the car."""
 import random
+from collections import deque
 import time
+
+import numpy as np
 
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import custom, log
@@ -282,3 +285,255 @@ def test_certifier_fills_the_plan_only_while_its_go_is_out():
   gc.fill(msg.turnpilotPlan)
   g = msg.as_reader().turnpilotPlan.goCertified
   assert g.cause == 'turnRelease' and g.id == gc.id and abs(g.t - DT_MDL) < 1e-6
+
+
+# --- the planner: longitudinal_planner.py with the lift wired in ---
+
+def tesla_cp():
+  from opendbc.car.tesla.interface import CarInterface
+  from opendbc.car.tesla.values import CAR
+  cp = CarInterface.get_non_essential_params(CAR.TESLA_MODEL_3)
+  cp.openpilotLongitudinalControl = True  # the demo car: alpha longitudinal on (DESIGN decision 8)
+  return cp
+
+
+def planner_sm(v=0., plan=None, model_v2=None, brake=False, gas=False, enabled=True, radar_lead=None, age=0., cruise_kph=40.):
+  from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
+  msgs = {s: messaging.new_message(s) for s in ('carState', 'selfdriveState', 'radarState', 'controlsState')}
+  cs = msgs['carState'].carState
+  cs.vEgo, cs.standstill, cs.vCruise, cs.brakePressed, cs.gasPressed = float(v), v < 0.01, cruise_kph, brake, gas
+  msgs['selfdriveState'].selfdriveState.enabled = enabled
+  msgs['controlsState'].controlsState.longControlState = LongCtrlState.pid if enabled else LongCtrlState.off
+  if radar_lead is not None:
+    lead = msgs['radarState'].radarState.leadOne
+    lead.present, lead.dRel, lead.modelProb, lead.aLeadTau = True, float(radar_lead), 0.9, 1.5
+  sm = {s: getattr(m.as_reader(), s) for s, m in msgs.items()}
+  sm['modelV2'] = model_v2 if model_v2 is not None else model(**HOLDING)
+  if plan is not None:
+    sm['turnpilotPlan'] = plan
+  return FakeSM(sm, age=age)
+
+
+WARM_S = 2.  # s standing held before a go: the cruise candidate ramps up from the planner's start (it is 2.0 after a stand)
+
+
+def new_planner(warm=True):
+  """The planner, standing WARM_S held by the model (no go) first, as a car at its line is."""
+  from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
+  lp = LongitudinalPlanner(tesla_cp(), init_v=0.)
+  for _ in range(round(WARM_S / DT_MDL) if warm else 0):
+    lp.update(planner_sm(0., go_plan('none')))
+  return lp
+
+
+def published(lp, sm):
+  pm = mock_pm()
+  sm.logMonoTime = {'modelV2': 0}
+  sm.all_checks = lambda: True
+  lp.publish(sm, pm)
+  return pm.sent['longitudinalPlan'].longitudinalPlan
+
+
+def mock_pm():
+  class PM:
+    def __init__(self):
+      self.sent = {}
+
+    def send(self, s, msg):
+      self.sent[s] = msg.as_reader()
+  return PM()
+
+
+def test_planner_lifts_the_models_standstill_hold_only_for_a_certified_go():
+  lp = new_planner()  # standing, the model holding: TurnPilot's hold gone, no go
+  assert lp.output_a_target == 0. and lp.output_should_stop
+  lp.update(planner_sm(0., go_plan()))
+  assert lp.output_a_target == GO_ACCEL and not lp.output_should_stop and lp.mpc.source == log.LongitudinalPlan.LongitudinalPlanSource.e2e
+  lp_msg = published(lp, planner_sm(0., go_plan()))
+  assert lp_msg.turnpilotGoLift and lp_msg.turnpilotGoEnd == '' and lp_msg.aTarget == GO_ACCEL and not lp_msg.shouldStop
+  # withdrawn: that same frame the model's hold is back
+  lp.update(planner_sm(0., go_plan('none')))
+  assert lp.output_a_target == 0. and lp.output_should_stop
+  lp_msg = published(lp, planner_sm(0., go_plan('none')))
+  assert not lp_msg.turnpilotGoLift and lp_msg.turnpilotGoEnd == 'withdrawn'
+
+
+def run(lp, frames):
+  """frames: lists of planner_sm keywords, one a frame. (aTarget, shouldStop) of each."""
+  out = []
+  for kw in frames:
+    lp.update(planner_sm(**kw))
+    out.append((float(lp.output_a_target), bool(lp.output_should_stop)))
+  return out
+
+
+def test_planner_output_is_untouched_whenever_the_lift_may_not_act():
+  """Twin planners, the same frames, one with a certified go: identical outputs at or above GO_END_SPEED, with a lead inside
+  GO_CLEAR_M, under TurnPilot's hold (a walker's), braking, a shadow, faulted (disabled) or stale plan, and after its window."""
+  base = {'plan': go_plan('none')}
+  cases = {
+    'speed': [{'v': GO_END_SPEED}] * 30, 'lead': [{'radar_lead': 8.}] * 30, 'leadAt14': [{'radar_lead': GO_CLEAR_M - 1.}] * 30,
+    'modelLead': [{'model_v2': model(**HOLDING, lead_x=10.)}] * 30, 'brake': [{'brake': True}] * 30,
+  }
+  for name, frames in cases.items():
+    plain = run(new_planner(), [{**base, **f} for f in frames])
+    gone = run(new_planner(), [{**f, 'plan': go_plan(t=i * DT_MDL)} for i, f in enumerate(frames)])
+    assert plain == gone, name
+  held = go_plan(should_stop=True, speed_cap=0.)  # TurnPilot holds (a walker in front): the go means nothing
+  assert run(new_planner(), [{'plan': go_plan('none', should_stop=True, speed_cap=0.)}] * 30) == run(new_planner(), [{'plan': held}] * 30)
+  for plan in (go_plan(shadow=True), go_plan(state=State.disabled, should_stop=True)):
+    assert run(new_planner(), [{'plan': go_plan('none', shadow=plan.shadow, state=plan.state, should_stop=plan.shouldStop)}] * 30) == \
+      run(new_planner(), [{'plan': plan}] * 30)
+  assert run(new_planner(), [{'plan': go_plan(), 'age': 1.}] * 30) == run(new_planner(), [{'plan': go_plan('none'), 'age': 1.}] * 30)
+  # past the window: the same go asserted on lifts no more
+  n = round(GO_WINDOW_S / DT_MDL)
+  out = run(new_planner(), [{'plan': go_plan(t=i * DT_MDL)} for i in range(n + 20)])
+  assert all(o == (GO_ACCEL, False) for o in out[:n]) and all(o == (0., True) for o in out[n:])
+
+
+class Recorder(GoLift):
+  """GoLift that keeps each frame's inputs and output, so the planner's own candidates are known to the test."""
+  def __init__(self):
+    super().__init__()
+    self.log = []
+
+  def update(self, sm, v_ego, mpc, cruise, tp, e2e, dt=DT_MDL, now=None):
+    out = super().update(sm, v_ego, mpc, cruise, tp, e2e, dt, now)
+    self.log.append((v_ego, mpc, cruise, tp, e2e, out, self.lifting))
+    return out
+
+
+def test_planner_property_random():
+  """Random drives through the real planner: its output with the lift is the min() of the same candidates with only the e2e
+  one lifted, so never above max(its output without the lift, GO_ACCEL), and the any() of their stops less only the
+  model's; a frame not lifted is the stock blend exactly."""
+  from opendbc.car.interfaces import ACCEL_MAX, ACCEL_MIN
+  rng = random.Random(7)
+  lifted = 0
+  for _ in range(40):
+    lp = new_planner()
+    lp.go_lift = rec = Recorder()
+    rec.log = []
+    go_id, v, t = 1, 0., 0.
+    for _ in range(rng.randint(20, 90)):
+      kw = {'v': v, 'plan': go_plan('turnRelease', go_id, t=t, should_stop=rng.random() < 0.03,
+                                    speed_cap=rng.choice([100., 100., 4.3, 0.5]), accel_cap=rng.choice([10., 10., 1.0, 0.3]))}
+      if rng.random() < 0.05:
+        kw['radar_lead'] = rng.choice([6., 14., 30.])
+      if rng.random() < 0.03:
+        kw['brake'] = True
+      kw['model_v2'] = model(should_stop=v < 0.3, plan=lambda t_: 0., accel=rng.uniform(-0.5, 0.3)) if rng.random() < 0.8 else \
+        model(**GOING, accel=0.6)
+      if rng.random() < 0.03:
+        kw['plan'] = go_plan('none')
+      lp.update(planner_sm(**kw))
+      v_ego, mpc, cruise, tp, e2e, out, lifting = rec.log[-1]
+      cands = [mpc, cruise] + ([tp] if tp is not None else [])
+      plain = float(np.clip(min([c[0] for c in cands] + [e2e[0]]), ACCEL_MIN, ACCEL_MAX))
+      a = float(lp.output_a_target)
+      assert a <= max(plain, GO_ACCEL) + 1e-6
+      if not lifting:
+        assert out == e2e and a == plain and lp.output_should_stop == any(c[1] for c in cands + [e2e])
+      else:
+        lifted += 1
+        assert v_ego < GO_END_SPEED and a == float(np.clip(min([c[0] for c in cands] + [max(e2e[0], GO_ACCEL)]), ACCEL_MIN, ACCEL_MAX))
+        assert lp.output_should_stop == any(c[1] for c in cands)
+      v = max(v + a * DT_MDL, 0.)  # the car follows its plan
+      t += DT_MDL
+      if rng.random() < 0.02:
+        go_id, t = go_id + 1, 0.
+  assert lifted > 200
+
+
+# --- closed loop: the planner driving a point mass, a model that holds a standstill ---
+
+def holding_model(v):
+  """G0's stand: the model holds the car (shouldStop, its plan to a stop), braking gently when it rolls."""
+  a = -0.4 if v > 0.05 else 0.
+  return model(should_stop=v < 0.3 and a < 0.1, plan=lambda t: max(v - 0.6 * t, 0.), accel=a)
+
+
+def model_that_takes_over(v):
+  """Holds at a standstill, then, rolling, means to go: shouldStop false and a plan 0.8 m/s^2 on."""
+  if v < 0.3:
+    return holding_model(v)
+  return model(plan=lambda t: v + 0.8 * t, accel=0.8)
+
+
+def closed_loop(model_fn, seconds=9., lag_s=0.3, go_at=WARM_S, withdraw_at=None, brake_at=None, lead_at=None):
+  """The real planner closing the loop on a point mass whose accel follows aTarget lag_s late (a pure delay; -1.0 m/s^2 on a
+  shouldStop, longcontrol's stopping), standing until go_at, then TurnPilot's go asserted as turnpilotd asserts it
+  (GoCertifier: until its window, the model's takeover or 3 m/s; withdrawn at withdraw_at). The driver brakes from brake_at,
+  a lead stands 8 m ahead from lead_at. Rows (t, v, s, aTarget, lifting, certified)."""
+  lp = new_planner(warm=False)
+  gc = GoCertifier()
+  queue = deque([0.] * max(round(lag_s / DT_MDL), 1))
+  v = s = 0.
+  rows = []
+  for i in range(round(seconds / DT_MDL)):
+    t = i * DT_MDL
+    m = model_fn(v)
+    gc.update(m, v, DT_MDL)
+    if abs(t - go_at) < DT_MDL / 2:
+      assert gc.start('turnRelease')
+    if withdraw_at is not None and abs(t - withdraw_at) < DT_MDL / 2:
+      gc.withdraw('test')
+    msg = messaging.new_message('turnpilotPlan')
+    p = msg.turnpilotPlan
+    p.state, p.accelCap, p.speedCap = State.turning, 10., 100.
+    gc.fill(p)
+    brake = brake_at is not None and t >= brake_at
+    lead = 8. if lead_at is not None and t >= lead_at else None
+    lp.update(planner_sm(v, msg.as_reader().turnpilotPlan, m, brake=brake, radar_lead=lead))
+    a_cmd = -2. if brake else -1. if lp.output_should_stop else float(lp.output_a_target)
+    queue.append(a_cmd)
+    v = max(v + queue.popleft() * DT_MDL, 0.)
+    s += v * DT_MDL
+    rows.append((t, v, s, float(lp.output_a_target), lp.go_lift.lifting, gc.active))
+  lp.certifier = gc
+  return rows, lp
+
+
+def test_closed_loop_a_model_that_never_takes_over_is_nudged_2_25_m_at_most():
+  """The model holds throughout: the go lifts the car at +0.5 m/s^2 for its 3 s, no more: 1.5 m/s and 2.25 m at most (a lag
+  only shortens it), then the model's hold is back and the car stops again on the model's own braking (here a gentle 0.4
+  m/s^2: turnpilotd's withdrawal of a go not taken over stops it sooner, test_turnpilotd_go.py)."""
+  for lag in (0.15, 0.3, 0.5):
+    rows, lp = closed_loop(holding_model, seconds=11., lag_s=lag)
+    lifted = [r for r in rows if r[4]]
+    assert len(lifted) == round(GO_WINDOW_S / DT_MDL) and all(r[3] == GO_ACCEL for r in lifted)
+    # turnpilotd's window and plannerd's agree: its end clears the go the frame plannerd's would have ended it
+    assert lp.certifier.end == 'window' and not lp.certifier.taken_over and lp.go_lift.end == 'withdrawn'
+    end_lift = lifted[-1]
+    assert max(r[1] for r in rows) <= GO_ACCEL * GO_WINDOW_S + 1e-6
+    assert end_lift[2] <= 0.5 * GO_ACCEL * GO_WINDOW_S ** 2 + 1e-6
+    assert rows[-1][1] < 0.05
+    assert all(r[3] >= -2. for r in rows)
+
+
+def test_closed_loop_the_lift_ends_on_the_models_takeover():
+  """A model that goes once the car rolls: the lift ends TAKEOVER_S after its plan says go, well inside the window, and the
+  model drives on past 3 m/s by itself. With an actuator lag of up to 0.3 s the car is past 0.3 m/s inside the unprotected
+  left's LEFT_NO_MOVE_S (1.0 s, CRITIQUE REQUIRED 4)."""
+  from openpilot.selfdrive.turnpilot.turnpilotd import LEFT_NO_MOVE_S, STANDSTILL_SPEED
+  for lag in (0.15, 0.3):
+    rows, lp = closed_loop(model_that_takes_over, lag_s=lag)
+    lifted = [r for r in rows if r[4]]
+    assert 0 < len(lifted) < round(GO_WINDOW_S / DT_MDL) and lp.certifier.end == 'takeover' and lp.certifier.taken_over
+    moving = next(r[0] for r in rows if r[1] >= STANDSTILL_SPEED)
+    assert moving - WARM_S <= LEFT_NO_MOVE_S, (lag, moving - WARM_S)
+    assert rows[-1][1] > GO_END_SPEED and not rows[-1][4]
+
+
+def test_closed_loop_withdrawn_mid_lift_or_braked_ends_it_that_frame():
+  rows, lp = closed_loop(holding_model, withdraw_at=WARM_S + 1.)
+  at = next(i for i, r in enumerate(rows) if r[0] >= WARM_S + 1. - 1e-6)
+  assert rows[at - 1][4] and not any(r[4] for r in rows[at:]) and lp.go_lift.end == 'withdrawn'
+  assert rows[-1][1] < 0.05 and rows[-1][2] <= 0.5 * GO_ACCEL * 1. ** 2 + 0.5
+  rows, lp = closed_loop(holding_model, brake_at=WARM_S + 1.)
+  at = next(i for i, r in enumerate(rows) if r[0] >= WARM_S + 1. - 1e-6)
+  assert rows[at - 1][4] and not any(r[4] for r in rows[at:]) and lp.go_lift.end == 'driver'
+  # a lead stopping 8 m ahead mid-lift: over at once, the mpc holds the car behind it
+  rows, lp = closed_loop(holding_model, lead_at=WARM_S + 1.)
+  at = next(i for i, r in enumerate(rows) if r[0] >= WARM_S + 1. - 1e-6)
+  assert not any(r[4] for r in rows[at:]) and lp.go_lift.end == 'lead'

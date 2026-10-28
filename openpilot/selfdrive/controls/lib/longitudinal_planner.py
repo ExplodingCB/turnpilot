@@ -13,6 +13,7 @@ from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import Longi
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan, should_stop
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
+from openpilot.selfdrive.turnpilot.go_override import GoLift
 from openpilot.selfdrive.turnpilot.hooks import limits_plan, plan_accel
 from openpilot.common.swaglog import cloudlog
 
@@ -37,6 +38,7 @@ class LongitudinalPlanner:
     self.fcw = False
     self.dt = dt
     self.accel_boost = AccelBoost()
+    self.go_lift = GoLift()  # TurnPilot's bounded go (turnpilot/go_override.py)
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.a_cruise = init_a
@@ -104,12 +106,22 @@ class LongitudinalPlanner:
 
     output_a_target_e2e = self.accel_boost.update(sm, output_a_target_e2e, output_a_target_mpc, self.a_cruise)
 
+    tp = limits_plan(sm)
+    # TurnPilot's turn speed and scene limits (a faulted plan's too), reported as a cruise limit
+    tp_candidate = (plan_accel(tp.accelCap, tp.speedCap, v_ego), tp.shouldStop) if tp is not None else None
+    # TurnPilot's bounded go (turnpilot/go_override.py): for a go turnpilotd certifies, and only while the model alone holds
+    # the car, the e2e candidate lifted to +0.5 m/s^2 at most and its stop dropped, 3 s at most, under 3 m/s. Every other
+    # candidate stays in the min() and the any()
+    model_t = getattr(sm, 'logMonoTime', {}).get('modelV2')
+    output_a_target_e2e, output_should_stop_e2e = self.go_lift.update(
+      sm, v_ego, (output_a_target_mpc, output_should_stop_mpc), (self.a_cruise, cruise_should_stop), tp_candidate,
+      (output_a_target_e2e, output_should_stop_e2e), self.dt, model_t * 1e-9 if model_t else None)
+
     candidates = [(output_a_target_mpc, self.mpc.source, output_should_stop_mpc),
                   (self.a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop),
                   (output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e)]
-    tp = limits_plan(sm)
-    if tp is not None:  # TurnPilot's turn speed and scene limits (a faulted plan's too), reported as a cruise limit
-      candidates.append((plan_accel(tp.accelCap, tp.speedCap, v_ego), LongitudinalPlanSource.cruise, tp.shouldStop))
+    if tp_candidate is not None:
+      candidates.append((tp_candidate[0], LongitudinalPlanSource.cruise, tp_candidate[1]))
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
     self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
@@ -139,5 +151,7 @@ class LongitudinalPlanner:
     longitudinalPlan.accelBoost = float(self.accel_boost.total_boost)
     longitudinalPlan.shouldStop = bool(self.output_should_stop)
     longitudinalPlan.allowBrake = True
+    longitudinalPlan.turnpilotGoLift = bool(self.go_lift.lifting)
+    longitudinalPlan.turnpilotGoEnd = self.go_lift.end
 
     pm.send('longitudinalPlan', plan_send)
