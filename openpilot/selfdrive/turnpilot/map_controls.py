@@ -65,7 +65,12 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   stop sign already stops; the maneuver stays protected once seen so, after its control drops out behind the car). A
   signal there doesn't protect it (SIGNAL_PROTECTS_LEFT): a left on a green ball is unprotected. turnpilotd hands it in each frame
   (update()'s turn) and it becomes a control of its own, kind unprotectedTurn, at the junction's hold line less
-  MAP_MARGIN_M: the curve, the latch and the stop sign's rules, handed back at once once held (unprotectedTurnTakeControl).
+  MAP_MARGIN_M: the curve, the latch and the stop sign's rules. Held, it does what the unprotected left asks (update()'s
+  left, a LeftCommand from unprotected_left.py through turnpilotd; TurnPilotAutoLeft): auto (the default; Kellen,
+  2026-10-28, "No it has to ship taking the turn", no intervention) holds it, never handing back but for the left's fault
+  (leftUndecidedTakeControl), creeps its stop point on to where the left asks (CREEP_SPEED, CREEP_ACCEL; still the latch,
+  never past it), and releases it on the left's go (cause gap); announce and off hand it back at once
+  (unprotectedTurnTakeControl), announce saying whether it would have gone.
   A failing or missing controls status leaves the turn unprotected. One the
   car isn't held at goes with its maneuver (skipped too fast, rerouted away, passed), never with a fault (it carries on,
   dead-reckoned); a held one is position-free like any latch. Its junction is the nearest of navd's readings
@@ -132,6 +137,23 @@ PROTECT_PAST_M = 2.           # ...to this far past it is the junction's own: th
 SIGNAL_PROTECTS_LEFT = False
 
 STOP_SIGN_REASON = "Stop sign: take control to proceed"
+# The autonomous unprotected left (unprotected_left.py, DESIGN phase 4 G4) creeps its held stop point on for a view
+CREEP_SPEED = 0.7             # m/s
+CREEP_ACCEL = 0.5             # m/s^2
+CREEP_AT_M = 0.1              # crept to within this of its target: held there again
+
+
+@dataclass
+class LeftCommand:
+  """What the unprotected left (unprotected_left.py, through turnpilotd) asks of its hold line's latch. mode:
+  TurnPilotAutoLeft's (off: handed back at once, as G1; announce: handed back, the reason its verdict; auto: held for its
+  go, no handback); go: release it now (cause gap); creep_m: its stop point this far past where it latched;
+  take_control: a fault (undecided), handed back held (leftUndecidedTakeControl); reason: what to say."""
+  mode: str = 'off'
+  go: bool = False
+  creep_m: float = 0.
+  take_control: bool = False
+  reason: str = ''
 
 
 def engage_distance(v_ego: float) -> float:
@@ -330,6 +352,8 @@ class MapControlPolicy:
     before it knew the route), the one there carries on, dead-reckoned."""
     tc = self.turn
     if tc is not None and tc.held:
+      if isinstance(turn, tuple):
+        self._turn_raw = turn[1] - HOLD_LINE_M - MAP_MARGIN_M  # kept current: a release must not read the car's moves as a jump
       return tc  # position-free: only its release lets go
     if isinstance(turn, str):
       if tc is not None:
@@ -359,7 +383,7 @@ class MapControlPolicy:
         if self._turn_floor is not None:
           self._turn_floor -= v * dt
         stop_d = v ** 2 / (2. * -MAP_DECEL_MAX)
-        if tc.engaged and tc.state is not None and not tc.state.override and raw < was_raw - 2. and \
+        if tc.engaged and tc.state is not None and not tc.state.override and not tc.state.done and raw < was_raw - 2. and \
            raw < stop_d - LATCH_PAST_M:
           # its junction read nearer (route_follower.py: the nearest of navd's readings), its line now where the car,
           # braking at the floor, would stop past the latch's reach: never dropped as an overrun and crossed blind, the
@@ -399,10 +423,11 @@ class MapControlPolicy:
     cloudlog.event("turnpilot.map_stop_overrun", error=True, kind=c.kind, key=list(c.key), d=round(c.d, 1), v=round(v, 2))
 
   def update(self, nav, updated: bool, valid: bool, v_ego: float, gas_pressed: bool, lights: Lights = NO_LIGHTS,
-             dt: float = DT_MDL, turn=None) -> MapDecision:
+             dt: float = DT_MDL, turn=None, left: LeftCommand | None = None) -> MapDecision:
     """nav: the latest navInstruction, updated: it arrived this frame, valid: its valid flag; carState's vEgo and
     gasPressed; lights: light_input()'s; turn: (maneuver id, m to its junction, 'left' or 'right') of the route's
-    unprotected_turn() the car is taking, or None."""
+    unprotected_turn() the car is taking, or None; left: the unprotected left's command for its latch (None: off)."""
+    self.left = left if left is not None else LeftCommand()
     v = max(v_ego, 0.)
     controls = self.tracker.update(nav, updated, valid, v, dt)
     if self.held is not None and all(c.key != self.held for c in controls) and \
@@ -539,10 +564,21 @@ class MapControlPolicy:
     st.moved_m += v * dt
     what = description(c, self.turn_name)
     cause, prompt = None, None
-    if c.kind == UNPROTECTED:
-      # no gap judgement yet: handed back at once, held while the driver takes over (module docstring)
+    left = getattr(self, 'left', LeftCommand())
+    if c.kind == UNPROTECTED and left.mode == 'auto':
+      # the autonomous left's (unprotected_left.py): held for its go, never handed back but for its fault
+      if left.take_control:
+        prompt, reason = 'leftUndecidedTakeControl', left.reason or f"Unprotected {self.turn_name}: take control"
+      elif left.go:
+        cause = 'gap'
+        reason = left.reason
+      else:
+        reason = left.reason or f"Unprotected {self.turn_name}: waiting for a gap"
+    elif c.kind == UNPROTECTED:
+      # off (G1): handed back at once, held while the driver takes over; announce: the same, saying whether it would go
       prompt = 'unprotectedTurnTakeControl'
-      reason = f"Unprotected {self.turn_name}: take control"
+      reason = f"{left.reason}: take control" if left.mode == 'announce' and left.reason else \
+        f"Unprotected {self.turn_name}: take control"
     elif c.kind == 'stop':
       # a full stop, then handed back: there is no cross-traffic rule to go on (module docstring)
       prompt = 'stopSignTakeControl' if st.dwell_t >= STOP_SIGN_HANDBACK_S - 1e-9 else None
@@ -576,6 +612,12 @@ class MapControlPolicy:
     if prompt is not None:
       prompts.insert(0, prompt)  # the held control's prompt first
     st.action = 'awaitingDriver' if prompt is not None else 'held'
+    creep = left.creep_m - st.moved_m if c.kind == UNPROTECTED and left.mode == 'auto' and prompt is None else 0.
+    if creep > CREEP_AT_M:
+      # on for a view, slowly, to where the left asks: still the latch's (position-free), never past its target
+      cap = min(CREEP_SPEED, math.sqrt(2. * MAP_STOP_DECEL * max(creep - CREEP_AT_M, 0.)))
+      out.stops.append(Stop(CREEP_ACCEL, cap, False, reason, creep))
+      return
     out.stops.append(Stop(HOLD_ACCEL, 0., True, reason, 0.))
 
   def _yield(self, c, v, out, prompts) -> None:

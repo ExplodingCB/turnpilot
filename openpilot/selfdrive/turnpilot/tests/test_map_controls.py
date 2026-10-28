@@ -739,3 +739,106 @@ def test_a_yield_is_passed_only_by_passing_it():
   car.run_until(lambda out, dec: out.stops)
   out, dec, _ = car.step(gas=True)
   assert out.stops and out.prompt == 'yieldAhead'
+
+
+# --- the autonomous unprotected left (unprotected_left.py, DESIGN phase 4 G4): the hold line's latch takes its commands ---
+
+def left_cmd(mode='auto', go=False, creep_m=0., take_control=False, reason=''):
+  from openpilot.selfdrive.turnpilot.map_controls import LeftCommand
+  return LeftCommand(mode, go, creep_m, take_control, reason)
+
+
+def run_left(car, seconds, cmd, **kw):
+  res = None
+  for _ in range(int(round(seconds / DT_MDL))):
+    res = car.policy_step(cmd, **kw)
+  return res
+
+
+def policy_step(self, left, gas=False):
+  """Car.step with the left's command handed to the policy; gas: the driver's foot (1.5 m/s^2), the plan not applied."""
+  due = self.frame % 20 == 0
+  self.frame += 1
+  turn = None if self.turn is None else (self.turn[1], self.turn[0] - self.s, self.turn[2])
+  out = self.policy.update(self.nav() if due else None, due, self.nav_valid, self.v, gas, NO_LIGHTS, DT_MDL, turn=turn, left=left)
+  dec = decide(out.stops, self.v)
+  dec.accel_cap = self.scene.ramp(dec.accel_cap, DT_MDL)
+  cmd = min(plan_accel(dec.accel_cap, dec.speed_cap, self.v), (self.cruise - self.v) / 2., 1.5)
+  if dec.should_stop:
+    cmd = min(cmd, -1.)
+  if gas:
+    cmd = 1.5
+  self.v = max(self.v + cmd * DT_MDL, 0.)
+  self.s += self.v * DT_MDL
+  self.t += DT_MDL
+  self.rows.append((self.t, self.s, self.v, cmd, dec, out))
+  return out, dec, cmd
+
+
+Car.policy_step = policy_step
+
+
+def held_left(car, cmd):
+  for _ in range(int(60. / DT_MDL)):
+    out, dec, _ = car.policy_step(cmd)
+    if held(out, dec):
+      return out, dec
+  raise AssertionError("never held")
+
+
+def test_auto_left_waits_at_its_line_without_handing_back():
+  # no intervention (Kellen, 2026-10-28): held at the line for the left's go, however long, never a take-control
+  car = left_car()
+  out, dec = held_left(car, left_cmd(reason="Waiting for a gap"))
+  assert out.prompt == 'none' and out.shown.action == 'held' and dec.reason == "Waiting for a gap"
+  s_held = car.s
+  out, dec, _ = run_left(car, 120., left_cmd(reason="Waiting for a gap"))
+  assert held(out, dec) and out.prompt == 'none' and car.s - s_held < 0.05
+
+
+def test_auto_left_go_releases_the_latch_with_the_car_stopped():
+  car = left_car()
+  held_left(car, left_cmd())
+  out, dec, _ = car.policy_step(left_cmd(go=True))
+  assert out.released_stopped and not dec.should_stop and out.shown is None or out.shown.kind != UNPROTECTED or \
+    out.shown.action == 'released'
+  # released for good: nothing of the latch comes back however the car stands after
+  out, dec, _ = run_left(car, 5., left_cmd())
+  assert not dec.should_stop and not any(s.should_stop for s in out.stops)
+
+
+def test_auto_left_creeps_slowly_to_its_target_and_holds_there():
+  car = left_car()
+  held_left(car, left_cmd())
+  s0 = car.s
+  from openpilot.selfdrive.turnpilot.map_controls import CREEP_ACCEL, CREEP_SPEED
+  out, dec, _ = car.policy_step(left_cmd(creep_m=2., reason="Creeping for a view"))
+  assert not dec.should_stop and dec.speed_cap <= CREEP_SPEED + 1e-6 and dec.accel_cap <= CREEP_ACCEL + 1e-6
+  assert dec.reason == "Creeping for a view" and out.prompt == 'none'
+  out, dec, _ = run_left(car, 10., left_cmd(creep_m=2., reason="Creeping for a view"))
+  assert held(out, dec) and 1.7 < car.s - s0 < 2.2 and max(r[2] for r in car.rows[-200:]) <= CREEP_SPEED + 0.05
+  # frozen where it is (a car came into the band): held there, never on
+  s1 = car.s
+  out, dec, _ = run_left(car, 5., left_cmd(creep_m=car.s - s0))
+  assert held(out, dec) and car.s - s1 < 0.05
+
+
+def test_auto_left_undecided_hands_back_held():
+  car = left_car()
+  held_left(car, left_cmd())
+  out, dec, _ = car.policy_step(left_cmd(take_control=True, reason="View of oncoming traffic blocked: take control"))
+  assert held(out, dec) and out.prompt == 'leftUndecidedTakeControl' and out.shown.action == 'awaitingDriver'
+  assert dec.reason == "View of oncoming traffic blocked: take control"
+  # the driver takes over and drives off: theirs, no overrun
+  run_left(car, 3., left_cmd(take_control=True), gas=True)
+  assert car.policy.turn.state.done == 'released' and car.policy._alert == 'none'
+
+
+def test_announce_and_off_hand_back_at_the_line_as_before():
+  for cmd, reason in ((left_cmd('announce', reason="Unprotected left: would go"), "Unprotected left: would go: take control"),
+                      (left_cmd('off'), "Unprotected left: take control"), (None, "Unprotected left: take control")):
+    car = left_car()
+    out, dec = held_left(car, cmd)
+    assert out.prompt == 'unprotectedTurnTakeControl' and dec.reason == reason and out.shown.action == 'awaitingDriver'
+    out, dec, _ = car.policy_step(left_cmd('announce', go=True) if cmd is not None else None)
+    assert held(out, dec)  # announce never goes
