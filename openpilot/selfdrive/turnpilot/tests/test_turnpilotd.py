@@ -2290,3 +2290,16 @@ def test_a_withdrawn_go_is_not_given_again_by_a_hold_that_comes_and_goes():
   assert all(p.controlPrompt == 'cantStartTakeControl' and p.shouldStop and p.desire == Desire.none for p in plans)
   assert sim.v < 0.05
 
+
+
+def test_the_no_move_limit_is_a_param_for_the_sweep():
+  """TurnPilotNoMoveS (main()) sets a standstill turn's no-move limit, NO_MOVE_S to NO_MOVE_MAX_S, so the sweep's V1 tapless
+  column can measure a pull-away later than 2 s with no code edit. The unprotected turn's LEFT_NO_MOVE_S stays."""
+  left = Maneuver(*classify("turn", "left"), "turn", "left", 90., geometry=True, opposing='present')
+  t_left = Maneuver(*classify("turn", "left"), "turn", "left", 90., geometry=True, opposing='none')
+  tp = TurnPilot()
+  tp.no_move_s = 20.
+  tp.start_post_go(t_left, 9., 0., True)
+  assert tp.no_move_limit == 20.
+  tp.start_post_go(left, 9., 0., True)
+  assert tp.no_move_limit == LEFT_NO_MOVE_S

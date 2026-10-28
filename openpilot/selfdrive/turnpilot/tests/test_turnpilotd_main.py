@@ -188,3 +188,14 @@ def test_post_go_profile_unknown_to_the_build_is_the_default():
   with mock.patch.object(turnpilotd, 'log_error') as log_error:
     assert turnpilotd.post_go_profile_for(FakeParams(TurnPilotPostGoProfile='nope'), 'TurnPilotPostGoProfile', 'graduated') == 'graduated'
   assert log_error.call_count == 1
+
+
+@pytest.mark.parametrize("value,limit", [(None, 2.0), ('5.0', 5.0), (20.0, 20.0), ('0.5', 2.0), ('100', 20.0), ('x', 2.0)])
+def test_main_reads_the_no_move_limit(value, limit):
+  made, real = [], turnpilotd.TurnPilot
+  def make():
+    made.append(real())
+    return made[-1]
+  with mock.patch.object(turnpilotd, 'TurnPilot', side_effect=make):
+    run_main(frames=3, TurnPilotNoMoveS=value)
+  assert made[0].no_move_s == limit

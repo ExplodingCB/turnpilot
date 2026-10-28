@@ -62,7 +62,8 @@ speed capped by the heading it has turned, DesireTiming.turned_deg at the go and
 POST_GO_MAX_M on, and dropped at the pass of a turn missed straight on. TurnPilotPostGoProfile names the profile
 (graduated by default; none, flat3, flat43 for the BeamNG sweep), and an unprotected turn's go (unprotected_turn: a left
 across the oncoming road) takes TurnPilotLeftGoProfile's (left: 1.5 m/s^2, 4.3 m/s). The caps only lower speed.
-A go the car hasn't pulled away on (STANDSTILL_SPEED) within NO_MOVE_S, LEFT_NO_MOVE_S for an unprotected turn (CRITIQUE
+A go the car hasn't pulled away on (STANDSTILL_SPEED) within NO_MOVE_S (TurnPilotNoMoveS, up to NO_MOVE_MAX_S, for the
+sweep), LEFT_NO_MOVE_S for an unprotected turn (CRITIQUE
 REQUIRED 4: its gap runs out while it stands), counting only while nothing else holds it (no TurnPilot hold, no close lead,
 no pedal), is the model holding the car: TurnPilot withdraws the go before the car moves, holding it standing (shouldStop,
 a 0 speed cap: braking at -2.0 at most, from under 0.3 m/s; no turn pulse), and hands back loudly (controlPrompt
@@ -172,6 +173,7 @@ STALLED_REASON = "Stalled in the turn: take control"
 # not at STANDSTILL_SPEED this long after TurnPilot's go, nothing else holding the car: the model is holding it (DESIGN phase 4
 # section 2-3; G0, 2026-10-28: 14 of 24 tapless goes stood 20 s). Withdrawn and handed back; an unprotected turn's sooner
 NO_MOVE_S = 2.
+NO_MOVE_MAX_S = 20.  # TurnPilotNoMoveS is clamped to NO_MOVE_S..this (the sweep's V1 tapless column measures to 20 s)
 LEFT_NO_MOVE_S = 1.
 NO_MOVE_REASON = "Can't start the turn: take control"
 
@@ -213,6 +215,7 @@ class TurnPilot:
     self.map_now = None  # this frame's map control decision, once update() has made it
     self.post_go_profile = POST_GO_DEFAULT  # TurnPilotPostGoProfile (main()): a standstill turn's post-go profile
     self.left_go_profile = LEFT_GO_PROFILE  # TurnPilotLeftGoProfile (main()): an unprotected turn's
+    self.no_move_s = NO_MOVE_S  # TurnPilotNoMoveS (main()): a standstill turn's no-move limit (an unprotected turn's is fixed)
     self._rf_ticked = self._yaw_ticked = False  # update() dead-reckoned the route, and counted the yaw, this frame
     self.reset()
 
@@ -594,7 +597,7 @@ class TurnPilot:
     left = unprotected_turn(maneuver, right_hand_traffic)
     name = self.left_go_profile if left else self.post_go_profile
     self.post_go = PostGo(POST_GO_PROFILES[name], maneuver, distance, turned_deg, right_hand_traffic)
-    self.no_move_limit, self.go_wait_s, self.go_withdrawn = (LEFT_NO_MOVE_S if left else NO_MOVE_S), 0., False
+    self.no_move_limit, self.go_wait_s, self.go_withdrawn = (LEFT_NO_MOVE_S if left else self.no_move_s), 0., False
     cloudlog.event("turnpilot.post_go", profile=name, unprotected=left, turned_deg=round(turned_deg, 1), distance=round(distance, 1))
 
   def no_move(self, sm, cs, v_ego: float, acting: bool, decision) -> bool:
@@ -860,6 +863,20 @@ def post_go_profile_for(params, key: str, default: str) -> str:
   return value
 
 
+def no_move_for(params) -> float:
+  """TurnPilotNoMoveS, clamped to NO_MOVE_S..NO_MOVE_MAX_S; NO_MOVE_S if unset, unreadable or unknown to this build."""
+  try:
+    value = params.get("TurnPilotNoMoveS")
+  except UnknownKeyName:
+    log_error("turnpilotd: TurnPilotNoMoveS unknown to this build's params; run scons")
+    return NO_MOVE_S
+  try:
+    return min(max(float(value), NO_MOVE_S), NO_MOVE_MAX_S) if value is not None else NO_MOVE_S
+  except (TypeError, ValueError):
+    log_error(f"turnpilotd: TurnPilotNoMoveS {value!r} isn't a number, {NO_MOVE_S} s instead")
+    return NO_MOVE_S
+
+
 def disabled_plan(shadow: bool, reason: str, fault=Fault.none, handback=Handback.none):
   """A plan nothing acts on: no desire, no lane change, no limits. handback: a model fallback, which selfdrived still
   raises through a disabled plan (hooks.fresh_plan)."""
@@ -936,6 +953,7 @@ def main():
       tp.camera_mode = camera_lights_mode(params)
       tp.post_go_profile = post_go_profile_for(params, "TurnPilotPostGoProfile", POST_GO_DEFAULT)
       tp.left_go_profile = post_go_profile_for(params, "TurnPilotLeftGoProfile", LEFT_GO_PROFILE)
+      tp.no_move_s = no_move_for(params)
       if params.get("ChestnutActive") is False:  # None: no big model expected this drive
         tp.big_model_failed(enabled)
 
