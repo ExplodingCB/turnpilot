@@ -66,8 +66,7 @@ def test_an_empty_road_goes_from_the_line_with_no_pulse_before_it():
   assert sim.s > JUNCTION + 30.
   go = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
   # no pulse on the approach: the first turn desire is the go, from the line, standing
-  before = [p for p in plans[:go]]
-  assert all(p.desire in (Desire.none,) for p in before)
+  assert all(p.desire == Desire.none for p in plans[:go])
   assert sim.trace[go - 1][1] < 0.3 and LINE - 1. < sim.trace[go][0] <= LINE + 0.1  # at the line, latched (under 0.3 m/s)
   assert plans[go].controlPrompt == 'leftGo' and str(plans[go].unprotectedLeft.state) == 'go'
   assert sim.tp.post_go is not None or any(p.unprotectedLeft.state == 'committed' for p in plans[go:])
@@ -134,6 +133,8 @@ def test_a_car_in_the_band_at_first_motion_withdraws_the_go_short_of_the_oncomin
   while not any(p.desire == Desire.turnLeft for p in plans[-1:]):
     plans += drive(sim, DT_MDL)
     assert sim.t < 60.
+  # the go took the left's post-go profile and its shorter no-move limit (CRITIQUE REQUIRED 4)
+  assert sim.tp.post_go is not None and sim.tp.post_go.profile == POST_GO_PROFILES['left'] and sim.tp.no_move_limit == LEFT_NO_MOVE_S
   state['car'], state['t'] = sim.s + 90., sim.t  # 90 m up the oncoming lane at the go
   more = drive(sim, 1.5)
   alerts = [p for p in more if str(p.controlAlert) == 'oncomingHolding']
