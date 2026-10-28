@@ -1,4 +1,5 @@
-"""The route's stop signs, yields and traffic signals, from Valhalla (navInstruction.controls, map_controls.py).
+"""The route's stop signs, yields and traffic signals, from Valhalla and the OSM stop-sign sidecar (navInstruction.controls,
+map_controls.py).
 
 route_controls() takes navd's route steps and asks Valhalla two things. trace_attributes (edge_walk over the route's own
 shape) gives the directed edges the route drives, with each edge's traffic_signal, its end node's traffic_signal and the
@@ -6,13 +7,28 @@ roads meeting there. Locate gives what trace_attributes doesn't: a directed edge
 verbose locate, radius 1, a metre back from each edge's end, picks the candidate with the edge's own id. Valhalla puts a
 control on the edge that ends at the junction, so every control is placed at the END of its edge:
   signal = the edge's traffic_signal or its end node's; stop = locate's stop_sign; yield = locate's yield_sign.
-Internal intersection edges (inside a divided road's junction) are skipped.
+The OSM sidecar (routing/osm_sidecar.py, from sidecar_dir) adds what Valhalla misses: it sets no stop_sign on about a
+quarter of the OSM-mapped stop approaches (research_allway.md section 0). Its entries for the edge's way and direction
+("<way_id>:<f|b>", a list, since a way passes several junctions) are the edge's when the entry's line, the OSM stop node,
+projects inside the edge's span on the route within LINE_TOL_M of it (past SPAN_START_M from its start, which is the
+previous edge's end), or, for a stop on the junction node (no line), when that node is within NODE_TOL_M of the edge's
+end. The edge's stops and yields are the union of both. One exception: a stop or yield Valhalla flags that the sidecar
+doesn't map for this direction, while it maps one for the other direction inside this edge with an explicit direction tag,
+is the phantom Valhalla makes of a stop it can't direct (its far-end flag): dropped, and logged. An undirected stop's
+other end may be its real junction, so there Valhalla's flag stays.
+Internal-intersection edges (inside a divided road's junction) are searched too; a control on one is the preceding
+junction's (the end of the last edge before them), so a stop mapped in a median stops the car before the first
+carriageway. One edge end is one node, and its kinds are one control, the signal over the stop over the yield; controls at
+different nodes never merge, however close (STOP_SIGNS.md G11, G18).
 junction: other roads meet at the end node. crossSuspect (stop and yield only): the route's road outranks every road
-crossing there, so the sign is likely the cross road's (real OSM: undirected stops are flagged on every approach).
+crossing there, so the sign is likely the cross road's.
 The stop line: a sim sidecar (tiles_dir/controls.json, {"controls": {"<way_id>:<f|b>": {kind, line: [lat, lon], ...}}} from
-tools/sim/bridge/beamng/mapsignals.py) gives it for its controls, projected onto the route within the edge (lineMapped);
-otherwise it is the edge's end less CONTROL_LINE_M. Either way less MAP_MARGIN_M. Controls within MERGE_M merge, the
-signal over the stop over the yield.
+tools/sim/bridge/beamng/mapsignals.py) gives the sim's real lines, projected onto the route within the edge (lineMapped,
+line source sim). Else the OSM stop node of the control's kind on its own edge (lineMapped, line source osm), but only where
+it is at least CONTROL_LINE_M back from the edge's end: an OSM stop node marks a sign, not a line, and one mapped nearer
+the junction never moves a stop nearer than the default (the stop-point rule that knows the cross road's width is SG1b's).
+Otherwise the edge's end less CONTROL_LINE_M. Either way less MAP_MARGIN_M. osm_node is the OSM junction the sidecar
+says the control governs (0 when it has none).
 Off the route (controls_ahead): the same, over the road ahead of the car instead of a route's shape. Locate (verbose, by
 the car's heading) gives the edge the car is on and its shape from the car on; from its end node, the edge that carries on
 nearest the bearing it arrives with (within NEXT_HEADING_TOL: the road straight on), and so on to AHEAD_M or AHEAD_EDGES.
@@ -20,9 +36,11 @@ That road is walked as a one-step route. A control at its end counts (the route'
 Past a junction the car may turn off it: navd looks again every second, and turnpilotd drops what a lookup no longer lists
 (map_controls.py).
 Status: ok; walkOrSnap (edge_walk failed, walk_or_snap matched it, logged); partial (more than PARTIAL_UNMATCHED of the
-edges unmatched by locate); failed (nothing: both matches failed, or any exception); unsupported (tiles_dir given and it
-has no controls_built marker: tiles built from data with no controls, the old sim exports). The route publishes whatever
-the status: navd sends it on every message, and turnpilotd says so out loud.
+edges unmatched by locate, or the OSM sidecar missing or stale where one is expected: the stops Valhalla misses are
+unknown; logged, and each stop and yield's junction_status is failed); failed (nothing: both matches failed, or any
+exception); unsupported (tiles_dir given and it has no controls_built marker: tiles built from data with no controls, the
+old sim exports). The route publishes whatever the status: navd sends it on every message, and turnpilotd says so out loud.
+sidecar_dir None means no sidecar is expected (synthetic tests); navd's sources always pass one (routing/sources.py).
 """
 import json
 import math
@@ -30,12 +48,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.turnpilot.routing import osm_sidecar
 from openpilot.selfdrive.turnpilot.routing.guidance import opposing_leg
 
 CONTROL_LINE_M = 10.    # m before the junction node a stop line is taken to be, without a mapped one
 MAP_MARGIN_M = 1.       # m short of the line the car stops
-MERGE_M = 15.           # controls this close are one
 PARTIAL_UNMATCHED = 0.10
+LINE_TOL_M = 5.         # m: a sidecar line further than this from the route isn't on it
+NODE_TOL_M = 5.         # m: a junction-node control's node this close to an edge's end is that end
+SPAN_START_M = 0.5      # m: a line this close past an edge's start is on the node it shares with the edge before
+EDGE_END_M = 1.         # m: a line this far past an edge's end still projects onto it
 LOCATE_BACK_M = 1.      # m back from an edge's end the locate point goes, so it is on the edge, not the junction node
 END_OF_ROUTE_M = 1.     # an edge ending this close to the route's end ends at the destination: its control isn't driven to
 SIDECAR = 'controls.json'
@@ -69,6 +91,10 @@ class Control:
   cross_suspect: bool = False
   instance: str = ''   # the sim's signal instance its line came from (the sidecar), for logs and tests
   point: tuple[float, float] | None = None  # (lat, lon) of the stop point: controls_ahead's, which navd measures from
+  line_source: str = 'default'  # 'sim' (the sim's controls.json), 'osm' (the OSM stop node) or 'default' (the end less 10 m)
+  osm_node: int = 0    # the OSM junction node the sidecar says it governs; 0 none
+  junction_status: str = 'ok'  # 'failed' for a stop or yield when the OSM sidecar was missing or stale (STOP_SIGNS.md N7;
+                               # MapJunction.status, SG1b)
 
 
 def decode6(s: str) -> list[tuple[float, float]]:
@@ -120,6 +146,12 @@ def point_back(pts, cum, idx: int, back_m: float):
 
 def project(pts, cum, p, lo_m: float, hi_m: float) -> float | None:
   """m along pts of the closest spot to p between lo_m and hi_m along, or None."""
+  hit = nearest(pts, cum, p, lo_m, hi_m)
+  return None if hit is None else hit[0]
+
+
+def nearest(pts, cum, p, lo_m: float, hi_m: float) -> tuple[float, float] | None:
+  """(m along pts, m from p) of the closest spot to p on the segments between lo_m and hi_m along, or None."""
   best = None
   for j in range(len(pts) - 1):
     if cum[j + 1] < lo_m or cum[j] > hi_m:
@@ -134,7 +166,7 @@ def project(pts, cum, p, lo_m: float, hi_m: float) -> float | None:
     d = haversine(q, p)
     if best is None or d < best[0]:
       best = (d, cum[j] + t * (cum[j + 1] - cum[j]))
-  return None if best is None else best[1]
+  return None if best is None else (best[1], best[0])
 
 
 def point_at(pts, cum, s: float):
@@ -272,14 +304,17 @@ def opposing_roads(call, steps) -> dict[int, tuple[float, int]]:
     return {}
 
 
-def route_controls(call, steps, tiles_dir=None) -> tuple[list[Control], str]:
+def route_controls(call, steps, tiles_dir=None, sidecar_dir=None, audit: list | None = None) -> tuple[list[Control], str]:
   """(controls along the route nearest first, status). call(endpoint, request) -> response: actor_call or http_call.
   tiles_dir: the local tiles' directory, for the controls_built marker and the sim sidecar; None for tiles built from
-  real OSM, which carry their own controls."""
+  real OSM, which carry their own controls. sidecar_dir: the directory holding the OSM sidecar (osm_controls/) and the
+  tiles' stamp (a corridor pack, a region's or the sim tiles' directory), osm_sidecar.NO_DIRECTORY when one is expected
+  but the tiles have no directory, None when none is (module docstring). audit: a list each edge with a stop or yield
+  from either source is appended to, as a dict (route_audit.py)."""
   try:
     if tiles_dir is not None and not (Path(tiles_dir) / MARKER).exists():
       return [], 'unsupported'
-    return _route_controls(call, steps, tiles_dir)
+    return _route_controls(call, steps, tiles_dir, sidecar_dir, audit=audit)
   except Exception:
     cloudlog.exception("turnpilot controls: failed")
     return [], 'failed'
@@ -330,11 +365,11 @@ def road_ahead(call, position, heading: float) -> list[tuple[float, float]]:
   return shape if len(shape) >= 2 else []
 
 
-def controls_ahead(call, position, heading: float, tiles_dir=None) -> tuple[list[Control], str, list]:
+def controls_ahead(call, position, heading: float, tiles_dir=None, sidecar_dir=None) -> tuple[list[Control], str, list]:
   """(controls on the road ahead of the car, nearest first, status, the road [(lat, lon), ...]), off the route (module
   docstring). position: (lat, lon); heading: deg; the controls' route_m are m along the road from where the car was on it,
-  their point (lat, lon) set. Statuses as route_controls'; failed also when no road there goes the car's way, or the
-  heading is unknown."""
+  their point (lat, lon) set. tiles_dir, sidecar_dir and statuses as route_controls'; failed also when no road there goes
+  the car's way, or the heading is unknown."""
   try:
     if tiles_dir is not None and not (Path(tiles_dir) / MARKER).exists():
       return [], 'unsupported', []
@@ -347,7 +382,7 @@ def controls_ahead(call, position, heading: float, tiles_dir=None) -> tuple[list
       return [], 'failed', []
     cum = cumulative(shape)
     steps = [{'geometry': {'coordinates': [[lo, la] for la, lo in shape]}, 'distance': cum[-1]}]
-    controls, status = _route_controls(call, steps, tiles_dir, ahead=True)
+    controls, status = _route_controls(call, steps, tiles_dir, sidecar_dir, ahead=True)
     for c in controls:
       c.point = point_at(shape, cum, c.route_m)
     return controls, status, shape
@@ -356,7 +391,18 @@ def controls_ahead(call, position, heading: float, tiles_dir=None) -> tuple[list
     return [], 'failed', []
 
 
-def _route_controls(call, steps, tiles_dir, ahead: bool = False) -> tuple[list[Control], str]:
+def osm_at(osm, entry: dict, pts, cum, begin_m: float, end_m: float, end_point) -> float | None:
+  """m along the route of a sidecar entry on the edge from begin_m to end_m (module docstring), or None if it isn't its."""
+  if entry.get('line'):
+    hit = nearest(pts, cum, (float(entry['line'][0]), float(entry['line'][1])), begin_m - EDGE_END_M, end_m + EDGE_END_M)
+    if hit is None or hit[1] > LINE_TOL_M or not begin_m + SPAN_START_M < hit[0] <= end_m + EDGE_END_M:
+      return None
+    return hit[0]
+  pos = osm.junction_pos(entry.get('junction_node', 0))
+  return end_m if pos is not None and haversine(pos, end_point) <= NODE_TOL_M else None
+
+
+def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = False, audit: list | None = None) -> tuple[list[Control], str]:
   """ahead: the road ahead of the car (controls_ahead), not a route: its end is no destination."""
   pts = route_shape(steps)
   if len(pts) < 2:
@@ -367,60 +413,97 @@ def _route_controls(call, steps, tiles_dir, ahead: bool = False) -> tuple[list[C
   tpts = decode6(t['shape']) if isinstance(t.get('shape'), str) else [(p['lat'], p['lon']) for p in t.get('shape', [])]
   tcum = cumulative(tpts)
   scale = cum[-1] / tcum[-1] if tcum and tcum[-1] > 0. else 1.
-  edges = [e for e in t['edges'] if not e.get('internal_intersection')]
+  edges = t['edges']  # internal-intersection edges too: a control in a median is the junction's before it
   locs = [dict(zip(('lat', 'lon'), point_back(tpts, tcum, e['end_shape_index'], LOCATE_BACK_M), strict=True)) | {'radius': 1}
           for e in edges]
   located = call('locate', {'locations': locs, 'costing': 'auto', 'verbose': True}) if locs else []
-  sidecar = load_sidecar(tiles_dir)
-  found, unmatched = [], 0
-  for e, loc in zip(edges, located, strict=False):
+  sim = load_sidecar(tiles_dir)
+  osm = osm_sidecar.load(sidecar_dir, pts) if sidecar_dir is not None else None
+  osm_ok = osm is not None and osm.status == 'ok'
+  ends = []                   # per edge: (end m on the route, span m, key, its end node)
+  at = {}                     # anchor edge -> {kind: [(source edge, osm entry or None, m along or None)]}
+  unmatched = anchor = 0
+  for i, (e, loc) in enumerate(zip(edges, located, strict=False)):
+    internal = bool(e.get('internal_intersection'))
+    if not internal or not ends:
+      anchor = i
     candidate = next((c.get('edge') or {} for c in (loc or {}).get('edges') or []
                       if (c.get('edge_id') or {}).get('value') == e['id']), None)
     if candidate is None:
-      unmatched += 1
+      unmatched += 0 if internal else 1
       candidate = {}
-    node = e.get('end_node') or {}
-    kinds = []
-    if e.get('traffic_signal') or node.get('traffic_signal'):
-      kinds.append('signal')
-    if candidate.get('stop_sign'):
-      kinds.append('stop')
-    if candidate.get('yield_sign'):
-      kinds.append('yield')
-    if not kinds:
-      continue
     end_i, begin_i = e['end_shape_index'], e['begin_shape_index']
     span = (tcum[end_i] - tcum[begin_i]) * scale
     # where the edge ends on the route's own shape, near where the trace says
     expect = tcum[end_i] * scale
     end_m = project(pts, cum, tpts[end_i], expect - 30., expect + 30.)
     end_m = expect if end_m is None else end_m
+    key = f"{e.get('way_id')}:{'f' if e.get('forward') else 'b'}"
+    ends.append((end_m, span, key, e.get('end_node') or {}))
+    valhalla = (['signal'] if e.get('traffic_signal') or (e.get('end_node') or {}).get('traffic_signal') else []) + \
+      (['stop'] if candidate.get('stop_sign') else []) + (['yield'] if candidate.get('yield_sign') else [])
+    hits, phantoms = [], []
+    if osm_ok:
+      for entry in osm.entries(key):
+        m = osm_at(osm, entry, pts, cum, end_m - span, end_m, tpts[end_i])
+        if m is not None and entry.get('kind') in ('stop', 'yield'):
+          hits.append((entry, m))
+      other = f"{e.get('way_id')}:{'b' if e.get('forward') else 'f'}"
+      for kind in ('stop', 'yield'):
+        if kind in valhalla and not any(h[0]['kind'] == kind for h in hits) and \
+           any(x.get('kind') == kind and x.get('evidence') == 'mid_directed' and x.get('line') and
+               osm_at(osm, x, pts, cum, end_m - span, end_m, tpts[end_i]) is not None for x in osm.entries(other)):
+          valhalla.remove(kind)
+          phantoms.append(kind)
+          cloudlog.info(f"turnpilot controls: Valhalla's {kind} on {key} at {end_m:.0f} m is a phantom: the OSM sidecar's is directed {other}")
+    if audit is not None and (valhalla or hits or phantoms):
+      audit.append({'edge': i, 'key': key, 'internal': internal, 'anchor': anchor, 'end_m': end_m, 'valhalla': list(valhalla),
+                    'phantom': phantoms, 'osm': [dict(entry, m=m) for entry, m in hits]})
+    kinds = at.setdefault(anchor, {}) if valhalla or hits else None
+    for kind in valhalla:
+      kinds.setdefault(kind, []).append((i, None, None))
+    for entry, m in hits:
+      kinds.setdefault(entry['kind'], []).append((i, entry, m))
+  if edges and unmatched > PARTIAL_UNMATCHED * sum(1 for e in edges if not e.get('internal_intersection')) and status == 'ok':
+    status = 'partial'
+  if osm is not None and not osm_ok:
+    cloudlog.error(f"turnpilot controls: the OSM stop-sign sidecar is {osm.status} ({osm.detail}): the stops Valhalla doesn't flag are " +
+                   "unknown, said as partial")
+    if status in ('ok', 'walkOrSnap'):
+      status = 'partial'
+
+  found = []
+  for a, kinds in at.items():
+    if not kinds:
+      continue
+    kind = min(kinds, key=KIND_RANK.get)
+    end_m, span, key, node = ends[a]
     if end_m > cum[-1] - END_OF_ROUTE_M and not ahead:
       continue  # the route ends on this edge (a destination mid-edge snaps onto either direction): no junction ahead
     crossing = [ROAD_CLASS_RANK.get(x.get('road_class'), 8) for x in node.get('intersecting_edges') or []]
     junction = bool(crossing)
-    ours = ROAD_CLASS_RANK.get(e.get('road_class'), 8)
-    cross_suspect = junction and all(ours < c for c in crossing)
-    entry = sidecar.get(f"{e.get('way_id')}:{'f' if e.get('forward') else 'b'}")
-    for kind in kinds:
-      line_m, mapped, instance = end_m - CONTROL_LINE_M, False, ''
-      if entry is not None and entry.get('kind') == kind and entry.get('line'):
-        p = project(pts, cum, tuple(entry['line']), end_m - span - 1., end_m + 1.)
-        if p is not None:
-          line_m, mapped, instance = p, True, entry.get('instance', '')
-      found.append((line_m - MAP_MARGIN_M, kind, mapped, junction, cross_suspect and kind in ('stop', 'yield'), instance))
-  if edges and unmatched > PARTIAL_UNMATCHED * len(edges) and status == 'ok':
-    status = 'partial'
-  merged = []
-  for c in sorted(found, key=lambda c: c[0]):
-    if merged and c[0] - merged[-1][0] < MERGE_M:
-      if KIND_RANK[c[1]] < KIND_RANK[merged[-1][1]]:
-        merged[-1] = c
-      continue
-    merged.append(c)
+    ours = ROAD_CLASS_RANK.get(edges[a].get('road_class'), 8)
+    cross_suspect = junction and all(ours < c for c in crossing) and kind in ('stop', 'yield')
+    line_m, mapped, instance, source = end_m - CONTROL_LINE_M, False, '', 'default'
+    own = sorted(((m, entry) for i, entry, m in kinds[kind] if i == a and entry is not None and entry.get('line')), key=lambda x: x[0])
+    osm_node = next((int(entry.get('junction_node') or 0) for _, entry, _ in kinds[kind] if entry is not None), 0)
+    sim_entry = sim.get(key)
+    if sim_entry is not None and sim_entry.get('kind') == kind and sim_entry.get('line'):
+      p = project(pts, cum, tuple(sim_entry['line']), end_m - span - 1., end_m + 1.)
+      if p is not None:
+        line_m, mapped, instance, source = p, True, sim_entry.get('instance', ''), 'sim'
+    if source == 'default' and own:
+      m, entry = own[-1]  # the line nearest the junction, if the way has two
+      osm_node = int(entry.get('junction_node') or 0)
+      if m <= end_m - CONTROL_LINE_M:
+        line_m, mapped, source = m, True, 'osm'
+    failed = osm is not None and not osm_ok and kind in ('stop', 'yield')
+    found.append((line_m - MAP_MARGIN_M, kind, mapped, junction, cross_suspect, instance, source, osm_node, 'failed' if failed else 'ok'))
   controls = []
-  for i, (s, kind, mapped, junction, suspect, instance) in enumerate(merged):
+  for i, (s, kind, mapped, junction, suspect, instance, source, osm_node, jstatus) in enumerate(sorted(found, key=lambda c: c[0])):
     step_idx, along, route_m = to_step(starts, max(s, 0.))
-    controls.append(Control(i, kind, route_m, step_idx, along, mapped, junction, suspect, instance))
-  cloudlog.info(f"turnpilot controls: {len(controls)} on the route ({status}), {unmatched}/{len(edges)} edges unmatched")
+    controls.append(Control(i, kind, route_m, step_idx, along, mapped, junction, suspect, instance, line_source=source, osm_node=osm_node,
+                            junction_status=jstatus))
+  side = 'none expected' if osm is None else osm.status
+  cloudlog.info(f"turnpilot controls: {len(controls)} on the route ({status}), {unmatched}/{len(edges)} edges unmatched, OSM sidecar {side}")
   return controls, status
