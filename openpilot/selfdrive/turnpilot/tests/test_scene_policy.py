@@ -339,14 +339,30 @@ def test_committed_turn_is_never_held_again():
 
 def test_track_evidence_outlives_a_spell_unpublished():
   # the tracker keeps a track it has stopped publishing (MAX_COAST_S) until MAX_AGE_S, CLOSE_HOLD_S close in, and matches
-  # it again under the same id: a confirmed pedestrian occluded for 0.6 s and back at a lower confidence is still confirmed
+  # it again under the same id: a confirmed pedestrian (seen on every 10 Hz run for a second) unpublished for 0.4 s (occluded
+  # for 0.9 s: the tracker coasts it MAX_COAST_S first) and back at a lower confidence is confirmed again on its first
+  # frame back, its hits before the occlusion still recent
   sp = ScenePolicy()
-  sp.update(scene([ped(20., 0.2, in_path=True, age=6, conf=0.7)]).objects, True, None, 1000., 10.)
-  for _ in range(12):
+  for k in range(20):
+    sp.update(scene([ped(20., 0.2, in_path=True, age=2 + k // 2, conf=0.7)]).objects, True, None, 1000., 10.)
+  assert sp.tracks[0].confirmed
+  for _ in range(8):
     sp.update([], True, None, 1000., 10.)
-  back = scene([ped(13., 0.2, in_path=True, age=7, conf=0.55)])
+  assert not sp.tracks[0].confirmed  # coasted out: no hard stop on a frame of it alone (skeptic G1, the 1 Hz phantom)
+  back = scene([ped(13., 0.2, in_path=True, age=12, conf=0.55)])
   d = sp.update(back.objects, True, None, 1000., 10.)
   assert d.reason == "pedestrian in path" and d.accel_cap < NO_ACCEL_CAP
+  # unpublished for 1.2 s, its hits no longer recent: its stop brakes on the comfortable curve until it is steady again
+  sp = ScenePolicy()
+  for k in range(20):
+    sp.update(scene([ped(20., 0.2, in_path=True, age=2 + k // 2, conf=0.7)]).objects, True, None, 1000., 10.)
+  for _ in range(24):
+    sp.update([], True, None, 1000., 10.)
+  assert sp.update(back.objects, True, None, 1000., 10.).accel_cap == NO_ACCEL_CAP
+  for k in range(8):
+    d = sp.update(scene([ped(13., 0.2, in_path=True, age=13 + k // 2, conf=0.55)]).objects, True, None, 1000., 10.)
+  assert d.accel_cap < NO_ACCEL_CAP
+  back = scene([ped(13., 0.2, in_path=True, age=7, conf=0.55)])
   # gone longer than the tracker keeps any track: a new one, which earns its stop afresh
   sp = ScenePolicy()
   sp.update(scene([ped(20., 0.2, in_path=True, age=6, conf=0.7)]).objects, True, None, 1000., 10.)
@@ -575,3 +591,78 @@ def test_a_crosswalk_hold_brakes_hard_only_for_a_confirmed_walker_and_logs_it():
   worst, events = run(0.9, 10)
   assert worst < MAP_DECEL_MAX - 1e-6
   assert events and events[0]['track_id'] == 4 and events[0]['reason'] == "pedestrian in crosswalk" and events[0]['confirmed']
+
+
+def _flicker_run(every: int, conf: float = 0.7, x0: float = 90., v0: float = 10.):
+  """A stationary in-path person x0 m ahead on the road camera, detected on 1 of every `every` detector runs (10 Hz), through
+  the real SceneTracker and ScenePolicy, the car taking the plan's brake. (worst plan accel, hard_brake events)"""
+  from openpilot.cereal import messaging
+  from openpilot.common.transformations.camera import DEVICE_CAMERAS
+  from openpilot.selfdrive.turnpilot.detector.decoder import PERSON
+  from openpilot.selfdrive.turnpilot.scene.tests.test_tracker import calibration, car_state, detections
+  from openpilot.selfdrive.turnpilot.scene.tracker import SceneTracker
+  tr, sp, cal = SceneTracker(DEVICE_CAMERAS[('mici', 'os04c10')], 'mici'), ScenePolicy(), calibration()
+  v, x, t, det_frame, worst = v0, x0, 0., 0, 0.
+  with mock.patch('openpilot.selfdrive.turnpilot.scene_policy.cloudlog') as log:
+    for k in range(int(12 / DT_MDL)):
+      t += DT_MDL
+      x -= v * DT_MDL
+      if x < 3.:
+        break
+      if k % 2 == 0:
+        det_frame += 1
+        objs = [(PERSON, x, 0.2, conf)] if det_frame % every == 0 else []
+        tr.update(detections(tr, 'road', t, objs, frame_id=det_frame), cal, car_state(v), now=t)
+      msg = messaging.new_message('turnpilotScene')
+      tr.available = True
+      tr.fill_scene(msg.turnpilotScene)
+      sc = msg.as_reader().turnpilotScene
+      d = sp.update(sc.objects, sc.available, None, 1000., v)
+      a = plan_accel(d.accel_cap, d.speed_cap, v)
+      worst = min(worst, a)
+      v = max(v + max(min(a, 0.), -3.5) * DT_MDL, 0.)
+  return worst, [c.kwargs for c in log.event.call_args_list if c.args[0] == "turnpilot.hard_brake"]
+
+
+def test_a_phantom_seen_about_once_a_second_never_brakes_hard():
+  # skeptic G1: seen on 1 in 8-14 detector runs it built up 5-12 hits with no braking between them, then one new frame
+  # asked for -2.6 to -8.8 m/s^2 cold. Sparse hits never confirm: the steady curve only
+  for every in (3, 4, 6, 8, 10, 12, 14):
+    worst, events = _flicker_run(every)
+    assert worst >= MAP_DECEL_MAX - 1e-6, (every, worst)
+    assert not events, every
+  # seen on every run or every other one, it is slowed for from far out, gently
+  for every in (1, 2):
+    worst, _ = _flicker_run(every)
+    assert MAP_DECEL_MAX - 1e-6 <= worst < -1., (every, worst)
+
+
+def test_confirmation_needs_recent_hits_and_is_lost_when_the_track_coasts_out():
+  sp, v = ScenePolicy(), 10.
+  def frame(objs):
+    sc = scene(objs)
+    return sp.update(sc.objects, True, None, 1000., v)
+  # 3 hits at 0.9, then one a second, published for half a second after each: never confirmed, never below -2.0
+  for k in range(5):
+    frame([ped(30., 0.1, in_path=True, age=2 + k // 4, conf=0.9, trackId=1)])  # 2-3 hits in the first quarter second
+  assert not sp.tracks[1].confirmed
+  age = 3
+  for k in range(int(10. / DT_MDL)):
+    if k % int(1. / DT_MDL) == 0:
+      age += 1
+    d = frame([ped(10., 0.1, in_path=True, age=age, conf=0.9, trackId=1)] if k % int(1. / DT_MDL) < 10 else [])
+    assert plan_accel(d.accel_cap, d.speed_cap, v) >= MAP_DECEL_MAX - 1e-6, k
+  # confirmed while seen steadily, lost the frame the tracker stops publishing it, back at once with steady recent hits
+  sp = ScenePolicy()
+  for k in range(4):
+    frame([ped(30., 0.1, in_path=True, age=2 + 2 * k, conf=0.9, trackId=2)])
+  assert sp.tracks[2].confirmed
+  frame([])
+  assert not sp.tracks[2].confirmed
+  frame([ped(30., 0.1, in_path=True, age=10, conf=0.9, trackId=2)])
+  assert sp.tracks[2].confirmed
+  # a track first seen with its hits (the tracker publishes from MIN_HITS on) and coasted out a second: one new hit isn't enough
+  for _ in range(int(1.2 / DT_MDL)):
+    frame([])
+  frame([ped(30., 0.1, in_path=True, age=11, conf=0.9, trackId=2)])
+  assert not sp.tracks[2].confirmed
