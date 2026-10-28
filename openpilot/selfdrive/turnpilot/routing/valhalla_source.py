@@ -127,20 +127,21 @@ class ValhallaSource:
       r = resp.json()
     return r['routes'][0]['legs'][0]['steps'] if len(r.get('routes', [])) else []
 
-  def controls(self, steps, tiles_dir=None):
+  def controls(self, steps, tiles_dir=None, *, sidecar_dir):
     """(controls, status) along the route steps (routing/controls.py). tiles_dir: the tiles' directory when their
     controls must be checked for (local tiles: the controls_built marker and the sim's sidecar), None when the tiles come
-    from real OSM."""
-    return route_controls(self._call(), steps, tiles_dir)
+    from real OSM. sidecar_dir: where the OSM stop-sign sidecar and the tiles' stamp are (routing/osm_sidecar.py), always
+    given (sources.py), so no route goes without it unsaid."""
+    return route_controls(self._call(), steps, tiles_dir, sidecar_dir)
 
   def opposing(self, steps):
     """{step index: (m/s, lanes)} of the roads straight across the route's maneuvers (routing/controls.py: opposing_roads)."""
     return opposing_roads(self._call(), steps)
 
-  def controls_ahead(self, position, heading, tiles_dir=None):
+  def controls_ahead(self, position, heading, tiles_dir=None, *, sidecar_dir):
     """(controls, status, road) ahead of the car at position (lat, lon) heading that way (routing/controls.py:
-    controls_ahead), each with its stop point. tiles_dir: as for controls()."""
-    return controls_ahead(self._call(), position, heading, tiles_dir)
+    controls_ahead), each with its stop point. tiles_dir and sidecar_dir: as for controls()."""
+    return controls_ahead(self._call(), position, heading, tiles_dir, sidecar_dir)
 
   def _call(self):
     if self.actor is None:

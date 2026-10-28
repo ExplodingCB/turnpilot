@@ -20,6 +20,7 @@ from openpilot.selfdrive.turnpilot.maps.status import STATUS_PARAM, read_status
 from openpilot.selfdrive.turnpilot.maps.tests.fakes import (CHICAGO, INDY_EAST, KEY, SEATTLE, MapServer, coverage_doc, level2_tile, make_pack,
                                                             self_signed, tile_files)
 from openpilot.selfdrive.turnpilot.routing import valhalla_source
+from openpilot.selfdrive.turnpilot.routing.osm_sidecar import NO_DIRECTORY
 from openpilot.selfdrive.turnpilot.routing.sources import PACKS_DIR, REFUSED_RETRY_SECONDS, RETRY_SECONDS, MapRouter
 from openpilot.selfdrive.turnpilot.routing.tests.test_valhalla_routing import HAVE_VALHALLA, TURN_LANES_OSM, build_tiles
 from openpilot.selfdrive.turnpilot.routing.valhalla_source import ValhallaSource, locate, tiles_usable
@@ -150,16 +151,17 @@ class FakeValhalla:
   def __call__(self, tiles):
     if self.test.broken_tiles:
       raise RuntimeError('tiles do not load')
-    source = SimpleNamespace(tiles=tiles, calls=[], tiles_dir=tiles, controls_calls=[])
+    # as ValhallaSource: a valhalla_service URL has no tiles directory
+    source = SimpleNamespace(tiles=tiles, calls=[], tiles_dir=None if tiles.startswith('http') else tiles, controls_calls=[])
 
-    def controls(steps, tiles_dir=None):
-      source.controls_calls.append((steps, tiles_dir))
+    def controls(steps, tiles_dir=None, *, sidecar_dir):
+      source.controls_calls.append((steps, tiles_dir, sidecar_dir))
       return [], 'ok'
 
     source.controls = controls
 
-    def controls_ahead(position, heading, tiles_dir=None):
-      source.controls_calls.append(('ahead', position, heading, tiles_dir))
+    def controls_ahead(position, heading, tiles_dir=None, *, sidecar_dir):
+      source.controls_calls.append(('ahead', position, heading, tiles_dir, sidecar_dir))
       return [], 'ok', [position, position]
 
     source.controls_ahead = controls_ahead
@@ -230,10 +232,15 @@ class TestMapRouter(RouterCase):
     self.assertEqual(downloads[-1]['progress'], 1.0)
     self.assertEqual(list((self.maps / PACKS_DIR).glob('.download-*')), [])  # the tar is gone once unpacked
 
-  def test_corridor_controls_need_no_marker(self):
+  def test_corridor_controls_need_no_marker_and_read_the_packs_sidecar(self):
+    # tiles from real OSM carry their controls (no marker); the OSM stop-sign sidecar is the pack's own osm_controls/,
+    # checked against its manifest's osm_timestamp (routing/osm_sidecar.py), for the route and the road ahead off it
     steps = self.router.route(START, DESTINATION, 90, 'en')
     self.router.controls(steps)
-    self.assertEqual(self.built[0].controls_calls, [(steps, None)])
+    pack = self.router.corridor.pack.path
+    self.assertEqual(self.built[0].controls_calls, [(steps, None, pack)])
+    self.router.controls_ahead(START, 90.)
+    self.assertEqual(self.built[0].controls_calls[-1], ('ahead', START[::-1], 90., None, pack))
 
   def test_reroutes_on_the_same_corridor(self):
     self.router.route(START, DESTINATION, 90, 'en')
@@ -485,7 +492,7 @@ class TestLocalOverride(RouterCase):
     coverage_path(self.maps).unlink()
     steps = self.router.route(CHICAGO, CHICAGO, 90, 'en')
     self.assertEqual(self.router.controls(steps), ([], 'ok'))
-    self.assertEqual(self.built[0].controls_calls, [(steps, '/sim/tiles')])
+    self.assertEqual(self.built[0].controls_calls, [(steps, '/sim/tiles', '/sim/tiles')])  # the local tiles hold their sidecar
     self.assertEqual(self.router.controls(list(steps)), ([], 'failed'))
 
   def test_controls_ahead_on_the_local_tiles_before_any_route(self):
@@ -494,9 +501,17 @@ class TestLocalOverride(RouterCase):
     self.assertEqual(self.router.controls_ahead((-87.6, 41.8), 90.)[:2], ([], 'failed'))
     self.params.values['TurnPilotValhallaTiles'] = '/sim/tiles'
     self.assertEqual(self.router.controls_ahead((-87.6, 41.8), 90.)[:2], ([], 'ok'))
-    self.assertEqual(self.built[0].controls_calls, [('ahead', (41.8, -87.6), 90., '/sim/tiles')])
+    self.assertEqual(self.built[0].controls_calls, [('ahead', (41.8, -87.6), 90., '/sim/tiles', '/sim/tiles')])
     self.router.route(CHICAGO, CHICAGO, 90, 'en')
     self.assertEqual(len(self.built), 1)  # the same actor routes
+
+  def test_a_valhalla_service_has_no_directory_for_a_sidecar_which_is_said(self):
+    # a sidecar is expected everywhere: a valhalla_service URL has none to read, which controls.py says (partial)
+    self.params.values['TurnPilotValhallaTiles'] = 'http://127.0.0.1:8002'
+    coverage_path(self.maps).unlink()
+    steps = self.router.route(CHICAGO, CHICAGO, 90, 'en')
+    self.router.controls(steps)
+    self.assertEqual(self.built[0].controls_calls, [(steps, None, NO_DIRECTORY)])
 
   def test_local_tiles_fail_loudly(self):
     self.params.values['TurnPilotValhallaTiles'] = '/sim/tiles'

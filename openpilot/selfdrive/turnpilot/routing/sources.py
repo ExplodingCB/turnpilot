@@ -6,6 +6,11 @@ destination runs locally on it. Any failure is a MapError, reported in TurnPilot
 
 TurnPilotValhallaTiles is the developer and sim override (BeamNG sets it): when set, its tiles are used as they are,
 with no geofence and no download.
+
+The route's controls (routing/controls.py) come from the source that routed it, with the OSM stop-sign sidecar from the
+same place (routing/osm_sidecar.py): a corridor's pack directory (its osm_controls/ and the manifest's osm_timestamp), or
+the local tiles' own directory (osm_controls/ and meta.json); a valhalla_service URL has none, which is said. A sidecar is
+always expected: a missing or stale one makes the controls' status partial, out loud.
 """
 import time
 import uuid
@@ -19,6 +24,7 @@ from openpilot.selfdrive.turnpilot.maps.coverage import CoverageCache, check_tri
 from openpilot.selfdrive.turnpilot.maps.geofence import Region
 from openpilot.selfdrive.turnpilot.maps.paths import maps_dir
 from openpilot.selfdrive.turnpilot.maps.status import NavStatus
+from openpilot.selfdrive.turnpilot.routing.osm_sidecar import NO_DIRECTORY
 from openpilot.selfdrive.turnpilot.routing.valhalla_source import ValhallaSource
 
 PACKS_DIR = 'corridors'
@@ -73,7 +79,8 @@ class MapRouter:
     self.local: tuple[str, ValhallaSource] | None = None
     self.corridor: Corridor | None = None
     self.failure: Failure | None = None
-    self.served: tuple | None = None  # (steps, source, tiles_dir) of the last route: controls() asks the same source
+    # (steps, source, tiles_dir, sidecar_dir) of the last route: controls() asks the same source
+    self.served: tuple | None = None
 
   @property
   def packs_dir(self) -> Path:
@@ -85,12 +92,13 @@ class MapRouter:
   def controls(self, steps) -> tuple[list, str]:
     """(controls, status) for steps, the last route this router gave (routing/controls.py), from the source that routed it:
     local tiles are checked for their controls (the controls_built marker, the sim's sidecar), a corridor from real OSM
-    carries them. ([], 'failed') for steps it didn't route."""
+    carries them; the OSM stop-sign sidecar from the same place (module docstring). ([], 'failed') for steps it didn't
+    route."""
     served = self.served
     if served is None or served[0] is not steps:
       cloudlog.error("turnpilot: controls asked for a route this router didn't give")
       return [], 'failed'
-    return served[1].controls(steps, tiles_dir=served[2])
+    return served[1].controls(steps, tiles_dir=served[2], sidecar_dir=served[3])
 
   def opposing(self, steps) -> dict:
     """{step index: (m/s, lanes)} of the roads straight across the route's maneuvers (routing/controls.py: opposing_roads),
@@ -112,12 +120,18 @@ class MapRouter:
         self.local = (tiles, self.valhalla(tiles))
       except Exception:
         cloudlog.exception(f"turnpilot: TurnPilotValhallaTiles ({tiles}) doesn't load for the controls ahead")
-    source = self.served[1:] if self.served is not None else \
-      (self.local[1], getattr(self.local[1], 'tiles_dir', None)) if self.local is not None else None
+    source = self.served[1:] if self.served is not None else self.local_served(self.local[1]) if self.local is not None else None
     if source is None:
       cloudlog.warning("turnpilot: controls ahead asked for with no map source yet")
       return [], 'failed', []
-    return source[0].controls_ahead((position[1], position[0]), bearing, tiles_dir=source[1])
+    return source[0].controls_ahead((position[1], position[0]), bearing, tiles_dir=source[1], sidecar_dir=source[2])
+
+  @staticmethod
+  def local_served(source) -> tuple:
+    """(source, tiles_dir, sidecar_dir) for the local tiles: their own directory holds the sidecar; a valhalla_service
+    URL has none (NO_DIRECTORY, which controls.py says out loud)."""
+    tiles_dir = getattr(source, 'tiles_dir', None)
+    return source, tiles_dir, tiles_dir if tiles_dir else NO_DIRECTORY
 
   def clear(self):
     """No destination."""
@@ -153,7 +167,7 @@ class MapRouter:
     steps = self.routed(self.local[1], start, destination, bearing, language, 'the local tiles')
     if not steps:
       raise MapError('no_route', f"Valhalla found no route on the local tiles ({tiles}).", 'No route found')
-    self.served = (steps, self.local[1], getattr(self.local[1], 'tiles_dir', None))
+    self.served = (steps, *self.local_served(self.local[1]))
     self.status.set('ready', 'Routing on local tiles (developer override, no geofence).', 'Local tiles', source='local',
                     destination=list(destination))
     return steps
@@ -178,7 +192,7 @@ class MapRouter:
           raise MapError('no_route', "No route on the map for this drive.", 'No route found')
         if current.pack.holds(steps):
           self.ready(current.region, destination)
-          self.served = (steps, current.source, None)
+          self.served = (steps, current.source, None, current.pack.path)
           return steps
         cloudlog.warning("turnpilot: the reroute leaves the corridor, downloading a new corridor")
       else:
@@ -206,7 +220,7 @@ class MapRouter:
     if cancelled is not None and cancelled():
       raise cancelled_error()
     self.ready(region, destination)
-    self.served = (steps, downloaded.source, None)
+    self.served = (steps, downloaded.source, None, downloaded.pack.path)
     return steps
 
   def ready(self, region: Region, destination):

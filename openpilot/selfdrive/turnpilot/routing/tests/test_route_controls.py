@@ -409,7 +409,7 @@ def through(sim_map, instance):
   for label, (a, b) in (('along', (w[0], w[-1])), ('against', (w[-1], w[0]))):
     far = next((x[-1] if x[0] == b else x[0]) for x in ways if x is not w and b in (x[0], x[-1]))
     steps_ = src.route(ll[a][::-1], ll[far][::-1], None, None)
-    controls, status = src.controls(steps_, tiles_dir=src.tiles_dir)
+    controls, status = src.controls(steps_, tiles_dir=src.tiles_dir, sidecar_dir=src.tiles_dir)
     assert status == 'ok'
     out[label] = [c.instance for c in controls if c.line_mapped]
   return out
@@ -427,10 +427,10 @@ def test_sim_controls_ahead_of_the_car_off_the_route(sim_map):
   """BeamNG route_demo, 2026-10-28: rerouting at (-332, 495) heading southwest, the car drove through the signal at
   (-382, 445). The lookup ahead of the car finds it on its mapped line; heading the other way, it isn't ahead."""
   src = sim_map[0]
-  controls, status, _ = src.controls_ahead((39.7728582, -86.1619751), 225., tiles_dir=src.tiles_dir)
+  controls, status, _ = src.controls_ahead((39.7728582, -86.1619751), 225., tiles_dir=src.tiles_dir, sidecar_dir=src.tiles_dir)
   assert status == 'ok'
   first = controls[0]
   assert (first.kind, first.line_mapped) == ('signal', True) and 60. < first.route_m < 75., controls
   assert haversine(first.point, (39.7724078, -86.1625586)) < 6.
-  controls, status, _ = src.controls_ahead((39.7724078, -86.1625586), 45., tiles_dir=src.tiles_dir)
+  controls, status, _ = src.controls_ahead((39.7724078, -86.1625586), 45., tiles_dir=src.tiles_dir, sidecar_dir=src.tiles_dir)
   assert status == 'ok' and all(c.kind != 'signal' or c.route_m > 200. for c in controls), controls
