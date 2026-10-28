@@ -48,6 +48,7 @@ Once the detector is back and TurnPilot acts again, the dropped maneuver is take
 half driven (_take_up_dropped).
 A turn the car pulls away into from a standstill (a hold's go, the turn's pulse in that frame) is unverified: in BeamNG it
 was taken about half the time (2026-10-28). Past its junction (the follower's pass) having turned under MISSED_TURN_DEG,
+its desire not cleared at the turn's angle (a turn under 20 deg clears under MISSED_TURN_DEG, and that one was taken),
 it was missed: turnMissed for MISSED_HOLD_S, which selfdrived chimes as a skip ("Turn Missed", "Rerouting") and on which
 navd reroutes at once. Nothing brakes for it. Standing more than STALL_PROMPT_S after the go, STALL_MIN_DEG to
 STALL_MAX_DEG into the turn, with no hold of TurnPilot's and no lead within STOPPED_LEAD_M, it stalled in the junction:
@@ -520,7 +521,7 @@ class TurnPilot:
     if not (rf.passed and self.go_id is not None and self.go_id == d.maneuver_id == rf.maneuver_id):
       return
     self.go_id = None
-    if acting and d.turned_deg < MISSED_TURN_DEG:
+    if acting and not d.done and d.turned_deg < MISSED_TURN_DEG:  # done before the pass: cleared at its angle, taken
       self.missed_t = MISSED_HOLD_S
       cloudlog.event("turnpilot_turn_missed", error=True, turned_deg=round(d.turned_deg, 1), v_ego=round(v_ego, 2),
                      distance=round(rf.distance, 1))

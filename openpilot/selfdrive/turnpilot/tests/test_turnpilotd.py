@@ -1,4 +1,5 @@
 """turnpilotd closed loop: synthetic navd, model and scene around a point-mass car that follows the plan's limits."""
+import math
 from unittest import mock
 
 from opendbc.car.structs import car
@@ -1975,3 +1976,31 @@ def test_stalled_in_the_junction_after_the_go_asks_for_the_drivers_go_and_never_
   walker = ({'cls': 'pedestrian', 'x': 4., 'y': 0.1, 'vx': 0., 'vy': 0., 'inPath': True},)
   plans = stand(sim, STALL_PROMPT_S + 1., objects=walker)
   assert any(p.shouldStop for p in plans) and all(p.controlPrompt == 'none' for p in plans if p.shouldStop)
+
+
+def test_a_shallow_turn_taken_from_a_stop_sign_is_not_called_missed():
+  """Skeptic probe, 2026-10-28: a turn under 20 deg clears its desire at max(angle - 10, 0.75 angle), under 15 deg, and
+  turned_deg stops there. Released from a stop sign 20 m before it at cruise 10 m/s and yawed through its full angle, the
+  car passed it 'turned under 15 deg' and the turn was called missed: the chime, 'Rerouting', and navd's reroute. A turn
+  whose desire cleared at its angle was taken; a car that goes straight past the same junction is still missed."""
+  def run(angle, yaw):
+    sim = Sim([(300., "turn", "left", junction_of("left", angle=angle, opposing='none')), (1500., "turn", "right", junction_of("right"))],
+              cruise=10., controls=[(280., 'stop')])
+    sim.go_taps = False
+    stop_at(sim, 280., limit=200.)
+    sim.run(2.5)
+    sim.step(gas=True, engaged=True)
+    assert sim.tp.go_id is not None
+    plans, yawed = [], 0.
+    while sim.s < 345.:
+      yr = 0.3 if yaw and 300. - sim.s < 6. and yawed < angle else 0.
+      yawed += math.degrees(yr * DT_MDL)
+      plans.append(sim.step(engaged=True, yaw_rate=yr))
+      assert sim.t < 400.
+    return plans, yawed
+
+  for angle in (12., 15., 17., 19.):
+    plans, yawed = run(angle, True)
+    assert yawed >= angle and not any(p.turnMissed for p in plans), angle
+  plans, _ = run(15., False)  # straight on past it: missed
+  assert any(p.turnMissed for p in plans)
