@@ -231,8 +231,8 @@ def test_runs_end_to_end(tmp_path, monkeypatch, name, runs, trigger, failure):
     assert r['maneuvers_attempted'] == 1 and not r['disengagements']
     assert r['wrong_side_m'] == 0.0  # checked against the plan's road model, saved beside the runs for a rescore
     assert r['failures'][0] == failure
-    if name == 'unprotected_left':  # its junction's mapped signal decides the go it takes there
-      assert r['junction_go'] == 'signalGo' and "the driver never gave the go (signalGo) at the junction's signal" in r['failures']
+    if name == 'unprotected_left':  # no turnpilotd here: the left never went by itself
+      assert "never went at the unprotected left" in r['failures']
     gap = 'ped_gap' if name.startswith('ped') else 'car_gap'
     assert any(row[gap] is not None for row in r['rows'])
     assert r['pose_fields'] == run.POSE_FIELDS and len(r['poses']) > 20 * 10

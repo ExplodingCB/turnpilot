@@ -201,95 +201,58 @@ class TestChecks:
 
 
 class TestGasTaps:
-  LINE = 'Stopped at unprotected left — tap gas to go'
-
-  def left_run(self, tap=True, stop=True):
-    """An unprotected left: stops at the hold line, the driver's go, the detector's oncoming hold, the turn, arrival."""
+  """No gas go anywhere (Kellen, 2026-10-28): the score records every press while engaged, and any fails the run."""
+  def left_run(self, tap=False, stop=True, go=True):
+    """An autonomous unprotected left: waits at its hold line, goes by itself, turns, arrives."""
     at_line = {'nav_dist': 9.0, 'nav_remaining': 69.0}
-    stand = {'state': 'holding', 'reason': self.LINE, 'control_prompt': 'unprotectedTurnGo', 'v': 0.0 if stop else 3.0, **at_line}
+    stand = {'state': 'holding', 'reason': 'Waiting for a gap', 'control_prompt': 'waitingForGap', 'left_state': 'waitGap',
+             'left_treq': 8.4, 'v': 0.0 if stop else 3.0, **at_line}
     return drive(route([(120.0, 'turn', 'left'), (60.0, 'arrive', '')])[:1] +
                  [(2.5, stand),
-                  (1.0, {'state': 'holding', 'reason': 'waiting for oncoming', 'v': 0.0, 'gas': tap, **at_line}),
-                  (3.0, {'state': 'holding', 'reason': 'waiting for oncoming', 'v': 0.0, **at_line}),
-                  (2.0, {'v': 5.0, 'nav_dist': lambda tau: round(9.0 - 10.0 * tau, 1), 'nav_remaining': lambda tau: round(69.0 - 10.0 * tau, 1)}),
-                  (4.0, {'v': 8.0, 'nav_type': 'arrive', 'nav_mod': '', 'nav_dist': lambda tau: round(50.0 - 10.0 * tau, 1),
-                         'nav_remaining': lambda tau: round(50.0 - 10.0 * tau, 1), 'dest_dist': lambda tau: 50.0 - 10.0 * tau})])
+                  (1.0, {**stand, 'gas': tap}),
+                  (3.0, stand)] +
+                 ([(2.0, {'v': 5.0, 'control_prompt': 'leftGo', 'left_state': 'go', 'nav_dist': lambda tau: round(9.0 - 10.0 * tau, 1),
+                          'nav_remaining': lambda tau: round(69.0 - 10.0 * tau, 1)}),
+                   (4.0, {'v': 8.0, 'left_state': 'committed', 'nav_type': 'arrive', 'nav_mod': '',
+                          'nav_dist': lambda tau: round(50.0 - 10.0 * tau, 1), 'nav_remaining': lambda tau: round(50.0 - 10.0 * tau, 1),
+                          'dest_dist': lambda tau: 50.0 - 10.0 * tau})] if go else [(20., stand)]))
 
-  def test_the_score_records_each_tap_with_its_prompt_and_how_long_the_car_stood(self):
+  def test_a_left_that_waits_and_goes_by_itself_passes(self):
     res = score.summarize('unprotected_left', self.left_run(), 'arrived')
     assert res['passed'], res['failures']
+    assert res['gas_taps'] == [] and res['left']['gos']
+
+  def test_any_press_is_recorded_and_fails_the_run(self):
+    res = score.summarize('unprotected_left', self.left_run(tap=True), 'arrived')
     assert len(res['gas_taps']) == 1
     tap = res['gas_taps'][0]
-    assert tap['prompt'] == 'unprotectedTurnGo' and tap['reason'] == self.LINE
+    assert tap['prompt'] == 'waitingForGap' and tap['reason'] == 'Waiting for a gap'
     assert tap['stopped_s'] == pytest.approx(2.5, abs=0.06) and tap['t'] == pytest.approx(15.5, abs=0.06)
-
-  def test_a_press_turnpilot_never_asked_for_fails_the_run(self):
-    # standing with nothing held and no prompt, the gas pressed: no go was asked for (a stall push would hide a hold let
-    # go with no pull-away, or push the car at a lead)
-    rows = self.left_run()
-    stand = {'state': 'following', 'reason': '', 'control_prompt': 'none', 'v': 0.0, 'nav_dist': 9.0, 'nav_remaining': 69.0}
-    rows = rows[:40] + drive([(4.5, stand), (1.0, {**stand, 'gas': True})]) + rows[40:]
-    t = 0.
-    for r in rows:
-      r['t'], t = round(t, 3), t + DT
-    res = score.summarize('unprotected_left', rows, 'arrived')
-    assert any('no go' in f for f in res['failures']), res['failures']
+    assert any('no taps anywhere' in f for f in res['failures']), res['failures']
+    # whatever the scenario
+    rows = drive([(2.0, {}), (1.0, {'gas': True}), (2.0, {})])
+    assert any('no taps anywhere' in f for f in score.check('route_demo', score.summarize('route_demo', rows, 'arrived')))
 
   def test_engaging_on_the_gas_is_no_tap(self):
     rows = drive([(1.0, {'enabled': False, 'gas': True}), (1.0, {})])
     assert score.summarize('route_demo', rows, 'arrived')['gas_taps'] == []
 
-  def test_an_unprotected_left_without_the_go_fails(self):
-    for name in ('unprotected_left', 'unprotected_left_visible'):
-      res = score.summarize(name, self.left_run(tap=False), 'arrived')
-      assert "the driver never gave the go at the unprotected left's hold line" in res['failures'], name
-
-  def test_an_unprotected_left_that_never_stops_at_its_line_fails(self):
-    res = score.summarize('unprotected_left', self.left_run(stop=False), 'arrived')
-    assert "never stopped at the unprotected left's hold line for the driver's go" in res['failures']
-
-  SIGNAL = 'Stopped at signal — tap gas to go'
-
-  def signal_run(self, prompt='signalGo', reason=SIGNAL):
-    rows = self.left_run()
-    for r in rows:
-      if r['control_prompt'] == 'unprotectedTurnGo':
-        r['control_prompt'], r['reason'] = prompt, reason
-    return rows
-
-  def test_a_left_at_a_mapped_signal_takes_the_signals_go(self):
-    # BeamNG smoke 2026-10-28: the signal tiles map a signal at both left scenarios' junction, which protects the left
-    # (map_controls.protected): one stop, its go signalGo, never unprotectedTurnGo. A green is still permissive: the oncoming
-    # hold after that go is checked as before
-    for name in ('unprotected_left', 'unprotected_left_visible'):
-      res = score.summarize(name, self.signal_run(), 'arrived', junction_control='signal')
-      assert res['passed'], (name, res['failures'])
-      assert res['junction_go'] == 'signalGo'
-      res = score.summarize(name, self.signal_run(), 'arrived')  # no signal mapped there: it had to be unprotectedTurnGo
-      assert "the driver never gave the go at the unprotected left's hold line" in res['failures'], name
-      res = score.summarize(name, self.left_run(), 'arrived', junction_control='signal')  # a second, unprotected stop
-      assert "the driver never gave the go (signalGo) at the junction's signal" in res['failures'], name
-      assert "never stopped at the junction's signal for the driver's go (signalGo)" in res['failures'], name
-
-  def test_a_go_at_a_signal_before_the_junction_is_not_the_junctions(self):
-    rows = self.signal_run()
-    for r in rows:
-      r['j_dist'] = 120. if r['control_prompt'] == 'signalGo' or r['gas'] else 20.
-    res = score.summarize('unprotected_left', rows, 'arrived', junction_control='signal')
-    assert "the driver never gave the go (signalGo) at the junction's signal" in res['failures']
+  def test_a_left_that_never_goes_fails(self):
+    res = score.summarize('unprotected_left', self.left_run(go=False), 'timeout')
+    assert "never went at the unprotected left" in res['failures']
 
 
 class TestOncomingPresented:
-  """The left scenarios require the oncoming hold only where an oncoming car came to the junction while the car was at
-  it, before it: one that came after the car had turned tested nothing, and fails the run as untested."""
+  """The left scenarios require the wait only where an oncoming car came to the junction while the car was at it, before
+  it: one that came after the car had turned tested nothing, and fails the run as untested."""
 
   def run_with(self, car_at, waited=True):
-    rows = TestGasTaps().signal_run()
+    rows = TestGasTaps().left_run()
     for i, r in enumerate(rows):
       t = i * DT
       r['j_dist'], r['j_ahead'] = (20., 20.) if t < 18. else (5., -5.)
       r['car_j_dist'] = 60. - 10. * max(t - car_at, 0.)
-      if not waited and r['reason'] == 'waiting for oncoming':
+      if not waited and r['reason'] == 'Waiting for a gap':
         r['reason'] = 'Stopped at signal'
     return rows
 
@@ -306,6 +269,64 @@ class TestOncomingPresented:
     res = score.summarize('unprotected_left', self.run_with(car_at=30.), 'arrived', junction_control='signal')
     assert res['oncoming_presented'] is False
     assert any("the wait went untested" in f for f in res['failures']), res['failures']
+
+
+class TestUnprotectedLeft:
+  """The autonomous left's gate numbers (CRITIQUE REQUIRED 5, G6): post-encroachment time, false gos, missed gaps,
+  undecided only without a gap of tReq offered, no stall, no missed turn."""
+  T_REQ = 8.4
+
+  def stream(self, go_at, cars, end=40., v_car=11., stall=False, undecided_at=None, missed=False):
+    """The car waits at its line (j_dist 9 m) and goes at go_at (None: never), through the zone 1.5 s later for 1.5 s; cars
+    pass the junction at the times in cars at v_car."""
+    rows = []
+    for k in range(int(end / DT)):
+      t = round(k * DT, 3)
+      went = go_at is not None and t >= go_at
+      j = 9. if not went else max(9. - 6. * (t - go_at), -30.)
+      state = 'undecided' if undecided_at is not None and t >= undecided_at else 'go' if went and t < go_at + 4. else \
+        'committed' if went else 'waitGap'
+      onc = [[abs(v_car * (tc - t)), v_car * (tc - t)] for tc in cars]
+      rows.append(row(t, v=0. if not went else 6., j_dist=abs(j), j_ahead=j, onc=onc, car_j_dist=min((o[0] for o in onc), default=None),
+                      left_state=state, left_treq=self.T_REQ, state='holding' if not went else 'turning',
+                      reason='Waiting for a gap' if not went else '', turn_missed=missed and t > (go_at or 0.) + 5.,
+                      control_prompt='stalledTakeControl' if stall and went and t > go_at + 8. else 'none'))
+    return rows
+
+  def test_a_go_after_the_last_car_passes(self):
+    lr = score.unprotected_left(self.stream(go_at=20., cars=[5., 10., 15.]))
+    assert lr['gos'] == [20.] and not lr['false_goes'] and lr['pet_s'] >= score.PET_MIN_S
+
+  def test_a_go_into_a_close_car_is_a_false_go_and_too_little_pet(self):
+    lr = score.unprotected_left(self.stream(go_at=12., cars=[5., 15.]))
+    assert lr['false_goes'] and lr['false_goes'][0]['tta_s'] < self.T_REQ
+    assert lr['pet_s'] < score.PET_MIN_S
+    res = score.summarize('unprotected_left', self.stream(go_at=12., cars=[5., 15.]), 'arrived')
+    assert any('false go' in f for f in res['failures']) and any('post-encroachment' in f for f in res['failures'])
+
+  def test_a_long_gap_waited_through_is_counted_missed_not_failed(self):
+    # cars 5 s and 25 s through: a 20 s gap the car stood through; it went after the last
+    lr = score.unprotected_left(self.stream(go_at=30., cars=[5., 25.], end=45.))
+    assert lr['missed_gaps'] == 1 and any(g >= self.T_REQ for g in lr['gaps_offered_s'])
+    res = score.summarize('unprotected_left', self.stream(go_at=30., cars=[5., 25.], end=45.), 'arrived')
+    assert not any('gap' in f for f in res['failures'])
+
+  def test_undecided_passes_only_without_a_gap_offered(self):
+    # a dense stream (4 s apart) the whole time: undecided is no failure of the left's rule
+    rows = self.stream(go_at=None, cars=[4. * k for k in range(1, 12)], end=45., undecided_at=20.)
+    res = score.summarize('unprotected_left', rows, 'timeout')
+    assert res['left']['undecided_t'] == 20. and not res['left']['gap_before_undecided']
+    assert not any('undecided' in f or 'arrived' in f or 'maneuvers' in f for f in res['failures']), res['failures']
+    # with a 15 s gap offered before it: a failure
+    rows = self.stream(go_at=None, cars=[2., 17.], end=45., undecided_at=40.)
+    res = score.summarize('unprotected_left', rows, 'timeout')
+    assert any('undecided' in f for f in res['failures']), res['failures']
+
+  def test_a_stall_or_a_missed_turn_fails(self):
+    res = score.summarize('unprotected_left', self.stream(go_at=20., cars=[5.], stall=True), 'arrived')
+    assert any('stalled' in f for f in res['failures'])
+    res = score.summarize('unprotected_left', self.stream(go_at=20., cars=[5.], missed=True), 'arrived')
+    assert "missed the turn" in res['failures']
 
 
 class TestOncomingLane:

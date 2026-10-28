@@ -212,6 +212,7 @@ class Runner:
       'dest_dist': None if self.plan.dest is None else round(math.hypot(self.plan.dest[0] - x, self.plan.dest[1] - y), 1),
       'blinker': 'left' if b.blinker[0] else 'right' if b.blinker[1] else '',
       'ped_gap': None, 'car_gap': None, 'pacer_dx': None, 'j_dist': junction_distance(self.plan, x, y), 'car_j_dist': None,
+      'onc': None,
       **score.msg_fields(sm['selfdriveState'], sm['carState'], sm['turnpilotPlan'] if sm.seen['turnpilotPlan'] else None,
                          sm['navInstruction'] if sm.seen['navInstruction'] and sm.valid['navInstruction'] else None,
                          sm['modelV2']),
@@ -226,6 +227,10 @@ class Runner:
       if a.trigger == 'oncoming':  # where the oncoming traffic is, for the score's "presented" (score.oncoming_presented)
         dj = junction_distance(self.plan, pose[0], pose[1])
         r['car_j_dist'] = round(dj if r['car_j_dist'] is None else min(r['car_j_dist'], dj), 2)
+        # and each car's, with how far the junction is ahead of it along its heading, for the left's PET and false gos
+        hc = pose[2]
+        ahead = (self.plan.junction[0] - pose[0]) * math.cos(hc) + (self.plan.junction[1] - pose[1]) * math.sin(hc)
+        r['onc'] = (r['onc'] or []) + [[round(dj, 2), round(ahead, 2)]]
       if a.trigger == 'pace':
         r['pacer_dx'] = round((pose[0] - x) * math.cos(h) + (pose[1] - y) * math.sin(h), 2)
     r['j_ahead'] = None

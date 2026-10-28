@@ -7,7 +7,11 @@ A row is a dict:
   enabled            selfdriveState.enabled; alert, alert_text: its alertType and alertText1
   steer, gas, brake  carState steeringPressed, gasPressed, brakePressed
   state, reason      turnpilotPlan.state and .reason; lc, prompt: its laneChange and signalPrompt
-  control_prompt     turnpilotPlan.controlPrompt: the go TurnPilot asks the driver for ('none', 'stopSignGo', ...)
+  control_prompt     turnpilotPlan.controlPrompt ('none', 'waitingForGap', 'leftGo', 'stalledTakeControl', ...)
+  left_state         turnpilotPlan.unprotectedLeft.state ('off', 'waitGap', 'go', 'undecided', ...); left_treq, left_rreq its
+                     tReq and rReq; turn_missed turnpilotPlan.turnMissed
+  onc                [[m to the junction, m it is ahead of the car along its own heading], ...] of each oncoming scenario car
+                     (None before they recorded it)
   lc_wait, lc_want   turnpilotPlan.laneChangeWait (why a change the route wants isn't offered) and laneChangeWant
   desire             turnpilotPlan.desire (a log.Desire index); map_kind: its mapControl.kind ('none', 'signal', ...)
   lc_state           modelV2.meta.laneChangeState
@@ -55,6 +59,16 @@ LINE_BOX_MARGIN_M = 2. # a junction's box reaches this far past its mapped stop 
 INTO_JUNCTION_DEG = 60.  # ...within this of the bearing to it
 NEAR_JUNCTION_M = 35.  # timing.GO_NEAR_M: a stop and the go within this of the junction are its own
 PRESENT_CAR_M = 30.    # an oncoming car this close to the junction while the car is before it, at it: the conflict is presented
+# The autonomous unprotected left (DESIGN phase 4 G4, G6; CRITIQUE REQUIRED 5): no gas tap anywhere (any press fails a run);
+# the post-encroachment time with each oncoming car through the junction's conflict zone under PET_MIN_S fails; a go with an
+# oncoming car under the plan's tReq from the zone at its own speed is a false go (fails); a gap of tReq or more offered
+# while the car waited at its line without going is a missed gap (counted, not failed: the velocity-free rule's 1.3x margin
+# and 2.5 s window wait out gaps a little longer than tReq by design); undecided passes only if no such gap was offered
+# before it; a stall or an unmoving go (stalledTakeControl, cantStartTakeControl) and a missed turn fail
+PET_MIN_S = 2.
+CONFLICT_M = 8.        # the conflict zone: within this of the junction's point
+APPROACH_SPEED_S = 0.5  # an oncoming car's speed at a go: from its distance this long before
+LEFT_STALLS = ('stalledTakeControl', 'cantStartTakeControl')
 
 
 def msg_fields(ss, cs, tp, nav, model) -> dict:
@@ -66,6 +80,10 @@ def msg_fields(ss, cs, tp, nav, model) -> dict:
     'state': '' if tp is None else str(tp.state), 'reason': '' if tp is None else str(tp.reason),
     'lc': '' if tp is None else str(tp.laneChange), 'prompt': '' if tp is None else str(tp.signalPrompt),
     'control_prompt': '' if tp is None else str(tp.controlPrompt),
+    'left_state': 'off' if tp is None else str(tp.unprotectedLeft.state),
+    'left_treq': 0. if tp is None else round(float(tp.unprotectedLeft.tReq), 2),
+    'left_rreq': 0. if tp is None else round(float(tp.unprotectedLeft.rReq), 1),
+    'turn_missed': False if tp is None else bool(tp.turnMissed),
     'lc_wait': '' if tp is None else str(tp.laneChangeWait), 'lc_want': 0 if tp is None else int(tp.laneChangeWant),
     'desire': 0 if tp is None else int(tp.desire), 'map_kind': '' if tp is None else str(tp.mapControl.kind),
     'lc_state': str(model.meta.laneChangeState),
@@ -106,7 +124,7 @@ def rows_from_log(msgs) -> list[dict]:
     nav = latest.get('navInstruction')
     rows.append({'t': round(t - t0, 3), 'wall': None, 'x': None, 'y': None, 'heading': None, 'v': round(cs.vEgo, 2), 'route': route,
                  'dest_dist': None, 'blinker': 'left' if cs.leftBlinker else 'right' if cs.rightBlinker else '',
-                 'ped_gap': None, 'car_gap': None, 'pacer_dx': None, 'j_dist': None, 'car_j_dist': None,
+                 'ped_gap': None, 'car_gap': None, 'pacer_dx': None, 'j_dist': None, 'car_j_dist': None, 'onc': None,
                  **msg_fields(latest['selfdriveState'].selfdriveState, cs, m.turnpilotPlan,
                               nav.navInstruction if nav is not None and nav.valid else None, latest['modelV2'].modelV2)})
   return rows
@@ -390,10 +408,63 @@ def _hold_with(hs, word):
   return [h for h in hs if word in h['reason']]
 
 
-GO_PROMPTS = ('stopSignGo', 'signalGo', 'unprotectedTurnGo')  # turnpilotPlan.controlPrompt values that ask for the driver's go
-# the go a turn takes at its junction, by the junction's own mapped control (catalog.junction_control): its signal or stop
-# sign protects the turn (map_controls.protected), and only an unsignalized one is an unprotectedTurn stop
-JUNCTION_GO = {'signal': 'signalGo', 'stop': 'stopSignGo'}
+def zone_spans(rows, dist) -> list[tuple[float, float]]:
+  """[(t in, t out)] of the spans dist(row) is within CONFLICT_M (None: not known, out)."""
+  spans, start = [], None
+  for r in rows:
+    d = dist(r)
+    inside = d is not None and d <= CONFLICT_M
+    if inside and start is None:
+      start = r['t']
+    elif not inside and start is not None:
+      spans.append((start, r['t']))
+      start = None
+  if start is not None:
+    spans.append((start, rows[-1]['t']))
+  return spans
+
+
+def span_gap(a, b) -> float:
+  """s between two spans, 0 if they overlap."""
+  return max(b[0] - a[1], a[0] - b[1], 0.)
+
+
+def unprotected_left(rows) -> dict:
+  """The autonomous left's numbers (module constants): the minimum post-encroachment time with any oncoming car, false gos,
+  the gaps offered at the line, those missed, and whether it ended undecided (before or after a gap of tReq was offered)."""
+  n = max((len(r['onc']) for r in rows if r.get('onc')), default=0)
+  ego = zone_spans(rows, lambda r: r.get('j_dist'))
+  cars = [zone_spans(rows, lambda r, k=k: r['onc'][k][0] if r.get('onc') and len(r['onc']) > k else None) for k in range(n)]
+  pets = [span_gap(e, c) for e in ego for spans in cars for c in spans]
+  gos = [i for i in range(1, len(rows)) if rows[i].get('left_state') == 'go' and rows[i - 1].get('left_state') != 'go']
+  false_goes = []
+  for i in gos:
+    r = rows[i]
+    j = next((j for j in range(i, -1, -1) if r['t'] - rows[j]['t'] >= APPROACH_SPEED_S), None)
+    for k in range(n):
+      if j is None or not r.get('onc') or len(r['onc']) <= k or not rows[j].get('onc') or len(rows[j]['onc']) <= k:
+        continue
+      d, ahead = r['onc'][k]
+      v = (rows[j]['onc'][k][0] - d) / (r['t'] - rows[j]['t'])
+      if ahead > 0. and d > CONFLICT_M and v > 0.5 and (d - CONFLICT_M) / v < r.get('left_treq', 0.):
+        false_goes.append({'t': r['t'], 'car': k, 'tta_s': round((d - CONFLICT_M) / v, 2), 't_req': r.get('left_treq')})
+  # gaps between the cars' passes through the zone (and after the last, to the run's end), against the plan's tReq
+  passes = sorted(c for spans in cars for c in spans)
+  bounds = [(a[1], b[0]) for a, b in zip(passes, passes[1:], strict=False) if b[0] > a[1]]
+  if passes and rows[-1]['t'] > passes[-1][1]:
+    bounds.append((passes[-1][1], rows[-1]['t']))
+  t_req = max((r.get('left_treq', 0.) for r in rows if r.get('left_state') == 'waitGap'), default=0.)
+  offered = [(a, b) for a, b in bounds if t_req > 0. and b - a >= t_req]
+  waiting = [r['t'] for r in rows if r.get('left_state') == 'waitGap' and r['v'] < STOPPED_V]
+  go_t = [rows[i]['t'] for i in gos]
+  missed = [(a, b) for a, b in offered if any(a <= t <= b - t_req for t in waiting) and not any(a <= t <= b - t_req for t in go_t)]
+  undecided_t = next((r['t'] for r in rows if r.get('left_state') == 'undecided'), None)
+  return {'pet_s': round(min(pets), 2) if pets else None, 'gos': go_t, 'false_goes': false_goes,
+          'gaps_offered_s': [round(b - a, 1) for a, b in offered], 'missed_gaps': len(missed), 't_req': t_req,
+          'undecided_t': undecided_t,
+          'gap_before_undecided': undecided_t is not None and any(b - t_req <= undecided_t for a, b in offered),
+          'stalls': sorted({r['control_prompt'] for r in rows if r.get('control_prompt') in LEFT_STALLS}),
+          'turn_missed': any(r.get('turn_missed') for r in rows)}
 
 
 def check(name: str, res: dict) -> list[str]:
@@ -407,10 +478,10 @@ def check(name: str, res: dict) -> list[str]:
     w = res['wrong_side'][0]
     fails.append(f"drove {res['wrong_side_m']:.0f} m in the oncoming lane outside the junctions, first at t={w['t']:.1f} s " +
                  f"({w['x']:.0f}, {w['y']:.0f}), up to {max(x['max_past_m'] for x in res['wrong_side']):.1f} m past the divider")
-  asked = [x for x in res.get('gas_taps', []) if x['prompt'] not in GO_PROMPTS]
-  if asked:
-    x = asked[0]
-    fails.append(f"{len(asked)} gas press(es) with no go asked for, first at t={x['t']:.1f} s ({x['reason'] or 'no hold'}, " +
+  taps = res.get('gas_taps', [])
+  if taps:  # no gas go anywhere (Kellen, 2026-10-28): any press while engaged is the driver's, a failed run
+    x = taps[0]
+    fails.append(f"{len(taps)} gas press(es), no taps anywhere, first at t={x['t']:.1f} s ({x['reason'] or 'no hold'}, " +
                  f"stood {x['stopped_s']} s)")
   taken, attempted = res['maneuvers_taken'], res['maneuvers_attempted']
   hs = res['holds']
@@ -420,24 +491,31 @@ def check(name: str, res: dict) -> list[str]:
       fails.append("never held to a stop for the pedestrian in the crosswalk")
     elif not any(x['resumed'] for x in h if x['stopped']):
       fails.append("did not move on after the crosswalk cleared")
-  elif name.startswith('unprotected_left'):  # and its variants at other approaches
-    # a left on a green is still permissive: the oncoming hold is required wherever an oncoming car was presented
-    h = _hold_with(hs, 'oncoming')
-    if res.get('oncoming_presented') is False:
-      fails.append(f"no oncoming car came within {PRESENT_CAR_M:.0f} m of the junction while the car was at it: the wait went untested")
-    elif not h:
-      fails.append("never waited for oncoming traffic")
-    elif not any(x['resumed'] for x in h):
-      fails.append("did not go after the oncoming cars passed")
+  elif name.startswith('unprotected_left'):  # and its variants at other approaches and gap streams
+    lr = res['left']
+    if lr['undecided_t'] is not None and lr['gap_before_undecided']:
+      fails.append(f"undecided at t={lr['undecided_t']:.1f} s with a gap of {max(lr['gaps_offered_s'])} s (tReq {lr['t_req']} s) offered")
+    elif lr['undecided_t'] is None:
+      # waiting is required wherever an oncoming car was presented; the wait is the left's own at its line
+      h = _hold_with(hs, 'gap') + _hold_with(hs, 'oncoming') + _hold_with(hs, 'Oncoming')
+      if res.get('oncoming_presented') is False:
+        fails.append(f"no oncoming car came within {PRESENT_CAR_M:.0f} m of the junction while the car was at it: the wait went untested")
+      elif not h:
+        fails.append("never waited for oncoming traffic")
+      if not lr['gos']:
+        fails.append("never went at the unprotected left")
+      if lr['false_goes']:
+        x = lr['false_goes'][0]
+        fails.append(f"{len(lr['false_goes'])} false go(es): at t={x['t']:.1f} s an oncoming car {x['tta_s']} s from the junction " +
+                     f"(tReq {x['t_req']} s)")
+      if lr['pet_s'] is not None and lr['pet_s'] < PET_MIN_S:
+        fails.append(f"post-encroachment time {lr['pet_s']} s with an oncoming car, under {PET_MIN_S} s")
+    if lr['stalls']:
+      fails.append(f"stalled or never moved on its go ({', '.join(lr['stalls'])})")
+    if lr['turn_missed']:
+      fails.append("missed the turn")
     if res['min_gap_car_m'] is not None and res['min_gap_car_m'] < CAR_MIN_GAP_M:
       fails.append(f"came within {res['min_gap_car_m']} m of an oncoming car")
-    go = res.get('junction_go', 'unprotectedTurnGo')
-    at = "the unprotected left's hold line" if go == 'unprotectedTurnGo' else f"the junction's {res['junction_control']}"
-    if go not in res['stopped_for_go']:
-      fails.append(f"never stopped at {at} for the driver's go" + ('' if go == 'unprotectedTurnGo' else f" ({go})"))
-    if not any(x['prompt'] == go and (x.get('j_dist') is None or x['j_dist'] <= NEAR_JUNCTION_M) for x in res['gas_taps']):
-      fails.append("the driver never gave the go at the unprotected left's hold line" if go == 'unprotectedTurnGo' else
-                   f"the driver never gave the go ({go}) at {at}")
   elif name == 'ped_in_path':
     g = res['stop_gap_m']
     if res['outcome'] != 'stopped' or g is None:
@@ -454,7 +532,8 @@ def check(name: str, res: dict) -> list[str]:
   elif name == 'lane_change':
     if not res['lane_changes']:
       fails.append("never changed lanes")
-  if name in ('ped_crosswalk_right', 'lane_change', 'route_demo') or name.startswith('unprotected_left'):
+  undecided_ok = name.startswith('unprotected_left') and res['left']['undecided_t'] is not None and not res['left']['gap_before_undecided']
+  if (name in ('ped_crosswalk_right', 'lane_change', 'route_demo') or name.startswith('unprotected_left')) and not undecided_ok:
     if res['outcome'] != 'arrived':
       fails.append(f"ended {res['outcome']}, not arrived")
     if attempted == 0 or taken < attempted:
@@ -467,7 +546,7 @@ def check(name: str, res: dict) -> list[str]:
 def summarize(name: str, rows, outcome: str, road: dict | None = None, junction_control: str | None = None) -> dict:
   """road: catalog.road_model's roads around the run, for the oncoming-lane check (rows with positions need one);
   junction_control: the scenario junction's own mapped control (catalog.junction_control's kind: 'signal', 'stop',
-  'none'; None: not known), which decides the go its turn takes there (JUNCTION_GO)."""
+  'none'; None: not known), recorded with the result (a signal there no longer protects a left: map_controls)."""
   ms = maneuvers(rows)
   wrong_m, wrong_spans = wrong_side(rows, road)
   res = {
@@ -486,12 +565,12 @@ def summarize(name: str, rows, outcome: str, road: dict | None = None, junction_
     'positions': any(r.get('x') is not None for r in rows),
     'wrong_side_m': wrong_m,
     'wrong_side': wrong_spans,
-    # the gos TurnPilot asked for with the car standing at the junction (stopSignGo, unprotectedTurnGo, signalGo)
+    # the prompts TurnPilot showed with the car standing at the junction (waitingForGap, a handback)
     'stopped_for_go': sorted({r['control_prompt'] for r in rows if r.get('control_prompt', 'none') not in ('', 'none') and
                               r['v'] < STOPPED_V and near_junction(r)}),
     'junction_control': junction_control,
-    'junction_go': JUNCTION_GO.get(junction_control or 'none', 'unprotectedTurnGo'),
     'oncoming_presented': oncoming_presented(rows),
+    'left': unprotected_left(rows),
     'lane_blocked': any(r.get('reason') == 'car in target lane' for r in rows),
     'signal_prompts': sum(1 for a, b in zip(rows, rows[1:], strict=False) if b.get('blinker') and b['blinker'] != a.get('blinker')),
   }
@@ -506,6 +585,10 @@ def report(label: str, res: dict) -> str:
   line = f"{label}: {'PASS' if res['passed'] else 'FAIL'} {res['outcome']}, {res['maneuvers_taken']}/{res['maneuvers_attempted']} maneuvers, " + \
          f"{len(res['disengagements'])} disengagements, holds {holds}, gas taps {taps}, min gap ped {res['min_gap_ped_m']} car {res['min_gap_car_m']}, " + \
          f"oncoming lane {res.get('wrong_side_m')} m"
+  lr = res.get('left')
+  if lr is not None and (lr['gos'] or lr['undecided_t'] is not None or lr['pet_s'] is not None):
+    line += f", left: PET {lr['pet_s']} s, false goes {len(lr['false_goes'])}, missed gaps {lr['missed_gaps']} of " + \
+            f"{len(lr['gaps_offered_s'])} offered, gos {lr['gos']}, undecided {lr['undecided_t']}"
   return line + ''.join(f"\n  {f}" for f in res['failures'])
 
 
