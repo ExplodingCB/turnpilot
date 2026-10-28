@@ -62,6 +62,12 @@ speed capped by the heading it has turned, DesireTiming.turned_deg at the go and
 POST_GO_MAX_M on, and dropped at the pass of a turn missed straight on. TurnPilotPostGoProfile names the profile
 (graduated by default; none, flat3, flat43 for the BeamNG sweep), and an unprotected turn's go (unprotected_turn: a left
 across the oncoming road) takes TurnPilotLeftGoProfile's (left: 1.5 m/s^2, 4.3 m/s). The caps only lower speed.
+A go the car hasn't pulled away on (STANDSTILL_SPEED) within NO_MOVE_S, LEFT_NO_MOVE_S for an unprotected turn (CRITIQUE
+REQUIRED 4: its gap runs out while it stands), counting only while nothing else holds it (no TurnPilot hold, no close lead,
+no pedal), is the model holding the car: TurnPilot withdraws the go before the car moves, holding it standing (shouldStop,
+a 0 speed cap: braking at -2.0 at most, from under 0.3 m/s; no turn pulse), and hands back loudly (controlPrompt
+cantStartTakeControl, NO_MOVE_REASON) until the driver takes over (openpilot disengaged: any gas press). The turn isn't
+cancelled: its desire state stays, and the driver drives it.
 Standing engaged with nothing of TurnPilot's holding the car (no shouldStop, no cap biting), no lead from the model within
 STOPPED_LEAD_M (one further on doesn't hold a standing car), gas and brake off, the model stopped on its own: said on the
 status line after STOPPED_NOTE_S (STOPPED_NOTE), and handed back loudly (controlPrompt carStoppedTakeControl) after
@@ -162,6 +168,11 @@ STALL_PROMPT_S = 3.    # standing this long after the go, STALL_MIN_DEG to STALL
 STALL_MIN_DEG = 20.    # handed back (the stop line it left is within STOPPED_CONTROL_M, so the empty-road handback
 STALL_MAX_DEG = 80.    # comes only after the long stand; the sweep's stalls stood 20 s at 46-78 deg)
 STALLED_REASON = "Stalled in the turn: take control"
+# not at STANDSTILL_SPEED this long after TurnPilot's go, nothing else holding the car: the model is holding it (DESIGN phase 4
+# section 2-3; G0, 2026-10-28: 14 of 24 tapless goes stood 20 s). Withdrawn and handed back; an unprotected turn's sooner
+NO_MOVE_S = 2.
+LEFT_NO_MOVE_S = 1.
+NO_MOVE_REASON = "Can't start the turn: take control"
 
 
 def close_lead(model) -> bool:
@@ -241,6 +252,9 @@ class TurnPilot:
       self.skip_cap_id: int | None = None  # a dropped turn skipped on taking it up: its cap stays until it is passed
       self.go_id: int | None = None  # the turn a hold let go of at standstill: checked for a miss and a stall
       self.post_go: PostGo | None = None  # ...and driven under its post-go profile (start_post_go)
+      self.no_move_limit = NO_MOVE_S       # ...withdrawn if the car hasn't moved this long after it (no_move)
+      self.go_wait_s: float | None = None  # s stood since TurnPilot's go, nothing else holding the car; None: moved, or no go
+      self.go_withdrawn = False            # the go withdrawn: the car held standing, handed back (cantStartTakeControl)
     else:
       self.desires.hold_off()  # the disabled plan dropped the desire: as on re-engaging, a fresh pulse only before the turn
     self.lanes = LanePlanner()
@@ -446,13 +460,14 @@ class TurnPilot:
     # straight across the junction
     self.release_go = self.was_stopping and not decision.should_stop and v_ego < STANDSTILL_SPEED
     self.was_stopping = decision.should_stop
+    withdrawn = self.no_move(sm, cs, v_ego, acting, decision)
 
     lanes = model_lanes_from_msg(model)
     desire = self.desires.update(desire_on, rf.distance, rf.maneuver_id, rf.passed, v_ego, cs.steeringAngleDeg,
                                  lanes.keep_left_ok, lanes.keep_right_ok, DT_MDL, default_yaw_rate(cs, model),
                                  lat_active=lat_active, replaced=rf.replaced,
                                  may_start=skip.feasible_now and not held, go=self.release_go,
-                                 holding=decision.should_stop)
+                                 holding=decision.should_stop or withdrawn)
     self._yaw_ticked = True
     d = self.desires
     if self.release_go and d.maneuver_id == rf.maneuver_id and d.started and d.side != 0 and not d.done and upcoming is not None:
@@ -501,6 +516,8 @@ class TurnPilot:
     if self.post_go is not None:  # only ever lowers: a positive accel cap, a speed cap braking at -2.0 at most
       go_accel, go_speed = self.post_go.caps(v_ego)
       plan.accelCap, plan.speedCap = min(plan.accelCap, go_accel), min(plan.speedCap, go_speed)
+    if withdrawn:  # standing (under STANDSTILL_SPEED when withdrawn): the speed cap's -2.0 floor at most, never harder
+      plan.shouldStop, plan.speedCap = True, 0.
     self.limits = (plan.accelCap, plan.speedCap, plan.shouldStop)
     no_junction_data = maneuver is not None and maneuver.kind in (TURN, KEEP) and not maneuver.geometry
     plan.turnMissed = acting and self.missed_t > 0.
@@ -512,7 +529,9 @@ class TurnPilot:
       plan.controlAlert = 'hardBrake'
     stalled = self.stalled_in_turn(sm, cs, v_ego, acting, decision, mapd)
     stopped = self.stopped_unheld(sm, cs, v_ego, acting, decision, mapd)
-    if stalled:
+    if withdrawn:
+      plan.controlPrompt, plan.reason = 'cantStartTakeControl', NO_MOVE_REASON
+    elif stalled:
       plan.controlPrompt, plan.reason = 'stalledTakeControl', STALLED_REASON
     elif stopped == STOPPED_NOTE:
       plan.reason = plan.reason or STOPPED_NOTE
@@ -537,7 +556,7 @@ class TurnPilot:
     if not acting:
       plan.state = State.unavailable
       plan.reason = HANDBACK_REASON.get(handback, WAITING_REASON)
-    elif decision.holding:
+    elif decision.holding or withdrawn:
       plan.state = State.holding
     elif not rf.valid:
       plan.state = State.noRoute
@@ -573,7 +592,31 @@ class TurnPilot:
     left = unprotected_turn(maneuver, right_hand_traffic)
     name = self.left_go_profile if left else self.post_go_profile
     self.post_go = PostGo(POST_GO_PROFILES[name], maneuver, distance, turned_deg, right_hand_traffic)
+    self.no_move_limit, self.go_wait_s, self.go_withdrawn = (LEFT_NO_MOVE_S if left else NO_MOVE_S), 0., False
     cloudlog.event("turnpilot.post_go", profile=name, unprotected=left, turned_deg=round(turned_deg, 1), distance=round(distance, 1))
+
+  def no_move(self, sm, cs, v_ego: float, acting: bool, decision) -> bool:
+    """TurnPilot's go is withdrawn: the car not at STANDSTILL_SPEED no_move_limit after it, nothing else holding it (module
+    docstring). Latched until openpilot is disengaged (the driver taking over); read before this frame's go starts a new
+    clock (start_post_go)."""
+    enabled = sm['carControl'].enabled
+    if self.go_withdrawn:
+      self.go_withdrawn = enabled
+      return self.go_withdrawn
+    if self.go_wait_s is None:
+      return False
+    if v_ego >= STANDSTILL_SPEED or not enabled:  # it pulled away, or the driver took over
+      self.go_wait_s = None
+      return False
+    if acting and not decision.should_stop and not decision.holding and not close_lead(sm['modelV2']) and \
+       not cs.gasPressed and not cs.brakePressed:
+      self.go_wait_s += DT_MDL
+    if self.go_wait_s < self.no_move_limit - 1e-6:
+      return False
+    cloudlog.event("turnpilot.go_not_moving", error=True, stood_s=round(self.go_wait_s, 1), limit_s=self.no_move_limit,
+                   turned_deg=round(self.desires.turned_deg, 1))
+    self.go_withdrawn, self.go_wait_s = True, None
+    return True
 
   def stalled_in_turn(self, sm, cs, v_ego: float, acting: bool, decision, mapd) -> bool:
     """The car has stood STALL_PROMPT_S in the turn a hold let go of, with nothing holding it (module docstring): hand
@@ -582,6 +625,7 @@ class TurnPilot:
     in_turn = self.go_id is not None and self.go_id == d.maneuver_id == rf.maneuver_id and \
       STALL_MIN_DEG <= d.turned_deg <= STALL_MAX_DEG
     stalled = acting and in_turn and sm['carControl'].enabled and v_ego < STANDSTILL_SPEED and not decision.should_stop and \
+      not self.go_withdrawn and \
       not decision.holding and not close_lead(sm['modelV2']) and not cs.gasPressed and not cs.brakePressed and \
       mapd.prompt not in TAKE_CONTROL_PROMPTS
     was = self.stall_s > STALL_PROMPT_S
@@ -598,6 +642,7 @@ class TurnPilot:
     near = [c for c in list(self.map_controls.tracker.controls.values()) + [self.map_controls.turn]
             if c is not None and abs(c.d) < STOPPED_CONTROL_M]
     unheld = acting and sm['carControl'].enabled and v_ego < STANDSTILL_SPEED and not decision.should_stop and \
+      not self.go_withdrawn and \
       not decision.holding and not lead and not cs.gasPressed and not cs.brakePressed and mapd.prompt not in TAKE_CONTROL_PROMPTS
     limit = NEAR_CONTROL_STAND_S if near else STOPPED_HANDBACK_S
     was = self.stopped_s >= limit - 1e-6

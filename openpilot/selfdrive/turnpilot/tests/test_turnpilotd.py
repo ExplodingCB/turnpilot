@@ -16,7 +16,8 @@ from openpilot.selfdrive.turnpilot.turn_skip import MIN_FIRST_PULSE_M
 from openpilot.selfdrive.turnpilot.route_follower import Maneuver, classify
 from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP, POST_GO_PROFILES, V_TURN_MIN
 from openpilot.selfdrive.turnpilot.turnpilotd import (CAR_UNKNOWN_REASON, DETECTOR_DEADLINE_S, DETECTOR_START_DEADLINE_S, NO_LONG_REASON,
-                                                       GAS_DISENGAGE_REASON, NEAR_CONTROL_STAND_S, SIGNAL_STOPPED_REASON, STALL_PROMPT_S, STALLED_REASON,
+                                                       GAS_DISENGAGE_REASON, LEFT_NO_MOVE_S, NEAR_CONTROL_STAND_S, NO_MOVE_REASON, NO_MOVE_S,
+                                                       SIGNAL_STOPPED_REASON, STALL_PROMPT_S, STALLED_REASON,
                                                        STOPPED_HANDBACK_S, STOPPED_LEAD_M, STOPPED_NOTE, STOPPED_NOTE_S, STOPPED_REASON,
                                                        TURN_MISSED_REASON, WAITING_REASON, TurnPilot, long_control_for)
 from openpilot.selfdrive.turnpilot.handback import Handback
@@ -2222,3 +2223,55 @@ def test_the_unprotected_left_takes_its_own_post_go_profile():
   assert tp.post_go.profile == POST_GO_PROFILES['graduated']
   tp.start_post_go(t_left, 9., 0., True)
   assert tp.post_go.profile == POST_GO_PROFILES['flat43']
+
+
+def test_no_move_after_the_go_withdraws_it_and_hands_back():
+  """DESIGN section 2/3: the car not at 0.3 m/s NO_MOVE_S (2.0 s) after the go is the model holding it; TurnPilot withdraws
+  the go before the car moves (holds it standing: shouldStop, a 0 speed cap braking no harder than -2.0, no turn pulse)
+  and hands back loudly (cantStartTakeControl, "Can't start the turn: take control"), until the driver takes over."""
+  sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
+  go_from_the_hold(sim)
+  plans = stand(sim, NO_MOVE_S - 0.2)
+  assert all(p.controlPrompt == 'none' and not p.shouldStop for p in plans)
+  p = stand(sim, 0.4)[-1]
+  assert p.controlPrompt == 'cantStartTakeControl' and p.reason == NO_MOVE_REASON == "Can't start the turn: take control"
+  assert p.shouldStop and p.speedCap == 0. and plan_accel(p.accelCap, p.speedCap, 0.3) >= -2.0
+  assert p.desire == Desire.none and p.state == State.holding
+  # held so while engaged, the plan applied: the car stays put, and no other handback replaces it
+  plans = [sim.step(engaged=True) for _ in range(int(10. / DT_MDL))]
+  assert all(p.controlPrompt == 'cantStartTakeControl' and p.shouldStop for p in plans) and sim.v < 0.05
+  # the driver takes over (any gas press disengages): released, and nothing comes back
+  p = sim.step(engaged=False, gas=True)
+  assert p.controlPrompt == 'none' and not p.shouldStop
+  assert all(p.controlPrompt == 'none' and not p.shouldStop for p in [sim.step(engaged=True) for _ in range(int(3. / DT_MDL))])
+
+
+def test_no_move_handback_not_for_a_car_that_pulls_away_late_or_waits_behind_a_lead():
+  # at 0.3 m/s 1.5 s after the go (G0: 50 left at 10 m took 1.95-3.11 s; those hand back): nothing said
+  sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
+  go_from_the_hold(sim)
+  stand(sim, 1.5)
+  plans = [sim.step(engaged=True) for _ in range(int(4. / DT_MDL))]
+  assert sim.v > 0.3 and all(p.controlPrompt == 'none' and not p.shouldStop for p in plans)
+  # stopped again once moving, under 20 deg in (the stall's range): not this handback
+  assert all(p.controlPrompt != 'cantStartTakeControl' for p in stand(sim, 4.))
+  # a lead close ahead holds the car: the go's clock waits for it
+  sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
+  go_from_the_hold(sim)
+  assert all(p.controlPrompt == 'none' for p in stand(sim, NO_MOVE_S + 2., lead_prob=0.9, lead_x=STOPPED_LEAD_M - 5.))
+  assert stand(sim, NO_MOVE_S + 0.2)[-1].controlPrompt == 'cantStartTakeControl'
+
+
+def test_an_unprotected_turns_go_is_withdrawn_after_a_shorter_no_move():
+  """CRITIQUE REQUIRED 4: a go across the oncoming road with no movement is withdrawn at LEFT_NO_MOVE_S (1.0 s), not 2.0:
+  the gap it was certified for runs out while the car stands. Any other turn waits NO_MOVE_S (2.0 s)."""
+  left = Maneuver(*classify("turn", "left"), "turn", "left", 90., geometry=True, opposing='present')
+  t_left = Maneuver(*classify("turn", "left"), "turn", "left", 90., geometry=True, opposing='none')
+  tp = TurnPilot()
+  tp.start_post_go(left, 9., 0., True)
+  assert tp.no_move_limit == LEFT_NO_MOVE_S == 1.0
+  tp.start_post_go(t_left, 9., 0., True)
+  assert tp.no_move_limit == NO_MOVE_S == 2.0
+  tp.left_go_profile = 'graduated'  # the limit goes with the turn, not the profile
+  tp.start_post_go(left, 9., 0., True)
+  assert tp.no_move_limit == LEFT_NO_MOVE_S

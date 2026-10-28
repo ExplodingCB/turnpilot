@@ -53,7 +53,8 @@ def limits_plan(sm, now: float | None = None):
 
 CONTROL_ALERT_FIRST = ('hardBrake', 'cannotStopComfortably', 'offRouteStopsUnknown')  # above too fast to turn
 # handbacks: the car held while the driver is told to take control (map_controls.py, turnpilotd.py), above too fast to turn
-TAKE_CONTROL_PROMPTS = ('stopSignTakeControl', 'unprotectedTurnTakeControl', 'carStoppedTakeControl', 'stalledTakeControl')
+TAKE_CONTROL_PROMPTS = ('stopSignTakeControl', 'unprotectedTurnTakeControl', 'carStoppedTakeControl', 'stalledTakeControl',
+                        'cantStartTakeControl')
 # never sent since gas go went (2026-10-28), kept in the append-only schema: the driver's gas tap as a go, and going on red
 RETIRED_PROMPTS = ('stopSignGo', 'signalGo', 'unprotectedTurnGo', 'carStoppedGo')
 RETIRED_ALERTS = ('goingOnRed',)
@@ -75,7 +76,7 @@ def plan_events(sm, now: float | None = None) -> list[str]:
   2. a fault (turnpilotUnavailable);
   3. a hard brake for a confirmed pedestrian or oncoming vehicle (turnpilotControlAlert, hardBrake), then a handback
      with the car held (turnpilotControlPrompt, TAKE_CONTROL_PROMPTS: a stop sign, an unprotected turn, the car stopped
-     or stalled in a turn), then a map stop it can't make gently (turnpilotControlAlert, cannotStopComfortably: take
+     or stalled in a turn, or not pulling away after TurnPilot's go), then a map stop it can't make gently (turnpilotControlAlert, cannotStopComfortably: take
      control), or off the route with the map stops ahead unknown (offRouteStopsUnknown: the speed capped, take control
      or wait for the reroute);
   4. too fast to turn, or a turn from a standstill missed (turnpilotTooFastToTurn, turnMissed);
@@ -133,6 +134,7 @@ CONTROL_PROMPT_TEXT = {
   'unprotectedTurnTakeControl': 'TurnPilot can\'t judge oncoming traffic',
   'carStoppedTakeControl': 'Nothing ahead is holding the car',
   'stalledTakeControl': 'The car stopped in the turn',
+  'cantStartTakeControl': 'The car didn\'t pull away',
 }
 CONTROL_ALERT_TEXT = {
   'cannotStopComfortably': 'Cannot stop gently for the stop/signal',

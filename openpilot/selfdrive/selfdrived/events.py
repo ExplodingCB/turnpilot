@@ -309,7 +309,8 @@ def turnpilot_too_fast_to_turn_alert(CP: car.CarParams, CS: car.CarState, sm: me
 
 CONTROL_PROMPT_TITLE = {'yieldAhead': "Yield Ahead", 'stopSignTakeControl': "Stop Sign: Take Control",
                         'unprotectedTurnTakeControl': "Unprotected Turn: Take Control",
-                        'carStoppedTakeControl': "Car Stopped: Take Control", 'stalledTakeControl': "Stalled: Take Control"}
+                        'carStoppedTakeControl': "Car Stopped: Take Control", 'stalledTakeControl': "Stalled: Take Control",
+                        'cantStartTakeControl': "Can't Start Turn: Take Control"}
 CONTROL_ALERT_TITLE = {'cannotStopComfortably': "Take Control", 'stopOverrun': "Stop Line Passed",
                        'proceedingOnYellow': "Proceeding on Yellow",
                        'mapControlsUnavailable': "Map Stops Unavailable", 'lightSourceRejected': "Light Source Rejected",

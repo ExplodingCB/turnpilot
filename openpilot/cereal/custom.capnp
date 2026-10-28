@@ -161,6 +161,8 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     unprotectedTurnTakeControl @7;  # held at an unprotected turn's hold line: no gap judgement yet, take control
     carStoppedTakeControl @8;       # standing engaged with nothing of TurnPilot's holding it (turnpilotd.py: stopped_unheld)
     stalledTakeControl @9;          # standing in the turn after its go (turnpilotd.py: stalled_in_turn)
+    cantStartTakeControl @10;       # not moving NO_MOVE_S after TurnPilot's go from a standstill: the go is withdrawn
+                                    # (held standing) and handed back (turnpilotd.py: no_move)
   }
   enum ControlAlert {
     none @0;

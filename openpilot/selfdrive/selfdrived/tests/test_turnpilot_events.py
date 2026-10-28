@@ -199,8 +199,16 @@ def test_a_hard_brake_for_a_confirmed_pedestrian_is_raised_first_with_the_handba
 def test_take_control_prompts_are_loud_and_outrank_a_skip():
   from openpilot.selfdrive.turnpilot.hooks import plan_events
   for prompt, title in (('stopSignTakeControl', 'Stop sign: take control to proceed'),
-                        ('unprotectedTurnTakeControl', 'Unprotected left: take control')):
+                        ('unprotectedTurnTakeControl', 'Unprotected left: take control'),
+                        ('cantStartTakeControl', "Can't start the turn: take control")):
     a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt=prompt, reason=title)))
     assert a.alert_text_1 == title and a.audible_alert == AudibleAlert.tpHandback
     assert a.visual_alert == VisualAlert.steerRequired and 'accelerator' not in a.alert_text_2
     assert plan_events(FakeSM(plan(controlPrompt=prompt, tooFastToTurn=True))) == ['turnpilotControlPrompt']
+
+
+def test_a_go_the_car_never_moved_on_hands_back_loudly():
+  # turnpilotd's no-move handback (G3): the car didn't pull away after TurnPilot's go, which is withdrawn
+  a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt='cantStartTakeControl')))
+  assert a.alert_text_1 == "Can't Start Turn: Take Control" and a.alert_text_2 == "The car didn't pull away"
+  assert a.audible_alert == AudibleAlert.tpHandback and a.visual_alert == VisualAlert.steerRequired
