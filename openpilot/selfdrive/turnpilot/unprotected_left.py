@@ -79,7 +79,7 @@ BAND_TOL_DEG = 2.          # the band's near edge widens with range by this (hea
 CLEAR_WINDOW_S = 2.5       # the band clear on road runs this long (CRITIQUE REQUIRED 2: 2-3 s, 3x the longest dropout)
 ROAD_FRESH_S = 0.3         # road runs further apart than this start the window over
 STALE_UNDECIDED_S = 2.     # no road run this long while waiting: a fault
-YAW_UNDECIDED_DEG = 15.    # standing yawed further into the turn: the road camera isn't up the oncoming approach
+YAW_UNDECIDED_DEG = 15.    # standing yawed further either way (after a withdrawn go): the road camera isn't up the oncoming approach
 
 STAND_SPEED = 1.           # m/s: a velocity-trusted track slower than this stands
 OCCLUDER_PAST_M = 30.      # an occluder stands within this past the maneuver point...
@@ -120,7 +120,7 @@ class LeftInput:
   held: bool               # the hold line's latch has the car (map_controls)
   raw: RawFrame | None     # a detector run that arrived this frame, None if none did
   objects: list            # the scene's tracks (TurnpilotScene.TrackedObject), car frame
-  heading_deg: float       # the car's heading change toward the turn since its approach (turnpilotd.track_yaw)
+  heading_deg: float       # the car's heading change toward the turn since its first pulse, moving (turnpilotd.track_yaw)
   v_limit: float | None    # m/s, the opposing road's mapped limit, None unknown
   opposing_lanes: int | None
   range_m: float = ROAD_RANGE_M
@@ -373,7 +373,7 @@ class UnprotectedLeft:
       return self._undecided(out, 'position')
     if self.road_age > STALE_UNDECIDED_S:
       return self._undecided(out, 'stale')
-    if inp.heading_deg > YAW_UNDECIDED_DEG:
+    if abs(inp.heading_deg) > YAW_UNDECIDED_DEG:
       return self._undecided(out, 'yaw')
 
     if inp.mode == ANNOUNCE:

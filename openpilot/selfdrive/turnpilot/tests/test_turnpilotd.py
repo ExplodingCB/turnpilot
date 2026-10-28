@@ -1575,13 +1575,14 @@ def test_unprotected_left_stops_before_the_hold_line_and_hands_back():
 
 def test_the_oncoming_hold_counts_a_car_up_the_road_with_the_car_yawed_into_the_left():
   # DESIGN phase 4 section 2 (the road-frame band): the car stands at its hold line 30 deg into the left (yawed there on the
-  # approach); an oncoming car 50 m up the road is 22 m to its right in its own frame. turnpilotd turns the scene back by
-  # the car's heading change toward the turn since TURN_DESIRE_LEAD_M, so it still holds
+  # approach by its pulse); an oncoming car 50 m up the road is 22 m to its right in its own frame. turnpilotd turns the
+  # scene back by the car's heading change toward the turn since its desire went out, so it still holds
   sim = Sim(TURNS_AHEAD)
   sim.go_taps = False
-  while sim.distance() > TURN_DESIRE_LEAD_M + 5.:
+  while not sim.tp.desires.started:
     sim.step()
-  yaw_rate = math.radians(30.) / (sim.distance() / sim.v)  # 30 deg left by the junction at this speed
+  assert sim.distance() <= TURN_DESIRE_LEAD_M + 1.
+  yaw_rate = math.radians(30.) / ((sim.distance() - HOLD_LINE_M) / sim.v)  # 30 deg left by the hold line at this speed
   while sim.v > 0.05 or sim.distance() > HOLD_LINE_M + 5.:
     sim.step(yaw_rate=yaw_rate if sim.tp.approach_yaw_deg < 30. else 0.)
   assert abs(sim.tp.approach_yaw_deg - 30.) < 1.

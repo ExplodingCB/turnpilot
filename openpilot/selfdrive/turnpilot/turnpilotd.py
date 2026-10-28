@@ -112,7 +112,7 @@ from openpilot.common.params import Params, UnknownKeyName
 from openpilot.common.realtime import DT_MDL, Ratekeeper
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
-from openpilot.selfdrive.turnpilot.desire_timing import ENTRY_M, TURN_DESIRE_LEAD_M, TURN_STARTED_DEG, DesireTiming
+from openpilot.selfdrive.turnpilot.desire_timing import ENTRY_M, TURN_STARTED_DEG, DesireTiming
 from openpilot.selfdrive.turnpilot.control_text import STOPPED_NOTE
 from openpilot.selfdrive.turnpilot.handback import Handback
 from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, CLEAR_DESIRE, CONTROL_STATUS_ALERTS, TAKE_CONTROL_PROMPTS
@@ -200,9 +200,11 @@ NO_MOVE_REASON = "Can't start the turn: take control"
 GO_LINE_M = HOLD_LINE_M + MAP_MARGIN_M - LATCH_PAST_M
 LEFT_RANGE_MAX_M = 400.  # TurnPilotLeftRangeM is clamped to 0..this
 LEFT_HOLDS_PULSE = ('approach', 'waitGap', 'creep', 'undecided', 'announce')  # the left's states with no turn pulse yet
-# the junction rules' road frame (scene_policy.road_frame): the car's heading change toward its turn, counted from this far
-# out (the road is taken as straight over its last TURN_DESIRE_LEAD_M, where the turn's first pulse would go)
-YAW_FROM_M = TURN_DESIRE_LEAD_M
+# the junction rules' road frame (scene_policy.road_frame): the car's heading change toward its turn, counted only once the
+# turn's desire has gone out (before it the model follows its lane: its yaw is the road's bend, not the car turning; skeptic
+# G4: a 6 deg bend away from the turn over the last 40 m turned the band off the oncoming lane), and only moving (a standing
+# car doesn't yaw; a biased yaw rate over minutes at the line would)
+YAW_MIN_SPEED = STANDSTILL_SPEED
 
 
 def close_lead(model) -> bool:
@@ -291,7 +293,7 @@ class TurnPilot:
       self.go_wait_s: float | None = None  # s stood since TurnPilot's go, nothing else holding the car; None: moved, or no go
       self.go_withdrawn = False            # the go withdrawn: the car held standing, handed back (cantStartTakeControl)
       self.go_in_junction = False          # the go came with the car in the junction (go_at_line): never withdrawn
-      self.approach_yaw_deg = 0.           # the car's heading change toward the route's turn from YAW_FROM_M out (track_yaw)
+      self.approach_yaw_deg = 0.           # the car's heading change toward the route's turn since its first pulse (track_yaw)
       self._yaw_id: int | None = None      # ...for this maneuver
     else:
       self.desires.hold_off()  # the disabled plan dropped the desire: as on re-engaging, a fresh pulse only before the turn
@@ -452,7 +454,7 @@ class TurnPilot:
       self._take_up_dropped(upcoming, rf, v_ego, right_hand_traffic)
     self.acting = acting
     self.check_missed(rf, v_ego, acting)
-    self.track_yaw(upcoming, rf, default_yaw_rate(cs, model))
+    self.track_yaw(upcoming, rf, default_yaw_rate(cs, model), v_ego)
 
     # the map's stop signs and signals: every frame, whatever the maneuver (a skipped turn keeps its stop). And the route's
     # unprotected turn while TurnPilot drives it: not skipped (too fast: skipped out loud and rerouted, never braked for at
@@ -679,14 +681,19 @@ class TurnPilot:
     if d.alert != 'none' and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS:
       plan.controlAlert = d.alert
 
-  def track_yaw(self, maneuver, rf, yaw_rate: float) -> None:
-    """approach_yaw_deg: how far the car has turned toward the route's turn since it came within YAW_FROM_M of it, for the
-    junction rules' road frame (scene_policy.road_frame). Any turn the car yawed into on its approach (pulsed early,
-    standing at its hold line 30-45 deg in) or creeping, before its desire went out or with none."""
-    if maneuver is None or maneuver.kind != TURN or rf.maneuver_id != self._yaw_id or (rf.distance > YAW_FROM_M and not rf.passed):
+  def track_yaw(self, maneuver, rf, yaw_rate: float, v_ego: float) -> None:
+    """approach_yaw_deg: how far the car has turned toward the route's turn since the turn's desire first went out for it,
+    for the junction rules' road frame (scene_policy.road_frame): a turn pulsed on the approach that left the car standing
+    at its hold line 30-45 deg in, or the autonomous left's from its go (its first pulse). Before the desire the model
+    follows its lane, so the car stands aligned with it and the yaw read meanwhile is the road's bend: never counted (the
+    band would turn off the oncoming lane). Counted only moving (YAW_MIN_SPEED). Last frame's desire state."""
+    d = self.desires
+    pulsed = d.maneuver_id == rf.maneuver_id and d.started
+    if maneuver is None or maneuver.kind != TURN or rf.maneuver_id != self._yaw_id or not pulsed:
       self._yaw_id, self.approach_yaw_deg = rf.maneuver_id, 0.
       return
-    self.approach_yaw_deg += math.degrees(yaw_rate * DT_MDL) * maneuver.side
+    if v_ego >= YAW_MIN_SPEED:
+      self.approach_yaw_deg += math.degrees(yaw_rate * DT_MDL) * maneuver.side
 
   def go_at_line(self, distance: float) -> bool:
     """A go from the car standing at or short of the route's junction's hold line, distance (the follower's) GO_LINE_M or

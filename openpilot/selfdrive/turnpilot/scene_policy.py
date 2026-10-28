@@ -295,7 +295,7 @@ class RoadFrame:
 
 
 def road_frame(objects, heading_deg: float, side: int) -> list:
-  """objects in the road's frame, for a car that has turned heading_deg toward side (LEFT positive) since its approach: the
+  """objects in the road's frame, for a car that has turned heading_deg toward side (LEFT positive) since its turn's first pulse: the
   oncoming lanes are the road's, whichever way the car stands (DESIGN phase 4 section 2: standing 30 deg into a left, an
   oncoming car 50 m up the road is 22 m to the car's right)."""
   a = math.radians(heading_deg) * side
@@ -307,7 +307,7 @@ def junction_stops(objects, maneuver, distance, v_ego, right_hand_traffic, is_wa
   """Holds at the hold line before a turn: the crosswalk of a curb-side turn, oncoming traffic across a far-side one.
   may_leave: whether a walker's velocity is trusted to let it go when it is leaving the crosswalk; may_harden: whether a
   walker's or an oncoming vehicle's track is confirmed, to brake harder than the curve for it. heading_deg: the car's
-  heading change toward the turn since its approach; the oncoming band is the road's frame (road_frame)."""
+  heading change toward the turn since its first pulse (turnpilotd.track_yaw); the oncoming band is the road's frame (road_frame)."""
   far_side = far_side_turn(maneuver, right_hand_traffic)
   if not hold_line_stop(maneuver, distance, v_ego, "", far_side):
     return []
@@ -353,7 +353,7 @@ def scene_policy(objects, available: bool, maneuver, distance: float, v_ego: flo
                  right_hand_traffic: bool = True, heading_deg: float = 0.) -> SceneDecision:
   """One frame on its own: evidence from this frame's tracks alone, no ramp, no gas release, nothing carried through a
   gap. objects: tracked objects (ignored when not available); maneuver: RouteFollower.upcoming or None; heading_deg: the
-  car's heading change toward its turn since the approach (junction_stops)."""
+  car's heading change toward its turn since its first pulse (junction_stops)."""
   objects = list(objects) if available else []
   stops = pedestrian_stops(objects, v_ego) + junction_stops(objects, maneuver, distance, v_ego, right_hand_traffic,
                                                             heading_deg=heading_deg)

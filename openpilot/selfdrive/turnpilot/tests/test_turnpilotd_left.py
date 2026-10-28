@@ -249,3 +249,55 @@ def test_a_left_the_detector_cant_see_far_enough_for_is_skipped_at_route_time():
   sim = Sim([(600., "turn", "left", (0., 270., 2, 'present', 20.1, 1)), (2000., "turn", "right", junction_of("right"))])
   sim.tp.auto_left, sim.go_taps = 'off', False
   assert not any(p.tooFastToTurn for p in drive(sim, 5.))
+
+
+def bend_run(bend_deg, standstill_yaw=0.):
+  """LEFT_25 with the road bending bend_deg (positive toward the turn) over the car's last 40 to 12 m, the car following its
+  lane there (no pulse before its line: the yaw is the road's), and one oncoming car at the limit timed to be 110-130 m out
+  as the car stands at its line, in the oncoming lane straight ahead of the car as it stands there. standstill_yaw: rad/s
+  of yaw rate read while the car stands (a biased model or gyro). (sim, plans, the oncoming car's m from the car at the go)"""
+  frame = [0]
+
+  def onc_s(sim):
+    return JUNCTION + 420. - V_25 * sim.t
+
+  def raw(sim):
+    frame[0] += 1
+    if frame[0] % 2:
+      return None
+    s = onc_s(sim)
+    return RawFrame([raw_box(s - sim.s, 3.6)] if -5. < s - sim.s < 400. else [], 'road', sim.t)
+  sim = left_sim()
+  sim.raw = raw
+  plans = []
+  while sim.t < 90.:
+    d = JUNCTION - sim.s
+    yaw = math.radians(bend_deg) / (28. / sim.v) if 12. < d < 40. and sim.v > 0.5 else 0.
+    if sim.v < 0.05:
+      yaw = standstill_yaw
+    turning = sim.tp.desires.started and abs(JUNCTION - sim.s) < 12. and sim.v > 0.3
+    plans.append(sim.step(engaged=True, yaw_rate=sim.v / 8. if turning else yaw))
+    if plans[-1].desire == Desire.turnLeft:
+      break
+  return sim, plans, onc_s(sim) - sim.s
+
+
+def test_a_bend_before_the_junction_is_the_road_not_the_car_turning():
+  # skeptic G4 B1: the road bends 6 deg away from the turn over the car's last 40 m (a 270 m radius); the car follows its lane
+  # and stands aligned with it at the line, the oncoming lane straight up the road ahead of it. Counted as the car turning,
+  # that yaw turned the band away from the oncoming lane and the car went with a car 74 m out (6.6 s against a T_req of
+  # 8.3 s). Before the turn's desire goes out the model follows its lane, so its yaw is the road's: the band is turned only
+  # by the car's turn since its first pulse (the go, for the autonomous left)
+  for bend_deg in (-6., 6.):
+    sim, plans, onc = bend_run(bend_deg)
+    assert plans[-1].desire == Desire.turnLeft, bend_deg
+    assert onc < 0. or onc > plans[-1].unprotectedLeft.rReq, f"bend {bend_deg}: went with an oncoming car {onc:.0f} m out"
+    assert sim.tp.approach_yaw_deg == 0.  # nothing counted before the go
+
+
+def test_a_standing_car_never_counts_yaw():
+  # a model or gyro yaw-rate bias read while the car stands (minutes at its line after a withdrawn go) is no turn
+  sim, plans, _ = bend_run(0., standstill_yaw=math.radians(0.5))
+  assert plans[-1].desire == Desire.turnLeft and sim.tp.approach_yaw_deg == 0.
+  plans = drive(sim, 0.5)  # moving on the go, turning at the sim's 8 m radius: counted
+  assert sim.tp.approach_yaw_deg > 0.
