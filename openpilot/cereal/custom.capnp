@@ -167,6 +167,8 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
                                 # its hold line is at the nearest of them, so the car may stop early (route_follower.py)
     offRouteStopsUnknown @8;    # off the route, the map stops ahead of the car couldn't be looked up (navd's
                                 # offRouteControlsStatus not ok): the speed is capped, take control or wait for the reroute
+    hardBrake @9;               # braking harder than -2.0 m/s^2 for a confirmed in-path pedestrian or oncoming vehicle
+                                # (scene_policy.py), while it lasts; logged with its evidence (turnpilot.hard_brake)
   }
   mapControl @24 :MapControlStatus;
   controlPrompt @25 :ControlPrompt;

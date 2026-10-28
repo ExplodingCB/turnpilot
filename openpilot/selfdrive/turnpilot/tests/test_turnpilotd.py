@@ -2004,3 +2004,19 @@ def test_a_shallow_turn_taken_from_a_stop_sign_is_not_called_missed():
     assert yawed >= angle and not any(p.turnMissed for p in plans), angle
   plans, _ = run(15., False)  # straight on past it: missed
   assert any(p.turnMissed for p in plans)
+
+
+def test_a_hard_brake_is_raised_only_for_a_confirmed_pedestrian():
+  # one detector frame of a pedestrian 10 m ahead at 10 m/s: braked for on the curve, no hard brake raised; a confirmed
+  # one 10 m ahead: braked hard, and the plan says so (controlAlert hardBrake)
+  sim = Sim([(2000., "turn", "right")], cruise=10.)
+  sim.v = 10.
+  plans = [sim.step(objects=[{'cls': 'pedestrian', 'x': 10., 'y': 0., 'inPath': True, 'age': 2, 'conf': 0.95}])]
+  plans += [sim.step() for _ in range(20)]
+  assert all(plan_accel(p.accelCap, p.speedCap, 10.) >= -2. - 1e-6 and p.controlAlert != 'hardBrake' for p in plans)
+  sim = Sim([(2000., "turn", "right")], cruise=10.)
+  sim.v = 10.
+  plans = [sim.step(objects=[{'cls': 'pedestrian', 'x': 10. - 0.5 * k, 'y': 0., 'inPath': True, 'age': 5 + k, 'conf': 0.9}])
+           for k in range(6)]
+  assert plans[-1].controlAlert == 'hardBrake' and plans[-1].reason == "pedestrian in path"
+  assert plan_accel(plans[-1].accelCap, plans[-1].speedCap, 10.) < -2.

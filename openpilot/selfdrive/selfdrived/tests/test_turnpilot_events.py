@@ -197,3 +197,11 @@ def test_cannot_stop_outranks_and_the_prompt_chimes_once():
   assert a.alert_type == 'turnpilotControlPrompt/warning'
   # once the take-control alert's own short hold is over, one prompt alert held up: soundd plays its one-shot sound once
   assert all(s == AudibleAlert.prompt for s in sounds[20:])
+
+
+def test_a_hard_brake_for_a_confirmed_pedestrian_is_raised_first_with_the_handback_chime():
+  a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='hardBrake', reason='pedestrian in path')))
+  assert a.alert_text_1 == 'Braking Hard' and a.alert_text_2 == 'pedestrian in path'
+  assert a.audible_alert == AudibleAlert.tpHandback and a.visual_alert == VisualAlert.fcw
+  from openpilot.selfdrive.turnpilot.hooks import plan_events
+  assert plan_events(FakeSM(plan(controlAlert='hardBrake', tooFastToTurn=True))) == ['turnpilotControlAlert']

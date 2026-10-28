@@ -39,13 +39,24 @@ set by the tracker, age its hits. If a tracker publishes velocity relative to th
 reads as oncoming and the junction hold is conservative, not missed. Nor is a new track's vx trusted for the oncoming
 hold: until VEL_TRUST_HITS a vehicle in the oncoming lanes is taken as coming at ONCOMING_ASSUMED_SPEED, and held for on
 the comfortable curve only: a parked car or a ghost of a few frames never brakes the car hard.
+
+Hard braking (Kellen, 2026-10-28: confirmed in-path pedestrian and oncoming stops may brake as hard as they need, "but be
+careful, phantom emergency braking is really dangerous"). Only these stops ever ask for more than -2.0 m/s^2, the floor
+of every map, light and speed-cap stop, and only from a confirmed track: CONFIRM_HITS matched detections at CONFIRM_CONF
+or more, or CONFIRM_STEADY_HITS at any (a track starts only at the tracker's NEW_TRACK_CONF), ranged (the tracker
+publishes only tracks with a ground position), in the path (in_path), or for the oncoming hold also VEL_TRUST_HITS so
+its motion is the tracker's, not range noise. A track the tracker published for one detector frame (MIN_HITS) or a
+few never does: its stop brakes on the comfortable curve (no accel cap, a speed cap no lower than STOP_DECEL takes).
+Every hard brake is logged at its start with the track's evidence (turnpilot.hard_brake) and is raised to the driver
+(SceneDecision.hard_brake: turnpilotd's controlAlert hardBrake).
 """
 import math
 from collections import deque
 from dataclasses import dataclass, field
 
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_TAU, plan_accel
+from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_ACCEL_MIN, SPEED_CAP_TAU, plan_accel
 from openpilot.selfdrive.turnpilot.route_follower import LEFT, TURN
 from openpilot.selfdrive.turnpilot.scene.tracker import CLOSE_HOLD_S, MAX_AGE_S
 from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP
@@ -125,6 +136,8 @@ class SceneDecision:
   should_stop: bool = False
   holding: bool = False   # the limits bite now
   reason: str = ""
+  hard_brake: bool = False  # the accel cap asks for more than SPEED_CAP_ACCEL_MIN: a confirmed track's hard stop
+  evidence: dict | None = None  # ...the track it is for (Stop.evidence)
 
 
 @dataclass
@@ -136,6 +149,7 @@ class Stop:
   d_stop: float = 0.      # where it was, for ScenePolicy to carry it while the scene is gone
   v_lead: float = 0.
   confirmed: bool = True
+  evidence: dict | None = None  # the track it is for (track_evidence()), logged with a hard brake
 
 
 def stop_command(v_ego: float, d_stop: float) -> tuple[float, float, bool]:
@@ -147,14 +161,21 @@ def stop_command(v_ego: float, d_stop: float) -> tuple[float, float, bool]:
   return accel_cap, speed_cap, v_ego < STOP_SPEED and d < STOP_NEAR_M
 
 
-def stop(v_ego: float, d_stop: float, reason: str, confirmed: bool = True, v_lead: float = 0.) -> Stop:
+def track_evidence(obj) -> dict:
+  """What a stop for this track rests on, for the log of a hard brake."""
+  return {'track_id': int(obj.trackId), 'cls': str(obj.cls), 'camera': str(obj.camera), 'hits': int(obj.age),
+          'conf': round(float(obj.conf), 3), 'x': round(float(obj.x), 2), 'y': round(float(obj.y), 2),
+          'vx': round(float(obj.vx), 2), 'vy': round(float(obj.vy), 2), 'in_path': bool(obj.inPath)}
+
+
+def stop(v_ego: float, d_stop: float, reason: str, confirmed: bool = True, v_lead: float = 0., evidence: dict | None = None) -> Stop:
   """A stop point d_stop m ahead, moving away at v_lead (then the car only has to slow to v_lead by there). Unconfirmed,
   it brakes no harder than the curve: no accel cap, and a speed cap no further below v_ego than STOP_DECEL takes."""
   accel_cap, speed_cap, should_stop = stop_command(max(v_ego - v_lead, 0.), d_stop)
   speed_cap += v_lead
   if not confirmed and accel_cap < NO_ACCEL_CAP:
     accel_cap, speed_cap = NO_ACCEL_CAP, max(speed_cap, v_ego - STOP_DECEL * SPEED_CAP_TAU)
-  return Stop(accel_cap, speed_cap, should_stop and v_lead <= 0., reason, d_stop, v_lead, confirmed)
+  return Stop(accel_cap, speed_cap, should_stop and v_lead <= 0., reason, d_stop, v_lead, confirmed, evidence)
 
 
 def velocity_trusted(obj) -> bool:
@@ -202,9 +223,10 @@ def pedestrian_stops(objects, v_ego: float, is_confirmed=confirmed_track) -> lis
     if str(obj.cls) != "pedestrian" or obj.x <= 0. or not in_path(obj) or is_rider(obj, objects, is_confirmed):
       continue
     if obj.vx > MOVING_PED_VX and is_confirmed(obj):
-      stops.append(stop(v_ego, obj.x - PED_STOP_GAP_M - obj.vx * FOLLOW_GAP_S, "following pedestrian", is_confirmed(obj), obj.vx))
+      stops.append(stop(v_ego, obj.x - PED_STOP_GAP_M - obj.vx * FOLLOW_GAP_S, "following pedestrian", is_confirmed(obj), obj.vx,
+                        track_evidence(obj)))
     else:
-      stops.append(stop(v_ego, obj.x - PED_STOP_GAP_M, "pedestrian in path", is_confirmed(obj)))
+      stops.append(stop(v_ego, obj.x - PED_STOP_GAP_M, "pedestrian in path", is_confirmed(obj), evidence=track_evidence(obj)))
   return stops
 
 
@@ -219,7 +241,8 @@ def committed_past_line(distance: float, v_ego: float, far_side: bool) -> bool:
   return distance < ONCOMING_ENTRY_M or v_ego ** 2 / (2. * STOP_DECEL) > distance - ONCOMING_ENTRY_M
 
 
-def hold_line_stop(maneuver, distance, v_ego, reason: str, far_side: bool = False, confirmed: bool = True) -> list[Stop]:
+def hold_line_stop(maneuver, distance, v_ego, reason: str, far_side: bool = False, confirmed: bool = True,
+                   evidence: dict | None = None) -> list[Stop]:
   """A stop at the hold line before a turn, while the junction rules apply. Past it and not committed, a far-side turn
   stops where the comfortable curve can (standing, where it is), which is short of the oncoming lanes: never a hard stop
   in the junction, never creeping on toward them. confirmed: as stop()'s, the evidence for it earned a hard stop."""
@@ -232,7 +255,7 @@ def hold_line_stop(maneuver, distance, v_ego, reason: str, far_side: bool = Fals
     d_hold = v_ego ** 2 / (2. * STOP_DECEL)
   if d_hold > v_ego ** 2 / (2. * STOP_DECEL) + HOLD_ENGAGE_MARGIN_M:
     return []
-  return [stop(v_ego, d_hold, reason, confirmed)]
+  return [stop(v_ego, d_hold, reason, confirmed, evidence=evidence)]
 
 
 def far_side_turn(maneuver, right_hand_traffic: bool) -> bool:
@@ -275,7 +298,7 @@ def junction_stops(objects, maneuver, distance, v_ego, right_hand_traffic, is_wa
        obj.x > distance - ONCOMING_PAST_M and toward > ONCOMING_MIN_SPEED and \
        max(obj.x - distance, 0.) / toward < ONCOMING_TTA_S:
       hard = trusted and may_harden(obj)
-      holds = hold_line_stop(maneuver, distance, v_ego, "waiting for oncoming", far_side, hard)
+      holds = hold_line_stop(maneuver, distance, v_ego, "waiting for oncoming", far_side, hard, track_evidence(obj))
       if hard:
         return holds
   return holds
@@ -326,6 +349,7 @@ class ScenePolicy:
     self.junction: Stop | None = None    # the junction hold in force on the last frame
     self.fault_junction: Stop | None = None  # ...kept through a fault, which lost the route it was for
     self.fault_open = False  # a fault lost the route with the car committed to (or released into) its junction
+    self.hard = False  # the last frame braked harder than SPEED_CAP_ACCEL_MIN (hard_brake())
 
   def fault(self, maneuver_id: int | None = None) -> None:
     """turnpilotd faulted and dropped the route (maneuver_id: its maneuver): the junction hold in force stays where it
@@ -345,7 +369,7 @@ class ScenePolicy:
     if route_back or committed or d_stop < -(HOLD_LINE_M + TURN_ZONE_PAST_M) or (gas_pressed and d_stop < GAS_RELEASE_M):
       self.fault_junction = None
       return []
-    self.fault_junction = stop(v_ego, d_stop, h.reason, h.confirmed)
+    self.fault_junction = stop(v_ego, d_stop, h.reason, h.confirmed, evidence=h.evidence)
     return [self.fault_junction]
 
   def update(self, objects, available: bool, maneuver, distance: float, v_ego: float, right_hand_traffic: bool = True,
@@ -373,7 +397,7 @@ class ScenePolicy:
       self.carried_junction = (maneuver_id, junction[0].reason) if junction else None
     else:
       # no evidence either way: keep what was in force, the pedestrians where they were relative to the road
-      self.carried = [stop(v_ego, s.d_stop - (v_ego - s.v_lead) * dt, s.reason, s.confirmed, s.v_lead) for s in self.carried]
+      self.carried = [stop(v_ego, s.d_stop - (v_ego - s.v_lead) * dt, s.reason, s.confirmed, s.v_lead, s.evidence) for s in self.carried]
       peds = self.carried
       junction = []
       if self.carried_junction is not None and self.carried_junction[0] == maneuver_id:
@@ -391,9 +415,24 @@ class ScenePolicy:
     if maneuver_id is not None and maneuver_id in (self.released_id, self.committed_id):
       junction = []
     self.junction = junction[0] if junction else None
-    decision = decide(peds + junction + self._fault_hold(available, maneuver, distance, v_ego, gas_pressed, dt) + list(extra_stops), v_ego)
+    stops = peds + junction + self._fault_hold(available, maneuver, distance, v_ego, gas_pressed, dt) + list(extra_stops)
+    decision = decide(stops, v_ego)
     decision.accel_cap = self.ramp(decision.accel_cap, dt)
+    self.hard_brake(decision, stops, v_ego)
     return decision
+
+  def hard_brake(self, decision: SceneDecision, stops: list[Stop], v_ego: float) -> None:
+    """decision.hard_brake while its accel cap asks for more than SPEED_CAP_ACCEL_MIN, with the evidence of the stop that
+    asks for the most; logged once at its start (module docstring)."""
+    hard = decision.accel_cap < SPEED_CAP_ACCEL_MIN
+    if hard:
+      worst = min(stops, key=lambda s: s.accel_cap)
+      decision.hard_brake, decision.evidence = True, worst.evidence
+      if not self.hard:
+        cloudlog.event("turnpilot.hard_brake", error=True, reason=worst.reason, accel_cap=round(decision.accel_cap, 2),
+                       need=round(worst.accel_cap, 2), v_ego=round(v_ego, 2), d_stop=round(worst.d_stop, 2),
+                       confirmed=worst.confirmed, **(worst.evidence or {}))
+    self.hard = hard
 
   def update_evidence(self, objects) -> None:
     """This frame's tracks into their evidence. A track missing from this frame keeps its evidence for KEEP_EVIDENCE_S:

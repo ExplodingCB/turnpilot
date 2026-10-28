@@ -312,7 +312,8 @@ CONTROL_PROMPT_TITLE = {'stopSignGo': "Stop Sign", 'signalGo': "Signal Ahead", '
 CONTROL_ALERT_TITLE = {'cannotStopComfortably': "Take Control", 'stopOverrun': "Stop Line Passed",
                        'proceedingOnYellow': "Proceeding on Yellow", 'goingOnRed': "Going on Red",
                        'mapControlsUnavailable': "Map Stops Unavailable", 'lightSourceRejected': "Light Source Rejected",
-                       'junctionUncertain': "Junction Position Uncertain", 'offRouteStopsUnknown': "Off Route"}
+                       'junctionUncertain': "Junction Position Uncertain", 'offRouteStopsUnknown': "Off Route",
+                       'hardBrake': "Braking Hard"}
 TURNPILOT_CONTROL_ALERT_S = 3.  # an overrun, a yellow or a red go is held up this long
 
 
@@ -336,6 +337,9 @@ def turnpilot_control_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.S
     return Alert("TAKE CONTROL", "TurnPilot stopped responding while holding the car", AlertStatus.critical, AlertSize.mid,
                  Priority.MID, VisualAlert.steerRequired, AudibleAlert.tpHandback, .1)
   kind = str(plan.controlAlert)
+  if kind == 'hardBrake':  # a confirmed track's hard stop (scene_policy.py), while it lasts: what it is for, loud
+    return Alert(CONTROL_ALERT_TITLE[kind], plan.reason or CONTROL_ALERT_TEXT[kind], AlertStatus.critical, AlertSize.mid,
+                 Priority.MID, VisualAlert.fcw, AudibleAlert.tpHandback, .1)
   if kind == 'cannotStopComfortably':
     return Alert(CONTROL_ALERT_TITLE[kind], CONTROL_ALERT_TEXT[kind], AlertStatus.critical, AlertSize.mid, Priority.MID,
                  VisualAlert.steerRequired, AudibleAlert.tpHandback, .1)

@@ -475,6 +475,8 @@ class TurnPilot:
     plan.reason = decision.reason or (TURN_MISSED_REASON if plan.turnMissed else "") or lane_reason or mapd.reason or \
       (NO_JUNCTION_DATA_REASON if no_junction_data else "")
     fill_map_control(plan, mapd)
+    if decision.hard_brake:  # a confirmed track's hard stop outranks the map's alerts (scene_policy.py)
+      plan.controlAlert = 'hardBrake'
     stalled = self.stalled_in_turn(sm, cs, v_ego, acting, decision, mapd)
     if self.stopped_unheld(sm, cs, v_ego, acting, decision, mapd) or stalled:
       plan.controlPrompt, plan.reason = 'carStoppedGo', STALLED_REASON if stalled else STOPPED_REASON

@@ -1,7 +1,9 @@
+from unittest import mock
+
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.turnpilot.hooks import plan_accel
+from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_ACCEL_MIN as MAP_DECEL_MAX, plan_accel
 from openpilot.selfdrive.turnpilot.route_follower import NOMINAL_ANGLE_DEG, Maneuver, classify
-from openpilot.selfdrive.turnpilot.scene_policy import (ACCEL_CAP_JERK, COMMIT_SPEED, CROSSWALK_LEAVING_FRAMES, GAS_RELEASE_M, HOLD_LINE_M,
+from openpilot.selfdrive.turnpilot.scene_policy import (ACCEL_CAP_JERK, COMMIT_SPEED, CONFIRM_HITS, CROSSWALK_LEAVING_FRAMES, GAS_RELEASE_M, HOLD_LINE_M,
                                                         NO_ACCEL_CAP, NO_SPEED_CAP, ONCOMING_ASSUMED_SPEED, ONCOMING_ENTRY_M, ONCOMING_TTA_S,
                                                         PED_STOP_GAP_M, STOP_DECEL, VEL_TRUST_HITS, ScenePolicy, scene_policy)
 from openpilot.selfdrive.turnpilot.tests.synthetic import scene
@@ -474,3 +476,61 @@ def test_an_untrusted_track_in_the_oncoming_lanes_never_brakes_harder_than_the_c
   # a trusted one closing fast still gets the hard stop it needs
   d = policy([car(31., 5., vx=-12., age=VEL_TRUST_HITS)], maneuver=LEFT_TURN, distance=11., v_ego=4.46)
   assert d.holding and d.accel_cap < -STOP_DECEL
+
+
+# --- hard braking needs a confirmed detection (Kellen, 2026-10-28: "phantom emergency braking is really dangerous") ---
+
+def test_a_one_frame_phantom_pedestrian_at_10_m_never_brakes_harder_than_minus_2():
+  # a pedestrian box in the path 10 m ahead at 10 m/s for one detector frame (the tracker's 2 hits, high confidence), then
+  # gone: with the scene still up, and with the scene dropping out right after it (its stop carried), the plan never asks
+  # for more than -2.0 m/s^2 on any frame
+  for available_after in (True, False):
+    sp, v = ScenePolicy(), 10.
+    for k in range(int(3. / DT_MDL)):
+      objects = [ped(10. - v * k * DT_MDL, 0.1, in_path=True, age=2, conf=0.95)] if k < 2 else []
+      sc = scene(objects, True if k < 2 else available_after)
+      d = sp.update(sc.objects, sc.available, None, 1000., v)
+      assert plan_accel(d.accel_cap, d.speed_cap, v) >= MAP_DECEL_MAX - 1e-6, (available_after, k, d)
+      assert not d.hard_brake
+      v = max(v + max(plan_accel(d.accel_cap, d.speed_cap, v), -3.5) * DT_MDL, 0.)
+
+
+def test_a_phantom_seen_a_few_frames_never_brakes_hard_until_confirmed():
+  # hits growing one per detector frame (10 Hz) at a confidence under CONFIRM_CONF: under -2.0 only once confirmed
+  sp, v = ScenePolicy(), 10.
+  for k in range(8):
+    age = 2 + k // 2
+    sc = scene([ped(10., 0.1, in_path=True, age=age, conf=0.55)])
+    d = sp.update(sc.objects, True, None, 1000., v)
+    assert plan_accel(d.accel_cap, d.speed_cap, v) >= MAP_DECEL_MAX - 1e-6, (k, age)
+
+
+def test_a_confirmed_pedestrian_at_10_m_brakes_hard_and_says_so_with_its_evidence():
+  sp, v = ScenePolicy(), 10.
+  with mock.patch('openpilot.selfdrive.turnpilot.scene_policy.cloudlog') as log:
+    accels = []
+    for _ in range(10):
+      sc = scene([ped(10., 0.1, in_path=True, age=CONFIRM_HITS, conf=0.9, trackId=7)])
+      d = sp.update(sc.objects, True, None, 1000., v)
+      accels.append(plan_accel(d.accel_cap, d.speed_cap, v))
+  assert min(accels) < MAP_DECEL_MAX - 1.
+  assert d.hard_brake and d.reason == "pedestrian in path"
+  events = [c for c in log.event.call_args_list if c.args[0] == "turnpilot.hard_brake"]
+  assert len(events) == 1  # once, on its start
+  kw = events[0].kwargs
+  assert kw['track_id'] == 7 and kw['cls'] == 'pedestrian' and kw['hits'] == CONFIRM_HITS and kw['conf'] == 0.9
+  assert kw['x'] == 10. and kw['reason'] == "pedestrian in path" and kw['accel_cap'] < MAP_DECEL_MAX
+  # gone: no hard brake, and the next one is logged afresh
+  d = sp.update([], True, None, 1000., v)
+  assert not d.hard_brake
+
+
+def test_a_hard_stop_for_a_trusted_oncoming_car_is_logged_too():
+  sp = ScenePolicy()
+  with mock.patch('openpilot.selfdrive.turnpilot.scene_policy.cloudlog') as log:
+    for _ in range(10):
+      sc = scene([car(31., 5., vx=-12., age=VEL_TRUST_HITS, trackId=3)])
+      d = sp.update(sc.objects, True, LEFT_TURN, 11., 4.46, maneuver_id=1)
+  assert d.hard_brake and d.reason == "waiting for oncoming"
+  kw = next(c.kwargs for c in log.event.call_args_list if c.args[0] == "turnpilot.hard_brake")
+  assert kw['track_id'] == 3 and kw['cls'] == 'car' and kw['vx'] == -12.
