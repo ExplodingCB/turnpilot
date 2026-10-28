@@ -28,7 +28,7 @@ export PYTHONPATH="$OPENPILOT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 # navd routes on the sim map's own tiles, never on real roads (the default 'auto' falls back to Mapbox);
 # TURNPILOT_TILES picks the tiles, e.g. ~/turnpilot_data/valhalla/west_coast_usa_lanes for the turn-lane demos. Without it,
 # the tiles with the level's stop signs and signals (tools/turnpilot/build_sim_tiles.sh) when they are built.
-# The driver's gas tap is the go at a map stop: DisengageOnAccelerator must be off (turnpilotd refuses to run with it on).
+# No gas go (2026-10-28): any gas press disengages, as on the car (DisengageOnAccelerator on, preflight fails without it).
 # TURNPILOT_LIGHT_ORACLE=1 lets turnpilotd take the sim's light oracle (run_bridge.py --light-oracle); SIM ONLY, it needs
 # SIMULATION=1 too, and the param clears on every manager start.
 python3 -c "
@@ -38,7 +38,7 @@ from openpilot.selfdrive.test.helpers import set_params_enabled
 set_params_enabled()
 p = Params()
 p.put_bool('AlphaLongitudinalEnabled', True)
-p.put_bool('DisengageOnAccelerator', False)
+p.put_bool('DisengageOnAccelerator', True)
 p.put('TurnPilotRouteSource', 'valhalla')
 signals = os.path.expanduser('~/turnpilot_data/valhalla/west_coast_usa_signals')
 default = signals if os.path.exists(os.path.join(signals, 'controls_built')) else os.path.expanduser('~/turnpilot_data/valhalla/west_coast_usa')

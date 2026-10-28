@@ -32,7 +32,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"DisableLogging", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, BOOL}},
     {"DisablePowerDown", {PERSISTENT, BOOL}},
     {"DisableUpdates", {PERSISTENT, BOOL}},
-    {"DisengageOnAccelerator", {PERSISTENT, BOOL, "0"}},
+    {"DisengageOnAccelerator", {PERSISTENT, BOOL, "1"}},
     {"DongleId", {PERSISTENT, STRING}},
     {"DoReboot", {CLEAR_ON_MANAGER_START, BOOL}},
     {"DoShutdown", {CLEAR_ON_MANAGER_START, BOOL}},

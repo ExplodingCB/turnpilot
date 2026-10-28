@@ -288,9 +288,22 @@ def test_plan_events_map_controls_by_priority():
 
 
 def test_control_texts():
-  from openpilot.selfdrive.turnpilot.hooks import CONTROL_ALERT_TEXT, CONTROL_PROMPT_TEXT
-  assert all(p in CONTROL_PROMPT_TEXT for p in custom.TurnpilotPlan.ControlPrompt.schema.enumerants if p != 'none')
-  assert all(a in CONTROL_ALERT_TEXT for a in custom.TurnpilotPlan.ControlAlert.schema.enumerants if a != 'none')
+  from openpilot.selfdrive.turnpilot.hooks import CONTROL_ALERT_TEXT, CONTROL_PROMPT_TEXT, RETIRED_ALERTS, RETIRED_PROMPTS
+  prompts = [p for p in custom.TurnpilotPlan.ControlPrompt.schema.enumerants if p not in ('none',) + RETIRED_PROMPTS]
+  alerts = [a for a in custom.TurnpilotPlan.ControlAlert.schema.enumerants if a not in ('none',) + RETIRED_ALERTS]
+  assert all(p in CONTROL_PROMPT_TEXT for p in prompts) and all(a in CONTROL_ALERT_TEXT for a in alerts)
+  assert not any('accelerator' in t or 'tap gas' in t for t in list(CONTROL_PROMPT_TEXT.values()) + list(CONTROL_ALERT_TEXT.values()))
+
+
+def test_no_gas_go_is_ever_sent():
+  # the retired gas-go prompts and goingOnRed appear nowhere in what TurnPilot sends from (no gas go, 2026-10-28)
+  from pathlib import Path
+  from openpilot.selfdrive.turnpilot.hooks import RETIRED_ALERTS, RETIRED_PROMPTS
+  root = Path(__file__).parents[1]
+  for name in ('map_controls.py', 'scene_policy.py', 'control_text.py'):
+    text = (root / name).read_text()
+    assert not any(f"'{p}'" in text for p in RETIRED_PROMPTS + RETIRED_ALERTS), name
+    assert 'tap gas' not in text and 'press accelerator' not in text, name
 
 
 def test_stale_hold_is_loud():

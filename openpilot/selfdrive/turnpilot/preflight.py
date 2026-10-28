@@ -76,6 +76,13 @@ def check_toggle(name: str, key: str, enabled: bool, fix: str) -> Check:
   return Check(name, PASS, key) if enabled else Check(name, FAIL, f"{key} is off", fix)
 
 
+def check_gas_disengages(enabled: bool) -> Check:
+  """DisengageOnAccelerator: any gas press disengages (Kellen, 2026-10-28: no gas go anywhere; the press is the driver
+  taking over, never TurnPilot's go)."""
+  return check_toggle("gas disengages", "DisengageOnAccelerator", enabled,
+                      "Settings > Toggles > Disengage on accelerator pedal, or preflight --set DisengageOnAccelerator=1")
+
+
 def check_shadow(enabled: bool, shadow: bool) -> Check:
   name = "shadow mode"
   if not enabled:
@@ -286,6 +293,7 @@ def collect(params) -> list[Check]:
     check_alpha_long(params.get_bool("AlphaLongitudinalEnabled"), cp),
     check_toggle("navigation", "NavigationEnabled", params.get_bool("NavigationEnabled"), f"{SETTINGS_DEVELOPER} > navigation (alpha)"),
     check_toggle("TurnPilot", "TurnPilotEnabled", enabled, "preflight --set TurnPilotEnabled=1, then turn the car off and on"),
+    check_gas_disengages(params.get_bool("DisengageOnAccelerator")),
     check_shadow(enabled, shadow),
     check_route_source(mode, tiles),
     check_map_server(missing_config(params), coverage.names() if coverage else None, coverage_error, tiles, params.get(COVERAGE_STATUS)),

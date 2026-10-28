@@ -154,6 +154,13 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     unprotectedTurnGo @4;  # held at an unprotected turn's hold line: check oncoming traffic, press the accelerator to go
     carStoppedGo @5;       # standing engaged with nothing of TurnPilot's holding it, no lead and no map control near: the
                            # model stopped on its own; the driver's gas tap goes, TurnPilot never does (turnpilotd.py)
+    # Handbacks (DESIGN phase 4, G1: no gas go anywhere; the four above are no longer sent). The car stays held (by
+    # TurnPilot's latch, or the model) while the driver is told loudly to take control; any gas press disengages
+    # (DisengageOnAccelerator), and the driver driving off releases the hold
+    stopSignTakeControl @6;         # stopped STOP_SIGN_HANDBACK_S at a stop sign: no cross-traffic check, take control
+    unprotectedTurnTakeControl @7;  # held at an unprotected turn's hold line: no gap judgement yet, take control
+    carStoppedTakeControl @8;       # standing engaged with nothing of TurnPilot's holding it (turnpilotd.py: stopped_unheld)
+    stalledTakeControl @9;          # standing in the turn after its go (turnpilotd.py: stalled_in_turn)
   }
   enum ControlAlert {
     none @0;

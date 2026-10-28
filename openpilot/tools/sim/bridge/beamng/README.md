@@ -243,10 +243,11 @@ It runs `maplanes.py`, then `mapsignals.py` on the committed `wcusa_map_node_sig
 (re-dump them with `probe_signals.py` after a game or level update), builds the tiles, and adds `controls.json` (each
 control's real stop line) and the `controls_built` marker. Tiles without the marker are reported unsupported: on the old
 `west_coast_usa` and `west_coast_usa_lanes` tiles navd sends no controls, and TurnPilot says so on screen.
-`launch_openpilot.sh` uses the signals tiles by default once they are built, and turns `DisengageOnAccelerator` off:
-the driver's gas tap is the go at a stop sign or an unchecked signal, and turnpilotd refuses to run with it on.
+`launch_openpilot.sh` uses the signals tiles by default once they are built, and turns `DisengageOnAccelerator` on, as
+on the car: there is no gas go (2026-10-28), any press disengages. A stop sign stops and hands back ("Stop sign: take
+control to proceed"), and so does an unprotected turn at its hold line.
 
-Signals are held for the driver's go whatever the light (no light source on the car). The sim's light oracle gives
+A signal adds nothing unless a light source reads red or yellow for it (no light source on the car this week). The sim's light oracle gives
 turnpilotd the game's light states instead, SIM ONLY:
 
 ```bash

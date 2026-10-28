@@ -19,10 +19,10 @@ it again under the same id (KEEP_EVIDENCE_S), not just while it is published.
 
 No scene is no evidence, never a reason to hold: a missing detector is turnpilotd's to hand back (a soft disable), not
 this policy's to stop for. Nor is it a reason to release: ScenePolicy keeps the stops in force when the scene went
-away, dead-reckoned with the car's speed, until it comes back. A gas press at the hold line releases the junction hold
-for that maneuver, not just while it's held: otherwise lifting off brings the hold back, inside the junction if the car
-crept past the line. The press that released a map stop (an unprotected left's go, map_controls.py) isn't one: the
-detector's holds only add to the driver's go. Past the hold line a turn is committed for good once stopping in the
+away, dead-reckoned with the car's speed, until it comes back. The driver taking over at the hold line (a gas press with
+openpilot disengaged: DisengageOnAccelerator, turnpilotd.py) releases the junction hold for that maneuver, not just
+while it's held: otherwise re-engaging brings the hold back, inside the junction if the car went past the line. A gas
+press with openpilot still engaged is never a go (no gas go, 2026-10-28). Past the hold line a turn is committed for good once stopping in the
 junction is worse than finishing it (committed_past_line): a curb-side turn faster than COMMIT_SPEED, a far-side one
 once it can't stop short of the oncoming lanes on the comfortable curve, so the oncoming hold still stops a car pulling
 away from the line on the driver's go (BeamNG: it held only because the car happened to be under 2 m/s there). Slowing
@@ -30,7 +30,7 @@ later in the junction never brings its junction hold back (pedestrians in the pa
 those and the rest of what one frame can't know; scene_policy() is one frame on its own.
 A turnpilotd fault (fault()) loses the route, and with it the maneuver a junction hold is for: the hold in force then
 stays where it was, dead-reckoned like a carried pedestrian stop, until a live scene judges the junction again with the
-route back, the car is committed past it, or a gas press releases it. A junction the car was committed to or released
+route back, the car is committed past it, or the driver takes over at it. A junction the car was committed to or released
 into stays so when the route is back under a new id, the car at it.
 
 Objects are TurnpilotScene.TrackedObject (or anything with the same fields): x m forward, y m LEFT in the
@@ -90,8 +90,8 @@ HOLD_LINE_M = 8.0           # m before the maneuver point where the car waits at
 HOLD_ENGAGE_MARGIN_M = 15.  # the junction hold engages within braking distance of the hold line plus this
 COMMIT_SPEED = 2.0          # m/s: past the hold line and faster than this, the car is committed to its turn
 TURN_ZONE_PAST_M = 5.       # m past the maneuver point the junction rules still apply
-GAS_RELEASE_M = 5.          # a gas press releases a junction hold only this close to the hold line (or past it): further
-                            # out it's the driver keeping up speed, and the hold still has an oncoming car to wait for
+GAS_RELEASE_M = 5.          # the driver taking over releases a junction hold only this close to the hold line (or past
+                            # it): further out the hold still has an oncoming car to wait for once re-engaged
 
 CROSSWALK_X_BEFORE_M = 6.   # crosswalk zone on the turn side, along the car's axis relative to the maneuver point
 CROSSWALK_X_AFTER_M = 15.
@@ -373,13 +373,10 @@ class ScenePolicy:
     return [self.fault_junction]
 
   def update(self, objects, available: bool, maneuver, distance: float, v_ego: float, right_hand_traffic: bool = True,
-             maneuver_id: int | None = None, gas_pressed: bool = False, dt: float = DT_MDL, extra_stops=(),
-             go_press: bool = False) -> SceneDecision:
-    """As scene_policy(), plus maneuver_id (RouteFollower.maneuver_id) and carState.gasPressed, once per frame dt apart.
-    extra_stops: the map's stop signs and signals (map_controls.py), composed with the scene's like any other stop.
-    go_press: this gas press is the one that released a map stop (turnpilotd): the map's go, not a release of the scene's
-    holds, which only add to it; another press is."""
-    gas_pressed = gas_pressed and not go_press
+             maneuver_id: int | None = None, gas_pressed: bool = False, dt: float = DT_MDL, extra_stops=()) -> SceneDecision:
+    """As scene_policy(), plus maneuver_id (RouteFollower.maneuver_id), once per frame dt apart. gas_pressed: the driver
+    taking over (turnpilotd: carState.gasPressed with openpilot disengaged), never a go. extra_stops: the map's stop signs
+    and signals (map_controls.py), composed with the scene's like any other stop."""
     far_side = far_side_turn(maneuver, right_hand_traffic)
     self.t += dt
     if available:
@@ -404,7 +401,7 @@ class ScenePolicy:
         junction = hold_line_stop(maneuver, distance, v_ego, self.carried_junction[1], far_side)
 
     if junction and gas_pressed and maneuver_id is not None and distance - HOLD_LINE_M < GAS_RELEASE_M:
-      self.released_id = maneuver_id  # the driver looked and goes: stopping again further in would be worse
+      self.released_id = maneuver_id  # the driver took over and goes: stopping again further in would be worse
     if maneuver_id is not None and maneuver is not None and maneuver.kind == TURN and \
        committed_past_line(distance, v_ego, far_side):
       self.committed_id = maneuver_id  # never stopped in the junction for it again, however slow the car gets in there

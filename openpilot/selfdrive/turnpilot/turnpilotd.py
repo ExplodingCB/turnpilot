@@ -46,6 +46,9 @@ was; scene_policy.py), which plannerd acts on (hooks.limits_plan), so a turnpilo
 drives the car on through a pedestrian. Its desire and lane change are never acted on.
 Once the detector is back and TurnPilot acts again, the dropped maneuver is taken up or skipped out loud, never left
 half driven (_take_up_dropped).
+No gas go anywhere (Kellen, 2026-10-28; DESIGN phase 4, G1): any gas press disengages (DisengageOnAccelerator, on by
+default; preflight fails without it), which is the driver taking over, never TurnPilot's go. A gas press with openpilot
+disengaged (the driver driving) is what releases the scene's junction hold at its line (scene_policy.py).
 A turn the car pulls away into from a standstill (a hold's go, the turn's pulse in that frame) is unverified: in BeamNG it
 was taken about half the time (2026-10-28). Past its junction (the follower's pass) having turned under MISSED_TURN_DEG,
 its desire not cleared at the turn's angle (a turn under 20 deg clears under MISSED_TURN_DEG, and that one was taken),
@@ -122,7 +125,6 @@ HANDBACK_REASON = {Handback.detectorStopped: "detector stopped: take control",
                    Handback.noDetector: "detector not running: take control",
                    Handback.modelFellBack: "driving model fell back: take control"}
 WAITING_REASON = "waiting for the detector"
-DISENGAGE_ON_ACCEL_REASON = "map stops need DisengageOnAccelerator off"
 STANDSTILL_SPEED = 0.3  # m/s: a hold let go slower than this pulls the car away with a fresh turn pulse
 # standing engaged this long with nothing of TurnPilot's holding the car, no lead and no map control within STOPPED_CONTROL_M,
 # the model stopped on its own (BeamNG route_demo, 2026-10-28: 470 s on an empty road): the driver is asked for the go
@@ -191,7 +193,6 @@ class TurnPilot:
       self.lights_age = float('inf')  # s since the last turnpilotLights
       self.was_stopping = False    # the last plan held the car (shouldStop)
       self.release_go = False      # ...and let go of it at standstill: the turn pulses again now
-      self.go_press = False        # the gas press that released a map stop, while it lasts: the go, not a scene release
       self.detector_seen = False   # fresh detections since TurnPilot was turned on
       self.stale_s = 0.            # how long the scene has been unavailable
       self.waited_s = 0.           # how long modeld has run since TurnPilot was turned on, before the first detection
@@ -392,6 +393,7 @@ class TurnPilot:
     elif engaged and upcoming is None:
       turn = KEEP_TURN  # the route gone with the handback: it carries on, dead-reckoned
     mapd = self.map_update(sm, v_ego, cs.gasPressed, turn)
+    took_over = cs.gasPressed and not sm['carControl'].enabled  # the driver driving, never a go (module docstring)
 
     # too fast to make the turn: skipped, so nothing below acts on it (no desire, no cap, no turn holds or lane changes)
     desire_out = self.desires.maneuver_id == rf.maneuver_id and self.desires.started
@@ -409,13 +411,9 @@ class TurnPilot:
     if cap_on is None and rf.maneuver_id == self.skip_cap_id:
       cap_on = upcoming  # the skipped turn's pulse may have been taken before it was cleared: never sped up into it
 
-    # the scene's holds only ever brake, so they keep the real maneuver through a handback. The press that released a map
-    # stop is its go: the scene's holds (an oncoming car, a pedestrian) only add to it (scene_policy.py)
-    # Nor is a press while a map stop is stopping the car near here (a brush on the approach to it): that is the map's
-    # override, and the detector's holds at that junction still stand once the map's go comes
-    self.go_press = cs.gasPressed and (mapd.gas_go or self.go_press)
+    # the scene's holds only ever brake, so they keep the real maneuver through a handback
     decision = self.scene_now = self.scene.update(objects, available, maneuver, rf.distance, v_ego, right_hand_traffic, rf.maneuver_id,
-                                                 cs.gasPressed and not mapd.stopping, extra_stops=mapd.stops, go_press=self.go_press)
+                                                 took_over, extra_stops=mapd.stops)
     # a hold let go with the car standing (the walker cleared, a stop's go): the model won't pull away on its own, and the
     # turn's pulse is long forgotten, so it goes again in this very plan, the one that lets the car go: held, the desire
     # was dropped to none, so it is a fresh edge (desire_timing.py). BeamNG: let go a frame before its pulse, the car drove
@@ -609,7 +607,7 @@ class TurnPilot:
     else:
       d.resume()
 
-  def plan(self, sm, scene, enabled: bool, shadow: bool, *args, long_control: bool | None, disengage_on_accel: bool = False, **kwargs):
+  def plan(self, sm, scene, enabled: bool, shadow: bool, *args, long_control: bool | None, **kwargs):
     """update(), but a disabled plan while openpilot doesn't control speed (on a Tesla, without alpha longitudinal):
     its speed caps would do nothing there, and the turn desires would go out at whatever speed stock ACC holds.
     long_control None: card hasn't written CarParams yet, so it isn't known. A disabled plan while TurnPilot is on
@@ -618,19 +616,6 @@ class TurnPilot:
     the drive, so it is noted here too, where update() isn't reached."""
     self.handback_now = self.scene_now = self.map_now = None
     self._rf_ticked = self._yaw_ticked = False
-    if enabled and disengage_on_accel:
-      # a gas tap is the driver's go at a map stop: with DisengageOnAccelerator it would disengage instead, so TurnPilot
-      # refuses to run (Kellen: never stop control silently). The holds in force stay on the faulted plan
-      self.fault_track(sm)
-      self.stop('fault')
-      # nor a latch to replay once it is off again, wherever the car has rolled meanwhile (the fault says so)
-      self.map_controls.drop_latch('disengageOnAccelerator')
-      self.watch_model(sm['modelV2'], enabled)
-      msg = disabled_plan(shadow, DISENGAGE_ON_ACCEL_REASON, Fault.disengageOnAccelerator,
-                          Handback.modelFellBack if self.fell_back else Handback.none)
-      self.fill_stop_abort(msg.turnpilotPlan)
-      self.fault_limits(msg.turnpilotPlan, sm, scene, map_controls=False)
-      return msg
     if enabled and not long_control:
       self.fault_track(sm)
       self.stop('fault')
@@ -663,26 +648,23 @@ class TurnPilot:
       self.fault_limits(msg.turnpilotPlan, sm, scene)
       return msg
 
-  def fault_limits(self, plan, sm, scene, map_controls: bool = True) -> None:
+  def fault_limits(self, plan, sm, scene) -> None:
     """A faulted plan's limits: the scene's, with no route (scene_policy.py: ScenePolicy.fault), and the map stops'
     (their latch above all). The ones update() made this frame before it failed, if it got that far; the last plan's if
-    the scene fails too. map_controls False (DisengageOnAccelerator on): no stop control at all, it refuses to run."""
+    the scene fails too."""
     try:
       decision = self.scene_now
       cs = sm['carState']
       if decision is None:
-        stops = []
-        if map_controls:
-          try:  # the map stops in force, the latch above all (map_controls.py): a fault never lets a held car go
-            # the route is lost with the fault: an unprotected turn's stop carries on, dead-reckoned (map_controls.py)
-            stops = self.map_update(sm, max(cs.vEgo, 0.), cs.gasPressed, KEEP_TURN).stops
-          except Exception:
-            log_error("turnpilotd.fault_map_controls_failed")
-            stops = self.map_controls.held_stops()
-        self.go_press = cs.gasPressed and ((self.map_now is not None and self.map_now.gas_go) or self.go_press)
-        stopping = self.map_now is not None and self.map_now.stopping
+        try:  # the map stops in force, the latch above all (map_controls.py): a fault never lets a held car go
+          # the route is lost with the fault: an unprotected turn's stop carries on, dead-reckoned (map_controls.py)
+          stops = self.map_update(sm, max(cs.vEgo, 0.), cs.gasPressed, KEEP_TURN).stops
+        except Exception:
+          log_error("turnpilotd.fault_map_controls_failed")
+          stops = self.map_controls.held_stops()
+        took_over = cs.gasPressed and not sm['carControl'].enabled
         decision = self.scene.update(list(scene.objects) if scene.available else [], scene.available, None, float('inf'),
-                                     max(cs.vEgo, 0.), gas_pressed=cs.gasPressed and not stopping, extra_stops=stops, go_press=self.go_press)
+                                     max(cs.vEgo, 0.), gas_pressed=took_over, extra_stops=stops)
         self.was_stopping = decision.should_stop
       if self.hold_v is not None:
         self.hold_v = None if not sm['carControl'].latActive else \
@@ -789,7 +771,7 @@ def main():
   rk = Ratekeeper(1. / DT_MDL, print_delay_threshold=None)
   tp = TurnPilot()
   tracker = None
-  enabled = shadow = paint_rule = disengage_on_accel = False
+  enabled = shadow = paint_rule = False
   driver_signals, right_hand_traffic = True, True
   long_control: bool | None = None
   invalid_frames = PLAN_INPUT_GRACE_FRAMES
@@ -802,7 +784,6 @@ def main():
       right_hand_traffic = not params.get_bool("IsRhdDetected")
       driver_signals = driver_signals_for(params)
       long_control = long_control_for(params)
-      disengage_on_accel = params.get_bool("DisengageOnAccelerator")
       tp.oracle_ok = oracle_accepted(os.environ, read_bool(params, "TurnPilotSimLightOracle", False))
       tp.yellow_decel = yellow_decel_for(params)
       if params.get("ChestnutActive") is False:  # None: no big model expected this drive
@@ -826,8 +807,7 @@ def main():
     paint = lane_paint_from_msg(sm['turnpilotDetections'].lanePaint) if scene.available and sm.seen['turnpilotDetections'] else ()
     # the lane planner takes this frame's checks (an offered change aborts at once); the plan's valid has a grace
     valid = sm.all_checks(['carState', 'modelV2'])
-    msg = tp.plan(sm, scene, enabled, shadow, driver_signals, right_hand_traffic, paint, paint_rule, valid, long_control=long_control,
-                  disengage_on_accel=disengage_on_accel)
+    msg = tp.plan(sm, scene, enabled, shadow, driver_signals, right_hand_traffic, paint, paint_rule, valid, long_control=long_control)
     invalid_frames = 0 if valid else invalid_frames + 1
     msg.valid = invalid_frames < PLAN_INPUT_GRACE_FRAMES
     pm.send('turnpilotPlan', msg)

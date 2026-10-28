@@ -52,8 +52,12 @@ def limits_plan(sm, now: float | None = None):
 
 
 CONTROL_ALERT_FIRST = ('hardBrake', 'cannotStopComfortably', 'offRouteStopsUnknown')  # above too fast to turn
-CONTROL_ALERT_EVENTS = ('stopOverrun', 'proceedingOnYellow', 'goingOnRed', 'junctionUncertain')  # below the prompt, above a
-                                                                                                # lane change
+# handbacks: the car held while the driver is told to take control (map_controls.py, turnpilotd.py), above too fast to turn
+TAKE_CONTROL_PROMPTS = ('stopSignTakeControl', 'unprotectedTurnTakeControl', 'carStoppedTakeControl', 'stalledTakeControl')
+# never sent since gas go went (2026-10-28), kept in the append-only schema: the driver's gas tap as a go, and going on red
+RETIRED_PROMPTS = ('stopSignGo', 'signalGo', 'unprotectedTurnGo', 'carStoppedGo')
+RETIRED_ALERTS = ('goingOnRed',)
+CONTROL_ALERT_EVENTS = ('stopOverrun', 'proceedingOnYellow', 'junctionUncertain')  # below the prompt, above a lane change
 CONTROL_STATUS_ALERTS = ('mapControlsUnavailable', 'lightSourceRejected')  # last of all, a status line
 
 
@@ -69,14 +73,15 @@ def plan_events(sm, now: float | None = None) -> list[str]:
   TurnPilot's alerts share one slot, at most one of them a frame, by this priority:
   1. a handback (turnpilotDetectorStopped, turnpilotNoDetector, turnpilotModelFellBack; handback.py): nothing here while one is set;
   2. a fault (turnpilotUnavailable);
-  3. a hard brake for a confirmed pedestrian or oncoming vehicle (turnpilotControlAlert, hardBrake), a map stop it can't
-     make gently (turnpilotControlAlert, cannotStopComfortably: take control), or off the route with
-     the map stops ahead unknown (offRouteStopsUnknown: the speed capped, take control or wait for the reroute);
+  3. a hard brake for a confirmed pedestrian or oncoming vehicle (turnpilotControlAlert, hardBrake), then a handback
+     with the car held (turnpilotControlPrompt, TAKE_CONTROL_PROMPTS: a stop sign, an unprotected turn, the car stopped
+     or stalled in a turn), then a map stop it can't make gently (turnpilotControlAlert, cannotStopComfortably: take
+     control), or off the route with the map stops ahead unknown (offRouteStopsUnknown: the speed capped, take control
+     or wait for the reroute);
   4. too fast to turn, or a turn from a standstill missed (turnpilotTooFastToTurn, turnMissed);
-  5. a map control's prompt to the driver (turnpilotControlPrompt: stop sign, signal or unprotected turn go, yield ahead),
-     or the car stopped with nothing holding it (carStoppedGo);
-  6. a map control's other alerts (turnpilotControlAlert: a stop line overrun, going on a yellow or a red, an unprotected
-     turn's junction uncertain);
+  5. a map control's other prompt (turnpilotControlPrompt: yield ahead, visual only);
+  6. a map control's other alerts (turnpilotControlAlert: a stop line overrun, going on a yellow, an unprotected turn's
+     junction uncertain);
   7. a planned lane change, offered or just aborted (turnpilotLaneChangeLeft/Right/Aborted, LaneChangeEvents);
   8. the wrong lane, or a lane it can't confirm (turnpilotWrongLane);
   9. the map controls' status (turnpilotControlAlert: map stops unavailable, light source rejected).
@@ -100,6 +105,10 @@ def plan_events(sm, now: float | None = None) -> list[str]:
   if plan.shadow:  # in shadow mode the driver drives, and TurnPilot acts on nothing
     return []
   alert = str(plan.controlAlert)
+  if alert == 'hardBrake':
+    return ['turnpilotControlAlert']
+  if str(plan.controlPrompt) in TAKE_CONTROL_PROMPTS:
+    return ['turnpilotControlPrompt']
   if alert in CONTROL_ALERT_FIRST:
     return ['turnpilotControlAlert']
   if plan.tooFastToTurn or plan.turnMissed:
@@ -119,17 +128,16 @@ def plan_events(sm, now: float | None = None) -> list[str]:
 
 # turnpilotPlan.controlPrompt / controlAlert -> what the driver is told (selfdrived/events.py)
 CONTROL_PROMPT_TEXT = {
-  'stopSignGo': 'Stop sign: check cross traffic, press accelerator to go',
-  'signalGo': 'Signal ahead: light not checked, press accelerator to proceed',
   'yieldAhead': 'Yield ahead',
-  'unprotectedTurnGo': 'Unprotected turn: check oncoming traffic, press accelerator to go',
-  'carStoppedGo': 'Nothing ahead is holding the car: press accelerator to continue',
+  'stopSignTakeControl': 'TurnPilot can\'t check cross traffic',
+  'unprotectedTurnTakeControl': 'TurnPilot can\'t judge oncoming traffic',
+  'carStoppedTakeControl': 'Nothing ahead is holding the car',
+  'stalledTakeControl': 'The car stopped in the turn',
 }
 CONTROL_ALERT_TEXT = {
   'cannotStopComfortably': 'Cannot stop gently for the stop/signal',
   'stopOverrun': 'Passed the stop line without stopping',
   'proceedingOnYellow': 'Too close to stop for the yellow',
-  'goingOnRed': 'Going on red: your go',
   'mapControlsUnavailable': 'Map stops and signals unavailable',
   'lightSourceRejected': 'Light source not accepted: lights unknown',
   'junctionUncertain': 'GPS unsure where the junction is: slow, may stop short of it',

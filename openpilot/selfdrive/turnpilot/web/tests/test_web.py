@@ -962,10 +962,10 @@ class TestStatusReader(WebTestCase):
 class TestMapHoldStatus(OpenpilotTestCase):
   def test_hold_and_unavailable_on_the_phone(self):
     snap = {"at": 100., "onroad": True, "route": None, "gps": None,
-            "plan": {"state": "holding", "reason": "Stopped at stop sign — tap gas to go", "shadow": False,
+            "plan": {"state": "holding", "reason": "Stop sign: take control to proceed", "shadow": False,
                      "map": {"kind": "stop", "action": "awaitingDriver", "light": "unknown", "source": "none", "status": "ok"}}}
     tp = status.format_status(snap, None, True, False, now=101.)["turnpilot"]
-    assert (tp["label"], tp["reason"]) == ("Stopped at stop sign", "tap gas to go")
+    assert (tp["label"], tp["reason"]) == ("Stopped at stop sign", "take control")
     snap["plan"] = {"state": "following", "reason": "Map stops/signals: unsupported", "shadow": False,
                     "map": {"kind": "none", "action": "none", "light": "unknown", "source": "none", "status": "unsupported"}}
     tp = status.format_status(snap, None, True, False, now=101.)["turnpilot"]

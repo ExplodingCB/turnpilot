@@ -5,7 +5,7 @@ import pytest
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_ACCEL_MIN, plan_accel
-from openpilot.selfdrive.turnpilot.map_controls import (DWELL_S, GREEN_STEADY_S, LIGHT_STALE_S, MAP_DECEL_MAX, NO_LIGHTS,
+from openpilot.selfdrive.turnpilot.map_controls import (STOP_SIGN_HANDBACK_S, GREEN_STEADY_S, LIGHT_STALE_S, MAP_DECEL_MAX, NO_LIGHTS,
                                                          OFF_ROUTE_REASON, OFF_ROUTE_SPEED, T_LAT, UNPROTECTED, YIELD_SPEED, Lights,
                                                          MapControlPolicy, engage_distance, light_input, unprotected_turn)
 from openpilot.selfdrive.turnpilot.route_follower import make_maneuver
@@ -83,6 +83,11 @@ def held(out, dec):
   return dec.should_stop and out.shown is not None and out.shown.action in ('held', 'awaitingDriver')
 
 
+def drive_off(car, seconds=3.):
+  """The driver takes over from a hold (a gas press disengages) and drives away: the plan isn't applied meanwhile."""
+  return car.run(seconds, gas=True, accel=1.5)
+
+
 # --- stop sign lifecycle ---
 
 def test_stop_sign_lifecycle():
@@ -105,27 +110,23 @@ def test_stop_sign_lifecycle():
   assert all(b <= a + 1e-9 for a, b in zip(caps, caps[1:], strict=False))  # the cap never rises on the approach
   assert car.v < 0.3 and -2. < 250. - car.s < 5.
   assert out.reason == '' and 'stop sign' in dec.reason.lower()
-  # the dwell: gas in it is ignored, and there's no prompt yet
-  out, dec, _ = car.run(1.0)
+  # the full stop, with no prompt yet, then the handback: held, take control
+  out, dec, _ = car.run(STOP_SIGN_HANDBACK_S - 0.2)
   assert held(out, dec) and out.prompt == 'none'
-  car.step(gas=True, accel=0.)
-  out, dec, _ = car.step(accel=0.)
-  assert held(out, dec)
-  out, dec, _ = car.run(DWELL_S)
-  assert held(out, dec) and out.prompt == 'stopSignGo' and 'tap gas to go' in dec.reason
-  # then a gas tap goes: the hold releases at standstill (turnpilotd re-pulses the turn there)
-  out, dec, _ = car.step(gas=True, accel=0.)
-  assert not dec.should_stop and out.released_stopped and out.prompt == 'none'
-  out, dec, _ = car.run(5.)
-  assert not out.stops and car.s > 260.
+  out, dec, _ = car.run(0.3)
+  assert held(out, dec) and out.prompt == 'stopSignTakeControl'
+  # the driver takes over and goes: released, and nothing left
+  drive_off(car)
+  out, dec, _ = car.run(3.)
+  assert not out.stops and not dec.should_stop and car.s > 260.
 
 
-def test_no_motion_before_the_tap():
+def test_no_motion_while_handed_back():
   car = Car([(150., 'stop')])
   car.run_until(held)
   s_held = car.s
   car.run(30.)
-  assert car.s - s_held < 0.05 and car.rows[-1][-1].prompt == 'stopSignGo'
+  assert car.s - s_held < 0.05 and car.rows[-1][-1].prompt == 'stopSignTakeControl'
 
 
 @pytest.mark.parametrize("v0", [11.2, 15.6])  # 25 and 35 mph
@@ -155,18 +156,19 @@ def test_latch_survives_jumps_gaps_new_routes_and_invalid_nav():
   car.nav_valid, car.route_count, car.controls = True, 2, []  # a reroute that doesn't list it
   out, dec, _ = car.run(1.5)
   assert held(out, dec) and car.s - s_held < 0.05
-  # it still releases only by its rule: the dwell's long past, a tap goes
-  out, dec, _ = car.step(gas=True, accel=0.)
+  # it still releases only by its rule: handed back long since, the driver drives off
+  drive_off(car)
+  out, dec, _ = car.step()
   assert not dec.should_stop
 
 
-def test_overrun_with_gas_held_through_the_dwell():
+def test_driven_off_in_the_full_stop_under_the_gas_is_the_drivers():
   car = Car([(120., 'stop')])
   car.run_until(held)
   car.run(0.5)
-  out, dec, _ = car.run(3., gas=True, accel=1.)  # the driver drives off in the dwell
+  out, dec, _ = car.run(3., gas=True, accel=1.)  # the driver drives off before the handback
   assert not dec.should_stop
-  assert any(o.alert == 'stopOverrun' for *_, o in car.rows[-60:])
+  assert not any(o.alert == 'stopOverrun' for *_, o in car.rows[-60:])
   out, dec, _ = car.run(3.)
   assert not dec.should_stop and car.v > 2.
 
@@ -404,21 +406,21 @@ def left_car(controls=(), v=13.4, at=250.):
   return car
 
 
-def test_unprotected_left_stops_before_the_hold_line_and_needs_a_tap():
+def test_unprotected_left_stops_before_the_hold_line_and_hands_back():
   car = left_car()
   out, dec = car.run_until(held)
   assert car.v < 0.3 and 0. <= 250. - HOLD_LINE_M - car.s < 3.  # before the line, never past it
   assert all(cmd >= MAP_DECEL_MAX - 1e-6 for *_, cmd, _, _ in car.rows)
-  assert out.shown.kind == UNPROTECTED and out.prompt == 'unprotectedTurnGo'  # no dwell: the driver's go at once
-  assert dec.reason == "Stopped at unprotected left — tap gas to go" and out.shown.action == 'awaitingDriver'
+  assert out.shown.kind == UNPROTECTED and out.prompt == 'unprotectedTurnTakeControl'  # handed back at once
+  assert dec.reason == "Unprotected left: take control" and out.shown.action == 'awaitingDriver'
   s_held = car.s
   out, dec, _ = car.run(20.)
   assert held(out, dec) and car.s - s_held < 0.05
-  out, dec, _ = car.step(gas=True, accel=0.)
-  assert not dec.should_stop and out.released_stopped and out.prompt == 'none' and out.shown.kind == 'none'
-  car.run(5.)
+  drive_off(car, 2.)
+  out, dec, _ = car.run(5.)
+  assert not dec.should_stop and out.prompt == 'none' and out.shown.kind == 'none'
   assert car.s > 250.
-  assert not any(o.prompt == 'unprotectedTurnGo' for *_, o in car.rows[-90:])  # never a second stop
+  assert not any(o.prompt == 'unprotectedTurnTakeControl' for *_, o in car.rows[-100:])  # never a second stop
 
 
 def test_unprotected_left_approach_reason_and_engage():
@@ -437,12 +439,12 @@ def test_a_signal_at_the_junction_leaves_the_left_unprotected():
 
 @pytest.mark.parametrize("kind", ['stop'])
 def test_stop_sign_at_the_junction_protects_the_left(kind):
-  # its own latch holds the car: one stop, one tap, no second stop at the hold line
+  # its own latch holds the car: one stop, one handback, no second stop at the hold line
   car = left_car([(250. - 11., kind)])
   out, dec = car.run_until(held)
   assert out.shown.kind == kind and -2. < 239. - car.s < 5.
-  car.run(DWELL_S + 0.5)
-  car.step(gas=True, accel=0.)
+  car.run(STOP_SIGN_HANDBACK_S + 0.5)
+  drive_off(car, 2.)
   car.run(8.)
   assert car.s > 252.
   assert not any(o.shown is not None and o.shown.kind == UNPROTECTED for *_, o in car.rows)
@@ -455,8 +457,8 @@ def test_yield_or_a_stop_far_upstream_leaves_the_left_unprotected():
   assert car.rows[-1][-1].shown.kind == UNPROTECTED
   car = left_car([(150., 'stop')])
   car.run_until(held)
-  car.run(DWELL_S + 0.5)
-  car.step(gas=True, accel=0.)
+  car.run(STOP_SIGN_HANDBACK_S + 0.5)
+  drive_off(car, 2.)
   out, dec = car.run_until(held)
   assert out.shown.kind == UNPROTECTED and 0. <= 242. - car.s < 3.
 
@@ -472,7 +474,8 @@ def test_unprotected_latch_is_position_free_and_says_so_through_a_fault():
   out, dec, _ = car.run(1.)
   assert held(out, dec) and out.shown.kind == UNPROTECTED
   assert car.policy.held_stops() and car.policy.held_stops()[0].should_stop
-  out, dec, _ = car.step(gas=True, accel=0.)
+  drive_off(car, 2.)
+  out, dec, _ = car.step()
   assert not dec.should_stop
 
 
@@ -486,9 +489,10 @@ def test_a_left_not_held_goes_with_its_maneuver():
 
 def test_unprotected_turn_texts():
   from openpilot.selfdrive.turnpilot.control_text import hold_text, is_map_reason
-  assert hold_text(UNPROTECTED, 'awaitingDriver') == ('Stopped at unprotected turn', 'tap gas to go')
+  assert hold_text(UNPROTECTED, 'awaitingDriver') == ('Stopped at unprotected turn', 'take control')
   assert hold_text(UNPROTECTED, 'held') == ('Stopped at unprotected turn', '')
-  assert is_map_reason("Unprotected left ahead") and is_map_reason("Stopped at unprotected left — tap gas to go")
+  assert is_map_reason("Unprotected left ahead") and is_map_reason("Unprotected left: take control")
+  assert is_map_reason("Stop sign: take control to proceed")
 
 
 # --- found in review: the car never left stuck, never let go of a light by a nudge, never re-held where it isn't ---
@@ -529,26 +533,27 @@ def test_a_gas_nudge_in_a_queue_short_of_a_red_doesnt_let_go_of_it():
 
 
 def test_a_reroute_that_adopts_the_held_stop_keeps_its_latch_and_the_next_stop_holds_too():
-  # held at a stop sign, a reroute lists the same sign under a new key: the gas tap releases it, and the next stop sign
-  # latches the car with its own prompt, never a cap of 0 with no hold
+  # held at a stop sign, a reroute lists the same sign under a new key: the driver driving off releases it, and the next
+  # stop sign latches the car with its own handback, never a cap of 0 with no hold
   car = Car([(120., 'stop'), (300., 'stop')])
   car.run_until(held)
   car.route_count = 2
   car.run(3.)
-  out, dec, _ = car.step(gas=True, accel=0.)
+  drive_off(car, 2.)
+  out, dec, _ = car.step()
   assert not dec.should_stop and car.policy.held is None
   out, dec = car.run_until(held, max_s=60.)
   assert -2. < 300. - car.s < 5.
-  out, dec, _ = car.run(DWELL_S + 0.5)
-  assert out.prompt == 'stopSignGo'
+  out, dec, _ = car.run(STOP_SIGN_HANDBACK_S + 0.5)
+  assert out.prompt == 'stopSignTakeControl'
 
 
 def test_a_held_car_that_moved_off_without_the_plan_is_let_go_never_re_held_down_the_road():
-  # held at a stop sign, the plan stops being applied (shadow mode turned on) and openpilot drives on with no gas: the
-  # latch lets go once the car is moving off, out loud, so it isn't replayed when the plan applies again further on
-  car = Car([(120., 'stop')])
-  car.run_until(held)
-  car.run(1.)
+  # held at a red (a hold with no handback), the plan stops being applied (shadow mode turned on) and openpilot drives on
+  # with no gas: the latch lets go once the car is moving off, out loud, so it isn't replayed when the plan applies again
+  car = Car([(120., 'signal')])
+  car.run_until(held, lights=oracle('red'))
+  car.run(1., lights=oracle('red'))
   alerts = []
   for _ in range(int(20. / DT_MDL)):
     out, dec, _ = car.step(accel=1.0 if car.v < 14. else 0.)  # the plan not applied: the car drives on regardless
@@ -559,21 +564,10 @@ def test_a_held_car_that_moved_off_without_the_plan_is_let_go_never_re_held_down
   assert not dec.should_stop and not out.stops
 
 
-def test_dropping_the_latch_for_disengage_on_accelerator_never_replays_it():
-  car = Car([(120., 'stop')])
-  car.run_until(held)
-  car.policy.drop_latch('disengageOnAccelerator')
-  assert car.policy.held is None and car.policy.held_stops() == []
-  car.v, car.cruise = 2.2, 2.2
-  car.s += 1.7
-  out, dec, _ = car.step()
-  assert not dec.should_stop
-
-
 def test_unprotected_left_whose_junction_is_read_nearer_than_the_car_can_stop_short_of_stops_at_the_floor():
   # the route's junction estimate moves 20 m nearer (route_follower.py: the nearest of navd's readings) once the car is
   # braking for its hold line: the line is now behind the car. Never dropped as an overrun and crossed blind: the car
-  # brakes at the floor, no harder, stops as soon as it can, said out loud, and is held there for the driver's tap
+  # brakes at the floor, no harder, stops as soon as it can, said out loud, and is held there and handed back
   for jump in (20., 12.):
     car = left_car()
     car.run_until(lambda out, dec, car=car: out.stops and 250. - car.s < 28.)
@@ -583,7 +577,7 @@ def test_unprotected_left_whose_junction_is_read_nearer_than_the_car_can_stop_sh
     assert car.v < 0.3 and 250. - car.s > HOLD_LINE_M, jump  # short of the true hold line
     assert all(cmd >= MAP_DECEL_MAX - 1e-6 for *_, cmd, _, _ in car.rows), jump
     assert 'cannotStopComfortably' in alerts, jump
-    assert out.shown.kind == UNPROTECTED and out.prompt == 'unprotectedTurnGo'
+    assert out.shown.kind == UNPROTECTED and out.prompt == 'unprotectedTurnTakeControl'
     s_held = car.s
     out, dec, _ = car.run(5.)
     assert held(out, dec) and car.s - s_held < 0.05
@@ -702,3 +696,46 @@ def test_yellow_decel_param_never_takes_a_light_stop_past_minus_2():
   car.run_until(lambda out, dec: car.s > 400. - 97., lights=oracle('green'))
   car.run(6., lights=oracle('yellow'))
   assert min(r[3] for r in car.rows) >= MAP_DECEL_MAX - 1e-6
+
+
+# --- G1: no gas go anywhere; a hold TurnPilot can't release is a loud handback (Kellen, 2026-10-28) ---
+
+def test_a_stop_sign_hands_back_after_a_second_stopped_and_no_gas_releases_it():
+  car = Car([(150., 'stop')])
+  car.run_until(held)
+  out, dec, _ = car.run(0.5)
+  assert held(out, dec) and out.prompt == 'none'
+  out, dec, _ = car.run(0.6)
+  assert held(out, dec) and out.prompt == 'stopSignTakeControl' and dec.reason == "Stop sign: take control to proceed"
+  assert out.shown.action == 'awaitingDriver'
+  # a gas press is the driver's (a disengage), never TurnPilot's go: the hold stays, and nothing is released or re-pulsed
+  out, dec, _ = car.step(gas=True, accel=0.)
+  out, dec, _ = car.step(accel=0.)
+  assert held(out, dec) and not out.released_stopped and out.prompt == 'stopSignTakeControl'
+
+
+def test_the_driver_driving_off_a_handed_back_stop_is_a_clean_release():
+  for gas in (True, False):  # under the gas, or disengaged and away on the brake's release (no plan applied)
+    car = Car([(150., 'stop')])
+    car.run_until(held)
+    car.run(1.5)
+    car.run(3., gas=gas, accel=1.5)
+    out, dec, _ = car.step()
+    assert not dec.should_stop and car.policy.held is None, gas
+    assert all(r[-1].alert != 'stopOverrun' for r in car.rows), gas
+
+
+def test_an_unprotected_left_hands_back_at_its_hold_line_and_no_gas_goes():
+  car = left_car()
+  out, dec = car.run_until(held)
+  assert out.prompt == 'unprotectedTurnTakeControl' and dec.reason == "Unprotected left: take control"
+  car.step(gas=True, accel=0.)
+  out, dec, _ = car.run(2.)
+  assert held(out, dec) and out.prompt == 'unprotectedTurnTakeControl' and not out.released_stopped
+
+
+def test_a_yield_is_passed_only_by_passing_it():
+  car = Car([(150., 'yield')])
+  car.run_until(lambda out, dec: out.stops)
+  out, dec, _ = car.step(gas=True)
+  assert out.stops and out.prompt == 'yieldAhead'

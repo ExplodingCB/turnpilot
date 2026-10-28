@@ -153,12 +153,12 @@ class TestMapControlStatus:
   def test_hold_at_a_stop_sign_or_signal(self):
     held = plan(state='holding', shouldStop=True, reason='Stopped at stop sign', mapControl={'kind': 'stop', 'action': 'held'})
     assert status_text(held, True) == ('Stopped at stop sign', '')
-    waiting = plan(state='holding', shouldStop=True, reason='Stopped at stop sign — tap gas to go',
+    waiting = plan(state='holding', shouldStop=True, reason='Stop sign: take control to proceed',
                    mapControl={'kind': 'stop', 'action': 'awaitingDriver'})
-    assert status_text(waiting, True) == ('Stopped at stop sign', 'tap gas to go')
-    signal = plan(state='holding', shouldStop=True, reason='Stopped at signal — tap gas to go',
-                  mapControl={'kind': 'signal', 'action': 'awaitingDriver'})
-    assert status_text(signal, True) == ('Stopped at signal', 'tap gas to go')
+    assert status_text(waiting, True) == ('Stopped at stop sign', 'take control')
+    left = plan(state='holding', shouldStop=True, reason='Unprotected left: take control',
+                mapControl={'kind': 'unprotectedTurn', 'action': 'awaitingDriver'})
+    assert status_text(left, True) == ('Stopped at unprotected turn', 'take control')
     red = plan(state='holding', shouldStop=True, reason='Red light (sim oracle)',
                mapControl={'kind': 'signal', 'action': 'held', 'lightState': 'red', 'lightSource': 'simOracle'})
     assert status_text(red, True) == ('Red light', 'sim oracle')

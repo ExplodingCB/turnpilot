@@ -419,22 +419,6 @@ def test_fault_keeps_a_junction_open():
     assert (d.reason == "waiting for oncoming") == held, distance
 
 
-def test_the_go_that_released_a_map_stop_never_releases_the_oncoming_hold():
-  # the driver's gas tap at an unprotected left's hold line is the map latch's go (map_controls.py): the detector still
-  # holds the car for a car it sees coming. Only another press, the driver overriding the detector, releases that
-  oncoming = scene([car(40., 5., vx=-10., age=VEL_TRUST_HITS)])
-  sp = ScenePolicy()
-  d = sp.update(oncoming.objects, True, LEFT_TURN, HOLD_LINE_M + 0.8, 0., maneuver_id=3, gas_pressed=True, go_press=True)
-  assert d.should_stop and d.reason == "waiting for oncoming"
-  for _ in range(10):  # the same press, held
-    d = sp.update(oncoming.objects, True, LEFT_TURN, HOLD_LINE_M + 0.8, 0., maneuver_id=3, gas_pressed=True, go_press=True)
-    assert d.should_stop and d.reason == "waiting for oncoming"
-  d = sp.update(oncoming.objects, True, LEFT_TURN, HOLD_LINE_M + 0.8, 0., maneuver_id=3)
-  assert d.should_stop
-  d = sp.update(oncoming.objects, True, LEFT_TURN, HOLD_LINE_M + 0.8, 0., maneuver_id=3, gas_pressed=True)
-  assert not d.holding and sp.released_id == 3
-
-
 def test_after_the_go_an_oncoming_car_still_holds_short_of_the_oncoming_lanes():
   # pulling away from the hold line past COMMIT_SPEED is no commitment while the car can still stop short of the oncoming
   # lanes on the comfortable curve (BeamNG: the hold depended on the car happening to be under 2 m/s there)

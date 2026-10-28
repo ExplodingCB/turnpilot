@@ -148,30 +148,20 @@ def test_lane_not_confirmed_is_said_with_a_chime():
   assert a.alert_text_1 == "Wrong Lane" and a.audible_alert == AudibleAlert.none
 
 
-def test_map_control_prompts_chime_and_yield_is_silent():
-  a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt='stopSignGo', reason='Stopped at stop sign — tap gas to go')))
-  assert a.alert_text_1 == 'Stopped at stop sign — tap gas to go' and 'press accelerator to go' in a.alert_text_2
-  assert a.audible_alert == AudibleAlert.prompt
-  a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt='signalGo', reason='Signal ahead: light not checked')))
-  assert 'press accelerator to proceed' in a.alert_text_2 and a.audible_alert == AudibleAlert.prompt
+def test_map_control_prompts_hand_back_loudly_and_yield_is_silent():
+  a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt='stopSignTakeControl', reason='Stop sign: take control to proceed')))
+  assert a.alert_text_1 == 'Stop sign: take control to proceed' and a.alert_text_2 == "TurnPilot can't check cross traffic"
+  assert a.audible_alert == AudibleAlert.tpHandback
   a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt='yieldAhead')))
   assert a.audible_alert == AudibleAlert.none
-  a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt='unprotectedTurnGo',
-                                                           reason='Stopped at unprotected left — tap gas to go')))
-  assert a.alert_text_1 == 'Stopped at unprotected left — tap gas to go' and 'check oncoming traffic' in a.alert_text_2
-  assert a.audible_alert == AudibleAlert.prompt
-  a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt='unprotectedTurnGo')))
-  assert a.alert_text_1 == 'Unprotected Turn'
-  # the model stopped on its own, nothing holding the car: the driver's go, with a chime
-  a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt='carStoppedGo', reason='Car stopped — tap gas to continue')))
-  assert a.alert_text_1 == 'Car stopped — tap gas to continue' and 'press accelerator to continue' in a.alert_text_2
-  assert a.audible_alert == AudibleAlert.prompt
+  a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt='unprotectedTurnTakeControl')))
+  assert a.alert_text_1 == 'Unprotected Turn: Take Control' and a.audible_alert == AudibleAlert.tpHandback
 
 
 def test_map_control_alerts():
   a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='cannotStopComfortably')))
   assert a.alert_text_1 == 'Take Control' and a.audible_alert == AudibleAlert.tpHandback
-  for kind in ('stopOverrun', 'proceedingOnYellow', 'goingOnRed', 'junctionUncertain'):
+  for kind in ('stopOverrun', 'proceedingOnYellow', 'junctionUncertain'):
     a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert=kind)))
     assert a.audible_alert == AudibleAlert.prompt and a.duration >= 200, kind
   for kind in ('mapControlsUnavailable', 'lightSourceRejected'):
@@ -186,17 +176,16 @@ def test_map_control_alerts():
   assert a.alert_text_1 == 'TAKE CONTROL' and a.audible_alert == AudibleAlert.tpHandback
 
 
-def test_cannot_stop_outranks_and_the_prompt_chimes_once():
+def test_cannot_stop_outranks_and_the_handback_chimes_while_it_lasts():
   slot = AlertSlot()
   a = slot.step(plan(controlAlert='cannotStopComfortably', tooFastToTurn=True))
   assert a.alert_type == 'turnpilotControlAlert/warning'
   sounds = []
   for _ in range(300):
-    a = slot.step(plan(controlPrompt='stopSignGo', reason='Stopped at stop sign — tap gas to go'))
+    a = slot.step(plan(controlPrompt='stopSignTakeControl', reason='Stop sign: take control to proceed'))
     sounds.append(a.audible_alert)
   assert a.alert_type == 'turnpilotControlPrompt/warning'
-  # once the take-control alert's own short hold is over, one prompt alert held up: soundd plays its one-shot sound once
-  assert all(s == AudibleAlert.prompt for s in sounds[20:])
+  assert all(s == AudibleAlert.tpHandback for s in sounds[20:])
 
 
 def test_a_hard_brake_for_a_confirmed_pedestrian_is_raised_first_with_the_handback_chime():
@@ -205,3 +194,13 @@ def test_a_hard_brake_for_a_confirmed_pedestrian_is_raised_first_with_the_handba
   assert a.audible_alert == AudibleAlert.tpHandback and a.visual_alert == VisualAlert.fcw
   from openpilot.selfdrive.turnpilot.hooks import plan_events
   assert plan_events(FakeSM(plan(controlAlert='hardBrake', tooFastToTurn=True))) == ['turnpilotControlAlert']
+
+
+def test_take_control_prompts_are_loud_and_outrank_a_skip():
+  from openpilot.selfdrive.turnpilot.hooks import plan_events
+  for prompt, title in (('stopSignTakeControl', 'Stop sign: take control to proceed'),
+                        ('unprotectedTurnTakeControl', 'Unprotected left: take control')):
+    a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt=prompt, reason=title)))
+    assert a.alert_text_1 == title and a.audible_alert == AudibleAlert.tpHandback
+    assert a.visual_alert == VisualAlert.steerRequired and 'accelerator' not in a.alert_text_2
+    assert plan_events(FakeSM(plan(controlPrompt=prompt, tooFastToTurn=True))) == ['turnpilotControlPrompt']
