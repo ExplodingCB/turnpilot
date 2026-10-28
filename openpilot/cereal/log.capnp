@@ -2503,8 +2503,7 @@ struct NavInstruction {
     id @0 :UInt16;            # index along the route; the identity is (routeCount, id)
     kind @1 :ControlKind;
     distance @2 :Float32;     # m to the stop point (the line less a margin)
-    lineMapped @3 :Bool;      # the line came from mapped data (the sim's controls.json, or the OSM stop node from the OSM
-                              # stop-sign sidecar, routing/osm_sidecar.py), not the junction less 10 m
+    lineMapped @3 :Bool;      # the line came from mapped data (the sim sidecar), not the junction less 10 m
     junction @4 :Bool;        # other roads meet the route at its node
     crossSuspect @5 :Bool;    # the route's road outranks every crossing one: a stop/yield likely for the cross road
   }

@@ -265,7 +265,8 @@ def replay(fixture):
 
 def test_c13_an_osm_mapped_stop_valhalla_does_not_flag_is_returned(tmp_path):
   """A quarter of the OSM-mapped stop approaches have no stop_sign flag in Valhalla's tiles (research_allway.md section 0):
-  the sidecar's stop is unioned in, at its real line, the OSM stop node."""
+  the sidecar's stop is unioned in, at the default stop point (the edge's end less CONTROL_LINE_M), its OSM stop node
+  carried as data only (osm_sign_m, for route_audit; SG1b's stop-point rule may move it)."""
   fixture = json.loads((FIXTURES / 'valhalla_unflagged_stop.json').read_text())
   assert route_controls(replay(fixture), fixture['steps']) == ([], 'ok')  # Valhalla alone: no stop there
   side = tmp_path / 'pack'
@@ -276,8 +277,8 @@ def test_c13_an_osm_mapped_stop_valhalla_does_not_flag_is_returned(tmp_path):
   controls, status = route_controls(replay(fixture), fixture['steps'], sidecar_dir=side)
   assert status == 'ok'
   assert [(c.kind, c.line_mapped, c.line_source, c.osm_node, c.step_idx, c.junction_status) for c in controls] == \
-    [('stop', True, 'osm', 5001, 0, 'ok')]
-  assert abs(controls[0].route_m - (135. - MAP_MARGIN_M)) < 0.5
+    [('stop', False, 'default', 5001, 0, 'ok')]
+  assert abs(controls[0].route_m - (150. - OFF)) < 0.5 and abs(controls[0].osm_sign_m - 135.) < 0.5
 
 
 def test_c14_a_phantom_far_end_flag_is_overruled_by_the_sidecars_direction(tmp_path):
@@ -329,18 +330,21 @@ def test_the_sidecar_entry_for_an_edge_is_the_one_whose_line_is_inside_it(tmp_pa
   side = {'77:f': [entry('stop', 185., junction=902), entry('stop', 80., junction=901), entry('stop', 300., junction=903, east=30.)]}
   controls, status = route_controls(v, steps(), sidecar_dir=osm_dir(tmp_path, side))
   assert status == 'ok'
-  assert [(c.kind, round(c.route_m, 1), c.osm_node, c.line_mapped) for c in controls] == \
-    [('stop', 80. - MAP_MARGIN_M, 901, True), ('stop', 185. - MAP_MARGIN_M, 902, True)]
+  assert [(c.kind, round(c.route_m, 1), c.osm_node, c.line_mapped, round(c.osm_sign_m, 1)) for c in controls] == \
+    [('stop', 100. - OFF, 901, False, 80.), ('stop', 200. - OFF, 902, False, 185.)]
 
 
-def test_a_flagged_stop_takes_the_sidecars_line_and_node(tmp_path):
-  v = StubValhalla([(0., 100., {'stop': True, 'way_id': 77}), (100., 400., {})])
-  controls, _ = route_controls(v, steps(), sidecar_dir=osm_dir(tmp_path / 'a', {'77:f': [entry('stop', 82., junction=900)]}))
-  assert [(round(c.route_m, 1), c.line_mapped, c.line_source, c.osm_node) for c in controls] == [(81., True, 'osm', 900)]
-  # an OSM stop node is a sign's place, not a line: one nearer the junction than the default line never moves the stop
-  # nearer (SG1b's stop point takes the cross road's width into account)
-  controls, _ = route_controls(v, steps(), sidecar_dir=osm_dir(tmp_path / 'b', {'77:f': [entry('stop', 95., junction=900)]}))
-  assert [(round(c.route_m, 1), c.line_mapped, c.line_source, c.osm_node) for c in controls] == [(100. - OFF, False, 'default', 900)]
+@pytest.mark.parametrize('kind, sign_m', [('stop', 82.), ('stop', 70.), ('stop', 95.), ('yield', 66.)])
+def test_b2_an_osm_stop_node_never_moves_the_stop_point(tmp_path, kind, sign_m):
+  """An OSM stop node marks a sign, not a line, and SG1a moves no stop point: Valhalla's stop or yield stays at the
+  default (its edge's end less CONTROL_LINE_M) whether the sign is 18, 30 or 5 m back, and takes the sidecar's junction
+  node and the sign's place as data (osm_sign_m, route_audit). A yield moved back to its sign would end map_controls'
+  YIELD_SPEED cap there, 30-40 m short of the merge (the I-70 East on-ramp's moved from 749 to 715 m), so the car could
+  reach the conflict point well above 5 m/s. SG1b's stop-point rule, which knows the cross road's width, may move it."""
+  v = StubValhalla([(0., 100., {kind: True, 'way_id': 77}), (100., 400., {})])
+  controls, _ = route_controls(v, steps(), sidecar_dir=osm_dir(tmp_path, {'77:f': [entry(kind, sign_m, junction=900)]}))
+  assert [(c.kind, round(c.route_m, 1), c.line_mapped, c.line_source, c.osm_node, round(c.osm_sign_m, 1)) for c in controls] == \
+    [(kind, 100. - OFF, False, 'default', 900, sign_m)]
 
 
 def test_a_junction_node_stop_from_the_sidecar_is_on_the_edge_ending_there(tmp_path):

@@ -15,14 +15,14 @@ def test_every_stop_and_yield_approach_with_both_sources(tmp_path):
   report = route_audit.audit(v, steps(), None, osm_dir(tmp_path, side))
   assert report.status == 'ok' and report.sidecar == 'ok'
   assert [c.kind for c in report.controls] == ['stop', 'yield', 'signal']  # the signal is a control, not a stop or yield row
-  rows = [(r.key, r.valhalla, r.sidecar, r.line_source, r.osm_node, r.control) for r in report.rows]
-  assert rows == [
-    ('71:f', 'stop', 'stop (mid_directed, stop=minor)', 'osm', 901, 'stop at 81 m'),
-    ('72:f', '-', 'yield (mid_undirected, stop=none)', 'osm', 902, 'yield at 184 m'),
-    ('74:b', 'stop (phantom: dropped)', '-', '-', 0, '-'),
+  rows = [(r.key, r.valhalla, r.sidecar, r.line_source, r.sign_m, r.osm_node, r.control) for r in report.rows]
+  assert rows == [  # the OSM sign is shown where it is; the stop point stays the default (SG1a moves none)
+    ('71:f', 'stop', 'stop (mid_directed, stop=minor)', 'default', 82., 901, 'stop at 89 m'),
+    ('72:f', '-', 'yield (mid_undirected, stop=none)', 'default', 185., 902, 'yield at 189 m'),
+    ('74:b', 'stop (phantom: dropped)', '-', '-', None, 0, '-'),
   ]
   text = '\n'.join(route_audit.lines(report))
-  for word in ('71:f', 'Valhalla', 'sidecar', 'line', 'OSM node', '901', 'phantom', 'yield (mid_undirected'):
+  for word in ('71:f', 'Valhalla', 'sidecar', 'line', 'sign m', 'OSM node', '901', 'phantom', 'yield (mid_undirected'):
     assert word in text
   assert json.loads(json.dumps(route_audit.as_json(report)))['rows'][0]['osm_node'] == 901
 

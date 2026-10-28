@@ -12,8 +12,9 @@ is (tiles built from its PBF carry their controls): build_region.py --sidecar-on
 One row per route edge where Valhalla or the sidecar has a stop or yield (routing/controls.py's union): the m along the
 route of the edge's end (its node), the edge's way and direction, Valhalla's flag (a phantom it made of a stop it can't
 direct is shown dropped), the sidecar's entries (kind, evidence, stop=all|minor|none), the line source of the control there
-(osm: the OSM stop node; sim: the sim's controls.json; default: the node less 10 m), the OSM junction node, and the control
-navd sends (its kind and stop point). An internal-intersection edge's row says which junction's control it joined.
+(sim: the sim's controls.json; default: the node less 10 m), where the OSM stop node is (the sign: data only, it never
+moves the stop point in SG1a), the OSM junction node, and the control navd sends (its kind and stop point). An
+internal-intersection edge's row says which junction's control it joined.
 """
 import argparse
 import json
@@ -36,6 +37,7 @@ class Row:
   osm_node: int        # the OSM junction node the sidecar names (0 none)
   control: str         # the control navd sends there, '-' for none
   joins: int = -1      # an internal edge's: the trace edge whose junction its control is
+  sign_m: float | None = None  # m along the route of the OSM stop node on the control's edge (data only), None for none
 
 
 @dataclass
@@ -60,8 +62,9 @@ def audit(call, steps, tiles_dir, sidecar_dir) -> Report:
     sidecar = ', '.join(f"{h['kind']} ({h['evidence']}, stop={h['stop_tag']})" for h in e['osm']) or '-' if checked else 'not checked'
     c = by_edge.get(e['anchor'])
     osm_node = next((int(h['junction_node']) for h in e['osm'] if h.get('junction_node')), c.osm_node if c is not None else 0)
+    sign_m = None if c is None or c.osm_sign_m is None else round(c.osm_sign_m, 1)
     rows.append(Row(round(e['end_m'], 1), e['key'], e['internal'], valhalla, sidecar, c.line_source if c is not None else '-', osm_node,
-                    f"{c.kind} at {c.route_m:.0f} m" if c is not None else '-', e['anchor'] if e['internal'] else -1))
+                    f"{c.kind} at {c.route_m:.0f} m" if c is not None else '-', e['anchor'] if e['internal'] else -1, sign_m))
   detail = 'none expected' if side is None else side.status + (f" ({side.detail})" if side.detail else '')
   total = sum(float(s.get('distance', 0.)) for s in steps)
   return Report(status, detail, rows, controls, total)
@@ -69,10 +72,11 @@ def audit(call, steps, tiles_dir, sidecar_dir) -> Report:
 
 def lines(report: Report) -> list[str]:
   out = [f"Route {report.route_m / 1000:.2f} km: controls status {report.status}, OSM sidecar: {report.sidecar}",
-         f"{'node m':>8}  {'way:dir':<16} {'Valhalla':<26} {'sidecar':<40} {'line':<8} {'OSM node':>12}  control"]
+         f"{'node m':>8}  {'way:dir':<16} {'Valhalla':<26} {'sidecar':<40} {'line':<8} {'sign m':>7} {'OSM node':>12}  control"]
   for r in report.rows:
     way = r.key + (f" (median, joins {r.joins})" if r.internal else '')
-    out.append(f"{r.node_m:>8.1f}  {way:<16} {r.valhalla:<26} {r.sidecar:<40} {r.line_source:<8} {r.osm_node or '-':>12}  {r.control}")
+    sign = '-' if r.sign_m is None else f"{r.sign_m:.0f}"
+    out.append(f"{r.node_m:>8.1f}  {way:<16} {r.valhalla:<26} {r.sidecar:<40} {r.line_source:<8} {sign:>7} {r.osm_node or '-':>12}  {r.control}")
   if not report.rows:
     out.append("(no stop or yield approach on the route)")
   out.append(f"{len(report.rows)} stop/yield approaches; navd sends {len(report.controls)} controls: " +
@@ -83,7 +87,8 @@ def lines(report: Report) -> list[str]:
 def as_json(report: Report) -> dict:
   return {'status': report.status, 'sidecar': report.sidecar, 'route_m': report.route_m, 'rows': [asdict(r) for r in report.rows],
           'controls': [{'kind': c.kind, 'route_m': round(c.route_m, 1), 'line_source': c.line_source, 'osm_node': c.osm_node,
-                        'junction_status': c.junction_status} for c in report.controls]}
+                        'osm_sign_m': None if c.osm_sign_m is None else round(c.osm_sign_m, 1), 'junction_status': c.junction_status}
+                       for c in report.controls]}
 
 
 def point(text: str) -> tuple[float, float]:

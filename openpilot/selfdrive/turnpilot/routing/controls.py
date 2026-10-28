@@ -27,11 +27,12 @@ junction: other roads meet at the end node. crossSuspect (stop and yield only): 
 crossing there, so the sign is likely the cross road's.
 The stop line: a sim sidecar (tiles_dir/controls.json, {"controls": {"<way_id>:<f|b>": {kind, line: [lat, lon], ...}}} from
 tools/sim/bridge/beamng/mapsignals.py) gives the sim's real lines, projected onto the route within the edge (lineMapped,
-line source sim). Else the OSM stop node of the control's kind on its own edge (lineMapped, line source osm), but only where
-it is at least CONTROL_LINE_M back from the edge's end: an OSM stop node marks a sign, not a line, and one mapped nearer
-the junction never moves a stop nearer than the default (the stop-point rule that knows the cross road's width is SG1b's).
-Otherwise the edge's end less CONTROL_LINE_M. Either way less MAP_MARGIN_M. osm_node is the OSM junction the sidecar
-says the control governs (0 when it has none).
+line source sim). Otherwise the edge's end less CONTROL_LINE_M (line source default), for Valhalla's controls and the
+sidecar's alike. Either way less MAP_MARGIN_M. The OSM stop node never sets it: it marks a sign, not a line, 20-40 m back
+on some approaches, and a yield moved back to its sign would end map_controls' YIELD_SPEED cap well short of the merge.
+It is carried as data only (osm_sign_m: the sign nearest the junction on the control's own edge, for route_audit); the
+stop-point rule that knows the cross road's width is SG1b's. osm_node is the OSM junction the sidecar says the control
+governs (0 when it has none).
 Off the route (controls_ahead): the same, over the road ahead of the car instead of a route's shape. Locate (verbose, by
 the car's heading) gives the edge the car is on and its shape from the car on; from its end node, the edge that carries on
 nearest the bearing it arrives with (within NEXT_HEADING_TOL: the road straight on), and so on to AHEAD_M or AHEAD_EDGES.
@@ -95,8 +96,10 @@ class Control:
   cross_suspect: bool = False
   instance: str = ''   # the sim's signal instance its line came from (the sidecar), for logs and tests
   point: tuple[float, float] | None = None  # (lat, lon) of the stop point: controls_ahead's, which navd measures from
-  line_source: str = 'default'  # 'sim' (the sim's controls.json), 'osm' (the OSM stop node) or 'default' (the end less 10 m)
+  line_source: str = 'default'  # 'sim' (the sim's controls.json) or 'default' (the edge's end less 10 m)
   osm_node: int = 0    # the OSM junction node the sidecar says it governs; 0 none
+  osm_sign_m: float | None = None  # m along the route (navd's frame) of the OSM stop node on its edge, nearest the junction:
+                                   # data only (route_audit), never the stop point
   junction_status: str = 'ok'  # 'failed' for a stop or yield when the OSM sidecar was missing or stale (STOP_SIGNS.md N7;
                                # MapJunction.status, SG1b)
   edge: int = -1       # the trace edge whose end it is at (route_audit.py)
@@ -512,18 +515,18 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
       p = project(pts, cum, tuple(sim_entry['line']), end_m - span - 1., end_m + 1.)
       if p is not None:
         line_m, mapped, instance, source = p, True, sim_entry.get('instance', ''), 'sim'
-    if source == 'default' and own:
-      m, entry = own[-1]  # the line nearest the junction, if the way has two
-      osm_node = int(entry.get('junction_node') or 0)
-      if m <= end_m - CONTROL_LINE_M:
-        line_m, mapped, source = m, True, 'osm'
+    sign_m = None
+    if own:
+      sign_m, entry = own[-1]  # the sign nearest the junction, if the way has two: data, never the stop point
+      osm_node = int(entry.get('junction_node') or 0) or osm_node
     failed = osm is not None and not osm_ok and kind in ('stop', 'yield')
-    found.append((line_m - MAP_MARGIN_M, kind, mapped, junction, cross_suspect, instance, source, osm_node, 'failed' if failed else 'ok', a))
+    found.append((line_m - MAP_MARGIN_M, kind, mapped, junction, cross_suspect, instance, source, osm_node, 'failed' if failed else 'ok', a,
+                  sign_m))
   controls = []
-  for i, (s, kind, mapped, junction, suspect, instance, source, osm_node, jstatus, a) in enumerate(sorted(found, key=lambda c: c[0])):
+  for i, (s, kind, mapped, junction, suspect, instance, source, osm_node, jstatus, a, sign_m) in enumerate(sorted(found, key=lambda c: c[0])):
     step_idx, along, route_m = to_step(starts, max(s, 0.))
     controls.append(Control(i, kind, route_m, step_idx, along, mapped, junction, suspect, instance, line_source=source, osm_node=osm_node,
-                            junction_status=jstatus, edge=a))
+                            osm_sign_m=None if sign_m is None else to_step(starts, max(sign_m, 0.))[2], junction_status=jstatus, edge=a))
   side = 'none expected' if osm is None else osm.status
   cloudlog.info(f"turnpilot controls: {len(controls)} on the route ({status}), {unmatched}/{len(edges)} edges unmatched, OSM sidecar {side}")
   return controls, status
