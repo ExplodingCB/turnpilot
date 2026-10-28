@@ -869,3 +869,8 @@ def test_the_turn_light_is_the_signal_at_the_lefts_junction_from_any_source():
   assert car.policy.turn_light(7, 250. - car.s) == 'unknown'
   # another maneuver's junction isn't this one's
   assert car.policy.turn_light(8, 400.) == 'none'
+  # navd's controls failing (no junction data is never clear): whether there is a signal isn't known, so its light isn't
+  car = left_car()
+  car.status = 'failed'
+  car.run(1.)
+  assert car.policy.turn_light(7, 250. - car.s) == 'unknown'

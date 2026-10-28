@@ -409,15 +409,17 @@ class UnprotectedLeft:
     # held short of its line (the latch reaches LATCH_NEAR_M short of it), where the longer crossing puts R_req past the
     # range: rolled up to the line first (the latch's creep), where it is judged (BeamNG: held 16 m out, R_req 164 m)
     short = inp.distance - LINE_D
-    if inp.mode == AUTO and rreq > inp.range_m and short > ROLL_UP_M and not self.hold_here:
+    roll_up = inp.mode == AUTO and rreq > inp.range_m and short > ROLL_UP_M and not self.hold_here
+    if roll_up and not held_else:
       self.roll_stall = self.roll_stall + dt if inp.v_ego < 0.3 else 0.
       if self.roll_stall < ROLL_UP_STALL_S - 1e-6:
         self.creep_to = max(self.latch_d - LINE_D, 0.)
         out.state = self.state = 'creep'
         out.prompt, out.reason, out.creep_m = 'creepingForView', "Rolling up to the line", self.creep_to
         return out
-    # faults: never a go it can't judge
-    if rreq > inp.range_m:
+    # faults: never a go it can't judge. Short of its line under another hold or a light not green it waits where it is (no
+    # roll-up toward the junction under a red), its reach judged from the line once it has rolled up
+    if rreq > inp.range_m and not (roll_up and held_else):
       return self._undecided(out, 'range')
     if self.road_age > STALE_UNDECIDED_S:
       return self._undecided(out, 'stale')

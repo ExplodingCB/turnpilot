@@ -334,14 +334,16 @@ class MapControlPolicy:
   def turn_light(self, maneuver_id: int, distance: float) -> str:
     """The light of the signal at the junction of the unprotected turn maneuver_id, distance m ahead, for the autonomous
     left's go (unprotected_left.py: DESIGN G4 go condition 5): 'none' with no signal there (one from PROTECT_BEFORE_M
-    before it to PROTECT_PAST_M past it, once seen the junction's for good: it drops out 15 m behind the car); else what
+    before it to PROTECT_PAST_M past it, once seen the junction's for good: it drops out 15 m behind the car), 'unknown'
+    with navd's controls failing or unsupported (whether there is one isn't known); else what
     every source reads around the junction (PROTECT_BEFORE_M before it to CAMERA_ASSOC_PAST_M past it), the camera's in
     shadow too: it only ever keeps the car where it stands, never brakes it. Red over yellow over green; 'unknown' with no
     read. The last update's lights."""
     if any(c.kind == 'signal' and distance - PROTECT_BEFORE_M <= c.d <= distance + PROTECT_PAST_M for c in self.tracker.controls.values()):
       self._signal_turn_id = maneuver_id
     if self._signal_turn_id != maneuver_id:
-      return 'none'
+      # navd's controls failing or unsupported: a signal there isn't known not to be (no junction data is never clear)
+      return 'unknown' if self.tracker.route and self.tracker.status not in ('ok', 'none') else 'none'
     lo, hi = distance - PROTECT_BEFORE_M, distance + CAMERA_ASSOC_PAST_M
     lights = self._lights
     states = {st for st, d in (lights.lights or []) if lo <= d <= hi}

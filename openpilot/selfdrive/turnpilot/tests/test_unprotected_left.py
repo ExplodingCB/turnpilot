@@ -499,3 +499,15 @@ def test_a_go_never_outlives_another_hold_or_a_change_before_its_commit():
   j.step(v=0.5, distance=HOLD_D - 0.1)
   d = j.step(v=3.5, distance=ONCOMING_ENTRY_M + 2., objects=[walker])
   assert d.state in ('go', 'committed') and not d.stops
+
+
+def test_held_short_of_its_line_under_a_red_it_waits_where_it_is():
+  # held short of its line where R_req from there is past the range, under a red (or anything else holding the car): no roll-up
+  # toward the junction under it, and no 'range' fault for a reach it will judge from the line once it has rolled up
+  from openpilot.selfdrive.turnpilot.unprotected_left import LINE_D, ROLL_UP_STALL_S
+  for kw in ({'light': 'red'}, {'other_hold': True}):
+    j = Junction()
+    d = j.wait(ROLL_UP_STALL_S + 2., distance=16., v=0., **kw)
+    assert d.r_req > RANGE and d.state == 'waitGap' and d.creep_m == 0. and not any(x.go for x in j.decisions), kw
+    d = j.step(distance=16., v=0., light='green')
+    assert d.state == 'creep' and abs(d.creep_m - (16. - LINE_D)) < 1e-6 and d.reason == "Rolling up to the line", kw
