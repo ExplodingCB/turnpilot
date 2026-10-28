@@ -28,7 +28,8 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   at its hold line (unprotectedTurnTakeControl: no gap judgement yet). Releasing a control releases those RELEASE_SPAN_M
   past it too (the far side of a divided road).
 - A signal adds nothing (Kellen, 2026-10-28: through greens without slowing; DESIGN phase 4, G1): no stop, no cap, no
-  prompt, unless an accepted light source reads red or yellow for it. The driving model's own braking is the car's
+  prompt, unless an accepted light source reads red or yellow for it (the autonomous left standing at its line is the one
+  exception: it goes only on a green read, turn_light). The driving model's own braking is the car's
   red-light handling; the map signal is only where a light is looked for. On the car this week no light source is
   accepted (the camera's reader ships in shadow), so a mapped signal never slows the car; in the sim the light oracle
   stands in for it, so a sim red still stops. A red is a stop on the MAP_STOP_DECEL curve, seeded where it is first read
@@ -42,7 +43,9 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   default) its governing heads are associated with the signals (a head from CAMERA_ASSOC_BEFORE_M short of a signal's
   line to CAMERA_ASSOC_PAST_M past it is that signal's, the last line before it winning) and what it would do is logged
   on every change (turnpilot.camera_light_shadow; turnpilot.camera_light_unmapped for a red or yellow with no mapped
-  signal: no synthetic control, CRITIQUE cut), and nothing it reads reaches a stop, a cap, a prompt or a release. Its
+  signal: no synthetic control, CRITIQUE cut), and nothing it reads reaches a stop, a cap, a prompt or a release: the one
+  thing it gates is the autonomous left's go (turn_light, its red too: keeping the car standing where it is never brakes
+  it), which at a signal needs a green read from some source (unprotected_left.SIGNAL_NEEDS_GREEN). Its
   reader turned off for the drive is said once (lightSourceRejected, "Camera light reader off for this drive"), on its
   own hold and only where no other alert is said, so it never mutes a take-control, overrun or yellow alert. Add-only
   needs both keys, modeld's message not shadow and turnpilotd's own TurnPilotCameraLights addOnly: then a camera red

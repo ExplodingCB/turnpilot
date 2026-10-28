@@ -696,7 +696,9 @@ class TurnPilot:
     for the junction rules' road frame (scene_policy.road_frame): a turn pulsed on the approach that left the car standing
     at its hold line 30-45 deg in, or the autonomous left's from its go (its first pulse). Before the desire the model
     follows its lane, so the car stands aligned with it and the yaw read meanwhile is the road's bend: never counted (the
-    band would turn off the oncoming lane). Counted only moving (YAW_MIN_SPEED). Last frame's desire state."""
+    band would turn off the oncoming lane). Counted only moving (YAW_MIN_SPEED). Last frame's desire state. A turn that still
+    pulses on its approach (TURN_DESIRE_LEAD_M: TurnPilotAutoLeft off or announce, a left a stop sign protects) still counts
+    a bend between its pulse and its line: nothing here knows the road's own heading (the map's would)."""
     d = self.desires
     pulsed = d.maneuver_id == rf.maneuver_id and d.started
     if maneuver is None or maneuver.kind != TURN or rf.maneuver_id != self._yaw_id or not pulsed:
