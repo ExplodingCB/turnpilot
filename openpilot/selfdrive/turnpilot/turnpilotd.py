@@ -66,8 +66,9 @@ A go the car hasn't pulled away on (STANDSTILL_SPEED) within NO_MOVE_S, LEFT_NO_
 REQUIRED 4: its gap runs out while it stands), counting only while nothing else holds it (no TurnPilot hold, no close lead,
 no pedal), is the model holding the car: TurnPilot withdraws the go before the car moves, holding it standing (shouldStop,
 a 0 speed cap: braking at -2.0 at most, from under 0.3 m/s; no turn pulse), and hands back loudly (controlPrompt
-cantStartTakeControl, NO_MOVE_REASON) until the driver takes over (openpilot disengaged: any gas press). The turn isn't
-cancelled: its desire state stays, and the driver drives it.
+cantStartTakeControl, NO_MOVE_REASON) until the driver takes over (openpilot disengaged: any gas press); a scene hold
+that comes and goes meanwhile (a walker crossing) is no new go. The turn isn't cancelled: its desire state stays, and the
+driver drives it.
 Standing engaged with nothing of TurnPilot's holding the car (no shouldStop, no cap biting), no lead from the model within
 STOPPED_LEAD_M (one further on doesn't hold a standing car), gas and brake off, the model stopped on its own: said on the
 status line after STOPPED_NOTE_S (STOPPED_NOTE), and handed back loudly (controlPrompt carStoppedTakeControl) after
@@ -461,6 +462,7 @@ class TurnPilot:
     self.release_go = self.was_stopping and not decision.should_stop and v_ego < STANDSTILL_SPEED
     self.was_stopping = decision.should_stop
     withdrawn = self.no_move(sm, cs, v_ego, acting, decision)
+    self.release_go = self.release_go and not withdrawn  # handed back: a hold that comes and goes is no new go
 
     lanes = model_lanes_from_msg(model)
     desire = self.desires.update(desire_on, rf.distance, rf.maneuver_id, rf.passed, v_ego, cs.steeringAngleDeg,

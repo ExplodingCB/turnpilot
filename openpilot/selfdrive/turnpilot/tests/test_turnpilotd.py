@@ -2275,3 +2275,18 @@ def test_an_unprotected_turns_go_is_withdrawn_after_a_shorter_no_move():
   tp.left_go_profile = 'graduated'  # the limit goes with the turn, not the profile
   tp.start_post_go(left, 9., 0., True)
   assert tp.no_move_limit == LEFT_NO_MOVE_S
+
+
+def test_a_withdrawn_go_is_not_given_again_by_a_hold_that_comes_and_goes():
+  """Withdrawn and handed back, the car held: a walker crossing in front (a scene hold) and clearing is no new go. The
+  driver was told to take control, and only the driver taking over ends it."""
+  sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
+  go_from_the_hold(sim)
+  assert stand(sim, NO_MOVE_S + 0.2)[-1].controlPrompt == 'cantStartTakeControl'
+  walker = ({'cls': 'pedestrian', 'x': 4., 'y': 0.1, 'vx': 0., 'vy': 0., 'inPath': True},)
+  held = stand(sim, 2., objects=walker)
+  assert all(p.shouldStop for p in held)
+  plans = [sim.step(engaged=True) for _ in range(int(5. / DT_MDL))]
+  assert all(p.controlPrompt == 'cantStartTakeControl' and p.shouldStop and p.desire == Desire.none for p in plans)
+  assert sim.v < 0.05
+
