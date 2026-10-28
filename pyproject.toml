@@ -1,7 +1,7 @@
 [project]
 name = "openpilot"
 requires-python = ">= 3.12.3, < 3.13"
-license = {text = "MIT License"}
+license = {text = "AGPL-3.0-only"}
 version = "0.1.0"
 description = "an open source driver assistance system"
 authors = [
