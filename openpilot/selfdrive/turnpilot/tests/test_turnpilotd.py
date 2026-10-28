@@ -14,7 +14,8 @@ from openpilot.selfdrive.turnpilot.desire_timing import TURN_DESIRE_LEAD_M
 from openpilot.selfdrive.turnpilot.turn_skip import MIN_FIRST_PULSE_M
 from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP, V_TURN_MIN
 from openpilot.selfdrive.turnpilot.turnpilotd import (CAR_UNKNOWN_REASON, DETECTOR_DEADLINE_S, DETECTOR_START_DEADLINE_S, NO_LONG_REASON,
-                                                       STOPPED_LEAD_M, STOPPED_PROMPT_S, STOPPED_REASON, WAITING_REASON, TurnPilot, long_control_for)
+                                                       STOPPED_LEAD_M, STOPPED_PROMPT_S, STOPPED_REASON,
+                                                       TURN_MISSED_REASON, WAITING_REASON, TurnPilot, long_control_for)
 from openpilot.selfdrive.turnpilot.handback import Handback
 from openpilot.selfdrive.turnpilot.scene.tracker import STALE_S
 
@@ -1885,3 +1886,45 @@ def test_a_turn_lane_a_map_stop_leaves_no_room_for_is_skipped_out_loud_never_tur
   assert any(p.laneChangeWait == 'beforeWindow' for p in plans[:first])
   assert all(p.desire == Desire.none for p in plans)
   assert all(p.tooFastToTurn for p in plans[first:] if p.maneuverDistance > 0.)
+
+
+def go_from_the_hold(sim):
+  """TURNS_AHEAD's unprotected left: stopped at its hold line 9 m out, then the driver's go. Returns the go's plan."""
+  sim.go_taps = False
+  stop_at(sim, 300.)
+  sim.run(1.)
+  plan = sim.step(gas=True, engaged=True)
+  assert not plan.shouldStop and plan.desire == Desire.turnLeft  # the go pulse, at standstill
+  return plan
+
+
+def test_a_turn_from_a_standstill_driven_straight_past_its_junction_is_missed_out_loud():
+  """BeamNG standstill sweep, 2026-10-28: released from a stop, the car went straight on 7 of 21 times, with the model's
+  turn desire out and nothing said, then drove on displaced into the oncoming lane. Past the junction (the follower's pass)
+  having turned under 15 deg, the turn is missed: said with a chime ('Turn Missed', 'Rerouting', the too-fast-to-turn
+  alert) and navd reroutes at once. Nothing brakes for it."""
+  sim = Sim(TURNS_AHEAD)
+  go_from_the_hold(sim)
+  plans = []
+  while sim.s < 340.:
+    plans.append(sim.step(engaged=True))  # straight on: no yaw
+  passed = next(i for i, p in enumerate(plans) if p.turnMissed)
+  assert plans[passed].maneuverDistance < -10.  # at the pass, not before it
+  assert not any(p.turnMissed or p.tooFastToTurn for p in plans[:passed])
+  missed = [p for p in plans[passed:] if p.turnMissed]
+  assert 2.5 <= len(missed) * DT_MDL <= 3.5 and all(p.reason == TURN_MISSED_REASON for p in missed)
+  assert not any(p.tooFastToTurn for p in plans)  # navd's skip match is for a turn ahead, never one already passed
+  # never braked for: no stop, no accel cap, and no speed cap under the turn's own while it is said
+  assert all(not p.shouldStop and p.accelCap == NO_ACCEL_CAP for p in plans)
+  assert all(p.speedCap >= plans[passed - 1].speedCap - 1e-3 for p in missed)
+  assert not any(p.turnMissed for p in [sim.step(engaged=True) for _ in range(int(10. / DT_MDL))])  # said once
+
+  # taken: turned through it, nothing said
+  sim = Sim(TURNS_AHEAD)
+  go_from_the_hold(sim)
+  plans, turned = [], 0.
+  while sim.s < 340.:
+    plans.append(sim.step(engaged=True, yaw_rate=0.5 if 300. - sim.s < 10. and turned < 90. else 0.))
+    turned = max(turned, sim.tp.desires.turned_deg)
+  assert turned > 75. and not any(p.turnMissed for p in plans)
+

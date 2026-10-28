@@ -121,6 +121,8 @@ class RouteEngine:
     self.reroute_counter = 0
     self.maneuver_distance = None  # TurnPilot: m to the current step's maneuver, as last sent
     self.skipped = None  # TurnPilot: (route_count, step_idx) of a turn turnpilotd skipped (too fast): reroute once past it
+    self.missed_seen = False  # TurnPilot: the last turnpilotPlan said a turn was missed (turnMissed)
+    self.missed = False  # ...and it newly did: reroute at once, as past a skipped turn
 
     # TurnPilot: routes are computed by a RouteJob, in a thread unless background is False (tests that step navd)
     self.background = background
@@ -162,6 +164,14 @@ class RouteEngine:
     if 'turnpilotPlan' not in self.sm.data or not self.sm.updated['turnpilotPlan'] or not self.sm.valid['turnpilotPlan']:
       return
     plan = self.sm['turnpilotPlan']
+    # a turn from a standstill that went straight past its junction (turnpilotd: turnMissed, held about 3 s): navd has
+    # usually moved on to the next step by then (10 m past the step's end, before turnpilotd's pass at 15 m), so it is
+    # matched to no step: rerouted at once, once, unless the car is on the step navd is on (it turned after all)
+    missed = plan.turnMissed and not plan.shadow
+    if missed and not self.missed_seen:
+      self.missed = True
+      cloudlog.event("navd.turn_missed", step_idx=self.step_idx)
+    self.missed_seen = missed
     # a shadow plan is for scoring drives: nothing acts on it (the human drives, and may brake and take the turn)
     if plan.shadow or not plan.tooFastToTurn or self.step_idx is None or self.maneuver_distance is None:
       return
@@ -205,7 +215,8 @@ class RouteEngine:
       return
 
     self.recompute_hold -= 1
-    skipped_past = self.skipped_turn_passed()  # TurnPilot: a reroute past a skipped turn waits for nothing
+    skipped_past = self.skipped_turn_passed() or self.missed_off_route()  # TurnPilot: a reroute past a skipped or missed
+                                                                          # turn waits for nothing
     if skipped_past or new_destination != self.requested_destination or (self.should_recompute() and self.recompute_hold <= 0):
       self.recompute_hold = RECOMPUTE_HOLD
       self.calculate_route(new_destination)
@@ -414,6 +425,15 @@ class RouteEngine:
       self.recompute_hold = 0
       return False
     return distance_to_maneuver < -MANEUVER_TRANSITION_THRESHOLD
+
+  def missed_off_route(self) -> bool:
+    """TurnPilot: turnpilotd said a turn was missed (note_skip), and the car is off the step navd is on: reroute now."""
+    if not self.missed:
+      return False
+    self.missed = False
+    if self.step_idx is None or self.last_position is None or self.route_geometry is None:
+      return False
+    return along_path(self.route_geometry[self.step_idx], self.last_position)[1] > NEXT_STEP_NEAR
 
   def should_recompute(self):
     if self.step_idx is None:

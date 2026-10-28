@@ -71,7 +71,7 @@ def plan_events(sm, now: float | None = None) -> list[str]:
   2. a fault (turnpilotUnavailable);
   3. a map stop it can't make gently (turnpilotControlAlert, cannotStopComfortably: take control), or off the route with
      the map stops ahead unknown (offRouteStopsUnknown: the speed capped, take control or wait for the reroute);
-  4. too fast to turn (turnpilotTooFastToTurn);
+  4. too fast to turn, or a turn from a standstill missed (turnpilotTooFastToTurn, turnMissed);
   5. a map control's prompt to the driver (turnpilotControlPrompt: stop sign, signal or unprotected turn go, yield ahead),
      or the car stopped with nothing holding it (carStoppedGo);
   6. a map control's other alerts (turnpilotControlAlert: a stop line overrun, going on a yellow or a red, an unprotected
@@ -101,7 +101,7 @@ def plan_events(sm, now: float | None = None) -> list[str]:
   alert = str(plan.controlAlert)
   if alert in CONTROL_ALERT_FIRST:
     return ['turnpilotControlAlert']
-  if plan.tooFastToTurn:
+  if plan.tooFastToTurn or plan.turnMissed:
     return ['turnpilotTooFastToTurn']
   if str(plan.controlPrompt) != 'none':
     return ['turnpilotControlPrompt']
@@ -169,7 +169,7 @@ def lane_change_events(plan) -> tuple[str, ...]:
   from its warning until it starts, and an abort while laneChangeAbort holds its reason. Nothing while the plan is too
   fast to turn, faulted, or has a map control's prompt or alert above it: those outrank it (plan_events). plan:
   shown_plan's, or None."""
-  if plan is None or plan.tooFastToTurn or plan.fault != custom.TurnpilotPlan.Fault.none or control_outranks_lane_change(plan):
+  if plan is None or plan.tooFastToTurn or plan.turnMissed or plan.fault != custom.TurnpilotPlan.Fault.none or control_outranks_lane_change(plan):
     return ()
   offer = str(plan.laneChangeOffer)
   events = ('turnpilotLaneChangeLeft',) if offer == 'left' else ('turnpilotLaneChangeRight',) if offer == 'right' else ()

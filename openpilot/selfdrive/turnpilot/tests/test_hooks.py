@@ -319,3 +319,19 @@ def test_stale_hold_is_loud():
     update(ev, FakeSM({'turnpilotPlan': held}))
     assert update(ev, FakeSM({'turnpilotPlan': off})) == ()
     assert update(ev, FakeSM({'turnpilotPlan': off}, age=PLAN_MAX_AGE_S + 0.05)) == ()
+
+
+def test_a_missed_turn_takes_the_too_fast_to_turn_slot():
+  # a turn missed from a standstill (turnMissed) is said where a skipped one is: after a fault and a cannot-stop, before a
+  # map prompt, and over a lane change
+  def events(**fields):
+    msg = messaging.new_message('turnpilotPlan')
+    for k, v in fields.items():
+      setattr(msg.turnpilotPlan, k, v)
+    plan = msg.as_reader().turnpilotPlan
+    return plan_events(FakeSM({'turnpilotPlan': plan})) + list(lane_change_events(plan))
+  assert events(turnMissed=True) == ['turnpilotTooFastToTurn']
+  assert events(turnMissed=True, laneChangeOffer='left', laneMismatch='wrongLaneForTurn') == ['turnpilotTooFastToTurn']
+  assert events(turnMissed=True, controlPrompt='carStoppedGo') == ['turnpilotTooFastToTurn']
+  assert events(turnMissed=True, fault='error') == ['turnpilotUnavailable']
+  assert events(turnMissed=True, shadow=True) == []

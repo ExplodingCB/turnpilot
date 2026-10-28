@@ -297,10 +297,12 @@ def turnpilot_lane_change_aborted_alert(CP: car.CarParams, CS: car.CarState, sm:
 def turnpilot_too_fast_to_turn_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool,
                                      soft_disable_time: int, personality) -> Alert:
   """The turn ahead is skipped and navd reroutes (turnpilotPlan.tooFastToTurn): too fast to make it, or a map stop left no
-  room to get into its lane (laneChangeWait unreachable, lane_planner.py)."""
+  room to get into its lane (laneChangeWait unreachable, lane_planner.py). Or a turn the car pulled away into from a
+  standstill went straight past its junction (turnpilotPlan.turnMissed, turnpilotd.py): missed, and navd reroutes."""
   plan = shown_plan(sm)
   lane = plan is not None and str(plan.laneChangeWait) == 'unreachable'
-  return Alert("Can't Reach Turn Lane" if lane else "Too Fast to Turn", "Rerouting",
+  missed = plan is not None and plan.turnMissed
+  return Alert("Turn Missed" if missed else "Can't Reach Turn Lane" if lane else "Too Fast to Turn", "Rerouting",
                AlertStatus.userPrompt, AlertSize.mid,
                Priority.LOW, VisualAlert.none, AudibleAlert.tpTooFastTurn, 3.)
 

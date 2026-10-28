@@ -193,6 +193,9 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
   }
   laneChangeWait @27 :LaneChangeWait;
   laneChangeWant @28 :Int8;           # lane changes the route wants before the maneuver, positive left, at any speed
+  turnMissed @29 :Bool;               # a turn the car pulled away into from a standstill went past its junction turned under
+                                      # 15 deg: missed, held about 3 s; selfdrived chimes (turnpilotTooFastToTurn, "Turn
+                                      # Missed") and navd reroutes at once (turnpilotd.py)
 }
 
 struct TurnpilotDetections @0xaedffd8f31e7b55d {

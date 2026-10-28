@@ -58,6 +58,9 @@ def test_turnpilot_chimes_on_skip_and_handback():
   # skipped because a map stop left no room to get into the turn's lane: said so
   a, = alerts(EventName.turnpilotTooFastToTurn, FakeSM(plan(laneChangeWait='unreachable')))
   assert a.alert_text_1 == "Can't Reach Turn Lane" and a.alert_text_2 == 'Rerouting' and a.audible_alert == AudibleAlert.tpTooFastTurn
+  # a turn from a standstill driven straight past its junction: missed, said so, with the same chime
+  a, = alerts(EventName.turnpilotTooFastToTurn, FakeSM(plan(turnMissed=True)))
+  assert a.alert_text_1 == "Turn Missed" and a.alert_text_2 == 'Rerouting' and a.audible_alert == AudibleAlert.tpTooFastTurn
   for name in (EventName.turnpilotDetectorStopped, EventName.turnpilotNoDetector, EventName.turnpilotModelFellBack):
     events = Events()
     events.add(name)

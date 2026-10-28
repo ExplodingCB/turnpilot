@@ -570,6 +570,46 @@ class TestRouteEngine(unittest.TestCase):
     self.engine.note_skip()
     self.assertIsNone(self.engine.skipped)
 
+  def miss_past_junction(self, at=(0.00115, 0), shadow=False):
+    """The car 55 m before the turn, then straight on past the junction; there turnpilotd says the turn was missed (a turn
+    from a standstill that went straight: turnMissed). Returns the router."""
+    self.skip_route()
+    self.engine.last_position = (0.0005, 0)
+    self.engine.send_instruction()
+    self.plan.maneuverDistance = 55.
+    self.engine.note_skip()
+    with serving(self.engine, self.response) as router:
+      self.engine.recompute_hold = RECOMPUTE_HOLD  # just routed: a reroute would normally wait
+      self.engine.last_position = at
+      self.engine.recompute_route(gps_ok=True)
+      self.engine.send_instruction()  # navd moves on to the next step here, past the turn's end
+      self.assertEqual(router.call_count, 0)
+      self.plan.turnMissed, self.plan.maneuverDistance, self.plan.shadow = True, -15., shadow
+      self.engine.note_skip()
+      self.engine.recompute_route(gps_ok=True)
+      self.engine.send_instruction()
+      for _ in range(3):  # the plan says so for about 3 s: one reroute for it
+        self.engine.note_skip()
+        self.engine.recompute_route(gps_ok=True)
+        self.engine.send_instruction()
+    return router
+
+  def test_reroute_at_once_on_a_missed_turn(self):
+    # TurnPilot: a turn from a standstill went straight past its junction; navd reroutes at once, as past a skipped turn,
+    # ignoring the hold and the off-route counter, and only once
+    router = self.miss_past_junction()
+    self.assertEqual(router.call_count, 1)
+    self.assertEqual(router.calls[0][0], (0.00115, 0))
+    self.assertEqual(self.engine.route_count, 2)
+
+  def test_missed_turn_on_the_route_after_all_or_in_shadow_is_not_rerouted(self):
+    # on the road the route turns onto (the car turned, its yaw misread), navd is on that step already: no reroute
+    router = self.miss_past_junction(at=(0.001, 0.0002))
+    self.assertEqual(router.call_count, 0)
+    self.assertEqual(self.engine.step_idx, 1)
+    router = self.miss_past_junction(shadow=True)
+    self.assertEqual(router.call_count, 0)
+
   def test_skipped_turn_taken_after_all_moves_on(self):
     # the turn was flagged skipped, but the car turned (a driver who braked, or a desire after turnpilotd's skip state
     # reset): on the next step's road, navd moves on to it rather than rerouting from a spot on the route

@@ -46,6 +46,10 @@ was; scene_policy.py), which plannerd acts on (hooks.limits_plan), so a turnpilo
 drives the car on through a pedestrian. Its desire and lane change are never acted on.
 Once the detector is back and TurnPilot acts again, the dropped maneuver is taken up or skipped out loud, never left
 half driven (_take_up_dropped).
+A turn the car pulls away into from a standstill (a hold's go, the turn's pulse in that frame) is unverified: in BeamNG it
+was taken about half the time (2026-10-28). Past its junction (the follower's pass) having turned under MISSED_TURN_DEG,
+it was missed: turnMissed for MISSED_HOLD_S, which selfdrived chimes as a skip ("Turn Missed", "Rerouting") and on which
+navd reroutes at once. Nothing brakes for it.
 Standing engaged STOPPED_PROMPT_S with nothing of TurnPilot's holding the car (no shouldStop, no cap biting), no lead from
 the model within STOPPED_LEAD_M (one further on doesn't hold a standing car), no map control within STOPPED_CONTROL_M,
 gas and brake off, the model stopped on its own: the plan asks for the driver's go (controlPrompt carStoppedGo, "Car
@@ -125,6 +129,10 @@ STOPPED_LEAD_PROB = 0.5  # modelV2.leadsV3[0].prob over this is a lead (plannerd
 STOPPED_LEAD_M = 15.  # ...and it holds the car only this close: openpilot stands long_mpc.STOP_DISTANCE (6 m) behind a
                       # lead it is queued for, and closes up to one further on (route_demo: a ~0.6 lead at 21-28 m, 470 s)
 STOPPED_REASON = "Car stopped — tap gas to continue"
+# a turn released from a standstill (a hold's go: BeamNG 2026-10-28, taken about half the time) is checked, never trusted:
+MISSED_TURN_DEG = 15.  # past its junction (the follower's pass) turned less than this, it was missed: said and rerouted
+MISSED_HOLD_S = 3.     # turnMissed is held this long, for the alert and for navd (1 Hz) to see it
+TURN_MISSED_REASON = "Turn missed — rerouting"
 
 
 class ErrorLog:
@@ -177,6 +185,7 @@ class TurnPilot:
       self.disengaged_s = 0.       # ...of it with openpilot disengaged
       self.engaged_wait_s = 0.     # time since the first engaged frame, before the first detection
     self.stopped_s = 0.            # standing engaged with nothing holding the car (carStoppedGo)
+    self.missed_t = 0.             # turnMissed is held while this counts down
     if not keep_turn:
       # maneuver ids never repeat: the scene kept through a fault holds ids (its commitment, a gas release, a carried hold)
       self.follower = RouteFollower(self.follower.maneuver_id + 1 if hasattr(self, 'follower') else 0)
@@ -190,6 +199,7 @@ class TurnPilot:
       self.turn_cap_id: int | None = None  # ...whose turn speed cap stays, its desire having gone out
       self.turn_held_id: int | None = None  # ...whose turn desire was out: held to its clear, never cancelled
       self.skip_cap_id: int | None = None  # a dropped turn skipped on taking it up: its cap stays until it is passed
+      self.go_id: int | None = None  # the turn a hold let go of at standstill: checked for a miss
     else:
       self.desires.hold_off()  # the disabled plan dropped the desire: as on re-engaging, a fresh pulse only before the turn
     self.lanes = LanePlanner()
@@ -348,6 +358,7 @@ class TurnPilot:
     elif acting and not self.acting and self.dropped_id is not None:
       self._take_up_dropped(upcoming, rf, v_ego, right_hand_traffic)
     self.acting = acting
+    self.check_missed(rf, v_ego, acting)
 
     # the map's stop signs and signals: every frame, whatever the maneuver (a skipped turn keeps its stop). And the route's
     # unprotected turn while TurnPilot drives it: not skipped (too fast: skipped out loud and rerouted, never braked for at
@@ -405,6 +416,9 @@ class TurnPilot:
                                  may_start=skip.feasible_now and not held, go=self.release_go,
                                  holding=decision.should_stop)
     self._yaw_ticked = True
+    d = self.desires
+    if self.release_go and d.maneuver_id == rf.maneuver_id and d.started and d.side != 0 and not d.done:
+      self.go_id = rf.maneuver_id
     if held and desire not in (Desire.none, CLEAR_DESIRE) and desire != self.last_desire:
       desire = Desire.none  # held: the desire out stays out, but never a new rising edge (a repeat pulse under way)
     plan.desire = self.last_desire = desire
@@ -442,7 +456,10 @@ class TurnPilot:
     plan.shouldStop = decision.should_stop
     self.limits = (plan.accelCap, plan.speedCap, plan.shouldStop)
     no_junction_data = maneuver is not None and maneuver.kind in (TURN, KEEP) and not maneuver.geometry
-    plan.reason = decision.reason or lane_reason or mapd.reason or (NO_JUNCTION_DATA_REASON if no_junction_data else "")
+    plan.turnMissed = acting and self.missed_t > 0.
+    self.missed_t = max(self.missed_t - DT_MDL, 0.)
+    plan.reason = decision.reason or (TURN_MISSED_REASON if plan.turnMissed else "") or lane_reason or mapd.reason or \
+      (NO_JUNCTION_DATA_REASON if no_junction_data else "")
     fill_map_control(plan, mapd)
     if self.stopped_unheld(sm, cs, v_ego, acting, decision, mapd):
       plan.controlPrompt, plan.reason = 'carStoppedGo', STOPPED_REASON
@@ -481,6 +498,18 @@ class TurnPilot:
     else:
       plan.state = State.following
     return msg
+
+  def check_missed(self, rf, v_ego: float, acting: bool) -> None:
+    """The turn a hold let go of at standstill is passed (the follower's pass, this update) having turned under
+    MISSED_TURN_DEG: missed (module docstring). Read before this frame's DesireTiming update, which drops the turn."""
+    d = self.desires
+    if not (rf.passed and self.go_id is not None and self.go_id == d.maneuver_id == rf.maneuver_id):
+      return
+    self.go_id = None
+    if acting and d.turned_deg < MISSED_TURN_DEG:
+      self.missed_t = MISSED_HOLD_S
+      cloudlog.event("turnpilot_turn_missed", error=True, turned_deg=round(d.turned_deg, 1), v_ego=round(v_ego, 2),
+                     distance=round(rf.distance, 1))
 
   def stopped_unheld(self, sm, cs, v_ego: float, acting: bool, decision, mapd) -> bool:
     """The car has stood engaged STOPPED_PROMPT_S with nothing holding it (module docstring): ask for the driver's go."""
