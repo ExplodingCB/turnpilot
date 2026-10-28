@@ -2,6 +2,8 @@
 Plain strings in and out, no cereal: the web app's status formatting can't depend on a messaging build."""
 
 TAKE_CONTROL = 'take control'
+# turnpilotd's plan.reason while the model stands the car with nothing of TurnPilot's holding it, before its handback
+STOPPED_NOTE = "Car stopped, nothing ahead holding it"
 
 
 def hold_text(kind: str, action: str, light_state: str = 'unknown', light_source: str = 'none') -> tuple[str, str] | None:

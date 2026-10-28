@@ -84,6 +84,7 @@ from openpilot.common.realtime import DT_MDL, Ratekeeper
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.selfdrive.turnpilot.desire_timing import ENTRY_M, TURN_STARTED_DEG, DesireTiming
+from openpilot.selfdrive.turnpilot.control_text import STOPPED_NOTE
 from openpilot.selfdrive.turnpilot.handback import Handback
 from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, CLEAR_DESIRE, CONTROL_STATUS_ALERTS, TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.map_controls import (KEEP_TURN, PROTECT_PAST_M, YELLOW_DECEL, YELLOW_DECEL_MAX, MapControlPolicy,
@@ -140,7 +141,6 @@ STOPPED_CONTROL_M = 30.
 STOPPED_LEAD_PROB = 0.5  # modelV2.leadsV3[0].prob over this is a lead (plannerd's own threshold)
 STOPPED_LEAD_M = 15.  # ...and it holds the car only this close: openpilot stands long_mpc.STOP_DISTANCE (6 m) behind a
                       # lead it is queued for, and closes up to one further on (route_demo: a ~0.6 lead at 21-28 m, 470 s)
-STOPPED_NOTE = "Car stopped, nothing ahead holding it"
 STOPPED_REASON = "Car stopped: take control"
 SIGNAL_STOPPED_REASON = "Stopped at the signal: take control"
 # a turn released from a standstill (a hold's go: BeamNG 2026-10-28, taken about half the time) is checked, never trusted:

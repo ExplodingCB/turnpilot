@@ -1,6 +1,6 @@
 """What TurnPilot shows, from turnpilotPlan and carState. No raylib here: soundd uses it for the prompt's chime."""
 from openpilot.cereal import custom, log
-from openpilot.selfdrive.turnpilot.control_text import controls_problem, hold_text, is_map_reason
+from openpilot.selfdrive.turnpilot.control_text import STOPPED_NOTE, controls_problem, hold_text, is_map_reason
 
 State = custom.TurnpilotPlan.State
 Desire = log.Desire
@@ -59,6 +59,8 @@ def status_text(plan, engaged: bool) -> tuple[str, str]:
       title, detail = 'Holding', plan.reason
   elif plan.state == State.arrived:
     title = 'Arrived'
+  elif plan.reason == STOPPED_NOTE:  # the model stands the car, nothing of TurnPilot's holding it: said before the handback
+    title, detail = 'Car stopped', 'nothing ahead holding it'
   elif controls_problem(str(plan.mapControl.controlsStatus)):
     # no stop signs or signals from the map for this route: never shown as clear
     title, detail = 'Map stops unavailable', controls_problem(str(plan.mapControl.controlsStatus))

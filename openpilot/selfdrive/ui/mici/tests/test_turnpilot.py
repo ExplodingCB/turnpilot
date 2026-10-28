@@ -170,6 +170,13 @@ class TestMapControlStatus:
     assert status_text(plan(state='holding', mapControl={'kind': 'stop', 'action': 'infeasible'}), True) == \
       ('Cannot stop gently', 'take control')
 
+  def test_car_stopped_with_nothing_holding_it_is_said_on_the_device(self):
+    # the model standing the car with nothing of TurnPilot's holding it: said on the device's status line well before
+    # the handback (turnpilotd's STOPPED_NOTE), never a blank line for a minute
+    from openpilot.selfdrive.turnpilot.control_text import STOPPED_NOTE
+    p = plan(state='following', reason=STOPPED_NOTE)
+    assert status_text(p, True) == ('Car stopped', 'nothing ahead holding it')
+
   def test_map_controls_unavailable_is_never_clear(self):
     p = plan(state='following', reason='Map stops/signals: unsupported', mapControl={'controlsStatus': 'unsupported'})
     assert status_text(p, True) == ('Map stops unavailable', 'unsupported')
