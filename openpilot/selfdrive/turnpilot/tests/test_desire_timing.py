@@ -459,3 +459,20 @@ def test_entry_pulse_goes_once_the_gap_after_a_late_repulse_has_passed():
   entry = [d for _, d in edges if 0. < d < ENTRY_M]
   assert len(entry) == 1, edges
   assert late[-1] - entry[0] >= ENTRY_GAP_S * v - 0.5, edges
+
+
+def test_a_turn_whose_first_pulse_is_its_go():
+  # the autonomous unprotected left (DESIGN phase 4 section 2): no pulse on the approach (may_start false), so the car stands
+  # straight at its hold line with the road camera up the oncoming approach; the go is its first pulse, at once, standing
+  dt_ = DesireTiming()
+  out = []
+  for k in range(int(6. / DT_MDL)):
+    out.append(dt_.update(LEFT_TURN, 40. - 31. * k * DT_MDL / 6., 1, False, 5., 0., True, True, DT_MDL, 0., may_start=False))
+  for _ in range(int(30. / DT_MDL)):  # held at the line, waiting for a gap
+    out.append(dt_.update(LEFT_TURN, 9., 1, False, 0., 0., True, True, DT_MDL, 0., may_start=False, holding=True))
+  assert set(out) == {Desire.none} and not dt_.started
+  assert dt_.update(LEFT_TURN, 9., 1, False, 0., 0., True, True, DT_MDL, 0., go=True) == Desire.turnLeft
+  assert dt_.started and dt_.side != 0
+  # and the car gets STANDSTILL_REARM_S to move off on it
+  out = [dt_.update(LEFT_TURN, 9., 1, False, 0., 0., True, True, DT_MDL, 0.) for _ in range(int(1.5 / DT_MDL))]
+  assert set(out) == {Desire.turnLeft}

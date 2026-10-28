@@ -22,7 +22,9 @@ in the junction for oncoming traffic, 15-25 degrees into a left, longer than the
 pedestrian) none goes, and the model finishes it (H2: 9 of 10 from 25-42 degrees). While a hold has the car standing
 (turnpilotd: shouldStop) the turn desire is none, its edge still in the model's queue, so the pulse on the hold's go is
 a fresh edge in the very plan that lets the car go (BeamNG unprotected_left_visible: let go a frame or more before its
-pulse, the car drove straight across the junction).
+pulse, the car drove straight across the junction). A turn with no pulse before its hold (the autonomous unprotected left:
+turnpilotd holds may_start off on its approach, so the car stands straight with the road camera up the oncoming approach)
+takes its go as its first pulse, at once.
 A repeat pulse is a short drop to none, long enough that modeld (unsynchronized, conflated subscriber) can't miss it.
 The model keeps the rising edges of the last 132 frames (6.6 s at 20 Hz, the big model's state_desire_q), and
 forgets a pulse when it leaves that queue. A pulse still in the queue once the car is round the corner turns it
@@ -231,7 +233,11 @@ class DesireTiming:
 
     if v_ego < STANDSTILL_SPEED:
       self._stopped_t += dt
-      if holding and turn and self.started:
+      if go and turn and not self.started and may_start:
+        # a turn whose first pulse is its go (an unprotected left taken from its hold line with no pulse on the approach,
+        # turnpilotd): now, standing, and the car gets STANDSTILL_REARM_S to move off on it
+        self._stopped_t = 0.
+      elif holding and turn and self.started:
         # held standing: none until the go, which then pulses a fresh edge at once; the edge already sent stays queued
         self.active, self._rearmed, self._gap = False, True, 0
         self._held_none += 1
