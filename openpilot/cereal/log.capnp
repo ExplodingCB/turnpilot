@@ -2503,7 +2503,8 @@ struct NavInstruction {
     id @0 :UInt16;            # index along the route; the identity is (routeCount, id)
     kind @1 :ControlKind;
     distance @2 :Float32;     # m to the stop point (the line less a margin)
-    lineMapped @3 :Bool;      # the line came from mapped data (the sim sidecar), not the junction less 10 m
+    lineMapped @3 :Bool;      # the line came from mapped data (the sim's controls.json, or the OSM stop node from the OSM
+                              # stop-sign sidecar, routing/osm_sidecar.py), not the junction less 10 m
     junction @4 :Bool;        # other roads meet the route at its node
     crossSuspect @5 :Bool;    # the route's road outranks every crossing one: a stop/yield likely for the cross road
   }
@@ -2516,7 +2517,8 @@ struct NavInstruction {
     none @0;         # no route, or an old navd
     ok @1;
     walkOrSnap @2;   # the route didn't edge_walk, matched by walk_or_snap
-    partial @3;      # over 10% of the route's edges unmatched by locate
+    partial @3;      # over 10% of the route's edges unmatched by locate, or the OSM stop-sign sidecar missing or stale
+                     # (not stamped with the tiles' osm_timestamp): the stops Valhalla doesn't flag are unknown
     failed @4;       # no controls: trace_attributes failed, or an exception (the route still publishes)
     unsupported @5;  # the tiles carry no control data (no controls_built marker)
     pending @6;      # offRouteControlsStatus only: off the route, the first lookup ahead of the car not back yet

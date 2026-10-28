@@ -144,7 +144,8 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     lightState @4 :LightState;
     lightSource @5 :LightSource;
     controlsStatus @6 :ControlsStatus;
-    lineMapped @7 :Bool;             # the stop line came from mapped data (the sim sidecar), not the junction less 10 m
+    lineMapped @7 :Bool;             # the stop line came from mapped data (the sim's controls.json, or the OSM stop node
+                                     # from the OSM stop-sign sidecar), not the junction less 10 m
   }
   enum ControlPrompt {
     none @0;
