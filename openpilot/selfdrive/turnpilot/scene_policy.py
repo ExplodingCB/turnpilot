@@ -61,9 +61,8 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_ACCEL_MIN, SPEED_CAP_TAU, plan_accel
 from openpilot.selfdrive.turnpilot.route_follower import LEFT, TURN
 from openpilot.selfdrive.turnpilot.scene.tracker import CLOSE_HOLD_S, MAX_AGE_S
-from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP
+from openpilot.selfdrive.turnpilot.turn_speed import NO_ACCEL_CAP, NO_SPEED_CAP
 
-NO_ACCEL_CAP = 10.
 VEHICLES = ("car", "truck", "bus", "motorcycle", "cyclist")
 TWO_WHEELERS = ("cyclist", "motorcycle")
 

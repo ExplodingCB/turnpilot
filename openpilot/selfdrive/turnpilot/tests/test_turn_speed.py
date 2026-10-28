@@ -4,8 +4,10 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.desire_timing import TURN_DESIRE_LEAD_M
 from openpilot.selfdrive.turnpilot.route_follower import NOMINAL_ANGLE_DEG, Maneuver, classify
 from openpilot.selfdrive.turnpilot.hooks import plan_accel
-from openpilot.selfdrive.turnpilot.turn_speed import (CORNER_M, NO_SPEED_CAP, V_CORNER, V_TURN_MAX, V_TURN_MIN, turn_speed_cap,
-                                                      turn_target_speed)
+from openpilot.selfdrive.turnpilot.scene_policy import NO_ACCEL_CAP
+from openpilot.selfdrive.turnpilot.turn_speed import (CORNER_M, LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_MAX_M,
+                                                      POST_GO_PROFILES, V_CORNER, V_TURN_MAX, V_TURN_MIN, PostGo, post_go_caps,
+                                                      turn_speed_cap, turn_target_speed)
 
 
 def maneuver(mtype, modifier):
@@ -74,3 +76,70 @@ def test_corner_curve_at_real_angles():
     assert turn_speed_cap(real, CORNER_M, 4.) == V_CORNER, angle
   keep = Maneuver(*classify("turn", "slight right"), "turn", "slight right", 30., geometry=True)
   assert turn_speed_cap(keep, CORNER_M, 4.) > V_CORNER
+
+
+def test_post_go_cap_shape_by_angle():
+  """DESIGN phase 4 section 3, the graduated profile: from the go, accel capped at 1.0 m/s^2 until 45 deg turned; speed
+  capped at 3.0 m/s until 15 deg, ramping linearly to 4.3 at 45 deg, then blended linearly into the turn's own corner cap by
+  60 deg, where the profile ends."""
+  g = POST_GO_PROFILES['graduated']
+  corner = 5.5  # any corner cap: the blend's far end
+  for deg, speed in ((-5., 3.0), (0., 3.0), (10., 3.0), (15., 3.0), (30., 3.65), (44.99, 4.3), (45., 4.3), (52.5, 4.9),
+                     (59.99, 5.5)):
+    accel, cap = post_go_caps(g, deg, corner)
+    assert math.isclose(cap, speed, abs_tol=1e-3), deg
+    assert accel == (1.0 if deg < 45. else NO_ACCEL_CAP), deg
+  assert post_go_caps(g, 60., corner) == post_go_caps(g, 90., corner) == (NO_ACCEL_CAP, NO_SPEED_CAP)
+  # a corner cap under the profile's end: the blend comes down to it, never under it
+  assert math.isclose(post_go_caps(g, 52.5, 3.5)[1], 3.9, abs_tol=1e-3)
+
+
+def test_post_go_profiles_for_the_sweep():
+  """The four standstill variants of the BeamNG sweep (V1 tapless: no cap; flat 3.0 to 45 deg; graduated; flat 4.3, the
+  capped ones with the 1.0 accel cap) and the unprotected left's own (1.5 m/s^2, 4.3 flat to 45 deg), each by name, the
+  default the graduated one."""
+  assert POST_GO_DEFAULT == 'graduated' and LEFT_GO_PROFILE == 'left'
+  assert set(POST_GO_PROFILES) == {'none', 'flat3', 'graduated', 'flat43', 'left'}
+  at = {name: [post_go_caps(p, deg, V_CORNER) for deg in (0., 30., 50.)] for name, p in POST_GO_PROFILES.items()}
+  assert at['none'] == [(NO_ACCEL_CAP, NO_SPEED_CAP)] * 3
+  assert [c for _, c in at['flat3'][:2]] == [3.0, 3.0] and [c for _, c in at['flat43'][:2]] == [4.3, 4.3]
+  assert [round(c, 2) for _, c in at['graduated'][:2]] == [3.0, 3.65]
+  assert [c for _, c in at['left'][:2]] == [4.3, 4.3]
+  for name in ('flat3', 'graduated', 'flat43'):
+    assert [a for a, _ in at[name]] == [1.0, 1.0, NO_ACCEL_CAP], name
+  assert [a for a, _ in at['left']] == [1.5, 1.5, NO_ACCEL_CAP]
+  # the caps only ever lower speed: the accel cap is positive, and the speed cap's own braking stays at -2.0 or gentler
+  for p in POST_GO_PROFILES.values():
+    for deg in range(-10, 100, 5):
+      for v in (0., 1., 3., 5., 8.):
+        accel, cap = post_go_caps(p, deg, V_CORNER)
+        assert accel > 0. and plan_accel(accel, cap, v) >= -2.0
+
+
+def test_post_go_follows_the_turn_from_the_go():
+  """PostGo keys the caps on the heading turned toward the maneuver: DesireTiming.turned_deg at the go (a hold reached
+  already 40 deg into the turn starts the ramp there), then the car's yaw. It ends once the blend is done, or POST_GO_MAX_M
+  from the go however little the car turned (a turn missed straight on is not held to 3 m/s down the road)."""
+  m = Maneuver(*classify("turn", "left"), "turn", "left", 90.)
+  pg = PostGo(POST_GO_PROFILES['graduated'], m, 10., 0.)
+  assert pg.caps(0.) == (1.0, 3.0) and not pg.over
+  pg.update(1., math.radians(30.), 1.)  # 30 deg of yaw toward the left
+  assert math.isclose(pg.turned_deg, 30.) and math.isclose(pg.caps(1.)[1], 3.65, abs_tol=1e-3)
+  pg.update(1., -math.radians(10.), 1.)  # yaw away counts back
+  assert math.isclose(pg.turned_deg, 20.)
+  pg.update(1., math.radians(45.), 1.)
+  assert pg.over and pg.caps(1.) == (NO_ACCEL_CAP, NO_SPEED_CAP)
+
+  right = Maneuver(*classify("turn", "right"), "turn", "right", 90.)
+  pg = PostGo(POST_GO_PROFILES['graduated'], right, 10., 40.)
+  assert math.isclose(pg.caps(0.)[1], 3.0 + 1.3 * 25. / 30., abs_tol=1e-3)
+  pg.update(1., -math.radians(10.), 1.)  # a right turns clockwise: negative yaw
+  assert math.isclose(pg.turned_deg, 50.)
+  # the blend's far end is the maneuver's own corner cap where the car is, the junction POST_GO's distance from the go
+  assert math.isclose(pg.caps(1.)[1], 4.3 + (turn_speed_cap(right, 9., 1.) - 4.3) / 3., abs_tol=1e-3)
+
+  straight = PostGo(POST_GO_PROFILES['graduated'], m, 10., 0.)
+  while not straight.over:
+    straight.update(3., 0., DT_MDL)
+    assert straight.travelled_m <= POST_GO_MAX_M + 1.
+  assert straight.caps(3.) == (NO_ACCEL_CAP, NO_SPEED_CAP)

@@ -14,13 +14,34 @@ A keep (a slight turn at a junction) is capped only from town speeds: above KEEP
 off, and the cap would brake the car at 2 m/s^2 from highway speed for a bend it takes as it is. Ramps and forks are
 never capped. Only junction maneuvers are capped at all: a road that bends is the model's (route_follower.py), and a
 turn the car is too fast for is skipped, cap and all (turn_skip.py).
+
+The post-go profile (DESIGN phase 4 section 3, G3): a turn a TurnPilot hold lets go of at a standstill (turnpilotd's go)
+is driven under its own caps from the go, keyed on the heading turned toward the maneuver (DesireTiming.turned_deg at the
+go, then the car's yaw; PostGo). In BeamNG the turns the car pulled away into were missed by going straight at 4-12 m/s,
+the model's curvature collapsing as speed rose, or taken swinging past the divider after the launch overshot; capping the
+accel removes the overshoot, and the speed cap keeps the car slow while it is still pointed across the junction. The
+graduated profile, the default: accel cap 1.0 m/s^2 from the go until 45 deg; speed cap 3.0 m/s until 15 deg, ramping
+linearly to 4.3 at 45 deg; from 45 deg the speed cap blends linearly into the maneuver's own corner cap (turn_speed_cap,
+where the car is) by 60 deg, and the profile ends there. It ends too POST_GO_MAX_M from the go however little the car has
+turned: a turn missed straight on (turnpilotd's turnMissed) is not held to 3 m/s down the road. The caps only lower
+speed (a positive accel cap, a speed cap braking at no more than -2.0 m/s^2, hooks.plan_accel), so they never brake
+hard; they can't start a turn the model holds, which turnpilotd's no-move handback covers.
+Profiles by name, so the BeamNG sweep needs no code edit: param TurnPilotPostGoProfile picks the standstill turn's
+(none: V1 tapless, no cap at all; flat3: 3.0 m/s to 45 deg; graduated; flat43: 4.3 m/s to 45 deg; the capped ones with
+the 1.0 m/s^2 accel cap, all with the same 45-60 deg blend), and TurnPilotLeftGoProfile the unprotected left's (left,
+the default: 1.5 m/s^2 and 4.3 m/s flat to 45 deg, DESIGN section 2, because the left starts straight and the slow first
+stage would hold it in the oncoming lanes about 1.2 s longer; any of the others for the sweep's comparison cell). The
+left's profile gets the same 45-60 deg blend: section 2 says "then the normal corner cap", which for a left of 45 deg or
+more is V_CORNER where the car is, the profile's own 4.3.
 """
 import math
+from dataclasses import dataclass
 
 from openpilot.selfdrive.turnpilot.desire_timing import TURN_DESIRE_LEAD_M
 from openpilot.selfdrive.turnpilot.route_follower import KEEP, LEFT, TURN
 
 NO_SPEED_CAP = 100.
+NO_ACCEL_CAP = 10.
 A_LAT_MAX = 2.0         # m/s^2 through the corner
 A_DECEL = 1.5           # m/s^2 braking curve into the corner
 V_TURN_MIN = 6.9        # m/s (25 km/h), gate 1's speed at the pulse
@@ -60,3 +81,66 @@ def turn_speed_cap(maneuver, distance: float, v_ego: float, right_hand_traffic: 
   if maneuver.kind == TURN and maneuver.angle_deg >= CORNER_ANGLE_MIN_DEG:
     cap = min(cap, math.sqrt(V_CORNER ** 2 + 2. * A_DECEL * max(distance - CORNER_M - lag / 2., 0.)))
   return min(cap, NO_SPEED_CAP)
+
+
+POST_GO_RAMP_START_DEG = 15.  # the speed cap is the profile's v_start up to here...
+POST_GO_CAP_END_DEG = 45.     # ...ramping to its v_end here, where the accel cap ends...
+POST_GO_BLEND_END_DEG = 60.   # ...then blended into the corner cap by here, where the profile ends
+POST_GO_MAX_M = 60.           # m from the go: a 20 m hold, a 90 deg arc of 12 m (19 m), and room; past it the profile ends
+POST_GO_DEFAULT = 'graduated'  # TurnPilotPostGoProfile unset or unknown
+LEFT_GO_PROFILE = 'left'       # TurnPilotLeftGoProfile unset or unknown
+
+
+@dataclass(frozen=True)
+class PostGoProfile:
+  accel_cap: float = NO_ACCEL_CAP  # m/s^2 from the go until POST_GO_CAP_END_DEG
+  v_start: float = NO_SPEED_CAP    # m/s up to POST_GO_RAMP_START_DEG
+  v_end: float = NO_SPEED_CAP      # m/s at POST_GO_CAP_END_DEG
+
+  @property
+  def capped(self) -> bool:
+    return self.v_start < NO_SPEED_CAP or self.accel_cap < NO_ACCEL_CAP
+
+
+POST_GO_PROFILES = {
+  'none': PostGoProfile(),                    # V1 tapless: the model alone
+  'flat3': PostGoProfile(1.0, 3.0, 3.0),      # V3's cap, without the gas tap
+  'graduated': PostGoProfile(1.0, 3.0, 4.3),
+  'flat43': PostGoProfile(1.0, 4.3, 4.3),
+  'left': PostGoProfile(1.5, 4.3, 4.3),       # the unprotected left (DESIGN section 2)
+}
+
+
+def post_go_caps(profile: PostGoProfile, turned_deg: float, corner_cap: float) -> tuple[float, float]:
+  """(accel cap, speed cap) of profile turned_deg into the turn from its go; corner_cap: the maneuver's own speed cap where
+  the car is, which the speed cap blends into from POST_GO_CAP_END_DEG to POST_GO_BLEND_END_DEG."""
+  if not profile.capped or turned_deg >= POST_GO_BLEND_END_DEG:
+    return NO_ACCEL_CAP, NO_SPEED_CAP
+  if turned_deg < POST_GO_CAP_END_DEG:
+    f = min(max((turned_deg - POST_GO_RAMP_START_DEG) / (POST_GO_CAP_END_DEG - POST_GO_RAMP_START_DEG), 0.), 1.)
+    return profile.accel_cap, profile.v_start + (profile.v_end - profile.v_start) * f
+  f = (turned_deg - POST_GO_CAP_END_DEG) / (POST_GO_BLEND_END_DEG - POST_GO_CAP_END_DEG)
+  return NO_ACCEL_CAP, profile.v_end + (min(corner_cap, NO_SPEED_CAP) - profile.v_end) * f
+
+
+class PostGo:
+  """A turn let go of at a standstill, under profile from its go: maneuver, the m to its junction and the deg turned toward
+  it (DesireTiming.turned_deg) at the go. update() each frame with the car's speed and yaw rate; over once the profile is
+  done (module docstring)."""
+  def __init__(self, profile: PostGoProfile, maneuver, distance: float, turned_deg: float, right_hand_traffic: bool = True):
+    self.profile, self.maneuver, self.right_hand_traffic = profile, maneuver, right_hand_traffic
+    self.distance_at_go, self.turned_deg, self.travelled_m = distance, turned_deg, 0.
+
+  @property
+  def over(self) -> bool:
+    return not self.profile.capped or self.turned_deg >= POST_GO_BLEND_END_DEG or self.travelled_m > POST_GO_MAX_M
+
+  def update(self, v_ego: float, yaw_rate: float, dt: float) -> None:
+    self.travelled_m += max(v_ego, 0.) * dt
+    self.turned_deg += math.degrees(yaw_rate * dt) * self.maneuver.side
+
+  def caps(self, v_ego: float) -> tuple[float, float]:
+    if self.over:
+      return NO_ACCEL_CAP, NO_SPEED_CAP
+    corner = turn_speed_cap(self.maneuver, self.distance_at_go - self.travelled_m, v_ego, self.right_hand_traffic)
+    return post_go_caps(self.profile, self.turned_deg, corner)
