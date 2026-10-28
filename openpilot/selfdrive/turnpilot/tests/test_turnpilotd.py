@@ -2291,6 +2291,142 @@ def test_a_withdrawn_go_is_not_given_again_by_a_hold_that_comes_and_goes():
   assert sim.v < 0.05
 
 
+WALKER = ({'cls': 'pedestrian', 'x': 4., 'y': 0.1, 'vx': 0., 'vy': 0., 'inPath': True},)
+
+
+def walker_stops_the_car(sim, n_max=400):
+  """A walker on the turn's exit crosswalk, in the path, stops the car where it is (scene_policy: a pedestrian in the path
+  still stops a committed turn), and stands in front of it 2 s. Then they clear: the hold lets go at standstill, a go."""
+  n = 0
+  while sim.v > 0.05:
+    sim.step(WALKER, engaged=True)
+    n += 1
+    assert n < n_max
+  assert all(p.shouldStop for p in stand(sim, 2., objects=WALKER))
+
+
+def finish_the_turn(sim, seconds=8.):
+  """The model goes at last: the car drives the turn round, yawing while it moves."""
+  plans, turned = [], sim.tp.desires.turned_deg
+  for _ in range(int(seconds / DT_MDL)):
+    plans.append(sim.step(engaged=True, yaw_rate=0.3 if sim.v > 0.5 and turned < 90. else 0.))
+    turned = max(turned, sim.tp.desires.turned_deg)
+  return plans, turned
+
+
+def test_a_go_in_the_junction_is_never_withdrawn_and_the_turn_is_finished():
+  """Skeptic G3: the no-move withdrawal froze the car in the junction. A walker stops the car 45 deg into the turn, past the
+  hold line and committed to it, and clears: TurnPilot's go. The model stands 3.2 s (G0: its shouldStop held about 3 s after
+  a release). That go is never withdrawn: TurnPilot never holds the car in the junction (stopping in it is worse than
+  finishing it), the stall's handback without a hold says so after STALL_PROMPT_S, and the car finishes the turn."""
+  sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
+  go_from_the_hold(sim)
+  while sim.tp.desires.turned_deg < 45.:
+    sim.step(engaged=True, yaw_rate=0.3 if sim.v > 0.5 else 0.)
+    assert sim.t < 200.
+  walker_stops_the_car(sim)
+  assert sim.distance() < HOLD_LINE_M - 2. and sim.tp.scene.committed_id == sim.tp.follower.maneuver_id
+  plans = stand(sim, 0.05)  # the walker gone: TurnPilot's go, its post-go caps (only lowering speed) from where it is
+  assert sim.tp.release_go and sim.tp.go_id == sim.tp.follower.maneuver_id and sim.tp.post_go.turned_deg >= 45.
+  assert sim.tp.go_wait_s is None and not sim.tp.go_withdrawn
+  plans += stand(sim, 3.15)  # the model hesitates
+  assert not any(p.shouldStop or p.controlPrompt == 'cantStartTakeControl' or p.speedCap < 1. for p in plans)
+  stalled = [p for p in plans if p.controlPrompt == 'stalledTakeControl']
+  assert stalled and len(stalled) * DT_MDL < 0.3 and stalled[-1].reason == STALLED_REASON  # handed back, nothing held
+  after, turned = finish_the_turn(sim)
+  assert not any(p.shouldStop or p.controlPrompt == 'cantStartTakeControl' for p in after)
+  assert sim.v > 3. and turned >= 80.
+
+
+def test_a_go_in_an_unprotected_left_across_the_oncoming_lanes_is_never_withdrawn():
+  """Skeptic G3's worst case: a left across an oncoming road. TurnPilot hands back at its hold line (G1), the driver drives
+  through the line and engages again, a walker stops the car 40 deg in, in the oncoming lanes, and clears. The go takes the
+  left's profile and its 1.0 s no-move limit, and the model stands 1.5 s: the car is never held there, nothing TurnPilot
+  does keeps it in the oncoming lanes, and it finishes the turn once the model goes."""
+  sim = Sim([(300., "turn", "left"), (1500., "turn", "right")])
+  while sim.s < 295.:
+    sim.step(engaged=sim._take_over_from is None)
+    assert sim.t < 200., (sim.s, sim.v)
+  while sim.tp.desires.turned_deg < 40.:
+    sim.step(engaged=sim._take_over_from is None, yaw_rate=0.3 if sim.v > 0.5 else 0.)
+    assert sim.t < 300.
+  sim.go_taps = False
+  walker_stops_the_car(sim)
+  assert sim.distance() < HOLD_LINE_M
+  plans = stand(sim, LEFT_NO_MOVE_S + 0.5)
+  assert sim.tp.no_move_limit == LEFT_NO_MOVE_S and sim.tp.post_go.profile == POST_GO_PROFILES['left']
+  assert not any(p.shouldStop or p.controlPrompt == 'cantStartTakeControl' for p in plans) and not sim.tp.go_withdrawn
+  plans = stand(sim, STALL_PROMPT_S - LEFT_NO_MOVE_S)  # handed back without a hold as a stall in the turn
+  assert plans[-1].controlPrompt == 'stalledTakeControl' and not any(p.shouldStop for p in plans)
+  after, turned = finish_the_turn(sim)
+  assert not any(p.shouldStop for p in after) and sim.v > 3. and turned >= 80.
+
+
+def test_a_go_past_the_hold_line_under_20_deg_in_is_handed_back_as_a_stall_never_held():
+  """A walker stops the car past the hold line before it has turned 20 deg (a left still crossing the near lanes) and clears.
+  The go isn't withdrawn there (no hold in the junction), and the model standing is still never silent: the go was in the
+  junction, so the stall's handback (stalledTakeControl, no hold) covers it from 0 deg, not only from STALL_MIN_DEG."""
+  sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
+  go_from_the_hold(sim)
+  while sim.distance() > HOLD_LINE_M - 2.5:
+    sim.step(engaged=True, yaw_rate=0.05 if sim.v > 0.5 else 0.)
+    assert sim.t < 200.
+  walker_stops_the_car(sim)
+  assert sim.distance() < HOLD_LINE_M - 2. and sim.tp.desires.turned_deg < 15.
+  plans = stand(sim, STALL_PROMPT_S - 0.2)
+  assert not any(p.shouldStop or p.controlPrompt != 'none' for p in plans)
+  p = stand(sim, 0.4)[-1]
+  assert p.controlPrompt == 'stalledTakeControl' and not p.shouldStop and p.desire == Desire.none
+  # a go at the hold line under 20 deg in is withdrawn as before, not a stall
+  sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
+  go_from_the_hold(sim)
+  assert sim.distance() >= HOLD_LINE_M
+  assert stand(sim, NO_MOVE_S + 0.2)[-1].controlPrompt == 'cantStartTakeControl'
+
+
+def test_a_go_at_the_hold_line_already_into_the_turn_is_still_withdrawn():
+  """G0: a 10 m hold was reached 39-49 deg into the turn, the desire pulsed on the approach. The car stands at the hold line,
+  not in the junction, so its go is still withdrawn after NO_MOVE_S (by the car's place, not its heading)."""
+  sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
+  sim.go_taps = False
+  sim.tp.oracle_ok = True
+  light = {'state': 'red'}
+
+  def lights(sim):
+    msg = messaging.new_message('turnpilotLights')
+    msg.turnpilotLights.source = 'simOracle'
+    msg.turnpilotLights.lights = [{'state': light['state'], 'distance': 290. - sim.s, 'instance': 'trafficLight 1'}]
+    return msg.as_reader().turnpilotLights
+  sim.lights = lights
+  stop_at(sim, 290.)
+  sim.run(1.)
+  sim.tp.desires.turned_deg = 40.
+  light['state'] = 'green'
+  while sim.trace[-1][2].shouldStop:
+    sim.step(engaged=True)
+    assert sim.t < 120.
+  assert sim.distance() >= HOLD_LINE_M and sim.tp.go_wait_s is not None
+  p = stand(sim, NO_MOVE_S + 0.2)[-1]
+  assert p.controlPrompt == 'cantStartTakeControl' and p.shouldStop and p.speedCap == 0.
+
+
+def test_a_go_into_a_junction_the_scene_committed_to_or_the_driver_released_is_never_withdrawn():
+  """The scene never holds the car again in a junction it committed to, or one the driver took over into (committed_id,
+  released_id): nor does a no-move withdrawal, wherever the follower places the car."""
+  t_left = Maneuver(*classify("turn", "left"), "turn", "left", 90., geometry=True, opposing='none')
+  for field in ('committed_id', 'released_id', None):
+    tp = TurnPilot()
+    if field is not None:
+      setattr(tp.scene, field, tp.follower.maneuver_id)
+    tp.start_post_go(t_left, 12., 0., True)
+    assert (tp.go_wait_s is None) == (field is not None), field
+    tp.scene.committed_id = tp.scene.released_id = tp.follower.maneuver_id + 1  # another maneuver's: no matter
+    tp.start_post_go(t_left, 12., 0., True)
+    assert tp.go_wait_s == 0.
+    tp.start_post_go(t_left, HOLD_LINE_M - 2., 0., True)  # past the hold line
+    assert tp.go_wait_s is None
+
+
 
 def test_the_no_move_limit_is_a_param_for_the_sweep():
   """TurnPilotNoMoveS (main()) sets a standstill turn's no-move limit, NO_MOVE_S to NO_MOVE_MAX_S, so the sweep's V1 tapless

@@ -55,21 +55,25 @@ was taken about half the time (2026-10-28). Past its junction (the follower's pa
 its desire not cleared at the turn's angle (a turn under 20 deg clears under MISSED_TURN_DEG, and that one was taken),
 it was missed: turnMissed for MISSED_HOLD_S, which selfdrived chimes as a skip ("Turn Missed", "Rerouting") and on which
 navd reroutes at once. Nothing brakes for it. Standing more than STALL_PROMPT_S after the go, STALL_MIN_DEG to
-STALL_MAX_DEG into the turn, with no hold of TurnPilot's and no lead within STOPPED_LEAD_M, it stalled in the junction:
-handed back loudly (controlPrompt stalledTakeControl, STALLED_REASON), and TurnPilot never goes itself.
+STALL_MAX_DEG into the turn (from its start, for a go that came in the junction), with no hold of TurnPilot's and no lead
+within STOPPED_LEAD_M, it stalled in the junction: handed back loudly (controlPrompt stalledTakeControl, STALLED_REASON),
+never held there, and TurnPilot never goes itself.
 From the go such a turn is driven under its post-go profile (turn_speed.py: PostGo; DESIGN phase 4 section 3): accel and
 speed capped by the heading it has turned, DesireTiming.turned_deg at the go and the car's yaw after, until 60 deg or
 POST_GO_MAX_M on, and dropped at the pass of a turn missed straight on. TurnPilotPostGoProfile names the profile
 (graduated by default; none, flat3, flat43 for the BeamNG sweep), and an unprotected turn's go (unprotected_turn: a left
 across the oncoming road) takes TurnPilotLeftGoProfile's (left: 1.5 m/s^2, 4.3 m/s). The caps only lower speed.
-A go the car hasn't pulled away on (STANDSTILL_SPEED) within NO_MOVE_S (TurnPilotNoMoveS, up to NO_MOVE_MAX_S, for the
-sweep), LEFT_NO_MOVE_S for an unprotected turn (CRITIQUE
+A go from the hold line (go_at_line: the car GO_LINE_M or more before the maneuver point, the scene not committed to the
+junction nor released into it) the car hasn't pulled away on (STANDSTILL_SPEED) within NO_MOVE_S (TurnPilotNoMoveS, up to
+NO_MOVE_MAX_S, for the sweep), LEFT_NO_MOVE_S for an unprotected turn (CRITIQUE
 REQUIRED 4: its gap runs out while it stands), counting only while nothing else holds it (no TurnPilot hold, no close lead,
 no pedal), is the model holding the car: TurnPilot withdraws the go before the car moves, holding it standing (shouldStop,
 a 0 speed cap: braking at -2.0 at most, from under 0.3 m/s; no turn pulse), and hands back loudly (controlPrompt
 cantStartTakeControl, NO_MOVE_REASON) until the driver takes over (openpilot disengaged: any gas press); a scene hold
 that comes and goes meanwhile (a walker crossing) is no new go. The turn isn't cancelled: its desire state stays, and the
-driver drives it.
+driver drives it. A go in the junction (a walker's hold released partway round) is never withdrawn: stopping there is worse
+than finishing the turn, so TurnPilot never holds the car in it; it keeps the post-go caps, which only lower speed, and the
+stall's handback without a hold.
 Standing engaged with nothing of TurnPilot's holding the car (no shouldStop, no cap biting), no lead from the model within
 STOPPED_LEAD_M (one further on doesn't hold a standing car), gas and brake off, the model stopped on its own: said on the
 status line after STOPPED_NOTE_S (STOPPED_NOTE), and handed back loudly (controlPrompt carStoppedTakeControl) after
@@ -102,15 +106,15 @@ from openpilot.selfdrive.turnpilot.control_text import STOPPED_NOTE
 from openpilot.selfdrive.turnpilot.handback import Handback
 from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, CLEAR_DESIRE, CONTROL_STATUS_ALERTS, TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.detector.light_state import LIGHT_MODE_DEFAULT, camera_lights_mode
-from openpilot.selfdrive.turnpilot.map_controls import (CAMERA_STALE_S, KEEP_TURN, PROTECT_PAST_M, YELLOW_DECEL, YELLOW_DECEL_MAX,
-                                                         MapControlPolicy, camera_light_input, light_input, turn_stop_feasible,
-                                                         unprotected_turn)
+from openpilot.selfdrive.turnpilot.map_controls import (CAMERA_STALE_S, KEEP_TURN, LATCH_PAST_M, MAP_MARGIN_M, PROTECT_PAST_M, YELLOW_DECEL,
+                                                         YELLOW_DECEL_MAX, MapControlPolicy, camera_light_input, light_input,
+                                                         turn_stop_feasible, unprotected_turn)
 from openpilot.selfdrive.turnpilot.lane_planner import (OPENPILOT_SIGNALS_BRANDS, LanePlanner, lane_change_window, lane_mismatch,
                                                          model_lanes_from_msg)
 from openpilot.selfdrive.turnpilot.route_follower import KEEP, LEFT, TURN, UNCERTAIN_M, RouteFollower
 from openpilot.selfdrive.turnpilot.scene.lane_paint import lane_paint_from_msg
 from openpilot.selfdrive.turnpilot.scene.tracker import STALE_S, SceneTracker, default_yaw_rate
-from openpilot.selfdrive.turnpilot.scene_policy import NO_ACCEL_CAP, ScenePolicy
+from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, NO_ACCEL_CAP, ScenePolicy
 from openpilot.selfdrive.turnpilot.turn_skip import TurnSkip, can_make_turn
 from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
 
@@ -176,6 +180,11 @@ NO_MOVE_S = 2.
 NO_MOVE_MAX_S = 20.  # TurnPilotNoMoveS is clamped to NO_MOVE_S..this (the sweep's V1 tapless column measures to 20 s)
 LEFT_NO_MOVE_S = 1.
 NO_MOVE_REASON = "Can't start the turn: take control"
+# ...but only a go from the hold line: the car standing this far or further before the maneuver point (the scene's hold line,
+# HOLD_LINE_M; an unprotected turn's map stop, MAP_MARGIN_M short of it, latches up to LATCH_PAST_M past its point), the
+# scene not committed to the junction nor the driver having taken over into it. Nearer, the car is in the junction: never
+# held there, the stall's handback covers it (skeptic G3: a walker's hold released 40-50 deg in froze the car there)
+GO_LINE_M = HOLD_LINE_M + MAP_MARGIN_M - LATCH_PAST_M
 
 
 def close_lead(model) -> bool:
@@ -259,6 +268,7 @@ class TurnPilot:
       self.no_move_limit = NO_MOVE_S       # ...withdrawn if the car hasn't moved this long after it (no_move)
       self.go_wait_s: float | None = None  # s stood since TurnPilot's go, nothing else holding the car; None: moved, or no go
       self.go_withdrawn = False            # the go withdrawn: the car held standing, handed back (cantStartTakeControl)
+      self.go_in_junction = False          # the go came with the car in the junction (go_at_line): never withdrawn
     else:
       self.desires.hold_off()  # the disabled plan dropped the desire: as on re-engaging, a fresh pulse only before the turn
     self.lanes = LanePlanner()
@@ -477,6 +487,7 @@ class TurnPilot:
     d = self.desires
     if self.release_go and d.maneuver_id == rf.maneuver_id and d.started and d.side != 0 and not d.done and upcoming is not None:
       self.go_id, self.stall_s = rf.maneuver_id, 0.
+      self.go_in_junction = not self.go_at_line(rf.distance)
       if sm['carControl'].enabled and not took_over:  # TurnPilot's go; the driver driving off a hold is the driver's
         self.start_post_go(upcoming, rf.distance, d.turned_deg, right_hand_traffic)
     elif self.post_go is not None:
@@ -591,19 +602,30 @@ class TurnPilot:
       cloudlog.event("turnpilot_turn_missed", error=True, turned_deg=round(d.turned_deg, 1), v_ego=round(v_ego, 2),
                      distance=round(rf.distance, 1))
 
+  def go_at_line(self, distance: float) -> bool:
+    """A go from the car standing at or short of the route's junction's hold line, distance (the follower's) GO_LINE_M or
+    more before it, the scene neither committed to that junction nor released into it by the driver: only such a go is
+    withdrawn (no_move). Otherwise the car is in the junction, where stopping is worse than finishing the turn
+    (scene_policy.py: committed_past_line); a stop line mapped nearer than GO_LINE_M (a sim sidecar's) is taken so too."""
+    mid = self.follower.maneuver_id
+    return distance >= GO_LINE_M and mid not in (self.scene.committed_id, self.scene.released_id)
+
   def start_post_go(self, maneuver, distance: float, turned_deg: float, right_hand_traffic: bool = True) -> None:
     """The go of a turn from a standstill: its post-go profile from now (module docstring), the unprotected turn's own for a
-    turn across the oncoming road."""
+    turn across the oncoming road, and its no-move clock if it goes from the hold line (go_at_line)."""
     left = unprotected_turn(maneuver, right_hand_traffic)
     name = self.left_go_profile if left else self.post_go_profile
     self.post_go = PostGo(POST_GO_PROFILES[name], maneuver, distance, turned_deg, right_hand_traffic)
-    self.no_move_limit, self.go_wait_s, self.go_withdrawn = (LEFT_NO_MOVE_S if left else self.no_move_s), 0., False
-    cloudlog.event("turnpilot.post_go", profile=name, unprotected=left, turned_deg=round(turned_deg, 1), distance=round(distance, 1))
+    at_line = self.go_at_line(distance)
+    self.no_move_limit, self.go_withdrawn = (LEFT_NO_MOVE_S if left else self.no_move_s), False
+    self.go_wait_s = 0. if at_line else None  # in the junction: never withdrawn, the stall's handback covers it
+    cloudlog.event("turnpilot.post_go", profile=name, unprotected=left, turned_deg=round(turned_deg, 1), distance=round(distance, 1),
+                   at_line=at_line)
 
   def no_move(self, sm, cs, v_ego: float, acting: bool, decision) -> bool:
-    """TurnPilot's go is withdrawn: the car not at STANDSTILL_SPEED no_move_limit after it, nothing else holding it (module
-    docstring). Latched until openpilot is disengaged (the driver taking over); read before this frame's go starts a new
-    clock (start_post_go)."""
+    """TurnPilot's go from the hold line (go_at_line) is withdrawn: the car not at STANDSTILL_SPEED no_move_limit after it,
+    nothing else holding it (module docstring). Latched until openpilot is disengaged (the driver taking over); read before
+    this frame's go starts a new clock (start_post_go). A go in the junction starts none: it is never withdrawn."""
     enabled = sm['carControl'].enabled
     if self.go_withdrawn:
       self.go_withdrawn = enabled
@@ -625,10 +647,11 @@ class TurnPilot:
 
   def stalled_in_turn(self, sm, cs, v_ego: float, acting: bool, decision, mapd) -> bool:
     """The car has stood STALL_PROMPT_S in the turn a hold let go of, with nothing holding it (module docstring): hand
-    back. The stop line it left is close behind it, so stopped_unheld would wait NEAR_CONTROL_STAND_S."""
+    back. The stop line it left is close behind it, so stopped_unheld would wait NEAR_CONTROL_STAND_S. From STALL_MIN_DEG
+    into the turn, or from its start if the go came in the junction (go_in_junction: never withdrawn, never silent)."""
     d, rf = self.desires, self.follower
     in_turn = self.go_id is not None and self.go_id == d.maneuver_id == rf.maneuver_id and \
-      STALL_MIN_DEG <= d.turned_deg <= STALL_MAX_DEG
+      (self.go_in_junction or STALL_MIN_DEG <= d.turned_deg) and d.turned_deg <= STALL_MAX_DEG
     stalled = acting and in_turn and sm['carControl'].enabled and v_ego < STANDSTILL_SPEED and not decision.should_stop and \
       not self.go_withdrawn and \
       not decision.holding and not close_lead(sm['modelV2']) and not cs.gasPressed and not cs.brakePressed and \

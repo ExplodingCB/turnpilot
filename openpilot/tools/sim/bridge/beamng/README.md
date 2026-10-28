@@ -289,7 +289,9 @@ OPENPILOT_PREFIX=tpsim python -c "from openpilot.common.params import Params; Pa
 
 Whatever the profile, a go the car hasn't pulled away on (0.3 m/s) within 2.0 s, 1.0 s into an unprotected turn
 (`turnpilotd.NO_MOVE_S`, `LEFT_NO_MOVE_S`), is withdrawn and handed back (`cantStartTakeControl`). The car is then held
-standing until openpilot disengages. For the V1 tapless column, which measures pull-aways later than 2 s, set
+standing until openpilot disengages. That applies only to a go from the hold line (`turnpilotd.GO_LINE_M`, 7 m or more
+before the junction). A go in the junction, such as a pedestrian hold released partway round, is never withdrawn: the car
+is never held there, and standing gets the stall handback (`stalledTakeControl`) with no hold. For the V1 tapless column, which measures pull-aways later than 2 s, set
 `TurnPilotNoMoveS` (FLOAT, 2.0 to 20.0 s, default 2.0) the same way; it sets the standstill turn's limit only, and the
 unprotected turn's 1.0 s stays. Put it back to 2.0 after the sweep. turnpilotd logs `turnpilot.post_go` (the profile chosen) at each go and `turnpilot.go_not_moving` at a withdrawal.
 
