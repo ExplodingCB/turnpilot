@@ -136,7 +136,7 @@ from openpilot.selfdrive.turnpilot.lane_planner import (OPENPILOT_SIGNALS_BRANDS
 from openpilot.selfdrive.turnpilot.route_follower import KEEP, LEFT, TURN, UNCERTAIN_M, RouteFollower
 from openpilot.selfdrive.turnpilot.scene.lane_paint import lane_paint_from_msg
 from openpilot.selfdrive.turnpilot.scene.tracker import STALE_S, SceneTracker, default_yaw_rate
-from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, NO_ACCEL_CAP, PATH_HALF_WIDTH_M, ScenePolicy, in_path
+from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, NO_ACCEL_CAP, PATH_HALF_WIDTH_M, STOP_DECEL, ScenePolicy, in_path
 from openpilot.selfdrive.turnpilot.turn_skip import TurnSkip, can_make_turn
 from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
 from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, OFF, ROAD_RANGE_M, LeftInput, UnprotectedLeft,
@@ -329,6 +329,8 @@ class TurnPilot:
       self.go_withdrawn = False            # the go withdrawn: the car held standing, handed back (cantStartTakeControl)
       self.go_in_junction = False          # the go came with the car in the junction (go_at_line): never withdrawn
       self.go_lifted = False               # ...certified for plannerd's lift (certify_go)
+      self.go_cert_id: int | None = None   # ...as this go (GoCertifier.id)
+      self.go_moved = False                # ...and the car has rolled since (no_move)
       self.approach_yaw_deg = 0.           # the car's heading change toward the route's turn since its first pulse (track_yaw)
       self._yaw_id: int | None = None      # ...for this maneuver
     else:
@@ -612,8 +614,12 @@ class TurnPilot:
     if self.post_go is not None:  # only ever lowers: a positive accel cap, a speed cap braking at -2.0 at most
       go_accel, go_speed = self.post_go.caps(v_ego)
       plan.accelCap, plan.speedCap = min(plan.accelCap, go_accel), min(plan.speedCap, go_speed)
-    if withdrawn:  # standing (under STANDSTILL_SPEED when withdrawn): the speed cap's -2.0 floor at most, never harder
-      plan.shouldStop, plan.speedCap = True, 0.
+    if withdrawn:  # held: a 0 speed cap, the speed cap's -2.0 floor at most, never harder, and shouldStop once standing;
+      plan.speedCap = 0.  # rolling (a lift the model never took over: 1.5 m/s at most), stopped at STOP_DECEL
+      if v_ego < STANDSTILL_SPEED:
+        plan.shouldStop = True
+      else:
+        plan.accelCap = min(plan.accelCap, -STOP_DECEL)
     self.limits = (plan.accelCap, plan.speedCap, plan.shouldStop)
     no_junction_data = maneuver is not None and maneuver.kind in (TURN, KEEP) and not maneuver.geometry
     plan.turnMissed = acting and self.missed_t > 0.
@@ -770,6 +776,7 @@ class TurnPilot:
     at_line = self.go_at_line(distance)
     self.no_move_limit, self.go_withdrawn = (LEFT_NO_MOVE_S if left else self.no_move_s), False
     self.go_wait_s = 0. if at_line else None  # in the junction: never withdrawn, the stall's handback covers it
+    self.go_moved = False
     cloudlog.event("turnpilot.post_go", profile=name, unprotected=left, turned_deg=round(turned_deg, 1), distance=round(distance, 1),
                    at_line=at_line)
 
@@ -801,6 +808,7 @@ class TurnPilot:
       return
     self.go_lifted = self.go_cert.start(cause, distance=round(distance, 1), at_line=self.go_wait_s is not None,
                                         turned_deg=round(self.desires.turned_deg, 1))
+    self.go_cert_id = self.go_cert.id if self.go_lifted else None
 
   def withdraw_go(self, sm, cs, acting: bool, available: bool, objects, raw, decision, took_over: bool) -> None:
     """The certified go out withdrawn this frame, plannerd's lift with it, once anything it was certified on stops holding
@@ -817,25 +825,46 @@ class TurnPilot:
       gc.withdraw(why)
 
   def no_move(self, sm, cs, v_ego: float, acting: bool, decision) -> bool:
-    """TurnPilot's go from the hold line (go_at_line) is withdrawn: the car not at STANDSTILL_SPEED no_move_limit after it,
-    nothing else holding it (module docstring). Latched until openpilot is disengaged (the driver taking over); read before
-    this frame's go starts a new clock (start_post_go). A go in the junction starts none: it is never withdrawn."""
+    """TurnPilot's go from the hold line (go_at_line) is withdrawn: the model holding the car (module docstring). An
+    uncertified go is followed by the car's first motion (STANDSTILL_SPEED), and withdrawn standing no_move_limit before it,
+    nothing else holding the car. A certified one (go_lifted: plannerd's lift rolls the car on whether the model goes or not)
+    is followed only once the model takes over (GoCertifier.taken_over: the takeover predicate, or GO_END_SPEED) and the car
+    has moved: a takeover the car doesn't move on is still the no-move withdrawal. Until then it
+    is withdrawn at once when its window ends with the model not having taken over (rolling: stopped at STOP_DECEL), or once
+    the car stands no_move_limit, first or again, nothing else holding it (the lift over early: a phantom in the path, a lead
+    come and gone). Rolled into the junction on the lift (the scene committed to it or released into it, or STALL_MIN_DEG
+    turned), it is never held there: the stall's handback without a hold covers it (go_in_junction). Latched until openpilot
+    is disengaged (the driver taking over); read before this frame's go starts a new clock (start_post_go). A go in the
+    junction starts none: it is never withdrawn."""
     enabled = sm['carControl'].enabled
     if self.go_withdrawn:
       self.go_withdrawn = enabled
       return self.go_withdrawn
     if self.go_wait_s is None:
       return False
-    if v_ego >= STANDSTILL_SPEED or not enabled:  # it pulled away, or the driver took over
+    gc = self.go_cert
+    mine = gc.id == self.go_cert_id and not gc.active  # the go certified for this turn is over
+    moving = v_ego >= STANDSTILL_SPEED
+    followed = (mine and gc.taken_over and (self.go_moved or moving)) if self.go_lifted else moving
+    if followed or not enabled:  # it pulled away (the model took over), or the driver took over
       self.go_wait_s = None
       return False
-    if acting and not decision.should_stop and not decision.holding and not close_lead(sm['modelV2']) and \
+    window_out = self.go_lifted and mine and gc.end == 'window'  # its lift's 3 s out, the model never taking over
+    if moving:
+      self.go_moved, self.go_wait_s = True, 0.  # rolling on the lift: the stand's clock starts over
+    elif acting and not decision.should_stop and not decision.holding and not close_lead(sm['modelV2']) and \
        not cs.gasPressed and not cs.brakePressed:
       self.go_wait_s += DT_MDL
-    if self.go_wait_s < self.no_move_limit - 1e-6:
+    if not window_out and self.go_wait_s < self.no_move_limit - 1e-6:
+      return False
+    mid, turned = self.follower.maneuver_id, self.desires.turned_deg
+    if self.go_moved and (mid in (self.scene.committed_id, self.scene.released_id) or turned >= STALL_MIN_DEG):
+      cloudlog.event("turnpilot.go_not_followed", error=True, in_junction=True, window_out=window_out, v=round(v_ego, 2),
+                     turned_deg=round(turned, 1))
+      self.go_in_junction, self.go_wait_s = True, None  # never held in the junction: the stall's handback, no hold
       return False
     cloudlog.event("turnpilot.go_not_moving", error=True, stood_s=round(self.go_wait_s, 1), limit_s=self.no_move_limit,
-                   turned_deg=round(self.desires.turned_deg, 1))
+                   turned_deg=round(turned, 1), lifted=self.go_lifted, moved=self.go_moved, window_out=window_out, v=round(v_ego, 2))
     self.go_withdrawn, self.go_wait_s = True, None
     return True
 

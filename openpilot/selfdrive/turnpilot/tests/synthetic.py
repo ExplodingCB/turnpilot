@@ -123,14 +123,17 @@ def road(lanes_left, lanes_right, line_prob=0.9, edge_std=0.3, lane_width=LANE_W
 DRIVING_PLAN_V = 5.  # m/s: the speed plan of a model driving on (go_override.model_takes_over: it means to keep moving)
 
 
-def model_v2(lanes_left=0, lanes_right=0, lane_change_state='off', big=False, lead_prob=None, lead_x=30., holds=False, **kwargs):
+def model_v2(lanes_left=0, lanes_right=0, lane_change_state='off', big=False, lead_prob=None, lead_x=30., holds=False, accel=0.,
+             should_stop=None, **kwargs):
   """A modelV2 reader with flat lane lines and road edges from road(); big: from the big (chestnut) driving model;
   lead_prob: leadsV3[0].prob, lead_x m ahead (no leads without it). holds: the model holds the car (action.shouldStop, a
-  speed plan of 0, G0's stand); otherwise it drives on (shouldStop false, DRIVING_PLAN_V planned)."""
+  speed plan of 0, G0's stand); otherwise it drives on (shouldStop false, DRIVING_PLAN_V planned). accel: its
+  action.desiredAcceleration; should_stop: its action.shouldStop, if not holds's."""
   line_ys, line_probs, edge_ys, edge_stds = road(lanes_left, lanes_right, **kwargs)
   msg = messaging.new_message('modelV2')
   m = msg.modelV2
-  m.action.shouldStop = holds
+  m.action.shouldStop = holds if should_stop is None else should_stop
+  m.action.desiredAcceleration = float(accel)
   m.velocity.x = [0. if holds else DRIVING_PLAN_V] * ModelConstants.IDX_N
   x = [float(v) for v in ModelConstants.X_IDXS]
   m.init('laneLines', 4)

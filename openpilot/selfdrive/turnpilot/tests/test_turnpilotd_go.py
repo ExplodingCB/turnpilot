@@ -2,15 +2,21 @@
 asserted to plannerd (turnpilotPlan.goCertified) for its bounded lift only when nothing in the car's path within 15 m, no
 lead and no hold of TurnPilot's is there, the driver isn't on a pedal, and TurnPilotGoOverride is on; it is withdrawn the
 frame any of that stops holding, and it ends on its own at 3 s, 3 m/s or the model's takeover."""
+from collections import deque
+
 from openpilot.cereal import messaging
 from openpilot.common.params import UnknownKeyName
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.turnpilot.go_override import GO_CLEAR_M, GO_WINDOW_S, TAKEOVER_S
+from openpilot.selfdrive.turnpilot.go_override import GO_ACCEL, GO_CLEAR_M, GO_WINDOW_S, TAKEOVER_S
+from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.scene.tracker import RawBox, RawFrame
-from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, WALKER, FakeParams, Sim, go_from_the_hold, stand,
+from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M
+from openpilot.selfdrive.turnpilot.tests.synthetic import model_v2
+from openpilot.selfdrive.turnpilot.tests.test_go_override import WARM_S, new_planner, planner_sm
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, WALKER, FakeParams, Sim, go_from_the_hold, stand, stop_at,
                                                                  walker_stops_the_car)
-from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import V_25, drive, left_sim
-from openpilot.selfdrive.turnpilot.turnpilotd import GO_OVERRIDE_DEFAULT, NO_MOVE_S, go_override_for
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import JUNCTION, V_25, drive, left_sim
+from openpilot.selfdrive.turnpilot.turnpilotd import GO_OVERRIDE_DEFAULT, NO_MOVE_REASON, NO_MOVE_S, go_override_for
 
 Desire = messaging.log.Desire
 
@@ -176,3 +182,135 @@ def test_go_override_param():
     def get(self, key):
       raise UnknownKeyName(key)
   assert go_override_for(Unknown()) is True
+
+
+# --- plannerd in the loop: the real planner lifting the car for turnpilotd's go, a model that holds or takes over ---
+
+def holding(sim):
+  """G0's stand: the model holds the car (shouldStop under 0.3 m/s, no motion planned), braking gently when it rolls."""
+  a = -0.4 if sim.v > 0.05 else 0.
+  return model_v2(*sim.model_lanes, holds=True, accel=a, should_stop=sim.v < 0.3 and a < 0.1, **sim.model_kw)
+
+
+def taking_over(sim):
+  """Holds at a standstill; rolling, it means to go (shouldStop false, motion planned, 0.8 m/s^2)."""
+  return holding(sim) if sim.v < 0.3 else model_v2(*sim.model_lanes, accel=0.8, **sim.model_kw)
+
+
+def attach_planner(sim, model_fn, lag_s=0.3):
+  """plannerd in sim's loop from now: the real LongitudinalPlanner takes each frame's turnpilotPlan, model_fn's modelV2 and
+  the car's state, and the car's accel follows its aTarget lag_s late (-1.0 m/s^2 on its shouldStop: longcontrol's
+  stopping). The car stands held when it is attached."""
+  lp = new_planner(warm=False)
+  queue = deque([0.] * max(round(lag_s / DT_MDL), 1))
+
+  def accel(sim, plan):
+    cs = sim.sm['carState']
+    lp.update(planner_sm(sim.v, plan, sim.sm['modelV2'], gas=cs.gasPressed, enabled=sim.sm['carControl'].enabled))
+    sim.planned.append((float(lp.output_a_target), bool(lp.output_should_stop), lp.go_lift.lifting))
+    queue.append(-1. if lp.output_should_stop else float(lp.output_a_target))
+    return queue.popleft()
+  sim.model, sim.accel, sim.planned = model_fn, accel, []
+  return lp
+
+
+def held_at_its_red(model_fn, lag_s=0.3):
+  """LEFT_AT_A_RED held at its red 10 m before the junction with plannerd in the loop, standing WARM_S, then its green.
+  Returns (sim, planner, the index in sim.trace of the go)."""
+  sim = held_at_the_red()
+  sim.go_taps, sim.tp.oracle_ok = False, True
+  light = {'state': 'red'}
+
+  def lights(sim):
+    msg = messaging.new_message('turnpilotLights')
+    msg.turnpilotLights.source = 'simOracle'
+    msg.turnpilotLights.lights = [{'state': light['state'], 'distance': 290. - sim.s, 'instance': 'trafficLight 1'}]
+    return msg.as_reader().turnpilotLights
+  sim.lights = lights
+  stop_at(sim, 290.)
+  lp = attach_planner(sim, model_fn, lag_s)
+  for _ in range(round(WARM_S / DT_MDL)):
+    assert sim.step(engaged=True).shouldStop
+  light['state'] = 'green'
+  while sim.trace[-1][2].shouldStop:
+    sim.step(engaged=True)
+    assert sim.t < 120.
+  return sim, lp, len(sim.trace) - 1
+
+
+def test_a_go_the_model_never_takes_over_is_withdrawn_at_its_window_and_handed_back():
+  """The lift rolls the car on (+0.5 m/s^2, 2.25 m at most); the model never takes over, and the go's window ends: TurnPilot
+  withdraws it at once (stopping the car at STOP_DECEL, never harder than -2.0) and hands back loudly, the car held standing,
+  not left to creep on the model's gentle braking and stand silently."""
+  for lag in (0.15, 0.3):
+    sim, lp, go_i = held_at_its_red(holding, lag)
+    s_go = sim.trace[go_i][0]
+    assert go(sim.trace[go_i][2])[0] == 'turnRelease'
+    plans = [sim.step(engaged=True) for _ in range(round((GO_WINDOW_S + 3.) / DT_MDL))]
+    first = next(i for i, p in enumerate(plans) if p.controlPrompt == 'cantStartTakeControl')
+    assert abs(first * DT_MDL - GO_WINDOW_S) <= DT_MDL + 1e-6 and plans[first].reason == NO_MOVE_REASON
+    assert all(p.controlPrompt == 'cantStartTakeControl' for p in plans[first:]) and plans[-1].shouldStop
+    assert sim.v < 0.05 and sim.s - s_go <= 0.5 * GO_ACCEL * GO_WINDOW_S ** 2 + 0.75 + 0.2, (lag, sim.s - s_go)
+    assert all(a >= -2. for a, _, _ in sim.planned) and sum(lifted for _, _, lifted in sim.planned) <= round(GO_WINDOW_S / DT_MDL)
+    assert sim.tp.go_cert.end == 'window' and not sim.tp.go_cert.taken_over
+
+
+def test_a_go_the_model_takes_over_is_driven_on_with_nothing_said():
+  sim, lp, go_i = held_at_its_red(taking_over)
+  plans = [sim.step(engaged=True) for _ in range(round(6. / DT_MDL))]
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  assert sim.tp.go_cert.end == 'takeover' and sim.tp.go_cert.taken_over and sim.v > 2.
+  lifted = sum(lifted for _, _, lifted in sim.planned)
+  assert 0 < lifted < round(GO_WINDOW_S / DT_MDL)
+
+
+def test_a_go_whose_lift_ended_early_stands_again_and_is_handed_back():
+  """A phantom in the path for one detector run mid-lift withdraws the go (inPath), and the lift with it; the model holds and
+  the car stands again short of the junction, nothing else holding it: withdrawn and handed back after NO_MOVE_S standing,
+  never a silent stand (before G5's rule it was 90 s: stopped_unheld near a control)."""
+  sim, lp, go_i = held_at_its_red(holding)
+  phantom = {'on': False}
+  sim.raw = lambda sim: RawFrame([raw_person(6., 0.)], 'road', sim.t) if phantom['on'] else None
+  plans = [sim.step(engaged=True) for _ in range(round(1.2 / DT_MDL))]
+  assert sim.v > 0.3 and all(go(p)[0] == 'turnRelease' for p in plans)
+  phantom['on'] = True
+  plans = [sim.step(engaged=True)]
+  phantom['on'] = False
+  assert go(plans[0])[0] == 'none' and sim.tp.go_cert.end == 'inPath'
+  plans += [sim.step(engaged=True) for _ in range(round(8. / DT_MDL))]
+  stood = next(i for i, p in enumerate(plans) if sim.trace[len(sim.trace) - len(plans) + i][1] < 0.3)
+  handed = next(i for i, p in enumerate(plans) if p.controlPrompt == 'cantStartTakeControl')
+  assert (handed - stood) * DT_MDL <= NO_MOVE_S + 0.2 and plans[-1].shouldStop and sim.v < 0.05
+
+
+def test_the_unprotected_lefts_lifted_go_never_reaches_the_oncoming_lanes_unfollowed():
+  """The autonomous left's go from its 9 m line, the model holding: the lift has the car past 0.3 m/s inside LEFT_NO_MOVE_S
+  (1.0 s) at a 0.3 s lag, so its no-move withdrawal doesn't come; the model never takes over, and the window's end withdraws
+  it: the car stops short of the oncoming lanes (ONCOMING_ENTRY_M before the maneuver point) and is handed back."""
+  sim = left_sim()
+  while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
+    drive(sim, DT_MDL)
+    assert sim.t < 60.
+  attach_planner(sim, holding)
+  plans = []
+  while not any(p.desire == Desire.turnLeft for p in plans[-1:]):
+    plans += drive(sim, DT_MDL)
+    assert sim.t < 90.
+  assert go(plans[-1])[0] == 'unprotectedLeft'
+  after = drive(sim, GO_WINDOW_S + 3.)
+  first = next(i for i, p in enumerate(after) if p.controlPrompt == 'cantStartTakeControl')
+  assert abs(first * DT_MDL - GO_WINDOW_S) <= DT_MDL + 1e-6, first * DT_MDL  # the window, not LEFT_NO_MOVE_S
+  assert sim.v < 0.05 and JUNCTION - sim.s > ONCOMING_ENTRY_M and after[-1].shouldStop
+
+
+def test_a_takeover_the_car_doesnt_move_on_is_still_the_no_move_withdrawal():
+  """The model's plan says go (the takeover predicate holds, the lift ends), but the car stands (a brake hold, an actuator
+  that doesn't answer): the go isn't followed until the car moves, so the no-move withdrawal still comes at NO_MOVE_S."""
+  sim = held_at_the_red()
+  go_from_the_hold(sim)
+  plans = []
+  for _ in range(round((NO_MOVE_S + 0.3) / DT_MDL)):
+    sim.v = 0.  # the default model drives on: its takeover holds while the car stands
+    plans.append(sim.step(engaged=True))
+  assert sim.tp.go_cert.end == 'takeover' and sim.tp.go_cert.taken_over
+  assert plans[-1].controlPrompt == 'cantStartTakeControl' and plans[-1].shouldStop

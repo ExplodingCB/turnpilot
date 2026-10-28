@@ -69,6 +69,8 @@ class Sim:
     self.big = False
     self.model_kw = {}  # synthetic.road() keywords for the model's lanes
     self.model_holds = False  # the model holds the car (stand()): its shouldStop, no motion planned; otherwise it drives on
+    self.model = None  # (sim) -> the modelV2 to send instead of the synthetic one
+    self.accel = None  # (sim, plan) -> the car's accel instead of following the plan's limits (a planner in the loop)
     self.model_running = True  # modeld publishing modelV2 (it doesn't while it loads the detector)
     self.nav_filter = None  # (sim, instruction) -> (instruction, valid): what navd sends instead
     # the driver takes over TAKE_OVER_S after TurnPilot stops the car at an unprotected turn and hands back (no gas go:
@@ -98,7 +100,8 @@ class Sim:
     self.sm.put('carState', car_state(self.v, steer, left_blinker=blinker, yaw_rate=yaw_rate, gas_pressed=gas))
     self.sm.put('carControl', car_control(lat_active, engaged))
     if self.model_running:
-      self.sm.put('modelV2', model_v2(*self.model_lanes, big=self.big, holds=self.model_holds, **self.model_kw))
+      self.sm.put('modelV2', self.model(self) if self.model is not None else
+                  model_v2(*self.model_lanes, big=self.big, holds=self.model_holds, **self.model_kw))
     if self.lights is not None:
       self.sm.put('turnpilotLights', self.lights(self))
     plan = self.tp.plan(self.sm, scene(objects, available), True, self.shadow, self.driver_signals, paint=self.paint,
@@ -107,6 +110,8 @@ class Sim:
     a = min(plan_accel(plan.accelCap, plan.speedCap, self.v), (self.cruise - self.v) / 2., 1.5)
     if plan.shouldStop:
       a = min(a, -1.)
+    if self.accel is not None:
+      a = self.accel(self, plan)
     if driver:
       a = TAKE_OVER_ACCEL  # the driver's foot, openpilot disengaged: the plan isn't applied
     self.v = max(self.v + max(a, -3.5) * DT_MDL, 0.)
