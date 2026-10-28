@@ -275,8 +275,8 @@ def leaving_crosswalk(obj, distance: float, side: int) -> bool:
 def junction_stops(objects, maneuver, distance, v_ego, right_hand_traffic, is_walker=crosswalk_walker,
                    may_leave=confirmed_track, may_harden=confirmed_track) -> list[Stop]:
   """Holds at the hold line before a turn: the crosswalk of a curb-side turn, oncoming traffic across a far-side one.
-  may_leave: whether a walker's velocity is trusted to let it go when it is leaving the crosswalk; may_harden: whether an
-  oncoming vehicle's track is confirmed, to brake harder than the curve for it."""
+  may_leave: whether a walker's velocity is trusted to let it go when it is leaving the crosswalk; may_harden: whether a
+  walker's or an oncoming vehicle's track is confirmed, to brake harder than the curve for it."""
   far_side = far_side_turn(maneuver, right_hand_traffic)
   if not hold_line_stop(maneuver, distance, v_ego, "", far_side):
     return []
@@ -286,7 +286,11 @@ def junction_stops(objects, maneuver, distance, v_ego, right_hand_traffic, is_wa
                distance - CROSSWALK_X_BEFORE_M < obj.x < distance + CROSSWALK_X_AFTER_M and
                CROSSWALK_Y_NEAR_M < obj.y * side < CROSSWALK_Y_FAR_M and
                not (may_leave(obj) and leaving_crosswalk(obj, distance, side))]
-    return hold_line_stop(maneuver, distance, v_ego, "pedestrian in crosswalk") if walkers else []
+    if not walkers:
+      return []
+    # the hold hardens only for a confirmed walker, and says which one (the most confirmed, then the nearest)
+    walker = min(walkers, key=lambda obj: (not may_harden(obj), obj.x))
+    return hold_line_stop(maneuver, distance, v_ego, "pedestrian in crosswalk", far_side, may_harden(walker), track_evidence(walker))
   holds = []
   for obj in objects:
     # a new track's vx is range noise, its sign included (VEL_TRUST_HITS): taken as coming, never as going away. Taken so,
@@ -345,7 +349,7 @@ class ScenePolicy:
     self.released_id: int | None = None  # the maneuver whose junction hold a gas press released
     self.committed_id: int | None = None  # the maneuver the car passed the hold line for faster than COMMIT_SPEED
     self.carried: list[Stop] = []        # the last available frame's pedestrian stops, moved with the car since
-    self.carried_junction: tuple[int | None, str] | None = None  # (maneuver id, reason) of its junction hold
+    self.carried_junction: tuple[int | None, Stop] | None = None  # (maneuver id, its junction hold): reason, confirmed, evidence
     self.junction: Stop | None = None    # the junction hold in force on the last frame
     self.fault_junction: Stop | None = None  # ...kept through a fault, which lost the route it was for
     self.fault_open = False  # a fault lost the route with the car committed to (or released into) its junction
@@ -391,14 +395,16 @@ class ScenePolicy:
                                 lambda obj: self.tracks[obj.trackId].confirmed and self.tracks[obj.trackId].leaving >= CROSSWALK_LEAVING_FRAMES,
                                 lambda obj: self.tracks[obj.trackId].confirmed)
       self.carried = peds
-      self.carried_junction = (maneuver_id, junction[0].reason) if junction else None
+      self.carried_junction = (maneuver_id, junction[0]) if junction else None
     else:
       # no evidence either way: keep what was in force, the pedestrians where they were relative to the road
       self.carried = [stop(v_ego, s.d_stop - (v_ego - s.v_lead) * dt, s.reason, s.confirmed, s.v_lead, s.evidence) for s in self.carried]
       peds = self.carried
       junction = []
       if self.carried_junction is not None and self.carried_junction[0] == maneuver_id:
-        junction = hold_line_stop(maneuver, distance, v_ego, self.carried_junction[1], far_side)
+        # the hold keeps what its evidence earned: an unconfirmed track's hold stays on the comfortable curve
+        h = self.carried_junction[1]
+        junction = hold_line_stop(maneuver, distance, v_ego, h.reason, far_side, h.confirmed, h.evidence)
 
     if junction and gas_pressed and maneuver_id is not None and distance - HOLD_LINE_M < GAS_RELEASE_M:
       self.released_id = maneuver_id  # the driver took over and goes: stopping again further in would be worse

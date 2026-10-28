@@ -518,3 +518,60 @@ def test_a_hard_stop_for_a_trusted_oncoming_car_is_logged_too():
   assert d.hard_brake and d.reason == "waiting for oncoming"
   kw = next(c.kwargs for c in log.event.call_args_list if c.args[0] == "turnpilot.hard_brake")
   assert kw['track_id'] == 3 and kw['cls'] == 'car' and kw['vx'] == -12.
+
+
+def _carried_junction_run(obj, drop_at: float, v0: float = 9., d0: float = 40.):
+  """A left turn approached at v0 from d0 m: obj (a car dict) seen over the 1.5 m before drop_at, then the scene gone
+  (detector stale) and the junction hold carried. The car takes the plan's brake. (worst plan accel, hard_brake events)"""
+  sp, v, dist, worst = ScenePolicy(), v0, d0, 0.
+  with mock.patch('openpilot.selfdrive.turnpilot.scene_policy.cloudlog') as log:
+    for _ in range(int(8 / DT_MDL)):
+      seen = drop_at + 1.5 > dist > drop_at
+      if dist > drop_at:
+        sc = scene([obj | {'x': dist + 20.}] if seen else [])
+        d = sp.update(sc.objects, True, LEFT_TURN, dist, v, maneuver_id=1)
+      else:
+        d = sp.update([], False, LEFT_TURN, dist, v, maneuver_id=1)
+      a = plan_accel(d.accel_cap, d.speed_cap, v)
+      worst = min(worst, a)
+      v = max(v + max(min(a, 0.), -3.5) * DT_MDL, 0.)
+      dist -= v * DT_MDL
+      if dist < 0:
+        break
+  return worst, [c.kwargs for c in log.event.call_args_list if c.args[0] == "turnpilot.hard_brake"]
+
+
+def test_a_carried_junction_hold_keeps_its_tracks_confirmation_and_evidence():
+  # skeptic G1: an untrusted 3-hit oncoming blip held the turn on the comfortable curve; the scene then dropped out and the
+  # carried hold was rebuilt confirmed, with no evidence: -2.9 to -8.8 m/s^2, logged confirmed=true
+  blip = car(0., 5., vx=-3., age=3, conf=0.5, trackId=9)
+  for drop_at in (22., 20., 18., 16., 14.):
+    worst, events = _carried_junction_run(blip, drop_at)
+    assert worst >= MAP_DECEL_MAX - 1e-6, (drop_at, worst)
+    assert not events, drop_at
+  # a trusted oncoming car closing fast: its carried hold still brakes as hard as it needs, logged with its evidence
+  trusted = car(0., 5., vx=-12., age=VEL_TRUST_HITS, trackId=3)
+  worst, events = _carried_junction_run(trusted, 18.)
+  assert worst < MAP_DECEL_MAX - 1e-6
+  assert events and all(e['confirmed'] and e['track_id'] == 3 and e['cls'] == 'car' for e in events)
+
+
+def test_a_crosswalk_hold_brakes_hard_only_for_a_confirmed_walker_and_logs_it():
+  # a crosswalk walker (5-9 hits at 0.5, steadily seen) that isn't confirmed: the hold stays on the comfortable curve, where it
+  # took the hold line's defaults (confirmed, no evidence) and asked for -7
+  def run(conf, age0, age_max=100):
+    sp, v, dist, worst = ScenePolicy(), 9., HOLD_LINE_M + 10., 0.
+    with mock.patch('openpilot.selfdrive.turnpilot.scene_policy.cloudlog') as log:
+      for k in range(int(3 / DT_MDL)):
+        sc = scene([ped(dist + 2., -5., age=min(age0 + k, age_max), conf=conf, trackId=4)])
+        d = sp.update(sc.objects, True, RIGHT_TURN, dist, v, maneuver_id=1)
+        a = plan_accel(d.accel_cap, d.speed_cap, v)
+        worst = min(worst, a)
+        v = max(v + max(min(a, 0.), -3.5) * DT_MDL, 0.)
+        dist -= v * DT_MDL
+    return worst, [c.kwargs for c in log.event.call_args_list if c.args[0] == "turnpilot.hard_brake"]
+  worst, events = run(0.5, 5, 9)  # under CONFIRM_STEADY_HITS, under CONFIRM_CONF
+  assert worst >= MAP_DECEL_MAX - 1e-6 and not events
+  worst, events = run(0.9, 10)
+  assert worst < MAP_DECEL_MAX - 1e-6
+  assert events and events[0]['track_id'] == 4 and events[0]['reason'] == "pedestrian in crosswalk" and events[0]['confirmed']
