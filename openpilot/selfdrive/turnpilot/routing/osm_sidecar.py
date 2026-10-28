@@ -14,7 +14,7 @@ tile, empty or not) and of the tiles within NEAR_DEG of it (read if there: a lin
 status: ok; missing (no directory, no osm_controls/, or a shard of the route's tiles not there or unreadable: a corridor from
 a server before the sidecar, or tiles built without it); stale (a shard's osm_timestamp isn't the tiles', or the tiles have
 none to check it against). Anything but ok means the stops Valhalla doesn't flag are unknown, which controls.py says out
-loud. Shards are cached by file (mtime and size), since navd looks up the road ahead every second.
+loud. Shards are cached by file (mtime and size, CACHE_MAX of them), since navd looks up the road ahead every second.
 """
 import json
 import threading
@@ -29,6 +29,7 @@ NO_DIRECTORY = ''   # sources.py: a sidecar is expected, but the tiles have no d
 SAMPLE_M = 25.      # m between the route points whose tiles must have a shard
 NEAR_DEG = 0.0006   # deg (about 50-65 m) around them: the tiles read too, when there
 M_PER_DEG = 111195.
+CACHE_MAX = 256     # shards kept parsed: a few corridors' worth; the oldest read goes first
 
 _cache: dict[Path, tuple[int, int, dict | None]] = {}
 _lock = threading.Lock()
@@ -102,7 +103,10 @@ def read_shard(path: Path) -> dict | None:
     cloudlog.error(f"turnpilot osm sidecar: {path} doesn't read: {type(e).__name__}: {e}")
     shard = None
   with _lock:
+    _cache.pop(path, None)
     _cache[path] = (st.st_mtime_ns, st.st_size, shard)
+    while len(_cache) > CACHE_MAX:
+      del _cache[next(iter(_cache))]
   return shard
 
 
