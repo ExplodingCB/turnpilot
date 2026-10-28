@@ -656,10 +656,15 @@ class TurnPilot:
       return None if not isinstance(turn, tuple) else LeftCommand(OFF)
     tc = self.map_controls.turn
     held = tc is not None and tc.held and tc.key[1] == int(turn[0])
+    # the latch holds the car at another maneuver's line than the route's now (a reading far off then back read as a pass
+    # and a new maneuver by the follower, which a turn whose desire isn't out doesn't hold): the car is held where its
+    # junction isn't known. Said for as long as it lasts, never a silent hold (skeptic G4)
+    stray = tc is not None and tc.held and not held
     scene = self.scene
-    inp = LeftInput(mode, rf.maneuver_id, upcoming.side, rf.distance, v_ego, held, raw, objects, self.approach_yaw_deg,
+    inp = LeftInput(mode, rf.maneuver_id, upcoming.side, rf.distance, v_ego, held or stray, raw, objects, self.approach_yaw_deg,
                     upcoming.opposing_speed or None, upcoming.opposing_lanes or None, self.left_range_m,
-                    scene_clear=scene.junction is None and not scene.carried, junction_uncertain=rf.junction_spread > UNCERTAIN_M,
+                    scene_clear=scene.junction is None and not scene.carried,
+                    junction_uncertain=rf.junction_spread > UNCERTAIN_M or stray,
                     go_withdrawn=self.go_withdrawn, committed=rf.maneuver_id in (scene.committed_id, scene.released_id),
                     spread_m=rf.junction_spread)
     d = self.left_now = self.left.update(inp, DT_MDL)
@@ -699,7 +704,10 @@ class TurnPilot:
     """A go from the car standing at or short of the route's junction's hold line, distance (the follower's) GO_LINE_M or
     more before it, the scene neither committed to that junction nor released into it by the driver: only such a go is
     withdrawn (no_move). Otherwise the car is in the junction, where stopping is worse than finishing the turn
-    (scene_policy.py: committed_past_line); a stop line mapped nearer than GO_LINE_M (a sim sidecar's) is taken so too."""
+    (scene_policy.py: committed_past_line); a stop line mapped nearer than GO_LINE_M (a sim sidecar's) is taken so too.
+    The autonomous left's go is always from its line (it goes only standing held there), whatever a reading says."""
+    if self.left_now is not None and self.left_now.go:
+      return True
     mid = self.follower.maneuver_id
     return distance >= GO_LINE_M and mid not in (self.scene.committed_id, self.scene.released_id)
 

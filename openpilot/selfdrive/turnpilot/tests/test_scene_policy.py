@@ -6,7 +6,7 @@ from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_ACCEL_MIN as MAP_DECEL
 from openpilot.selfdrive.turnpilot.route_follower import NOMINAL_ANGLE_DEG, Maneuver, classify
 from openpilot.selfdrive.turnpilot.scene_policy import (ACCEL_CAP_JERK, COMMIT_SPEED, CONFIRM_HITS, CROSSWALK_LEAVING_FRAMES, GAS_RELEASE_M, HOLD_LINE_M,
                                                         NO_ACCEL_CAP, NO_SPEED_CAP, ONCOMING_ASSUMED_SPEED, ONCOMING_ENTRY_M, ONCOMING_TTA_S,
-                                                        PED_STOP_GAP_M, STOP_DECEL, VEL_TRUST_HITS, ScenePolicy, scene_policy)
+                                                        PED_STOP_GAP_M, STOP_DECEL, VEL_TRUST_HITS, ScenePolicy, Stop, scene_policy)
 from openpilot.selfdrive.turnpilot.tests.synthetic import scene
 
 LEFT_TURN = Maneuver(*classify("turn", "left"), "turn", "left", NOMINAL_ANGLE_DEG["left"])
@@ -700,3 +700,22 @@ def test_confirmation_needs_recent_hits_and_is_lost_when_the_track_coasts_out():
     frame([])
   frame([ped(30., 0.1, in_path=True, age=11, conf=0.9, trackId=2)])
   assert not sp.tracks[2].confirmed
+
+
+def test_a_standing_car_a_latch_holds_is_never_committed_by_a_reading():
+  # skeptic G4 (blocker 3): held at an unprotected left's line through a long oncoming stream, one navd reading 6 m nearer put
+  # the follower's distance under ONCOMING_ENTRY_M: committed_past_line fired on a car that hadn't moved, the scene committed
+  # to the junction, and the left (committed first) stopped judging with the latch still holding the car. A car a latch
+  # holds (an extra stop with shouldStop, the car standing) is where the latch put it: a reading never commits it
+  latch = Stop(-0.5, 0., True, "Unprotected left: waiting for a gap", 0.)
+  sp = ScenePolicy()
+  sp.update([], True, LEFT_TURN, HOLD_LINE_M + 1., 0., maneuver_id=3, extra_stops=[latch])
+  sp.update([], True, LEFT_TURN, ONCOMING_ENTRY_M - 0.2, 0., maneuver_id=3, extra_stops=[latch])
+  assert sp.committed_id is None
+  # moving through (its go), the same reading commits it, as before
+  sp.update([], True, LEFT_TURN, ONCOMING_ENTRY_M - 0.2, 1., maneuver_id=3)
+  assert sp.committed_id == 3
+  # and nothing holding it, standing there, it is past the line: committed (a driver who stopped in the junction)
+  sp = ScenePolicy()
+  sp.update([], True, LEFT_TURN, ONCOMING_ENTRY_M - 0.2, 0., maneuver_id=4)
+  assert sp.committed_id == 4

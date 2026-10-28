@@ -46,8 +46,10 @@ profile): the road camera only from the go to the commit (CRITIQUE REQUIRED 3; t
 while held, for the exit crosswalk). Until the car can no longer stop short of the oncoming lanes on the comfortable curve
 (scene_policy.committed_past_line), every road run is checked again for the remaining clear time, and at its first motion
 (STANDSTILL_SPEED: CRITIQUE REQUIRED 4) with the latency gone: a car in the band then withdraws the go, the car stops
-where the comfortable curve can (oncomingHolding, a chime) and waits again. Committed, nothing here ever stops the car (a
-pedestrian in the path still does: scene_policy). A go the car hasn't moved on within turnpilotd's LEFT_NO_MOVE_S is
+where the comfortable curve can (oncomingHolding, a chime) and waits again; standing where it was held, it can always
+stay. It is committed only by its own go and motion, never by a reading while it stands (a scene commit before its go,
+with the car held, is a 'position' fault). Committed, nothing here ever stops the car (a pedestrian in the path still
+does: scene_policy). A go the car hasn't moved on within turnpilotd's LEFT_NO_MOVE_S is
 withdrawn and handed back there (the model holding the car; G5's bounded go is the remedy).
 """
 import math
@@ -337,7 +339,11 @@ class UnprotectedLeft:
     if self.alert_t > 0.:
       out.alert = 'oncomingHolding'
 
-    if self.state == 'committed' or inp.committed or (self.went and committed_past_line(inp.distance, inp.v_ego, True)):
+    standing = inp.held or self.hold_here
+    # committed by its own go and motion: never by a reading before it moved (skeptic G4: a reading 6 m nearer while held at
+    # the line committed the scene, and the left stopped judging with the latch holding the car, silently, for good)
+    past = inp.committed or committed_past_line(inp.distance, inp.v_ego, True)
+    if self.state == 'committed' or (self.went and self.moved and past) or (inp.committed and not self.went and not standing):
       if self.state != 'committed':
         cloudlog.event("turnpilot.left_committed", distance=round(inp.distance, 1), v=round(inp.v_ego, 2))
       self.state, self.hold_here = 'committed', False
@@ -345,11 +351,14 @@ class UnprotectedLeft:
       return out
     if self.state == 'undecided':
       return self._undecided(out, self.why)
+    if inp.committed and not self.went and standing:
+      # the scene committed to the junction while the car stands held short of it, the left never having gone: where the
+      # car is isn't known. Out loud, never a freeze
+      return self._undecided(out, 'position')
 
     if self.went:
       return self._after_go(inp, out, raw_blockers, dt)
 
-    standing = inp.held or self.hold_here
     if not standing:
       out.state = self.state = 'approach'
       out.view = 'road' if inp.distance <= VIEW_FROM_M else 'none'
@@ -360,6 +369,8 @@ class UnprotectedLeft:
       out.clear_s = 0.
     certified = self.clear_s >= CLEAR_WINDOW_S - 1e-6 and not blocked_view and crosswalk and inp.scene_clear
     out.view = 'roadAndWide'
+    if inp.junction_uncertain:  # where the car is isn't known: before anything is judged from it (a roll-up included)
+      return self._undecided(out, 'position')
     # held short of its line (the latch reaches LATCH_NEAR_M short of it), where the longer crossing puts R_req past the
     # range: rolled up to the line first (the latch's creep), where it is judged (BeamNG: held 16 m out, R_req 164 m)
     short = inp.distance - LINE_D
@@ -373,8 +384,6 @@ class UnprotectedLeft:
     # faults: never a go it can't judge
     if rreq > inp.range_m:
       return self._undecided(out, 'range')
-    if inp.junction_uncertain:
-      return self._undecided(out, 'position')
     if self.road_age > STALE_UNDECIDED_S:
       return self._undecided(out, 'stale')
     if abs(inp.heading_deg) > YAW_UNDECIDED_DEG:
@@ -440,8 +449,9 @@ class UnprotectedLeft:
     if not raw_blockers:
       return out
     stop_m = inp.v_ego ** 2 / (2. * STOP_DECEL)
-    if stop_m >= inp.distance - ONCOMING_ENTRY_M:
-      return out  # can't stop short of the oncoming lanes: on (committed_past_line commits it next)
+    if self.moved and stop_m >= inp.distance - ONCOMING_ENTRY_M:
+      return out  # can't stop short of the oncoming lanes: on (committed_past_line commits it next). Not yet moved, it stands
+                  # where it was held: it can always stay (a reading nearer than the line never makes it go on)
     cloudlog.event("turnpilot.left_go_withdrawn", error=True, first_motion=first_motion, distance=round(inp.distance, 1),
                    v=round(inp.v_ego, 2), blockers=len(raw_blockers), r_req=round(out.r_req, 1))
     self.went, self.moved, self.hold_here, self.clear_s = False, False, True, 0.

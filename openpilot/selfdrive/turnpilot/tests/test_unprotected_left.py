@@ -395,3 +395,31 @@ def test_a_creep_the_car_never_makes_is_handed_back():
   j = Junction()
   d = j.wait(CREEP_STALL_S + 2., boxes=[box], objects=[turner], v=0., scene_clear=False)
   assert d.state == 'creep'
+
+
+def test_a_commit_while_standing_held_before_any_go_is_a_fault_never_a_freeze():
+  # skeptic G4 (blocker 3): the scene committed to the junction (a reading put the car past its line) while the latch held it
+  # and the left had never gone: the left took it as committed, sent nothing, and the car stood forever, silently. Before
+  # the left's own go a commit is no commit; held standing, it is a contradiction: undecided, out loud
+  j = Junction()
+  j.wait(1.)
+  d = j.step(committed=True)
+  assert d.state == 'undecided' and d.why == 'position' and d.prompt == 'leftUndecidedTakeControl' and not d.go
+  # after its go the car must have moved before anything commits it: at the go, a nearer reading (under ONCOMING_ENTRY_M)
+  # leaves its abort window open until it pulls away
+  j = Junction()
+  j.wait(CLEAR_WINDOW_S + 0.2)
+  assert any(x.go for x in j.decisions)
+  j.held = False
+  d = j.step(distance=ONCOMING_ENTRY_M - 0.5, committed=True)
+  assert d.state == 'go'
+  d = j.step(boxes=[raw(80., 3.6)], distance=ONCOMING_ENTRY_M - 0.5, committed=True)
+  # standing where it was held, it can always stay: a car in the band withdraws the go whatever the reading says
+  assert d.state == 'waitGap' and d.alert == 'oncomingHolding' and d.stops and d.stops[0].should_stop
+  j = Junction()
+  j.wait(CLEAR_WINDOW_S + 0.2)
+  j.held = False
+  d = j.step(v=0.5, distance=ONCOMING_ENTRY_M - 0.5, committed=True)  # its first motion: the re-check, then committed
+  assert d.state == 'go'
+  d = j.step(v=0.6, distance=ONCOMING_ENTRY_M - 0.6, committed=True)
+  assert d.state == 'committed'

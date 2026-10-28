@@ -445,7 +445,10 @@ class ScenePolicy:
 
     if junction and gas_pressed and maneuver_id is not None and distance - HOLD_LINE_M < GAS_RELEASE_M:
       self.released_id = maneuver_id  # the driver took over and goes: stopping again further in would be worse
-    if maneuver_id is not None and maneuver is not None and maneuver.kind == TURN and \
+    # a standing car a latch holds (map_controls: position-free) is where the latch put it, short of its line: a reading that
+    # puts it past (GPS while standing) never commits it (skeptic G4: the unprotected left stopped judging, held forever)
+    latched = v_ego < STOP_SPEED and any(s.should_stop for s in extra_stops)
+    if maneuver_id is not None and maneuver is not None and maneuver.kind == TURN and not latched and \
        committed_past_line(distance, v_ego, far_side):
       self.committed_id = maneuver_id  # never stopped in the junction for it again, however slow the car gets in there
     if self.fault_open and maneuver_id is not None and maneuver is not None and maneuver.kind == TURN:

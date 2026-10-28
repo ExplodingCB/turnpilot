@@ -7,10 +7,10 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.scene.tracker import RawBox, RawFrame
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, ONCOMING_ENTRY_M
-from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of
+from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of, nav_instruction
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Sim
 from openpilot.selfdrive.turnpilot.turn_speed import POST_GO_PROFILES
-from openpilot.selfdrive.turnpilot.turnpilotd import LEFT_NO_MOVE_S, TurnPilot, auto_left_for, left_range_for
+from openpilot.selfdrive.turnpilot.turnpilotd import GO_LINE_M, LEFT_NO_MOVE_S, TurnPilot, auto_left_for, left_range_for
 from openpilot.selfdrive.turnpilot.unprotected_left import CLEAR_WINDOW_S, CREEP_STALL_S, ROAD_RANGE_M, STALE_UNDECIDED_S, r_req, t_req
 
 Desire = log.Desire
@@ -41,8 +41,8 @@ def road_runs(cars=lambda sim: ()):
   return raw
 
 
-def left_sim(cars=lambda sim: (), runs=True):
-  sim = Sim(LEFT_25)
+def left_sim(cars=lambda sim: (), runs=True, sim_cls=Sim):
+  sim = sim_cls(LEFT_25)
   sim.tp.auto_left = 'auto'
   sim.go_taps = False
   sim.raw = road_runs(cars) if runs else None
@@ -342,3 +342,82 @@ def test_a_creep_for_a_view_the_car_never_makes_is_never_silent():
   assert str(plans[first].controlPrompt) == 'leftUndecidedTakeControl' and plans[first].reason == "Can't creep for a view: take control"
   assert (first - creep) * DT_MDL <= CREEP_STALL_S + 1. and plans[first].shouldStop
   assert not any(p.desire == Desire.turnLeft for p in plans)
+
+
+def jump_run(jump_m, seconds, n_cars=12, sim_cls=Sim):
+  """LEFT_25 held at its line through a stream of n_cars oncoming cars 3 s apart (no gap of T_req), the first 60 m past
+  the junction as the car nears it; once the car stands waiting, one navd reading puts the junction jump_m nearer (GPS
+  standing). (sim, plans, s at which the last car passed the junction's conflict point)"""
+  stream = [JUNCTION + 60. + k * 3. * V_25 for k in range(n_cars)]
+  t0 = [None]
+
+  def cars(sim):
+    if t0[0] is None and JUNCTION - sim.s < 60.:
+      t0[0] = sim.t
+    dt = sim.t - t0[0] if t0[0] is not None else 0.
+    return [(s - V_25 * dt, 3.6) for s in stream]
+  sim = left_sim(cars, sim_cls=sim_cls)
+  jumped = {'on': False, 'n': 0}
+
+  def nav(sim, instr):
+    if jumped['on'] and jumped['n'] < 1 and instr.maneuverModifier == 'left':
+      jumped['n'] += 1
+      return nav_instruction(instr.maneuverDistance - jump_m, "turn", "left", remaining=instr.distanceRemaining,
+                             junction=LEFT_25[0][3], ahead=[(1500. - sim.s - jump_m, "turn", "right", junction_of("right"))]), True
+    return instr, True
+  sim.nav_filter = nav
+  plans = []
+  while sim.t < seconds:
+    plans += drive(sim, DT_MDL)
+    if not jumped['on'] and sim.tp.left_now is not None and sim.tp.left_now.state == 'waitGap' and sim.v < 0.05:
+      jumped['on'] = True
+  assert jumped['n'] == 1
+  return sim, plans, t0[0] + (stream[-1] - JUNCTION - 3.) / V_25
+
+
+def test_a_nearer_reading_while_held_at_the_line_never_silently_freezes_the_left():
+  # skeptic G4 (blocker 3): one reading 5.5-10 m nearer while the car stood at its line committed the scene to the junction
+  # (the follower's distance under ONCOMING_ENTRY_M), the left took that as its commit with no go, and the latch held the
+  # car forever ("waiting for a gap", no chime, 130 s past the stream's end). The left keeps judging and goes after it
+  for jump in (5.5, 6., 10.):
+    sim, plans, last = jump_run(jump, 90.)
+    states = [str(p.unprotectedLeft.state) for p in plans]
+    go = next((i for i, p in enumerate(plans) if str(p.controlPrompt) == 'leftGo'), None)
+    assert go is not None, (jump, sorted(set(states)))
+    assert 'committed' not in states[:go] and go * DT_MDL > last, jump
+    assert sim.s > JUNCTION + 10., jump
+    assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans), jump
+  # a reading further off than the follower's spread allows (UNCERTAIN_M; the reading after it then reads as a new maneuver
+  # to the follower, the latch still holding the car at the old one's line): a fault, said for as long as it holds the car,
+  # never a freeze
+  sim, plans, _ = jump_run(20., 60.)
+  first = next(i for i, p in enumerate(plans) if str(p.controlPrompt) == 'leftUndecidedTakeControl')
+  assert plans[first].reason == "Junction position unsure: take control" and sim.s < LINE + 1.
+  assert all(str(p.controlPrompt) == 'leftUndecidedTakeControl' and p.shouldStop for p in plans[first:])
+
+
+
+class GoHeldSim(Sim):
+  """The model holding the car at a standstill once TurnPilot's turn pulse (its go) has gone out: it never pulls away."""
+  went = False
+
+  def step(self, *a, **k):
+    plan = super().step(*a, **k)
+    self.went = self.went or plan.desire == Desire.turnLeft
+    if self.went:
+      self.s -= self.v * DT_MDL
+      self.v = 0.
+      self.trace[-1] = (self.s, self.v, plan)
+    return plan
+
+
+def test_a_go_after_a_nearer_reading_is_still_withdrawn_when_the_car_doesnt_move():
+  # the left goes only standing held at its line: after a nearer reading (the follower's distance under GO_LINE_M) its go is
+  # still a go from the line, withdrawn and handed back when the model holds the car (LEFT_NO_MOVE_S), never taken for a go
+  # in the junction left to the stall's handback
+  sim, plans, last = jump_run(6., 70., sim_cls=GoHeldSim)
+  go = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
+  assert sim.distance() < GO_LINE_M and not sim.tp.go_in_junction
+  after = plans[go:]
+  withdrawn = next(i for i, p in enumerate(after) if str(p.controlPrompt) == 'cantStartTakeControl')
+  assert withdrawn * DT_MDL <= LEFT_NO_MOVE_S + 0.2 and after[-1].shouldStop and sim.s < LINE + 1.
