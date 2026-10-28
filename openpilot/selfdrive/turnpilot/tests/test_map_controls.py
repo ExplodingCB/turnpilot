@@ -221,32 +221,6 @@ def test_queue_behind_a_lead_creeps_to_the_line():
   assert -2. < 200. - car.s < 5.
 
 
-# --- signals, no light source (the car tonight) ---
-
-def test_unknown_signal_holds_and_prompts():
-  car = Car([(200., 'signal')])
-  out, dec = car.run_until(lambda out, dec: out.stops)
-  assert out.prompt == 'signalGo' and 'light not checked' in dec.reason
-  car.run_until(held)
-  out, dec, _ = car.run(20.)
-  assert held(out, dec) and out.prompt == 'signalGo' and 'tap gas to go' in dec.reason
-  out, dec, _ = car.step(gas=True, accel=0.)
-  assert not dec.should_stop and out.released_stopped
-
-
-def test_unknown_signal_pre_confirm_while_rolling_and_release_span():
-  car = Car([(200., 'signal'), (220., 'signal'), (300., 'signal')])
-  car.run_until(lambda out, dec: out.stops)
-  car.run(1.)
-  car.step(gas=True, accel=0.)  # a tap while rolling: the driver saw the light
-  out, dec = car.run_until(lambda out, dec: car.s > 205.)
-  assert min(r[2] for r in car.rows) > 5.  # never stopped
-  # the one 20 m on (the far side of a divided road) went with it; the one at 300 m is its own
-  assert all(s.reason == '' or car.s > 220. for s in out.stops)
-  out, dec = car.run_until(lambda out, dec: out.stops and out.shown.id == 2)
-  car.run_until(held)
-
-
 # --- signals with the sim oracle ---
 
 def lights(state, distance):
@@ -279,20 +253,23 @@ def test_red_holds_and_steady_green_releases():
   assert car.s > 155. and not out.stops
 
 
-def test_gas_on_red_releases_with_going_on_red():
+def test_gas_on_red_never_releases_it():
+  # no gas go (Kellen, 2026-10-28): a press at a red hold is the driver's, never a release; the hold stays
   car = Car([(150., 'signal')])
   car.run_until(held, lights=oracle('red'))
   out, dec, _ = car.step(gas=True, accel=0., lights=oracle('red'))
-  assert not dec.should_stop and out.alert == 'goingOnRed'
+  out, dec, _ = car.step(accel=0., lights=oracle('red'))
+  assert held(out, dec) and out.alert == 'none' and not out.released_stopped
 
 
 def test_stale_or_far_light_is_unknown():
+  # a red 25 m+ off the control isn't its light, and two lights disagreeing about it are unknown: nothing to stop for
   car = Car([(150., 'signal')])
-  out, dec = car.run_until(lambda out, dec: out.stops, lights=lights('green', 100.))  # 25 m+ off the control: not its light
-  assert out.prompt == 'signalGo'
-  # two lights disagreeing about it: unknown
+  for _ in range(int(5. / DT_MDL)):
+    out, dec, _ = car.step(lights=oracle('red', 40.))  # 40 m past it
+    assert not out.stops
   out, dec, _ = car.step(lights=Lights([('green', car.controls[0][0] - car.s), ('red', car.controls[0][0] - car.s + 3.)], 'simOracle'))
-  assert out.shown.light_state == 'unknown' and out.prompt == 'signalGo'
+  assert out.shown.light_state == 'unknown' and not out.stops and out.prompt == 'none'
 
 
 @pytest.mark.parametrize("mph", [25, 35, 45])
@@ -321,16 +298,21 @@ def test_yellow_boundary(mph, side):
 
 
 def test_flicker_green_unknown_green():
+  # green, a spell with no light, green: unknown is nothing to stop for, so never a cap
   car = Car([(300., 'signal')])
-  car.run_until(lambda out, dec: 300. - car.s < 80., lights=oracle('green'))  # engaged, and going on the green
-  out, dec, _ = car.run(0.6, lights=oracle('green'))
-  assert out.shown.action == 'released' and dec.speed_cap >= car.v
-  out, dec, _ = car.run(0.4, lights=NO_LIGHTS)  # 0.4 s with no light: far out, that's a stop decision
-  assert dec.speed_cap < car.v or dec.accel_cap < NO_ACCEL_CAP
-  out, dec, _ = car.run(0.4, lights=oracle('green'))  # green back, not steady yet: still stopping
-  assert dec.speed_cap < car.v + 0.5
-  out, dec, _ = car.run(0.2, lights=oracle('green'))
-  assert dec.speed_cap >= car.v  # steady: no cap
+  for lit, secs in ((oracle('green'), 3.), (NO_LIGHTS, 0.4), (oracle('green'), 0.4), (NO_LIGHTS, 2.)):
+    for _ in range(int(round(secs / DT_MDL))):
+      out, dec, _ = car.step(lights=lit)
+      assert not out.stops and dec.speed_cap >= car.v
+
+
+def test_a_red_whose_light_is_lost_stays_stopped_until_a_steady_green():
+  car = Car([(150., 'signal')])
+  car.run_until(held, lights=oracle('red'))
+  out, dec, _ = car.run(10., lights=NO_LIGHTS)
+  assert held(out, dec) and car.policy.stop_ahead() == 0.
+  out, dec, _ = car.run(GREEN_STEADY_S + 0.1, lights=oracle('green'))
+  assert not dec.should_stop
 
 
 def test_light_input_acceptance():
@@ -394,7 +376,7 @@ def test_light_rejected_alert():
 
 def test_crossing_reason():
   car = Car([(200., 'signal', False, False, False)])
-  out, dec = car.run_until(held)
+  out, dec = car.run_until(held, lights=oracle('red'))
   assert 'crossing' in dec.reason
 
 
@@ -446,9 +428,16 @@ def test_unprotected_left_approach_reason_and_engage():
   assert out.stops[0].reason == "Unprotected left ahead" and out.shown.kind == UNPROTECTED
 
 
-@pytest.mark.parametrize("kind", ['stop', 'signal'])
-def test_stop_sign_or_signal_at_the_junction_protects_the_left(kind):
-  # its own latch holds the car (a signal whatever the light): one stop, one tap, no second stop at the hold line
+def test_a_signal_at_the_junction_leaves_the_left_unprotected():
+  # signals don't hold, and a green ball can't be told from an arrow (SIGNAL_PROTECTS_LEFT): the left stops at its hold line
+  car = left_car([(250. - 11., 'signal')])
+  out, dec = car.run_until(held, lights=lambda car: lights('green', 239. - car.s))
+  assert out.shown.kind == UNPROTECTED and -2. < 250. - HOLD_LINE_M - 1. - car.s < 5.
+
+
+@pytest.mark.parametrize("kind", ['stop'])
+def test_stop_sign_at_the_junction_protects_the_left(kind):
+  # its own latch holds the car: one stop, one tap, no second stop at the hold line
   car = left_car([(250. - 11., kind)])
   out, dec = car.run_until(held)
   assert out.shown.kind == kind and -2. < 239. - car.s < 5.
@@ -521,20 +510,21 @@ def test_creeping_over_the_line_under_the_drivers_foot_is_never_stopped_in_the_j
   assert not out.stops and dec.speed_cap > 5. and car.v > v_creep - 0.05
 
 
-def test_a_gas_nudge_in_a_queue_short_of_a_signal_doesnt_let_go_of_it():
-  # queued behind a lead 22 m short of an unchecked signal, the driver creeps up a little under the gas: that isn't the
-  # go. Once the lead leaves the car still stops at the line and is held there for the tap
+def test_a_gas_nudge_in_a_queue_short_of_a_red_doesnt_let_go_of_it():
+  # queued behind a lead 22 m short of a red, the driver creeps up a little under the gas: the car still stops at the line
+  # once the lead leaves, and is held there
   car = Car([(200., 'signal')])
-  car.run_until(lambda out, dec: out.stops)
+  red = oracle('red')
+  car.run_until(lambda out, dec: out.stops, lights=red)
   car.lead_stop = 178.
-  out, dec = car.run_until(lambda out, dec: car.v < 0.01 and car.s > 150.)
+  out, dec = car.run_until(lambda out, dec: car.v < 0.01 and car.s > 150., lights=red)
   assert 200. - car.s > 20.
-  out, dec, _ = car.run(1.)
-  assert out.prompt == 'none'  # no go asked for where a tap isn't one
-  car.run(0.5, gas=True, accel=0.4)
-  car.run(2.)
+  out, dec, _ = car.run(1., lights=red)
+  assert out.prompt == 'none'
+  car.run(0.5, gas=True, accel=0.4, lights=red)
+  car.run(2., lights=red)
   car.lead_stop = None
-  out, dec = car.run_until(held, max_s=40.)
+  out, dec = car.run_until(held, max_s=40., lights=red)
   assert -2. < 200. - car.s < 5.
 
 
@@ -613,13 +603,14 @@ def test_off_route_holds_for_the_signal_on_its_own_road_not_the_stale_routes():
   car.run(2.)
   car.nav_valid, car.off_route = False, [(car.s + 90., 'signal')]
   line = car.off_route[0][0]
-  out, dec = car.run_until(held, max_s=30.)
+  red = lambda car: lights('red', line - car.s)  # noqa: E731
+  out, dec = car.run_until(held, max_s=30., lights=red)
   assert line - 3. < car.s < line + 0.5
-  assert out.prompt == 'signalGo' and out.alert == 'none'
+  assert out.prompt == 'none' and out.alert == 'none'
   assert all(r[3] >= MAP_DECEL_MAX - 1e-6 for r in car.rows)
-  car.run(3.)
-  assert car.v == 0.  # held for the driver's go, like any signal
-  car.step(gas=True)
+  car.run(3., lights=red)
+  assert car.v == 0.  # held for the green, like any red
+  car.run(GREEN_STEADY_S + 0.1, lights=lambda car: lights('green', line - car.s))
   car.run(4.)
   assert car.s > line + 2.
 
@@ -631,10 +622,10 @@ def test_off_route_an_engaged_signal_the_lookup_takes_over_is_held_at_the_lookup
   for stale_off in (15., -15., 19.):
     car = Car([(150., 'signal')])
     while not any(c.engaged for c in car.policy.tracker.controls.values()):
-      car.step()
+      car.step(lights=oracle('red'))
     line = 150. - stale_off
     car.nav_valid, car.off_status, car.off_route = False, 'ok', [(line, 'signal')]
-    out, dec = car.run_until(held, max_s=40.)
+    out, dec = car.run_until(held, max_s=40., lights=lambda car, line=line: lights('red', line - car.s))
     assert line - 3. < car.s < line + 0.5, (stale_off, car.s - line)
     assert all(r[3] >= MAP_DECEL_MAX - 1e-6 for r in car.rows), stale_off
 
@@ -666,3 +657,48 @@ def test_no_destination_is_not_off_route():
   car.nav_valid, car.off_route = False, None
   out, dec, _ = car.run(10.)
   assert out.alert == 'none' and not out.stops and car.v > 13.
+
+
+# --- G1 (2026-10-28): a signal adds nothing unless a light source reads red or yellow for it ---
+
+@pytest.mark.parametrize("light", [None, 'green', 'unknown'])
+def test_unknown_or_green_signal_adds_no_slowing_at_all(light):
+  # no light source (the car this week), a green, or an unknown light: no stop, no cap, no prompt, nothing to stop at
+  car = Car([(200., 'signal'), (215., 'signal')])
+  lit = NO_LIGHTS if light is None else oracle(light)
+  for _ in range(int(25. / DT_MDL)):
+    out, dec, cmd = car.step(lights=lit)
+    assert out.stops == [] and out.prompt == 'none' and not dec.should_stop, car.s
+    assert car.policy.stop_ahead() is None
+  assert car.s > 300. and min(r[2] for r in car.rows) >= 13.4 - 1e-6
+
+
+def test_a_red_seen_inside_the_engage_distance_stops_on_a_seeded_curve():
+  # passing through, the light reads red 60 m out at 13.4 m/s (inside engage_distance, ~88 m): a stop on the curve from
+  # there, never harder than -2.0, held at the line, and the signal is now one the car is stopping at
+  car = Car([(260., 'signal')])
+  car.run_until(lambda out, dec: car.s > 200.)
+  assert car.policy.stop_ahead() is None
+  out, dec, _ = car.step(lights=oracle('red'))
+  assert out.stops and car.policy.stop_ahead() is not None
+  out, dec = car.run_until(held, lights=oracle('red'))
+  assert all(r[3] >= MAP_DECEL_MAX - 1e-6 for r in car.rows)
+  assert -2. < 260. - car.s < 5.
+
+
+def test_a_red_too_close_to_stop_for_gently_brakes_at_minus_2_and_says_so():
+  car = Car([(250., 'signal')])
+  car.run_until(lambda out, dec: car.s > 220.)
+  out, dec, _ = car.step(lights=oracle('red'))
+  assert out.alert == 'cannotStopComfortably' and out.stops
+  car.run(4., lights=oracle('red'))
+  assert all(r[3] >= MAP_DECEL_MAX - 1e-6 for r in car.rows)
+
+
+def test_yellow_decel_param_never_takes_a_light_stop_past_minus_2():
+  # TurnPilotYellowDecel 2.5 would have floored a yellow stop at -2.5: the standing rule is -2.0 for every map or light stop
+  # a green, then the yellow 97 m out at 20 m/s: stoppable at 2.5 after T_LAT, not at 2.0
+  car = Car([(400., 'signal')], v=20., yellow_decel=2.5)
+  car.run_until(lambda out, dec: car.s > 400. - 97., lights=oracle('green'))
+  car.run(6., lights=oracle('yellow'))
+  assert min(r[3] for r in car.rows) >= MAP_DECEL_MAX - 1e-6

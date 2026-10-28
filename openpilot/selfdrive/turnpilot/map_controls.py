@@ -21,16 +21,18 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   COMMIT_SPEED with no go (the plan not applied: shadow mode turned on) is let go, as an overrun: the latch is never
   replayed down the road. A car stopped further out (a queue) isn't latched: the MPC holds it behind the lead.
 - Positive go only. A stop sign is released by a gas tap after DWELL_S held (no auto-go: no cross traffic sensing), and
-  the driver is prompted then (stopSignGo). A signal is held at whatever the light, unless an accepted light source says
-  green, steadily, for GREEN_STEADY_S: unknown, stale, absent, conflicting or unassociated lights all hold. The driver's
-  gas tap releases it any time after it engages (seen it green while rolling up: faster than COMMIT_SPEED, or at the line,
-  within LATCH_NEAR_M; a nudge creeping in a queue further out isn't a go, and isn't asked for), and it prompts for that
-  at once (signalGo) while the light is unknown. On the car tonight there is no light source, so every mapped signal is held.
-  A tap on a red (the sim oracle's) still goes, with goingOnRed: the driver's right on red. Releasing one releases the
-  controls RELEASE_SPAN_M past it too (the far side of a divided road).
-- A green that goes yellow, red or unknown is decided once: stop when the stopping distance at YELLOW_DECEL after T_LAT
-  fits, braking no harder than YELLOW_DECEL; otherwise committed, with proceedingOnYellow, and a later red never reverses
-  it. A stop so decided is released by the next steady green.
+  the driver is prompted then (stopSignGo). Releasing one releases the controls RELEASE_SPAN_M past it too (the far side
+  of a divided road).
+- A signal adds nothing (Kellen, 2026-10-28: through greens without slowing; DESIGN phase 4, G1): no stop, no cap, no
+  prompt, unless an accepted light source reads red or yellow for it. The driving model's own braking is the car's
+  red-light handling; the map signal is only where a light is looked for. On the car this week no light source is
+  accepted (the camera's reader ships in shadow), so a mapped signal never slows the car; in the sim the light oracle
+  stands in for it, so a sim red still stops. A red is a stop on the MAP_STOP_DECEL curve, seeded where it is first read
+  (the curve from engage_distance if it is further out), never harder than MAP_DECEL_MAX: one that needs more brakes at
+  that floor, cannotStopComfortably. A yellow is decided once: stop when the stopping distance at YELLOW_DECEL after T_LAT
+  fits (YELLOW_DECEL, TurnPilotYellowDecel, no more than -MAP_DECEL_MAX); otherwise committed, with proceedingOnYellow,
+  and a later red never reverses it. A stop is released only by a steady green (GREEN_STEADY_S): a light gone unknown
+  keeps it. The driver's gas never releases one.
 - A yield caps the speed to YIELD_SPEED at its line, never stops the car, and goes once passed or on a gas tap. One whose
   road outranks every crossing one (crossSuspect: likely mapped for the cross road) is dropped and logged. Such a stop
   sign still stops, and says the approach is unverified.
@@ -41,9 +43,9 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   under the driver's foot is the same.
 - An unprotected turn (Kellen, 2026-10-27: the same rule as stop signs and lights) is a routed far-side turn (a left on the
   right) across an oncoming approach (navInstruction.maneuverOpposing present, or unknown: no junction data is never
-  clear) with no stop sign or signal of its own at the junction (one within PROTECT_BEFORE_M before it to PROTECT_PAST_M
-  past it, whatever its state: a signal already holds, a stop sign already stops; the maneuver stays protected once seen
-  so, after its control drops out behind the car). turnpilotd hands it in each frame
+  clear) with no stop sign of its own at the junction (one within PROTECT_BEFORE_M before it to PROTECT_PAST_M past it: a
+  stop sign already stops; the maneuver stays protected once seen so, after its control drops out behind the car). A
+  signal there doesn't protect it (SIGNAL_PROTECTS_LEFT): a left on a green ball is unprotected. turnpilotd hands it in each frame
   (update()'s turn) and it becomes a control of its own, kind unprotectedTurn, at the junction's hold line less
   MAP_MARGIN_M: the curve, the latch and the stop sign's gas rules, with no dwell: held, the driver is prompted at once
   (unprotectedTurnGo), and only a gas tap goes. A failing or missing controls status leaves the turn unprotected. One the
@@ -75,8 +77,8 @@ from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP
 
 MAP_STOP_DECEL = 1.5          # m/s^2, the braking curve to a map stop point
 MAP_DECEL_MAX = SPEED_CAP_ACCEL_MIN  # -2.0 m/s^2: a map stop never brakes harder
-YELLOW_DECEL = 2.0            # m/s^2 for a stop decided on a yellow (TurnPilotYellowDecel; 2.5 needs Kellen's sign-off)
-YELLOW_DECEL_MAX = 2.5
+YELLOW_DECEL = 2.0            # m/s^2 for a stop decided on a yellow (TurnPilotYellowDecel)
+YELLOW_DECEL_MAX = -MAP_DECEL_MAX  # 2.0: a light stop never brakes harder than any map stop (Kellen, 2026-10-28)
 CONTROL_LINE_M = 10.          # without a mapped line, the stop line is the junction less this (routing/controls.py)
 LATCH_SPEED = 0.3             # m/s: slower than this...
 LATCH_NEAR_M = 5.             # ...this close to the stop point...
@@ -93,6 +95,7 @@ DRIVE_OFF_M = 2.              # m a held car moved under the driver's gas: drive
 LIGHT_ASSOC_M = 25.           # a light belongs to the signal control whose stop point is this close to its own
 LIGHT_STALE_S = 0.6           # s: an older light message is stale (unknown)
 STOPPING_NEAR_M = 30.         # a map stop this close that is stopping the car owns the driver's gas (MapDecision.stopping)
+SIGNAL_GO, SIGNAL_STOP, SIGNAL_COMMITTED = 'go', 'stop', 'committed'  # a signal's ControlState.mode
 OFF_ROUTE_SPEED = 5.          # m/s: off the route with the stops ahead unknown, the speed is capped to this...
 OFF_ROUTE_DECEL = 1.0         # m/s^2: ...coming down from the car's speed this gently
 OFF_ROUTE_REASON = "Off route, map stops unknown — take control or wait for reroute"
@@ -103,9 +106,11 @@ KEEP_TURN = 'keep'            # update()'s turn when the route isn't known this 
 MAP_MARGIN_M = 1.             # m short of the hold line an unprotected turn stops, as navd's controls stop short of their line
 PROTECT_BEFORE_M = 30.        # a stop sign or signal this far before the junction (its line, mapped or the junction less 11)...
 PROTECT_PAST_M = 2.           # ...to this far past it is the junction's own: the turn isn't unprotected
+# A signal at the junction doesn't protect a left (DESIGN phase 4, decision 4): signals don't hold now, and nothing here can
+# tell a green arrow from a green ball, so a left at a signal is unprotected. True: a signal protects it, as a stop sign does
+SIGNAL_PROTECTS_LEFT = False
 
 GO_STOP_SIGN = "Stop sign: check cross traffic, press accelerator to go"
-GO_SIGNAL = "Signal ahead: light not checked, press accelerator to proceed"
 
 
 def engage_distance(v_ego: float) -> float:
@@ -136,8 +141,9 @@ def unprotected_turn(maneuver, right_hand_traffic: bool = True) -> bool:
 
 
 def protected(controls, distance: float) -> bool:
-  """A stop sign or signal of the junction distance m ahead stops the car there already."""
-  return any(c.kind in ('stop', 'signal') and distance - PROTECT_BEFORE_M <= c.d <= distance + PROTECT_PAST_M for c in controls)
+  """A stop sign of the junction distance m ahead stops the car there already (a signal too, with SIGNAL_PROTECTS_LEFT)."""
+  kinds = ('stop', 'signal') if SIGNAL_PROTECTS_LEFT else ('stop',)
+  return any(c.kind in kinds and distance - PROTECT_BEFORE_M <= c.d <= distance + PROTECT_PAST_M for c in controls)
 
 
 @dataclass
@@ -193,7 +199,8 @@ class ControlState:
   cap: float = NO_SPEED_CAP
   infeasible: bool = False
   override: bool = False        # the driver's gas on the approach
-  mode: str = 'stop'            # signals: 'stop', 'go' (a steady green), 'committed' (on a yellow)
+  mode: str = 'stop'            # signals: SIGNAL_GO (the default: nothing to stop for), SIGNAL_STOP (a red, or a yellow
+                                # decided so), SIGNAL_COMMITTED (a yellow too late to stop for)
   yellow: bool = False          # a stop decided on a yellow
   green_t: float = 0.
   light: str = 'unknown'
@@ -227,10 +234,15 @@ class MapControlPolicy:
     self._off_cap: float | None = None  # m/s: the off-route cap while the stops ahead are unknown (module docstring)
 
   def stop_ahead(self) -> float | None:
-    """m to the nearest stop sign or signal the car is going to stop at (not released, not going on a green), or None:
-    a turn just past one is taken from a stop, never too fast (turn_skip.py)."""
-    ds = [0. if c.held else c.d for c in self.tracker.controls.values() if c.kind in ('stop', 'signal') and
-          (c.held or c.d > -LATCH_PAST_M) and not (c.state is not None and (c.state.done or c.state.mode != 'stop'))]
+    """m to the nearest stop sign or signal the car is going to stop at, or None: a stop sign not released, a signal only
+    while it is stopping the car (a red, or a yellow decided a stop), never one it goes through. A turn just past one is
+    taken from a stop, never too fast (turn_skip.py), and the lane change window plans around it (lane_planner.py)."""
+    def stopping(c):
+      st = c.state
+      if c.kind == 'signal':
+        return st is not None and not st.done and st.mode == SIGNAL_STOP
+      return c.kind == 'stop' and not (st is not None and st.done)
+    ds = [0. if c.held else c.d for c in self.tracker.controls.values() if stopping(c) and (c.held or c.d > -LATCH_PAST_M)]
     return min(ds) if ds else None
 
   def turn_engaged(self, maneuver_id: int) -> bool:
@@ -366,7 +378,7 @@ class MapControlPolicy:
     if any(c.engaged for c in self.tracker.lost):
       self._transient('mapControlsUnavailable')
     for c in controls:
-      st = c.state = c.state or ControlState()
+      st = c.state = c.state or ControlState(mode=SIGNAL_GO if c.kind == 'signal' else 'stop')
       if st.done:
         continue
       if c.kind == 'signal':
@@ -416,7 +428,7 @@ class MapControlPolicy:
     if pick is not None:
       st = pick.state
       out.shown = Shown(pick.key[1] & 0xFFFF, pick.kind, pick.d, st.action, st.light, lights.source, self.tracker.status, pick.line_mapped)
-      if not out.reason and pick.kind == 'signal' and st.mode == 'go' and lights.lights is not None:
+      if not out.reason and pick.kind == 'signal' and st.mode == SIGNAL_GO and st.light == 'green':
         out.reason = "Green (sim oracle)"
     elif self.tracker.route:
       out.shown = Shown(0, 'none', 0., 'none', 'unknown', lights.source, self.tracker.status)
@@ -442,25 +454,19 @@ class MapControlPolicy:
         cause = 'gas'
       reason = f"Stopped at {what} — tap gas to go" if ready else f"Stopped at {what}"
     else:
-      prompt = 'signalGo' if st.light == 'unknown' else None
       if st.green_t >= GREEN_STEADY_S - 1e-9:
         cause = 'green'
-      elif gas_edge:
-        cause = 'gas'
-        if st.light == 'red':
-          self._transient('goingOnRed')
       reason = f"Red light (sim oracle){'' if c.junction else ' (crossing)'}" if st.light == 'red' else \
-        f"Stopped at {what} — tap gas to go"
+        f"Stopped at {what}: waiting for green"
     if cause is None and st.moved_m > DRIVE_OFF_M and v > COMMIT_SPEED:
       # driven off under the driver's foot: lifting must not stop the car in the junction. Or gone with no go at all, the
       # plan not applied (shadow mode turned on): the latch must not stop the car wherever the plan applies again
       if not gas_pressed or (c.kind == 'stop' and st.gas_in_dwell):
         self._transient('stopOverrun')
-      elif c.kind == 'signal' and st.light == 'red':
-        self._transient('goingOnRed')
       cause = 'drivenOff' if gas_pressed else 'movedOff'
-    if cause == 'green':  # a stop decided on a yellow is undone by the next steady green: back to going on it
-      st.mode, st.yellow, st.action = 'go', False, 'released'
+    if cause == 'green':  # a red's stop, or one decided on a yellow, is undone by the next steady green: back to going on it
+      self._signal_go(c)
+      st.action = 'released'
       self.held, c.held = None, False
       out.released_stopped = out.released_stopped or v < LATCH_SPEED
       cloudlog.event("turnpilot.map_stop_released", kind=c.kind, key=list(c.key), cause=cause, v=round(v, 2))
@@ -496,6 +502,13 @@ class MapControlPolicy:
   def _approach(self, c, controls, v, gas_pressed, gas_edge, gas_lift, out, prompts) -> bool:
     """A stop sign or signal not held: the curve, the decisions, the latch. True while it is infeasible."""
     st = c.state
+    if c.kind == 'signal':
+      self._signal_mode(c, v)
+      if st.mode != SIGNAL_STOP:  # nothing to stop for: no stop, no cap, no prompt (module docstring)
+        st.action = 'proceedingOnYellow' if st.mode == SIGNAL_COMMITTED else 'none'
+        if c.d < -OVERRUN_PAST_M:
+          st.done = 'passed'
+        return False
     if not c.engaged:
       if c.d > engage_distance(v) or c.d < -OVERRUN_PAST_M:
         return False
@@ -507,36 +520,8 @@ class MapControlPolicy:
       self._check(c, v, 'jumped')
 
     if c.kind == 'signal':
-      oracle = st.light != 'unknown'
-      if st.mode == 'stop' and st.green_t >= GREEN_STEADY_S - 1e-9:
-        st.mode, st.yellow = 'go', False
-      elif st.mode == 'go' and st.light != 'green':
-        # decided once: a later red never reverses a commit, and only a steady green undoes a stop
-        if c.d >= v * T_LAT + v ** 2 / (2. * self.yellow_decel):
-          st.mode, st.yellow, st.cap = 'stop', True, curve(v, c.d)
-          cloudlog.event("turnpilot.map_signal_decided", decision='stop', light=st.light, d=round(c.d, 1), v=round(v, 2))
-        else:
-          st.mode = 'committed'
-          self._transient('proceedingOnYellow')
-          cloudlog.event("turnpilot.map_signal_decided", decision='go', light=st.light, d=round(c.d, 1), v=round(v, 2))
-      if st.mode in ('go', 'committed'):
-        st.action = 'released' if st.mode == 'go' else 'proceedingOnYellow'
-        if c.d < -OVERRUN_PAST_M:
-          st.done = 'passed'
-        return False
-      go_zone = v > COMMIT_SPEED or c.d < LATCH_NEAR_M
-      if gas_edge and go_zone:
-        # the driver's go: seen it green while rolling up, or going on the red at the line. A nudge standing or creeping in
-        # a queue short of the line isn't one: the car still stops at the line for it
-        if st.light == 'red':
-          self._transient('goingOnRed')
-        st.action = 'released'
-        self._release(c, controls, 'gas', v, out)
-        return False
-      if not oracle and go_zone:  # asked for only where a tap is the go
-        prompts.append('signalGo')
-      lit = {'red': "Red light (sim oracle)", 'yellow': "Yellow light (sim oracle)"}.get(st.light)
-      reason = (lit + ('' if c.junction else ' (crossing)')) if lit else f"Signal ahead: light not checked{'' if c.junction else ' (crossing)'}"
+      lit = {'red': "Red light (sim oracle)", 'yellow': "Yellow light (sim oracle)"}.get(st.light, "Stopping for the signal")
+      reason = lit + ('' if c.junction else ' (crossing)')
     else:
       if c.kind == UNPROTECTED:
         reason = f"Unprotected {self.turn_name} ahead"
@@ -564,7 +549,7 @@ class MapControlPolicy:
     cv = curve(v, c.d)
     st.cap = cv if v < LATCH_SPEED else min(st.cap, cv)  # re-seeded only at standstill (a queue)
     need = needed(v, c.d)
-    floor = min(MAP_DECEL_MAX, -self.yellow_decel) if st.yellow else MAP_DECEL_MAX
+    floor = MAP_DECEL_MAX  # a yellow's stop too (YELLOW_DECEL_MAX)
     accel = max(need, floor) if need < -MAP_STOP_DECEL else NO_ACCEL_CAP
     if st.infeasible and need >= floor:
       st.infeasible = False
@@ -578,9 +563,35 @@ class MapControlPolicy:
     out.stops.append(Stop(accel, st.cap, False, reason, c.d))
     return st.infeasible
 
+  def _signal_go(self, c) -> None:
+    """A signal back to nothing to stop for (a steady green): its curve gone, re-seeded if it stops the car again."""
+    st = c.state
+    st.mode, st.yellow, st.infeasible, st.cap = SIGNAL_GO, False, False, NO_SPEED_CAP
+    c.engaged = False
+
+  def _signal_mode(self, c, v: float) -> None:
+    """A signal's light into its mode (module docstring): a steady green undoes a stop, a red going is a stop, a yellow
+    going is decided once. A stop is engaged where it is first read (or at engage_distance), its curve seeded there."""
+    st = c.state
+    if st.mode == SIGNAL_STOP and st.green_t >= GREEN_STEADY_S - 1e-9:
+      self._signal_go(c)
+      cloudlog.event("turnpilot.map_stop_released", kind=c.kind, key=list(c.key), cause='green', d=round(c.d, 1), v=round(v, 2))
+    elif st.mode == SIGNAL_GO and st.light == 'red':
+      st.mode, st.yellow = SIGNAL_STOP, False
+      cloudlog.event("turnpilot.map_signal_decided", decision='stop', light=st.light, d=round(c.d, 1), v=round(v, 2))
+    elif st.mode == SIGNAL_GO and st.light == 'yellow':
+      # decided once: a later red never reverses a commit, and only a steady green undoes a stop
+      if c.d >= v * T_LAT + v ** 2 / (2. * min(self.yellow_decel, YELLOW_DECEL_MAX)):
+        st.mode, st.yellow = SIGNAL_STOP, True
+        cloudlog.event("turnpilot.map_signal_decided", decision='stop', light=st.light, d=round(c.d, 1), v=round(v, 2))
+      else:
+        st.mode = SIGNAL_COMMITTED
+        self._transient('proceedingOnYellow')
+        cloudlog.event("turnpilot.map_signal_decided", decision='go', light=st.light, d=round(c.d, 1), v=round(v, 2))
+
   def _check(self, c, v, when: str) -> None:
     """Can the car stop at -MAP_DECEL_MAX from here? If not it brakes at the floor, alerted (cannotStopComfortably)."""
-    floor = min(MAP_DECEL_MAX, -self.yellow_decel) if c.state.yellow else MAP_DECEL_MAX
+    floor = MAP_DECEL_MAX
     c.state.infeasible = needed(v, c.d) < floor - 1e-9
     if c.state.infeasible:
       cloudlog.event("turnpilot.map_stop_infeasible", error=True, kind=c.kind, key=list(c.key), when=when, d=round(c.d, 1),

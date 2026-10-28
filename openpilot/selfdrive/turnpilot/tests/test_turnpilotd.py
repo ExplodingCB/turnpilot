@@ -1409,16 +1409,13 @@ def test_stop_sign_on_the_route_holds_until_the_drivers_tap():
   assert sim.s > 220.
 
 
-def test_signal_with_no_light_source_holds_and_prompts():
+def test_signal_with_no_light_source_adds_nothing():
+  # the car this week: no light source, so a mapped signal neither slows the car nor asks for anything (the model's own
+  # braking handles the light)
   sim = Sim([(1000., "turn", "right"), (2000., "turn", "left")], controls=[(200., 'signal')])
-  prompts = []
-  for _ in range(int(10. / DT_MDL)):
-    prompts.append(sim.step().controlPrompt)
-  assert 'signalGo' in prompts
-  plan = stop_at(sim, 200.)
-  assert plan.shouldStop and plan.controlPrompt == 'signalGo' and plan.reason == "Stopped at signal — tap gas to go"
-  plan = sim.step(gas=True)
-  assert not plan.shouldStop
+  plans = [sim.step() for _ in range(int(25. / DT_MDL))]
+  assert sim.s > 300. and min(v for _, v, _ in sim.trace) >= 13. - 1e-6
+  assert all(not p.shouldStop and p.speedCap > 20. and p.accelCap == NO_ACCEL_CAP and p.controlPrompt == 'none' for p in plans)
 
 
 def test_sim_oracle_green_passes_and_needs_simulation_and_the_param():
@@ -1435,11 +1432,17 @@ def test_sim_oracle_green_passes_and_needs_simulation_and_the_param():
   sim.lights = lights('green')
   reasons = [sim.step().reason for _ in range(int(25. / DT_MDL))]
   assert sim.s > 210. and min(v for _, v, _ in sim.trace) > 12. and "Green (sim oracle)" in reasons
-  # not accepted (no SIMULATION, or the param off): rejected out loud, and the light is unknown: held
+  # accepted, a red: stopped at the line, and held
   sim = Sim([(1000., "turn", "right"), (2000., "turn", "left")], controls=[(200., 'signal')])
-  sim.lights = lights('green')
+  sim.tp.oracle_ok = True
+  sim.lights = lights('red')
   plan = stop_at(sim, 200.)
-  assert plan.shouldStop and plan.controlPrompt == 'signalGo'
+  assert plan.shouldStop and -2. < 200. - sim.s < 5. and plan.reason == "Red light (sim oracle)"
+  # not accepted (no SIMULATION, or the param off): rejected out loud, and the light is unknown: nothing to stop for
+  sim = Sim([(1000., "turn", "right"), (2000., "turn", "left")], controls=[(200., 'signal')])
+  sim.lights = lights('red')
+  sim.run(25.)
+  assert sim.s > 300. and not any(p.shouldStop for _, _, p in sim.trace)
   assert any(p.controlAlert == 'lightSourceRejected' for _, _, p in sim.trace)
 
 
@@ -1573,14 +1576,13 @@ def test_left_from_a_t_stem_or_a_right_has_no_unprotected_stop():
     assert sim.s > 320. and not any(p.shouldStop or p.controlPrompt != 'none' for _, _, p in sim.trace if p.maneuverDistance > -20.)
 
 
-def test_signal_at_the_junction_protects_the_left_with_one_stop():
+def test_a_left_at_a_signal_is_unprotected_and_stops_at_its_hold_line():
+  # a signal at the junction holds nothing (SIGNAL_PROTECTS_LEFT): the left stops at its own hold line, not the signal's
   sim = Sim(TURNS_AHEAD, controls=[(289., 'signal')])
   sim.go_taps = False
   plan = stop_at(sim, 289.)
-  assert plan.mapControl.kind == 'signal' and plan.controlPrompt == 'signalGo'
-  sim.step(gas=True)
-  sim.run(15., turn_at=300.)
-  assert sim.s > 320. and not any(p.mapControl.kind == 'unprotectedTurn' for _, _, p in sim.trace)
+  assert plan.mapControl.kind == 'unprotectedTurn' and 300. - HOLD_LINE_M - 4. < sim.s < 300. - HOLD_LINE_M
+  assert not any(p.mapControl.kind == 'signal' and p.shouldStop for _, _, p in sim.trace)
 
 
 def test_left_too_fast_to_make_is_skipped_out_loud_not_braked_for():
@@ -1617,6 +1619,11 @@ def oncoming_from(sim, s_world, speed=10.):
   return objects
 
 
+def go(sim, objects=lambda sim: ()):
+  """The go at an unprotected left's hold line (the driver's tap, until the gap logic gives it)."""
+  sim.step(objects(sim), gas=True)
+
+
 def test_go_at_an_unprotected_left_with_a_car_coming_still_waits_for_it():
   # the driver's tap is the latch's go; the detector, seeing a car coming, still holds the car at the line until it is
   # through (it only adds holds), and then the car goes and turns
@@ -1637,29 +1644,25 @@ def test_go_at_an_unprotected_left_with_a_car_coming_still_waits_for_it():
   assert sim.s > 320.
 
 
-def test_a_permissive_left_at_a_signal_still_waits_for_oncoming_after_the_signals_go():
-  # BeamNG smoke 2026-10-28: the signal tiles map a signal at the unprotected_left junction, which protects it from the
-  # unprotected-turn stop (one stop, signalGo). A green is still permissive: after the driver's go at the signal line (the
-  # car stood 22-26 m before the junction there), the detector's oncoming hold stops the car before the oncoming lanes,
-  # taking a new track as coming whatever its vx reads (velocity_trusted), and the press held on doesn't release it
+def test_a_left_at_a_signal_still_waits_for_oncoming_after_its_go():
+  # BeamNG smoke 2026-10-28: a signal mapped at the unprotected_left junction, 11-26 m before it. A green is permissive:
+  # the left stops at its own hold line, and after the go the detector's oncoming hold stops the car before the oncoming
+  # lanes, taking a new track as coming whatever its vx reads (velocity_trusted)
   for before in (11., 22., 26.):
     sim = Sim(TURNS_AHEAD, controls=[(300. - before, 'signal')])
     sim.go_taps = False
     plan = stop_at(sim, 300. - before)
-    assert plan.mapControl.kind == 'signal' and plan.controlPrompt == 'signalGo', before
+    assert plan.mapControl.kind == 'unprotectedTurn', before
     held_s = sim.s
     t0 = sim.t
 
     def car(sim, t0=t0):  # coming at 10 m/s, a new track that reads as going away
       return ({'cls': 'car', 'x': 380. - 10. * (sim.t - t0) - sim.s, 'y': 5., 'vx': 4., 'age': 10},)
-    sim.step(car(sim), gas=True)
-    for _ in range(int(2. / DT_MDL)):  # the press held on: still the signal's go, not an override of the detector
-      sim.step(car(sim), gas=True)
+    go(sim, car)
     while car(sim)[0]['x'] > sim.distance() - 5.:
       plan = sim.step(car(sim))
       assert sim.distance() >= HOLD_LINE_M - 0.5, (before, "moved into the junction with the car still coming")
     assert any(p.reason == "waiting for oncoming" for _, _, p in sim.trace), before
-    assert not any(p.mapControl.kind == 'unprotectedTurn' for _, _, p in sim.trace)
     sim.run(20., objects=car, turn_at=300.)
     assert sim.s > 320. and sim.s > held_s, before
 
@@ -1873,11 +1876,13 @@ def test_a_lead_too_far_ahead_to_hold_the_car_doesnt_keep_it_standing_silently()
 
 
 def test_a_turn_lane_a_map_stop_leaves_no_room_for_is_skipped_out_loud_never_turned_from_the_wrong_lane():
-  """The map's lane list puts the car two lanes right of the left turn's lane, and a signal 100 m before the turn leaves no
+  """The map's lane list puts the car two lanes right of the left turn's lane, and a red 100 m before the turn leaves no
   room to change before it at speed nor after its go: the turn is skipped as too fast to turn is (navd reroutes), the plan
   saying why (laneChangeWait unreachable), and its desire never goes out."""
   sim = Sim([(400., 'turn', 'left', T_LEFT)], cruise=11., nav_lanes={0: THREE_LANES_LEFT_TURN}, model_lanes=(2, 0),
             controls=[(300., 'signal')])
+  sim.tp.oracle_ok = True
+  sim.lights = oracle_lights('red', 300.)  # read red from the start: a stop the car makes
   sim.run(25.)
   plans = [p for _, _, p in sim.trace]
   first = next(i for i, p in enumerate(plans) if p.tooFastToTurn)
@@ -2020,3 +2025,39 @@ def test_a_hard_brake_is_raised_only_for_a_confirmed_pedestrian():
            for k in range(6)]
   assert plans[-1].controlAlert == 'hardBrake' and plans[-1].reason == "pedestrian in path"
   assert plan_accel(plans[-1].accelCap, plans[-1].speedCap, 10.) < -2.
+
+
+def oracle_lights(state, s_signal):
+  def make(sim):
+    msg = messaging.new_message('turnpilotLights')
+    msg.turnpilotLights.source = 'simOracle'
+    msg.turnpilotLights.lights = [{'state': state, 'distance': s_signal - sim.s, 'instance': 'trafficLight 1'}]
+    return msg.as_reader().turnpilotLights
+  return make
+
+
+def test_a_too_fast_turn_just_past_a_green_or_unchecked_signal_is_still_skipped():
+  # a signal 8 m before the junction the car passes through on a green (or with no light source): it doesn't stop there,
+  # so the turn is too fast and is skipped out loud, as with no signal (a stop sign there would be a stop: 1505)
+  for state in (None, 'green'):
+    sim = Sim([(100., "turn", "right", junction_of('right')), (2000., "turn", "left")], cruise=20., controls=[(92., 'signal')])
+    sim.v = 20.
+    if state is not None:
+      sim.tp.oracle_ok = True
+      sim.lights = oracle_lights(state, 92.)
+    sim.run(4.)
+    assert any(p.tooFastToTurn for _, _, p in sim.trace), state
+    assert not any(p.shouldStop for _, _, p in sim.trace)
+
+
+def test_the_lane_window_ignores_a_signal_the_car_passes_through():
+  # 1875's road with the signal on a green: no stop there, so the window is the one at speed, and the turn lane is
+  # reachable before the turn (never laneChangeWait unreachable, never skipped)
+  sim = Sim([(400., 'turn', 'left', T_LEFT)], cruise=11., nav_lanes={0: THREE_LANES_LEFT_TURN}, model_lanes=(2, 0),
+            controls=[(300., 'signal')])
+  sim.tp.oracle_ok = True
+  sim.lights = oracle_lights('green', 300.)
+  sim.run(12.)
+  plans = [p for _, _, p in sim.trace]
+  assert not any(p.tooFastToTurn or p.laneChangeWait == 'unreachable' or p.laneChangeWait == 'afterStop' for p in plans)
+  assert sim.tp.map_controls.stop_ahead() is None
