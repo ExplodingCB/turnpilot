@@ -7,13 +7,14 @@ from openpilot.tools.turnpilot import route_audit
 
 
 def test_every_stop_and_yield_approach_with_both_sources(tmp_path):
-  v = StubValhalla([(0., 100., {'stop': True, 'way_id': 71}), (100., 200., {'way_id': 72}),
-                    (200., 290., {}), (290., 300., {'stop': True, 'way_id': 74, 'forward': False}), (300., 400., {})])
+  v = StubValhalla([(0., 100., {'stop': True, 'way_id': 71}), (100., 200., {'way_id': 72}), (200., 250., {'node_signal': True}),
+                    (250., 290., {}), (290., 300., {'stop': True, 'way_id': 74, 'forward': False}), (300., 400., {})])
   side = {'71:f': [entry('stop', 82., junction=901, stop_tag='minor')],
           '72:f': [entry('yield', 185., junction=902, evidence='mid_undirected')],
           '74:f': [entry('stop', 300., junction=904)]}  # directed the other way: 74:b's flag is Valhalla's phantom
   report = route_audit.audit(v, steps(), None, osm_dir(tmp_path, side))
   assert report.status == 'ok' and report.sidecar == 'ok'
+  assert [c.kind for c in report.controls] == ['stop', 'yield', 'signal']  # the signal is a control, not a stop or yield row
   rows = [(r.key, r.valhalla, r.sidecar, r.line_source, r.osm_node, r.control) for r in report.rows]
   assert rows == [
     ('71:f', 'stop', 'stop (mid_directed, stop=minor)', 'osm', 901, 'stop at 81 m'),

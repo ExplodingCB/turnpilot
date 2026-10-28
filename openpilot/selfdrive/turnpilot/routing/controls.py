@@ -457,7 +457,7 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
           valhalla.remove(kind)
           phantoms.append(kind)
           cloudlog.info(f"turnpilot controls: Valhalla's {kind} on {key} at {end_m:.0f} m is a phantom: the OSM sidecar's is directed {other}")
-    if audit is not None and (valhalla or hits or phantoms):
+    if audit is not None and (hits or phantoms or 'stop' in valhalla or 'yield' in valhalla):
       audit.append({'edge': i, 'key': key, 'internal': internal, 'anchor': anchor, 'end_m': end_m, 'valhalla': list(valhalla),
                     'phantom': phantoms, 'osm': [dict(entry, m=m) for entry, m in hits]})
     kinds = at.setdefault(anchor, {}) if valhalla or hits else None
