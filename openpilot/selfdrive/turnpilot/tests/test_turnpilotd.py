@@ -15,7 +15,7 @@ from openpilot.selfdrive.turnpilot.desire_timing import TURN_DESIRE_LEAD_M
 from openpilot.selfdrive.turnpilot.turn_skip import MIN_FIRST_PULSE_M
 from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP, V_TURN_MIN
 from openpilot.selfdrive.turnpilot.turnpilotd import (CAR_UNKNOWN_REASON, DETECTOR_DEADLINE_S, DETECTOR_START_DEADLINE_S, NO_LONG_REASON,
-                                                       NEAR_CONTROL_STAND_S, SIGNAL_STOPPED_REASON, STALL_PROMPT_S, STALLED_REASON,
+                                                       GAS_DISENGAGE_REASON, NEAR_CONTROL_STAND_S, SIGNAL_STOPPED_REASON, STALL_PROMPT_S, STALLED_REASON,
                                                        STOPPED_HANDBACK_S, STOPPED_LEAD_M, STOPPED_NOTE, STOPPED_NOTE_S, STOPPED_REASON,
                                                        TURN_MISSED_REASON, WAITING_REASON, TurnPilot, long_control_for)
 from openpilot.selfdrive.turnpilot.handback import Handback
@@ -53,12 +53,13 @@ class FakeSM:
 
 class Sim:
   def __init__(self, maneuvers, cruise=13., nav_lanes=None, model_lanes=(0, 0), shadow=False, driver_signals=False, paint=(),
-               paint_rule=True, long_control=True, controls=(), controls_status=None):
+               paint_rule=True, long_control=True, controls=(), controls_status=None, disengage_on_accel=True):
     self.navd, self.tp, self.sm = FakeNavd(maneuvers, nav_lanes, controls=controls, controls_status=controls_status), TurnPilot(), FakeSM()
     self.lights = None  # turnpilotLights to send each frame, a function of the sim
     self.paint, self.paint_rule, self.inputs_valid = paint, paint_rule, True
     self.s, self.v, self.cruise, self.t = 0., cruise, cruise, 0.
     self.model_lanes, self.shadow, self.driver_signals, self.long_control = model_lanes, shadow, driver_signals, long_control
+    self.disengage_on_accel = disengage_on_accel
     self.big = False
     self.model_kw = {}  # synthetic.road() keywords for the model's lanes
     self.model_running = True  # modeld publishing modelV2 (it doesn't while it loads the detector)
@@ -95,7 +96,7 @@ class Sim:
       self.sm.put('turnpilotLights', self.lights(self))
     plan = self.tp.plan(self.sm, scene(objects, available), True, self.shadow, self.driver_signals, paint=self.paint,
                         paint_rule=self.paint_rule, inputs_valid=self.inputs_valid,
-                        long_control=self.long_control).as_reader().turnpilotPlan
+                        long_control=self.long_control, disengage_on_accel=self.disengage_on_accel).as_reader().turnpilotPlan
     a = min(plan_accel(plan.accelCap, plan.speedCap, self.v), (self.cruise - self.v) / 2., 1.5)
     if plan.shouldStop:
       a = min(a, -1.)
@@ -134,6 +135,23 @@ def test_disabled_and_no_route():
   sm.put('navInstruction', nav_instruction(100., valid=False), valid=False)
   plan = TurnPilot().update(sm, scene(), True, False).as_reader().turnpilotPlan
   assert plan.state == State.noRoute and not plan.routeValid and plan.handback == Handback.none
+
+
+def test_turnpilot_faults_out_loud_while_a_gas_press_does_not_disengage():
+  # skeptic G1: DisengageOnAccelerator off (a device that had it written off for the old gas go) and TurnPilot ran on, a gas
+  # press while engaged not disengaging: the driver driving off a handed-back stop sign did it still engaged, silently.
+  # It faults instead (turnpilotUnavailable), and a pedestrian in the path is still stopped for on the faulted plan
+  x_ped = 80.
+  sim = Sim([(300., "turn", "left")], cruise=10., disengage_on_accel=False)
+  sim.run(20., objects=lambda sim: ({'cls': 'pedestrian', 'x': x_ped - sim.s, 'y': 0.1, 'inPath': True},))
+  for _, _, plan in sim.trace:
+    assert plan.state == State.disabled and plan.fault == Fault.disengageOnAccelerator and plan.reason == GAS_DISENGAGE_REASON
+    assert plan.desire == Desire.none
+  assert sim.v == 0. and 0. < x_ped - sim.s < PED_STOP_GAP_M + 2.
+  # on: TurnPilot runs
+  sim = Sim([(300., "turn", "left")], cruise=10.)
+  sim.run(2.)
+  assert sim.trace[-1][2].fault == Fault.none and sim.trace[-1][2].state != State.disabled
 
 
 def test_nothing_without_openpilot_longitudinal():

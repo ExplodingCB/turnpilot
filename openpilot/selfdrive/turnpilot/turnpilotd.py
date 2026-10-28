@@ -47,8 +47,9 @@ drives the car on through a pedestrian. Its desire and lane change are never act
 Once the detector is back and TurnPilot acts again, the dropped maneuver is taken up or skipped out loud, never left
 half driven (_take_up_dropped).
 No gas go anywhere (Kellen, 2026-10-28; DESIGN phase 4, G1): any gas press disengages (DisengageOnAccelerator, on by
-default; preflight fails without it), which is the driver taking over, never TurnPilot's go. A gas press with openpilot
-disengaged (the driver driving) is what releases the scene's junction hold at its line (scene_policy.py).
+default; preflight fails without it, and TurnPilot faults while it is off: Fault.disengageOnAccelerator), which is the
+driver taking over, never TurnPilot's go. A gas press with openpilot disengaged (the driver driving) is what releases the
+scene's junction hold at its line (scene_policy.py).
 A turn the car pulls away into from a standstill (a hold's go, the turn's pulse in that frame) is unverified: in BeamNG it
 was taken about half the time (2026-10-28). Past its junction (the follower's pass) having turned under MISSED_TURN_DEG,
 its desire not cleared at the turn's angle (a turn under 20 deg clears under MISSED_TURN_DEG, and that one was taken),
@@ -108,6 +109,9 @@ APPROACH_M = 150.  # a turn or keep this close (or inside its lane change window
 NO_LONG_REASON = "openpilot longitudinal is off"
 ERROR_REASON = "TurnPilot error"
 CAR_UNKNOWN_REASON = "waiting for the car's parameters"
+# DisengageOnAccelerator off: a gas press while engaged doesn't disengage, so the driver driving off a handed-back stop sign
+# or unprotected left would do it still engaged. TurnPilot refuses to run, out loud (Fault.disengageOnAccelerator)
+GAS_DISENGAGE_REASON = "turn on Disengage on accelerator pedal"
 ERROR_LOG_PERIOD_S = 10.  # s between logged exceptions from one place, so one that fails every frame doesn't flood the log
 # the plan is invalid once carState or modelV2 have failed their checks this many frames in a row (0.5 s at 20 Hz, as
 # hooks.PLAN_MAX_AGE_S), not at the first: a plan invalid for one frame drops its desire for that frame, and modeld takes
@@ -625,15 +629,28 @@ class TurnPilot:
     else:
       d.resume()
 
-  def plan(self, sm, scene, enabled: bool, shadow: bool, *args, long_control: bool | None, **kwargs):
+  def plan(self, sm, scene, enabled: bool, shadow: bool, *args, long_control: bool | None, disengage_on_accel: bool = True,
+           **kwargs):
     """update(), but a disabled plan while openpilot doesn't control speed (on a Tesla, without alpha longitudinal):
     its speed caps would do nothing there, and the turn desires would go out at whatever speed stock ACC holds.
     long_control None: card hasn't written CarParams yet, so it isn't known. A disabled plan while TurnPilot is on
     carries its fault, which selfdrived shows (turnpilotUnavailable): TurnPilot never stops working unannounced.
     It also carries a model fallback's handback, which outranks the fault (see the module docstring): a fallback lasts
-    the drive, so it is noted here too, where update() isn't reached."""
+    the drive, so it is noted here too, where update() isn't reached.
+    disengage_on_accel: the DisengageOnAccelerator param. Off, any gas press no longer disengages (Kellen, 2026-10-28: it
+    must), so TurnPilot faults (Fault.disengageOnAccelerator, turnpilotUnavailable) instead of running with it off
+    unannounced; the holds in force stay on the faulted plan (fault_limits), so no held car is let go."""
     self.handback_now = self.scene_now = self.map_now = None
     self._rf_ticked = self._yaw_ticked = False
+    if enabled and long_control and not disengage_on_accel:
+      self.fault_track(sm)
+      self.stop('fault')
+      self.watch_model(sm['modelV2'], enabled)
+      msg = disabled_plan(shadow, GAS_DISENGAGE_REASON, Fault.disengageOnAccelerator,
+                          Handback.modelFellBack if self.fell_back else Handback.none)
+      self.fill_stop_abort(msg.turnpilotPlan)
+      self.fault_limits(msg.turnpilotPlan, sm, scene)
+      return msg
     if enabled and not long_control:
       self.fault_track(sm)
       self.stop('fault')
@@ -790,7 +807,7 @@ def main():
   tp = TurnPilot()
   tracker = None
   enabled = shadow = paint_rule = False
-  driver_signals, right_hand_traffic = True, True
+  driver_signals, right_hand_traffic, disengage_on_accel = True, True, True
   long_control: bool | None = None
   invalid_frames = PLAN_INPUT_GRACE_FRAMES
   while True:
@@ -802,6 +819,7 @@ def main():
       right_hand_traffic = not params.get_bool("IsRhdDetected")
       driver_signals = driver_signals_for(params)
       long_control = long_control_for(params)
+      disengage_on_accel = params.get_bool("DisengageOnAccelerator")
       tp.oracle_ok = oracle_accepted(os.environ, read_bool(params, "TurnPilotSimLightOracle", False))
       tp.yellow_decel = yellow_decel_for(params)
       if params.get("ChestnutActive") is False:  # None: no big model expected this drive
@@ -825,7 +843,8 @@ def main():
     paint = lane_paint_from_msg(sm['turnpilotDetections'].lanePaint) if scene.available and sm.seen['turnpilotDetections'] else ()
     # the lane planner takes this frame's checks (an offered change aborts at once); the plan's valid has a grace
     valid = sm.all_checks(['carState', 'modelV2'])
-    msg = tp.plan(sm, scene, enabled, shadow, driver_signals, right_hand_traffic, paint, paint_rule, valid, long_control=long_control)
+    msg = tp.plan(sm, scene, enabled, shadow, driver_signals, right_hand_traffic, paint, paint_rule, valid, long_control=long_control,
+                  disengage_on_accel=disengage_on_accel)
     invalid_frames = 0 if valid else invalid_frames + 1
     msg.valid = invalid_frames < PLAN_INPUT_GRACE_FRAMES
     pm.send('turnpilotPlan', msg)

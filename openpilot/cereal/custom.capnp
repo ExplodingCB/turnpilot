@@ -38,7 +38,7 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     none @0;
     error @1;           # turnpilotd failed this frame (logged); TurnPilot does nothing until it recovers
     noLongitudinal @2;  # openpilot doesn't control speed on this car, so TurnPilot does nothing
-    disengageOnAccelerator @3;  # DisengageOnAccelerator is on: a gas tap can't mean "go" at a map stop, so TurnPilot refuses
+    disengageOnAccelerator @3;  # DisengageOnAccelerator is off: a gas press must disengage (no gas go), so TurnPilot refuses
   }
   enum LaneMismatch {
     none @0;

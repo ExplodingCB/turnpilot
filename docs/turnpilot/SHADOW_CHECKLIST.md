@@ -48,7 +48,7 @@ The second person watches the page. The TurnPilot row shows one of these:
 | Holding | Slowing or stopping. The Reason line says why |
 | No route, Arrived, Off | Not navigating |
 
-The Reason line reads `pedestrian in path`, `pedestrian in crosswalk`, `waiting for oncoming`, `Stopped at unprotected left — tap gas to go` (every left across a road ahead with no stop sign or signal of its own), `car in target lane`, `lane change timed out`, or `detector unavailable`. With no detector running, every left turn reads Holding with `detector unavailable`. That is expected until the detector is installed, and preflight's `detector pkl` line says whether it is.
+The Reason line reads `pedestrian in path`, `pedestrian in crosswalk`, `waiting for oncoming`, `take control` under `Stopped at unprotected turn` (every left across a road ahead with no stop sign of its own, and a left on a green ball), `car in target lane`, `lane change timed out`, or `detector unavailable`. With no detector running, every left turn reads Holding with `detector unavailable`. That is expected until the detector is installed, and preflight's `detector pkl` line says whether it is.
 
 Compare the page with what the driver does, and note every difference:
 

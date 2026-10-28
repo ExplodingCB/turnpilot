@@ -56,7 +56,8 @@ def test_active_plan_needs_a_fresh_valid_enabled_plan():
 
 def test_plan_events():
   Fault = custom.TurnpilotPlan.Fault
-  for fault, events in ((Fault.none, []), (Fault.error, ['turnpilotUnavailable']), (Fault.noLongitudinal, ['turnpilotUnavailable'])):
+  for fault, events in ((Fault.none, []), (Fault.error, ['turnpilotUnavailable']), (Fault.noLongitudinal, ['turnpilotUnavailable']),
+                        (Fault.disengageOnAccelerator, ['turnpilotUnavailable'])):
     msg = messaging.new_message('turnpilotPlan')
     msg.turnpilotPlan.state, msg.turnpilotPlan.fault = State.disabled, fault
     plan = msg.as_reader().turnpilotPlan

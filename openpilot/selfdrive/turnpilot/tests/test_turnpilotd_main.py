@@ -83,7 +83,7 @@ def run_main(frames, failing_frames=0, tracker=None, checks=lambda frame: True, 
   pm.send.side_effect = lambda s, msg: sent.append((s, msg.as_reader()))
   rk = mock.MagicMock()
   rk.keep_time.side_effect = [None] * (frames - 1) + [Stop()]
-  params = FakeParams(TurnPilotEnabled=True, CarParams=car_params_bytes(), **params)
+  params = FakeParams(**{'TurnPilotEnabled': True, 'CarParams': car_params_bytes(), 'DisengageOnAccelerator': True, **params})
   with mock.patch.object(messaging, 'SubMaster', return_value=sm), mock.patch.object(messaging, 'PubMaster', return_value=pm), \
        mock.patch.object(turnpilotd, 'Params', return_value=params), mock.patch.object(turnpilotd, 'Ratekeeper', return_value=rk), \
        mock.patch.object(turnpilotd, 'SceneTracker', return_value=tracker or mock.MagicMock()), \
@@ -105,6 +105,16 @@ def test_plan_failure_publishes_a_disabled_plan_and_goes_on():
   assert all(p.state == State.unavailable and p.reason == turnpilotd.WAITING_REASON and p.fault == custom.TurnpilotPlan.Fault.none
              for p in plans[4:])
   assert errors == ["turnpilotd.scene_failed", "turnpilotd.plan_failed"] * 4  # the tracker reads modelV2 too
+
+
+def test_disengage_on_accelerator_off_faults_out_loud():
+  # a device with DisengageOnAccelerator written off (the old gas go wanted it off): a gas press while engaged wouldn't
+  # disengage, so every plan is faulted for it (selfdrived: turnpilotUnavailable), never TurnPilot running on silently
+  plans, _, errors = run_main(frames=5, DisengageOnAccelerator=False)
+  plans = [p.turnpilotPlan for p in plans]
+  assert all(p.state == State.disabled and p.fault == custom.TurnpilotPlan.Fault.disengageOnAccelerator and
+             p.reason == turnpilotd.GAS_DISENGAGE_REASON for p in plans)
+  assert not errors
 
 
 def test_scene_failure_publishes_an_empty_scene_and_goes_on():
