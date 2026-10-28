@@ -37,6 +37,19 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   fits (YELLOW_DECEL, TurnPilotYellowDecel, no more than -MAP_DECEL_MAX); otherwise committed, with proceedingOnYellow,
   and a later red never reverses it. A stop is released only by a steady green (GREEN_STEADY_S): a light gone unknown
   keeps it. The driver's gas never releases one.
+- The camera's light reader (DESIGN phase 4 G2, detector/light_state.py, its heads in turnpilotDetections.lights) is a
+  second source that may only ever add a stop, and this week it adds none: in shadow (TurnPilotCameraLights shadow, the
+  default) its governing heads are associated with the signals (a head from CAMERA_ASSOC_BEFORE_M short of a signal's
+  line to CAMERA_ASSOC_PAST_M past it is that signal's, the last line before it winning) and what it would do is logged
+  on every change (turnpilot.camera_light_shadow; turnpilot.camera_light_unmapped for a red or yellow with no mapped
+  signal: no synthetic control, CRITIQUE cut), and nothing it reads reaches a stop, a cap, a prompt or a release. Its
+  reader turned off for the drive is said once (lightSourceRejected, "Camera light reader off for this drive"). Add-only
+  needs both keys, modeld's message not shadow and turnpilotd's own TurnPilotCameraLights addOnly: then a camera red
+  raises a signal's light to red, and a camera yellow to yellow only while a yellow stop at it is still feasible (a
+  yellow too late to stop for would commit the signal to go, and a commit outlasts a later red: a removed stop). A
+  camera green or unknown never enters, so a camera red can hold a stop the oracle's green would have released, never
+  the reverse; and a stop the camera added is released only by an accepted green once the camera's red has gone (on the
+  car, where no other source is accepted, that is never: the stand handback ends it, which is why add-only stays off).
 - A yield caps the speed to YIELD_SPEED at its line, never stops the car, and goes once passed. One whose
   road outranks every crossing one (crossSuspect: likely mapped for the cross road) is dropped and logged. Such a stop
   sign still stops, and says the approach is unverified.
@@ -98,6 +111,10 @@ OVERRUN_PAST_M = 2.           # m past the line, moving faster than COMMIT_SPEED
 DRIVE_OFF_M = 2.              # m a held car moved under the driver's gas: driven off
 LIGHT_ASSOC_M = 25.           # a light belongs to the signal control whose stop point is this close to its own
 LIGHT_STALE_S = 0.6           # s: an older light message is stale (unknown)
+CAMERA_STALE_S = 1.0          # s: a camera light read older than this is none (it reads on road camera runs only, ~5 Hz)
+CAMERA_ASSOC_BEFORE_M = 10.   # a camera head from this far short of a signal's line...
+CAMERA_ASSOC_PAST_M = 40.     # ...to this far past it is that signal's (far-side heads hang ~18-35 m past the line)
+CAMERA_OFF_REASON = "Camera light reader off for this drive"
 SIGNAL_GO, SIGNAL_STOP, SIGNAL_COMMITTED = 'go', 'stop', 'committed'  # a signal's ControlState.mode
 OFF_ROUTE_SPEED = 5.          # m/s: off the route with the stops ahead unknown, the speed is capped to this...
 OFF_ROUTE_DECEL = 1.0         # m/s^2: ...coming down from the car's speed this gently
@@ -150,13 +167,49 @@ def protected(controls, distance: float) -> bool:
 
 
 @dataclass
+class CameraLights:
+  heads: list                  # [(voted state, m to the head)] of the governing heads (light_state.py)
+  shadow: bool = True          # logged, never acted on; False only with both keys (camera_light_input)
+  status: str = 'read'         # turnpilotDetections.lightStatus
+
+
+@dataclass
 class Lights:
   lights: list | None = None   # [(state, distance)] from an accepted, fresh source; None without one
   source: str = 'none'         # TurnpilotLights.Source of the last message
   rejected: bool = False       # a source that isn't accepted here sent lights (lightSourceRejected)
+  camera: CameraLights | None = None  # the camera's reader, fresh (camera_light_input); never in lights
 
 
 NO_LIGHTS = Lights()
+
+
+def camera_light_input(msg, status: str, age_s: float, mode: str) -> CameraLights | None:
+  """The camera's lights from the last road camera run's turnpilotDetections.lights and lightStatus, age_s old; mode:
+  turnpilotd's TurnPilotCameraLights. None when off, stale, or not read (no calibration yet). A reader off for the drive
+  (disabled) comes through, with no heads, to be said."""
+  if mode == 'off' or msg is None:
+    return None
+  if status == 'disabled':
+    return CameraLights([], True, status)
+  if status != 'read' or age_s > CAMERA_STALE_S or str(msg.source) != 'camera':
+    return None
+  heads = [(str(light.state), float(light.distance)) for light in msg.lights if light.governs]
+  return CameraLights(heads, bool(msg.shadow) or mode != 'addOnly', status)
+
+
+def camera_owner(dist: float, signals):
+  """The signal control a camera head dist m ahead belongs to: the last line before it within the association window."""
+  owners = [o for o in signals if o.d - CAMERA_ASSOC_BEFORE_M <= dist <= o.d + CAMERA_ASSOC_PAST_M]
+  return max(owners, key=lambda o: o.d, default=None)
+
+
+def camera_state(c, signals, camera: CameraLights | None) -> str:
+  """The camera's state for signal c: its heads' states, if they agree."""
+  if camera is None:
+    return 'unknown'
+  states = {st for st, dist in camera.heads if st != 'unknown' and camera_owner(dist, signals) is c}
+  return states.pop() if len(states) == 1 else 'unknown'
 
 
 def light_input(msg, age_s: float, simulation: bool, oracle_param: bool) -> Lights:
@@ -231,6 +284,9 @@ class MapControlPolicy:
     self.turn_name = 'left'
     self._protected_id: int | None = None  # the maneuver a stop sign or signal of its junction protected: it stays so
     self._off_cap: float | None = None  # m/s: the off-route cap while the stops ahead are unknown (module docstring)
+    self._camera_would: dict = {}  # signal key -> what the camera would have it do, as last logged
+    self._camera_unmapped: tuple = ()  # the unmapped camera states last logged
+    self._camera_off_said = False
 
   def stop_ahead(self) -> float | None:
     """m to the nearest stop sign or signal the car is going to stop at, or None: a stop sign not released, a signal only
@@ -363,12 +419,20 @@ class MapControlPolicy:
     infeasible = False
     if any(c.engaged for c in self.tracker.lost):
       self._transient('mapControlsUnavailable')
+    camera = lights.camera
+    if camera is not None and camera.status == 'disabled' and not self._camera_off_said:
+      self._camera_off_said = True
+      self._transient('lightSourceRejected')
+      cloudlog.event("turnpilot.camera_lights_off", error=True)
+    live_signals = [c for c in controls if c.kind == 'signal' and not (c.state is not None and c.state.done)]
     for c in controls:
       st = c.state = c.state or ControlState(mode=SIGNAL_GO if c.kind == 'signal' else 'stop')
       if st.done:
         continue
       if c.kind == 'signal':
         st.light = self._light(c, controls, lights)
+        if camera is not None and not camera.shadow:
+          st.light = self._camera_adds(c, st, camera_state(c, live_signals, camera), v)
         st.green_t = st.green_t + dt if st.light == 'green' else 0.
       if c.held:
         self._held(c, controls, v, gas_pressed, dt, out, prompts)
@@ -407,6 +471,8 @@ class MapControlPolicy:
       out.alert = 'mapControlsUnavailable'
     elif lights.rejected:
       out.alert = 'lightSourceRejected'
+    if out.alert == 'lightSourceRejected' and self._camera_off_said and not lights.rejected and not out.reason:
+      out.reason = CAMERA_OFF_REASON
     live = [c for c in controls if c.state is not None and not c.state.done]
     pick = next((c for c in live if c.held), None) or next((c for c in live if c.engaged), None) or \
       next((c for c in live if c.d > -OVERRUN_PAST_M), None)
@@ -417,7 +483,48 @@ class MapControlPolicy:
         out.reason = "Green (sim oracle)"
     elif self.tracker.route:
       out.shown = Shown(0, 'none', 0., 'none', 'unknown', lights.source, self.tracker.status)
+    self._camera_log(live_signals, camera, v)
     return out
+
+  def _camera_adds(self, c, st, cam: str, v: float) -> str:
+    """Add-only: signal c's light raised by the camera's (module docstring). Never lowered."""
+    if cam == 'red':
+      return 'red'
+    if cam == 'yellow' and st.light != 'red' and st.mode == SIGNAL_GO and \
+       c.d >= v * T_LAT + v ** 2 / (2. * min(self.yellow_decel, YELLOW_DECEL_MAX)):
+      return 'yellow'
+    return st.light
+
+  def _camera_log(self, signals, camera: CameraLights | None, v: float) -> None:
+    """What the camera would have each signal do, logged on a change; it reads nothing back into the policy."""
+    keys = set()
+    for c in signals:
+      keys.add(c.key)
+      cam = camera_state(c, signals, camera)
+      st = c.state
+      if cam == 'red':
+        need = needed(v, c.d)
+        would = 'held' if c.held else 'stop' if need >= -MAP_STOP_DECEL else 'stopFirm' if need >= MAP_DECEL_MAX else \
+          'cannotStopComfortably'
+      elif cam == 'yellow':
+        would = 'stop' if c.d >= v * T_LAT + v ** 2 / (2. * min(self.yellow_decel, YELLOW_DECEL_MAX)) else 'proceedOnYellow'
+      else:
+        would = 'none'
+      if self._camera_would.get(c.key, ('unknown', 'none')) != (cam, would):
+        self._camera_would[c.key] = (cam, would)
+        cloudlog.event("turnpilot.camera_light_shadow", key=list(c.key), d=round(c.d, 1), v=round(v, 2), camera=cam, would=would,
+                       acting=camera is not None and not camera.shadow, policy_light=st.light if st else 'unknown',
+                       policy_mode=st.mode if st else '', needed=round(needed(v, c.d), 2),
+                       heads=[(h, round(dist, 1)) for h, dist in camera.heads] if camera is not None else [])
+    for k in [k for k in self._camera_would if k not in keys]:
+      del self._camera_would[k]
+    unmapped = tuple(sorted({h for h, dist in camera.heads if h in ('red', 'yellow') and camera_owner(dist, signals) is None})) \
+      if camera is not None else ()
+    if unmapped != self._camera_unmapped:
+      self._camera_unmapped = unmapped
+      if unmapped:
+        cloudlog.event("turnpilot.camera_light_unmapped", states=list(unmapped), v=round(v, 2),
+                       heads=[(h, round(dist, 1)) for h, dist in camera.heads])
 
   def _held(self, c, controls, v, gas_pressed, dt, out, prompts) -> None:
     st = c.state

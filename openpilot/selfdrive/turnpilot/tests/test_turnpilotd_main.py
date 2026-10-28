@@ -147,3 +147,14 @@ def test_a_model_fallback_before_this_process_still_hands_back():
   for active in (True, None):  # the big model running, or none expected (no chestnut): no fallback
     plans, _, _ = run_main(frames=5, ChestnutActive=active)
     assert all(p.turnpilotPlan.handback == Handback.none for p in plans)
+
+
+@pytest.mark.parametrize("value,mode", [(None, 'shadow'), ('addOnly', 'addOnly'), ('off', 'off'), ('bogus', 'shadow')])
+def test_main_reads_the_camera_lights_mode(value, mode):
+  made, real = [], turnpilotd.TurnPilot
+  def make():
+    made.append(real())
+    return made[-1]
+  with mock.patch.object(turnpilotd, 'TurnPilot', side_effect=make):
+    run_main(frames=3, TurnPilotCameraLights=value)
+  assert made[0].camera_mode == mode

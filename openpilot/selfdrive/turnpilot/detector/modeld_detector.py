@@ -32,10 +32,9 @@ import numpy as np
 from openpilot.cereal import custom, log, messaging
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
-from openpilot.common.params import UnknownKeyName
 from openpilot.selfdrive.turnpilot.detector.decoder import decode, decode_lights, fill_detections
 from openpilot.selfdrive.turnpilot.detector.graph import detector_pkl_path, letterbox
-from openpilot.selfdrive.turnpilot.detector.light_state import LightHead, LightReader
+from openpilot.selfdrive.turnpilot.detector.light_state import LIGHT_MODE_DEFAULT, LightHead, LightReader, camera_lights_mode
 from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN, LanePaintClassifier, LinePaint, fill_lane_paint
 from openpilot.selfdrive.turnpilot.scene.ranging import camera_height, road_lens
 from openpilot.selfdrive.turnpilot.scene.tracker import predicted_path
@@ -62,21 +61,8 @@ RETRY_MAX_S = 60.          # ...to this
 PARAM_CHECK_S = 1.0        # TurnPilotEnabled is read this often
 PAINT_BUDGET_S = 0.005     # the lane paint read's median over TIME_WINDOW reads above this turns it off for the drive
 LIGHT_BUDGET_S = 0.004     # the light read's median over TIME_WINDOW reads above this turns the lights off for the drive
-LIGHT_MODES = ('off', 'shadow', 'addOnly')  # TurnPilotCameraLights
-LIGHT_MODE_DEFAULT = 'shadow'  # read and logged, never acted on (CRITIQUE: no stop authority until the replay gate passes)
 LanePaintStatus = custom.TurnpilotDetections.LanePaintStatus
 LightStatus = custom.TurnpilotDetections.LightStatus
-
-
-def camera_lights_mode(params) -> str:
-  """TurnPilotCameraLights: off, shadow (the default, and anything unknown) or addOnly."""
-  try:
-    value = params.get("TurnPilotCameraLights")
-  except UnknownKeyName:
-    cloudlog.error("turnpilot detector: TurnPilotCameraLights unknown to this build's params, lights in shadow; run scons")
-    return LIGHT_MODE_DEFAULT
-  value = value.decode() if isinstance(value, bytes) else value
-  return value if value in LIGHT_MODES else LIGHT_MODE_DEFAULT
 
 
 def frame_view(model_state, index: int):

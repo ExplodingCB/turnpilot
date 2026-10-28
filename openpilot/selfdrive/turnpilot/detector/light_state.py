@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from openpilot.common.params import UnknownKeyName
+from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.turnpilot.scene.ranging import Lens, calib_from_view
 
 HEAD_MIN_H_PX = 24          # full-frame px
@@ -55,6 +57,19 @@ HEAD_DROP_S = 0.6           # a head not seen this long is forgotten
 GOVERN_BEARING_DEG = 10.    # a head within this of the lane's bearing governs it
 MAX_READ_HEADS = 8          # heads read a frame, the most confident first (decode_lights' order): the read's time stays bounded
 STATES = ('red', 'yellow', 'green')
+LIGHT_MODES = ('off', 'shadow', 'addOnly')  # TurnPilotCameraLights
+LIGHT_MODE_DEFAULT = 'shadow'  # read and logged, never acted on (CRITIQUE: no stop authority until the replay gate passes)
+
+
+def camera_lights_mode(params) -> str:
+  """TurnPilotCameraLights, read by modeld and turnpilotd: off, shadow (the default, and anything unknown) or addOnly."""
+  try:
+    value = params.get("TurnPilotCameraLights")
+  except UnknownKeyName:
+    cloudlog.error("turnpilot: TurnPilotCameraLights unknown to this build's params, camera lights in shadow; run scons")
+    return LIGHT_MODE_DEFAULT
+  value = value.decode() if isinstance(value, bytes) else value
+  return value if value in LIGHT_MODES else LIGHT_MODE_DEFAULT
 
 
 @dataclass

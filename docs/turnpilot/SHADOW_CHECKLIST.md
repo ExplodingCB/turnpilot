@@ -58,6 +58,12 @@ Compare the page with what the driver does, and note every difference:
 4. Holding has a real reason behind it. Note a hold with nothing there.
 5. The driver brakes or waits for a pedestrian, cyclist or car and the page does not say Holding. Note the miss.
 
+## Traffic lights
+
+The comma reads traffic lights from the road camera in shadow only (`TurnPilotCameraLights`, `shadow` by default). What it reads is logged and never slows or stops the car, on any rung. The driver owns every red. Leave the param at `shadow`: `addOnly` is not ready for the car.
+
+At each signal, the second person notes the light's colour as the car reaches it and whether the car stopped. That is what the logs are checked against. A "Light Source Rejected" alert reading "Camera light reader off for this drive" means the reader failed or ran too slow and is off until the next drive. Note the time. TurnPilot keeps working without it.
+
 ## When to take over
 
 On rungs 2 to 4, steer or brake at once when:

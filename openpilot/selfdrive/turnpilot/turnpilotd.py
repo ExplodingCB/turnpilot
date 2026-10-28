@@ -88,8 +88,10 @@ from openpilot.selfdrive.turnpilot.desire_timing import ENTRY_M, TURN_STARTED_DE
 from openpilot.selfdrive.turnpilot.control_text import STOPPED_NOTE
 from openpilot.selfdrive.turnpilot.handback import Handback
 from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, CLEAR_DESIRE, CONTROL_STATUS_ALERTS, TAKE_CONTROL_PROMPTS
-from openpilot.selfdrive.turnpilot.map_controls import (KEEP_TURN, PROTECT_PAST_M, YELLOW_DECEL, YELLOW_DECEL_MAX, MapControlPolicy,
-                                                         light_input, turn_stop_feasible, unprotected_turn)
+from openpilot.selfdrive.turnpilot.detector.light_state import LIGHT_MODE_DEFAULT, camera_lights_mode
+from openpilot.selfdrive.turnpilot.map_controls import (CAMERA_STALE_S, KEEP_TURN, PROTECT_PAST_M, YELLOW_DECEL, YELLOW_DECEL_MAX,
+                                                         MapControlPolicy, camera_light_input, light_input, turn_stop_feasible,
+                                                         unprotected_turn)
 from openpilot.selfdrive.turnpilot.lane_planner import (OPENPILOT_SIGNALS_BRANDS, LanePlanner, lane_change_window, lane_mismatch,
                                                          model_lanes_from_msg)
 from openpilot.selfdrive.turnpilot.route_follower import KEEP, LEFT, TURN, UNCERTAIN_M, RouteFollower
@@ -190,6 +192,7 @@ class TurnPilot:
     self.limits = (NO_ACCEL_CAP, NO_SPEED_CAP, False)  # the last plan's (accelCap, speedCap, shouldStop)
     self.oracle_ok = False  # the sim light oracle is accepted: SIMULATION=1 and TurnPilotSimLightOracle (main())
     self.yellow_decel = YELLOW_DECEL  # TurnPilotYellowDecel (main())
+    self.camera_mode = LIGHT_MODE_DEFAULT  # TurnPilotCameraLights (main()): the camera's lights, shadow unless addOnly
     self.map_now = None  # this frame's map control decision, once update() has made it
     self._rf_ticked = self._yaw_ticked = False  # update() dead-reckoned the route, and counted the yaw, this frame
     self.reset()
@@ -204,6 +207,8 @@ class TurnPilot:
       # TurnPilot off clears it (map_controls.py)
       self.map_controls = MapControlPolicy(self.yellow_decel)
       self.lights_age = float('inf')  # s since the last turnpilotLights
+      self.camera_read = None         # the camera's lights from the last road run (or a reader off), camera_light_input's
+      self.camera_age = float('inf')  # s since it
       self.was_stopping = False    # the last plan held the car (shouldStop)
       self.release_go = False      # ...and let go of it at standstill: the turn pulses again now
       self.detector_seen = False   # fresh detections since TurnPilot was turned on
@@ -589,10 +594,25 @@ class TurnPilot:
       self.lights_age = 0. if sm.updated['turnpilotLights'] else self.lights_age + DT_MDL
       lights_msg = sm['turnpilotLights'] if self.lights_age < float('inf') else None
     lights = light_input(lights_msg, self.lights_age, self.oracle_ok, True)
+    lights.camera = self.camera_lights(sm, data)
     self.map_controls.yellow_decel = self.yellow_decel
     self.map_now = self.map_controls.update(sm['navInstruction'], sm.updated['navInstruction'], sm.valid['navInstruction'], v_ego,
                                             gas_pressed, lights, DT_MDL, turn=turn)
     return self.map_now
+
+  def camera_lights(self, sm, data):
+    """The camera's lights (map_controls.camera_light_input) from the last turnpilotDetections of a road camera run, or one
+    saying the reader is off; a wide camera run keeps the last road read, which ages out after CAMERA_STALE_S."""
+    self.camera_age += DT_MDL
+    if 'turnpilotDetections' in data and sm.updated['turnpilotDetections']:
+      td = sm['turnpilotDetections']
+      status = str(td.lightStatus)
+      if status != 'wideCamera':
+        self.camera_read, self.camera_age = camera_light_input(td.lights, status, 0., self.camera_mode), 0.
+    cam = self.camera_read
+    if cam is None or (cam.status != 'disabled' and self.camera_age > CAMERA_STALE_S):
+      return None
+    return cam
 
   def _take_up_dropped(self, upcoming, rf, v_ego: float, right_hand_traffic: bool = True) -> None:
     """TurnPilot acts again after a handback (the detector is back): the maneuver dropped at the handback is never left
@@ -798,7 +818,8 @@ def lane_paint_active(params) -> bool:
 def main():
   params = Params()
   pm = messaging.PubMaster(['turnpilotPlan', 'turnpilotScene'])
-  # no route, no detector (TurnPilotEnabled off, no pkl), no light source (only the sim's oracle publishes one)
+  # no route, no detector (TurnPilotEnabled off, no pkl), no light source (only the sim's oracle publishes one; the
+  # camera's lights ride in turnpilotDetections, shadow unless TurnPilotCameraLights is addOnly)
   optional = ['navInstruction', 'turnpilotDetections', 'turnpilotLights']
   sm = messaging.SubMaster(['carState', 'carControl', 'navInstruction', 'modelV2', 'turnpilotDetections', 'extrinsicsCalibration',
                             'deviceState', 'narrowRoadCameraState', 'turnpilotLights'],
@@ -822,6 +843,7 @@ def main():
       disengage_on_accel = params.get_bool("DisengageOnAccelerator")
       tp.oracle_ok = oracle_accepted(os.environ, read_bool(params, "TurnPilotSimLightOracle", False))
       tp.yellow_decel = yellow_decel_for(params)
+      tp.camera_mode = camera_lights_mode(params)
       if params.get("ChestnutActive") is False:  # None: no big model expected this drive
         tp.big_model_failed(enabled)
 
