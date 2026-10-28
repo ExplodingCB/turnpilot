@@ -63,8 +63,9 @@ PRESENT_CAR_M = 30.    # an oncoming car this close to the junction while the ca
 # the post-encroachment time with each oncoming car through the junction's conflict zone under PET_MIN_S fails; a go with an
 # oncoming car under the plan's tReq from the zone at its own speed is a false go (fails); a gap of tReq or more offered
 # while the car waited at its line without going is a missed gap (counted, not failed: the velocity-free rule's 1.3x margin
-# and 2.5 s window wait out gaps a little longer than tReq by design); undecided passes only if no such gap was offered
-# before it; a stall or an unmoving go (stalledTakeControl, cantStartTakeControl) and a missed turn fail
+# and 2.5 s window wait out gaps a little longer than tReq by design); undecided passes only if no such gap was offered with
+# the car at its line, before or after it (and a tReq is known); a stall or an unmoving go (stalledTakeControl,
+# cantStartTakeControl) and a missed turn fail
 PET_MIN_S = 2.
 CONFLICT_M = 8.        # the conflict zone: within this of the junction's point
 APPROACH_SPEED_S = 0.5  # an oncoming car's speed at a go: from its distance this long before
@@ -453,16 +454,21 @@ def unprotected_left(rows) -> dict:
   bounds = [(a[1], b[0]) for a, b in zip(passes, passes[1:], strict=False) if b[0] > a[1]]
   if passes and rows[-1]['t'] > passes[-1][1]:
     bounds.append((passes[-1][1], rows[-1]['t']))
-  t_req = max((r.get('left_treq', 0.) for r in rows if r.get('left_state') == 'waitGap'), default=0.)
+  # the tReq it judged with at its line: any held row's (waiting, creeping, or undecided at once)
+  held = [r for r in rows if r.get('left_state') in ('waitGap', 'creep', 'undecided') and r['v'] < STOPPED_V]
+  t_req = max((r.get('left_treq', 0.) for r in held), default=0.)
+  t_line = held[0]['t'] if held else None
   offered = [(a, b) for a, b in bounds if t_req > 0. and b - a >= t_req]
   waiting = [r['t'] for r in rows if r.get('left_state') == 'waitGap' and r['v'] < STOPPED_V]
   go_t = [rows[i]['t'] for i in gos]
   missed = [(a, b) for a, b in offered if any(a <= t <= b - t_req for t in waiting) and not any(a <= t <= b - t_req for t in go_t)]
   undecided_t = next((r['t'] for r in rows if r.get('left_state') == 'undecided'), None)
+  # undecided passes only where no gap of tReq was offered with the car at its line, before or after it: a stream that ends
+  # in an empty road offers one. No tReq known at all is no pass either
   return {'pet_s': round(min(pets), 2) if pets else None, 'gos': go_t, 'false_goes': false_goes,
           'gaps_offered_s': [round(b - a, 1) for a, b in offered], 'missed_gaps': len(missed), 't_req': t_req,
           'undecided_t': undecided_t,
-          'gap_before_undecided': undecided_t is not None and any(b - t_req <= undecided_t for a, b in offered),
+          'gap_before_undecided': undecided_t is not None and (t_req <= 0. or any(t_line is not None and b > t_line for a, b in offered)),
           'stalls': sorted({r['control_prompt'] for r in rows if r.get('control_prompt') in LEFT_STALLS}),
           'turn_missed': any(r.get('turn_missed') for r in rows)}
 
@@ -494,7 +500,8 @@ def check(name: str, res: dict) -> list[str]:
   elif name.startswith('unprotected_left'):  # and its variants at other approaches and gap streams
     lr = res['left']
     if lr['undecided_t'] is not None and lr['gap_before_undecided']:
-      fails.append(f"undecided at t={lr['undecided_t']:.1f} s with a gap of {max(lr['gaps_offered_s'])} s (tReq {lr['t_req']} s) offered")
+      gap = f"a gap of {max(lr['gaps_offered_s'])} s" if lr['gaps_offered_s'] else "no tReq known"
+      fails.append(f"undecided at t={lr['undecided_t']:.1f} s with {gap} (tReq {lr['t_req']} s) offered at its line")
     elif lr['undecided_t'] is None:
       # waiting is required wherever an oncoming car was presented; the wait is the left's own at its line
       h = _hold_with(hs, 'gap') + _hold_with(hs, 'oncoming') + _hold_with(hs, 'Oncoming')

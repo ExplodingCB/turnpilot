@@ -443,3 +443,24 @@ class TestFromMessages:
     assert [(h['reason'], h['stopped'], h['resumed']) for h in res['holds']] == [('pedestrian in crosswalk', True, True)]
     assert len(res['disengagements']) == 1 and res['disengagements'][0]['cause'].startswith('steerSaturated')
     assert res['maneuvers_attempted'] == 1 and res['maneuvers_taken'] == 0  # it disengaged before navd moved on
+
+
+def test_undecided_at_once_with_an_empty_road_after_the_stream_fails():
+  # BeamNG unprotected_left_gap4 (2026-10-28): handed back undecided at the line the moment it latched (never in waitGap),
+  # the stream passed, and the road stood empty for 170 s: an offered gap, so a failure, never a pass for want of a tReq
+  rows = []
+  for k in range(int(60. / DT)):
+    t = round(k * DT, 3)
+    onc = [[abs(11. * (tc - t)), 11. * (tc - t)] for tc in (12., 16., 20., 24.)]
+    rows.append(row(t, v=0., j_dist=22., j_ahead=22., onc=onc, car_j_dist=min(o[0] for o in onc),
+                    left_state='undecided' if t >= 2. else 'approach', left_treq=11.7, state='holding',
+                    reason='Oncoming traffic too fast to judge: take control', control_prompt='leftUndecidedTakeControl'))
+  res = score.summarize('unprotected_left_gap4', rows, 'timeout')
+  assert res['left']['t_req'] == 11.7 and res['left']['gaps_offered_s']
+  assert any('undecided' in f for f in res['failures']), res['failures']
+  assert not res['passed']
+  # with no tReq known at all, undecided is a failure too
+  for r in rows:
+    r['left_treq'] = 0.
+  res = score.summarize('unprotected_left_gap4', rows, 'timeout')
+  assert any('undecided' in f for f in res['failures']), res['failures']
