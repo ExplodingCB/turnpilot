@@ -214,7 +214,7 @@ struct TurnpilotDetections @0xaedffd8f31e7b55d {
     wide @1;
   }
   struct Detection {
-    cls @0 :UInt8;      # COCO class id (0 person, 1 bicycle, 2 car, 3 motorcycle, 5 bus, 7 truck)
+    cls @0 :UInt8;      # COCO class id (0 person, 1 bicycle, 2 car, 3 motorcycle, 5 bus, 7 truck); traffic lights (9) go in lights
     conf @1 :Float32;
     x0 @2 :Float32;     # pixels in the full sensor frame
     y0 @3 :Float32;
@@ -254,6 +254,19 @@ struct TurnpilotDetections @0xaedffd8f31e7b55d {
   }
   lanePaintStatus @6 :LanePaintStatus;
   lanePaintTime @7 :Float32;      # s spent reading the paint in this step, 0 when not read; executionTime is the detector's alone
+  # Traffic lights read on the road camera's frame of this step (detector/light_state.py), source camera; shadow while
+  # TurnPilotCameraLights is shadow: turnpilotd logs what it would do and never acts on it
+  lights @8 :TurnpilotLights;
+  enum LightStatus {
+    unset @0;        # a log from before the field
+    read @1;
+    wideCamera @2;   # this run was on the wide camera; lights are only read on the road camera
+    noCalibration @3;  # no calibration yet, so no horizon to gate the boxes by: nothing read
+    disabled @4;     # the reader failed or ran over its budget earlier and is off for the drive
+    off @5;          # TurnPilotCameraLights off, or modeld has no road camera
+  }
+  lightStatus @9 :LightStatus;
+  lightTime @10 :Float32;         # s spent reading the lights in this step, 0 when not read
 }
 
 struct TurnpilotScene @0xf35cc4560bbf6ec2 {
@@ -284,9 +297,9 @@ struct TurnpilotScene @0xf35cc4560bbf6ec2 {
 }
 
 struct TurnpilotLights @0xda96579883444c35 {
-  # Traffic light states ahead, for TurnPilot's map signal holds (selfdrive/turnpilot/map_controls.py). Only the BeamNG
-  # bridge's oracle publishes it today (simOracle), and turnpilotd takes that only with SIMULATION=1 and
-  # TurnPilotSimLightOracle set: never on the car.
+  # Traffic light states ahead, for TurnPilot's map signal holds (selfdrive/turnpilot/map_controls.py). The BeamNG
+  # bridge's oracle publishes it as its own message (simOracle), and turnpilotd takes that only with SIMULATION=1 and
+  # TurnPilotSimLightOracle set: never on the car. modeld's camera reader fills one inside turnpilotDetections (camera).
   enum Source {
     none @0;
     simOracle @1;
@@ -300,11 +313,18 @@ struct TurnpilotLights @0xda96579883444c35 {
   }
   struct Light {
     state @0 :State;
-    distance @1 :Float32;  # m ahead to its stop line
+    distance @1 :Float32;  # m ahead to its stop line; source camera: to the head itself, from its elevation (the line is unknown)
     instance @2 :Text;     # the sim's signal instance, for logs
+    # source camera only (detector/light_state.py)
+    conf @3 :Float32;      # the detector's class-9 confidence
+    box @4 :List(Float32); # x0, y0, x1, y1 normalized 0-1 in the road camera's frame
+    bearing @5 :Float32;   # deg left of the calibrated forward axis
+    votes @6 :UInt8;       # of the last LIGHT_VOTE_M reads of this head, how many read this state
+    governs @7 :Bool;      # its bearing lies over the car's lane (within GOVERN_BEARING_DEG)
   }
   source @0 :Source;
   lights @1 :List(Light);
+  shadow @2 :Bool;   # source camera: logged by turnpilotd, never acted on (TurnPilotCameraLights shadow)
 }
 
 struct CustomReserved4 @0x80ae746ee2596b11 {

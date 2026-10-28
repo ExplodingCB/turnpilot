@@ -2,7 +2,8 @@ import numpy as np
 
 from openpilot.cereal import messaging
 from openpilot.common.test import OpenpilotTestCase
-from openpilot.selfdrive.turnpilot.detector.decoder import CAR, MIN_CONF, PERSON, TRUCK, decode, fill_detections
+from openpilot.selfdrive.turnpilot.detector.decoder import CAR, MAX_DETECTIONS, MAX_LIGHTS, MIN_CONF, PERSON, TRAFFIC_LIGHT, TRUCK, \
+  decode, decode_lights, fill_detections
 from openpilot.selfdrive.turnpilot.detector.graph import letterbox
 
 LB = letterbox(1344, 760)  # into 640x384: scale 0.476, 11 px of padding top and bottom
@@ -60,3 +61,18 @@ class TestDecoder(OpenpilotTestCase):
     d = td.detections[0]
     assert d.cls == PERSON and abs(d.conf - 0.75) < 1e-6
     np.testing.assert_allclose([d.x0, d.y0, d.x1, d.y1], [100, 200, 300, 500], atol=1e-3)
+
+  def test_lights_decoded_apart(self):
+    rows = [[10, 50, 60, 120, 0.9, PERSON], [100, 20, 110, 50, 0.8, TRAFFIC_LIGHT], [200, 20, 210, 50, MIN_CONF - 0.01, TRAFFIC_LIGHT]]
+    lights = decode_lights(raw_output(rows), LB)
+    assert lights[:, 5].tolist() == [TRAFFIC_LIGHT]
+    np.testing.assert_allclose(lights[0, :4], [*LB.to_frame(100, 20), *LB.to_frame(110, 50)], atol=1e-3)
+    assert decode(raw_output(rows), LB)[:, 5].tolist() == [PERSON]
+
+  def test_lights_never_displace_road_users(self):
+    # a dense signalized scene: the lights' boxes, however confident, never push a road user out of the message
+    users = [[10 + i, 50, 60 + i, 120, 0.36 + 0.001 * i, PERSON] for i in range(MAX_DETECTIONS)]
+    lights = [[300 + 5 * i, 20, 305 + 5 * i, 40, 0.99, TRAFFIC_LIGHT] for i in range(MAX_LIGHTS + 4)]
+    raw = raw_output(lights + users)
+    assert len(decode(raw, LB)) == MAX_DETECTIONS
+    assert len(decode_lights(raw, LB)) == MAX_LIGHTS

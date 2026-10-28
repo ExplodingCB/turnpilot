@@ -7,8 +7,13 @@ from openpilot.selfdrive.turnpilot.detector.graph import Letterbox
 # COCO ids kept: road users only
 PERSON, BICYCLE, CAR, MOTORCYCLE, BUS, TRUCK = 0, 1, 2, 3, 5, 7
 KEEP_CLASSES = (PERSON, BICYCLE, CAR, MOTORCYCLE, BUS, TRUCK)
+# COCO 9, traffic light: decoded apart (decode_lights) for the camera light reader (light_state.py) when
+# TurnPilotCameraLights isn't off, into the message's lights, never into its detections: the tracker takes road users only,
+# and a junction full of heads never pushes a pedestrian out of the MAX_DETECTIONS
+TRAFFIC_LIGHT = 9
 MIN_CONF = 0.35
 MAX_DETECTIONS = 64  # the message never carries more than this, highest confidence first
+MAX_LIGHTS = 16      # traffic light boxes, apart, highest confidence first
 # our own hood (and on the wide camera, the dashboard) reads as a car: a box at least this wide (fraction of the frame)
 # that reaches the bottom edge. A real vehicle's visible bottom ends at the hood line, so it only drops one closer than that.
 HOOD_MIN_WIDTH, HOOD_MIN_BOTTOM = 0.5, 0.97
@@ -24,12 +29,21 @@ def decode(raw: np.ndarray, lb: Letterbox, min_conf: float = MIN_CONF) -> np.nda
   """raw: (300, 6) or (1, 300, 6), x0 y0 x1 y1 in model input pixels, conf, class.
   Returns (N, 6) float32 rows of x0 y0 x1 y1 in full-frame pixels (clipped to the frame), conf, class; highest conf first.
   Drops other classes, low confidence and our own hood."""
+  return _decode(raw, lb, min_conf, KEEP_CLASSES, MAX_DETECTIONS)
+
+
+def decode_lights(raw: np.ndarray, lb: Letterbox, min_conf: float = MIN_CONF) -> np.ndarray:
+  """decode()'s rows for traffic lights alone, at most MAX_LIGHTS."""
+  return _decode(raw, lb, min_conf, (TRAFFIC_LIGHT,), MAX_LIGHTS)
+
+
+def _decode(raw: np.ndarray, lb: Letterbox, min_conf: float, classes: tuple, limit: int) -> np.ndarray:
   out = np.asarray(raw, dtype=np.float32).reshape(-1, 6)
   out = out[np.isfinite(out).all(axis=1)]
   cls = np.rint(out[:, 5])
-  keep = (out[:, 4] >= min_conf) & np.isin(cls, KEEP_CLASSES)
+  keep = (out[:, 4] >= min_conf) & np.isin(cls, classes)
   out = out[keep]
-  out = out[np.argsort(-out[:, 4], kind='stable')][:MAX_DETECTIONS]
+  out = out[np.argsort(-out[:, 4], kind='stable')][:limit]
   x0, y0 = lb.to_frame(out[:, 0], out[:, 1])
   x1, y1 = lb.to_frame(out[:, 2], out[:, 3])
   boxes = np.stack([np.clip(x0, 0, lb.cam_w), np.clip(y0, 0, lb.cam_h), np.clip(x1, 0, lb.cam_w), np.clip(y1, 0, lb.cam_h)], axis=1)
