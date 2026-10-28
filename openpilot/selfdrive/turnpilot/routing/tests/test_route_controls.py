@@ -304,16 +304,22 @@ def test_c14_a_phantom_far_end_flag_is_overruled_by_the_sidecars_direction(tmp_p
 
 
 def test_c14_a_phantom_on_a_way_split_is_overruled_by_the_next_ways_entry(tmp_path):
-  """Our edge (way 77, against its order) ends at a way split, where the route carries on along way 78. The other
-  direction's directed stop on the split node is keyed to the way its traffic arrives on, way 78 against ours (78:b),
-  never 77:f, so the phantom check looks there too (Lexington KY: way 16169193 and 1334314513). A stop keyed to our
-  own direction on the next way is no phantom's evidence."""
-  edges = [(0., 90., {}), (90., 100., {'stop': True, 'way_id': 77, 'forward': False}), (100., 400., {'way_id': 78})]
+  """Our edge (way 77, against its order) ends at a way split (no other road meets there), where the route carries on
+  along way 78. The other direction's directed stop on the split node is keyed to the way its traffic arrives on, way
+  78 against ours (78:b), never 77:f, so the phantom check looks there too (Lexington KY: way 16169193 and 1334314513).
+  A stop keyed to our own direction on the next way is no phantom's evidence, and where other roads meet (a junction,
+  where the route may turn onto the cross road) the next way's entries are never read: a phantom lives on a node
+  Valhalla can't direct, not at a junction."""
+  split = [(0., 90., {}), (90., 100., {'stop': True, 'way_id': 77, 'forward': False, 'crossing': []}), (100., 400., {'way_id': 78})]
   theirs = {'78:b': [entry('stop', 100., junction=900)]}
-  controls, status = route_controls(StubValhalla(edges), steps(), sidecar_dir=osm_dir(tmp_path / 'theirs', theirs))
+  controls, status = route_controls(StubValhalla(split), steps(), sidecar_dir=osm_dir(tmp_path / 'theirs', theirs))
   assert status == 'ok' and controls == []
   ours = {'78:f': [entry('stop', 100., junction=900)]}
-  controls, _ = route_controls(StubValhalla(edges), steps(), sidecar_dir=osm_dir(tmp_path / 'ours', ours))
+  controls, _ = route_controls(StubValhalla(split), steps(), sidecar_dir=osm_dir(tmp_path / 'ours', ours))
+  assert [(c.kind, round(c.route_m, 1)) for c in controls] == [('stop', 100. - OFF)]
+  junction = [(0., 90., {}), (90., 100., {'stop': True, 'way_id': 77, 'forward': False, 'crossing': ['residential']}),
+              (100., 400., {'way_id': 78})]
+  controls, _ = route_controls(StubValhalla(junction), steps(), sidecar_dir=osm_dir(tmp_path / 'junction', theirs))
   assert [(c.kind, round(c.route_m, 1)) for c in controls] == [('stop', 100. - OFF)]
 
 

@@ -472,9 +472,10 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
         m = osm_at(osm, entry, pts, cum, end_m - span, end_m, tpts[end_i])
         if m is not None and entry.get('kind') in ('stop', 'yield'):
           hits.append((entry, m))
-      # the other direction: of our way, and of the next edge's way where it differs (a way split's sign is keyed to the
-      # way its traffic arrives on)
-      nxt = edges[i + 1] if i + 1 < len(edges) else {}
+      # the other direction: of our way, and, where no other road meets the end node (a way split, never a junction the
+      # route may turn at), of the next edge's way (a split's sign is keyed to the way its traffic arrives on)
+      split = not (e.get('end_node') or {}).get('intersecting_edges')
+      nxt = edges[i + 1] if i + 1 < len(edges) and split else {}
       others = list(dict.fromkeys(f"{x['way_id']}:{'b' if x.get('forward') else 'f'}" for x in (e, nxt) if x.get('way_id') is not None))
       for kind in ('stop', 'yield'):
         if kind in valhalla and phantom(osm, kind, others, hits, pts, cum, end_m - span, end_m, tpts[end_i]):
