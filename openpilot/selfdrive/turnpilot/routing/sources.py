@@ -92,6 +92,15 @@ class MapRouter:
       return [], 'failed'
     return served[1].controls(steps, tiles_dir=served[2])
 
+  def opposing(self, steps) -> dict:
+    """{step index: (m/s, lanes)} of the roads straight across the route's maneuvers (routing/controls.py: opposing_roads),
+    from the source that routed it; {} (unknown) for steps it didn't route."""
+    served = self.served
+    if served is None or served[0] is not steps:
+      cloudlog.error("turnpilot: opposing roads asked for a route this router didn't give")
+      return {}
+    return served[1].opposing(steps)
+
   def controls_ahead(self, position, bearing) -> tuple[list, str, list]:
     """(controls, status, road) on the road ahead of the car off the route (routing/controls.py: controls_ahead), from the source
     that routed the last route, or the local tiles (loaded here if no route has yet: TurnPilotValhallaTiles). position:

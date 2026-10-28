@@ -53,6 +53,7 @@ class RouteJob(threading.Thread):
     self.steps: list[dict] | None = None
     self.controls: list = []  # TurnPilot: the route's stop signs, yields and signals (turnpilot/routing/controls.py)
     self.controls_status = 'none'
+    self.opposing: dict = {}  # TurnPilot: {step index: (m/s, lanes)} of the roads across its maneuvers (routing/controls.py)
 
   def run(self):
     router, destination = self.engine.router, self.destination
@@ -74,6 +75,13 @@ class RouteJob(threading.Thread):
       except Exception:
         cloudlog.exception("navd: route controls failed")
         self.controls, self.controls_status = [], 'failed'
+      # the opposing roads' mapped speeds, for the unprotected left's required clear range: unknown on a failure (the left then
+      # takes 45 mph and is skipped past the detector's range), never a guess lower
+      try:
+        self.opposing = router.opposing(self.steps)
+      except Exception:
+        cloudlog.exception("navd: route opposing roads failed")
+        self.opposing = {}
 
 
 class AheadJob(threading.Thread):
@@ -109,6 +117,7 @@ class RouteEngine:
     self.route_count = 0  # TurnPilot: routes calculated, so a replaced route is told apart from the one it replaces
     self.controls: list = []  # TurnPilot: the route's stop signs, yields and signals, and Valhalla's status for them
     self.controls_status = 'none'
+    self.opposing: dict = {}  # TurnPilot: the route's opposing roads' speeds and lanes (RouteJob.opposing)
     # TurnPilot: off the route with a destination, the controls ahead of the car (AheadJob), [(id, Control)] on the road
     # looked up (an (n, 2) array of (longitude, latitude)), and the lookup's status: navInstruction.offRouteControls
     self.off_controls: list = []
@@ -256,6 +265,7 @@ class RouteEngine:
       return
     self.route = job.steps
     self.controls, self.controls_status = job.controls, job.controls_status
+    self.opposing = job.opposing
     self.route_count += 1
     self.route_geometry = [np.array(step['geometry']['coordinates'], dtype=np.float64).reshape((-1, 2)) for step in self.route]
     self.step_idx = 0
@@ -306,7 +316,7 @@ class RouteEngine:
     self.maneuver_distance = distance_to_maneuver_along_geometry
     msg.navInstruction.maneuverDistance = distance_to_maneuver_along_geometry
     set_banner(msg.navInstruction, banner_step['bannerInstructions'], distance_to_maneuver_along_geometry)
-    fill_guidance(msg.navInstruction, self.route, self.step_idx, distance_to_maneuver_along_geometry)
+    fill_guidance(msg.navInstruction, self.route, self.step_idx, distance_to_maneuver_along_geometry, self.opposing)
     # TurnPilot: the controls in maneuverDistance's frame, the steps' distances and then along this step's geometry
     car_along = sum(s['distance'] for s in self.route[:self.step_idx]) + along_geometry
     fill_controls(msg.navInstruction, self.controls, self.controls_status, car_along)

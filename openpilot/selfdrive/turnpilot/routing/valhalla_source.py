@@ -9,7 +9,7 @@ from pathlib import Path
 import requests
 
 from openpilot.common.swaglog import cloudlog
-from openpilot.selfdrive.turnpilot.routing.controls import actor_call, controls_ahead, http_call, route_controls
+from openpilot.selfdrive.turnpilot.routing.controls import actor_call, controls_ahead, http_call, opposing_roads, route_controls
 
 # tools/turnpilot/install_valhalla_device.sh puts pyvalhalla here, since the system venv is read-only
 DEVICE_PYVALHALLA = '/data/turnpilot/pyvalhalla'
@@ -132,6 +132,10 @@ class ValhallaSource:
     controls must be checked for (local tiles: the controls_built marker and the sim's sidecar), None when the tiles come
     from real OSM."""
     return route_controls(self._call(), steps, tiles_dir)
+
+  def opposing(self, steps):
+    """{step index: (m/s, lanes)} of the roads straight across the route's maneuvers (routing/controls.py: opposing_roads)."""
+    return opposing_roads(self._call(), steps)
 
   def controls_ahead(self, position, heading, tiles_dir=None):
     """(controls, status, road) ahead of the car at position (lat, lon) heading that way (routing/controls.py:

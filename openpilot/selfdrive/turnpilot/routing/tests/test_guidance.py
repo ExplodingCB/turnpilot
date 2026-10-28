@@ -200,3 +200,60 @@ class TestGuidance(unittest.TestCase):
 
 if __name__ == '__main__':
   unittest.main()
+
+
+class TestOpposingRoad(unittest.TestCase):
+  """The unprotected left's R_req is from the opposing road's mapped speed limit (unprotected_left.py): one verbose locate per
+  route, a point OPPOSING_PROBE_M out along each opposing leg, the edge coming into the junction (routing/controls.py)."""
+
+  def test_the_opposing_leg_of_a_junction(self):
+    from openpilot.selfdrive.turnpilot.routing.guidance import opposing_leg
+    steps = steps_of('valhalla_left_then_right.json')
+    lat, lon, bearing = opposing_leg(steps, 0)
+    # the car comes in heading 90 (in: bearing 270 out of the junction); straight across leaves at 90
+    self.assertAlmostEqual(bearing, 90.)
+    self.assertAlmostEqual(lat, 39.77, places=5)
+    self.assertGreater(lon, -86.163)
+    self.assertIsNone(opposing_leg(steps, 1))  # a bend: nothing across
+    self.assertIsNone(opposing_leg(steps, 3))
+
+  def test_locate_reads_the_inbound_edges_speed_limit_and_lanes(self):
+    from openpilot.selfdrive.turnpilot.routing.controls import opposing_roads
+    steps = steps_of('valhalla_left_then_right.json')
+    calls = []
+
+    def call(endpoint, req):
+      calls.append((endpoint, req))
+      loc = req['locations'][0]
+      inbound = {'heading': loc['heading'], 'distance': 0.5, 'edge': {'lane_count': 1, 'forward': True}, 'edge_info': {'speed_limit': 40}}
+      outbound = {'heading': (loc['heading'] + 180) % 360, 'distance': 0.5, 'edge': {'lane_count': 2}, 'edge_info': {'speed_limit': 90}}
+      return [{'edges': [outbound, inbound]}]
+    roads = opposing_roads(call, steps)
+    self.assertEqual(list(roads), [0])  # the left's junction; the bend has no opposing road
+    speed, lanes = roads[0]
+    self.assertAlmostEqual(speed, 40 / 3.6, places=3)
+    self.assertEqual(lanes, 1)
+    self.assertEqual(len(calls), 1)  # one batched call
+    self.assertEqual(calls[0][1]['locations'][0]['heading'], 270)  # coming into the junction from across
+    # untagged (0): unknown; unlimited (255): unknown too (the left takes 45 mph and skips it past the range)
+    for limit in (0, 255):
+      roads = opposing_roads(lambda e, r, limit=limit: [{'edges': [{'heading': 270, 'distance': 0., 'edge': {'lane_count': 1},
+                                                                    'edge_info': {'speed_limit': limit}}]}], steps)
+      self.assertEqual(roads[0], (0., 1))
+    # nothing found, or the call failing: no entry (unknown), never a speed
+    self.assertEqual(opposing_roads(lambda e, r: [{'edges': []}], steps), {})
+
+    def boom(e, r):
+      raise RuntimeError("valhalla down")
+    self.assertEqual(opposing_roads(boom, steps), {})
+
+  def test_into_navinstruction(self):
+    steps = steps_of('valhalla_left_then_right.json')
+    instruction = messaging.new_message('navInstruction').navInstruction
+    fill_guidance(instruction, steps, 0, 300, opposing={0: (11.11, 1)})
+    self.assertAlmostEqual(instruction.maneuverOpposingSpeed, 11.11, places=3)
+    self.assertEqual(instruction.maneuverOpposingLanes, 1)
+    self.assertAlmostEqual(instruction.allManeuvers[0].opposingSpeed, 11.11, places=3)
+    self.assertEqual(instruction.allManeuvers[1].opposingSpeed, 0.)
+    fill_guidance(instruction, steps, 1, 300, opposing={0: (11.11, 1)})
+    self.assertEqual((instruction.maneuverOpposingSpeed, instruction.maneuverOpposingLanes), (0., 0))

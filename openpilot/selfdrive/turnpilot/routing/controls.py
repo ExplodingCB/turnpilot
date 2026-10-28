@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.turnpilot.routing.guidance import opposing_leg
 
 CONTROL_LINE_M = 10.    # m before the junction node a stop line is taken to be, without a mapped one
 MAP_MARGIN_M = 1.       # m short of the line the car stops
@@ -235,6 +236,40 @@ def trace(call, pts):
     raise ValueError("trace_attributes matched no edges")
   cloudlog.warning("turnpilot controls: the route matched only by walk_or_snap")
   return t, 'walkOrSnap'
+
+
+OPPOSING_HEADING_TOL = 45.  # deg: the opposing road's edge coming into the junction, within this of the leg reversed
+OPPOSING_RADIUS_M = 8.
+UNLIMITED_KPH = 255         # Valhalla's speed_limit for no limit (kUnlimitedSpeedLimit)
+
+
+def opposing_roads(call, steps) -> dict[int, tuple[float, int]]:
+  """{step index: (speed limit m/s, lanes)} for the road straight across the junction of each maneuver that ends a step
+  (guidance.opposing_leg), from one batched verbose locate OPPOSING_PROBE_M out along it: the edge coming into the junction,
+  its edge_info.speed_limit (tagged maxspeed, km/h; 0 untagged and 255 unlimited are 0, unknown) and edge.lane_count (0
+  unknown). A leg with no such edge has no entry; a failure is logged and gives {} (unknown everywhere: the unprotected left
+  takes 45 mph, never a guess lower)."""
+
+  try:
+    legs = {i: leg for i in range(len(steps)) if (leg := opposing_leg(steps, i)) is not None}
+    if not legs:
+      return {}
+    locs = [{'lat': lat, 'lon': lon, 'heading': round((b + 180.) % 360.) % 360, 'heading_tolerance': OPPOSING_HEADING_TOL,
+             'radius': OPPOSING_RADIUS_M} for lat, lon, b in legs.values()]
+    located = call('locate', {'locations': locs, 'costing': 'auto', 'verbose': True}) or []
+    out = {}
+    for (i, (_, _, b)), loc in zip(legs.items(), located, strict=False):
+      inbound = (b + 180.) % 360.
+      cands = [c for c in (loc or {}).get('edges') or [] if angle_diff(float(c.get('heading', inbound)), inbound) <= OPPOSING_HEADING_TOL]
+      if not cands:
+        continue
+      c = min(cands, key=lambda c: (round(float(c.get('distance', 0.)), 1), angle_diff(float(c.get('heading', inbound)), inbound)))
+      limit = float((c.get('edge_info') or {}).get('speed_limit') or 0.)
+      out[i] = (limit / 3.6 if 0. < limit < UNLIMITED_KPH else 0., int((c.get('edge') or {}).get('lane_count') or 0))
+    return out
+  except Exception:
+    cloudlog.exception("turnpilot opposing roads: failed")
+    return {}
 
 
 def route_controls(call, steps, tiles_dir=None) -> tuple[list[Control], str]:

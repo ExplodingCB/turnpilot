@@ -164,6 +164,12 @@ class FakeValhalla:
 
     source.controls_ahead = controls_ahead
 
+    def opposing(steps):
+      source.controls_calls.append(('opposing', steps))
+      return {0: (11.11, 1)}
+
+    source.opposing = opposing
+
     def route(start, destination, bearing, language):
       source.calls.append((start, destination, bearing, language))
       if self.test.route_error is not None:
@@ -462,6 +468,16 @@ class TestLocalOverride(RouterCase):
     self.assertEqual((status['state'], status['source']), ('ready', 'local'))
     self.router.route(CHICAGO, CHICAGO, 90, 'en')
     self.assertEqual(len(self.built), 1)  # the actor is kept
+
+  def test_opposing_roads_from_the_source_that_routed(self):
+    # the unprotected left's opposing speeds (routing/controls.py: opposing_roads) come from the source that routed the
+    # route; another route's steps get none (unknown), said
+    self.params.values['TurnPilotValhallaTiles'] = '/sim/tiles'
+    coverage_path(self.maps).unlink()
+    steps = self.router.route(CHICAGO, CHICAGO, 90, 'en')
+    self.assertEqual(self.router.opposing(steps), {0: (11.11, 1)})
+    self.assertEqual(self.built[0].controls_calls, [('opposing', steps)])
+    self.assertEqual(self.router.opposing(list(steps)), {})
 
   def test_controls_from_the_source_that_routed(self):
     # local tiles: checked for their controls (marker, sidecar); a corridor from real OSM: not; another route: failed

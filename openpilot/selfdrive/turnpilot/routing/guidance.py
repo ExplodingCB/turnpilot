@@ -13,7 +13,9 @@ road meets it (turnpilot/route_follower.py), and its angle from the two bearings
 A far-side turn (a left on the right) crosses the oncoming traffic of the road straight ahead, if there is one: opposing
 is present when a road other than the route's in and out leaves the junction within OPPOSING_DEG of straight on, none when
 none does. A road one-way away from the junction can't be told from a two-way one (OSRM's entry is true for both), so it
-counts: a hold too many, never one too few (turnpilot/map_controls.py). No junction data is unknown, never none.
+counts: a hold too many, never one too few (turnpilot/map_controls.py). No junction data is unknown, never none. The opposing
+road's mapped speed limit and lanes (maneuverOpposingSpeed, maneuverOpposingLanes: the unprotected left's R_req) come from a
+locate OPPOSING_PROBE_M out along it (opposing_leg; routing/controls.py: opposing_roads), 0 when unknown.
 Within a step the route goes straight through intersections without a maneuver; the next one with a lane list is sent
 as throughLanes, so a car in a turn-only lane there is flagged.
 """
@@ -25,6 +27,7 @@ MAX_MANEUVERS = 10  # allManeuvers is for the planner's lookahead; a long route 
 CONTROLS_BEHIND_M, CONTROLS_AHEAD_M = 15., 400.  # navInstruction.controls: the stop signs, yields and signals this near
 MAX_CONTROLS = 8
 OPPOSING_DEG = 45.  # a road leaving the junction this close to straight on is the oncoming approach
+OPPOSING_PROBE_M = 15.  # the opposing road's speed and lanes are read this far out along it (routing/controls.py)
 
 
 def to_direction(indication) -> str:
@@ -92,6 +95,32 @@ def maneuver_junction(steps, step_idx) -> dict | None:
           'opposing': 'present' if opposing else 'none'}
 
 
+def opposing_leg(steps, step_idx) -> tuple[float, float, float] | None:
+  """(lat, lon, bearing) of a point OPPOSING_PROBE_M out along the road straight across the junction of the maneuver that ends
+  step step_idx (maneuver_junction's opposing road, the one nearest straight on), bearing its way out of the junction; None
+  without one, or without junction data or its location."""
+  if step_idx + 1 >= len(steps):
+    return None
+  step = steps[step_idx + 1]
+  maneuver = step.get('maneuver') or {}
+  intersections = step.get('intersections') or []
+  if not intersections or maneuver.get('bearing_before') is None or not intersections[0].get('location'):
+    return None
+  first = intersections[0]
+  bearings, out, i_in = first.get('bearings'), first.get('out'), first.get('in')
+  if not bearings or out is None:
+    return None
+  ahead = (float(bearings[i_in]) + 180.) % 360. if i_in is not None and 0 <= i_in < len(bearings) else float(maneuver['bearing_before'])
+  off = sorted((abs((float(bearings[i]) - ahead + 180.) % 360. - 180.), float(bearings[i]))
+               for i in range(len(bearings)) if i not in (i_in, out))
+  if not off or off[0][0] > OPPOSING_DEG:
+    return None
+  b = off[0][1]
+  lon, lat = (float(v) for v in first['location'])
+  rad = np.radians(b)
+  return (lat + OPPOSING_PROBE_M * np.cos(rad) / 111320., lon + OPPOSING_PROBE_M * np.sin(rad) / (111320. * np.cos(np.radians(lat))), b)
+
+
 def through_lanes(steps, step_idx, distance_to_maneuver) -> tuple[list[dict], float]:
   """(lanes, m to it) for the next intersection ahead on the current step with a lane list of two or more, which the
   route goes straight through; ([], 0) if there is none before the maneuver."""
@@ -112,9 +141,11 @@ def through_lanes(steps, step_idx, distance_to_maneuver) -> tuple[list[dict], fl
   return [], 0.
 
 
-def upcoming_maneuvers(steps, step_idx, distance_to_maneuver) -> list[dict]:
+def upcoming_maneuvers(steps, step_idx, distance_to_maneuver, opposing=None) -> list[dict]:
   """The next MAX_MANEUVERS maneuvers ahead, with their distance from the ego: the one that ends the current step first.
-  Each carries its junction (maneuver_junction), so TurnPilot can look past a bend to the turn after it."""
+  Each carries its junction (maneuver_junction), so TurnPilot can look past a bend to the turn after it, and its opposing
+  road's speed and lanes (opposing: {step index: (m/s, lanes)}, routing/controls.py: opposing_roads; 0 unknown)."""
+  opposing = opposing or {}
   maneuvers = []
   distance = distance_to_maneuver
   for i, ahead in enumerate(steps[step_idx + 1:step_idx + 1 + MAX_MANEUVERS]):
@@ -123,15 +154,21 @@ def upcoming_maneuvers(steps, step_idx, distance_to_maneuver) -> list[dict]:
     maneuvers.append({'distance': distance, 'type': maneuver.get('type') or '', 'modifier': maneuver.get('modifier') or '',
                       'geometryValid': junction is not None, 'bearingBefore': junction['before'] if junction else 0.,
                       'bearingAfter': junction['after'] if junction else 0., 'branches': min(junction['branches'], 255) if junction else 0,
-                      'opposing': junction['opposing'] if junction else 'unknown'})
+                      'opposing': junction['opposing'] if junction else 'unknown',
+                      'opposingSpeed': float(opposing.get(step_idx + i, (0., 0))[0]),
+                      'opposingLanes': min(int(opposing.get(step_idx + i, (0., 0))[1]), 255)})
     distance += ahead['distance']
   return maneuvers
 
 
-def fill_guidance(instruction, steps, step_idx, distance_to_maneuver):
-  """Fill NavInstruction.lanes and allManeuvers for the ego being distance_to_maneuver short of the end of the step."""
+def fill_guidance(instruction, steps, step_idx, distance_to_maneuver, opposing=None):
+  """Fill NavInstruction.lanes and allManeuvers for the ego being distance_to_maneuver short of the end of the step.
+  opposing: {step index: (m/s, lanes)} of the route's opposing roads (routing/controls.py: opposing_roads)."""
+  opposing = opposing or {}
   instruction.lanes = approach_lanes(steps, step_idx, distance_to_maneuver)
-  instruction.allManeuvers = upcoming_maneuvers(steps, step_idx, distance_to_maneuver)
+  instruction.allManeuvers = upcoming_maneuvers(steps, step_idx, distance_to_maneuver, opposing)
+  speed, lanes = opposing.get(step_idx, (0., 0))
+  instruction.maneuverOpposingSpeed, instruction.maneuverOpposingLanes = float(speed), min(int(lanes), 255)
   junction = maneuver_junction(steps, step_idx)
   instruction.maneuverGeometryValid = junction is not None
   if junction is not None:

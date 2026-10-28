@@ -90,6 +90,8 @@ class StubRouter:
   def __init__(self, steps=None):
     self.steps, self.error, self.calls = steps, None, []
     self.controls_result: tuple = ([], 'ok')  # what controls() gives, or an exception it raises
+    self.opposing_result: dict | Exception = {}  # what opposing() gives ({step index: (m/s, lanes)}), or an exception it raises
+    self.opposing_calls: list = []  # the thread of each call
     self.controls_calls: list = []  # (steps, thread name) per call
     self.status = MagicMock()
     self.gate: threading.Event | None = None
@@ -118,6 +120,12 @@ class StubRouter:
     if isinstance(self.controls_result, Exception):
       raise self.controls_result
     return self.controls_result
+
+  def opposing(self, steps):
+    self.opposing_calls.append(threading.current_thread().name)
+    if isinstance(self.opposing_result, Exception):
+      raise self.opposing_result
+    return self.opposing_result
 
   def controls_ahead(self, position, bearing):
     self.ahead_calls.append((position, bearing, threading.current_thread().name))
@@ -369,6 +377,29 @@ class TestRouteEngine(unittest.TestCase):
     for _ in range(3):
       self.engine.send_instruction()
     self.assertEqual([name for _, name in self.engine.router.controls_calls], ['navd-route'])
+
+  def test_the_opposing_roads_speed_rides_with_its_maneuver(self):
+    # the unprotected left's R_req (turnpilot/unprotected_left.py) is from the opposing road's mapped limit: the route job looks
+    # them up once (router.opposing, off navd's loop) and each instruction carries its maneuver's
+    self.engine.background = True
+    self.engine.router.steps = self.response
+    self.engine.router.opposing_result = {0: (11.11, 1)}
+    self.engine.calculate_route((0.002, 0))
+    self.engine.job.join(5.)
+    self.engine.collect_route((0.002, 0))
+    self.engine.send_instruction()
+    ni = self.last_message('navInstruction').navInstruction
+    self.assertAlmostEqual(ni.maneuverOpposingSpeed, 11.11, places=3)
+    self.assertEqual(ni.maneuverOpposingLanes, 1)
+    self.assertEqual(self.engine.router.opposing_calls, ['navd-route'])
+    # a failure keeps the route, its opposing roads unknown (0: the left takes 45 mph)
+    self.engine.background = False
+    self.engine.router.opposing_result = RuntimeError("synthetic")
+    self.load_route()
+    self.engine.send_instruction()
+    message = self.last_message('navInstruction')
+    self.assertTrue(message.valid)
+    self.assertEqual(message.navInstruction.maneuverOpposingSpeed, 0.)
 
   def test_controls_failure_keeps_the_route(self):
     self.engine.router.controls_result = RuntimeError("synthetic")
