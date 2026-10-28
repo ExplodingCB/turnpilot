@@ -71,7 +71,7 @@ class Gate1:
     print(f"gate1 run {self.run + 1}/{len(self.leads)}: {self.turn.direction} at {self.turn.junction}, lead {self.lead} m", flush=True)
 
   def publish(self, desire, dist):
-    msg = messaging.new_message('turnpilotPlan')
+    msg = messaging.new_message('turnpilotPlan', valid=True)  # hooks.fresh_plan drops an invalid plan
     p = msg.turnpilotPlan
     p.state = custom.TurnpilotPlan.State.turning if desire else custom.TurnpilotPlan.State.approaching
     p.desire = desire
