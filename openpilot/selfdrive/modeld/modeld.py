@@ -35,7 +35,7 @@ from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
-from openpilot.selfdrive.turnpilot.hooks import active_plan, plan_desire
+from openpilot.selfdrive.turnpilot.hooks import active_plan, fresh_plan, plan_desire
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, should_stop, smooth_value, get_curvature_from_plan
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser
 from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_driving_model_data, fill_pose_msg, PublishState
@@ -503,7 +503,10 @@ def main(demo=False):
     last_vipc_frame_id = meta_main.frame_id
 
     if detector is not None and model_output is not None:
-      detector.step(pm, model, model_execution_time, prev_action.desiredCurvature, desire, [meta_main, meta_extra], sm['carControl'].enabled)
+      tp_fresh = fresh_plan(sm)  # the camera TurnPilot asks for (DESIGN phase 4 G4): read in shadow too, where it steers nothing
+      view = str(tp_fresh.detectorView) if tp_fresh is not None else 'auto'
+      detector.step(pm, model, model_execution_time, prev_action.desiredCurvature, desire, [meta_main, meta_extra], sm['carControl'].enabled,
+                    view)
 
 if __name__ == "__main__":
   try:

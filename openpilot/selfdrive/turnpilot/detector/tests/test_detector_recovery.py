@@ -110,6 +110,19 @@ class TestDetectorRecovery(OpenpilotTestCase):
     big_det, small_det = (d for _, d in host.detectors)
     assert len(big_det.run.calls) == 1 and len(small_det.run.calls) == 1
 
+  def test_host_passes_the_plans_view(self):
+    # modeld hands the host turnpilotPlan.detectorView: an unprotected left's go runs on the road camera, its turn desire or not
+    model, pm = object(), PM()
+    host = DetectorHost(FakeParams(True), 1344, 760, False, True, [model], load_fn=FakeLoad({model}))
+    host.load()
+    (_, det), = host.detectors
+    for _ in range(4):
+      host.step(pm, model, 0.010, 0.05, log.Desire.turnLeft, METAS, True, 'road')
+    assert det.run.calls and set(det.run.calls) == {'frame0'}
+    host.step(pm, model, 0.010, 0.05, log.Desire.turnLeft, METAS, True)
+    host.step(pm, model, 0.010, 0.05, log.Desire.turnLeft, METAS, True)
+    assert det.run.calls[-1] == 'frame1'  # auto: the turn's wide camera
+
   def test_host_passes_the_light_mode(self):
     model, params, pm = object(), FakeParams(True, 'off'), PM()
     host = DetectorHost(params, 1344, 760, False, True, [model], load_fn=FakeLoad({model}))

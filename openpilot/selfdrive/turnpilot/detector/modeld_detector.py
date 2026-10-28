@@ -1,6 +1,8 @@
 """The detector inside modeld: after modelV2 is sent, on frames modeld already uploaded, it runs YOLO26 on one camera and
 publishes turnpilotDetections. The road camera sees far ahead on straights; the wide one sees the crosswalk and cross
-traffic in turns. It runs in modeld because the chestnut's USB interface is claimed by one process.
+traffic in turns. turnpilotPlan.detectorView (read through fresh_plan, shadow too) overrides that pick: the unprotected left
+(unprotected_left.py) asks for the road camera from its go to its commit, whatever its turn desire (CRITIQUE REQUIRED 3).
+It runs in modeld because the chestnut's USB interface is claimed by one process.
 
 Each run on the road camera also reads the lane paint (scene/lane_paint.py) on that frame, from the host copy modeld made
 of it, with the frame's modelV2 and calibration read back off the bus and the detections masking what they hide, and
@@ -47,6 +49,10 @@ STEP_BUDGET_S = 0.045      # driving model + detector must finish within this of
 WIDE_CURVATURE = 0.01      # 1/m (a 100 m radius): at or above this, look through the wide camera
 WIDE_HOLD_S = 2.0          # and keep looking through it this long after the turn ends
 TURN_DESIRES = (log.Desire.turnLeft, log.Desire.turnRight)
+# turnpilotPlan.detectorView (DESIGN phase 4 G4, CRITIQUE REQUIRED 3): road is the road camera only, overriding a turn's wide
+# hold (an unprotected left from its go to its commit); roadAndWide the road camera with the wide one run in WIDE_EVERY (held
+# at its line: its exit crosswalk); auto, choose_camera's own pick
+WIDE_EVERY = 3
 TIME_WINDOW = 5            # the detector time estimate is the median of this many runs, so one slow run can't stop it
 # The estimate only changes when it runs, so after this many model frames skipped in a row, or this long by the clock
 # (a loaded host runs the driving model below 20 Hz), it runs anyway and the estimate starts over from that run: a burst
@@ -148,6 +154,7 @@ class ModeldDetector:
   light_mode = LIGHT_MODE_DEFAULT  # TurnPilotCameraLights, set by DetectorHost
   lights: CameraLightReader | None = None  # None: no road camera, or failed (lights_failed)
   lights_failed = False
+  view_runs = 0                   # runs under the roadAndWide view, for its one wide run in WIDE_EVERY
 
   def __init__(self, model_state, cam_w: int, cam_h: int, cameras: dict[str, int]):
     """cameras: 'road' and/or 'wide' -> index of its frame in modeld's packed input."""
@@ -175,10 +182,18 @@ class ModeldDetector:
     self.lane_paint = LanePaintReader(cam_w, cam_h, bus) if 'road' in cameras else None
     self.lights = CameraLightReader(bus) if 'road' in cameras else None
 
-  def choose_camera(self, desired_curvature: float, desire: int, now: float) -> str:
+  def choose_camera(self, desired_curvature: float, desire: int, now: float, view: str = 'auto') -> str:
+    """The camera for this run: the wide one in a turn or on a curve and WIDE_HOLD_S after, else the road one; the plan's
+    view (WIDE_EVERY) overrides that. A device with one camera runs it."""
     if abs(desired_curvature) >= WIDE_CURVATURE or desire in TURN_DESIRES:
       self.wide_until = now + WIDE_HOLD_S
-    want = 'wide' if now < self.wide_until else 'road'
+    if view == 'road':
+      want = 'road'
+    elif view == 'roadAndWide':
+      self.view_runs = (self.view_runs + 1) % WIDE_EVERY
+      want = 'wide' if self.view_runs == 0 else 'road'
+    else:
+      want = 'wide' if now < self.wide_until else 'road'
     return want if want in self.frames else next(iter(self.frames))
 
   def room(self, model_execution_time: float) -> bool:
@@ -199,9 +214,10 @@ class ModeldDetector:
     self.times.clear()
     return True
 
-  def step(self, pm, model_state, model_execution_time: float, desired_curvature: float, desire: int, metas: list) -> None:
+  def step(self, pm, model_state, model_execution_time: float, desired_curvature: float, desire: int, metas: list,
+           view: str = 'auto') -> None:
     """Called once per model frame after modelV2 is sent, with the driving model this detector was loaded for.
-    metas: FrameMeta of packed frames 0 and 1."""
+    metas: FrameMeta of packed frames 0 and 1; view: turnpilotPlan.detectorView (choose_camera)."""
     if model_state is not self.model_state:
       # DetectorHost picks the detector by model, so this is a bug: raise for the host to log and retry, never a quiet off
       raise ValueError("turnpilot detector stepped with a driving model it wasn't loaded for")
@@ -209,7 +225,7 @@ class ModeldDetector:
     if self.since_run < RUN_EVERY or time.monotonic() < self.retry_at or not self.room(model_execution_time):
       return
     try:
-      cam = self.choose_camera(desired_curvature, desire, time.monotonic())
+      cam = self.choose_camera(desired_curvature, desire, time.monotonic(), view)
       t0 = time.perf_counter()
       raw = self.run(input_frame=self.frames[cam]).numpy()
       dt = time.perf_counter() - t0
@@ -336,8 +352,8 @@ class DetectorHost:
     self.detectors = [(m, self.load_fn(m, *self.args)) for m in self.models]
 
   def step(self, pm, model_state, model_execution_time: float, desired_curvature: float, desire: int, metas: list,
-           engaged: bool) -> None:
-    """Called once per model frame after modelV2 is sent, with the model that made it."""
+           engaged: bool, view: str = 'auto') -> None:
+    """Called once per model frame after modelV2 is sent, with the model that made it. view: turnpilotPlan.detectorView."""
     try:
       if not self.check_enabled(time.monotonic()):
         return
@@ -353,7 +369,7 @@ class DetectorHost:
           cloudlog.warning("turnpilot detector: none for the driving model modeld is running, detector off")
         return
       det.light_mode = self.light_mode
-      det.step(pm, model_state, model_execution_time, desired_curvature, desire, metas)
+      det.step(pm, model_state, model_execution_time, desired_curvature, desire, metas, view)
       self.failures = 0
     except Exception:
       # never take modeld down: off until the next TurnPilotEnabled check, after a wait doubling from RETRY_S. turnpilotd

@@ -117,6 +117,27 @@ class TestModeldDetector(OpenpilotTestCase):
     assert make_detector({'wide': 0}).choose_camera(0.0, log.Desire.none, 0.0) == 'wide'
     assert make_detector({'road': 0}).choose_camera(0.05, log.Desire.turnLeft, 0.0) == 'road'
 
+  def test_the_plans_view_overrides_the_turns_wide_hold(self):
+    # CRITIQUE REQUIRED 3: from an unprotected left's go to its commit the road camera only, whatever the turn desire or the
+    # wide hold after it; held at its line, the road camera with the wide camera one run in WIDE_EVERY (its exit crosswalk)
+    from openpilot.selfdrive.turnpilot.detector.modeld_detector import WIDE_EVERY
+    det = make_detector()
+    assert det.choose_camera(0.05, log.Desire.turnLeft, 0.0, 'road') == 'road'
+    assert det.choose_camera(0.0, log.Desire.none, 0.5, 'road') == 'road'  # inside the turn desire's wide hold
+    picks = [det.choose_camera(0.05, log.Desire.turnLeft, 1.0 + 0.1 * k, 'roadAndWide') for k in range(3 * WIDE_EVERY)]
+    assert picks.count('wide') == 3 and picks.count('road') == 3 * (WIDE_EVERY - 1) and WIDE_EVERY >= 3
+    assert 'wide' not in picks[:WIDE_EVERY - 1]  # the road camera first
+    # auto: as before
+    assert det.choose_camera(0.05, log.Desire.turnLeft, 10.0, 'auto') == 'wide'
+    # a device with one camera runs it, whatever the view
+    assert make_detector({'wide': 0}).choose_camera(0.0, log.Desire.none, 0.0, 'road') == 'wide'
+
+  def test_step_takes_the_view(self):
+    det, pm = make_detector(), PM()
+    for k in range(3 * RUN_EVERY):
+      det.step(pm, det.model_state, 0.010, 0.05, log.Desire.turnLeft, [Meta(100 + k), Meta(200 + k)], view='road')
+    assert det.run.calls == ['frame0'] * 3 and all(str(td.camera) == 'road' for td in pm.sent)
+
   def test_every_nth_frame_and_message(self):
     det, pm = make_detector(), PM()
     for k in range(3 * RUN_EVERY):
