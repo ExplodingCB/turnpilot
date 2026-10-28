@@ -327,3 +327,22 @@ def test_its_geometry_takes_the_furthest_reading_of_the_junction():
   j = Junction()
   j.wait(CLEAR_WINDOW_S + 1., objects=[ped(HOLD_D + 13. + 10., 8.)], spread_m=13.)
   assert not any(x.go for x in j.decisions)
+
+
+def test_held_short_of_its_line_it_rolls_up_before_judging_the_reach():
+  # BeamNG unprotected_left_gap4 (2026-10-28): the latch held the car 16 m out, 7 m short of its 9 m line, where the longer
+  # crossing put R_req at 164 m, past the 150 m range: undecided at once. It rolls up to its line first (the latch's creep,
+  # under 0.7 m/s), where R_req is 134 m, and judges the gap there
+  from openpilot.selfdrive.turnpilot.unprotected_left import LINE_D, ROLL_UP_STALL_S
+  j = Junction()
+  d = j.step(distance=16.)
+  assert d.r_req > RANGE and d.state == 'creep' and abs(d.creep_m - (16. - LINE_D)) < 1e-6 and d.reason == "Rolling up to the line"
+  for dist in (14., 12., 10., LINE_D + 0.3):
+    d = j.step(distance=dist, v=0.6)
+    assert d.state in ('creep', 'waitGap') and not d.go
+  d = j.wait(CLEAR_WINDOW_S + 0.5, distance=LINE_D + 0.3, v=0.)
+  assert any(x.go for x in j.decisions) and all(x.state != 'undecided' for x in j.decisions)
+  # a roll-up the car never makes (the model holding it): undecided on the reach after ROLL_UP_STALL_S, said
+  j = Junction()
+  d = j.wait(ROLL_UP_STALL_S + 0.5, distance=16., v=0.)
+  assert d.state == 'undecided' and d.why == 'range'

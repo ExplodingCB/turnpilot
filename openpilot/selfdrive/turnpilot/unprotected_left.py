@@ -24,7 +24,9 @@ of straight ahead, break the clear window. It is velocity-free (one pixel of box
   R_req = v_limit x SPEED_MARGIN x T_req + the conflict point's distance (the maneuver point + CONFLICT_PAST_M)
 v_limit is the opposing road's mapped limit (navInstruction maneuverOpposingSpeed), DEFAULT_OPPOSING_SPEED when unknown.
 A left whose R_req is past the detector's proven range (TurnPilotLeftRangeM) is never attempted: turnpilotd skips it at
-route time (turn_skip: unprotectedRange, chimed, navd reroutes) and it is undecided here should it reach its hold.
+route time (turn_skip: unprotectedRange, chimed, navd reroutes) and it is undecided here should it reach its hold. Held
+short of its line (the latch reaches LATCH_NEAR_M short), where the longer crossing puts R_req past the range, the car rolls
+up to the line first (ROLL_UP_M; undecided only after ROLL_UP_STALL_S standing in it).
 The window (CLEAR_WINDOW_S) counts only road camera runs: a run gap over ROAD_FRESH_S, or the scene's holds, start it over.
 
 The view is blocked by an occluder: a velocity-trusted vehicle track standing still in the junction (the opposing
@@ -90,6 +92,8 @@ CREEP_MAX_M = 4.           # past the line
 CREEP_SHORT_M = 1.         # never nearer the oncoming lanes (ONCOMING_ENTRY_M) than this
 CREEP_DONE_M = 0.3         # crept to within this of its target: the full creep
 BLOCKED_UNDECIDED_S = 15.  # the view still blocked this long after the full creep: a fault
+ROLL_UP_M = 1.5            # held further short of the line than this with R_req past the range: rolled up to it first
+ROLL_UP_STALL_S = 10.      # standing that long in the roll-up: undecided on the reach
 
 EXIT_Y_NEAR_M, EXIT_Y_FAR_M = 3., 18.  # the exit crosswalk, to the turn side, CROSSWALK_X_* around the maneuver point
 BOX_X_BEFORE_M, BOX_X_AFTER_M = ONCOMING_PAST_M, 8.  # the junction box a vehicle mustn't be in...
@@ -279,6 +283,7 @@ class UnprotectedLeft:
     self.why = ''
     self.verdict = ''
     self.hold_here = False        # its own hold, after a withdrawn go
+    self.roll_stall = 0.          # s standing in a roll-up to the line
 
   def update(self, inp: LeftInput, dt: float) -> LeftDecision:
     if inp.mode not in (AUTO, ANNOUNCE):
@@ -342,6 +347,16 @@ class UnprotectedLeft:
     if self.latch_d is None:
       self.latch_d = inp.distance
     out.view = 'roadAndWide'
+    # held short of its line (the latch reaches LATCH_NEAR_M short of it), where the longer crossing puts R_req past the
+    # range: rolled up to the line first (the latch's creep), where it is judged (BeamNG: held 16 m out, R_req 164 m)
+    short = inp.distance - LINE_D
+    if inp.mode == AUTO and rreq > inp.range_m and short > ROLL_UP_M and not self.hold_here:
+      self.roll_stall = self.roll_stall + dt if inp.v_ego < 0.3 else 0.
+      if self.roll_stall < ROLL_UP_STALL_S - 1e-6:
+        self.creep_to = max(self.latch_d - LINE_D, 0.)
+        out.state = self.state = 'creep'
+        out.prompt, out.reason, out.creep_m = 'creepingForView', "Rolling up to the line", self.creep_to
+        return out
     # faults: never a go it can't judge
     if rreq > inp.range_m:
       return self._undecided(out, 'range')
