@@ -303,6 +303,20 @@ def test_c14_a_phantom_far_end_flag_is_overruled_by_the_sidecars_direction(tmp_p
   assert [(c.kind, round(c.route_m, 1), c.osm_node) for c in controls] == [('stop', 100. - OFF, 901)]
 
 
+def test_c14_a_phantom_on_a_way_split_is_overruled_by_the_next_ways_entry(tmp_path):
+  """Our edge (way 77, against its order) ends at a way split, where the route carries on along way 78. The other
+  direction's directed stop on the split node is keyed to the way its traffic arrives on, way 78 against ours (78:b),
+  never 77:f, so the phantom check looks there too (Lexington KY: way 16169193 and 1334314513). A stop keyed to our
+  own direction on the next way is no phantom's evidence."""
+  edges = [(0., 90., {}), (90., 100., {'stop': True, 'way_id': 77, 'forward': False}), (100., 400., {'way_id': 78})]
+  theirs = {'78:b': [entry('stop', 100., junction=900)]}
+  controls, status = route_controls(StubValhalla(edges), steps(), sidecar_dir=osm_dir(tmp_path / 'theirs', theirs))
+  assert status == 'ok' and controls == []
+  ours = {'78:f': [entry('stop', 100., junction=900)]}
+  controls, _ = route_controls(StubValhalla(edges), steps(), sidecar_dir=osm_dir(tmp_path / 'ours', ours))
+  assert [(c.kind, round(c.route_m, 1)) for c in controls] == [('stop', 100. - OFF)]
+
+
 @pytest.mark.parametrize('case', ['beside the node', 'mid-edge', 'ours an orphan', 'ours a yield', 'ours undirected'])
 def test_b1_a_missing_sidecar_entry_for_us_never_drops_a_real_stop(tmp_path, case):
   """Augusta Way (Highland Park IL, way 550724913 westbound): a mid-block footway crossing with a directed stop each side

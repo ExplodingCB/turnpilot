@@ -410,15 +410,15 @@ def osm_at(osm, entry: dict, pts, cum, begin_m: float, end_m: float, end_point) 
   return end_m if pos is not None and haversine(pos, end_point) <= NODE_TOL_M else None
 
 
-def phantom(osm, kind: str, other: str, hits, pts, cum, begin_m: float, end_m: float, end_point) -> bool:
+def phantom(osm, kind: str, others: list[str], hits, pts, cum, begin_m: float, end_m: float, end_point) -> bool:
   """Valhalla's `kind` on an edge is the phantom it makes of a stop on a graph node it can't direct (C14): only when the
-  sidecar has the other direction's directed `kind` ON the edge's end node (within PHANTOM_NODE_M) and nothing of ours
-  on the edge, whatever its kind (hits), nor an undirected or both-ways one keyed to the other direction there. The
-  sidecar leaving our direction out proves nothing by itself (a stop it can't tie to a junction, an old shard), so every
-  other case keeps the flag: an extra stop is cheap, a dropped real one isn't."""
+  sidecar has the other direction's (others: its keys) directed `kind` ON the edge's end node (within PHANTOM_NODE_M) and
+  nothing of ours on the edge, whatever its kind (hits), nor an undirected or both-ways one keyed to the other direction
+  there. The sidecar leaving our direction out proves nothing by itself (a stop it can't tie to a junction, an old
+  shard), so every other case keeps the flag: an extra stop is cheap, a dropped real one isn't."""
   if hits:
     return False
-  entries = osm.entries(other)
+  entries = [x for k in others for x in osm.entries(k)]
   if any(x.get('evidence') in ('mid_undirected', 'mid_both') and x.get('kind') in ('stop', 'yield') and
          osm_at(osm, x, pts, cum, begin_m, end_m, end_point) is not None for x in entries):
     return False
@@ -472,13 +472,16 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
         m = osm_at(osm, entry, pts, cum, end_m - span, end_m, tpts[end_i])
         if m is not None and entry.get('kind') in ('stop', 'yield'):
           hits.append((entry, m))
-      other = f"{e.get('way_id')}:{'b' if e.get('forward') else 'f'}"
+      # the other direction: of our way, and of the next edge's way where it differs (a way split's sign is keyed to the
+      # way its traffic arrives on)
+      nxt = edges[i + 1] if i + 1 < len(edges) else {}
+      others = list(dict.fromkeys(f"{x['way_id']}:{'b' if x.get('forward') else 'f'}" for x in (e, nxt) if x.get('way_id') is not None))
       for kind in ('stop', 'yield'):
-        if kind in valhalla and phantom(osm, kind, other, hits, pts, cum, end_m - span, end_m, tpts[end_i]):
+        if kind in valhalla and phantom(osm, kind, others, hits, pts, cum, end_m - span, end_m, tpts[end_i]):
           valhalla.remove(kind)
           phantoms.append(kind)
           cloudlog.info(f"turnpilot controls: Valhalla's {kind} on {key} at {end_m:.0f} m is a phantom: the OSM sidecar's is " +
-                        f"directed {other}, on the edge's end node")
+                        f"directed {' or '.join(others)}, on the edge's end node")
     if audit is not None:
       audit.append({'edge': i, 'key': key, 'internal': internal, 'anchor': anchor, 'begin_m': end_m - span, 'end_m': end_m,
                     'valhalla': list(valhalla), 'phantom': phantoms, 'osm': [dict(entry, m=m) for entry, m in hits]})
