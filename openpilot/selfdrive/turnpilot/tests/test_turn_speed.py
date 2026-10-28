@@ -143,3 +143,19 @@ def test_post_go_follows_the_turn_from_the_go():
     straight.update(3., 0., DT_MDL)
     assert straight.travelled_m <= POST_GO_MAX_M + 1.
   assert straight.caps(3.) == (NO_ACCEL_CAP, NO_SPEED_CAP)
+
+
+def test_post_go_ends_where_a_shallow_turn_is_done():
+  """A junction whose bearings turn 50 deg is done at 40 deg (DesireTiming clears its desire at max(angle - 10, 0.75 angle)):
+  the profile ends there too, not at 60 deg, so the car isn't crawling down the exit road under the ramp's cap."""
+  shallow = Maneuver(*classify("turn", "left"), "turn", "left", 50., geometry=True)
+  pg = PostGo(POST_GO_PROFILES['graduated'], shallow, 10., 0.)
+  pg.update(1., math.radians(39.), 1.)
+  assert not pg.over and pg.caps(1.)[0] == 1.0
+  pg.update(1., math.radians(1.5), 1.)
+  assert pg.over and pg.caps(1.) == (NO_ACCEL_CAP, NO_SPEED_CAP)
+  square = Maneuver(*classify("turn", "left"), "turn", "left", 90., geometry=True)  # done at 80: 60 ends it first
+  pg = PostGo(POST_GO_PROFILES['graduated'], square, 10., 59.)
+  assert not pg.over
+  pg.update(1., math.radians(1.5), 1.)
+  assert pg.over
