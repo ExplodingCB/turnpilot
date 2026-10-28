@@ -212,3 +212,32 @@ def test_a_go_the_car_never_moved_on_hands_back_loudly():
   a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt='cantStartTakeControl')))
   assert a.alert_text_1 == "Can't Start Turn: Take Control" and a.alert_text_2 == "The car didn't pull away"
   assert a.audible_alert == AudibleAlert.tpHandback and a.visual_alert == VisualAlert.steerRequired
+
+
+def test_the_unprotected_lefts_wait_is_silent_its_go_chimes_and_its_fault_hands_back():
+  # DESIGN phase 4 section 2, G4: waiting for a gap and creeping for a view are visual only (no intervention: waiting is
+  # ordinary); the go is a short chime; undecided (a fault) is the handback; a withdrawn go is an alert above the wait
+  from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS, plan_events
+  for prompt, title in (('waitingForGap', 'Waiting for a gap'), ('creepingForView', 'Creeping for a view')):
+    a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt=prompt, reason=title)))
+    assert a.alert_text_1 == title and a.audible_alert == AudibleAlert.none and a.visual_alert == VisualAlert.none
+    assert prompt not in TAKE_CONTROL_PROMPTS
+  a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt='leftGo', reason='Turning')))
+  assert a.alert_text_1 == 'Turning' and a.audible_alert == AudibleAlert.prompt
+  a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt='leftUndecidedTakeControl',
+                                                            reason="View of oncoming traffic blocked: take control")))
+  assert a.alert_text_1 == "View of oncoming traffic blocked: take control" and a.audible_alert == AudibleAlert.tpHandback
+  assert a.visual_alert == VisualAlert.steerRequired and 'leftUndecidedTakeControl' in TAKE_CONTROL_PROMPTS
+  assert plan_events(FakeSM(plan(controlPrompt='leftUndecidedTakeControl', tooFastToTurn=True))) == ['turnpilotControlPrompt']
+  a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='oncomingHolding')))
+  assert a.alert_text_1 == 'Oncoming: Holding' and a.audible_alert == AudibleAlert.prompt
+  assert plan_events(FakeSM(plan(controlAlert='oncomingHolding', controlPrompt='waitingForGap'))) == ['turnpilotControlAlert']
+
+
+def test_the_detector_view_and_the_lefts_status_are_in_the_plan():
+  p = plan(detectorView='road')
+  assert str(p.detectorView) == 'road' and str(plan().detectorView) == 'auto'
+  msg = messaging.new_message('turnpilotPlan')
+  ul = msg.turnpilotPlan.unprotectedLeft
+  ul.state, ul.rReq, ul.tReq, ul.clearS, ul.why = 'waitGap', 134., 8.4, 1.2, ''
+  assert str(msg.as_reader().turnpilotPlan.unprotectedLeft.state) == 'waitGap'

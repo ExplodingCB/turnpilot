@@ -163,6 +163,13 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     stalledTakeControl @9;          # standing in the turn after its go (turnpilotd.py: stalled_in_turn)
     cantStartTakeControl @10;       # not moving NO_MOVE_S after TurnPilot's go from a standstill: the go is withdrawn
                                     # (held standing) and handed back (turnpilotd.py: no_move)
+    # The autonomous unprotected left (unprotected_left.py, DESIGN phase 4 G4): no intervention while it can judge the
+    # junction, so waiting and creeping are visual only; undecided is a fault's handback
+    waitingForGap @11;              # held at the hold line until the oncoming band is certified clear (visual only)
+    creepingForView @12;            # creeping past the line for a view an occluder blocks (visual only)
+    leftGo @13;                     # going: a short chime
+    leftUndecidedTakeControl @14;   # can't judge the oncoming traffic (stale camera, position unknown, beyond the detector's
+                                    # range, yawed, view blocked after the full creep): held, take control
   }
   enum ControlAlert {
     none @0;
@@ -178,6 +185,8 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
                                 # offRouteControlsStatus not ok): the speed is capped, take control or wait for the reroute
     hardBrake @9;               # braking harder than -2.0 m/s^2 for a confirmed in-path pedestrian or oncoming vehicle
                                 # (scene_policy.py), while it lasts; logged with its evidence (turnpilot.hard_brake)
+    oncomingHolding @10;        # an unprotected left's go withdrawn before its commit for a car in the oncoming band:
+                                # stopping short of the oncoming lanes on the comfortable curve, waiting again
   }
   mapControl @24 :MapControlStatus;
   controlPrompt @25 :ControlPrompt;
@@ -207,6 +216,41 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
   turnMissed @29 :Bool;               # a turn the car pulled away into from a standstill went past its junction turned under
                                       # 15 deg: missed, held about 3 s; selfdrived chimes (turnpilotTooFastToTurn, "Turn
                                       # Missed") and navd reroutes at once (turnpilotd.py)
+
+  # The camera modeld's detector runs on (detector/modeld_detector.py: choose_camera), read through fresh_plan, so a shadow
+  # plan asks too
+  enum DetectorView {
+    auto @0;         # modeld's choice: the wide camera in a turn or on a curve, else the road camera
+    road @1;         # the road camera only: an unprotected left from its go to its commit (CRITIQUE REQUIRED 3)
+    roadAndWide @2;  # the road camera, the wide camera one run in WIDE_EVERY: held at an unprotected left's line (its exit
+                     # crosswalk)
+  }
+  detectorView @30 :DetectorView;
+  # The autonomous unprotected left's decision (unprotected_left.py), for the logs and the sim's scorer
+  struct UnprotectedLeftStatus {
+    enum State {
+      off @0;        # TurnPilotAutoLeft off, or no unprotected left in hand
+      approach @1;
+      waitGap @2;
+      creep @3;
+      go @4;
+      committed @5;
+      undecided @6;  # a fault: handed back (leftUndecidedTakeControl)
+      announce @7;   # TurnPilotAutoLeft announce: held and handed back, saying whether it would go
+    }
+    state @0 :State;
+    tReq @1 :Float32;          # s the oncoming lanes must stay clear
+    rReq @2 :Float32;          # m up them that must be seen clear
+    vLimit @3 :Float32;        # m/s, the opposing road's limit it took (mapped, or the 45 mph default)
+    rangeM @4 :Float32;        # the detector's proven range rReq is checked against (TurnPilotLeftRangeM)
+    clearS @5 :Float32;        # s the band has been clear on road camera runs
+    blockers @6 :UInt8;        # raw boxes in the band on the last road run
+    viewBlocked @7 :Bool;      # an occluder hides the oncoming lanes
+    crosswalkClear @8 :Bool;   # the exit crosswalk and the junction box
+    creepM @9 :Float32;        # m past its line the hold may creep to
+    why @10 :Text;             # undecided: its fault; announce: go or wait
+  }
+  unprotectedLeft @31 :UnprotectedLeftStatus;
 }
 
 struct TurnpilotDetections @0xaedffd8f31e7b55d {

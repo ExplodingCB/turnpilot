@@ -51,10 +51,12 @@ def limits_plan(sm, now: float | None = None):
   return plan if plan.state != custom.TurnpilotPlan.State.disabled or plan.fault != custom.TurnpilotPlan.Fault.none else None
 
 
-CONTROL_ALERT_FIRST = ('hardBrake', 'cannotStopComfortably', 'offRouteStopsUnknown')  # above too fast to turn
+CONTROL_ALERT_FIRST = ('hardBrake', 'cannotStopComfortably', 'offRouteStopsUnknown', 'oncomingHolding')  # above too fast to turn
 # handbacks: the car held while the driver is told to take control (map_controls.py, turnpilotd.py), above too fast to turn
 TAKE_CONTROL_PROMPTS = ('stopSignTakeControl', 'unprotectedTurnTakeControl', 'carStoppedTakeControl', 'stalledTakeControl',
-                        'cantStartTakeControl')
+                        'cantStartTakeControl', 'leftUndecidedTakeControl')
+# shown, never heard: the unprotected left waiting at its line or creeping for a view is ordinary (no intervention)
+SILENT_PROMPTS = ('none', 'yieldAhead', 'waitingForGap', 'creepingForView')
 # never sent since gas go went (2026-10-28), kept in the append-only schema: the driver's gas tap as a go, and going on red
 RETIRED_PROMPTS = ('stopSignGo', 'signalGo', 'unprotectedTurnGo', 'carStoppedGo')
 RETIRED_ALERTS = ('goingOnRed',)
@@ -78,9 +80,10 @@ def plan_events(sm, now: float | None = None) -> list[str]:
      with the car held (turnpilotControlPrompt, TAKE_CONTROL_PROMPTS: a stop sign, an unprotected turn, the car stopped
      or stalled in a turn, or not pulling away after TurnPilot's go), then a map stop it can't make gently (turnpilotControlAlert, cannotStopComfortably: take
      control), or off the route with the map stops ahead unknown (offRouteStopsUnknown: the speed capped, take control
-     or wait for the reroute);
+     or wait for the reroute), or an unprotected left's go withdrawn for oncoming traffic (oncomingHolding);
   4. too fast to turn, or a turn from a standstill missed (turnpilotTooFastToTurn, turnMissed);
-  5. a map control's other prompt (turnpilotControlPrompt: yield ahead, visual only);
+  5. a map control's other prompt (turnpilotControlPrompt: yield ahead, an unprotected left waiting for a gap or creeping for
+     a view, visual only; its go, a short chime);
   6. a map control's other alerts (turnpilotControlAlert: a stop line overrun, going on a yellow, an unprotected turn's
      junction uncertain);
   7. a planned lane change, offered or just aborted (turnpilotLaneChangeLeft/Right/Aborted, LaneChangeEvents);
@@ -135,6 +138,10 @@ CONTROL_PROMPT_TEXT = {
   'carStoppedTakeControl': 'Nothing ahead is holding the car',
   'stalledTakeControl': 'The car stopped in the turn',
   'cantStartTakeControl': 'The car didn\'t pull away',
+  'waitingForGap': 'Waiting for a gap in oncoming traffic',
+  'creepingForView': 'Creeping forward for a view of oncoming traffic',
+  'leftGo': 'Turning across oncoming traffic',
+  'leftUndecidedTakeControl': 'TurnPilot can\'t judge oncoming traffic',
 }
 CONTROL_ALERT_TEXT = {
   'cannotStopComfortably': 'Cannot stop gently for the stop/signal',
@@ -145,6 +152,7 @@ CONTROL_ALERT_TEXT = {
   'junctionUncertain': 'GPS unsure where the junction is: slow, may stop short of it',
   'offRouteStopsUnknown': 'Map stops unknown: take control or wait for reroute',
   'hardBrake': 'Braking hard',
+  'oncomingHolding': 'Oncoming traffic: holding short of its lanes',
 }
 
 

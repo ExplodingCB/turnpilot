@@ -14,7 +14,7 @@ from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.locationd.calibrationd import MIN_SPEED_FILTER
 from openpilot.common.hardware import HARDWARE
 from openpilot.selfdrive.turnpilot.hooks import (ABORT_TEXT, CONTROL_ALERT_TEXT, CONTROL_PROMPT_TEXT, CONTROL_STATUS_ALERTS,
-                                               TAKE_CONTROL_PROMPTS, fresh_plan, lane_change_text, shown_plan)
+                                               SILENT_PROMPTS, TAKE_CONTROL_PROMPTS, fresh_plan, lane_change_text, shown_plan)
 
 AlertSize = log.SelfdriveState.AlertSize
 AlertStatus = log.SelfdriveState.AlertStatus
@@ -310,12 +310,14 @@ def turnpilot_too_fast_to_turn_alert(CP: car.CarParams, CS: car.CarState, sm: me
 CONTROL_PROMPT_TITLE = {'yieldAhead': "Yield Ahead", 'stopSignTakeControl': "Stop Sign: Take Control",
                         'unprotectedTurnTakeControl': "Unprotected Turn: Take Control",
                         'carStoppedTakeControl': "Car Stopped: Take Control", 'stalledTakeControl': "Stalled: Take Control",
-                        'cantStartTakeControl': "Can't Start Turn: Take Control"}
+                        'cantStartTakeControl': "Can't Start Turn: Take Control", 'waitingForGap': "Waiting for a Gap",
+                        'creepingForView': "Creeping for a View", 'leftGo': "Turning",
+                        'leftUndecidedTakeControl': "Unprotected Turn: Take Control"}
 CONTROL_ALERT_TITLE = {'cannotStopComfortably': "Take Control", 'stopOverrun': "Stop Line Passed",
                        'proceedingOnYellow': "Proceeding on Yellow",
                        'mapControlsUnavailable': "Map Stops Unavailable", 'lightSourceRejected': "Light Source Rejected",
                        'junctionUncertain': "Junction Position Uncertain", 'offRouteStopsUnknown': "Off Route",
-                       'hardBrake': "Braking Hard"}
+                       'hardBrake': "Braking Hard", 'oncomingHolding': "Oncoming: Holding"}
 TURNPILOT_CONTROL_ALERT_S = 3.  # an overrun, a yellow or a red go is held up this long
 
 
@@ -323,7 +325,8 @@ def turnpilot_control_prompt_alert(CP: car.CarParams, CS: car.CarState, sm: mess
                                    personality) -> Alert:
   """TurnPilot needs the driver (turnpilotPlan.controlPrompt). A handback (hooks.TAKE_CONTROL_PROMPTS: a stop sign, an
   unprotected turn, the car stopped or stalled), the car held meanwhile, is take control with the handback's repeating
-  chime while it lasts; a yield is visual only."""
+  chime while it lasts; a yield, and an unprotected left waiting for its gap or creeping for a view (SILENT_PROMPTS), are
+  visual only; its go is a short chime."""
   plan = shown_plan(sm)
   prompt = str(plan.controlPrompt) if plan is not None else 'none'
   if prompt in TAKE_CONTROL_PROMPTS:
@@ -331,7 +334,7 @@ def turnpilot_control_prompt_alert(CP: car.CarParams, CS: car.CarState, sm: mess
                  AlertStatus.critical, AlertSize.mid, Priority.MID, VisualAlert.steerRequired, AudibleAlert.tpHandback, .1)
   return Alert(plan.reason if plan is not None and plan.reason else CONTROL_PROMPT_TITLE.get(prompt, "TurnPilot"),
                CONTROL_PROMPT_TEXT.get(prompt, ''), AlertStatus.userPrompt, AlertSize.mid, Priority.LOW, VisualAlert.none,
-               AudibleAlert.none if prompt in ('yieldAhead', 'none') else AudibleAlert.prompt, .1)
+               AudibleAlert.none if prompt in SILENT_PROMPTS else AudibleAlert.prompt, .1)
 
 
 def turnpilot_control_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int,
