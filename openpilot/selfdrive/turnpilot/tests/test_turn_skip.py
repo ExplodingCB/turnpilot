@@ -256,3 +256,15 @@ def test_stop_before_the_turn_means_not_too_fast():
       state = skip.update(turn, 60., 1, 20., False, stop_d=stop_d)
     assert state.skipped == skipped, stop_d
     assert state.feasible_now == (not skipped), stop_d
+
+
+def test_a_turn_whose_first_pulse_is_its_go_is_never_too_late():
+  # the autonomous unprotected left sends no pulse before its hold line (turnpilotd: may_start off), so no first pulse by
+  # MIN_FIRST_PULSE_M is no reason to skip it: its first pulse is the hold's go, from the line
+  left = maneuver_from_instruction(nav_instruction(40., "turn", "left", junction=junction_of("left")))
+  skip = TurnSkip()
+  for d in (MIN_FIRST_PULSE_M + 5., MIN_FIRST_PULSE_M - 1., 9.):
+    state = skip.update(left, d, 1, 3., False, pulse_at_go=True)
+    assert not state.skipped, d
+  # without it, as before
+  assert TurnSkip().update(left, MIN_FIRST_PULSE_M - 1., 1, 3., False).skipped
