@@ -90,7 +90,7 @@ def format_status(snap: dict | None, destination, enabled: bool, metric: bool, n
   reason = plan["reason"] if plan else offline_reason(fresh, snap["onroad"], enabled)
   m = (plan or {}).get("map")
   held = hold_text(m["kind"], m["action"], m["light"], m["source"]) if m and plan["state"] == "holding" else None
-  if held is not None:  # stopped at a stop sign or signal ("Stopped at stop sign", "tap gas to go"), or another hold with it
+  if held is not None:  # stopped at a stop sign or signal ("Stopped at stop sign", "take control"), or another hold with it
     label, reason = held[0], held[1] if is_map_reason(reason) or not reason else reason
   return {
     "reading": fresh,

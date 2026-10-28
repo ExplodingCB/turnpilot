@@ -300,7 +300,7 @@ def test_no_gas_go_is_ever_sent():
   from pathlib import Path
   from openpilot.selfdrive.turnpilot.hooks import RETIRED_ALERTS, RETIRED_PROMPTS
   root = Path(__file__).parents[1]
-  for name in ('map_controls.py', 'scene_policy.py', 'control_text.py'):
+  for name in ('map_controls.py', 'turnpilotd.py', 'scene_policy.py', 'control_text.py'):
     text = (root / name).read_text()
     assert not any(f"'{p}'" in text for p in RETIRED_PROMPTS + RETIRED_ALERTS), name
     assert 'tap gas' not in text and 'press accelerator' not in text, name

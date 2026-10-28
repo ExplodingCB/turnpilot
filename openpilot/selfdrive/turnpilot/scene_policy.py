@@ -25,7 +25,7 @@ while it's held: otherwise re-engaging brings the hold back, inside the junction
 press with openpilot still engaged is never a go (no gas go, 2026-10-28). Past the hold line a turn is committed for good once stopping in the
 junction is worse than finishing it (committed_past_line): a curb-side turn faster than COMMIT_SPEED, a far-side one
 once it can't stop short of the oncoming lanes on the comfortable curve, so the oncoming hold still stops a car pulling
-away from the line on the driver's go (BeamNG: it held only because the car happened to be under 2 m/s there). Slowing
+away from the line on its go (BeamNG: it held only because the car happened to be under 2 m/s there). Slowing
 later in the junction never brings its junction hold back (pedestrians in the path still stop it). ScenePolicy keeps
 those and the rest of what one frame can't know; scene_policy() is one frame on its own.
 A turnpilotd fault (fault()) loses the route, and with it the maneuver a junction hold is for: the hold in force then
@@ -233,7 +233,7 @@ def pedestrian_stops(objects, v_ego: float, is_confirmed=confirmed_track) -> lis
 def committed_past_line(distance: float, v_ego: float, far_side: bool) -> bool:
   """Past the hold line and committed to the turn: stopping in the junction is worse than finishing it. A curb-side turn
   faster than COMMIT_SPEED. A far-side one once it can't stop short of the oncoming lanes (ONCOMING_ENTRY_M) on the
-  comfortable curve: pulling away from the line on the driver's go is no commitment while it still can."""
+  comfortable curve: pulling away from the line on its go is no commitment while it still can."""
   if distance >= HOLD_LINE_M:
     return False
   if not far_side:

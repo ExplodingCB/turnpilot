@@ -779,8 +779,8 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.WARNING: turnpilot_lane_change_aborted_alert,
   },
 
-  # TurnPilot's map stop control (selfdrive/turnpilot/map_controls.py): the driver's go at a stop sign or an unchecked
-  # signal, and what it can't do there (hooks.plan_events has the order)
+  # TurnPilot's map stop control (selfdrive/turnpilot/map_controls.py): its handbacks with the car held (a stop sign, an
+  # unprotected turn, the car stopped or stalled: take control), and what it can't do there (hooks.plan_events has the order)
   EventName.turnpilotControlPrompt: {
     ET.WARNING: turnpilot_control_prompt_alert,
   },

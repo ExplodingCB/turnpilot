@@ -15,7 +15,8 @@ from openpilot.selfdrive.turnpilot.desire_timing import TURN_DESIRE_LEAD_M
 from openpilot.selfdrive.turnpilot.turn_skip import MIN_FIRST_PULSE_M
 from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP, V_TURN_MIN
 from openpilot.selfdrive.turnpilot.turnpilotd import (CAR_UNKNOWN_REASON, DETECTOR_DEADLINE_S, DETECTOR_START_DEADLINE_S, NO_LONG_REASON,
-                                                       STALL_PROMPT_S, STALLED_REASON, STOPPED_LEAD_M, STOPPED_PROMPT_S, STOPPED_REASON,
+                                                       NEAR_CONTROL_STAND_S, SIGNAL_STOPPED_REASON, STALL_PROMPT_S, STALLED_REASON,
+                                                       STOPPED_HANDBACK_S, STOPPED_LEAD_M, STOPPED_NOTE, STOPPED_NOTE_S, STOPPED_REASON,
                                                        TURN_MISSED_REASON, WAITING_REASON, TurnPilot, long_control_for)
 from openpilot.selfdrive.turnpilot.handback import Handback
 from openpilot.selfdrive.turnpilot.scene.tracker import STALE_S
@@ -1764,59 +1765,73 @@ def test_tiles_without_controls_are_said_out_loud():
   assert not any(p.controlAlert == 'mapControlsUnavailable' for p in plans)
 
 
-def test_stood_engaged_with_nothing_holding_it_asks_for_the_drivers_go_and_never_goes():
-  """BeamNG route_demo, 2026-10-28: after the reroute the model stopped on its own (shouldStop, no lead) on an empty road,
-  and the car stood 470 s. Standing engaged STOPPED_PROMPT_S with no TurnPilot hold, no lead and no map control within
-  30 m, TurnPilot asks for the driver's go, with a chime (carStoppedGo). It never goes itself."""
-  def stand(sim, seconds, **kw):
-    lead, lead_x = kw.pop('lead_prob', None), kw.pop('lead_x', 30.)
-    plans = []
-    for _ in range(int(round(seconds / DT_MDL))):
-      sim.model_kw = {} if lead is None else {'lead_prob': lead, 'lead_x': lead_x}
-      sim.v = 0.  # the model holds the car: nothing in the plan does
-      plans.append(sim.step(engaged=True, **kw))
-    return plans
+def stand(sim, seconds, **kw):
+  """The model holds the car standing for seconds, engaged (nothing in the plan does). lead_prob, lead_x: its lead."""
+  lead, lead_x = kw.pop('lead_prob', None), kw.pop('lead_x', 30.)
+  plans = []
+  for _ in range(int(round(seconds / DT_MDL))):
+    sim.model_kw = {} if lead is None else {'lead_prob': lead, 'lead_x': lead_x}
+    sim.v = 0.
+    plans.append(sim.step(engaged=True, **kw))
+  return plans
 
+
+def test_stood_engaged_with_nothing_holding_it_hands_back_and_never_goes():
+  """BeamNG route_demo, 2026-10-28: after the reroute the model stopped on its own (shouldStop, no lead) on an empty road,
+  and the car stood 470 s. Standing engaged with no TurnPilot hold, no lead and no map control within 30 m: said on the
+  status line after STOPPED_NOTE_S, and handed back loudly after STOPPED_HANDBACK_S (carStoppedTakeControl), long enough
+  for a red the map doesn't know (CRITIQUE REQUIRED 6: no handback at every unmapped red). It never goes itself."""
   sim = Sim([(2000., 'turn', 'left', T_LEFT)])
   sim.run(1.)
-  plans = stand(sim, STOPPED_PROMPT_S - 0.2)
+  plans = stand(sim, STOPPED_NOTE_S + 0.2)
+  assert all(p.controlPrompt == 'none' for p in plans) and plans[-1].reason == STOPPED_NOTE
+  plans = stand(sim, STOPPED_HANDBACK_S - STOPPED_NOTE_S - 0.4)
   assert all(p.controlPrompt == 'none' for p in plans)
-  plans = stand(sim, 0.4)
-  p = plans[-1]
-  assert p.controlPrompt == 'carStoppedGo' and p.reason == STOPPED_REASON
-  assert not p.shouldStop and p.speedCap > 20. and p.accelCap == NO_ACCEL_CAP and p.desire == Desire.none  # asks, never pushes
-  sim.step(engaged=True, gas=True)  # the driver's tap: the prompt goes, and its wait starts over
-  plans = stand(sim, STOPPED_PROMPT_S - 0.2)
-  assert all(p.controlPrompt == 'none' for p in plans)
-  assert stand(sim, 0.4)[-1].controlPrompt == 'carStoppedGo'
+  p = stand(sim, 0.4)[-1]
+  assert p.controlPrompt == 'carStoppedTakeControl' and p.reason == STOPPED_REASON == "Car stopped: take control"
+  assert not p.shouldStop and p.speedCap > 20. and p.accelCap == NO_ACCEL_CAP and p.desire == Desire.none  # never pushes
+  sim.step(engaged=False, gas=True)  # the driver took over (the press disengages): the wait starts over
+  assert all(p.controlPrompt == 'none' for p in stand(sim, STOPPED_HANDBACK_S - 0.2))
+  assert stand(sim, 0.4)[-1].controlPrompt == 'carStoppedTakeControl'
 
-  # not while disengaged, with a lead, with the brake on, or with a map control close by
+  # not while disengaged, with a lead, or with the brake on
   sim = Sim([(2000., 'turn', 'left', T_LEFT)])
   sim.run(1.)
   plans = []
-  for _ in range(int((STOPPED_PROMPT_S + 1.) / DT_MDL)):
+  for _ in range(int((STOPPED_HANDBACK_S + 1.) / DT_MDL)):
     sim.v = 0.
     plans.append(sim.step(engaged=False))
   assert all(p.controlPrompt == 'none' for p in plans)
-  assert all(p.controlPrompt == 'none' for p in stand(sim, STOPPED_PROMPT_S + 1., lead_prob=0.9, lead_x=7.))  # queued behind it
-  assert all(p.controlPrompt == 'none' for p in stand(sim, STOPPED_PROMPT_S + 1., lead_prob=0.6, lead_x=STOPPED_LEAD_M - 1.))
+  assert all(p.controlPrompt == 'none' for p in stand(sim, STOPPED_HANDBACK_S + 1., lead_prob=0.9, lead_x=7.))  # queued
+  assert all(p.controlPrompt == 'none' for p in stand(sim, STOPPED_HANDBACK_S + 1., lead_prob=0.6, lead_x=STOPPED_LEAD_M - 1.))
+
+
+def test_stood_at_a_mapped_signal_the_model_wont_leave_hands_back_after_the_long_stand():
+  """CRITIQUE REQUIRED 6: a mapped signal TurnPilot doesn't hold for (no light source) used to silence the stopped
+  handback for good: a model stall at a green was a silent indefinite stand. Within STOPPED_CONTROL_M of a map control,
+  standing NEAR_CONTROL_STAND_S (longer than a red) hands back (carStoppedTakeControl, "Stopped at the signal: take
+  control"). A stop sign queue the same."""
+  sim = Sim([(2000., 'turn', 'left', T_LEFT)], controls=[(20., 'signal')])
+  sim.run(0.2)
+  plans = stand(sim, NEAR_CONTROL_STAND_S - 0.2)
+  assert all(p.controlPrompt == 'none' for p in plans)
+  p = stand(sim, 0.4)[-1]
+  assert p.controlPrompt == 'carStoppedTakeControl' and p.reason == SIGNAL_STOPPED_REASON
+  assert NEAR_CONTROL_STAND_S > STOPPED_HANDBACK_S
   sim = Sim([(2000., 'turn', 'left', T_LEFT)], controls=[(28., 'stop')])
   sim.run(0.2)
-  assert all(p.controlPrompt == 'none' for p in stand(sim, STOPPED_PROMPT_S + 1.))  # a stop sign 25 m on: the queue for it
+  assert all(p.controlPrompt == 'none' for p in stand(sim, NEAR_CONTROL_STAND_S - 0.2))  # a stop sign 25 m on: its queue
+  assert stand(sim, 0.4)[-1].controlPrompt == 'carStoppedTakeControl'
 
 
 def test_a_lead_too_far_ahead_to_hold_the_car_doesnt_keep_it_standing_silently():
   """The same route_demo stand: the model saw a lead of prob ~0.6 at 21-28 m the whole 470 s (radarState too), standing.
   openpilot stands STOP_DISTANCE (6 m) behind a lead it is queued for: one that far ahead is not what holds the car, so
-  the driver is still asked for the go."""
+  it is still handed back."""
   sim = Sim([(2000., 'turn', 'left', T_LEFT)])
   sim.run(1.)
-  plans = []
-  for _ in range(int(round((STOPPED_PROMPT_S + 0.2) / DT_MDL))):
-    sim.model_kw = {'lead_prob': 0.6, 'lead_x': 25.}
-    sim.v = 0.
-    plans.append(sim.step(engaged=True))
-  assert plans[-1].controlPrompt == 'carStoppedGo' and plans[-1].reason == STOPPED_REASON
+  plans = stand(sim, STOPPED_HANDBACK_S + 0.2, lead_prob=0.6, lead_x=25.)
+  assert plans[-1].controlPrompt == 'carStoppedTakeControl' and plans[-1].reason == STOPPED_REASON
   assert 6. < STOPPED_LEAD_M < 21.  # past long_mpc.STOP_DISTANCE, short of the recorded lead
 
 
@@ -1903,11 +1918,11 @@ def test_a_turn_from_a_standstill_driven_straight_past_its_junction_is_missed_ou
   assert turned > 75. and not any(p.turnMissed for p in plans)
 
 
-def test_stalled_in_the_junction_after_the_go_asks_for_the_drivers_go_and_never_goes():
+def test_stalled_in_the_junction_after_the_go_hands_back_and_never_goes():
   """BeamNG standstill sweep, 2026-10-28: 2 of 21 turns released from a stop stood 20 s mid-junction, 46-78 deg round,
-  with nothing said: the stop line it was released from is within 30 m, so the empty-road prompt (carStoppedGo) never came.
-  Standing more than 3 s after the go, 20-80 deg into the turn, with no TurnPilot hold and no close lead, the plan asks for
-  the driver's go and says why. It never goes itself."""
+  with nothing said: the stop line it was released from is within 30 m, so the empty-road handback never came. Standing
+  more than 3 s after the go, 20-80 deg into the turn, with no TurnPilot hold and no close lead, it hands back loudly
+  (stalledTakeControl) and says why. It never goes itself."""
   def into_the_turn(sim, deg):
     go_from_the_hold(sim)
     while sim.tp.desires.turned_deg < deg:
@@ -1927,12 +1942,12 @@ def test_stalled_in_the_junction_after_the_go_asks_for_the_drivers_go_and_never_
   assert all(p.controlPrompt == 'none' for p in plans)
   before = plans[-1]
   p = stand(sim, 0.4)[-1]
-  assert p.controlPrompt == 'carStoppedGo' and p.reason == STALLED_REASON
-  assert not p.shouldStop and p.accelCap == NO_ACCEL_CAP and p.speedCap >= before.speedCap - 1e-3  # asks, never pushes
+  assert p.controlPrompt == 'stalledTakeControl' and p.reason == STALLED_REASON == "Stalled in the turn: take control"
+  assert not p.shouldStop and p.accelCap == NO_ACCEL_CAP and p.speedCap >= before.speedCap - 1e-3  # never pushes
   assert p.desire == Desire.none
-  sim.step(engaged=True, gas=True)  # the driver's tap: the prompt goes, and its wait starts over
+  sim.step(engaged=False, gas=True)  # the driver took over (the press disengages): the wait starts over
   assert all(p.controlPrompt == 'none' for p in stand(sim, STALL_PROMPT_S - 0.2))
-  assert stand(sim, 0.4)[-1].controlPrompt == 'carStoppedGo'
+  assert stand(sim, 0.4)[-1].controlPrompt == 'stalledTakeControl'
 
   # not with a lead close ahead, nor under 20 deg into the turn (the model may still be waiting to start it)
   sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
