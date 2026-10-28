@@ -303,8 +303,35 @@ done
 | `TurnPilotAutoLeft` | `off` (hand back at the line, G1), `announce` (hold, say whether it would go, hand back), `auto` | `auto` |
 | `TurnPilotLeftRangeM` | m, 0 to 400: the detector's proven range for oncoming traffic, from a measurement; a left whose R_req is past it is skipped at route time | `0.0` (unmeasured: every autonomous left skipped and rerouted) |
 
-Without G5's bounded go the model may hold the car at its go (G0: 14 of 24 tapless goes stood); then the go is withdrawn
-after 1.0 s and handed back (`cantStartTakeControl`), which the score fails as a stall.
+The model may hold the car at its go (G0: 14 of 24 tapless goes stood). G5's bounded go (next section) lifts that hold;
+with `TurnPilotGoOverride` off, or a go the car doesn't follow, the go is withdrawn and handed back (`cantStartTakeControl`),
+which the score fails as a stall.
+
+## Bounded go (G5)
+
+TurnPilot's go from a standstill (a turn its hold let go of, or the autonomous left's go) is certified to plannerd
+(`turnpilotPlan.goCertified`, cause `turnRelease` or `unprotectedLeft`, `selfdrive/turnpilot/go_override.py`). For it the
+longitudinal planner lifts the model's standstill hold: the e2e candidate goes to +0.5 m/s^2 at most and its shouldStop is
+dropped, for 3 s at most, under 3 m/s, and only while nothing else holds the car (no lead within 15 m, no TurnPilot hold,
+the mpc and cruise candidates not holding, no pedal). Lead, cruise and TurnPilot's caps stay in the min(). The lift ends
+once the model takes over (its shouldStop false and its planned speed 0.5 m/s or more from 1 s to 2 s ahead, held 0.3 s),
+and at once on a brake or gas press, a road user in the path within 15 m (a track or a raw box), a lead, a hold, or the
+go withdrawn. Alone it moves the car 2.25 m at most, at 1.5 m/s at most.
+
+A go the model never takes over is withdrawn at its 3 s and handed back (`cantStartTakeControl`, the car stopped at 1.5
+m/s^2 and held): with a model that holds, the car ends about 3.0 m past its line. A go the car doesn't move on within 2.0 s
+(1.0 s for the left) is withdrawn as before. With an actuator lag over about 0.4 s the lift doesn't reach 0.3 m/s inside
+the left's 1.0 s, so the left's go is withdrawn and handed back; measure the lag (`carState.aEgo` behind
+`carControl.actuators.accel`) before relying on it.
+
+| param | values | default |
+| --- | --- | --- |
+| `TurnPilotGoOverride` | BOOL: TurnPilot's go certified for the planner's lift | `1` (on); a build that doesn't know the key is on |
+
+The planner logs `longitudinalPlan.turnpilotGoLift` (lifted this frame) and `turnpilotGoEnd` (why the last lift ended:
+`window`, `takeover`, `speed`, `driver`, `lead`, `holder`, `modelBrake`, `withdrawn`, `replaced`), and cloudlog events
+`turnpilot.go_lift` and `turnpilot.go_lift_end`. turnpilotd logs `turnpilot.go_certified`, `turnpilot.go_not_certified`
+(with why), `turnpilot.go_end` and `turnpilot.go_not_moving`.
 
 ## Post-go profile sweep
 
