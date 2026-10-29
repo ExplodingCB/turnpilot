@@ -318,6 +318,14 @@ once the model takes over (its shouldStop false and its planned speed 0.5 m/s or
 and at once on a brake or gas press, a road user in the path within 15 m (a track or a raw box), a lead, a hold, or the
 go withdrawn. Alone it moves the car 2.25 m at most, at 1.5 m/s at most.
 
+A `turnRelease` go (a turn TurnPilot's own hold let go of: its walker cleared, its red went green) certifies only that
+TurnPilot's blocker left the path, never why the model still holds the car, so it rests on its junction's own
+certification, as the left's go rests on its gap: the junction's signal read green by an accepted source (here the light
+oracle), checked at the go and on every frame of it (`turnpilot.go_not_certified` why `light`, `turnpilot.go_end` reason
+`light`). The camera's shadow reader never certifies one (its red or yellow keeps one off), and with no signal mapped at
+the junction there is none (`RELEASE_UNSIGNALIZED` in `turnpilotd.py`). On the car, where no light source is accepted,
+a walker clearing at a signal is the model's go or the no-move handback, as before G5.
+
 A go the model never takes over is withdrawn at its 3 s and handed back (`cantStartTakeControl`, the car stopped at 1.5
 m/s^2 and held): with a model that holds, the car ends about 3.0 m past its line. A go the car doesn't move on within 2.0 s
 (1.0 s for the left) is withdrawn as before. With an actuator lag over about 0.4 s the lift doesn't reach 0.3 m/s inside

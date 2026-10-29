@@ -13,11 +13,11 @@ from openpilot.selfdrive.turnpilot.scene.tracker import RawBox, RawFrame
 from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M, SceneDecision
 from openpilot.selfdrive.turnpilot.tests.synthetic import model_v2
 from openpilot.selfdrive.turnpilot.tests.test_go_override import WARM_S, new_planner, planner_sm
-from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, WALKER, FakeParams, Sim, go_from_the_hold, stand, stop_at,
-                                                                 walker_stops_the_car)
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, WALKER, FakeParams, Sim, go_from_the_hold, junction_of,
+                                                                 oracle_lights, stand, stop_at, walker_stops_the_car)
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import JUNCTION, V_25, drive, left_sim
 from openpilot.selfdrive.turnpilot.turnpilotd import (GO_OVERRIDE_DEFAULT, LEFT_LAUNCH_SPEED, LEFT_LIFT_ROOM_M, NO_MOVE_REASON, NO_MOVE_S,
-                                                       go_override_for)
+                                                       RELEASE_UNSIGNALIZED, go_override_for)
 from openpilot.selfdrive.turnpilot.unprotected_left import LINE_D
 
 Desire = messaging.log.Desire
@@ -379,3 +379,109 @@ def test_a_left_go_nearer_the_oncoming_lanes_than_the_lifts_nudge_is_never_lifte
     sim.tp.certify_go(sim.sm, sim.sm['carState'], True, [], None, SceneDecision(), False, distance)
     assert sim.tp.go_cert.cause == cause and sim.tp.go_lifted == (cause != 'none'), distance
   assert LEFT_LIFT_ROOM_M == 4.5
+
+
+# --- skeptic G5: turnRelease rests on its junction's own certification, a green an accepted source reads ---
+
+# a right turn at a mapped signal (stop line 290 m, the junction 300 m): curb-side, no oncoming approach to cross
+RIGHT_AT_A_SIGNAL = [(300., "turn", "right", junction_of("right")), (1500., "turn", "left", junction_of("left"))]
+
+
+def model_stops_at(s_stop):
+  """The car's accel when the model alone stops it at s_stop (a red no source TurnPilot accepts reads: on the car this week
+  the camera's reader is shadow, so only the model stops for a red), at the speed it needs, cruising before."""
+  def accel(sim, plan):
+    d = s_stop - sim.s
+    if d <= 0.3:
+      return -3.
+    need = sim.v ** 2 / (2. * d)
+    return -need if need > 0.5 else min(1., (sim.cruise - sim.v) / 2.)
+  return accel
+
+
+def camera_reads(state, s_head=308.):
+  """turnpilotLights with no source and, riding along, the camera's shadow reader (turnpilotDetections.lights, as modeld
+  sends it) reading its governing head at s_head state, every frame."""
+  from openpilot.selfdrive.turnpilot.tests.test_camera_lights import detections
+  none = messaging.new_message('turnpilotLights').as_reader().turnpilotLights
+
+  def lights(sim):
+    sim.sm.put('turnpilotDetections', detections(state, s_head - sim.s, shadow=True))
+    return none
+  return lights
+
+
+def walker_clears_at_the_models_red(lights=None, controls=((290., 'signal'),)):
+  """Skeptic G5 probe: RIGHT_AT_A_SIGNAL on red, the model alone holding the car at its line (no source TurnPilot accepts
+  reads the red), plannerd in the loop with the model holding for the red throughout. A walker crosses in front (they have
+  the walk while the car has the red): TurnPilot's in-path hold. They clear: the hold lets go at a standstill. lights: the
+  Sim's lights function, or None. Returns (sim, the plans from the walker clearing, the car's s there)."""
+  sim = Sim(RIGHT_AT_A_SIGNAL, controls=list(controls))
+  sim.go_taps = False
+  sim.lights = lights
+  sim.accel = model_stops_at(289.)
+  while not (sim.v < 0.05 and sim.s > 280.):
+    sim.step(engaged=True)
+    assert sim.t < 80.
+  attach_planner(sim, holding)
+  held = [sim.step(WALKER, engaged=True) for _ in range(round(2. / DT_MDL))]
+  assert held[-1].shouldStop
+  s0 = sim.s
+  return sim, [sim.step(engaged=True) for _ in range(round(8. / DT_MDL))], s0
+
+
+def test_a_walker_clearing_at_a_red_only_the_model_holds_for_is_no_certified_go():
+  """Skeptic G5 blocker 1: turnRelease certified only that TurnPilot's walker left the path, and plannerd lifted the model's
+  red-light hold: the car rolled 3.0 m past where the model stopped for the red, 1.75 m past the line, at 1.5 m/s. At a
+  signal it is certified only on a green an accepted source reads (map_controls.release_light), and on the car no source is
+  accepted, nor is the camera's shadow reader's green (a phantom green would lift the car into a red); its red keeps it off
+  too. Uncertified, the go is as before G5: the model holds, and the no-move handback comes with the car held."""
+  for lights in (None, camera_reads('green'), camera_reads('red')):
+    sim, plans, s0 = walker_clears_at_the_models_red(lights)
+    assert all(go(p)[0] == 'none' for p in plans) and not any(lifted for _, _, lifted in sim.planned)
+    assert sim.s - s0 < 0.1 and max(v for _, v, _ in sim.trace[-len(plans):]) < 0.1
+    handed = next(i for i, p in enumerate(plans) if p.controlPrompt == 'cantStartTakeControl')
+    assert handed * DT_MDL <= NO_MOVE_S + 0.2 and all(p.shouldStop for p in plans[handed:])
+
+
+def test_turn_release_is_certified_on_an_accepted_green_only():
+  """The same walker clearing with the sim's oracle (an accepted source) reading the signal: green certifies the go, red
+  doesn't (its own hold stays); the camera's shadow red over the oracle's green keeps it off (it only ever keeps a go off).
+  Where navd maps no signal at the junction (an unmapped one, a stop sign, cross traffic would go unchecked): none
+  (RELEASE_UNSIGNALIZED)."""
+  def certified(lights, controls=((290., 'signal'),)):
+    sim, plans, _ = walker_clears_at_the_models_red(lights, controls)
+    return {go(p)[0] for p in plans} - {'none'}
+
+  def oracle(state, camera=None):
+    def lights(sim):
+      if camera is not None:
+        camera_reads(camera)(sim)
+      sim.tp.oracle_ok = True
+      return oracle_lights(state, 290.)(sim)
+    return lights
+  assert certified(oracle('green')) == {'turnRelease'}
+  assert certified(oracle('red')) == set()
+  assert certified(oracle('green', camera='red')) == set()
+  assert certified(None, controls=()) == set()
+  assert RELEASE_UNSIGNALIZED is False
+
+
+def test_a_shadow_camera_red_coming_mid_go_withdraws_it():
+  """Certified on the oracle's green, then the camera's shadow reader reads red: the go is withdrawn that frame (light), the
+  lift with it. Nothing brakes for the camera's read (shadow): only the lift is off."""
+  sim = held_at_the_red()
+  camera = {'state': None}
+  p = go_from_the_hold(sim)
+  base = sim.lights  # the oracle's, green now
+
+  def lights(sim):
+    if camera['state'] is not None:
+      camera_reads(camera['state'], 300.)(sim)
+    return base(sim)
+  sim.lights = lights
+  assert go(p)[0] == 'turnRelease'
+  assert all(go(q)[0] == 'turnRelease' for q in stand(sim, 0.3))
+  camera['state'] = 'red'
+  q = stand(sim, DT_MDL)[0]
+  assert go(q)[0] == 'none' and sim.tp.go_cert.end == 'light'

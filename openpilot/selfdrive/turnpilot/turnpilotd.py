@@ -92,11 +92,14 @@ driver is on a pedal or disengaged, the scene isn't live, a hold of TurnPilot's 
 GO_CLEAR_M, or a road user is in the path within it (path_blocker: a track, or a raw box of this frame's run); any of them
 coming during the go, TurnPilot handing back, or the left withdrawing its own go withdraws it that frame (withdraw_go), and
 it ends on its own at GO_WINDOW_S, GO_END_SPEED or the model's takeover (go_override.GoCertifier). plannerd then lifts the
-model's hold, +0.5 m/s^2 at most, while the model alone holds the car. Uncertified (the param off, a blocker), the go is
-as before: the model pulls away, or the no-move handback below comes. The left's go is lifted only from LEFT_LIFT_ROOM_M or
-more short of the oncoming lanes (its line, not a creep), and is followed into them only by a launch (left_launch): short of
-LEFT_LAUNCH_SPEED with LEFT_LAUNCH_ROOM_M left to stop short of them, it is withdrawn and handed back, never a coast across
-them on the lift's speed.
+model's hold, +0.5 m/s^2 at most, while the model alone holds the car. A turnRelease rests on its junction's own
+certification, as the left's go rests on its gap: the junction's signal read green by an accepted source, never the
+camera's shadow green (release_blocked, RELEASE_UNSIGNALIZED; skeptic G5: a walker clearing at a red the model alone held
+for had the lift roll the car into the junction), so on the car this week none. Uncertified (the param off, a blocker, no
+green), the go is as before: the model pulls away, or the no-move handback below comes. The left's go is lifted only from
+LEFT_LIFT_ROOM_M or more short of the oncoming lanes (its line, not a creep), and is followed into them only by a launch
+(left_launch): short of LEFT_LAUNCH_SPEED with LEFT_LAUNCH_ROOM_M left to stop short of them, it is withdrawn and handed
+back, never a coast across them on the lift's speed.
 Standing engaged with nothing of TurnPilot's holding the car (no shouldStop, no cap biting), no lead from the model within
 STOPPED_LEAD_M (one further on doesn't hold a standing car), gas and brake off, the model stopped on its own: said on the
 status line after STOPPED_NOTE_S (STOPPED_NOTE), and handed back loudly (controlPrompt carStoppedTakeControl) after
@@ -234,6 +237,15 @@ LEFT_GO_STATES = ('go', 'committed')  # the unprotected left's states its certif
 LEFT_LAUNCH_SPEED = 2.
 LEFT_LAUNCH_ROOM_M = 1.5
 LEFT_LIFT_ROOM_M = 0.5 * GO_ACCEL * GO_WINDOW_S ** 2 + (GO_ACCEL * GO_WINDOW_S) ** 2 / (2. * STOP_DECEL) + LEFT_LAUNCH_ROOM_M
+# turnRelease (a turn TurnPilot's own hold let go of at a standstill) certifies only that TurnPilot's blocker left the path,
+# never why the model still holds the car: a red no source TurnPilot accepts reads (the car's, this week), cross traffic, an
+# oncoming car, which plannerd can't tell from G0's spurious stand (skeptic G5). So it rests on its junction's own
+# certification: the junction's signal read green by an accepted source (map_controls.release_light: the camera's green, in
+# shadow, never certifies; its red or yellow keeps the go off), checked at the go and on every frame of it. On the car this
+# week no source is accepted, so no turnRelease: the model pulls away or the no-move handback comes, as before G5. True also
+# certifies it at a junction navd maps with no signal (controls ok); an unmapped signal or stop sign, and cross traffic, then
+# go unchecked
+RELEASE_UNSIGNALIZED = False
 
 
 def path_blocker(objects, raw, limit_m: float = GO_CLEAR_M) -> str:
@@ -567,7 +579,7 @@ class TurnPilot:
     self.was_stopping = decision.should_stop
     # the certified go out, a frame on (its window, the model's takeover), and withdrawn the frame what it rests on goes
     self.go_cert.update(model, v_ego, DT_MDL)
-    self.withdraw_go(sm, cs, acting, available, objects, raw, decision, took_over)
+    self.withdraw_go(sm, cs, acting, available, objects, raw, decision, took_over, rf.distance)
     withdrawn = self.no_move(sm, cs, v_ego, acting, decision) or self.left_launch(sm, rf, v_ego)
     if withdrawn:
       self.go_cert.withdraw('noMove')
@@ -814,30 +826,43 @@ class TurnPilot:
   def certify_go(self, sm, cs, available: bool, objects, raw, decision, took_over: bool, distance: float) -> None:
     """TurnPilot's go from a standstill (start_post_go's, at the hold line or in the junction: finishing a turn beats standing
     in it) certified for plannerd's bounded lift (turnpilotPlan.goCertified), cause unprotectedLeft for the autonomous left's,
-    turnRelease for any other turn released from TurnPilot's hold; or, TurnPilotGoOverride off or go_blocked, not, logged with
-    why. Uncertified, the go is as before G5: the model pulls away or the no-move handback comes."""
+    turnRelease for any other turn released from TurnPilot's hold at a junction whose light is read green (release_blocked);
+    or, TurnPilotGoOverride off, go_blocked or no green, not, logged with why. Uncertified, the go is as before G5: the model
+    pulls away or the no-move handback comes."""
     self.go_lifted = False
     cause = 'unprotectedLeft' if self.left_now is not None and self.left_now.go else 'turnRelease'
     why = 'param' if not self.go_override else self.go_blocked(sm, cs, available, objects, raw, decision, took_over)
     if not why and cause == 'unprotectedLeft' and distance - ONCOMING_ENTRY_M < LEFT_LIFT_ROOM_M:
       why = 'room'  # nearer the oncoming lanes than the lift's nudge and its stop: never lifted into them (LEFT_LIFT_ROOM_M)
+    if not why and cause == 'turnRelease':
+      why = self.release_blocked(distance)
     if why:
       cloudlog.event("turnpilot.go_not_certified", cause=cause, why=why, blocker=path_blocker(objects, raw) if why == 'inPath' else '',
-                     distance=round(distance, 1))
+                     distance=round(distance, 1), light=self.map_controls.release_light(distance) if cause == 'turnRelease' else '')
       return
     self.go_lifted = self.go_cert.start(cause, distance=round(distance, 1), at_line=self.go_wait_s is not None,
                                         turned_deg=round(self.desires.turned_deg, 1))
     self.go_cert_id = self.go_cert.id if self.go_lifted else None
 
-  def withdraw_go(self, sm, cs, acting: bool, available: bool, objects, raw, decision, took_over: bool) -> None:
+  def release_blocked(self, distance: float) -> str:
+    """Why a turnRelease go can't be certified at the junction distance m ahead, or stay so, '' if it can: its light
+    (map_controls.release_light) not green from an accepted source, or no signal there with RELEASE_UNSIGNALIZED (module
+    constants)."""
+    light = self.map_controls.release_light(distance)
+    return '' if light == 'green' or (light == 'none' and RELEASE_UNSIGNALIZED) else 'light'
+
+  def withdraw_go(self, sm, cs, acting: bool, available: bool, objects, raw, decision, took_over: bool, distance: float) -> None:
     """The certified go out withdrawn this frame, plannerd's lift with it, once anything it was certified on stops holding
-    (go_blocked), TurnPilot stops acting (a handback), or the autonomous left withdraws its own go (left out of its go)."""
+    (go_blocked; a turnRelease's light, release_blocked), TurnPilot stops acting (a handback), or the autonomous left
+    withdraws its own go (left out of its go). distance: m to the route's junction."""
     gc = self.go_cert
     if not gc.active:
       return
     why = 'handback' if not acting else self.go_blocked(sm, cs, available, objects, raw, decision, took_over)
     if not why and gc.cause == 'unprotectedLeft' and (self.left_now is None or self.left_now.state not in LEFT_GO_STATES):
       why = 'left'
+    if not why and gc.cause == 'turnRelease':
+      why = self.release_blocked(distance)
     if why:
       if why == 'inPath':
         cloudlog.event("turnpilot.go_path_blocked", go_id=gc.id, blocker=path_blocker(objects, raw))

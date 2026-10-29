@@ -354,6 +354,22 @@ class MapControlPolicy:
       states |= {st for st, d in lights.camera.heads if lo <= d <= hi}
     return next((st for st in ('red', 'yellow', 'green') if st in states), 'unknown')
 
+  def release_light(self, distance: float) -> str:
+    """The light of the route's junction distance m ahead for a go TurnPilot's own hold let go of (turnpilotd: turnRelease,
+    skeptic G5): 'none' with no signal there (PROTECT_BEFORE_M before it to PROTECT_PAST_M past it) and navd's controls ok,
+    'unknown' with them anything else (whether there is one isn't known). At a signal, around it as turn_light reads: a red
+    or a yellow from any source, the camera's in shadow too (here it only ever keeps a go off); a green only from an accepted
+    source, never the camera's (G2 is shadow: a phantom green would lift the car into a red); else 'unknown'. Latches
+    nothing (turn_light's latch is the unprotected left's). The last update's lights."""
+    if not any(c.kind == 'signal' and distance - PROTECT_BEFORE_M <= c.d <= distance + PROTECT_PAST_M
+               for c in self.tracker.controls.values()):
+      return 'none' if self.tracker.status == 'ok' else 'unknown'
+    lo, hi = distance - PROTECT_BEFORE_M, distance + CAMERA_ASSOC_PAST_M
+    lights = self._lights
+    accepted = {st for st, d in (lights.lights or []) if lo <= d <= hi}
+    camera = {st for st, d in lights.camera.heads if lo <= d <= hi} if lights.camera is not None else set()
+    return next((st for st in ('red', 'yellow') if st in accepted | camera), 'green' if 'green' in accepted else 'unknown')
+
   def held_stops(self) -> list:
     """The latch alone, for a faulted plan whose map update failed: a held car stays held."""
     return [Stop(HOLD_ACCEL, 0., True, "Stopped at a map stop", 0.)] if self.held is not None else []
