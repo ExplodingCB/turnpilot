@@ -193,6 +193,7 @@ class Approach:
   lanes_known: bool = False    # every direction it carries was matched, with its lanes
   rank: int = 8                # its class's rank (RANK), 8 unknown
   osm_evidence: str = ''       # the sidecar's evidence for its stop
+  overridden: bool = False     # TurnPilotJunctionOverrides names it (its tier is then no; certify's override reason)
 
   def to_msg(self) -> dict:
     return {'bearing': float(self.bearing), 'relBearing': float(self.rel_bearing), 'role': self.role, 'roadClass': self.road_class,
@@ -223,6 +224,7 @@ class Junction:
   validated: bool = False      # SG2: the validation for the ETA's lighting
   certification: str = 'unchecked'
   cert_reason: str = 'none'
+  cert_detail: str = ''        # navd and route_audit only: why (routing/certify.py)
   approaches: list[Approach] = field(default_factory=list)
   # navd and route_audit only
   plausible: bool = True
@@ -602,7 +604,7 @@ def classify(j: Junction, osm, ours_stops: bool, ctx: Context) -> None:
     # the tier
     key = approach_key(j.osm_node_id, a.way_id, a.forward) if j.osm_node_id and a.way_id and a.forward is not None else None
     if key is not None and key in ctx.overrides:
-      a.tier = 'no'
+      a.tier, a.overridden = 'no', True
     elif sv is not None:
       a.tier = 'surveyed' if sv['stops'] else 'no'
     elif not osm_ok:

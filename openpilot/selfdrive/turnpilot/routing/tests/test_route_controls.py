@@ -1018,6 +1018,8 @@ def test_an_override_makes_its_approach_no_and_an_unreadable_one_is_loud(tmp_pat
   ctx = context([survey()], overrides)
   _, j = junction_of(route_controls(v, steps(), sidecar_dir=allway(tmp_path / 'o'), context=ctx)[0])
   assert tiers(j) == {0: 'surveyed', 90: 'no', 270: 'no'} and j.status == 'ok'
+  # and says so, for certify's override reason (SG2)
+  assert {round(a.bearing) for a in j.approaches if a.overridden} == {90, 270}
 
   def unknown(key):
     raise UnknownKeyName(key)
