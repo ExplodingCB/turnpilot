@@ -1202,6 +1202,54 @@ def test_O5_O15_a_model_that_wont_start_is_withdrawn_retried_then_h5(tmp_path):
   assert all(d.takeover_s < 0. for d in out)
 
 
+def next_stop(d=20.):
+  """Another stop sign engaged d m ahead, not held (a G18 frontage stop, the far line of a divided road)."""
+  return SimpleNamespace(key=(0, 2), kind='stop', d=d, held=False, state=SimpleNamespace(moved_m=0.))
+
+
+def test_G18_a_next_stop_sign_ahead_never_takes_over_an_encounter_holding_the_car_its_own_hold_or_its_handback(tmp_path):
+  # once the latch has let go (a 'clear'), the decider's own hold is all that holds the car: a withdrawn go come to rest in
+  # observe, or a fault's handback. Another stop control engaged within STOP_SWEEP_M (frontage stops 15-30 m apart, a
+  # divided road's far line) had taken the encounter over, reset to 'approach' for it, and dropped that hold: no stop, no
+  # prompt, and a model that drove carried the car from rest into the first junction with no check
+  w = Drive(tmp_path, behaviour=lambda w: 'holds')
+  while not any(d.withdraw for d in w.trace):
+    w.step()
+    assert len(w.trace) * DT_MDL < 20.
+  while w.v > 0.05 or w.sg.aborting is not None:
+    w.step()
+  assert w.sg.state == 'observe' and not w.control.held
+  token = w.sg.token
+  nxt = next_stop()
+  out = w.run(3., approach=nxt)
+  # held in observe until its own retry, which is still this junction's (the next control's state never taken)
+  assert w.sg.token is token and w.sg.key == (0, 1) and all(d.state in ('observe', 'going') for d in out)
+  assert all(any(s.should_stop for s in d.stops) for d in out if d.state == 'observe')
+  w = Drive(tmp_path, behaviour=lambda w: 'holds')
+  out = w.run(40.)
+  assert out[-1].fault == 'H5'
+  out = w.run(2., approach=next_stop())
+  assert all(d.prompt == 'stopSignTakeControl' and d.fault == 'H5' and any(s.should_stop for s in d.stops) for d in out)
+  # a model that now drives from the observe hold, a car coming fast from the right: still the first junction's decider,
+  # holding the car (it never moves), and the next control only once this encounter is done
+  w = Drive(tmp_path, behaviour=lambda w: 'goes', lag_s=0.3)
+  out = w.run(3.2)
+  assert first_go(out) is not None
+  w.boxes = lambda ww: lane_box(ww, 'right', 20., views=('full', 'road'))  # withdraws the go
+  out = w.run(3.)
+  assert any(d.withdraw for d in out) and w.sg.state == 'observe'
+  w.boxes = lambda ww: {}
+  w.model_says = lambda d: (1.0, False, model_v2())
+  w.tracks = cars((31, 'right', rolling(w.t_cam - 100., d0=60., v0=12.)))
+  nxt, odo0 = next_stop(), w.odo
+  out = []
+  for _ in range(round(4. / DT_MDL)):
+    nxt.d -= w.v * DT_MDL
+    out.append(w.step(approach=nxt))
+  assert w.sg.token is not nxt.state and all(d.state != 'approach' for d in out)
+  assert w.odo - odo0 < 0.3 and w.v < 0.1
+
+
 def test_O11_O14_auto_without_its_data_acts_as_shadow_and_says_why_trial_skips_only_the_launch(tmp_path):
   import openpilot.selfdrive.turnpilot.routing.tests.test_certify as tc
   for changes, reason in (({'cameraSetbackM': None}, "Stop-sign go off: no camera measurements"),

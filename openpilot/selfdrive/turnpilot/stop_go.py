@@ -130,6 +130,7 @@ SIDE_OFF = ('unset', 'off', 'disabled')  # sideViewStatus with no side views for
 SIDE_VIEWS = ('sideLeft', 'sideRight')
 FORWARD = ('road', 'full')
 WAITING = ('stopped', 'rollUp', 'observe')
+IDLE = ('off', 'approach', 'done')  # an encounter another stop control ahead may take over (StopGo.takes)
 
 STOP_SIGN_REASON = "Stop sign: take control to proceed"  # map_controls' handback (H6), kept as it was
 REASONS = {
@@ -296,6 +297,7 @@ class StopGo:
     """No stop in hand: everything of the encounter cleared."""
     self.token = None              # the control's state object (adopt carries it): the encounter's identity
     self.key = None                # its key now
+    self.control = None            # the control itself, last seen (turnpilotd reads its junction info once it's gone)
     self.state = 'off'
     self.junction: sr.Junction | None = None
     self.lanes_all: list = []
@@ -358,7 +360,7 @@ class StopGo:
   def _take(self, ctl, f: Frame) -> None:
     """A new encounter with control ctl (held, or engaged ahead)."""
     self.reset()
-    self.token, self.key = ctl.state, ctl.key
+    self.token, self.key, self.control = ctl.state, ctl.key, ctl
     self.junction = f.junction
     if f.vis is not None and getattr(f.vis, 'setback', None) is not None:
       self.setback = float(f.vis.setback)
@@ -383,19 +385,26 @@ class StopGo:
 
   # ------------------------------------------------------------------------------------------------------------- update
 
+  def takes(self, ctl, ahead) -> bool:
+    """Whether this frame starts a new encounter: a stop control the latch holds now always does; one engaged ahead only
+    while the encounter in hand is idle (none, still approaching, or done). Once the latch has let go the decider's own hold
+    or its handback is all that holds the car (observe, ladder), and while it launches it is crossing: another stop sign
+    within STOP_SWEEP_M (a frontage stop 15-30 m on, a divided road's far line) waits until this one is done."""
+    cur = ctl or ahead
+    return cur is not None and cur.state is not self.token and (ctl is not None or self.state in IDLE)
+
   def update(self, f: Frame) -> StopGoDecision:
     ctl = f.control if f.control is not None and f.control.kind == 'stop' else None
     ahead = f.approach if f.approach is not None and f.approach.kind == 'stop' else None
     cur = ctl or ahead
-    moving_on = self.state in ('going', 'committed', 'inLane') or self.aborting is not None
-    if cur is not None and cur.state is not self.token and (ctl is not None or not moving_on):
+    if self.takes(ctl, ahead):
       self._take(cur, f)
     elif cur is None and self.token is not None and self.state in ('approach', 'done') and ctl is None:
       self.reset()
     if self.token is None:
       return StopGoDecision(state='off', mode=self._mode(f)[0])
-    if cur is not None:
-      self.key = cur.key
+    if cur is not None and cur.state is self.token:
+      self.key, self.control = cur.key, cur
     self.t += f.dt
     d = StopGoDecision(maneuver=f.maneuver, edges=self.edges)
     mode, why = self._mode(f)

@@ -269,6 +269,22 @@ def test_C1_V25_a_car_waiting_at_its_line_is_crossed_past_no_band_abort_no_h5(tm
   assert any(str(p.stopGo.state) == 'done' for p in plans) and sim.s > S_LINE + 15.
 
 
+def test_G18_a_second_stop_sign_20_m_on_never_takes_over_a_holding_encounter(tmp_path):
+  # a frontage stop 20 m past the first, engaged while the car stands at the first: after a withdrawn go (the latch let go
+  # with the 'clear') and after H5, the first junction's decider still holds the car and says its handback
+  sim = StopSim(tmp_path, model='holds')
+  sim.navd.controls.append((S_LINE + 20., 'stop', False, True, False, info()))
+  run_to_line(sim)
+  s0 = sim.s
+  sim.run(40.)
+  plans = sim.plans()
+  k = next(i for i, p in enumerate(plans) if p.stopGo.withdrawn)
+  assert all(p.shouldStop or str(p.stopGo.state) in ('going', 'observe') for p in plans[k:])
+  last = plans[-1]
+  assert str(last.stopGo.state) == 'ladder' and last.controlPrompt == 'stopSignTakeControl' and last.shouldStop
+  assert sim.s - s0 < 8.  # never carried on toward the second line
+
+
 def test_V19_a_car_backing_out_ahead_holds_the_go(tmp_path):
   sim = StopSim(tmp_path)
   run_to_line(sim)
