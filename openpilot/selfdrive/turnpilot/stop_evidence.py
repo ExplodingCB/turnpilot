@@ -22,6 +22,10 @@ control's stop point). From it, per track, for SG4a's and SG4b's decider and for
   front passed its line at DOWNGRADE_V or more without dropping under it in the DOWNGRADE_WINDOW_M before: SG4b's downgrade,
   and a validation failure).
 
+The opposite approach's lanes run parallel to ours, where a bearing says nothing about how far along one a car is (its
+3.7 m offset is a few degrees at 50 m, inside the angle allowance): there the position is the ground range's at the near end of
+an OPP_BAND band and the speed its fit's at the far end, and a car's box bottom is its front (head on).
+
 Bearings taken from one place are only comparable from that place, so a track's fit uses only the samples taken with our
 car where it stands now (within MOVE_TOL_M): moving restarts its trust, the conservative direction. Its first-track record
 (the validation's first-track range) is taken where the car stood then, distance along the lane being where the car is on
@@ -52,6 +56,7 @@ SPEED_SPAN_S = 0.6           # s of matches behind each one its nominal speed is
 APPROACH_V = 0.5             # m/s toward our path: moving toward the junction
 DEFAULT_LINE_M = 10.         # m from the node along an approach to its stop point when nothing says (STOP_SIGNS.md 4.5 step 3)
 CROSS_SKEW_DEG = 15.         # a lane within this of perpendicular is fitted as a cross lane (certify's skew check: 75-105)
+OPP_BAND = 0.3               # a parallel lane's (the opposite approach's) position is the ground range's, within this fraction
 MOTOR = ('car', 'truck', 'bus', 'motorcycle')
 
 CLASS_NAMES = {0: 'pedestrian', 1: 'cyclist', 2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}  # COCO ids (the tracker's)
@@ -247,7 +252,10 @@ class StopEvidence:
     return sr.reach_needed_allway(ln.limit) if ln.limit > 0. else 0.
 
   def first_range(self, ln: sr.Lane, s: Sample) -> float:
-    """m down ln at the pessimistic distance end (1.2): sLaneMin where our car stood, the bearing toward the axis."""
+    """m down ln at the pessimistic distance end (1.2): sLaneMin where our car stood, the bearing toward the axis; on a
+    parallel lane the ground range's near end (module docstring)."""
+    if not is_cross(ln):
+      return max((1. - OPP_BAND) * s.x - (ln.s_min + s.d_stop), 0.) - ln.conflict_m
     psi = min(max(abs(s.bearing) - self.bound, 0.), 89.5)
     return (ln.s_min + s.d_stop) * math.tan(math.radians(psi)) - ln.conflict_m
 
@@ -259,7 +267,7 @@ class StopEvidence:
       if hits < MIN_HITS:
         return
       ln = self.assign(s)
-      if ln is None or not is_cross(ln):
+      if ln is None:
         return
       first = First(s.t, self.first_range(ln, s), s.view, ln.role, ln.index, s.d_stop)
       self.first[tid] = first
@@ -316,14 +324,18 @@ class StopEvidence:
         inv, inv_slope = _linfit([s.t for s in ws], [1. / s.width for s in ws])
         ttc = inv / -inv_slope if inv_slope < -1e-12 else None
     else:
-      # the opposite approach's lanes: position only this group (its tracked test is SG4a's); never a trusted speed
-      fit = sr.TrackFit(d_lo=max(abs(last.y) / math.tan(math.radians(min(abs(last.bearing) + self.bound, 89.5))) - s_min, 0.),
-                        v_hi=0., v_trusted=False)
-      d_nom, v_nom, tta_foot, ttc = max(last.x - s_nom, 0.), 0., None, None
+      # a parallel lane (the opposite approach's): by ground range (module docstring)
+      vel = [s for s in here if s.t >= last.t - sr.VEL_TRUST_S - 1e-9]
+      d_nom, slope = _linfit([s.t for s in vel], [s.x - (s_nom + s.d_stop) for s in vel])
+      v_nom = -slope
+      trusted = last.t - here[0].t + 1e-9 >= sr.VEL_TRUST_S and len(vel) >= sr.VEL_TRUST_SAMPLES
+      fit = sr.TrackFit(d_lo=max((1. - OPP_BAND) * last.x - s_min, 0.) - ln.conflict_m, v_hi=max((1. + OPP_BAND) * v_nom, 0.),
+                        v_trusted=trusted)
+      tta_foot, ttc = None, None
     line = self.lines.get(ln.role, DEFAULT_LINE_M)
-    front = d_nom - CAR_HALF_LEN_M
+    front = d_nom - CAR_HALF_LEN_M if cross else d_nom  # side on, its box's bottom centre is its middle; head on, its front
     front_from_line = line - front
-    at_line = cross and -sr.SHIELD_BEFORE_M <= front_from_line <= sr.SHIELD_PAST_M
+    at_line = -sr.SHIELD_BEFORE_M <= front_from_line <= sr.SHIELD_PAST_M
     stopped = fit.v_trusted and fit.v_hi < sr.SHIELD_V
     if stopped:
       if st.stop_since is None:
@@ -337,23 +349,26 @@ class StopEvidence:
     seen_every = (self.newest_t is None or self.newest_t - last.t <= CYCLE_GAP_S) and all(g <= CYCLE_GAP_S + 1e-9 for g in gaps)
     shield = ln.stopping and at_line and sr.shield_ok(last.cls, stopped_s, fit.v_hi, len([s for s in here if s.t >= last.t - sr.VEL_TRUST_S - 1e-9]),
                                                       front_from_line, seen_every, moved)
-    through = self._through(st, ln, here, s_nom, line, last.cls) if cross else False
+    through = self._through(st, ln, here, s_nom, line, last.cls, cross)
     return TrackEvidence(tid, last.cls, ln.role, ln.index, last.view, last.t, len(here), fit.d_lo, fit.v_hi, fit.v_trusted, fit.a_lo,
                          fit.a_trusted, fit.tau_dot, fit.expansion_agrees, d_nom, v_nom,
                          d_nom / v_nom if v_nom > 0.1 else float('inf'), fit.d_lo / fit.v_hi if fit.v_hi > 0.1 else float('inf'),
                          tta_foot, ttc, sr.u2_state(fit, at_line=at_line), front_from_line, at_line and stopped, stopped_s, shield,
                          through, ln)
 
-  def _through(self, st: _State, ln: sr.Lane, here, s_nom: float, line: float, cls: str) -> bool:
+  def _through(self, st: _State, ln: sr.Lane, here, s_nom: float, line: float, cls: str, cross: bool = True) -> bool:
     """Through its line at speed (module docstring), measured at the lane's nominal offset; latched."""
     if st.through or cls not in MOTOR:
       return st.through
     last = here[-1]
     span = [s for s in here if s.t >= last.t - SPEED_SPAN_S - 1e-9]
     if len(span) >= 3 and last.t - span[0].t >= SPEED_SPAN_S / 2.:
-      ds = [s_nom * math.tan(math.radians(min(abs(s.bearing), 89.5))) - ln.conflict_m for s in span]
+      if cross:
+        ds = [s_nom * math.tan(math.radians(min(abs(s.bearing), 89.5))) - ln.conflict_m for s in span]
+      else:
+        ds = [s.x - (s_nom + s.d_stop) - ln.conflict_m for s in span]
       d, slope = _linfit([s.t for s in span], ds)
-      st.speeds.append((d - CAR_HALF_LEN_M, -slope))
+      st.speeds.append((d - CAR_HALF_LEN_M if cross else d, -slope))
     if not st.speeds or st.crossed:
       return st.through
     front, _ = st.speeds[-1]

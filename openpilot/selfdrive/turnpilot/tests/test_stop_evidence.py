@@ -223,3 +223,31 @@ def test_through_the_tracker_its_matches_bearings_and_widths():
   assert e.d_nom == pytest.approx(30. - 5. * 1.7, abs=0.5) and e.v_nom == pytest.approx(5., abs=0.5)
   # its first track is its second match, where the tracker publishes it (MIN_HITS): two hits make a track (1.4)
   assert abs(e.t - 1.7) < 1e-6 and abs(ev.first[e.track_id].t - 0.3) < 1e-6
+
+
+def test_the_opposite_approach_is_placed_by_ground_range_at_its_near_end():
+  # a lane parallel to ours: a bearing ray says nothing about where along it a car is (its 3.7 m offset is a few degrees at
+  # 50 m), so its position is the ground range's, at the near end of a 30% band; an oncoming car 70 m out braking to stand at
+  # its line (9 m out): first tracked well short of 70 m (pessimistic), approaching, stopped at its line (its box's bottom is
+  # its front, head on)
+  from openpilot.selfdrive.turnpilot.stop_evidence import OPP_BAND
+  opp = lane('opposite')
+  s_nom = (opp.s_min + opp.s_max) / 2.
+  ev = evidence()
+  d_at = braking(70., 13.4, 13.4 ** 2 / (2. * (70. - 9.)))
+
+  def opp_track(t, d):
+    x, y = s_nom + d, abs(opp.y)
+    return SimpleNamespace(track_id=5, t_seen=t, bearing_seen=math.degrees(math.atan2(y, x)), width_seen=40., view='road', cls=CAR,
+                           x=np.array([x, y, 0., 0.]), hits=5)
+  states = []
+  for k in range(int(12.0 * 5) + 1):  # it stands from 9.1 s
+    t = k / 5.
+    ev.observe([opp_track(t, d_at(t))], d_stop=0.)
+    states.append(ev.evaluate()[5])
+  first = ev.first[5]
+  assert first.role == 'opposite' and first.range_m == pytest.approx((1. - OPP_BAND) * (s_nom + 70.) - opp.s_min, abs=1e-6)
+  assert first.range_m < 70.
+  rec = ev.records[5]
+  assert rec.approaching is True and rec.stopped_at_line and not rec.through_at_speed
+  assert states[-1].stopped_at_line and states[-1].v_trusted
