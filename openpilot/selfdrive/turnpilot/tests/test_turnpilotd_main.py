@@ -1,5 +1,6 @@
 """turnpilotd as a process: when the manager runs it, and its loop living through exceptions, since a dead process
 soft-disables openpilot for the rest of the drive."""
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -76,6 +77,13 @@ class LoopSM:
   def all_checks(self, services):
     return self.checks(self.frame)
 
+  def drain(self):
+    """What turnpilotd's own turnpilotDetections socket drains this frame (messaging.drain_sock): the message the SubMaster
+    holds while it is updated, as an Event with its valid."""
+    if not self.updated.get('turnpilotDetections'):
+      return []
+    return [SimpleNamespace(valid=self.valid['turnpilotDetections'], turnpilotDetections=self.data['turnpilotDetections'])]
+
 
 def run_main(frames, failing_frames=0, tracker=None, checks=lambda frame: True, **params):
   sent, sm = [], LoopSM(failing_frames, checks)
@@ -85,6 +93,8 @@ def run_main(frames, failing_frames=0, tracker=None, checks=lambda frame: True, 
   rk.keep_time.side_effect = [None] * (frames - 1) + [Stop()]
   params = FakeParams(**{'TurnPilotEnabled': True, 'CarParams': car_params_bytes(), 'DisengageOnAccelerator': True, **params})
   with mock.patch.object(messaging, 'SubMaster', return_value=sm), mock.patch.object(messaging, 'PubMaster', return_value=pm), \
+       mock.patch.object(messaging, 'sub_sock', return_value=mock.MagicMock()), \
+       mock.patch.object(messaging, 'drain_sock', side_effect=lambda sock, wait_for_one=False: sm.drain()), \
        mock.patch.object(turnpilotd, 'Params', return_value=params), mock.patch.object(turnpilotd, 'Ratekeeper', return_value=rk), \
        mock.patch.object(turnpilotd, 'SceneTracker', return_value=tracker or mock.MagicMock()), \
        mock.patch.object(turnpilotd, 'DEVICE_CAMERAS', mock.MagicMock()), \
@@ -197,7 +207,7 @@ def test_an_invalid_detector_run_is_no_run_never_a_clear_one(valid):
 
 def test_scene_failure_publishes_an_empty_scene_and_goes_on():
   tracker = mock.MagicMock()
-  tracker.update.side_effect = RuntimeError("synthetic failure")
+  tracker.update_runs.side_effect = RuntimeError("synthetic failure")  # every run goes through update_runs (DetectionDrain)
   plans, scenes, errors = run_main(frames=5, failing_frames=0, tracker=tracker)
   assert len(plans) == len(scenes) == 5
   # an empty scene: unavailable, so TurnPilot doesn't act (waiting for the detector; once it has run, a stopped detector)

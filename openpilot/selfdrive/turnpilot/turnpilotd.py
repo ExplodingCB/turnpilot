@@ -149,7 +149,7 @@ from openpilot.selfdrive.turnpilot.lane_planner import (OPENPILOT_SIGNALS_BRANDS
                                                          model_lanes_from_msg)
 from openpilot.selfdrive.turnpilot.route_follower import KEEP, LEFT, TURN, UNCERTAIN_M, RouteFollower
 from openpilot.selfdrive.turnpilot.scene.lane_paint import lane_paint_from_msg
-from openpilot.selfdrive.turnpilot.scene.tracker import STALE_S, SceneTracker, default_yaw_rate
+from openpilot.selfdrive.turnpilot.scene.tracker import MAX_COAST_S, STALE_S, SWEEP_COAST_S, SceneTracker, default_yaw_rate
 from openpilot.selfdrive.turnpilot.scene_policy import (HOLD_LINE_M, NO_ACCEL_CAP, ONCOMING_ENTRY_M, PATH_HALF_WIDTH_M, STOP_DECEL, ScenePolicy,
                                                          far_side_turn, in_path)
 from openpilot.selfdrive.turnpilot.turn_skip import TurnSkip, can_make_turn
@@ -330,6 +330,7 @@ class TurnPilot:
     self._rf_ticked = self._yaw_ticked = False  # update() dead-reckoned the route, and counted the yaw, this frame
     self.go_override = GO_OVERRIDE_DEFAULT  # TurnPilotGoOverride (main())
     self.go_cert = GoCertifier()  # the go certified for plannerd's lift (go_override.py): its ids never repeat while this runs
+    self.sweeping = False  # the last plan asked modeld for a stop sweep (stopSweep, stopSweepGo): the tracker coasts longer
     self.reset()
 
   def reset(self, detector: bool = True, keep_turn: bool = False):
@@ -1379,24 +1380,58 @@ def lane_paint_active(params) -> bool:
 INVALID_RUNS: dict[str, int] = {}  # detector_run: invalid runs in a row, by service
 
 
+def run_invalid(service: str) -> None:
+  """An invalid run of service: counted, the first of a spell logged."""
+  INVALID_RUNS[service] = INVALID_RUNS.get(service, 0) + 1
+  if INVALID_RUNS[service] == 1:
+    cloudlog.event("turnpilot.detector_run_invalid", error=True, service=service)
+
+
+def run_valid(service: str) -> None:
+  """A valid run of service: how many invalid ones came before it, logged."""
+  if INVALID_RUNS.get(service):
+    cloudlog.event("turnpilot.detector_run_valid_again", service=service, invalid_runs=INVALID_RUNS.pop(service))
+
+
 def detector_run(sm, service: str):
-  """The latest run of a detector pass (turnpilotDetections, turnpilotFarDetections) for the tracker, None before the first
-  and while the latest is invalid. modeld publishes a run whose output wasn't finite valid False, its non-finite rows dropped
-  (no boxes, a far run's crop still set): taken as a run it is a clear one, the far crop covering the band. SubMaster sets
-  sm.valid from msg.valid even for services in ignore_valid, so an invalid run is no run (skeptic G6): the left sees none,
-  never clear (stale is its fault), and a detector that stays invalid leaves the scene unavailable (the detector's handback).
-  The first invalid run of a spell is logged, and how many there were when a valid one comes back."""
+  """The latest run of a detector pass (turnpilotFarDetections) for the tracker, None before the first and while the latest
+  is invalid. modeld publishes a run whose output wasn't finite valid False, its non-finite rows dropped (no boxes, a far
+  run's crop still set): taken as a run it is a clear one, the far crop covering the band. SubMaster sets sm.valid from
+  msg.valid even for services in ignore_valid, so an invalid run is no run (skeptic G6): the left sees none, never clear
+  (stale is its fault), and a detector that stays invalid leaves the scene unavailable (the detector's handback). The first
+  invalid run of a spell is logged, and how many there were when a valid one comes back. turnpilotDetections comes through
+  DetectionDrain by the same rule."""
   if not sm.seen[service]:
     return None
   if not sm.valid[service]:
     if sm.updated[service]:
-      INVALID_RUNS[service] = INVALID_RUNS.get(service, 0) + 1
-      if INVALID_RUNS[service] == 1:
-        cloudlog.event("turnpilot.detector_run_invalid", error=True, service=service)
+      run_invalid(service)
     return None
-  if INVALID_RUNS.get(service):
-    cloudlog.event("turnpilot.detector_run_valid_again", service=service, invalid_runs=INVALID_RUNS.pop(service))
+  run_valid(service)
   return sm[service]
+
+
+class DetectionDrain:
+  """turnpilotDetections for the tracker, off turnpilotd's own non-conflated socket (STOP_SIGNS.md 1.3, row E13). modeld
+  publishes it at 20 Hz under a stop sweep, one view a step, and turnpilotd's 20 Hz loop isn't in step with it: SubMaster's
+  socket is conflated, so whenever two runs land between polls it keeps the latest and the other view's run is lost. Every
+  message is drained here each frame; an invalid one is no run (detector_run's rule, logged the same way), and the rest go
+  to the tracker in camera-time order (SceneTracker.update_runs). The SubMaster keeps its subscription for what reads the
+  latest message (the far crop's and side views' status, the camera's lights, lane paint)."""
+  SERVICE = 'turnpilotDetections'
+
+  def __init__(self, sock):
+    self.sock = sock
+
+  def runs(self) -> list:
+    out = []
+    for evt in messaging.drain_sock(self.sock):
+      if not evt.valid:
+        run_invalid(self.SERVICE)
+        continue
+      run_valid(self.SERVICE)
+      out.append(evt.turnpilotDetections)
+    return sorted(out, key=lambda d: d.timestampEof)
 
 
 def main():
@@ -1408,6 +1443,7 @@ def main():
   sm = messaging.SubMaster(['carState', 'carControl', 'navInstruction', 'modelV2', 'turnpilotDetections', 'extrinsicsCalibration',
                             'deviceState', 'narrowRoadCameraState', 'turnpilotLights', 'turnpilotFarDetections'],
                            ignore_alive=optional, ignore_avg_freq=optional, ignore_valid=optional)
+  drain = DetectionDrain(messaging.sub_sock(DetectionDrain.SERVICE, conflate=False))
   rk = Ratekeeper(1. / DT_MDL, print_delay_threshold=None)
   tp = TurnPilot()
   tracker = None
@@ -1440,11 +1476,13 @@ def main():
 
     scene_msg = messaging.new_message('turnpilotScene')
     try:
+      runs = drain.runs()  # every frame, the tracker or not, so nothing piles up
       if tracker is None and sm.seen['deviceState'] and sm.seen['narrowRoadCameraState']:
         device_type = str(sm['deviceState'].deviceType)
         tracker = SceneTracker(DEVICE_CAMERAS[(device_type, str(sm['narrowRoadCameraState'].sensor))], device_type)
       if tracker is not None:
-        tracker.update(detector_run(sm, 'turnpilotDetections'), sm['extrinsicsCalibration'], sm['carState'], sm['modelV2'])
+        tracker.coast_s = SWEEP_COAST_S if tp.sweeping else MAX_COAST_S
+        tracker.update_runs(runs, sm['extrinsicsCalibration'], sm['carState'], sm['modelV2'])
         tracker.update_far(detector_run(sm, 'turnpilotFarDetections'), sm['extrinsicsCalibration'])
         tracker.fill_scene(scene_msg.turnpilotScene)
     except Exception:
@@ -1456,7 +1494,11 @@ def main():
     paint = lane_paint_from_msg(sm['turnpilotDetections'].lanePaint) if scene.available and sm.seen['turnpilotDetections'] else ()
     # the lane planner takes this frame's checks (an offered change aborts at once); the plan's valid has a grace
     valid = sm.all_checks(['carState', 'modelV2'])
-    raw = tracker.raw if tracker is not None and tracker.raw_new else None  # this frame's run, for the unprotected left
+    # this frame's run for the unprotected left: its road camera run when one came (the left reads only the road's), else
+    # the newest of whatever came (the go's path check reads any)
+    raw = None
+    if tracker is not None:
+      raw = tracker.raw_by_view.get('road') if 'road' in tracker.new_views else tracker.raw if tracker.raw_new else None
     raw_far = tracker.raw_far if tracker is not None and tracker.raw_far_new else None  # ...and the far crop's
     msg = tp.plan(sm, scene, enabled, shadow, driver_signals, right_hand_traffic, paint, paint_rule, valid, long_control=long_control,
                   disengage_on_accel=disengage_on_accel, raw=raw, raw_far=raw_far)

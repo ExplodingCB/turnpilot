@@ -2508,3 +2508,69 @@ def test_a_far_crop_suspended_for_a_stop_sweep_is_on_at_route_time_but_not_readi
   sim.far_status = lambda sim: 'sweep'
   sim.run(1.)
   assert sim.tp.far_live(route=True) and not sim.tp.far_live()
+
+
+class RecordingTracker:
+  """A SceneTracker stand-in that records every detector run handed to it, by frameId, once each."""
+  def __init__(self):
+    self.frames, self.tracks, self.raw_by_view, self.new_views, self.coast_s = [], [], {}, set(), 0.5
+    self.raw = self.raw_far = None
+    self.raw_new = self.raw_far_new = self.available = False
+
+  def update(self, det, *a, **k):
+    if det is not None and (not self.frames or self.frames[-1] != det.frameId):
+      self.frames.append(det.frameId)
+    return []
+
+  def update_runs(self, runs, *a, **k):
+    for d in runs:
+      self.update(d)
+    return []
+
+  def update_far(self, *a, **k):
+    pass
+
+  def fill_scene(self, scene, tracks=None):
+    scene.available = False
+
+
+def test_E13_no_detector_message_lost_at_20_hz_out_of_phase():
+  # STOP_SIGNS.md 1.3, E13: modeld publishes turnpilotDetections at 20 Hz, a view a step, and turnpilotd's 20 Hz loop isn't
+  # in step with it: with modeld's phase just under a poll's and a few ms of jitter, two runs land between some polls and
+  # none between others. A conflated socket keeps the latest only, so a run (a side view's, say) is lost; turnpilotd's own
+  # socket, drained, hands the tracker every one, in camera-time order
+  from openpilot.selfdrive.turnpilot.detector.decoder import fill_detections
+  from openpilot.selfdrive.turnpilot.tests import test_turnpilotd_main as tm
+  frames, period, phase = 60, DT_MDL, 0.049
+  views = ['full', 'sideLeft', 'full', 'sideRight']
+
+  def run_msg(k):
+    m = messaging.new_message('turnpilotDetections')
+    fill_detections(m.turnpilotDetections, [], k, int((k * period + phase) * 1e9), 'wide', 0.005)
+    m.turnpilotDetections.view = views[k % 4]
+    return m.as_reader().turnpilotDetections
+  published = [(k * period + phase + 0.003 * math.sin(1.7 * k), run_msg(k)) for k in range(frames)]
+
+  class Bus(tm.LoopSM):
+    def __init__(self, *a, **k):
+      super().__init__(*a, **k)
+      self.seen['turnpilotDetections'], self.batch = True, []
+
+    def update(self, timeout):
+      super().update(timeout)
+      t, prev = self.frame * period, (self.frame - 1) * period
+      self.batch = [m for tp, m in published if prev < tp <= t]
+      if self.batch:
+        self.data['turnpilotDetections'] = self.batch[-1]  # SubMaster's conflated socket: the latest
+      self.updated['turnpilotDetections'] = bool(self.batch)
+
+    def drain(self):
+      return [tm.SimpleNamespace(valid=True, turnpilotDetections=m) for m in self.batch]
+
+  tracker = RecordingTracker()
+  with mock.patch.object(tm, 'LoopSM', Bus):
+    tm.run_main(frames=frames, tracker=tracker)
+  sent = [m.frameId for tp, m in published if tp <= (frames - 1) * period]
+  batches = [sum(1 for tp, _ in published if (j - 1) * period < tp <= j * period) for j in range(frames)]
+  assert max(batches) == 2 and 0 in batches[1:]  # the phase really does put two runs between some polls
+  assert tracker.frames == sent  # every run, once each, in camera-time order
