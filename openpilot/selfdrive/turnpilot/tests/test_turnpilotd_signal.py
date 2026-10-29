@@ -115,3 +115,115 @@ def test_lane_change_waits_for_the_lamp_lead():
   assert offers and requests
   assert plans[requests[0]].turnSignal.litM >= LEAD_LONG_M
   assert all(p.signalPrompt == LaneChange.none for p in plans)
+
+
+# ---------------------------------------------------------------- a turn ended by its maneuver is never handed over (7.7)
+
+def releasing_sim(maneuvers, cruise, driver_left=None):
+  """The car signalling a right turn through a port that answers it: lit while asked, ready once not. driver_left: a dict
+  whose 'on' puts the driver's left lamp up, our right lamp released with NONE for a few frames, then the port idle and
+  blocked by the driver's lamp."""
+  sim = Sim(maneuvers, cruise=cruise, driver_signals=None)
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  state = driver_left if driver_left is not None else {'on': False}
+  state['release'] = 0
+
+  def port(s):
+    if state['on']:
+      state['release'] += 1
+      if state['release'] < 4:
+        return {'status': 'releasing', 'right': True, 'rightLamp': state['release'] < 2, 'leftLamp': True, 'block': 'otherSide'}
+      return {'status': 'ready', 'leftLamp': True, 'block': 'otherSide'}
+    if s.tp.signal_out.side == LaneChange.right:
+      return {'status': 'lit', 'right': True, 'rightLamp': True}
+    return {'status': 'ready'}
+  sim.car_signal = port
+  return sim
+
+
+def handed_over(sim, plans):
+  """(v, plan) of each plan asking the driver to signal (turnSignal.handedOver)."""
+  start = len(sim.trace) - len(plans)
+  return [(sim.trace[start + i][1], p) for i, p in enumerate(plans) if p.turnSignal.handedOver != LaneChange.none]
+
+
+def test_a_vetoed_turn_never_asks_for_the_side_the_driver_signalled_against():
+  driver = {'on': False}
+  sim = releasing_sim(RIGHT_TURN, 13., driver)
+  plans = drive_to(sim, 80.)
+  assert plans[-1].turnSignal.side == LaneChange.right
+  driver['on'] = True
+  plans = drive_to(sim, -40., blinker=True)
+  assert any(str(p.turnSignal.skip) == 'driverSignal' for p in plans)
+  told = handed_over(sim, plans)
+  assert not told, f"skipped on the driver's left lamp, then 'Signal {told[0][1].turnSignal.handedOver} yourself' at {told[0][0]:.1f} m/s"
+
+
+def too_fast_plans():
+  # a right turn 90 m ahead at 20 m/s: armed at once (lead + lag is 119 m), signalled, then skipped as too fast
+  sim = releasing_sim([(90., "turn", "right", junction_of("right")), (2000., "turn", "left")], 20.)
+  sim.v = 20.
+  plans = drive_to(sim, -40.)
+  assert any(p.turnSignal.side == LaneChange.right for p in plans) and any(p.tooFastToTurn for p in plans)
+  return sim, plans
+
+
+def test_a_too_fast_skip_never_asks_the_driver_to_signal():
+  sim, plans = too_fast_plans()
+  told = handed_over(sim, plans)
+  assert not told, f"skipped as too fast, then 'Signal {told[0][1].turnSignal.handedOver} yourself' at {told[0][0]:.1f} m/s"
+
+
+def test_a_turn_the_car_took_ended_by_the_pass_is_never_handed_over():
+  # the car round 66 deg of a 90 deg right (its clear is 80) when the follower counts the junction passed, 15 m past its
+  # furthest reading: DesireTiming done and the maneuver None on the same frame
+  sim = releasing_sim([(300., "turn", "right", junction_of("right")), (2000., "turn", "left")], 13.)
+  drive_to(sim, 5.)
+  plans, turned = [], 0.
+  while sim.distance() > -40. and sim.t < 120.:
+    plans.append(sim.step(engaged=True, yaw_rate=-0.25))
+    turned = max(turned, sim.tp.desires.turned_deg)
+  assert 45. < turned < 80., turned
+  assert not handed_over(sim, plans)
+
+
+def test_selfdrived_says_nothing_about_signalling_after_a_too_fast_skip():
+  """Through selfdrived's own Events, the real alert callbacks and AlertManager: what the screen shows and soundd plays
+  after the too-fast skip, at about 44 mph."""
+  import types
+
+  import openpilot.selfdrive.selfdrived.events as events_mod
+  from openpilot.cereal import log
+  from openpilot.common.realtime import DT_CTRL
+  from openpilot.selfdrive.selfdrived.alertmanager import AlertManager
+  from openpilot.selfdrive.selfdrived.events import ET, Events
+  from openpilot.selfdrive.turnpilot import hooks
+  EventName = log.OnroadEvent.EventName
+  sim, plans = too_fast_plans()
+  ev = hooks.CarSignalEvents()
+  current = {'plan': None}
+  saved = events_mod.CAR_SIGNAL_EVENTS, events_mod.shown_plan
+  events_mod.CAR_SIGNAL_EVENTS, events_mod.shown_plan = ev, lambda sm, now=None: current['plan']
+  try:
+    am = AlertManager()
+    port = types.SimpleNamespace(status='ready', fault='none', check='idle', checkWhy='', stillOn=False, rejected=0)
+    shown, frame = [], 0
+    start = len(sim.trace) - len(plans)
+    for i, p in enumerate(plans):
+      current['plan'] = p
+      for _ in range(5):  # selfdrived's 100 Hz over turnpilotd's 20 Hz
+        events = Events()
+        if p.tooFastToTurn or p.turnMissed:
+          events.add(EventName.turnpilotTooFastToTurn)
+        for name in ev.update(p, port, int(TeslaFlags.CAR_SIGNALS | TeslaFlags.CAR_SIGNALS_RECHECK), DT_CTRL):
+          events.add(getattr(EventName, name))
+        am.add_many(frame, events.create_alerts([ET.PERMANENT, ET.WARNING], [None, None, None, False, 0, None]))
+        am.process_alerts(frame, set())
+        a = am.current_alert
+        shown.append((sim.trace[start + i][1], a.alert_text_1, a.alert_text_2))
+        frame += 1
+  finally:
+    events_mod.CAR_SIGNAL_EVENTS, events_mod.shown_plan = saved
+  assert any(text1 == "Too Fast to Turn" or text1.startswith("Turn") for _, text1, _ in shown), {s[1] for s in shown}
+  bad = [s for s in shown if "yourself" in s[2]]
+  assert not bad, f"after the too-fast skip selfdrived shows {bad[0][1]!r} / {bad[0][2]!r} at {bad[0][0]:.1f} m/s"

@@ -12,7 +12,9 @@ limit is 50 mph or more. The car doesn't know its road's limit unless navd says 
 is the default. A turn arms at that lead plus ARM_LAG_S of travel, the longest the lamp can take to light, and its
 signal is held through stops, the unprotected left's wait and the go from a line until the turn is done (cleared at its
 angle, or passed as the route follower counts it), skipped, missed, rerouted, handed back or disengaged; one whose desire
-never went out also ends PASSED_DIST_M past its junction (passed straight).
+never went out also ends PASSED_DIST_M past its junction (passed straight). Only a handback or a disengagement, with the
+maneuver still ahead, tells the driver to signal it ("Signal Off", handedOver), and never while openpilot steers at 20 mph
+or more; a turn the maneuver ended (done, skipped, passed, missed) never does.
 
 With the car signalling, the driver overrules it before the turn starts (their lamp on the other side, hazards, or our
 lamp put out): the turn is skipped out loud and navd reroutes, except at the unprotected left's hold line, where the
@@ -306,13 +308,14 @@ class TurnSignalIntent:
   def update(self, *, status, port, gates_ok: bool, engaged: bool, lane_side: int, lane_pending: bool, maneuver, maneuver_id,
              distance: float, desires, missed: bool, v_ego: float, dt: float, limit_ms: float = 0.,
              left_lamp: bool = False, right_lamp: bool = False, at_left_line: bool = False, standing: bool = False,
-             go_now: bool = False) -> TurnSignalOut:
+             go_now: bool = False, skipped: bool = False, passed: bool = False) -> TurnSignalOut:
     """status: this frame's TurnSignal.Status; port: carState.carSignal; gates_ok: TurnPilot acting, not shadow, no fault;
     engaged: carControl.enabled; lane_side: the lane planner's side from its warning to the change's end; lane_pending: a
     change is wanted or offered for this maneuver; maneuver: the turn TurnPilot is taking (desire_on), None once skipped,
     dropped or handed back; desires: DesireTiming; missed: turnMissed; left_lamp/right_lamp: the lamps as UI_warning shows
     them (ours and the driver's); at_left_line: the unprotected left stands at its hold line; standing: the car stands
-    held at a line; go_now: TurnPilot's go from a line this frame."""
+    held at a line; go_now: TurnPilot's go from a line this frame; skipped: TurnSkip has skipped this maneuver (too fast,
+    lane unreachable, side uncertain, a veto); passed: the route follower counts it passed and navd hasn't moved on."""
     out = TurnSignalOut(status=status)
     self.prev_status, self.status = self.status, status
     lead = out.lead_m = lead_m(limit_ms, v_ego)
@@ -326,12 +329,16 @@ class TurnSignalIntent:
     d_this = desires.maneuver_id == maneuver_id
     ended = ''
     if self.armed_id is not None:
+      # the maneuver's own ends first (done, skipped, passed, missed): never handed over (DESIGN 7.7), whatever else
+      # happened on the same frame; on the follower's pass frame DesireTiming is already done for a turn the car took
       if maneuver_id != self.armed_id:
         ended = 'maneuver changed'
-      elif maneuver is None:
-        ended = 'skipped or handed back'
       elif d_this and desires.done:
         ended = 'done'
+      elif skipped:
+        ended = 'skipped'
+      elif passed:
+        ended = 'passed'
       elif distance < -PASSED_DIST_M and not standing and not (d_this and (desires.started or desires.turned_deg >= TURN_STARTED_DEG)):
         # no desire out and past the junction as the route follower counts a pass: distance is navd's nearest reading,
         # up to UNCERTAIN_M short of the truth (never while held at a line: a reading past it isn't driving past). A turn
@@ -340,17 +347,18 @@ class TurnSignalIntent:
       elif missed:
         ended = 'missed'
       elif not gates_ok or not engaged:
-        ended = 'disengaged'
+        ended = 'disengaged'  # openpilot disengaged, or TurnPilot handed back: the maneuver still ahead
+      elif maneuver is None:
+        ended = 'dropped'
       elif self.arm_travel > TRAVEL_BACKSTOP_M:
         ended = 'travel backstop'
         cloudlog.event("turnpilot.turn_signal_backstop", error=True, arm_m=round(self.arm_m, 1), travel=round(self.arm_travel, 1))
         self._notice('ranPast')
       if ended:
-        if ended in ('disengaged', 'skipped or handed back') and self.side == self.arm_side and \
-           self._lit_ours(port, self.arm_side) and status == Status.ready:
+        if ended == 'disengaged' and self.side == self.arm_side and self._lit_ours(port, self.arm_side) and status == Status.ready:
           self.handover_side = self.arm_side
         if ended not in ('done',) and self.lit_m > 0.:
-          cloudlog.event("turnpilot.turn_signal_ended", error=ended in ('skipped or handed back', 'passed without turning'),
+          cloudlog.event("turnpilot.turn_signal_ended", error=ended in ('dropped', 'passed without turning'),
                          why=ended, lit_m=round(self.lit_m, 1), arm_m=round(self.arm_m, 1))
         if ended in ('done', 'passed without turning', 'missed', 'travel backstop'):
           self.ended_id = self.armed_id  # never armed again for this maneuver
@@ -413,9 +421,13 @@ class TurnSignalIntent:
       out.signal_lit = self.dark_s[self.arm_side] <= LAMP_GAP_S and self.dark_s[other_side(self.arm_side)] > LAMP_GAP_S
 
     # "Signal Off": a lit car signal ended by a disengagement or handback with its maneuver ahead, once the release is
-    # done and the mask is down, unless the driver's lamp on that side is already lit
+    # done and the mask is down, unless the driver's lamp on that side is already lit. Never while openpilot steers at
+    # 20 mph or more (a TurnPilot handback): a driver's lamp rising there puts DesireHelper in preLaneChange, a lane
+    # change on a nudge; the handback's own alert says take control
     if self.handover_side != LaneChange.none and str(port.status) in ('ready', 'failed') and not (port.left or port.right):
-      if not lamps[self.handover_side]:
+      if engaged and v_ego >= LANE_CHANGE_SPEED_MIN:
+        cloudlog.event("turnpilot.turn_signal_handover_withheld", v_ego=round(v_ego, 2), side=int(self.handover_side))
+      elif not lamps[self.handover_side]:
         self.handed_over, self.handed_t = self.handover_side, HANDED_OVER_S
       self.handover_side = LaneChange.none
     if self.handed_t > 0.:

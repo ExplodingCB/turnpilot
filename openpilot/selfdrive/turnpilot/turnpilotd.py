@@ -616,7 +616,9 @@ class TurnPilot:
                                  missed=plan.turnMissed, v_ego=v_ego, dt=DT_MDL, limit_ms=sm['navInstruction'].speedLimit,
                                  left_lamp=cs.leftBlinker or port.leftLamp, right_lamp=cs.rightBlinker or port.rightLamp,
                                  at_left_line=at_left_line, standing=decision.should_stop or at_left_line,
-                                 go_now=self.release_go)
+                                 go_now=self.release_go,
+                                 skipped=self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id,
+                                 passed=rf.valid and rf.upcoming is None)
     self.signal_out = ts
     ts.fill(plan.turnSignal)
     if ts.skip != 'none' and act_on is not None and not committed and not self.skip.skipped:

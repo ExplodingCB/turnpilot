@@ -332,6 +332,57 @@ def test_not_handed_over_when_the_driver_signals_or_the_turn_ends():
   assert drive.step().handed_over == LaneChange.none
 
 
+def released(drive, n=5, **kw):
+  """The port releasing our lamp, then idle with the mask down: the handover's moment. Every frame's handed_over."""
+  drive.port = port(status='releasing', left=True)
+  out = [drive.step(**kw).handed_over]
+  drive.port = port(status='ready')
+  return out + [drive.step(**kw).handed_over for _ in range(n)]
+
+
+@pytest.mark.parametrize("end", [
+  {'maneuver': None, 'skipped': True},   # skipped: too fast, lane unreachable, side uncertain, a veto
+  {'maneuver': None, 'passed': True},    # the route follower's pass, before navd moves on
+  {'maneuver': None},                    # dropped with TurnPilot acting and engaged
+])
+def test_a_turn_ended_by_its_maneuver_is_never_handed_over(end):
+  """DESIGN 7.7: handedOver is for a request that ended because engagement ended or TurnPilot handed back, never because
+  the maneuver did. After a skip the car may be at road speed (too fast), the driver may just have signalled against the
+  turn (a veto), or the turn may already be behind the car (a pass): "Signal right yourself" is wrong in each."""
+  drive = Drive(m=maneuver("turn", "left"), distance=200.)
+  drive.port = port(status='lit', left=True)
+  drive.until(100.)
+  assert drive.out.side == LaneChange.left
+  assert all(h == LaneChange.none for h in released(drive, **end))
+  assert drive.out.side == LaneChange.none
+
+
+def test_the_pass_frame_of_a_turn_the_car_took_ends_it_done():
+  """The car round 66 of a 90 deg turn's 80 deg clear when the follower counts it passed: DesireTiming done and the
+  maneuver None on the same frame. The turn is done, never handed over."""
+  drive = Drive(distance=20.)
+  drive.port = port(status='lit', left=True)
+  drive.step()
+  drive.d = desires(started=True, done=True, turned=66.)
+  assert all(h == LaneChange.none for h in released(drive, maneuver=None))
+
+
+@pytest.mark.parametrize("v,engaged,handed", [
+  (5., True, True),     # TurnPilot handed back under 20 mph: DesireHelper never takes a lamp first set there
+  (20., False, True),   # openpilot disengaged: lateral off, DesireHelper off
+  (20., True, False),   # TurnPilot handed back at 45 mph, openpilot still steering: a lamp the driver sets now is a lane
+                        # change on a nudge (DesireHelper's preLaneChange), so no text asks for one
+])
+def test_a_handback_asks_for_the_signal_only_where_it_cant_start_a_lane_change(v, engaged, handed):
+  drive = Drive(distance=300., v=v)
+  drive.port = port(status='lit', left=True)
+  drive.until(60.)
+  assert drive.out.side == LaneChange.left
+  out = released(drive, gates_ok=False, engaged=engaged)
+  assert (LaneChange.left in out) == handed, out
+  assert v < LANE_CHANGE_SPEED_MIN or not engaged or not handed
+
+
 def test_signal_lit_for_the_left():
   drive = Drive(distance=20.)
   assert not drive.step().signal_lit
