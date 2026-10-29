@@ -638,6 +638,41 @@ def test_n8_the_maneuver_from_the_route_step_within_30_m_after_the_control(bound
   assert j.maneuver == want
 
 
+@pytest.mark.parametrize('lanes, want', [((1, 1), 13.0), ((2, 2), 16.7), ((3, 0), 14.85), (None, 11.0)])
+def test_g15_the_cross_roads_lanes_move_the_stop_point_back(lanes, want):
+  """A stop or yield's stop point is node - max(11 m, lanes_cross x 3.7 / 2 + 4.0 m + POS_ERR_M 2.0 m + 3.3 m) when the
+  cross road's lanes are known: 13.0 m for 2 lanes, 16.7 m for 4 (STOP_SIGNS.md 1.2, G15). The cross road's lanes are
+  its widest leg's, in and out, each way it carries matched (a one-way leg carries one); one with a direction unmatched
+  isn't known, and the stop point stays."""
+  if lanes is None:
+    cross = [leg(90., match=False), leg(270., match=False)]
+  elif lanes[1] == 0:
+    cross = [leg(90., drive='forward', **{'in': 0, 'out': 3}), leg(270., drive='backward', **{'in': 3, 'out': 0})]
+  else:
+    cross = [leg(90., **{'in': lanes[0], 'out': lanes[1]}), leg(270., **{'in': lanes[0], 'out': lanes[1]})]
+  for kind in ('stop', 'yield'):
+    v = StubJunction([(0., 100., {kind: True}), (100., 400., {})], {100.: cross})
+    c, j = junction_of(route_controls(v, steps())[0], kind)
+    assert abs(100. - c.route_m - want) < 0.01 and abs(j.stop_point_distance - want) < 0.01 and j.stop_point_source == 'default'
+
+
+def test_g15_a_signals_stop_point_never_moves(tmp_path):
+  """Signals keep their stop point however wide the cross road, alone or where a stop or yield shares its node (the
+  signal wins the node); a mapped line already further back than the rule stays where it is."""
+  wide = [leg(90., **{'in': 2, 'out': 2}), leg(270., **{'in': 2, 'out': 2})]
+  for flags in ({'node_signal': True}, {'node_signal': True, 'stop': True}, {'edge_signal': True, 'yield': True}):
+    v = StubJunction([(0., 100., flags), (100., 400., {})], {100.: wide})
+    controls, _ = route_controls(v, steps())
+    assert [(c.kind, round(c.route_m, 1), c.junction_info) for c in controls] == [('signal', 100. - OFF, None)]
+  side = {'77:f': {'kind': 'stop', 'line': list(pt(78.))}}  # the sim's line 22 m back: beyond the rule's 16.7 m
+  v = StubJunction([(0., 100., {'stop': True, 'way_id': 77}), (100., 400., {})], {100.: wide})
+  c, j = junction_of(route_controls(v, steps(), tiles_dir=marked(tmp_path, side))[0])
+  assert round(c.route_m, 1) == 78. - MAP_MARGIN_M and j.stop_point_source == 'mappedLine' and c.line_mapped
+  side = {'77:f': {'kind': 'stop', 'line': list(pt(95.))}}  # 5 m back: the rule moves it to 16.7 m
+  c, j = junction_of(route_controls(v, steps(), tiles_dir=marked(tmp_path, side))[0])
+  assert round(100. - c.route_m, 1) == 16.7 and j.stop_point_source == 'mappedLine'
+
+
 def rail_dir(tmp_path, rail, controls=None):
   d = osm_dir(tmp_path, controls)
   cell = level2_index(LON0, LAT0)
@@ -782,13 +817,15 @@ def context(entries=(), overrides=None, ok=True, error='', today=(2026, 10, 30))
 
 def test_a_counting_survey_sets_the_tiers_the_posted_speed_and_the_stop_point(tmp_path):
   """A survey matched by OSM node id and dated within a year: each approach it records stopping is surveyed (one it records
-  unstopped is no), and its posted sign is the assumed limit (source survey)."""
+  unstopped is no), its posted sign is the assumed limit (source survey), and our approach's stopPointM is the stop point
+  (source survey), closer than the 2-lane rule's 13 m since it is checked against the surveyed edge."""
   v = StubJunction([(0., 100., {'stop': True, 'way_id': 50}), (100., 400., {})], four())
   ctx = context([survey(stops=(True, True, True, False), stop_point=9.8)])
   c, j = junction_of(route_controls(v, steps(), sidecar_dir=allway(tmp_path), context=ctx)[0])
   assert j.surveyed and j.survey['osmNodeId'] == 900
   assert tiers(j) == {0: 'surveyed', 90: 'surveyed', 270: 'no'}
   assert {(a.speed_source, round(a.assumed_limit / 0.44704)) for a in j.approaches} == {('survey', 20)}
+  assert (j.stop_point_source, round(j.stop_point_distance, 1), round(100. - c.route_m, 1)) == ('survey', 9.8, 9.8)
 
 
 def test_a_survey_over_a_year_old_or_of_another_node_is_ignored(tmp_path):
@@ -920,7 +957,7 @@ def test_controls_ahead_lists_the_straight_on_leg_with_role_exit():
   v = StubRoadJunction([(0., 100., {'stop': True}), (100., 250., {}), (250., 400., {'stop': True})],
                        road=[(0., 100.), (100., 250.), (250., 400.)], junctions=junctions)
   controls, status, _ = controls_ahead(v, pt(0.), 3.)
-  assert status == 'ok' and [round(c.route_m) for c in controls] == [89, 389]
+  assert status == 'ok' and [round(c.route_m) for c in controls] == [87, 387]  # the 2-lane cross roads' 13 m
   first, last = (c.junction_info for c in controls)
   assert first.maneuver == last.maneuver == 'unknown'
   assert roles(first) == {0: ('exit', 0), 90: ('right', 90), 270: ('left', -90)}

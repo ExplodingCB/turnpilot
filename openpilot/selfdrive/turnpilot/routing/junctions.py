@@ -30,6 +30,12 @@ suspected), so a plain two-way's cross approaches are never unknown; unknown oth
 missing or stale. The plausibility gate (4.2): a junction where an approach (ours included) is primary or above and
 another two or more class ranks lower is implausible as an all-way, and a survey of it counts only with both looks
 (inPerson and streetImagery) in confirmedBy.
+
+The stop point (stop_offset; stop and yield only, never signals): node - max(the default 11 m or the mapped line's offset,
+lanes_cross x LANE_W_M / 2 + EDGE_PAD_M + POS_ERR_M + STOP_CLEAR_M) when the cross road's lanes are known (13.0 m for 2,
+16.7 m for 4): lanes_cross is the left or right leg at the control's node with the most lanes, in and out, each direction
+it carries matched. At a surveyed junction, the arriving approach's stopPointM (the loader has checked it is far enough
+outside the surveyed lane edge).
 """
 import json
 import math
@@ -37,6 +43,7 @@ from dataclasses import dataclass, field
 from datetime import date
 
 from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
+from openpilot.selfdrive.turnpilot.maps.surveys import POS_ERR_M, STOP_CLEAR_M
 
 LEG_PROBE_M = 8.        # m out along a leg its probe point goes
 LEG_RADIUS_M = 5        # m: the probe's locate radius
@@ -48,6 +55,8 @@ EXIT_AHEAD_TOL = 60.    # deg: off the route, at the road's end, the leg nearest
 ROLE_OPPOSITE_DEG = 45.  # deg either side of straight on: opposite
 ROLE_SIDE_DEG = 135.     # deg: right (+) or left (-) out to this, other past it
 MANEUVER_AFTER_M = 30.   # m after the junction node a route step's maneuver is the control's (N8)
+LANE_W_M = 3.7           # m per cross lane (STOP_SIGNS.md 1.2: the closest plausible near edge)
+EDGE_PAD_M = 4.0         # m: shoulder or parking 3.0 m plus the node's position error 1.0 m
 RAIL_M = 30.             # m from the node a mapped rail crossing is reported within (C7), besides one on our own edge
 RAIL_ON_ROUTE_M = 5.     # m: a crossing this close to the route is on it
 RAIL_NONE = -1.          # railDistance: none within RAIL_M nor on our edge
@@ -440,6 +449,28 @@ def approach(leg: Leg, h_in: float, inb: dict | None, outb: dict | None) -> Appr
   a.lanes_known = (a.inbound or a.outbound) and (not a.inbound or (inb is not None and a.lanes_in > 0)) and \
     (not a.outbound or (outb is not None and a.lanes_out > 0))
   return a
+
+
+def crossing(a: Approach) -> bool:
+  """A leg of the cross road: left or right, the exit included when the route turns onto it."""
+  return a.role in ('left', 'right') or (a.role == 'exit' and ROLE_OPPOSITE_DEG < abs(a.rel_bearing) <= ROLE_SIDE_DEG)
+
+
+def cross_lanes(approaches) -> int | None:
+  """The cross road's lanes at the control's node: the leg of it there with the most, in and out, of those whose every
+  direction was matched with its lanes; None when none is known."""
+  known = [a.lanes_in * a.inbound + a.lanes_out * a.outbound for a in approaches if a.node == 0 and crossing(a) and a.lanes_known]
+  return max(known) if known else None
+
+
+def stop_offset(j: Junction, base: float, mapped: bool, survey_point: float | None) -> tuple[float, str]:
+  """(m from the node to the stop point, its LineSource) for a stop or yield whose default or mapped line puts it base m
+  before the node (module docstring)."""
+  if survey_point is not None:
+    return float(survey_point), 'survey'
+  lanes = cross_lanes(j.approaches)
+  off = base if lanes is None else max(base, lanes * LANE_W_M / 2. + EDGE_PAD_M + POS_ERR_M + STOP_CLEAR_M)
+  return off, 'mappedLine' if mapped else 'default'
 
 
 def osm_node_at(osm, node_id: int, pos) -> int:

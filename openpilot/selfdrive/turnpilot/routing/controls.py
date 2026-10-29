@@ -30,9 +30,10 @@ tools/sim/bridge/beamng/mapsignals.py) gives the sim's real lines, projected ont
 line source sim). Otherwise the edge's end less CONTROL_LINE_M (line source default), for Valhalla's controls and the
 sidecar's alike. Either way less MAP_MARGIN_M. The OSM stop node never sets it: it marks a sign, not a line, 20-40 m back
 on some approaches, and a yield moved back to its sign would end map_controls' YIELD_SPEED cap well short of the merge.
-It is carried as data only (osm_sign_m: the sign nearest the junction on the control's own edge, for route_audit); the
-stop-point rule that knows the cross road's width is SG1b's. osm_node is the OSM junction the sidecar says the control
-governs (0 when it has none).
+It is carried as data only (osm_sign_m: the sign nearest the junction on the control's own edge, for route_audit). A stop or
+yield's stop point (never a signal's) then moves back to junctions.stop_offset's rule where the cross road's lanes are known
+(node - 13 m for 2 lanes, 16.7 m for 4: SG1b, G15), never forward, or to a counting survey's stopPointM. osm_node is the
+OSM junction the sidecar says the control governs (0 when it has none).
 Off the route (controls_ahead): the same, over the road ahead of the car instead of a route's shape. Locate (verbose, by
 the car's heading) gives the edge the car is on and its shape from the car on; from its end node, the edge that carries on
 nearest the bearing it arrives with (within NEXT_HEADING_TOL: the road straight on), and so on to AHEAD_M or AHEAD_EDGES.
@@ -698,7 +699,9 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
     jn.classify(j, osm, not f['suspected'], context)
     j.rail_distance = rail_distance(osm, pts, cum, end_m - span, end_m, nodes[0])
     j.maneuver = 'unknown' if ahead else maneuver_at(steps, starts, f['s'], end_m)
-    j.stop_point_distance, j.stop_point_source = end_m - f['s'], 'mappedLine' if f['mapped'] else 'default'
+    sv = jn.survey_approach(j.survey if j.surveyed else None, j.our_way, j.heading_in)
+    off, j.stop_point_source = jn.stop_offset(j, end_m - f['s'], f['mapped'], sv.get('stopPointM') if sv else None)
+    f['s'], j.stop_point_distance = end_m - off, off
     f['status'] = j.status
     f['info'] = j
 
