@@ -178,6 +178,23 @@ def check_detector(path: Path, chestnut: bool) -> Check:
                "update to a branch that carries it (compile_detector.py builds it on the Mac)")
 
 
+def check_far_crop(path: Path, far_range_m: float, on: bool) -> Check:
+  """The far crop (DESIGN phase 4 G5): its pkl, TurnPilotFarCrop and its measured range (TurnPilotLeftFarRangeM), which a
+  left past the full pass's range (45-55 mph oncoming) needs. Without them those lefts are skipped and rerouted: a warning."""
+  name = "far crop"
+  size = path.stat().st_size if path.is_file() else 0
+  if size <= MIN_PKL_BYTES:
+    why = "empty or a pointer" if path.is_file() else "missing"
+    return Check(name, WARN, f"{path.name} is {why}: no far crop, so no unprotected left past TurnPilotLeftRangeM",
+                 "update to a branch that carries it (compile_detector.py --far builds it on the Mac)")
+  if not on:
+    return Check(name, WARN, "TurnPilotFarCrop is off: no unprotected left past TurnPilotLeftRangeM", "preflight --set TurnPilotFarCrop=1")
+  if far_range_m <= 0.:
+    return Check(name, WARN, "TurnPilotLeftFarRangeM unmeasured (0): 45-55 mph unprotected lefts are skipped and rerouted",
+                 "set it only from a measured recall range on this car's frames")
+  return Check(name, PASS, f"{path.name} ({size / 1e6:.1f} MB), proven range {far_range_m:.0f} m")
+
+
 def check_chestnut(devices: list[dict]) -> Check:
   name = "chestnut"
   seen = [d for d in devices if is_chestnut_usb_id(d["vendorId"], d["productId"], include_bootloader=True)]
@@ -262,7 +279,9 @@ def collect(params) -> list[Check]:
   from openpilot.common.git import get_short_branch
   from openpilot.common.hardware.usb import get_usb_state
   from openpilot.selfdrive.modeld.helpers import chestnut_compiled
-  from openpilot.selfdrive.turnpilot.detector.graph import detector_pkl_path
+  from openpilot.selfdrive.turnpilot.detector.graph import detector_pkl_path, far_detector_pkl_path
+  from openpilot.selfdrive.turnpilot.detector.modeld_detector import far_crop_on
+  from openpilot.selfdrive.turnpilot.turnpilotd import left_far_range_for
   from openpilot.selfdrive.turnpilot.maps.client import MapError, missing_config
   from openpilot.selfdrive.turnpilot.maps.coverage import STATUS_PARAM as COVERAGE_STATUS, CoverageCache
   from openpilot.selfdrive.turnpilot.routing.valhalla_source import ValhallaSource, import_valhalla, locate
@@ -310,6 +329,7 @@ def collect(params) -> list[Check]:
   checks += [
     check_big_model(chestnut_compiled()),
     check_detector(detector_pkl_path(*CAR_CAMERA, chestnut), chestnut),
+    check_far_crop(far_detector_pkl_path(*CAR_CAMERA, chestnut), left_far_range_for(params), far_crop_on(params)),
     check_chestnut(devices),
     check_token(token),
     check_pairing_url(token, local_ip(), PORT),
