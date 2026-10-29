@@ -72,7 +72,7 @@ from openpilot.common.params import UnknownKeyName
 from openpilot.selfdrive.turnpilot.detector.decoder import (decode, decode_far, decode_far_lights, decode_lights, decode_side,
                                                            decode_signs, fill_detections, fill_far, fill_signs)
 from openpilot.selfdrive.turnpilot.detector.graph import (SIDE_INPUT_SIZE, Crop, crop_at, crop_views, detector_pkl_path,
-                                                         far_detector_pkl_path, letterbox, side_detector_pkl_path)
+                                                         far_detector_pkl_path, letterbox, side_detector_pkl_path, side_input_specs)
 from openpilot.selfdrive.turnpilot.detector.light_state import LIGHT_MODE_DEFAULT, LightHead, LightReader, camera_lights_mode
 from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN, LanePaintClassifier, LinePaint, fill_lane_paint
 from openpilot.selfdrive.turnpilot.detector.sideview import (RECALIB_DEG, SIDE_VIEWS, SectorQuality, SideGeometry, SideMap,
@@ -850,9 +850,8 @@ def load_far(model_state, cam_w: int, cam_h: int, index: int, bus) -> FarCrop | 
 
 
 def check_side_specs(art: dict, frame_size: int) -> None:
-  """A side-view pkl's input_specs and metadata against what modeld gives it (compile_detector.side_input_specs): the wide
+  """A side-view pkl's input_specs and metadata against what modeld gives it (graph.side_input_specs): the wide
   frame's view and a SIDE_INPUT_SIZE view's maps, by shape and dtype. Raises ValueError on a mismatch."""
-  from openpilot.selfdrive.turnpilot.detector.compile_detector import side_input_specs
   meta, specs = art['metadata'], art['input_specs']
   want = side_input_specs(*meta.get('camera_size', (0, 0)), '')
   got = {k: tuple(v[:2]) for k, v in specs.items()}

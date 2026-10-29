@@ -34,7 +34,8 @@ import numpy as np
 
 from openpilot.selfdrive.turnpilot.detector.graph import (DEFAULT_MODEL, FAR_CROP_SIZE, INPUT_SIZES, MODELS_DIR, SIDE_INPUT_SIZE, Crop,
                                                          crop_views, detector_pkl_path, far_detector_pkl_path, make_detector,
-                                                         make_far_detector, make_side_detector, onnx_path, side_detector_pkl_path)
+                                                         make_far_detector, make_side_detector, onnx_path, side_detector_pkl_path,
+                                                         side_input_specs)
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 
 
@@ -175,15 +176,6 @@ def _compile_far(cam_w: int, cam_h: int, model: str, out: Path, runs: int, retar
 
 # the demo route's comma four calibration (5beb9b58bd12b691/0000010a--a51155e496): the side views' self-test maps
 SIDE_TEST_RPY, SIDE_TEST_EULER = (-0.0004, 0.16485, 0.004535), (-2.1e-05, 0.00551, -0.00276)
-
-
-def side_input_specs(cam_w: int, cam_h: int, device: str) -> dict:
-  """What the side views' jit takes: the wide frame's NV12 view and one view's maps (sideview.SideMap)."""
-  stride, y_height, uv_height, _ = get_nv12_info(cam_w, cam_h)
-  n = SIDE_INPUT_SIZE[0] * SIDE_INPUT_SIZE[1]
-  return {'input_frame': ((stride * (y_height + uv_height),), np.dtype(np.uint8).str, device),
-          'luma_idx': ((n,), np.dtype(np.int32).str, device), 'chroma_idx': ((n,), np.dtype(np.int32).str, device),
-          'weights': ((3, n), np.dtype(np.uint8).str, device)}
 
 
 def compile_side(cam_w: int, cam_h: int, model: str, out: Path, runs: int, retargetable: bool) -> None:

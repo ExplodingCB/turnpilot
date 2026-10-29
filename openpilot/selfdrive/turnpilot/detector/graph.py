@@ -200,6 +200,17 @@ def far_detector_pkl_path(cam_w: int, cam_h: int, chestnut: bool, models_dir: Pa
   return models_dir / f'{"big_" if chestnut else ""}far_detector_{cam_w}x{cam_h}_tinygrad.pkl'
 
 
+def side_input_specs(cam_w: int, cam_h: int, device: str) -> dict:
+  """What the side views' jit takes (compile_detector writes it, modeld checks it at load): the wide frame's NV12 view and
+  one view's maps (sideview.SideMap), each (shape, numpy dtype str, device)."""
+  import numpy as np
+  stride, y_height, uv_height, _ = get_nv12_info(cam_w, cam_h)
+  n = SIDE_INPUT_SIZE[0] * SIDE_INPUT_SIZE[1]
+  return {'input_frame': ((stride * (y_height + uv_height),), np.dtype(np.uint8).str, device),
+          'luma_idx': ((n,), np.dtype(np.int32).str, device), 'chroma_idx': ((n,), np.dtype(np.int32).str, device),
+          'weights': ((3, n), np.dtype(np.uint8).str, device)}
+
+
 def side_detector_pkl_path(cam_w: int, cam_h: int, chestnut: bool, models_dir: Path = MODELS_DIR) -> Path:
   """The compiled side views for a camera size (detector_pkl_path's naming)."""
   return models_dir / f'{"big_" if chestnut else ""}side_detector_{cam_w}x{cam_h}_tinygrad.pkl'

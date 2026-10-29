@@ -763,3 +763,23 @@ def test_detections_are_published_at_20_hz():
   # the sweep runs a view on every model frame while it holds the car (STOP_SIGNS.md section 1.3)
   from openpilot.cereal.services import SERVICE_LIST
   assert SERVICE_LIST['turnpilotDetections'].frequency == 20.
+
+
+def test_a_side_pkl_is_checked_at_load():
+  # modeld loads the side pkl only if its input_specs and metadata are what it gives it: the wide frame's view and a
+  # 768x512 view's maps (graph.side_input_specs, which compile_detector writes)
+  from openpilot.selfdrive.turnpilot.detector.graph import side_input_specs
+  from openpilot.selfdrive.turnpilot.detector.modeld_detector import check_side_specs
+  from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
+  stride, y_height, uv_height, _ = get_nv12_info(1344, 760)
+  size = stride * (y_height + uv_height)
+  meta = {'kind': 'side', 'camera_size': (1344, 760), 'input_size': (768, 512)}
+  check_side_specs({'metadata': meta, 'input_specs': side_input_specs(1344, 760, 'AMD')}, size)
+  bad = side_input_specs(1344, 760, 'AMD')
+  bad['weights'] = ((2, 768 * 512), bad['weights'][1], 'AMD')
+  for art, frame_size in (({'metadata': meta, 'input_specs': bad}, size),
+                          ({'metadata': {**meta, 'kind': 'far'}, 'input_specs': side_input_specs(1344, 760, 'AMD')}, size),
+                          ({'metadata': {**meta, 'input_size': (640, 384)}, 'input_specs': side_input_specs(1344, 760, 'AMD')}, size),
+                          ({'metadata': meta, 'input_specs': side_input_specs(1344, 760, 'AMD')}, size + 128)):
+    with pytest.raises(ValueError):
+      check_side_specs(art, frame_size)
