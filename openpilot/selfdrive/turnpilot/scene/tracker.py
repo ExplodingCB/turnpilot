@@ -164,6 +164,7 @@ class Measurement:
   R: np.ndarray | None = None    # its covariance
   plausible: bool = True         # False for a person box that can't be a standing person; update() drops those
   bearing: float | None = None   # deg left of the calibrated axis of its bottom centre (calibrated runs only)
+  span: tuple | None = None      # (right edge, left edge) bearings at its bottom
 
 
 @dataclass
@@ -185,6 +186,7 @@ class Track:
   view: str = 'full'           # the pass of its last match: full, far, sideLeft, sideRight
   bearing_seen: float | None = None  # deg left of the calibrated axis of its last match's bottom centre (stop_evidence.py)
   width_seen: float = 0.             # px, its last match's box width in its camera's frame
+  span_seen: tuple | None = None     # (right edge, left edge) bearings of its last match's bottom (visibility.py's occluders)
 
   @property
   def cls(self) -> int:
@@ -260,6 +262,7 @@ class SceneTracker:
     lens = self.lenses[camera]
     rot = calib_from_view(list(calibration.rpyCalib), wide_euler)
     m.bearing = bearing_deg(lens, rot, (box[0] + box[2]) / 2, box[3])
+    m.span = (bearing_deg(lens, rot, box[2], box[3]), bearing_deg(lens, rot, box[0], box[3]))
     xy = ground_point(lens, rot, camera_height(calibration), (box[0] + box[2]) / 2, box[3])
     if xy is None:
       return m
@@ -313,7 +316,7 @@ class SceneTracker:
     trk.class_votes[m.cls] = trk.class_votes.get(m.cls, 0.0) + m.conf
     trk.hits += 1
     trk.view = view
-    trk.bearing_seen, trk.width_seen = m.bearing, float(m.box[2] - m.box[0])
+    trk.bearing_seen, trk.width_seen, trk.span_seen = m.bearing, float(m.box[2] - m.box[0]), m.span
     if m.xy is None:
       return
     if trk.x is None or trk.P is None:
@@ -327,7 +330,7 @@ class SceneTracker:
 
   def new_track(self, m: Measurement, camera: str, t: float, view: str = 'full') -> None:
     trk = Track(self.next_id, camera, m.box, m.box, t, m.conf, {m.cls: m.conf}, t=t, view=view, bearing_seen=m.bearing,
-                width_seen=float(m.box[2] - m.box[0]))
+                width_seen=float(m.box[2] - m.box[0]), span_seen=m.span)
     self.init_state(trk, m)
     self.next_id += 1
     self.tracks.append(trk)
