@@ -25,7 +25,7 @@ turned off that road). A route again takes over the engaged off-route ones the s
 Off the route with a destination and nothing known ahead (off_route_unknown), past OFF_ROUTE_GRACE_S: the lookup pending,
 failed, unsupported or partial, or none fresh for OFF_LOOKUP_STALE_S (navd gone quiet). The policy caps the speed and says so.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from openpilot.common.swaglog import cloudlog
@@ -34,6 +34,7 @@ from openpilot.selfdrive.turnpilot.route_follower import NAV_STALE_S
 CORRECTION_M = 0.5    # a fix moves the dead-reckoned distance at most this far
 FREEZE_SPEED = 0.5    # m/s: slower than this, fixes are ignored
 JUMP_M = 20.          # a fix this far off re-initialises the distance
+FIX_SPREAD_M = 20.    # m of travel a control's fixes are kept over for their spread (fix_spread)
 ADOPT_M = 20.         # a new route's control this close to an engaged one of the same kind is that one
 DROP_PAST_M = 15.     # a control this far behind the car is passed
 GAP_MAX_M = 150.      # m dead-reckoned without navd before the controls are dropped
@@ -60,6 +61,14 @@ class TrackedControl:
   misses: int = 0            # off-route lookups in a row it was missing from
   state: Any = None          # the policy's own state for it
   junction_info: dict | None = None  # a stop or yield's MapControl.junctionInfo as a dict (routing/junctions.py); None a signal's
+  fixes: list = field(default_factory=list)  # (odometer m, navd's distance plus it) of its moving fixes over the last FIX_SPREAD_M
+
+  @property
+  def fix_spread(self) -> float:
+    """m navd's fixes of it disagree by, its odometry removed, over the last FIX_SPREAD_M of fixes (frozen at the latch, as
+    fixes are while held): the stop-sign decider's position fault (STOP_SIGNS.md 7.1 H2)."""
+    vals = [x for _, x in self.fixes]
+    return max(vals) - min(vals) if len(vals) >= 2 else 0.
 
 
 def from_msg(route_count: int, c) -> TrackedControl:
@@ -99,11 +108,13 @@ class ControlTracker:
     self.off_status = 'none'  # navInstruction.offRouteControlsStatus of the last invalid message; none after a valid one
     self.gap_t = 0.          # s off the route (invalid or stale)
     self.lookup_age = float('inf')  # s since the last lookup ahead that said something
+    self.odo = 0.            # m driven (dead reckoned): the odometer TrackedControl.fixes are kept against
 
   def update(self, nav, updated: bool, valid: bool, v_ego: float, dt: float) -> list[TrackedControl]:
     """nav: the latest navInstruction; updated: it arrived this frame; valid: its valid flag. The controls nearest first."""
     v = max(v_ego, 0.)
     self.lost = []
+    self.odo += v * dt
     for c in self.controls.values():
       c.jumped = False
       if not c.held:
@@ -189,7 +200,7 @@ class ControlTracker:
         continue
       if t.held:
         continue
-      self._correct(t, key, float(c.distance), v)
+      self._correct(t, key, float(c.distance), v, self.odo)
     # back on the route: its own control takes over an engaged off-route one, the same control
     for k, o in list(self.controls.items()):
       if k[0] == OFF_ROUTE and (o.engaged or o.held) and adopt(o, [self.controls[m] for m in measured if m in self.controls]):
@@ -198,8 +209,12 @@ class ControlTracker:
     self.controls = {k: c for k, c in self.controls.items() if k in measured or c.engaged or c.held}
 
   @staticmethod
-  def _correct(t: TrackedControl, key, measured: float, v: float) -> None:
-    """A fix of a dead-reckoned distance: at most CORRECTION_M, none while slow, a jump re-initialises it."""
+  def _correct(t: TrackedControl, key, measured: float, v: float, odo: float | None = None) -> None:
+    """A fix of a dead-reckoned distance: at most CORRECTION_M, none while slow, a jump re-initialises it. A moving fix on
+    the route is kept for its spread (fix_spread), the odometer added back."""
+    if odo is not None and v >= FREEZE_SPEED:
+      t.fixes.append((odo, measured + odo))
+      t.fixes[:] = [x for x in t.fixes if x[0] >= odo - FIX_SPREAD_M]
     err = measured - t.d
     if abs(err) > JUMP_M:
       cloudlog.event("turnpilot.control_jump", kind=t.kind, key=list(key), d=round(t.d, 1), measured=round(measured, 1))
