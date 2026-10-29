@@ -132,6 +132,27 @@ def test_C1_a_surveyed_validated_all_way_goes_by_itself_after_the_full_stop_and_
   assert all(dd.prompt == 'waitingForCross' for dd in out[round(1.1 / DT_MDL):i])
 
 
+def test_a_faulted_plan_withdraws_a_go_in_hand_with_the_capped_abort_and_keeps_its_own_hold_never_the_latchs(tmp_path):
+  # turnpilotd.fault_limits (update() isn't run on a faulted frame): before the go the latch holds and the decider asks
+  # nothing; a go in hand is withdrawn (a fault is no time to cross) with the capped abort short of d_edge_min, never under
+  # -2.0; standing again with the latch gone, the decider's own hold keeps the car (STOP_SIGNS.md 2.6, owner rule)
+  w = World(tmp_path)
+  out = w.run(1.5)
+  assert out[-1].state in ('stopped', 'observe') and w.sg.fault_stops(0., w.odo) == []
+  out = w.run(4.)
+  assert first_go(out) is not None and w.sg.state == 'going'
+  w.v, w.a = 1.5, 1.0
+  w.run(0.3)
+  v, d_min = w.v, w.sg.edges.d_min
+  stops = w.sg.fault_stops(v, w.odo)
+  assert w.sg.state == 'observe' and w.sg.withdrawn == 'fault' and w.sg.retries == 1
+  assert len(stops) == 1 and -2.0 <= stops[0].accel_cap < 0. and stops[0].speed_cap == 0.
+  assert w.sg.pos_ref + (w.odo - w.sg.odo_ref) + stops[0].d_stop <= d_min - sr.M_EDGE + 1e-6
+  w.v, w.a = 0., 0.
+  held = w.sg.fault_stops(0., w.odo)
+  assert len(held) == 1 and held[0].should_stop and held[0].speed_cap == 0. and held[0].reason
+
+
 # ------------------------------------------------------------------------------------------------- the closed loop harness
 
 

@@ -232,6 +232,7 @@ class StopGoDecision:
   position_m: float = 0.
   maneuver: str = 'straight'
   holds: list = field(default_factory=list)  # this frame's Holds (the ledger's inputs)
+  acting: bool = False            # the mode acts (auto with its data, trial): not as shadow
   log: dict = field(default_factory=dict)
 
 
@@ -298,6 +299,7 @@ class StopGo:
     self.ev: dict = {}
     self.t = 0.                    # s on the decider's clock this encounter
     self.pos_ref, self.odo_ref = 0., 0.
+    self.latched = False           # the latch held the car last frame (fault_stops leaves a latched hold to it)
     self.dwell_s = 0.
     self.stand_s = 0.
     self.arrived_t: float | None = None
@@ -1237,10 +1239,31 @@ class StopGo:
                    t=round(self.t, 2))
     d.prompt, d.reason, d.fault, d.ledger, d.latch, d.action = 'stopSignTakeControl', self.fault_reason, h, FAULT, 'fault', 'awaitingDriver'
 
+  def fault_stops(self, v: float, odo: float) -> list:
+    """A faulted plan's (turnpilotd.fault_limits: update() isn't run): a go in hand withdrawn (its capped abort; a fault is
+    no time to cross), a capped abort in hand carried on, the decider's own hold on a standing car kept. The latch keeps its
+    own (map_controls)."""
+    if self.token is None:
+      return []
+    pos = self.pos_ref + (odo - self.odo_ref)
+    if self.state == 'going':
+      self.retries += 1
+      self.withdrawn, self.go = 'fault', None
+      self.aborting = {'to': self.edges.d_min - sr.M_EDGE, 'why': 'fault'}
+      self.state, self.clear_s = 'observe', 0.
+      cloudlog.event("turnpilot.stop_go_withdrawn", key=list(self.key), why='fault', pos=round(pos, 2),
+                     v=round(v, 2), retries=self.retries)
+    if self.aborting is not None and v >= STAND_V:
+      return [capped_abort(v, self.aborting['to'] - pos, "Stopping short: fault")]
+    if self.state in ('observe', 'ladder') and not self.latched:
+      return [hold_here(v, self.fault_reason or "Stopped at stop sign")]
+    return []
+
   # ------------------------------------------------------------------------------------------------------------- output
 
   def _finish(self, f: Frame, d: StopGoDecision, acting: bool, why: str) -> None:
-    d.state = self.state
+    d.state, d.acting = self.state, acting
+    self.latched = f.control is not None
     d.clear_s, d.rank, d.retries, d.crept_m = self.clear_s, self.rank, self.retries, self.crept_m
     d.side_live = f.side_status in SIDE_LIVE
     d.maps_valid = f.side_status != 'mapsStale'
