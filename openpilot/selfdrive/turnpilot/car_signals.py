@@ -10,8 +10,9 @@ LANE_CHANGE_SPEED_MIN a one-sided driver's blinker is a lane change on a nudge).
 The legal distance (IC 9-21-8-25): a turn or lane change is signalled continuously for the last 200 ft, 300 ft where the
 limit is 50 mph or more. The car doesn't know its road's limit unless navd says (navInstruction.speedLimit), so 300 ft
 is the default. A turn arms at that lead plus ARM_LAG_S of travel, the longest the lamp can take to light, and its
-signal is held through stops and the unprotected left's wait until the turn is done, skipped, missed, passed straight,
-rerouted, handed back or disengaged.
+signal is held through stops, the unprotected left's wait and the go from a line until the turn is done (cleared at its
+angle, or passed as the route follower counts it), skipped, missed, rerouted, handed back or disengaged; one whose desire
+never went out also ends PASSED_DIST_M past its junction (passed straight).
 
 With the car signalling, the driver overrules it before the turn starts (their lamp on the other side, hazards, or our
 lamp put out): the turn is skipped out loud and navd reroutes, except at the unprotected left's hold line, where the
@@ -27,7 +28,7 @@ from opendbc.car.tesla.values import TeslaFlags
 from openpilot.cereal import custom
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.desire_helper import LANE_CHANGE_SPEED_MIN
-from openpilot.selfdrive.turnpilot.route_follower import LEFT, TURN, KEEP
+from openpilot.selfdrive.turnpilot.route_follower import LEFT, PASSED_DIST_M, TURN, KEEP
 
 LaneChange = custom.TurnpilotPlan.LaneChange
 TurnSignal = custom.TurnpilotPlan.TurnSignal
@@ -331,8 +332,11 @@ class TurnSignalIntent:
         ended = 'skipped or handed back'
       elif d_this and desires.done:
         ended = 'done'
-      elif distance < 0. and not standing and not (d_this and desires.turned_deg >= TURN_STARTED_DEG):
-        ended = 'passed without turning'  # (never while held at a line: a reading jumping past it isn't driving past)
+      elif distance < -PASSED_DIST_M and not standing and not (d_this and (desires.started or desires.turned_deg >= TURN_STARTED_DEG)):
+        # no desire out and past the junction as the route follower counts a pass: distance is navd's nearest reading,
+        # up to UNCERTAIN_M short of the truth (never while held at a line: a reading past it isn't driving past). A turn
+        # whose desire is out ends only done, missed or passed on, never as the car pulls into it from a line
+        ended = 'passed without turning'
       elif missed:
         ended = 'missed'
       elif not gates_ok or not engaged:

@@ -11,7 +11,7 @@ from openpilot.selfdrive.turnpilot import car_signals as cs_mod
 from openpilot.selfdrive.turnpilot.car_signals import (ARM_LAG_S, CAR_SIGNAL_WAIT_S, LEAD_LONG_M, LEAD_SHORT_M, TRAVEL_BACKSTOP_M,
                                                         TurnSignalIntent, check_record, command_side, driver_signals_for, fw_list,
                                                         lead_m, port_signals, promote, record_matches, resolver, vin_valid)
-from openpilot.selfdrive.turnpilot.route_follower import classify, Maneuver
+from openpilot.selfdrive.turnpilot.route_follower import PASSED_DIST_M, classify, Maneuver
 
 LaneChange = custom.TurnpilotPlan.LaneChange
 Status = custom.TurnpilotPlan.TurnSignal.Status
@@ -123,7 +123,7 @@ def test_ends(end):
   if end == "done":
     drive.d = desires(started=True, done=True, turned=90.)
   elif end == "passed":
-    drive.distance = -2.
+    drive.distance = -PASSED_DIST_M - 1.  # past the junction as the route follower counts a pass
   elif end == "new_id":
     drive.distance = 500.  # the new maneuver, far off: not armed in its turn
   kw = {"new_id": {'maneuver_id': 1}, "skipped": {'maneuver': None}, "missed": {'missed': True},
@@ -137,6 +137,62 @@ def test_passed_with_the_yaw_holds_until_done():
   drive.d = desires(started=True, turned=20.)
   drive.distance = -3.
   assert drive.step().side == LaneChange.left
+
+
+def test_a_near_reading_past_the_junction_never_ends_it():
+  """rf.distance is the nearest of navd's readings (route_follower.JunctionSpan), up to UNCERTAIN_M short of the truth:
+  without a desire out, the signal ends only PASSED_DIST_M past it, as every other TurnPilot rule counts a pass."""
+  drive = Drive(distance=20.)
+  drive.step()
+  drive.distance = -2.
+  assert drive.step().side == LaneChange.left
+  drive.distance = -PASSED_DIST_M + 1.
+  assert drive.step().side == LaneChange.left
+
+
+def test_a_started_turn_ends_only_done_missed_or_passed_on():
+  """Once its desire is out, the turn's signal ends when the turn is done (cleared at its angle, or the follower's pass),
+  missed, or the maneuver moves on, never on a reading past the junction while the car pulls into it."""
+  drive = Drive(distance=20.)
+  drive.step()
+  drive.d = desires(started=True, turned=3.)
+  drive.distance = -14.
+  drive.v = 2.
+  assert all(s == LaneChange.left for s in (drive.step().side for _ in range(40)))
+  assert drive.step(missed=True).side == LaneChange.none
+
+
+def test_unprotected_left_keeps_its_signal_through_the_go():
+  """At the go from the left's hold line the lamp stays lit while the car pulls across the oncoming road, with the
+  junction's nearest reading at -1 m (the car at its line, LINE_D short of the maneuver point) and the turn under 15 deg."""
+  drive = Drive(m=maneuver("turn", "left"), distance=140., v=10.)
+  drive.kw = {'left_lamp': True}
+  drive.port = port(status='lit', left=True, left_lamp=True)
+  drive.until(6.)
+  assert drive.out.side == LaneChange.left
+  drive.v, drive.distance = 0., -1.
+  drive.step(100, at_left_line=True, standing=True)
+  assert drive.out.side == LaneChange.left
+  drive.d = desires(started=True)
+  sides = []
+  for i in range(20):
+    drive.v = min(0.5 + 0.2 * i, 4.)
+    drive.d.turned_deg = 0.6 * i  # about 12 deg over the first second from a standstill
+    sides.append(drive.step(go_now=i == 0).side)
+  assert all(s == LaneChange.left for s in sides), sides
+
+
+def test_stop_sign_right_keeps_its_signal_through_the_go():
+  drive = Drive(m=maneuver("turn", "right"), distance=120., v=8.)
+  drive.kw = {'right_lamp': True}
+  drive.port = port(status='lit', right=True, right_lamp=True)
+  drive.d = desires(started=True)
+  drive.until(2.)
+  drive.v, drive.distance = 0., -0.5  # stopped at the line; navd's nearest reading puts the junction 0.5 m behind
+  drive.step(60, standing=True)
+  assert drive.out.side == LaneChange.right
+  drive.v = 0.3
+  assert drive.step(go_now=True).side == LaneChange.right, "right signal dropped the frame the car pulled away"
 
 
 def test_travel_backstop_says_so():
