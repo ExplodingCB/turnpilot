@@ -515,6 +515,22 @@ def test_far_matches_tag_tracks_and_never_feed_confirmation():
   assert fresh.tracks == [] and fresh.raw is None and fresh.raw_far is not None
 
 
+def test_stop_signs_never_become_tracks_or_raw_boxes():
+  # a stop sign (COCO 11) rides in the message's signs, in shadow: the tracker reads detections only, so no track, raw box,
+  # and so no stop, cap or release comes of one
+  tracker = SceneTracker(CAMS, 'mici')
+  sign = detections(tracker, 'road', 1.0, [(CAR, 12.0, 0.0, 0.8)])
+  msg = messaging.new_message('turnpilotDetections')
+  td = msg.turnpilotDetections
+  fill_detections(td, np.zeros((0, 6), np.float32), 0, int(1e9), 'road', 0.005)
+  s = td.init('signs', 1)[0]
+  d = sign.detections[0]
+  s.box.cls, s.box.conf, s.box.x0, s.box.y0, s.box.x1, s.box.y1 = 11, 0.9, d.x0, d.y0, d.x1, d.y1
+  for k in range(5):
+    tracks = tracker.update(msg.as_reader().turnpilotDetections, calibration(), car_state(0.), now=1.0 + 0.1 * k)
+  assert tracks == [] and tracker.raw is not None and tracker.raw.boxes == []
+
+
 def test_the_tracker_says_which_lens_it_uses():
   from openpilot.selfdrive.turnpilot.scene.ranging import wide_lens
   tracker = SceneTracker(CAMS, 'mici')

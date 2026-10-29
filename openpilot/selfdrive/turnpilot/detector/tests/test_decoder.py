@@ -110,3 +110,30 @@ class TestFarDecoder(OpenpilotTestCase):
     # the full pass's messages say view full and what the far pass is doing
     full = messaging.new_message('turnpilotDetections').turnpilotDetections
     assert str(full.view) == 'full' and str(full.farStatus) == 'unset'
+
+
+class TestSideDecoder(OpenpilotTestCase):
+  def test_stop_signs_never_reach_the_detections(self):
+    # COCO 11, decoded apart (decode_signs) like the class-9 lights: the tracker, and so every stop, cap and release, never
+    # sees one
+    from openpilot.selfdrive.turnpilot.detector.decoder import STOP_SIGN, decode_signs
+    rows = [[10, 50, 60, 120, 0.9, STOP_SIGN], [100, 50, 160, 120, 0.8, PERSON], [200, 50, 260, 120, 0.7, TRAFFIC_LIGHT]]
+    assert decode(raw_output(rows), LB)[:, 5].tolist() == [PERSON]
+    signs = decode_signs(raw_output(rows), LB)
+    assert signs[:, 5].tolist() == [STOP_SIGN]
+    np.testing.assert_allclose(signs[0, :4], [*LB.to_frame(10, 50), *LB.to_frame(60, 120)], atol=1e-3)
+
+  def test_side_boxes_map_back_to_fisheye_pixels_and_the_dash_is_dropped(self):
+    from openpilot.selfdrive.turnpilot.detector.decoder import decode_side
+    from openpilot.selfdrive.turnpilot.detector.tests.test_sideview import geometry
+    geom = geometry()
+    rows = [[300, 160, 380, 215, 0.7, CAR],
+            [20, 380, 760, 512, 0.9, CAR],    # our dash: wider than 0.9 of the view and at its bottom
+            [20, 300, 700, 400, 0.9, TRUCK],  # wide, but clear of the bottom: a real truck close by
+            [300, 160, 380, 215, 0.9, 11],    # a stop sign: never a detection
+            [300, 160, 380, 215, 0.2, CAR]]   # too unsure
+    for name in ('sideLeft', 'sideRight'):
+      dets = decode_side(raw_output(rows), geom, name)
+      assert dets[:, 5].tolist() == [TRUCK, CAR], name
+      np.testing.assert_allclose(dets[1, :4], geom.box_to_fisheye(name, (300, 160, 380, 215)), atol=1e-3)
+      assert np.all(dets[:, :4] >= 0) and np.all(dets[:, [0, 2]] <= geom.cam_w) and np.all(dets[:, [1, 3]] <= geom.cam_h)
