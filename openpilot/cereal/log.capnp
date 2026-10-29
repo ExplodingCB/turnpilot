@@ -2528,9 +2528,9 @@ struct NavInstruction {
     turnAngle @8 :Float32;            # deg, from headingIn to the road the route leaves by (+ right, -180 to 180)
     roundabout @9 :Bool;              # the road the route leaves by is a roundabout's
     divided @10 :Bool;                # the junction spans more than one node (internal-intersection edges: a divided road)
-    railDistance @11 :Float32;        # m to the nearest mapped rail level crossing (the OSM sidecar's): along the route on the
-                                      # control's own edge, else straight-line from the node; -1 none within 50 m; -2 unknown
-                                      # (no sidecar)
+    railDistance @11 :Float32;        # m to the nearest mapped rail level crossing (the OSM sidecar's): along the route for one
+                                      # on the control's own edge however far back, else straight-line from the node within 30 m;
+                                      # -1 none; -2 unknown (no current sidecar)
     sidecar @12 :Bool;                # the OSM stop-sign sidecar was there and current for this junction
     suspected @13 :Bool;              # a suspected unmapped stop: every road crossing outranks ours by two or more classes and
                                       # nothing is mapped on our approach (the control's kind is stop)
@@ -2566,7 +2566,8 @@ struct NavInstruction {
   enum JunctionStatus {
     none @0;          # no junction data: a signal, or a navd before SG1b
     ok @1;
-    failed @2;        # the OSM sidecar missing or stale, the junction lookup (locate) failed, or the overrides unreadable
+    failed @2;        # the OSM sidecar missing or stale, the junction lookup (locate) failed, the overrides unreadable, or
+                      # the control at a node no other road meets with no junction found ahead for it
   }
   enum LineSource {
     default @0;       # node less max(11 m or the mapped line, the cross road's near edge + 2 m position error + 3.3 m)
