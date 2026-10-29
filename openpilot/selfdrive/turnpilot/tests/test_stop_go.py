@@ -1202,6 +1202,22 @@ def test_O5_O15_a_model_that_wont_start_is_withdrawn_retried_then_h5(tmp_path):
   assert all(d.takeover_s < 0. for d in out)
 
 
+def test_a_turn_desire_before_the_first_go_holds_it_and_the_gos_own_pulse_never_holds_its_retry(tmp_path):
+  # 2.4 item 3: a turn pulse before the go curls the car and throws away a side's reach: no go while one is out. The go's
+  # own pulse (turnpilotd sends the turn's first pulse with the decider's go) is no such pulse: after a withdrawn go the yaw
+  # and the wheel say whether the car curled, and the retry goes
+  w = World(tmp_path, maneuver='right')
+  out = w.run(5., desire_out=True)
+  assert first_go(out) is None and any(h.key == 'yaw' for h in out[-1].holds)
+  w = Drive(tmp_path, maneuver='right', behaviour=lambda w: 'holds')
+  out = w.run(4.)
+  i = first_go(out)
+  assert i is not None
+  out = w.run(12., desire_out=True)
+  assert any(d.withdraw for d in out) and first_go(out) is not None
+  assert not any(h.key == 'yaw' for d in out for h in d.holds)
+
+
 def next_stop(d=20.):
   """Another stop sign engaged d m ahead, not held (a G18 frontage stop, the far line of a divided road)."""
   return SimpleNamespace(key=(0, 2), kind='stop', d=d, held=False, state=SimpleNamespace(moved_m=0.))

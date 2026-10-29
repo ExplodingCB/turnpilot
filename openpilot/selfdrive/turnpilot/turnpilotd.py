@@ -606,7 +606,9 @@ class TurnPilot:
     # no turn desire before its go, a pulse curls the car 39-49 deg and throws away a side's reach)
     sg_turn = sg.acting and sg.state in STOP_GO_HOLDS_PULSE and sg.maneuver in ('left', 'right')
     hold_pulse = (self.left_now is not None and self.left_now.state in LEFT_HOLDS_PULSE) or sg_turn
-    pulse_at_go = (self.left_now is not None and self.left_now.state != 'off') or sg_turn
+    # ...and its first pulse is the decider's go, from the go on too (the go frame is 'going'): never skipped tooLate there
+    sg_go_turn = sg.acting and sg.state not in ('off', 'done') and sg.maneuver in ('left', 'right')
+    pulse_at_go = (self.left_now is not None and self.left_now.state != 'off') or sg_go_turn
 
     # too fast to make the turn: skipped, so nothing below acts on it (no desire, no cap, no turn holds or lane changes)
     desire_out = self.desires.maneuver_id == rf.maneuver_id and self.desires.started

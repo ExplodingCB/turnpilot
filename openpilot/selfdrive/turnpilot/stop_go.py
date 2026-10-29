@@ -338,6 +338,7 @@ class StopGo:
     self.lights = deque(maxlen=SIGNAL_HEAD_OF)
     self.signal_seen = False
     self.retries = 0
+    self.went = False              # a stopSign go has gone out this encounter (its turn's pulse with it)
     self.rollups = 0
     self.clear_boxes = 0
     self.stall_s = 0.
@@ -645,7 +646,7 @@ class StopGo:
                'tracks': self._known_tracks(f)}
     self.takeover.reset()
     self.takeover_s, self.uncommit_s = -1., 0.
-    self.state, self.clear_s = 'going', 0.
+    self.state, self.clear_s, self.went = 'going', 0., True
     self.static_s = self.dynamic_s = 0.
     self.next_chime = WAIT_INFO_S
     d.release = (self.key, 'clear') if ctl is not None else None
@@ -799,8 +800,9 @@ class StopGo:
     # 9 a signal head at the junction (C20)
     if self.signal_seen:
       holds.append(Hold('signal', "signal at junction", STATIC))
-    # 3 straight on its approach, no turn desire
-    if not launch and (abs(f.yaw20_deg) > YAW_GO_DEG or abs(f.steer_deg) > STEER_GO_DEG or f.desire_out):
+    # 3 straight on its approach, no turn desire before our first go (our own go's pulse is that go's: after a withdrawn go the
+    # yaw and the wheel say whether it curled the car)
+    if not launch and (abs(f.yaw20_deg) > YAW_GO_DEG or abs(f.steer_deg) > STEER_GO_DEG or (f.desire_out and not self.went)):
       holds.append(Hold('yaw', "the car isn't straight on its approach", STATIC))
     # 2 the views the maneuver needs, fresh on camera time (the side views while the speed gate runs them); E7, E8
     holds += self._view_holds(f)

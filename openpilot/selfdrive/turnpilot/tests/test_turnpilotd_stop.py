@@ -15,7 +15,7 @@ from openpilot.selfdrive.turnpilot.map_controls import STOP_SIGN_REASON
 from openpilot.selfdrive.turnpilot.routing.tests.test_certify import ETA, LAT, LON, NODE, survey, visibility
 from openpilot.selfdrive.turnpilot.scene.tracker import RawFrame
 from openpilot.selfdrive.turnpilot.tests.synthetic import model_v2
-from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import FakeParams, Sim
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Desire, FakeParams, Sim
 from openpilot.selfdrive.turnpilot.tests.test_visibility import raw_box, sectors
 from openpilot.selfdrive.turnpilot.turnpilotd import stop_sign_mode_for
 
@@ -313,6 +313,30 @@ def test_after_the_clear_the_decider_reads_its_own_controls_maneuver_junction_an
   released = [x for x in live if not x[4]]
   assert released and all(x[1:4] == (maneuver, True, 'certifiable') for x in live), sorted(set(live))[:6]
   assert all(str(p.stopGo.maneuver) == maneuver for p in plans[k:] if str(p.stopGo.state) != 'off')
+
+
+@pytest.mark.parametrize('maneuver', ['right', 'left'])
+def test_a_turn_at_the_stop_sign_takes_its_first_pulse_at_the_deciders_go_never_skipped_too_late(tmp_path, maneuver):
+  # its pulse waits for the go (2.4 item 3), 13 m from the turn: on the go frame the decider is 'going', which had let
+  # turn_skip skip the turn tooLate (no desire ever, 'Turn missed', a reroute, the car across the junction straight)
+  sim = StopSim(tmp_path, model='goes', info_kw={'maneuver': maneuver},
+                maneuvers=[(S_LINE + 13., 'turn', maneuver), (2000., 'turn', 'right' if maneuver == 'left' else 'left')])
+  run_to_line(sim)
+  sim.run(8.)
+  plans = sim.plans()
+  k = go_frame(sim)
+  assert k is not None and not any(p.tooFastToTurn for p in plans) and not sim.tp.skip.skipped
+  want = Desire.turnRight if maneuver == 'right' else Desire.turnLeft
+  assert all(p.desire == Desire.none for p in plans[:k]) and plans[k].desire == want
+  # a holding model: the go withdrawn short, and its own pulse is no reason to wait out the static bound: it goes again
+  sim = StopSim(tmp_path, model='holds', info_kw={'maneuver': maneuver},
+                maneuvers=[(S_LINE + 13., 'turn', maneuver), (2000., 'turn', 'right' if maneuver == 'left' else 'left')])
+  run_to_line(sim)
+  sim.run(14.)
+  plans = sim.plans()
+  gos = {p.goCertified.id for p in plans if str(p.goCertified.cause) == 'stopSign'}
+  assert len(gos) >= 2 and not any(p.tooFastToTurn for p in plans)
+  assert not any("isn't straight" in p.reason for p in plans)
 
 
 def test_V19_a_car_backing_out_ahead_holds_the_go(tmp_path):
