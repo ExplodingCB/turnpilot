@@ -1300,6 +1300,29 @@ def test_O1_position_uncertain_at_the_line_says_so_waits_10_s_then_h2(tmp_path):
   assert next(d for d in w.run(13.) if d.fault).fault == 'H2'
 
 
+def test_O1_at_a_surveyed_stop_point_a_latch_more_than_3_m_off_it_with_no_queue_is_h2_never_a_roll_up(tmp_path):
+  # 7.1 H2's third trigger: at a stop point from the survey, the latch and it disagreeing by more than POS_ERR_M + 1 m with
+  # no lead to explain it means navd's position and where the car stopped disagree, and the band's geometry rests on that
+  # position: it had rolled up onto it (O2), as much as 5 m further toward the junction on navd's word
+  j = junction(stop_point_source='survey')
+  w = World(tmp_path, j=j, d0=4.)
+  out = w.run(13.)
+  assert not any(d.state == 'rollUp' or d.go_cause == 'rollUp' or d.creep for d in out)
+  assert any(d.alert == 'junctionUncertain' for d in out) and out[5].ledger == 'fault'
+  h2 = next(k for k, d in enumerate(out) if d.fault == 'H2')
+  assert 9.9 <= (h2 + 1) * DT_MDL <= 10.6 and out[h2].reason == "Stop sign position uncertain: take control"
+  assert all(d.go_cause == 'none' for d in out)
+  # a lead within LEAD_GO_M explains it (a queue): the roll-up; within 3 m, or the default stop point: as before
+  w = World(tmp_path, j=junction(stop_point_source='survey'), d0=4.)
+  out = w.run(2., lead_m=6.)
+  assert out[0].state == 'rollUp' and not any(d.fault for d in out)
+  w = World(tmp_path, j=junction(stop_point_source='survey'), d0=2.5)
+  out = w.run(6.)
+  assert first_go(out) is not None
+  w = World(tmp_path, d0=4.)
+  assert w.run(0.1)[0].state == 'rollUp'
+
+
 def test_O3_the_capped_abort_is_never_below_2_m_s2_and_holds_a_standing_car(tmp_path):
   from openpilot.selfdrive.turnpilot.stop_go import capped_abort
   for v in np.linspace(0., 2., 9):

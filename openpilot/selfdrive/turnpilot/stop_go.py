@@ -46,8 +46,9 @@ decider computes would_go only (logged once a stop). Acting:
 
 Faults (7.1), each stopSignTakeControl with its reason, the car held (by the latch, or by the decider's own stop once the latch
 has let go): H1 a needed view without a run for DET_FAULT_S (held: cameraPaused for FAULT_GRACE_S first; moving before commit,
-the capped abort first), H2 the position unknown (no or a failed junctionInfo, or navd's fixes spread over 2 x POS_ERR_M on the
-last 20 m before the latch; held: junctionUncertain for FAULT_GRACE_S first), H3, H5, H7 (a person in the 0-3 m front zone not
+the capped abort first), H2 the position unknown (no or a failed junctionInfo, navd's fixes spread over 2 x POS_ERR_M on the
+last 20 m before the latch, or the latch more than H2_LINE_M from a surveyed stop point with no queue; held: junctionUncertain
+for FAULT_GRACE_S first), H3, H5, H7 (a person in the 0-3 m front zone not
 seen leaving, across views, FRONT_ZONE_MAX_S). Every hold on a standing car is scene_policy.stop(confirmed=False); every abort
 is the capped stop; nothing here asks for less than -2.0 m/s^2. The decider survives faults as the latch does (turnpilotd
 rebuilds it only in reset(detector=True)); the driver disengaging during the launch ends its encounter (O6, O7).
@@ -112,6 +113,7 @@ SIGNAL_SPAN_M = 8.              # m either side of our path the junction's regio
 YAW_GO_DEG = 3.                 # deg the car may be yawed off its approach at a go (2.4 item 3)
 STEER_GO_DEG = 10.              # deg of steering wheel angle still straight
 H2_SPREAD_M = 2. * sr.POS_ERR_M
+H2_LINE_M = sr.POS_ERR_M + 1.   # m the latch may lie from a surveyed stop point with no queue to explain it (7.1 H2)
 CROSS_DONE_YAW_DEG = 60.
 DRIVE_OFF_M, DRIVE_OFF_V = 2., 2.  # the driver drove a decider's own hold off (map_controls' DRIVE_OFF_M, COMMIT_SPEED)
 PED_STILL_V = 0.4               # m/s: a person moving slower stands (D3's measure, as a speed)
@@ -336,6 +338,7 @@ class StopGo:
     self.needed: set = set()
     self.paused_s = 0.
     self.h2_s = 0.
+    self.line_fault = ''           # the latch and the surveyed stop point disagree (H2's third trigger), why
     self.front: dict[int, dict] = {}       # person trackId: in the front zone, its y and vy, lost
     self.front_s = 0.
     self.front_ended: list = []            # (t, y) of front-zone tracks that ended at its side moving sideways
@@ -606,6 +609,17 @@ class StopGo:
 
   def _stopped(self, f, d, ctl, pos, acting, why) -> None:
     d.latch, d.detector_view, d.action, d.reason = 'wait', 'stopSweep', 'held', "Stopped at stop sign"
+    j = self.junction
+    if acting and ctl is not None and not self.line_fault and j is not None and j.stop_point_source == 'survey' and \
+       abs(pos) > H2_LINE_M and (f.lead_m is None or f.lead_m > LEAD_GO_M):
+      # H2's third trigger (7.1): at a surveyed stop point, the latch more than POS_ERR_M + 1 m from it with no queue to
+      # explain it says navd's position and where the car stopped (its line) disagree, and the band's geometry rests on
+      # that position: never a roll-up onto it. Observe, the position fault's grace (junctionUncertain), then H2
+      self.line_fault = f"latched {abs(pos):.1f} m {'short of' if pos < 0. else 'past'} the surveyed stop point"
+      cloudlog.event("turnpilot.stop_go_line_disagrees", error=True, key=list(self.key), pos=round(pos, 2), osmNodeId=j.osm_node_id)
+      self.state, self.clear_s = 'observe', 0.
+      self._observe(f, d, ctl, pos, acting, why)
+      return
     if acting and ctl is not None and -pos > LINE_M:
       # latched short of the stop point (O2): its stop point moved on to the stop point, rolling up on the map curve
       self.rollup_target = float(ctl.d)
@@ -853,6 +867,8 @@ class StopGo:
       return [Hold('position', "the junction's position isn't known", FAULT)]
     if f.position_spread > H2_SPREAD_M:
       return [Hold('position', f"its distance read {f.position_spread:.1f} m apart", FAULT)]
+    if self.line_fault:
+      return [Hold('position', self.line_fault, FAULT)]
     verdict = self.certified(f)
     if verdict.certification != 'certifiable' and verdict.reason != 'reach':
       return [Hold('cert:' + verdict.reason, f"can't certify ({verdict.reason}: {verdict.detail})" if verdict.detail else
