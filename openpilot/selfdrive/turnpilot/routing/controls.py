@@ -110,6 +110,7 @@ SAME_JUNCTION_M = 25.    # m: a road junction (or an internal-intersection edge)
                          # flags neither half internal: Indianapolis routes 60 and 73, 10 m), for suspected stops only
 SUSPECTED_STOPS = True   # emit suspected unmapped stops (N5) as stop controls: until SG2 routes around them, each is a stop
 CACHE_MAX = 4096         # Q1 and Q2 answers a LocateCache keeps, each
+SAME_EDGE_NODE_M = 1.5   # m: an edge's end node this close to another's is the same node (surveys.SAME_NODE_M)
 
 
 @dataclass
@@ -425,6 +426,26 @@ def _edge_from(call, p, heading: float, tol: float, radius: float, starting: boo
   if not (c.get('edge') or {}).get('forward', True):
     pts = pts[::-1]  # edge_info's shape runs the way's own direction
   return c, pts
+
+
+def own_edge(call, position, heading: float) -> tuple[int, bool, tuple[float, float]] | None:
+  """(way id, forward, end node (lat, lon)) of the edge the car at position (lat, lon) heading that way is on (locate, as
+  road_ahead's first edge), or None (none found, or the locate failed): SG2's avoidance loop never excludes it."""
+  try:
+    first = _edge_from(call, position, heading, AHEAD_HEADING_TOL, AHEAD_RADIUS_M, False)
+  except Exception:
+    cloudlog.exception("turnpilot controls: the car's own edge (locate) failed")
+    return None
+  if first is None:
+    return None
+  c, pts = first
+  return int((c.get('edge_info') or {}).get('way_id') or 0), bool((c.get('edge') or {}).get('forward', True)), (float(pts[-1][0]), float(pts[-1][1]))
+
+
+def same_edge(key, own) -> bool:
+  """A control's approach_key (way id, forward, its node) is the car's own edge (own_edge's): the way and direction equal
+  and the nodes within SAME_EDGE_NODE_M."""
+  return own is not None and key is not None and key[0] == own[0] and key[1] == own[1] and haversine(key[2], own[2]) <= SAME_EDGE_NODE_M
 
 
 def road_ahead(call, position, heading: float) -> list[tuple[float, float]]:

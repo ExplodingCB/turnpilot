@@ -99,10 +99,32 @@ class TestValhalla(unittest.TestCase):
     self.assertEqual(source.request(START, DESTINATION, 300.2, None)['locations'][0]['heading'], 300)
 
   def test_config_file(self):
+    # the local-tiles path builds its Actor from a config file: loaded and edited, so exclude_locations take 200 points
     with patch.object(valhalla_source, 'import_valhalla', fake_valhalla), tempfile.TemporaryDirectory() as directory:
       config = Path(directory) / 'valhalla.json'
-      config.write_text('{}')
-      self.assertEqual(ValhallaSource(str(config)).actor.config, str(config))
+      config.write_text(json.dumps({'mjolnir': {'tile_dir': '/t'}, 'service_limits': {'max_exclude_locations': 50, 'auto': {'max_distance': 9}}}))
+      got = ValhallaSource(str(config)).actor.config
+    self.assertEqual(got, {'mjolnir': {'tile_dir': '/t'}, 'service_limits': {'max_exclude_locations': 200, 'auto': {'max_distance': 9}}})
+
+  def test_corridor_config_raises_the_exclude_limit(self):
+    # a corridor's (or a tile directory's) Actor is built from get_config(): the limit is raised in that dict
+    with patch.object(valhalla_source, 'import_valhalla', fake_valhalla), tempfile.TemporaryDirectory() as tiles:
+      (Path(tiles) / 'tiles').mkdir()
+      config = ValhallaSource(tiles).actor.config
+    self.assertEqual(config['service_limits']['max_exclude_locations'], 200)
+    self.assertEqual(config['tile_dir'], str(Path(tiles) / 'tiles'))
+
+  def test_exclude_locations_carry_the_approach_edges_bearing(self):
+    with patch.object(valhalla_source, 'import_valhalla', fake_valhalla), tempfile.TemporaryDirectory() as tiles:
+      (Path(tiles) / 'tiles').mkdir()
+      source = ValhallaSource(tiles)
+      source.route(START, DESTINATION, 92.4, 'en', exclude=[{'lat': 39.771, 'lon': -86.165, 'heading': 271.6},
+                                                             {'lat': 39.772, 'lon': -86.163, 'heading': 359.7}])
+    self.assertEqual(source.actor.requests[0]['exclude_locations'],
+                     [{'lat': 39.771, 'lon': -86.165, 'heading': 272, 'heading_tolerance': 30},
+                      {'lat': 39.772, 'lon': -86.163, 'heading': 0, 'heading_tolerance': 30}])
+    self.assertNotIn('exclude_locations', source.request(START, DESTINATION, 90, None))
+    self.assertNotIn('exclude_locations', source.request(START, DESTINATION, 90, None, exclude=[]))
 
   def test_http_fallback(self):
     response = MagicMock(status_code=200)
@@ -217,13 +239,21 @@ class FakeValhalla:
 
     source.opposing = opposing
 
-    def route(start, destination, bearing, language):
+    def route(start, destination, bearing, language, exclude=None):
       source.calls.append((start, destination, bearing, language))
+      source.excludes.append(exclude)
       if self.test.route_error is not None:
         raise self.test.route_error
       return self.test.steps
 
     source.route = route
+    source.excludes = []
+
+    def own_edge(position, heading):
+      source.controls_calls.append(('own', position, heading))
+      return self.test.own
+
+    source.own_edge = own_edge
     self.test.built.append(source)
     return source
 
@@ -241,6 +271,7 @@ class RouterCase(unittest.TestCase):
     self.server.corridor = (200, make_pack({level2_tile(*START): b'tile'}), 'application/x-tar')
     self.params = self.server.params()
     self.steps, self.route_error, self.broken_tiles, self.built = STEPS, None, False, []
+    self.own = (812, True, (39.77, -86.16))
     self.router = MapRouter(self.params, self.maps, valhalla=FakeValhalla(self))
     # Mapbox went through requests.get; the map client only uses requests.request
     self.enterContext(patch('requests.get', side_effect=AssertionError('nothing may call requests.get (Mapbox)')))
@@ -507,6 +538,68 @@ class TestMapRouter(RouterCase):
     self.router.route(START, DESTINATION, 90, 'en')
     self.router.clear()
     self.assertEqual(self.status()['state'], 'idle')
+
+
+class TestReroute(RouterCase):
+  """reroute(): the avoidance loop's route with exclusions (STOP_SIGNS.md 3.3), status-neutral: it never writes
+  TurnPilotMapStatus and never downloads; a route that leaves the corridor, or any routing failure, is None (a failed
+  iteration) and leaves the served route alone."""
+  EXCLUDE = [{'lat': 39.771, 'lon': -86.165, 'heading': 271.6}]
+
+  def test_on_the_corridor(self):
+    first = self.router.route(START, DESTINATION, 90, 'en')
+    self.params.writes.clear()
+    self.steps = [dict(s) for s in STEPS]  # another route
+    got = self.router.reroute(START, DESTINATION, 90, 'en', self.EXCLUDE)
+    self.assertIs(got, self.steps)
+    self.assertEqual(self.built[0].excludes[-1], self.EXCLUDE)
+    self.assertEqual(self.params.writes, [])  # no status
+    self.assertEqual(len(self.server.corridor_requests()), 1)  # no download
+    self.assertEqual(self.router.controls(got), ([], 'ok'))  # served: its controls come from the same source
+    self.assertEqual(self.router.controls(first), ([], 'failed'))
+
+  def test_leaving_the_corridor_is_a_failed_iteration_not_a_download(self):
+    first = self.router.route(START, DESTINATION, 90, 'en')
+    self.params.writes.clear()
+    self.steps = [{**STEPS[0], 'geometry': {'type': 'LineString', 'coordinates': [list(START), [-85.9, 39.8]]}}] + STEPS[1:]
+    self.assertIsNone(self.router.reroute(START, DESTINATION, 90, 'en', self.EXCLUDE))
+    self.assertEqual((self.params.writes, len(self.server.corridor_requests())), ([], 1))
+    self.assertEqual(self.router.controls(first), ([], 'ok'))  # the previous route is still the served one
+    outside = (-86.4, 40.25)
+    self.steps = STEPS
+    self.assertIsNone(self.router.reroute(outside, DESTINATION, 90, 'en', self.EXCLUDE))  # the car off the corridor
+    self.assertEqual((self.params.writes, len(self.server.corridor_requests())), ([], 1))
+
+  def test_a_routing_failure_or_no_route_is_a_failed_iteration(self):
+    first = self.router.route(START, DESTINATION, 90, 'en')
+    self.params.writes.clear()
+    self.route_error = RuntimeError('No path could be found for input')
+    self.assertIsNone(self.router.reroute(START, DESTINATION, 90, 'en', self.EXCLUDE))
+    self.route_error, self.steps = None, []
+    self.assertIsNone(self.router.reroute(START, DESTINATION, 90, 'en', self.EXCLUDE))
+    self.assertEqual(self.params.writes, [])
+    self.assertEqual(self.router.controls(first), ([], 'ok'))
+
+  def test_another_destination_or_nothing_routed_yet_is_a_failed_iteration(self):
+    self.assertIsNone(self.router.reroute(START, DESTINATION, 90, 'en', self.EXCLUDE))
+    self.router.route(START, DESTINATION, 90, 'en')
+    self.assertIsNone(self.router.reroute(START, (-86.161, 39.775), 90, 'en', self.EXCLUDE))
+    self.assertEqual(len(self.server.corridor_requests()), 1)
+
+  def test_on_local_tiles(self):
+    self.params.values['TurnPilotValhallaTiles'] = '/sim/tiles'
+    coverage_path(self.maps).unlink()
+    self.router.route(CHICAGO, CHICAGO, 90, 'en')
+    self.params.writes.clear()
+    got = self.router.reroute(CHICAGO, CHICAGO, 90, 'en', self.EXCLUDE)
+    self.assertIs(got, self.steps)
+    self.assertEqual((self.built[0].excludes[-1], self.params.writes), (self.EXCLUDE, []))
+
+  def test_own_edge_from_the_source_that_routed(self):
+    self.assertIsNone(self.router.own_edge(START, 90.))  # nothing routed
+    self.router.route(START, DESTINATION, 90, 'en')
+    self.assertEqual(self.router.own_edge(START, 90.), self.own)
+    self.assertEqual(self.built[0].controls_calls[-1], ('own', START[::-1], 90.))
 
 
 class TestLocalOverride(RouterCase):

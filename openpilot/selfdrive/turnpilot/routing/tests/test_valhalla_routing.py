@@ -90,6 +90,11 @@ class TestTurnLanes(unittest.TestCase):
                                                      {'directions': ['straight'], 'active': False, 'activeDirection': 'none'},
                                                      {'directions': ['straight', 'right'], 'active': True, 'activeDirection': 'right'}])
 
+  def test_exclude_locations_take_200_points(self):
+    # Valhalla refuses more than its max_exclude_locations (50 by default): ValhallaSource raises it to 200 (3.3)
+    far = [{'lat': 39.70 + k * 1e-4, 'lon': -86.30, 'heading': 0.} for k in range(120)]
+    self.assertTrue(self.source.route(self.start, (-86.1600, 39.7740), 90, 'en', exclude=far))
+
   def test_navd_sends_the_lanes(self):
     engine, pm = route_engine(self.tiles, self.start, 90)
     engine.calculate_route((-86.1600, 39.7740))

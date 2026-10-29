@@ -1165,3 +1165,32 @@ def test_a_stop_before_a_crosswalk_node_is_read_at_the_junction_it_governs(tmp_p
                          {100.: four()[100.]}, every=2.)
   _, j = junction_of(route_controls(flagged, steps(every=2.), sidecar_dir=osm_dir(tmp_path / 'c'))[0])
   assert j.status == 'failed' and haversine((j.lat, j.lon), pt(84.)) < 0.5
+
+
+def test_own_edge_is_the_located_edge_by_heading_with_its_end_node():
+  """The car's own edge for SG2's avoidance loop (controls.own_edge): its way, direction and end node, so the exclusion of
+  a control on it is never sent and that control is unavoidable (STOP_SIGNS.md 3.3, N10)."""
+  from openpilot.selfdrive.turnpilot.routing.controls import own_edge, same_edge
+  shape = [{'lat': 39.77, 'lon': -86.16}, {'lat': 39.7705, 'lon': -86.16}, {'lat': 39.771, 'lon': -86.16}]
+  answers = {True: [{'edges': [{'edge_info': {'shape': shape, 'way_id': 50}, 'edge': {'forward': True}, 'distance': 1., 'percent_along': 0.4,
+                               'heading': 0.}]}],
+             False: [{'edges': [{'edge_info': {'shape': shape, 'way_id': 50}, 'edge': {'forward': False}, 'distance': 1., 'percent_along': 0.6,
+                                'heading': 180.}]}]}
+  requests = []
+
+  def call(forward):
+    def f(endpoint, req):
+      requests.append((endpoint, req))
+      return answers[forward]
+    return f
+  assert own_edge(call(True), (39.7704, -86.16), 0.) == (50, True, (39.771, -86.16))
+  assert requests[-1][1]['locations'][0]['heading'] == 0
+  assert own_edge(call(False), (39.7704, -86.16), 180.) == (50, False, (39.77, -86.16))  # its shape runs the way's direction
+  assert own_edge(lambda e, r: [{'edges': []}], (39.77, -86.16), 0.) is None
+  assert own_edge(lambda e, r: (_ for _ in ()).throw(RuntimeError('down')), (39.77, -86.16), 0.) is None
+  # the same edge: way and direction equal, the end node within 1.5 m (a trace's node and a locate's shape end differ by
+  # rounding); a split way's next edge is not
+  assert same_edge((50, True, (39.771, -86.16)), (50, True, (39.771000005, -86.1600001)))
+  assert not same_edge((50, True, (39.771, -86.16)), (50, False, (39.771, -86.16)))
+  assert not same_edge((50, True, (39.771, -86.16)), (50, True, (39.7712, -86.16)))
+  assert not same_edge((50, True, (39.771, -86.16)), None)

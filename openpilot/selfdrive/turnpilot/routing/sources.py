@@ -143,6 +143,50 @@ class MapRouter:
     tiles_dir = getattr(source, 'tiles_dir', None)
     return source, tiles_dir, tiles_dir if tiles_dir else NO_DIRECTORY
 
+  def own_edge(self, position, bearing):
+    """(way id, forward, end node) of the edge the car is on, from the source that routed the last route (routing/controls.py:
+    own_edge); None when nothing is routed or it can't say. position: navd's (longitude, latitude)."""
+    served = self.served
+    if served is None or not hasattr(served[1], 'own_edge'):
+      return None
+    try:
+      return served[1].own_edge((position[1], position[0]), bearing)
+    except Exception:
+      cloudlog.exception("turnpilot: the car's own edge failed")
+      return None
+
+  def reroute(self, start, destination, bearing, language, exclude) -> list[dict] | None:
+    """The steps from start to destination around exclude (valhalla_source: exclude_locations), for the stop-sign
+    avoidance loop (navd; STOP_SIGNS.md 3.3), or None for a failed iteration. Status-neutral: it never writes
+    TurnPilotMapStatus and never downloads. It routes on the local tiles (TurnPilotValhallaTiles), or on this destination's
+    corridor while the car is on it; a route that leaves the corridor, no route, or any routing error is None and leaves
+    the served route as it was. A route it gives becomes the served one, so controls() and opposing() answer for it."""
+    try:
+      tiles = local_override(self.params)
+      if tiles:
+        if self.local is None or self.local[0] != tiles:
+          cloudlog.warning("turnpilot reroute: the local tiles aren't loaded")
+          return None
+        source, extra = self.local[1], self.local_served(self.local[1])[1:]
+      else:
+        current = self.corridor
+        if current is None or current.destination != destination or not current.pack.path.is_dir() or not current.pack.covers(*start):
+          cloudlog.warning("turnpilot reroute: no corridor for this destination under the car")
+          return None
+        source, extra = current.source, (None, current.pack.path)
+      steps = source.route(start, destination, bearing, language, exclude=exclude)
+      if not steps:
+        cloudlog.warning("turnpilot reroute: no route around the exclusions")
+        return None
+      if not tiles and not self.corridor.pack.holds(steps):
+        cloudlog.warning("turnpilot reroute: the route around the exclusions leaves the corridor")
+        return None
+    except Exception as e:
+      cloudlog.warning(f"turnpilot reroute failed: {type(e).__name__}: {e}")
+      return None
+    self.served = (steps, source, *extra)
+    return steps
+
   def clear(self):
     """No destination."""
     self.failure = None
