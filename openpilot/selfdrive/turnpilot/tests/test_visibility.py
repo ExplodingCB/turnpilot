@@ -415,3 +415,22 @@ def test_a_non_stopping_lanes_need_is_the_two_way_requirement_from_the_edge_band
   rep = live().lanes(lns, 0., vis_file(), rot_deg=ROT, edges=EDGES)
   x = next(x for x in rep.lanes if x.role == 'left')
   assert not x.stopping and x.need_m == pytest.approx(sr.reach_needed_two_way(25. * sr.MPH, EDGES.d_max), abs=1e-6)
+
+
+def test_rule_5_a_non_stopping_lane_without_a_surveyed_sight_distance_has_no_reach():
+  # STOP_SIGNS.md 1.4 rule 5, row G2: YOLO reports cars, not hedges, fences, walls or crests, so a lane whose approach doesn't
+  # stop has reach 0 unless its approach's sight distance was surveyed. SG3b skeptic p4: at an unsurveyed two-way (tier
+  # mapStrong), zero detections, every view fresh and ok, the left lane read 27.2 m, the right 24.5 and the opposite 127.5
+  # (R_seen 114.6, over the 61.9-93.7 m two-way need at 10-15 mph) by the tables' walk, why 'range'
+  lns = junction_lanes(junction(25., tier='mapStrong'), 'straight', SETBACK)
+  for entry in (None, {**survey_entry(), 'approaches': [a for a in survey_entry()['approaches'] if a['wayId'] == 0]}):
+    rep = live().lanes(lns, 0., vis_file(), rot_deg=ROT, edges=EDGES, entry=entry)
+    assert {x.role for x in rep.lanes} == {'left', 'right', 'opposite'}
+    for x in rep.lanes:
+      assert not x.stopping and (x.reach_m, x.r_seen_m, x.why) == (0., 0., 'notSurveyed')
+  # its approach surveyed: the survey's sight distance bounds it like any lane's (rule 6)
+  rep = live().lanes(lns, 0., vis_file(), rot_deg=ROT, edges=EDGES, entry=survey_entry(sight=20.))
+  for x in rep.lanes:
+    assert x.why in ('cap', 'range') and 0. < x.reach_m <= 20. + 1e-6
+  # a stopping lane is untouched: without an entry it is the tables' walk (rule 3)
+  assert lane_of(report(live()), 'left').why == 'range' and lane_of(report(live()), 'left').reach_m > 0.

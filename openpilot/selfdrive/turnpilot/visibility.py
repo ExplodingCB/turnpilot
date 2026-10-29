@@ -21,6 +21,9 @@ turnpilotd's clock, so a detector that stops leaves nothing fresh). lanes() then
   bearing-only (1.2: an occluder whose depth is unknown).
 - At a surveyed junction, the survey's sight distance and the parking on the lane's binding curb (routing.certify.lane_cap),
   and a passing validation stamp's minFirstTrackM in place of the tables' range bound (never in place of the coverage).
+- A lane whose approach doesn't stop (section 4.1) has reach 0 (notSurveyed) unless the survey has that approach's sight
+  distance (1.4 rule 5, row G2): YOLO reports cars, not hedges, fences, walls or crests, so with no survey nothing says the
+  lane isn't hidden, whatever the tables' walk would reach (an unsurveyed junction's opposite lane read 127.5 m).
 
 Per lane: reach, R_seen = reach - v_c T_LAT, the binding limit (what ended the walk), its need (all-way or two-way), the raw
 boxes that block it (confidence RAW_BLOCK_CONF or more, not steady, whose bearing ray meets it within its need at either end
@@ -212,9 +215,12 @@ class LiveVisibility:
       elif not self.available:
         reach, why = 0., 'noView'
       else:
-        cap = lane_cap(ln, entry)[0] if entry is not None else None
-        validated = _per_lane(stamp.get('minFirstTrackM'), ln.role, ln.index) if stamp else None
-        reach, why = sr.reach_walk_why(ln, sight, rot_deg, validated_m=validated, cap_m=cap)
+        cap, cap_why = lane_cap(ln, entry) if entry is not None else (None, 'not surveyed')
+        if not ln.stopping and cap_why == 'not surveyed':  # rule 5: nothing but a survey says a hedge or crest isn't there
+          reach, why = 0., 'notSurveyed'
+        else:
+          validated = _per_lane(stamp.get('minFirstTrackM'), ln.role, ln.index) if stamp else None
+          reach, why = sr.reach_walk_why(ln, sight, rot_deg, validated_m=validated, cap_m=cap)
       v_c = sr.V_CROSS_FACTOR * ln.limit
       seen = LaneSeen(ln.role, ln.index, ln.movement, ln.stopping, ln.limit, need, reach, max(reach - v_c * sr.T_LAT, 0.), why)
       seen.blockers = self.blockers(ln, need, rot_deg, height)
