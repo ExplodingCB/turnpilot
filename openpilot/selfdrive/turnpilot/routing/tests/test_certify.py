@@ -131,6 +131,9 @@ class TestOrderedChecks:
     assert check(tmp_path, eta=utc(2026, 10, 29, 2, 0)) == ('uncertifiable', 'light')
     assert check(tmp_path, eta=utc(2026, 10, 28, 22, 30)) == ('uncertifiable', 'light')  # 18:30 EDT: the window's end reaches dusk
 
+  def test_9_light_without_a_valid_clock(self, tmp_path):
+    assert check(tmp_path, eta=None) == ('uncertifiable', 'light')
+
   def test_10_not_validated_without_a_stamp(self, tmp_path):
     assert check(tmp_path, s=survey(validations=[])) == ('uncertifiable', 'notValidated')
 

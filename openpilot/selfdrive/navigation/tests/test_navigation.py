@@ -98,6 +98,13 @@ class StubRouter:
     self.positions = []  # what position() said once the "download" was done
     self.ahead_result: tuple = ([], 'ok', [])  # what controls_ahead() gives (controls, status, road), or an exception it raises
     self.ahead_calls: list = []  # (position, bearing, thread name) per call
+    # TurnPilot (stop-sign avoidance): what each reroute() gives in turn (steps, or None for a failed iteration; None once
+    # they run out), its calls, the controls of given steps by identity, the car's own edge, and a hook run on each reroute
+    self.reroute_results: list = []
+    self.reroute_calls: list = []
+    self.controls_by_steps: dict = {}
+    self.own = None
+    self.on_reroute = None
 
   @property
   def call_count(self):
@@ -117,9 +124,23 @@ class StubRouter:
 
   def controls(self, steps):
     self.controls_calls.append((steps, threading.current_thread().name))
+    if id(steps) in self.controls_by_steps:
+      return self.controls_by_steps[id(steps)]
     if isinstance(self.controls_result, Exception):
       raise self.controls_result
     return self.controls_result
+
+  def reroute(self, start, destination, bearing, language, exclude):
+    self.reroute_calls.append((start, destination, bearing, language, exclude))
+    if self.on_reroute is not None:
+      self.on_reroute()
+    return self.reroute_results.pop(0) if self.reroute_results else None
+
+  def own_edge(self, position, bearing):
+    return self.own
+
+  def exclusion_headings(self, points):
+    return [self.headings.get(p[2]) for p in points] if hasattr(self, 'headings') else [None for _ in points]
 
   def opposing(self, steps):
     self.opposing_calls.append(threading.current_thread().name)
@@ -1060,3 +1081,248 @@ class TestRouteTracking(unittest.TestCase):
 
 if __name__ == '__main__':
   unittest.main()
+
+
+class TestStopAvoidance(unittest.TestCase):
+  """navd's stop-sign avoidance loop (STOP_SIGNS.md 3.3, rows C2, C21, N1-N3, N9-N14): every stop and yield the certifier
+  (routing/certify.py) can't certify is excluded by its approach edge and the route recomputed around it, with the
+  router's status-neutral reroute(). A fake router; the certifier is the real one where named, else a stand-in."""
+  STEP = 111.195
+
+  def setUp(self):
+    self.pm = MagicMock()
+    self.values = {'NavDestination': {'latitude': 0, 'longitude': 0.002}, 'LanguageSetting': 'main_en', 'TurnPilotStopSignGo': 'auto'}
+    self.sm = MagicMock()
+    self.sm.valid = dict.fromkeys(('gpsLocation', 'gpsLocationExternal'), True)
+    self.now, self.mono = 1_800_000_000., 1000.
+    self.certified: set = set()  # approach keys the stand-in certifier certifies
+    self.engine = self.make_engine()
+
+  def make_engine(self, certifier='fake'):
+    params = MagicMock()
+    params.get.side_effect = self.values.get
+    params.remove.side_effect = lambda key: self.values.pop(key, None)
+    engine = RouteEngine(self.sm, self.pm, params=params, router=StubRouter(), background=False, clock=lambda: self.now,
+                         monotonic=lambda: self.mono, certifier=self.certify if certifier == 'fake' else None)
+    engine.last_position, engine.last_bearing = (0, 0), 90
+    return engine
+
+  def certify(self, control, eta, runtime):
+    ok = control.approach_key in self.certified and runtime.mode == 'auto'
+    control.certification, control.cert_reason = ('certifiable', 'none') if ok else ('uncertifiable', 'notSurveyed')
+    return control.certification, control.cert_reason
+
+  def steps(self):
+    """A new route object each time (the router tells routes apart by identity), 2 x 111 m, 10 s each."""
+    return [{'geometry': {'coordinates': [[0, 0], [0.0005, 0], [0.001, 0]]}, 'distance': self.STEP, 'duration': 10,
+             'bannerInstructions': [{'distanceAlongGeometry': 100, 'primary': {'text': 'Turn right', 'type': 'turn', 'modifier': 'right'}}]},
+            {'geometry': {'coordinates': [[0.001, 0], [0.002, 0]]}, 'distance': self.STEP, 'duration': 10, 'bannerInstructions': []}]
+
+  @staticmethod
+  def stop(n, route_m, kind='stop', first=False, last=False, junction=True):
+    from openpilot.selfdrive.turnpilot.routing.controls import Control
+    from openpilot.selfdrive.turnpilot.routing.junctions import Junction
+    step = 0 if route_m < TestStopAvoidance.STEP else 1
+    return Control(n, kind, route_m, step, route_m - step * TestStopAvoidance.STEP, junction_info=Junction() if junction else None,
+                   approach_key=(500 + n, True, (0.0001 * n, 0.001)), exclusion=(0.0001 * n, 0.0009, 90. + n), first_edge=first, last_edge=last)
+
+  def route_with(self, controls, steps=None):
+    """Steps the router gives, with these controls."""
+    steps = steps if steps is not None else self.steps()
+    self.engine.router.controls_by_steps[id(steps)] = (controls, 'ok')
+    return steps
+
+  def start(self, controls, reroutes=(), destination=(0.002, 0)):
+    """Route to destination: the first route has controls; reroutes are (controls or None) the reroutes give in turn."""
+    router = self.engine.router
+    router.steps = self.route_with(controls)
+    router.reroute_results = [None if c is None else self.route_with(c) for c in reroutes]
+    self.engine.calculate_route(destination)
+    return router
+
+  def instruction(self):
+    self.engine.send_instruction()
+    return next(call.args[1] for call in reversed(self.pm.send.call_args_list) if call.args[0] == 'navInstruction').navInstruction
+
+  def test_C2_noTable_floor_every_stop_and_yield_is_routed_around(self):
+    """No camera measurements yet: the real certifier says noTable for every stop and yield, so the route avoids all of
+    them (the stop-free floor), excluding each approach edge by its local bearing (N9)."""
+    self.engine = self.make_engine(certifier=None)
+    a, y = self.stop(1, 60.), self.stop(2, 150., kind='yield')
+    router = self.start([a, y], reroutes=[[]])
+    self.assertEqual((a.junction_info.certification, a.junction_info.cert_reason), ('uncertifiable', 'noTable'))
+    self.assertEqual(y.junction_info.cert_reason, 'noTable')
+    self.assertEqual([c[4] for c in router.reroute_calls], [[{'lat': 0.0001, 'lon': 0.0009, 'heading': 91.}, {'lat': 0.0002, 'lon': 0.0009, 'heading': 92.}]])
+    self.assertEqual(self.engine.controls, [])
+    ni = self.instruction()
+    self.assertEqual((str(ni.avoidStatus), ni.avoidedControls), ('clean', 2))
+
+  def test_N9_the_exclusion_takes_valhallas_own_heading_at_the_point(self):
+    a, b = self.stop(1, 60.), self.stop(2, 150.)
+    self.engine.router.headings = {501: 349.}  # by way id: a's way
+    router = self.start([a, b], reroutes=[[]])
+    self.assertEqual([p['heading'] for p in router.reroute_calls[0][4]], [349., 92.])  # b: none found, the shape's bearing
+
+  def test_a_certifiable_stop_stays_and_signals_are_never_excluded(self):
+    from openpilot.selfdrive.turnpilot.routing.controls import Control
+    a = self.stop(1, 60.)
+    self.certified = {a.approach_key}
+    router = self.start([Control(0, 'signal', 30., 0, 30.), a])
+    self.assertEqual(router.reroute_calls, [])
+    ni = self.instruction()
+    self.assertEqual((str(ni.avoidStatus), ni.avoidedControls), ('clean', 0))
+
+  def test_N3_terminates_within_max_avoid_iter(self):
+    from openpilot.selfdrive.turnpilot.stop_rules import MAX_AVOID_ITER
+    router = self.start([self.stop(0, 60.)], reroutes=[[self.stop(k, 60.)] for k in range(1, 20)])
+    self.assertEqual(len(router.reroute_calls), MAX_AVOID_ITER)
+    self.assertEqual(self.engine.avoid_status, 'keptBest')
+    self.assertEqual([c.certification for c in self.engine.controls], ['unavoidable'])  # what is left needs the driver
+
+  def test_N3_terminates_within_avoid_time(self):
+    from openpilot.selfdrive.navigation.navd import AVOID_TIME_S
+
+    def slow():
+      self.mono += AVOID_TIME_S * 0.6
+    router = self.start([self.stop(0, 60.)], reroutes=[[self.stop(k, 60.)] for k in range(1, 20)])
+    self.assertGreater(len(router.reroute_calls), 2)  # (without the clock moving: many)
+    self.engine = self.make_engine()
+    self.engine.router.on_reroute = slow
+    router = self.start([self.stop(0, 60.)], reroutes=[[self.stop(k, 60.)] for k in range(1, 20)])
+    self.assertEqual(len(router.reroute_calls), 2)
+    self.assertEqual(self.engine.avoid_status, 'keptBest')
+
+  def test_N3_honours_cancel(self):
+    router = self.engine.router
+    router.on_reroute = lambda: self.engine.job.cancel.set()
+    self.start([self.stop(0, 60.)], reroutes=[[self.stop(k, 60.)] for k in range(1, 20)])
+    self.assertEqual(len(router.reroute_calls), 1)
+    self.assertIsNone(self.engine.route)  # a cancelled job's route is dropped, as before
+
+  def test_N3_a_failed_iteration_keeps_the_best_route_and_its_controls_as_a_pair(self):
+    b = self.stop(2, 150.)
+    router = self.start([self.stop(1, 60.)], reroutes=[[b], None])
+    self.assertEqual(len(router.reroute_calls), 2)
+    first_reroute = [steps for steps in router.controls_calls if steps[0] is not router.steps][0][0]
+    self.assertIs(self.engine.route, first_reroute)  # the steps of the last good iteration, and its controls with them
+    self.assertEqual(self.engine.controls, [b])
+    self.assertEqual((b.certification, self.engine.avoid_status), ('unavoidable', 'keptBest'))
+    avoid = self.engine.avoid_sets[(0.002, 0)]
+    self.assertEqual(avoid.keys(), {self.stop(1, 60.).approach_key})  # the failed batch (b) is dropped from the set
+
+  def test_N1_N10_first_last_and_own_edge_are_unavoidable_and_never_excluded(self):
+    own = self.stop(3, 100.)
+    self.engine.router.own = (own.approach_key[0], own.approach_key[1], (own.approach_key[2][0] + 1e-6, own.approach_key[2][1]))
+    first, last = self.stop(1, 20., first=True), self.stop(2, 200., last=True)
+    router = self.start([first, own, last])
+    self.assertEqual(router.reroute_calls, [])
+    self.assertEqual([c.certification for c in (first, own, last)], ['unavoidable'] * 3)
+    self.assertEqual(str(self.instruction().avoidStatus), 'unavoidable')
+
+  def test_N10_a_point_already_in_the_set_on_the_cars_own_edge_is_not_sent(self):
+    a, b = self.stop(1, 60.), self.stop(2, 150.)
+    self.start([a], reroutes=[[]])
+    self.engine.router.own = a.approach_key  # the car is now on a's approach edge
+    a2 = self.stop(1, 60.)
+    router = self.start([a2, b], reroutes=[[a2]])
+    self.assertEqual([p['heading'] for p in router.reroute_calls[-1][4]], [92.])  # b only
+    self.assertEqual((a2.certification, self.engine.avoid_status), ('unavoidable', 'unavoidable'))
+
+  def test_N2_a_banned_control_still_on_the_route_is_failed(self):
+    a = self.stop(1, 60.)
+    self.start([a], reroutes=[[self.stop(1, 60.)]])
+    ni = self.instruction()
+    self.assertEqual((str(ni.avoidStatus), ni.avoidedControls), ('failed', 0))
+    self.assertEqual([c.certification for c in self.engine.controls], ['unavoidable'])
+
+  def test_N12_C21_every_navd_reroute_reuses_the_set_and_a_new_destination_clears_it(self):
+    a, b = self.stop(1, 60.), self.stop(2, 150.)
+    self.start([a], reroutes=[[]])
+    router = self.start([b], reroutes=[[]])  # a reroute for the same destination (a missed turn, off the route, a skip)
+    self.assertEqual(sorted(p['heading'] for p in router.reroute_calls[-1][4]), [91., 92.])
+    router = self.start([self.stop(3, 60.)], reroutes=[[]], destination=(0.003, 0))
+    self.assertEqual([p['heading'] for p in router.reroute_calls[-1][4]], [93.])
+
+  def test_N11_a_runtime_input_change_reruns_the_loop_once(self):
+    a = self.stop(1, 60.)
+    self.certified = {a.approach_key}
+    router = self.start([a])
+    self.engine.recompute_hold = RECOMPUTE_HOLD
+    self.engine.recompute_route(gps_ok=True)
+    self.assertEqual(router.call_count, 1)
+    self.values['TurnPilotStopSignGo'] = 'shadow'  # the mode changed (side cameras off would too, from turnpilotPlan)
+    router.steps = self.route_with([self.stop(1, 60.)])
+    router.reroute_results = [self.route_with([])]
+    self.engine.recompute_route(gps_ok=True)
+    self.assertEqual(router.call_count, 2)
+    self.assertEqual(self.engine.avoid_status, 'clean')
+    self.engine.recompute_route(gps_ok=True)
+    self.assertEqual(router.call_count, 2)  # once
+
+  def test_N14_eta_leaving_its_window_reruns_once_and_a_slip_inside_does_not(self):
+    a = self.stop(1, 60.)
+    self.certified = {a.approach_key}
+    router = self.start([a])
+    self.assertEqual(a.certification, 'certifiable')
+    self.engine.recompute_hold = RECOMPUTE_HOLD
+    self.now += 600.  # stuck 10 min at the start: still inside the window (ETA - 5 min to + 20 min)
+    self.engine.send_instruction()
+    self.engine.recompute_route(gps_ok=True)
+    self.assertEqual(router.call_count, 1)
+    self.now += 700.  # 21.7 min late: outside
+    router.steps = self.route_with([self.stop(1, 60.)])
+    self.engine.send_instruction()
+    self.engine.recompute_route(gps_ok=True)
+    self.assertEqual(router.call_count, 2)
+    self.engine.send_instruction()
+    self.engine.recompute_route(gps_ok=True)
+    self.assertEqual(router.call_count, 2)  # the new route's window is from now
+
+  def test_the_loop_never_sets_the_map_status(self):
+    router = self.start([self.stop(1, 60.)], reroutes=[[self.stop(2, 150.)], None])
+    self.assertEqual(len(router.reroute_calls), 2)
+    self.assertEqual(router.status.method_calls, [])
+
+  def test_avoid_stops_off_certifies_but_excludes_nothing(self):
+    self.values['TurnPilotAvoidStops'] = False
+    a = self.stop(1, 60.)
+    router = self.start([a])
+    self.assertEqual((router.reroute_calls, a.certification), ([], 'uncertifiable'))
+    self.assertEqual(str(self.instruction().avoidStatus), 'none')
+
+  def test_a_control_without_its_exclusion_point_is_unavoidable(self):
+    a = self.stop(1, 60.)
+    a.exclusion = None
+    router = self.start([a])
+    self.assertEqual((router.reroute_calls, a.certification, self.engine.avoid_status), ([], 'unavoidable', 'unavoidable'))
+
+  def test_no_valid_clock_fails_the_light_check_and_is_avoided(self):
+    self.engine = self.make_engine(certifier=None)
+    self.engine.clock = lambda: None
+    a = self.stop(1, 60.)
+    with patch('openpilot.selfdrive.turnpilot.routing.certify.sr.light_window') as light:
+      router = self.start([a], reroutes=[[]])
+    # noTable comes first with the shipped file; the clock is checked without reaching the sun
+    self.assertEqual((a.cert_reason, light.call_count, len(router.reroute_calls)), ('noTable', 0, 1))
+    from openpilot.selfdrive.navigation.navd import eta_of, wall_clock
+    self.assertIsNone(eta_of(self.steps(), a, None))
+    with patch('openpilot.selfdrive.navigation.navd.system_time_valid', return_value=False):
+      self.assertIsNone(wall_clock())
+    with patch('openpilot.selfdrive.navigation.navd.system_time_valid', return_value=True):
+      self.assertGreater(wall_clock(), 1.7e9)
+
+  def test_the_params_are_declared(self):
+    # TurnPilotAvoidStops (on by default; step S3 sets it off) and TurnPilotStopLaunch (A_LAUNCH_PLAN, 0.5 m/s^2 until S4a)
+    header = (Path(__file__).parents[3] / 'common' / 'params_keys.h').read_text()
+    self.assertRegex(header, r'\{"TurnPilotAvoidStops", \{PERSISTENT, BOOL, "1"\}\}')
+    self.assertRegex(header, r'\{"TurnPilotStopLaunch", \{PERSISTENT, FLOAT, "0.5"\}\}')
+
+  def test_eta_of_each_control_from_the_step_durations(self):
+    seen = []
+
+    def certify(control, eta, runtime):
+      seen.append((control.id, eta))
+      return 'certifiable', 'none'
+    self.engine.certifier = certify
+    self.start([self.stop(1, 55.6), self.stop(2, self.STEP + 55.6)])
+    self.assertEqual([(i, round(t - self.now, 1)) for i, t in seen], [(1, 5.), (2, 15.)])

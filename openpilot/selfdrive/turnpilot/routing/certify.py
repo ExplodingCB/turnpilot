@@ -16,7 +16,8 @@ certify(junction, maneuver, visibility, surveys, eta, runtime) returns (certific
    7 notSurveyed   the junction's survey doesn't count, or a conflicting approach isn't surveyed as stopping (decision D10)
    8 override      an approach in TurnPilotJunctionOverrides (a downgrade or a signal seen)
    9 light         night, dusk, low sun along a conflicting approach, or the sun ahead with the veil present or unmeasured, at
-                   any time from ETA - ETA_EARLY_S to ETA + ETA_LATE_S (runtime.window; at the line (0, 0))
+                   any time from ETA - ETA_EARLY_S to ETA + ETA_LATE_S (runtime.window; at the line (0, 0)); or no ETA
+                   (the clock isn't valid yet)
   10 notValidated  no passing validation stamp for our approach for every lighting row the window needs, or one whose
                    maxDropoutS exceeds CLEAR_S / 3 on a binding lane
   11 reach         a conflicting lane's reach short of its requirement: the stamp's minFirstTrackM bounding the distance along
@@ -41,6 +42,7 @@ from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
 from openpilot.selfdrive.turnpilot.routing.junctions import LEG_HEADING_TOL, survey_approach
 
 MODES = ('off', 'shadow', 'trial', 'auto')
+MODE_PARAM = 'TurnPilotStopSignGo'
 ACTING = ('trial', 'auto')
 BINDING_CURB = {'left': 'right', 'right': 'left'}
 
@@ -111,7 +113,7 @@ def pick_stamp(entry: dict, row: str, heading_in: float) -> dict | None:
   return max(fits, key=lambda v: str(v.get('date'))) if fits else None
 
 
-def assess(junction: sr.Junction, maneuver: str, visibility, surveys, eta: float, runtime: Runtime) -> Verdict:
+def assess(junction: sr.Junction, maneuver: str, visibility, surveys, eta: float | None, runtime: Runtime) -> Verdict:
   """certify() with its detail: the failing check's why, each conflicting lane's need and reach, the lighting rows."""
   j = junction
   # 1 the camera
@@ -162,6 +164,8 @@ def assess(junction: sr.Junction, maneuver: str, visibility, surveys, eta: float
   if any(a.overridden for a in j.approaches):
     return _fail('override', 'an approach is in TurnPilotJunctionOverrides')
   # 9 light over the ETA window
+  if eta is None:
+    return _fail('light', "the clock isn't set (no GPS time yet): the sun can't be placed")
   looks = sorted({m.approach.bearing for m in moves})
   rows, why = sr.light_window(j.lat, j.lon, eta, j.heading_in, visibility.veil, looks, *runtime.window)
   if why:
@@ -214,6 +218,23 @@ def assess(junction: sr.Junction, maneuver: str, visibility, surveys, eta: float
   return Verdict('certifiable', 'none', '', out, rows, True)
 
 
+def stop_sign_mode(params) -> str:
+  """TurnPilotStopSignGo (off, shadow, trial, auto), read the way light_state reads its param: a value this build doesn't
+  know, or a param it doesn't know (UnknownKeyName, before SG4a adds it), or none at all, acts as shadow, logged."""
+  try:
+    value = params.get(MODE_PARAM)
+  except Exception as e:
+    cloudlog.warning(f"turnpilot certify: {MODE_PARAM} unreadable ({type(e).__name__}): acting as shadow")
+    return 'shadow'
+  if isinstance(value, bytes):
+    value = value.decode(errors='replace')
+  if value not in MODES:
+    if value is not None:
+      cloudlog.warning(f"turnpilot certify: {MODE_PARAM} is {value!r}, unknown to this build: acting as shadow")
+    return 'shadow'
+  return value
+
+
 def certify(junction: sr.Junction, maneuver: str, visibility, surveys, eta: float, runtime: Runtime) -> tuple[str, str]:
   """(certification, reason) for a stop or yield control's junction (module docstring)."""
   v = assess(junction, maneuver, visibility, surveys, eta, runtime)
@@ -227,6 +248,7 @@ def certify_control(control, visibility, surveys, eta: float, runtime: Runtime, 
     return 'unchecked', 'none'
   j = sr.junction_from_control(control)
   v = assess(j, maneuver or j.maneuver, visibility, surveys, eta, runtime)
+  control.certification, control.cert_reason = v.certification, v.reason
   info = getattr(control, 'junction_info', None)
   if info is not None:
     info.certification, info.cert_reason, info.validated = v.certification, v.reason, v.validated

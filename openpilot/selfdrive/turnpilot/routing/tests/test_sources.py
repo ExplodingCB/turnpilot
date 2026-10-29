@@ -254,6 +254,12 @@ class FakeValhalla:
       return self.test.own
 
     source.own_edge = own_edge
+
+    def exclusion_headings(points):
+      source.controls_calls.append(('headings', list(points)))
+      return [349. for _ in points]
+
+    source.exclusion_headings = exclusion_headings
     self.test.built.append(source)
     return source
 
@@ -594,6 +600,12 @@ class TestReroute(RouterCase):
     got = self.router.reroute(CHICAGO, CHICAGO, 90, 'en', self.EXCLUDE)
     self.assertIs(got, self.steps)
     self.assertEqual((self.built[0].excludes[-1], self.params.writes), (self.EXCLUDE, []))
+
+  def test_exclusion_headings_from_the_source_that_routed(self):
+    self.assertEqual(self.router.exclusion_headings([(39.8, -86.1, 5, True)]), [None])  # nothing routed: the shape's bearing stays
+    self.router.route(START, DESTINATION, 90, 'en')
+    self.assertEqual(self.router.exclusion_headings([(39.8, -86.1, 5, True)]), [349.])
+    self.assertEqual(self.built[0].controls_calls[-1], ('headings', [(39.8, -86.1, 5, True)]))
 
   def test_own_edge_from_the_source_that_routed(self):
     self.assertIsNone(self.router.own_edge(START, 90.))  # nothing routed

@@ -155,6 +155,18 @@ class MapRouter:
       cloudlog.exception("turnpilot: the car's own edge failed")
       return None
 
+  def exclusion_headings(self, points) -> list:
+    """Valhalla's own heading at each stop-sign exclusion point [(lat, lon, way id, forward)] from the source that routed the
+    last route (routing/controls.py: exclusion_headings); None for each when nothing is routed or it can't say."""
+    served = self.served
+    if served is None or not hasattr(served[1], 'exclusion_headings'):
+      return [None for _ in points]
+    try:
+      return served[1].exclusion_headings(points)
+    except Exception:
+      cloudlog.exception("turnpilot: the exclusion headings failed")
+      return [None for _ in points]
+
   def reroute(self, start, destination, bearing, language, exclude) -> list[dict] | None:
     """The steps from start to destination around exclude (valhalla_source: exclude_locations), for the stop-sign
     avoidance loop (navd; STOP_SIGNS.md 3.3), or None for a failed iteration. Status-neutral: it never writes

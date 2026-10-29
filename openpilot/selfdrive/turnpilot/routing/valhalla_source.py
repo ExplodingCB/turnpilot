@@ -18,8 +18,8 @@ from pathlib import Path
 import requests
 
 from openpilot.common.swaglog import cloudlog
-from openpilot.selfdrive.turnpilot.routing.controls import (LocateCache, Opposing, actor_call, controls_ahead, http_call, opposing_roads,
-                                                            own_edge, route_controls)
+from openpilot.selfdrive.turnpilot.routing.controls import (LocateCache, Opposing, actor_call, controls_ahead, exclusion_headings, http_call,
+                                                            opposing_roads, own_edge, route_controls)
 from openpilot.selfdrive.turnpilot.stop_rules import EXCLUDE_HEADING_TOL, MAX_EXCLUDE_LOCATIONS
 
 # tools/turnpilot/install_valhalla_device.sh puts pyvalhalla here, since the system venv is read-only
@@ -178,6 +178,10 @@ class ValhallaSource:
     """(way id, forward, end node (lat, lon)) of the edge the car at position (lat, lon) heading that way is on, or None
     (routing/controls.py: own_edge)."""
     return own_edge(self._call(), position, heading)
+
+  def exclusion_headings(self, points):
+    """Valhalla's own heading at each exclusion point [(lat, lon, way id, forward)], or None (routing/controls.py)."""
+    return exclusion_headings(self._call(), points)
 
   def _call(self):
     if self.actor is None:

@@ -140,6 +140,11 @@ class Control:
   exclusion: tuple[float, float, float] | None = None
   first_edge: bool = False
   last_edge: bool = False
+  # navd's, from SG2's certifier and avoidance loop (routing/certify.py, routing/avoid.py): its certification and reason
+  # (also on junction_info for the bus), and the Unix-time window its ETA's light check passed for (certifiable only)
+  certification: str = 'unchecked'
+  cert_reason: str = 'none'
+  eta_window: tuple[float, float] | None = None
 
 
 @dataclass
@@ -440,6 +445,26 @@ def own_edge(call, position, heading: float) -> tuple[int, bool, tuple[float, fl
     return None
   c, pts = first
   return int((c.get('edge_info') or {}).get('way_id') or 0), bool((c.get('edge') or {}).get('forward', True)), (float(pts[-1][0]), float(pts[-1][1]))
+
+
+def exclusion_headings(call, points) -> list[float | None]:
+  """Valhalla's own heading of each point's edge there, points [(lat, lon, way id, forward)], in one batched verbose locate:
+  the candidate on that way and direction, else None. Valhalla correlates an exclude_location against the edge heading it
+  computes itself, which on a short curved approach can be far off the route's local bearing (routing/avoid.py)."""
+  if not points:
+    return []
+  try:
+    answers = call('locate', {'locations': [{'lat': p[0], 'lon': p[1]} for p in points], 'costing': 'auto', 'verbose': True}) or []
+  except Exception:
+    cloudlog.exception("turnpilot controls: the exclusion points' locate failed: the route's bearings stay")
+    return [None for _ in points]
+  out = []
+  for k, p in enumerate(points):
+    cands = ((answers[k] if k < len(answers) else None) or {}).get('edges') or []
+    hit = next((c for c in cands if int((c.get('edge_info') or {}).get('way_id') or 0) == int(p[2]) and
+                bool((c.get('edge') or {}).get('forward', True)) == bool(p[3]) and c.get('heading') is not None), None)
+    out.append(float(hit['heading']) if hit is not None else None)
+  return out
 
 
 def same_edge(key, own) -> bool:

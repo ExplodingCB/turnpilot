@@ -1194,3 +1194,24 @@ def test_own_edge_is_the_located_edge_by_heading_with_its_end_node():
   assert not same_edge((50, True, (39.771, -86.16)), (50, False, (39.771, -86.16)))
   assert not same_edge((50, True, (39.771, -86.16)), (50, True, (39.7712, -86.16)))
   assert not same_edge((50, True, (39.771, -86.16)), None)
+
+
+def test_exclusion_headings_are_valhallas_own_at_the_point():
+  """Valhalla correlates an exclude_location by comparing its heading with the edge heading it computes itself, which on a
+  short curved approach can be 50 deg off the route's local bearing at the point (Indianapolis way 17439639: 38 deg from the
+  route's shape, 349 from locate), so the point is dropped. controls.exclusion_headings reads locate's heading of the
+  candidate on the control's own way and direction, in one batched call; None where none is found (the shape's bearing stays)."""
+  from openpilot.selfdrive.turnpilot.routing.controls import exclusion_headings
+  answers = [{'edges': [{'edge_info': {'way_id': 7}, 'edge': {'forward': False}, 'heading': 170.}, {'edge_info': {'way_id': 9}, 'edge': {'forward': True},
+                                                                                                    'heading': 349.4}]},
+             {'edges': [{'edge_info': {'way_id': 5}, 'edge': {'forward': True}, 'heading': 10.}]}, None]
+  requests = []
+
+  def call(endpoint, req):
+    requests.append((endpoint, req))
+    return answers
+  assert exclusion_headings(call, [(39.8244, -86.1928, 9, True), (39.8, -86.1, 6, True), (39.7, -86.0, 1, True)]) == [349.4, None, None]
+  assert requests == [('locate', {'locations': [{'lat': 39.8244, 'lon': -86.1928}, {'lat': 39.8, 'lon': -86.1}, {'lat': 39.7, 'lon': -86.0}],
+                                  'costing': 'auto', 'verbose': True})]
+  assert exclusion_headings(lambda e, r: (_ for _ in ()).throw(RuntimeError('down')), [(1., 2., 3, True)]) == [None]
+  assert exclusion_headings(call, []) == []
