@@ -35,7 +35,11 @@ def test_runs_onroad_only_with_turnpilot_enabled(started, enabled):
 def test_unreadable_car_params_fail_safe():
   params = FakeParams(CarParams=b"not capnp")
   assert not turnpilotd.long_control_for(params)
-  assert turnpilotd.driver_signals_for(params)
+  # the driver signals unless the car's own signal is ready, whatever the brand (car_signals.py): unreadable CarParams
+  # carry no car signal flags, so the status is off or unverified and the driver is prompted
+  assert turnpilotd.car_params(params) is None
+  assert turnpilotd.unverified_why_for(params, None) == "waiting for the car's parameters"
+  assert turnpilotd.driver_signals_for(turnpilotd.custom.TurnpilotPlan.TurnSignal.Status.off)
 
 
 def test_error_log_is_throttled():

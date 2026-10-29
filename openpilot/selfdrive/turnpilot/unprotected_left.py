@@ -125,6 +125,13 @@ BOX_Y_RIGHT_M, BOX_Y_LEFT_M = 12., 18.               # ...from this far to the o
 # the car at its line in the junction, the oncoming lanes empty at their own red, the cross traffic going, which nothing here
 # checks. False: only a red or yellow read keeps it waiting (unknown goes on the band alone)
 SIGNAL_NEEDS_GREEN = True
+# the autonomous left goes only with a lamp lit on its side, the car's or the driver's (car_signals.py, DESIGN phase4/blinker
+# 6.7): a car standing in a left-turn position with no lamp invites a following driver to pass on the left, into the path
+# the go takes. Standing at the line this long without one, it hands back. False restores STOP_SIGNS D15's rule (the
+# prompt never gates the go)
+LEFT_GO_NEEDS_SIGNAL = True
+LEFT_SIGNAL_WAIT_S = 10.
+NO_SIGNAL_REASON = "Unprotected left: waiting for the turn signal"
 LIGHT_UNKNOWN_S = 8.       # s at its line at a signal with no read of its light: can't tell red from green, a fault
 LIGHT_RED_MAX_S = 150.     # s at its line under a red: longer than a cycle (a red read that never ends), a fault
 GO_PROMPT_S = 1.5          # leftGo is shown this long
@@ -158,6 +165,8 @@ class LeftInput:
                                  # stop sign: map_controls.stop_ahead), last frame
   light: str = 'none'            # its junction's signal's light (map_controls.turn_light): none (no signal), red, yellow, green,
                                  # unknown
+  signal_lit: bool = True        # the turn's side lit (ours or the driver's), the other side dark (car_signals.py)
+  signal_veto: str = ''          # 'driverSignal': the driver overruled the car's signal at the line (hands back, car held)
 
 
 @dataclass
@@ -323,6 +332,7 @@ class UnprotectedLeft:
     self.hold_reason = WITHDRAWN_REASON['band']  # ...and what it says
     self.roll_stall = 0.          # s standing in a roll-up to the line
     self.light_s = 0.             # s at its line with its signal's light not green (unknown, or red and yellow)
+    self.unsignalled_s = 0.       # s standing at its line with no lamp on its side (LEFT_GO_NEEDS_SIGNAL)
     self.saw_green = False        # it stood at its line on a green
 
   def update(self, inp: LeftInput, dt: float) -> LeftDecision:
@@ -360,7 +370,8 @@ class UnprotectedLeft:
     if blocked_view:
       self.clear_s = 0.  # the lanes behind the occluder weren't seen: the window counts only with the view open
     light_go = inp.light in ('none', 'green') or (inp.light == 'unknown' and not SIGNAL_NEEDS_GREEN)
-    held_else = inp.other_hold or not light_go  # something else keeps it where it is: no go, no creep
+    no_signal = LEFT_GO_NEEDS_SIGNAL and inp.mode == AUTO and not inp.signal_lit
+    held_else = inp.other_hold or not light_go or no_signal  # something else keeps it where it is: no go, no creep
     if held_else:
       self.clear_s = 0.  # the window counts only from where nothing else holds it (hold, then judge: a fresh one at the green)
     crosswalk = exit_clear(inp.objects, inp.heading_deg, side, inp.distance, occ, inp.spread_m)
@@ -404,6 +415,11 @@ class UnprotectedLeft:
       out.clear_s = 0.
     certified = self.clear_s >= CLEAR_WINDOW_S - 1e-6 and not blocked_view and crosswalk and inp.scene_clear and not held_else
     out.view = 'roadAndWide'
+    if inp.signal_veto:  # the driver's lamp the other way, hazards or our lamp put out, at the line: a handback, car held
+      return self._undecided(out, 'driverSignal')
+    self.unsignalled_s = self.unsignalled_s + dt if no_signal else 0.
+    if self.unsignalled_s >= LEFT_SIGNAL_WAIT_S - 1e-6:
+      return self._undecided(out, 'unsignalled')
     if inp.junction_uncertain:  # where the car is isn't known: before anything is judged from it (a roll-up included)
       return self._undecided(out, 'position')
     # held short of its line (the latch reaches LATCH_NEAR_M short of it), where the longer crossing puts R_req past the
@@ -471,7 +487,7 @@ class UnprotectedLeft:
     self.blocked_s = self.creep_stall = 0.
     self.creep_to = min(self.creep_to, max(crept, 0.))
     out.state = self.state = 'waitGap'
-    out.prompt, out.reason, out.creep_m = 'waitingForGap', "Waiting for a gap", self.creep_to
+    out.prompt, out.reason, out.creep_m = 'waitingForGap', NO_SIGNAL_REASON if no_signal else "Waiting for a gap", self.creep_to
     if self.hold_here:
       out.stops = [stop(inp.v_ego, 0., self.hold_reason, confirmed=False)]
     return out
@@ -543,6 +559,8 @@ UNDECIDED_REASON = {
   'yaw': "Not facing oncoming traffic: take control",
   'blocked': "View of oncoming traffic blocked: take control",
   'creepStall': "Can't creep for a view: take control",
+  'unsignalled': "No turn signal at the line: take control",
+  'driverSignal': "Turn signal changed at the line: take control",
   'light': "Can't read the light: take control",
   'lightChange': "Light changing: take control",
 }

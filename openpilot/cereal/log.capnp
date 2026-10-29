@@ -140,6 +140,7 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     turnpilotNoDetector @113;       # TurnPilot: the detector never started (no pkl, a failed load), hand back to the driver
     turnpilotControlPrompt @114;    # TurnPilot map stop control: turnpilotPlan.controlPrompt (stop sign / signal go)
     turnpilotControlAlert @115;     # TurnPilot map stop control: turnpilotPlan.controlAlert
+    turnpilotCarSignal @116;        # TurnPilot's turn signal: turnpilotPlan.turnSignal (renumber at merge with tp/integrate)
 
     # TurnPilot: a planned lane change is coming (chime, countdown), and one was aborted before it started
     turnpilotLaneChangeLeft @110;

@@ -48,7 +48,12 @@ again, and any failure aborts it, with laneChangeAbort saying why for ABORT_HOLD
 turnpilotLaneChangeAborted): the line no longer broken white or the lane no longer valid, the blind spot occupied, a car in
 the target lane, no signal in time (or the blinker off before the change started), the route changed, the change no
 longer needed, the car too slow or too close to the maneuver, DesireHelper waiting too long. Once the change has started
-nothing cancels it: the car is already moving over. A change the driver makes alone gets the same cooldown before the next
+nothing cancels it: the car is already moving over. Where the car works its own turn signal (turnpilot/car_signals.py,
+a verified Tesla), the lamp goes on with the warning and the request waits, past the countdown, until it has been lit for
+the legal distance (litM >= leadM, IC 9-21-8-25), and the driver's lamp the other way or hazards (the port's block) are
+the driver declining the change: aborted noSignal. Who signals is latched per offer: one made with the car signalling
+keeps the car's path unless the car's signal fails (then the driver's path, prompted); one made with the driver
+signalling keeps it to its end. A change the driver makes alone gets the same cooldown before the next
 offer, for the lines to settle. TurnPilotLanePaintActive off plans no change at all; turnpilotd then publishes what this
 would have asked for in laneChangePaintRule.
 
@@ -129,7 +134,14 @@ AFTER_STOP_REASON = "lane change after the stop"
 UNREACHABLE_REASON = "can't reach the turn lane before the stop"
 
 SIDE_DIRECTIONS = {LEFT: ("left", "slightLeft"), RIGHT: ("right", "slightRight")}
-OPENPILOT_SIGNALS_BRANDS = ("hyundai",)  # ports that forward CarControl blinkers (CAN-FD); everyone else is prompted
+
+
+def offer_room_s(v_ego: float, lead_m: float | None) -> float:
+  """s at speed an offer needs: the warning and DesireHelper's start, or, where the car signals, the lamp's legal lead
+  if that is longer than the warning (at 25 mph, 300 ft is 8.2 s)."""
+  if lead_m is None:
+    return LC_OFFER_ROOM_S
+  return max(LC_WARN_S, lead_m / max(v_ego, LC_SPEED_MIN)) + LC_DH_START_S
 
 
 @dataclass(frozen=True)
@@ -380,7 +392,8 @@ def slow_zone(v_ego: float) -> float:
   return LC_SPEED_MIN ** 2 / (2. * STOP_CURVE_DECEL) + max(v_ego, LC_SPEED_MIN) * STOP_CURVE_LAG_S
 
 
-def stop_window(v_ego: float, distance: float, stop_d: float | None, changes: int = 1) -> tuple[float, float, str]:
+def stop_window(v_ego: float, distance: float, stop_d: float | None, changes: int = 1,
+                room_s: float = LC_OFFER_ROOM_S) -> tuple[float, float, str]:
   """(start, end, wait) of the lane change window for this many changes with a map stop stop_d m ahead (module docstring),
   the maneuver distance m ahead. wait: '' (offer in the window), 'afterStop' or 'unreachable'. A stop past the maneuver, or
   one before the window at the change's speed (the car is up to speed again by its start), changes nothing."""
@@ -392,12 +405,13 @@ def stop_window(v_ego: float, distance: float, stop_d: float | None, changes: in
   if before >= lane_change_window(v, changes)[0]:  # slowing for it shrinks the window: not the window at speed
     return start, end, ''
   end_stop = max(end, before + slow_zone(v))
-  if distance - end_stop >= v * LC_OFFER_ROOM_S:
-    return max(start, end_stop + v * LC_PRE_LEAD_S), end_stop, ''
+  if distance - end_stop >= v * room_s:
+    return max(start, end_stop + v * (LC_PRE_LEAD_S + room_s - LC_OFFER_ROOM_S)), end_stop, ''
   if before <= end:
     return start, end_stop, ''  # the junction's own stop, past the window's end: its braking ends the window, nothing more
   # after the go the car is at about LC_SPEED_MIN through the window's end
-  return start, end, 'afterStop' if before - lane_change_window(LC_SPEED_MIN)[1] >= AFTER_GO_M else 'unreachable'
+  after_go = AFTER_GO_M + LC_SPEED_MIN * (room_s - LC_OFFER_ROOM_S)
+  return start, end, 'afterStop' if before - lane_change_window(LC_SPEED_MIN)[1] >= after_go else 'unreachable'
 
 
 def target_lane_blocked(objects, direction: int, v_ego: float, width: float = LANE_WIDTH) -> bool:
@@ -546,20 +560,33 @@ class LanePlanner:
     self._pending_t = 0.
     self._wait, self._want, self._unreachable = 'none', 0, False  # this frame's LaneDecision.wait, want, unreachable
     self._unreachable_logged = None   # the maneuver whose unreachable lane was logged
+    self._offer_driver = True         # who signals this offer, latched at its warning (module docstring)
 
   @property
   def active(self) -> bool:
     return self.phase != Phase.IDLE or self.ours
 
+  @property
+  def signal_side(self) -> int:
+    """The side to signal for the planner: the offer's from its warning, and ours until the change under way is over."""
+    if self.phase in (Phase.WARN, Phase.REQUEST, Phase.WAIT):
+      return self.offer
+    if self.ours and self._lc_dir:
+      return _toward(self._lc_dir)
+    return LaneChange.none
+
   def update(self, maneuver, distance: float, lanes: ModelLanes, lc_state, v_ego: float, left_blinker: bool,
              right_blinker: bool, objects, driver_signals: bool, right_hand_traffic: bool, dt: float, paint=(),
              left_blindspot: bool = False, right_blindspot: bool = False, maneuver_id=None, inputs_valid: bool = True,
-             stop_d: float | None = None) -> LaneDecision:
+             stop_d: float | None = None, lit_m: float = math.inf, lead_m: float | None = None, car_block: bool = False,
+             signals_failed: bool = False) -> LaneDecision:
     """lc_state: modelV2.meta.laneChangeState; objects: tracked scene objects, empty when the scene is unavailable
     (DesireHelper's blindspot check still applies); paint: as for paint_lanes, empty when not read; blindspots: carState's;
     maneuver_id: RouteFollower.maneuver_id, a new one is a changed route; inputs_valid: carState and modelV2 pass their
     checks, else nothing is offered and an offer aborts; stop_d: m to the map stop the car will stop at next
-    (MapControlPolicy.stop_ahead), None without one."""
+    (MapControlPolicy.stop_ahead), None without one. Where the car signals (driver_signals False): lit_m, the m its lamp
+    has been lit for the offer's side (car_signals.py), lead_m the legal lead, car_block the port holding off (the
+    driver's other side, hazards), signals_failed the car's signal failed mid-offer: the driver's path takes over."""
     self._wait, self._want, self._unreachable = 'none', 0, False
     if self._abort_t > 0.:
       self._abort_t -= dt
@@ -607,7 +634,8 @@ class LanePlanner:
     wanted = desired_changes(maneuver, lanes, right_hand_traffic, paint, self.done, self._start)
     want = wanted if fast else 0
     start, end = lane_change_window(v_ego, abs(wanted))
-    win_start, win_end, stop_wait = stop_window(v_ego, distance, stop_d, abs(wanted))
+    room = offer_room_s(v_ego, lead_m if not driver_signals else None)
+    win_start, win_end, stop_wait = stop_window(v_ego, distance, stop_d, abs(wanted), room)
     self._want = wanted
     want_dir = LEFT if want > 0 else RIGHT if want < 0 else 0
     nav = _nav_lanes(maneuver)
@@ -638,9 +666,11 @@ class LanePlanner:
       self._reset()
       return self._abort(reason)
     if self.phase != Phase.IDLE:
+      if not self._offer_driver and signals_failed:
+        self._offer_driver = True  # the car's signal failed mid-offer: the driver's path, prompted
       return self._follow_up(maneuver, maneuver_id, distance, end, want_dir, fast, lanes, paint, objects, lc_state, v_ego,
-                             left_blinker, right_blinker, left_blindspot, right_blindspot, driver_signals, right_hand_traffic, dt,
-                             inputs_valid)
+                             left_blinker, right_blinker, left_blindspot, right_blindspot, self._offer_driver, right_hand_traffic, dt,
+                             inputs_valid, lit_m, lead_m, car_block)
 
     wanted_dir = LEFT if wanted > 0 else RIGHT if wanted < 0 else 0
     blocker = change_blocker(wanted_dir, lanes, paint, objects, right_hand_traffic,
@@ -671,13 +701,14 @@ class LanePlanner:
       return self._decision("car in target lane")
     self._wait = 'none'
     self.phase, self.offer, self.countdown = Phase.WARN, direction, LC_WARN_S
+    self._offer_driver = driver_signals
     self._maneuver_id, self._wait_t, self._pre_t = maneuver_id, 0., 0.
     self.abort, self._abort_t = 'none', 0.
     return self._decision(prompt=driver_signals)
 
   def _follow_up(self, maneuver, maneuver_id, distance, end, want_dir, fast, lanes, paint, objects, lc_state, v_ego,
                  left_blinker, right_blinker, left_blindspot, right_blindspot, driver_signals, right_hand_traffic, dt,
-                 inputs_valid) -> LaneDecision:
+                 inputs_valid, lit_m=math.inf, lead_m=None, car_block=False) -> LaneDecision:
     """An offered change, every frame until DesireHelper starts it: still wanted, still valid, still clear, still signaled."""
     d = _direction(self.offer)
     if not self.paint_rule:
@@ -702,12 +733,16 @@ class LanePlanner:
       return self._abort('carInLane')
 
     signaled = left_blinker if d == LEFT else right_blinker
+    if not driver_signals and car_block and self.phase in (Phase.WARN, Phase.REQUEST):
+      return self._abort('noSignal')  # the driver's lamp the other way, or hazards: the driver declines the change
     if self.phase == Phase.WARN:
       self.countdown = max(self.countdown - dt, 0.)
       if driver_signals and signaled:  # the driver's go-ahead, any time in the countdown
         self.phase = Phase.REQUEST
-      elif self.countdown <= 0.:
-        self.phase = Phase.WAIT if driver_signals else Phase.REQUEST
+      elif self.countdown <= 0. and driver_signals:
+        self.phase = Phase.WAIT
+      elif self.countdown <= 0. and (lead_m is None or lit_m >= lead_m):
+        self.phase = Phase.REQUEST  # the car's lamp has led the change by the legal distance
     elif self.phase == Phase.WAIT:
       self._wait_t += dt
       if signaled:

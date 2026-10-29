@@ -511,3 +511,38 @@ def test_held_short_of_its_line_under_a_red_it_waits_where_it_is():
     assert d.r_req > RANGE and d.state == 'waitGap' and d.creep_m == 0. and not any(x.go for x in j.decisions), kw
     d = j.step(distance=16., v=0., light='green')
     assert d.state == 'creep' and abs(d.creep_m - (16. - LINE_D)) < 1e-6 and d.reason == "Rolling up to the line", kw
+
+
+# ------------------------------------------------------------------- the turn signal (car_signals.py, DESIGN phase4/blinker 6.7)
+
+def test_no_go_and_no_creep_without_the_signal():
+  from openpilot.selfdrive.turnpilot.unprotected_left import LEFT_SIGNAL_WAIT_S, NO_SIGNAL_REASON
+  j = Junction()
+  d = j.wait(CLEAR_WINDOW_S + 1., signal_lit=False)
+  assert not any(x.go for x in j.decisions) and d.state == 'waitGap' and d.reason == NO_SIGNAL_REASON and d.creep_m == 0.
+  d = j.wait(LEFT_SIGNAL_WAIT_S - CLEAR_WINDOW_S - 1.5, signal_lit=False)
+  assert d.state == 'waitGap'
+  d = j.wait(1., signal_lit=False)
+  assert d.state == 'undecided' and d.why == 'unsignalled' and d.prompt == 'leftUndecidedTakeControl'
+  # lit: the window counts from the lamp, then it goes
+  j = Junction()
+  j.wait(2., signal_lit=False)
+  j.wait(CLEAR_WINDOW_S + 0.2, signal_lit=True)
+  assert any(x.go for x in j.decisions)
+
+
+def test_signal_gate_off_is_todays_rule(monkeypatch):
+  import openpilot.selfdrive.turnpilot.unprotected_left as ul
+  monkeypatch.setattr(ul, 'LEFT_GO_NEEDS_SIGNAL', False)
+  a, b = Junction(), Junction()
+  for _ in range(round((CLEAR_WINDOW_S + 1.) / DT_MDL)):
+    da, db = a.step(signal_lit=False), b.step()
+    assert (da.state, da.go, da.reason) == (db.state, db.go, db.reason)
+
+
+def test_a_veto_at_the_line_hands_back():
+  j = Junction()
+  j.wait(1.)
+  d = j.step(signal_veto='driverSignal')
+  assert d.state == 'undecided' and d.why == 'driverSignal' and not d.go
+  assert j.wait(CLEAR_WINDOW_S + 1.).state == 'undecided'

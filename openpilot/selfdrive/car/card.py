@@ -20,8 +20,10 @@ from opendbc.car.car_helpers import get_car, interfaces
 from opendbc.car.interfaces import CarInterfaceBase, RadarInterfaceBase
 from openpilot.selfdrive.pandad import can_capnp_to_list, can_list_to_can_capnp
 from openpilot.selfdrive.car.cruise import VCruiseHelper
+from openpilot.selfdrive.turnpilot.car_signals import check_record, resolver as car_signals_resolver
 
 REPLAY = "REPLAY" in os.environ
+SIMULATION = "SIMULATION" in os.environ
 
 EventName = log.OnroadEvent.EventName
 
@@ -98,7 +100,10 @@ class Car:
         with car.CarParams.from_bytes(cached_params_raw) as _cached_params:
           cached_params = _cached_params
 
-      self.CI = get_car(*self.can_callbacks, obd_callback(self.params), alpha_long_allowed, is_release, cached_params)
+      # TurnPilot: whether the car works its own turn signal this drive, from TurnPilotCarSignals and the verified record
+      # for this VIN and firmware (turnpilot/car_signals.py); a check mode read is written back to off at once
+      self.CI = get_car(*self.can_callbacks, obd_callback(self.params), alpha_long_allowed, is_release, cached_params,
+                        car_signals=car_signals_resolver(self.params, SIMULATION))
       self.RI = interfaces[self.CI.CP.carFingerprint].RadarInterface(self.CI.CP)
       self.CP = self.CI.CP
 
@@ -156,6 +161,8 @@ class Car:
 
     # card is driven by can recv, expected at 100Hz
     self.rk = Ratekeeper(100, print_delay_threshold=None)
+    self.signal_check_written = None  # the lamp check result card last wrote (TurnPilotCarSignalsCheck)
+    self.signal_record_deleted = False
 
   def state_update(self) -> tuple[car.CarState, structs.RadarDataT | None]:
     """carState update loop, driven by can"""
@@ -252,10 +259,37 @@ class Car:
     self.initialized_prev = initialized
     self.CS_prev = CS
 
+  def car_signals_tick(self) -> None:
+    """TurnPilot's car signals, once a second: the phone page's Start in Drive passed to the check, the check's result
+    written for the phone page and the resolver, and the verified record deleted on a lamp lit on the wrong side."""
+    port = getattr(self.CI.CS, 'car_signal', None)
+    if port is None or not port.active:
+      return
+    try:
+      if port.check is not None:
+        if self.params.get_bool("TurnPilotCarSignalsCheckNow"):
+          self.params.remove("TurnPilotCarSignalsCheckNow")
+          self.CI.start_signal_check()
+          cloudlog.warning("card: car signal check started in Drive from the phone")
+        result = port.check.result
+        if result is not None and result is not self.signal_check_written:
+          self.params.put("TurnPilotCarSignalsCheck", check_record(result, self.CP.carVin, self.CP.carFw, SIMULATION))
+          self.signal_check_written = result
+      if port.fault == 'wrongSide' and not self.signal_record_deleted:
+        self.params.remove("TurnPilotCarSignalsVerified")
+        self.signal_record_deleted = True
+        cloudlog.error("card: the car signalled the wrong side: TurnPilotCarSignalsVerified deleted, run the check again")
+    except Exception:
+      cloudlog.exception("card: car signals params failed")
+
   def params_thread(self, evt):
+    i = 0
     while not evt.is_set():
       self.is_metric = self.params.get_bool("IsMetric")
       self.initial_cruise_speed = self.params.get("InitialCruiseSpeedKph", return_default=True)
+      if i % 10 == 0:
+        self.car_signals_tick()
+      i += 1
       time.sleep(0.1)
 
   def card_thread(self):

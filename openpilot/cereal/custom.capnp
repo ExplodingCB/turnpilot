@@ -252,6 +252,37 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     why @10 :Text;             # undecided: its fault; announce: go or wait
   }
   unprotectedLeft @31 :UnprotectedLeftStatus;
+
+  # TurnPilot's turn signal (turnpilot/car_signals.py): who signals each maneuver, the car itself (a verified Tesla,
+  # opendbc car_signal.py) or the driver, prompted. Named TurnSignal, not CarSignal, to keep it apart from opendbc's
+  # CarState.CarSignal (the port's own statuses).
+  struct TurnSignal {
+    enum Status {
+      off @0;          # TurnPilotCarSignals off: the driver signals, prompted per turn
+      checking @1;     # this ignition runs the lamp check
+      unverified @2;   # mode on, but no verified record matches this car (why)
+      verifying @3;    # mode on, the ignition re-check in Park hasn't passed yet
+      waiting @4;      # mode on, the port has seen no stock body frame yet (the drive's first 15 s)
+      unavailable @5;  # the same past 15 s: the car can't signal
+      ready @6;        # the car signals TurnPilot's maneuvers
+      failed @7;       # the port faulted: the driver signals, prompted, for the rest of the drive
+    }
+    enum Skip { none @0; driverSignal @1; hazards @2; signalLost @3; sideUncertain @4; }
+    enum Notice { none @0; changedMidTurn @1; ranPast @2; }
+    status @0 :Status;
+    side @1 :LaneChange;        # the side to signal now, whoever signals: a lane change from its warning, a route turn
+                                # from its arming distance; controlsd commands it while ready
+    leadM @2 :Float32;          # m the signal must lead the move by: 60.96 (200 ft) or 91.44 (300 ft), IC 9-21-8-25
+    litM @3 :Float32;           # m travelled with the car's lamp continuously lit for side
+    handedOver @4 :LaneChange;  # the side whose lit car signal ended with engagement or a handback, maneuver still ahead;
+                                # about 3 s, after the mask is down ("Signal Off")
+    prompt @5 :LaneChange;      # ask the driver to signal this turn: not ready, under 20 mph, nothing pending
+    skip @6 :Skip;              # why this turn ahead was skipped by the signal's rules, for the tooFastToTurn alert
+    notice @7 :Notice;          # a one-off line, about 3 s
+    armM @8 :Float32;           # m before the maneuver the current turn armed at (lead plus ARM_LAG_S travel)
+    why @9 :Text;               # the status's reason, one line (unverified, unavailable, failed)
+  }
+  turnSignal @32 :TurnSignal;   # renumber at merge with tp/integrate (where goCertified holds @32)
 }
 
 struct TurnpilotDetections @0xaedffd8f31e7b55d {

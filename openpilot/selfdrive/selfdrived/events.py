@@ -13,8 +13,8 @@ from openpilot.common.git import get_short_branch
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.locationd.calibrationd import MIN_SPEED_FILTER
 from openpilot.common.hardware import HARDWARE
-from openpilot.selfdrive.turnpilot.hooks import (ABORT_TEXT, CONTROL_ALERT_TEXT, CONTROL_PROMPT_TEXT, CONTROL_STATUS_ALERTS,
-                                               SILENT_PROMPTS, TAKE_CONTROL_PROMPTS, fresh_plan, lane_change_text, shown_plan)
+from openpilot.selfdrive.turnpilot.hooks import (ABORT_TEXT, CAR_SIGNAL_EVENTS, CONTROL_ALERT_TEXT, CONTROL_PROMPT_TEXT, CONTROL_STATUS_ALERTS,
+                                               SILENT_PROMPTS, TAKE_CONTROL_PROMPTS, fresh_plan, lane_change_text, shown_plan, too_fast_title)
 
 AlertSize = log.SelfdriveState.AlertSize
 AlertStatus = log.SelfdriveState.AlertStatus
@@ -303,10 +303,21 @@ def turnpilot_too_fast_to_turn_alert(CP: car.CarParams, CS: car.CarState, sm: me
   lane = plan is not None and str(plan.laneChangeWait) == 'unreachable'
   missed = plan is not None and plan.turnMissed
   blind = plan is not None and str(plan.unprotectedLeft.state) == 'skipped'  # oncoming too fast for the detector's range
-  return Alert("Turn Missed" if missed else "Can't Reach Turn Lane" if lane else "Can't See Far Enough to Turn" if blind else
-               "Too Fast to Turn", "Rerouting",
+  signal = too_fast_title(plan) if plan is not None else None  # the turn signal's skips (car_signals.py: a veto, a side in doubt)
+  return Alert("Turn Missed" if missed else signal if signal else "Can't Reach Turn Lane" if lane else
+               "Can't See Far Enough to Turn" if blind else "Too Fast to Turn", "Rerouting",
                AlertStatus.userPrompt, AlertSize.mid,
                Priority.LOW, VisualAlert.none, AudibleAlert.tpTooFastTurn, 3.)
+
+
+def turnpilot_car_signal_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int,
+                               personality) -> Alert:
+  """TurnPilot's turn signal (turnpilot/car_signals.py): the line hooks.CarSignalEvents chose this frame (a prompt to
+  signal, a car signal failure, the check's steps, a notice)."""
+  line = CAR_SIGNAL_EVENTS.line or ("Turn Signal", "", 'none')
+  title, text, sound = line
+  return Alert(title, text, AlertStatus.userPrompt if sound != 'none' else AlertStatus.normal, AlertSize.mid,
+               Priority.LOW, VisualAlert.none, getattr(AudibleAlert, sound), .2)
 
 
 CONTROL_PROMPT_TITLE = {'yieldAhead': "Yield Ahead", 'stopSignTakeControl': "Stop Sign: Take Control",
@@ -793,6 +804,11 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
 
   EventName.turnpilotControlAlert: {  # engaged only: while the driver drives, passing a stop line is theirs to judge
     ET.WARNING: turnpilot_control_alert,
+  },
+
+  # TurnPilot's turn signal: shown engaged or not (the check runs disengaged, the driver signals either way)
+  EventName.turnpilotCarSignal: {
+    ET.PERMANENT: turnpilot_car_signal_alert,
   },
 
   EventName.laneChange: {

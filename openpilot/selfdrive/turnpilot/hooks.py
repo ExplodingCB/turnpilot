@@ -248,3 +248,134 @@ def plan_desire(desire: int, lat_active: bool) -> tuple[int, bool]:
 def plan_accel(accel_cap: float, speed_cap: float, v_ego: float) -> float:
   """The longitudinal planner's accel candidate from a plan's caps."""
   return min(accel_cap, max((speed_cap - v_ego) / SPEED_CAP_TAU, SPEED_CAP_ACCEL_MIN))
+
+
+# TurnPilot's turn signal (car_signals.py, DESIGN phase4/blinker 7.7): one event, turnpilotCarSignal, whose line is chosen
+# here. The skips go through the tooFastToTurn alert (too_fast_title). (title, text, sound) with sound an AudibleAlert name
+CAR_SIGNAL_FAULT_TEXT = {
+  'lampTimeout': "Lamp didn't light", 'lampLost': "Signal went out: stalk touched?", 'lampStuck': "Lamp stuck on: cancel the signal",
+  'wrongSide': "Car signalled the wrong side", 'noStockFrame': "No body-control message", 'capped': "Signal on too long",
+  'recheckFailed': "Re-check failed",
+}
+CAR_SIGNAL_FAULT_S = 4.
+CAR_SIGNAL_ONCE_S = 6.
+CAR_SIGNAL_NOTICE_S = 3.
+PROMPT_QUIET_S = 10.  # a prompt gone this long is a new one: chimed again
+SKIP_TITLE = {'hazards': "Turn Cancelled: Hazards On", 'signalLost': "Turn Cancelled: Signal Went Out",
+              'sideUncertain': "Turn Side Uncertain"}
+CHECK_TITLE = {'waiting': None, 'reason': "Turn Signal Check", 'release': "Checking Left Signal", 'left': "Checking Left Signal",
+               'right': "Checking Right Signal", 'pattern': "Checking Turn Signals", 'driverPress': "Signal Left Yourself",
+               'passed': "Turn Signal Check Passed", 'failed': "Turn Signal Check Failed", 'aborted': "Turn Signal Check Stopped"}
+
+
+def too_fast_title(plan) -> str | None:
+  """The tooFastToTurn alert's title for a turn the turn signal's rules skipped (turnSignal.skip), or None."""
+  skip = str(plan.turnSignal.skip)
+  if skip == 'driverSignal':
+    other = 'Left' if 'right' in str(plan.maneuverModifier) else 'Right'
+    return f"Turn Cancelled: You Signalled {other}"
+  return SKIP_TITLE.get(skip)
+
+
+class CarSignalEvents:
+  """selfdrived's turnpilotCarSignal: the turn signal's lines, their holds and once-per-drive logic (DESIGN 7.7). line is
+  the (title, text, sound) to show while the event is raised; events.py reads it."""
+  def __init__(self):
+    self.line: tuple[str, str, str] | None = None
+    self._held: tuple[str, str, str] | None = None
+    self._held_t = 0.
+    self._once: set[str] = set()
+    self._fault_said = False
+    self._still_said = False
+    self._prompt_side = 'none'
+    self._prompt_quiet = PROMPT_QUIET_S
+    self._check_stage = 'idle'
+    self._started = 0.
+
+  def _hold(self, line, seconds: float) -> None:
+    self._held, self._held_t = line, seconds
+
+  def update(self, plan, car_signal, flags: int, dt: float) -> tuple[str, ...]:
+    """plan: shown_plan's (None while stale); car_signal: carState.carSignal; flags: CarParams.flags on a Tesla."""
+    from opendbc.car.tesla.values import TeslaFlags
+    self._started += dt
+    self.line = None
+    ts = plan.turnSignal if plan is not None else None
+    status = str(ts.status) if ts is not None else 'off'
+    # the check and the re-check, from the port (carState.carSignal)
+    stage = str(car_signal.check)
+    if stage != self._check_stage and flags & TeslaFlags.CAR_SIGNALS_CHECK:
+      title = CHECK_TITLE.get(stage)
+      if title is not None:
+        why = str(car_signal.checkWhy) or "Hands off the signal, stay stopped"
+        sound = 'prompt' if stage in ('reason', 'passed', 'failed', 'aborted') else 'none'
+        self._hold((title, why, sound), CAR_SIGNAL_FAULT_S if stage in ('passed', 'failed', 'aborted') else 1e9)
+    self._check_stage = stage
+    if flags & TeslaFlags.CAR_SIGNALS_RECHECK and not flags & TeslaFlags.CAR_SIGNALS_CHECK and stage in ('left', 'right', 'waiting') \
+       and str(car_signal.status) == 'verifying':
+      self.line = ("Turn Signal Re-check", "Stay in Park" if stage != 'waiting' else str(car_signal.checkWhy), 'none')
+    # a fault, said once when it happens
+    if status == 'failed' and not self._fault_said:
+      self._fault_said = True
+      fault = str(car_signal.fault)
+      text = CAR_SIGNAL_FAULT_TEXT.get(fault, "Car signal failed")
+      if fault == 'lampTimeout' and car_signal.rejected > 0:
+        text = "Lamp didn't light: the panda refused it"
+      if fault == 'recheckFailed' and str(car_signal.checkWhy):
+        text = str(car_signal.checkWhy)
+      self._hold(("Car Signal Failed", text + ". You'll be asked to signal", 'prompt'), CAR_SIGNAL_FAULT_S)
+    # once per drive
+    if status == 'unverified' and 'unverified' not in self._once:
+      self._once.add('unverified')
+      self._hold(("Car Signals Not Verified", str(ts.why) or "Run the turn signal check", 'prompt'), CAR_SIGNAL_ONCE_S)
+    if status == 'unavailable' and 'unavailable' not in self._once:
+      self._once.add('unavailable')
+      self._hold(("Car Can't Signal", "No body-control message: you signal", 'prompt'), CAR_SIGNAL_ONCE_S)
+    if status == 'ready' and flags & TeslaFlags.CAR_SIGNALS and not flags & TeslaFlags.CAR_SIGNALS_RECHECK and \
+       'notRechecked' not in self._once:
+      self._once.add('notRechecked')
+      self._hold(("Car Signals Not Re-checked", "Verified in Drive: watch the first turn", 'prompt'), CAR_SIGNAL_ONCE_S)
+    # notices
+    if ts is not None and str(ts.handedOver) != 'none' and 'handedOver' not in self._once:
+      self._once.add('handedOver')
+      side = str(ts.handedOver)
+      self._hold(("Signal Off", f"Signal {side} yourself", 'prompt'), CAR_SIGNAL_NOTICE_S)
+    elif ts is not None and str(ts.handedOver) == 'none':
+      self._once.discard('handedOver')
+    notice = str(ts.notice) if ts is not None else 'none'
+    if notice != 'none' and f'notice:{notice}' not in self._once:
+      self._once.add(f'notice:{notice}')
+      self._hold(("Turn Signal Changed", "Finishing the turn", 'prompt') if notice == 'changedMidTurn' else
+                 ("Turn Signal Ended", "Signal ran past the turn", 'prompt'), CAR_SIGNAL_NOTICE_S)
+    elif notice == 'none':
+      self._once = {o for o in self._once if not o.startswith('notice:')}
+    # a masked lamp lit past its release
+    if car_signal.stillOn:
+      if not self._still_said:
+        self._still_said = True
+        self.line = ("Turn Signal Still On", "Cancel it if you're not turning", 'prompt')
+      else:
+        self.line = ("Turn Signal Still On", "Cancel it if you're not turning", 'none')
+    else:
+      self._still_said = False
+    # the prompt (car_signals.py 6.5): while it holds, chimed once per prompt
+    prompt = str(ts.prompt) if ts is not None else 'none'
+    if prompt != 'none':
+      sound = 'none'
+      if prompt != self._prompt_side or self._prompt_quiet >= PROMPT_QUIET_S:
+        sound = 'tpLaneChangeLeft' if prompt == 'left' else 'tpLaneChangeRight'
+      self._prompt_side, self._prompt_quiet = prompt, 0.
+      if self.line is None:
+        self.line = (f"Signal {prompt.capitalize()}", "For the turn ahead", sound)
+    else:
+      self._prompt_quiet += dt
+    if self._held_t > 0.:
+      self._held_t -= dt
+      if self.line is None or self._held[2] != 'none':
+        self.line = self._held
+        self._held = (self._held[0], self._held[1], 'none') if self._held_t > 0. else self._held
+    return ('turnpilotCarSignal',) if self.line is not None else ()
+
+
+# the line selfdrived's turnpilotCarSignal shows: CarSignalEvents.update sets it each frame (one selfdrived per process)
+CAR_SIGNAL_EVENTS = CarSignalEvents()

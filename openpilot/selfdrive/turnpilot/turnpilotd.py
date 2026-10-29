@@ -121,13 +121,14 @@ from openpilot.selfdrive.turnpilot.detector.light_state import LIGHT_MODE_DEFAUL
 from openpilot.selfdrive.turnpilot.map_controls import (CAMERA_STALE_S, KEEP_TURN, LATCH_PAST_M, MAP_MARGIN_M, PROTECT_PAST_M, YELLOW_DECEL,
                                                          YELLOW_DECEL_MAX, LeftCommand, MapControlPolicy, camera_light_input, light_input,
                                                          turn_stop_feasible, unprotected_turn)
-from openpilot.selfdrive.turnpilot.lane_planner import (OPENPILOT_SIGNALS_BRANDS, LanePlanner, lane_change_window, lane_mismatch,
-                                                         model_lanes_from_msg)
+from openpilot.selfdrive.turnpilot.car_signals import (TurnSignalIntent, TurnSignalOut, driver_signals_for, read_mode,
+                                                        record_matches)
+from openpilot.selfdrive.turnpilot.lane_planner import LanePlanner, Phase, lane_change_window, lane_mismatch, model_lanes_from_msg
 from openpilot.selfdrive.turnpilot.route_follower import KEEP, LEFT, TURN, UNCERTAIN_M, RouteFollower
 from openpilot.selfdrive.turnpilot.scene.lane_paint import lane_paint_from_msg
 from openpilot.selfdrive.turnpilot.scene.tracker import STALE_S, SceneTracker, default_yaw_rate
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, NO_ACCEL_CAP, ScenePolicy
-from openpilot.selfdrive.turnpilot.turn_skip import TurnSkip, can_make_turn
+from openpilot.selfdrive.turnpilot.turn_skip import SkipState, TurnSkip, can_make_turn
 from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
 from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, OFF, ROAD_RANGE_M, LeftInput, UnprotectedLeft,
                                                            left_mode_for, reach_at_line)
@@ -206,6 +207,9 @@ LEFT_HOLDS_PULSE = ('approach', 'waitGap', 'creep', 'undecided', 'announce')  # 
 # G4: a 6 deg bend away from the turn over the last 40 m turned the band off the oncoming lane), and only moving (a standing
 # car doesn't yaw; a biased yaw rate over minutes at the line would)
 YAW_MIN_SPEED = STANDSTILL_SPEED
+# a change the route wants that may still be offered: the turn's prompt waits (STOP_SIGNS D15), lest the driver's lamp be
+# read as the change's go-ahead. One past its window, unreachable or unplaceable will never be offered: it doesn't hold it
+LANE_PENDING_WAITS = ('beforeWindow', 'confirming', 'cooldown', 'blindspot', 'carInLane', 'afterStop')
 
 
 def close_lead(model) -> bool:
@@ -249,6 +253,12 @@ class TurnPilot:
     self.auto_left = AUTO  # TurnPilotAutoLeft (main()): the unprotected left's mode (unprotected_left.py)
     self.left_range_m = ROAD_RANGE_M  # TurnPilotLeftRangeM (main()): the detector's proven range its R_req is checked against
     self.left_now = None  # this frame's unprotected left decision (unprotected_left.LeftDecision), once update() has made it
+    # the turn signal (car_signals.py): who signals, the car (a verified Tesla) or the driver (prompted), and which side
+    self.turn_signal = TurnSignalIntent()
+    self.signal_out = TurnSignalOut()  # the last frame's, for the lane planner and the unprotected left
+    self.car_signal_flags = 0  # CarParams.flags on a Tesla (main()): CAR_SIGNALS, CAR_SIGNALS_CHECK
+    self.car_signal_mode = 'off'  # TurnPilotCarSignals (main())
+    self.unverified_why = ''  # why mode on found no verified record for this car (main())
     self._rf_ticked = self._yaw_ticked = False  # update() dead-reckoned the route, and counted the yaw, this frame
     self.reset()
 
@@ -399,11 +409,13 @@ class TurnPilot:
       self._stop_abort_t -= DT_MDL
       plan.laneChangeAbort = self.stop_abort
 
-  def update(self, sm, scene, enabled: bool, shadow: bool, driver_signals: bool = True, right_hand_traffic: bool = True, paint=(),
+  def update(self, sm, scene, enabled: bool, shadow: bool, driver_signals: bool | None = None, right_hand_traffic: bool = True, paint=(),
              paint_rule: bool = True, inputs_valid: bool = True, raw=None):
     """A turnpilotPlan message from sm's carState, navInstruction and modelV2, a TurnpilotScene, and the lane paint of
     modelV2's four lane lines (empty when unknown). paint_rule: TurnPilotLanePaintActive; inputs_valid: carState and
-    modelV2 pass their checks; raw: the detector run that arrived this frame (scene.tracker.RawFrame), or None."""
+    modelV2 pass their checks; raw: the detector run that arrived this frame (scene.tracker.RawFrame), or None.
+    driver_signals: None (main) takes it from the turn signal's status, the driver signalling unless the car's own signal
+    is ready (car_signals.py); a bool forces it, False then being the openpilot-signals path with no lamp lead gate."""
     self.handback_now = self.scene_now = self.map_now = self.left_now = None
     msg = messaging.new_message('turnpilotPlan')
     plan = msg.turnpilotPlan
@@ -420,6 +432,11 @@ class TurnPilot:
 
     cs, model = sm['carState'], sm['modelV2']
     v_ego = max(cs.vEgo, 0.)
+    port = cs.carSignal
+    signal_status = self.turn_signal.status_for(self.car_signal_flags, self.car_signal_mode, port, DT_MDL, self.unverified_why)
+    signal_forced = driver_signals is not None
+    if driver_signals is None:
+      driver_signals = driver_signals_for(signal_status)
     rf = self.follower
     rf.update(sm['navInstruction'], sm.updated['navInstruction'], sm.valid['navInstruction'], v_ego, DT_MDL,
               committed=self.turn_committed)
@@ -491,6 +508,13 @@ class TurnPilot:
     skip = self.skip.update(upcoming, rf.distance, rf.maneuver_id, v_ego, desire_out, right_hand_traffic, lat_active,
                             rf.ahead, rf.ahead_distance, stop_d=self.map_controls.stop_ahead(), stop_infeasible=stop_infeasible,
                             pulse_at_go=pulse_at_go, out_of_range=out_of_range)
+    # a turn whose bearings turn the other way from its modifier: the side the car would signal and steer is in doubt,
+    # so it is skipped out loud and rerouted as soon as it is the maneuver, in every mode (car_signals.py), never a
+    # committed one
+    if acting and upcoming is not None and upcoming.kind in (TURN, KEEP) and upcoming.bearing_side and \
+       upcoming.bearing_side != upcoming.side and not skip.skipped and not desire_out:
+      self.skip.skip(upcoming, rf.distance, rf.maneuver_id, v_ego, 'sideUncertain')
+      skip = SkipState(True, False)
     maneuver = None if skip.skipped else upcoming
     # navd reroutes on it and selfdrived alerts: only while TurnPilot is driving the route (handback outranks it). A turn
     # just past a bend that will be skipped once it is the maneuver is announced now, before its junction (turn_skip.py)
@@ -538,6 +562,10 @@ class TurnPilot:
     # so nothing is offered (an offer at the handback was cancelled above, as handedBack)
     lane_kw = {'left_blindspot': cs.leftBlindspot, 'right_blindspot': cs.rightBlindspot, 'maneuver_id': rf.maneuver_id,
                'inputs_valid': inputs_valid, 'stop_d': self.map_controls.stop_ahead()}
+    if not signal_forced:  # the car's lamp leads its own lane changes by the legal distance (lane_planner.py)
+      lane_kw.update(lit_m=self.signal_out.lit_m, lead_m=self.signal_out.lead_m,
+                     car_block=str(port.block) in ('otherSide', 'hazard') or port.hazard,
+                     signals_failed=signal_status == custom.TurnpilotPlan.TurnSignal.Status.failed)
     lane_args = (act_on, rf.distance, lanes, model.meta.laneChangeState, v_ego, cs.leftBlinker, cs.rightBlinker, objects,
                  driver_signals, right_hand_traffic, DT_MDL, paint)
     self.lanes.paint_rule = paint_rule
@@ -577,6 +605,29 @@ class TurnPilot:
     no_junction_data = maneuver is not None and maneuver.kind in (TURN, KEEP) and not maneuver.geometry
     plan.turnMissed = acting and self.missed_t > 0.
     self.missed_t = max(self.missed_t - DT_MDL, 0.)
+
+    # the turn signal (car_signals.py): the side, the prompt, the driver overruling the car, the lamp's lead
+    left_d = self.left_now
+    at_left_line = left_d is not None and left_d.state in ('waitGap', 'creep', 'undecided', 'announce')
+    ts = self.turn_signal.update(status=signal_status, port=port, gates_ok=acting and not shadow, engaged=sm['carControl'].enabled,
+                                 lane_side=self.lanes.signal_side, lane_pending=self.lanes.phase != Phase.IDLE or
+                                 (lc.want != 0 and lc.wait in LANE_PENDING_WAITS),
+                                 maneuver=desire_on, maneuver_id=rf.maneuver_id, distance=rf.distance, desires=self.desires,
+                                 missed=plan.turnMissed, v_ego=v_ego, dt=DT_MDL, limit_ms=sm['navInstruction'].speedLimit,
+                                 left_lamp=cs.leftBlinker or port.leftLamp, right_lamp=cs.rightBlinker or port.rightLamp,
+                                 at_left_line=at_left_line, standing=decision.should_stop or at_left_line,
+                                 go_now=self.release_go)
+    self.signal_out = ts
+    ts.fill(plan.turnSignal)
+    if ts.skip != 'none' and act_on is not None and not committed and not self.skip.skipped:
+      # the driver overruled the car's signal before the turn: skipped out loud, navd reroutes (never a committed turn)
+      self.skip.skip(act_on, rf.distance, rf.maneuver_id, v_ego, ts.skip)
+      plan.tooFastToTurn = True
+    signal_skip = self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id and \
+      self.skip.reason in ('driverSignal', 'hazards', 'signalLost', 'sideUncertain')
+    plan.turnSignal.skip = self.skip.reason if signal_skip else 'none'
+    if ts.side != LaneChange.none and str(port.block) == 'hazard' and not plan.reason:
+      plan.reason = "Hazards on: car not signalling"
     plan.reason = decision.reason or (TURN_MISSED_REASON if plan.turnMissed else "") or lane_reason or mapd.reason or \
       (NO_JUNCTION_DATA_REASON if no_junction_data else "")
     fill_map_control(plan, mapd)
@@ -671,7 +722,8 @@ class TurnPilot:
                     junction_uncertain=rf.junction_spread > UNCERTAIN_M or stray,
                     go_withdrawn=self.go_withdrawn, committed=rf.maneuver_id in (scene.committed_id, scene.released_id),
                     spread_m=rf.junction_spread, other_hold=stop_d is not None and stop_d <= rf.distance + PROTECT_PAST_M,
-                    light=self.map_controls.turn_light(int(turn[0]), turn[1]))
+                    light=self.map_controls.turn_light(int(turn[0]), turn[1]),
+                    signal_lit=self.signal_out.signal_lit, signal_veto=self.signal_out.left_veto)
     d = self.left_now = self.left.update(inp, DT_MDL)
     return LeftCommand(mode, d.go, d.creep_m, d.state == 'undecided', d.reason)
 
@@ -1059,10 +1111,15 @@ def car_params(params):
     return None
 
 
-def driver_signals_for(params) -> bool:
-  """True unless the car's port signals for openpilot's lane changes; unknown cars prompt the driver."""
-  cp = car_params(params)
-  return cp is None or cp.brand not in OPENPILOT_SIGNALS_BRANDS
+def unverified_why_for(params, cp) -> str:
+  """With TurnPilotCarSignals on, why no verified record matched this car (car_signals.record_matches), '' when one did."""
+  if cp is None:
+    return "waiting for the car's parameters"
+  try:
+    record = params.get("TurnPilotCarSignalsVerified")
+  except UnknownKeyName:
+    return "this build's params lack the car signal keys: run scons"
+  return record_matches(record, cp.carVin, cp.carFw, "SIMULATION" in os.environ)[1]
 
 
 def long_control_for(params) -> bool | None:
@@ -1095,7 +1152,8 @@ def main():
   tp = TurnPilot()
   tracker = None
   enabled = shadow = paint_rule = False
-  driver_signals, right_hand_traffic, disengage_on_accel = True, True, True
+  driver_signals = None  # from the turn signal's status, every frame (car_signals.py)
+  right_hand_traffic, disengage_on_accel = True, True
   long_control: bool | None = None
   invalid_frames = PLAN_INPUT_GRACE_FRAMES
   while True:
@@ -1105,7 +1163,10 @@ def main():
       shadow = params.get_bool("TurnPilotShadowMode")
       paint_rule = lane_paint_active(params)
       right_hand_traffic = not params.get_bool("IsRhdDetected")
-      driver_signals = driver_signals_for(params)
+      cp = car_params(params)
+      tp.car_signal_flags = int(cp.flags) if cp is not None and cp.brand == 'tesla' else 0
+      tp.car_signal_mode = read_mode(params)
+      tp.unverified_why = unverified_why_for(params, cp) if tp.car_signal_mode == 'on' else ''
       long_control = long_control_for(params)
       disengage_on_accel = params.get_bool("DisengageOnAccelerator")
       tp.oracle_ok = oracle_accepted(os.environ, read_bool(params, "TurnPilotSimLightOracle", False))

@@ -77,6 +77,11 @@ class Sim:
     self.take_over_on = ('unprotectedTurnTakeControl',)
     self._prompted_s = 0.
     self._take_over_from: float | None = None  # s where the driver's take-over began
+    # the driver answers turnpilotPlan.turnSignal.prompt with the stalk, held until the turn's signal ends (the car not
+    # signalling for itself: car_signals.py). The autonomous left goes only with a lamp lit on its side
+    self.answers_prompt = False
+    self._signal = 'none'
+    self.car_signal = None  # carState.carSignal's fields, a function of the sim (the car's own turn signal), or None
     self.trace = []
 
   def step(self, objects=(), available=True, steer=0., blinker=False, lat_active=True, yaw_rate=0., gas=False,
@@ -94,7 +99,15 @@ class Sim:
     if instr is not None:
       instr, valid = self.nav_filter(self, instr) if self.nav_filter is not None else (instr, True)
       self.sm.put('navInstruction', instr, valid)
-    self.sm.put('carState', car_state(self.v, steer, left_blinker=blinker, yaw_rate=yaw_rate, gas_pressed=gas))
+    if self.answers_prompt and self.trace:
+      prompt = str(self.trace[-1][2].turnSignal.prompt)
+      if prompt != 'none':
+        self._signal = prompt
+      elif self.tp.turn_signal.armed_id is None:
+        self._signal = 'none'
+    self.sm.put('carState', car_state(self.v, steer, left_blinker=blinker or self._signal == 'left',
+                                      right_blinker=self._signal == 'right', yaw_rate=yaw_rate, gas_pressed=gas,
+                                      car_signal=self.car_signal(self) if self.car_signal is not None else None))
     self.sm.put('carControl', car_control(lat_active, engaged))
     if self.model_running:
       self.sm.put('modelV2', model_v2(*self.model_lanes, big=self.big, **self.model_kw))
