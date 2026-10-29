@@ -265,7 +265,7 @@ def cached(path: Path = SHIPPED, sim_ok: bool = False) -> Visibility | None:
   except OSError:
     stamp = None
   hit = _cache.get(path)
-  if hit is not None and hit[0] == stamp and stamp is not None:
+  if hit is not None and hit[0] == stamp:
     return hit[1]
   try:
     out = load(path, sim_ok) if stamp is not None else None

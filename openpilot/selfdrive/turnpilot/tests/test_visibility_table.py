@@ -188,3 +188,11 @@ class TestTables:
     del raw['lens']
     assert vt.cached(write(tmp_path, raw)) is None
     assert vt.cached(tmp_path / 'missing.json') is None
+
+
+def test_a_missing_file_is_said_once_not_every_second(tmp_path):
+  from unittest.mock import patch
+  with patch.object(vt.cloudlog, 'error') as error:
+    for _ in range(3):
+      assert vt.cached(tmp_path / 'gone.json') is None
+  assert error.call_count == 1

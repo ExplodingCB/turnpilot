@@ -240,15 +240,25 @@ def stop_sign_mode(params) -> str:
   try:
     value = params.get(MODE_PARAM)
   except Exception as e:
-    cloudlog.warning(f"turnpilot certify: {MODE_PARAM} unreadable ({type(e).__name__}): acting as shadow")
+    say(f"turnpilot certify: {MODE_PARAM} unreadable ({type(e).__name__}): acting as shadow")
     return 'shadow'
   if isinstance(value, bytes):
     value = value.decode(errors='replace')
   if value not in MODES:
     if value is not None:
-      cloudlog.warning(f"turnpilot certify: {MODE_PARAM} is {value!r}, unknown to this build: acting as shadow")
+      say(f"turnpilot certify: {MODE_PARAM} is {value!r}, unknown to this build: acting as shadow")
     return 'shadow'
   return value
+
+
+_said: set = set()
+
+
+def say(message: str) -> None:
+  """A warning logged once per process (navd reads the mode every second)."""
+  if message not in _said:
+    _said.add(message)
+    cloudlog.warning(message)
 
 
 def certify(junction: sr.Junction, maneuver: str, visibility, surveys, eta: float, runtime: Runtime) -> tuple[str, str]:

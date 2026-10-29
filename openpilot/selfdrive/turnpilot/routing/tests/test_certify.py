@@ -349,3 +349,23 @@ class TestAssess:
     assert (info.certification, info.cert_reason, info.validated) == ('uncertifiable', 'notSurveyed', False)
     assert 'no counting survey' in info.cert_detail
     assert ce.certify_control(Control(2, 'signal', 80., 0, 80.), visibility(tmp_path), [], ETA, RUN) == ('unchecked', 'none')
+
+
+class TestModeParam:
+  def test_unknown_or_unreadable_acts_as_shadow_said_once(self):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from openpilot.common.params import UnknownKeyName
+
+    def unknown(key):
+      raise UnknownKeyName(key)
+    ce._said.clear()
+    with patch.object(ce.cloudlog, 'warning') as warn:
+      for _ in range(3):  # navd asks every second
+        assert ce.stop_sign_mode(SimpleNamespace(get=unknown)) == 'shadow'
+        assert ce.stop_sign_mode(SimpleNamespace(get=lambda k: 'sometimes')) == 'shadow'
+    assert warn.call_count == 2
+    assert ce.stop_sign_mode(SimpleNamespace(get=lambda k: None)) == 'shadow'
+    assert [ce.stop_sign_mode(SimpleNamespace(get=lambda k, m=m: m)) for m in ('off', 'trial', 'auto')] == ['off', 'trial', 'auto']
+    assert ce.stop_sign_mode(SimpleNamespace(get=lambda k: b'auto')) == 'auto'
