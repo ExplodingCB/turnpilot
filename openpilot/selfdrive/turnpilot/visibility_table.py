@@ -58,6 +58,7 @@ PROVISIONAL_USES = ('allWay',)
 DEFAULT_EDGE_DEG = 85.2   # the frame edge at lens k = 0, the bracket's pessimistic end until S1 fits the lens (1.1)
 SIM_PARAM = 'TurnPilotSimLightOracle'
 TABLE_RANK = {'measured': 0, 'sim': 1, 'provisional': 2}
+FOOTPRINT_MEMO = 50000  # points of the footprint mask remembered (Visibility.sight), then forgotten
 
 
 class VisibilityError(ValueError):
@@ -146,9 +147,22 @@ class Visibility:
     return out
 
   def sight(self, views: dict, zero=None, fresh=None, occluders=()) -> sr.Sight:
-    """A stop_rules.Sight over views, with this file's frame edge and footprint mask (none until S1 measures it)."""
+    """A stop_rules.Sight over views, with this file's frame edge and footprint mask (none until S1 measures it). The mask's
+    answer for a point is remembered on this object (exactly: the same side, bearing and range), since the stop-sign decider
+    walks the same lane points every frame while the car stands (half its walk's time was the footprint)."""
     mask, height = self.mask, self.height
-    mask_fn = (lambda side, bearing, rng: sr.footprint_ok(mask, side, bearing, rng, height)) if mask and height is not None else None
+    if not (mask and height is not None):
+      return sr.Sight(self.edge_deg, views, zero=zero, mask=None, fresh=fresh, occluders=list(occluders))
+    memo = self.__dict__.setdefault('_footprint', {})
+
+    def mask_fn(side, bearing, rng):
+      key = (side, bearing, rng)
+      hit = memo.get(key)
+      if hit is None:
+        if len(memo) > FOOTPRINT_MEMO:
+          memo.clear()
+        hit = memo[key] = sr.footprint_ok(mask, side, bearing, rng, height)
+      return hit
     return sr.Sight(self.edge_deg, views, zero=zero, mask=mask_fn, fresh=fresh, occluders=list(occluders))
 
 
