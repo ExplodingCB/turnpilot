@@ -380,15 +380,127 @@ def test_b2_an_osm_stop_node_never_moves_the_stop_point(tmp_path, kind, sign_m):
     [(kind, 100. - OFF, False, 'default', 900, sign_m)]
 
 
-def test_b3_a_sidecar_stop_tied_to_no_junction_is_still_a_stop(tmp_path):
+def test_b3_a_sidecar_stop_tied_to_no_junction_near_its_edges_end_is_still_a_stop(tmp_path):
   """The sidecar keeps a stop it ties to no junction within 60 m (a mid-block trail or rail crossing) with junction_node
-  0: where Valhalla doesn't flag it either, the union is the car's only source for it. It stops at its edge's default
-  stop point, with no OSM junction node, its sign carried as data."""
+  0, an orphan: where Valhalla doesn't flag it either, the union is the car's only source for it. With its sign within
+  ORPHAN_NEAR_M (CONTROL_LINE_M + 5 m) of its edge's end it stops at the edge's default stop point, at most 4 m past the
+  sign, with no OSM junction node, its sign carried as data."""
+  assert controls_module.ORPHAN_NEAR_M == CONTROL_LINE_M + 5.
   v = StubValhalla([(0., 100., {}), (100., 180., {'way_id': 77}), (180., 400., {})])
-  controls, status = route_controls(v, steps(), sidecar_dir=osm_dir(tmp_path, {'77:f': [entry('stop', 140., junction=0)]}))
+  for sign_m in (176., 166.):
+    controls, status = route_controls(v, steps(), sidecar_dir=osm_dir(tmp_path / str(sign_m), {'77:f': [entry('stop', sign_m, junction=0)]}))
+    assert status == 'ok'
+    assert [(c.kind, round(c.route_m, 1), c.osm_node, c.line_source, round(c.osm_sign_m, 1)) for c in controls] == \
+      [('stop', 180. - OFF, 0, 'default', sign_m)]
+
+
+@pytest.mark.parametrize('kind, sign_m, end_m, crossing', [
+  ('stop', 140., 180., ['residential']),  # the old B3 shape: 40 m before a junction
+  ('stop', 140., 500., []),               # 360 m before a node no other road meets: the stop would be mid-block
+  ('stop', 140., 500., ['residential']),  # 360 m before a junction (Jim Town Road, 635 m)
+  ('stop', 240., 300., ['residential']),  # 60 m (4th St NW, a reversed direction tag: 62 m)
+  ('yield', 140., 180., ['residential']),
+])
+def test_sg1a_an_orphan_sign_far_before_its_edges_end_is_left_out(tmp_path, kind, sign_m, end_m, crossing):
+  """An orphan's sign further than ORPHAN_NEAR_M before its Valhalla edge's end: the edge's end less CONTROL_LINE_M would
+  put the stop (or the yield's cap) that far past the sign, where there is none, often mid-block, and the car would drive
+  past the real sign unslowed and then stop there (Indianapolis: 146 of 176 such orphans more than 15 m past their sign,
+  the furthest 1119 m). Without a rail crossing just past its sign (the next tests) it is left out of the controls and
+  logged, as the base had it (route_audit lists it as uncovered); never placed at its sign either, since a reversed
+  direction tag would then stop the car past a junction (4th St NW)."""
+  v = StubValhalla([(0., 100., {}), (100., end_m, {'way_id': 77, 'crossing': crossing}), (end_m, 800., {})], total=800.)
+  with patch.object(controls_module, 'cloudlog') as log:
+    controls, status = route_controls(v, steps((400., 400.)), sidecar_dir=osm_dir(tmp_path, {'77:f': [entry(kind, sign_m, junction=0)]}))
+  assert status == 'ok' and controls == []
+  assert any('left out' in str(c.args[0]) and '77:f' in str(c.args[0]) for c in log.info.call_args_list)
+
+
+def test_sg1a_a_far_orphan_neither_drops_nor_moves_valhallas_own_flag(tmp_path):
+  """Valhalla's own flag on the edge stays where it was (its edge's end less CONTROL_LINE_M), the far orphan's sign carried
+  as data (osm_sign_m), and a far orphan of ours still counts as ours on the edge for the phantom check (C14)."""
+  v = StubValhalla([(0., 100., {}), (100., 180., {'way_id': 77, 'stop': True}), (180., 400., {})])
+  controls, _ = route_controls(v, steps(), sidecar_dir=osm_dir(tmp_path / 'flag', {'77:f': [entry('stop', 140., junction=0)]}))
+  assert [(c.kind, round(c.route_m, 1), c.osm_node, round(c.osm_sign_m, 1)) for c in controls] == [('stop', 180. - OFF, 0, 140.)]
+  edges = [(0., 100., {}), (100., 150., {'stop': True, 'way_id': 77, 'forward': False}), (150., 400., {})]
+  side = {'77:f': [entry('stop', 150., junction=900)], '77:b': [entry('stop', 120., junction=0)]}
+  controls, _ = route_controls(StubValhalla(edges, every=2.), steps(every=2.), sidecar_dir=osm_dir(tmp_path / 'phantom', side))
+  assert [(c.kind, round(c.route_m, 1)) for c in controls] == [('stop', 150. - OFF)]
+
+
+@pytest.mark.parametrize('kind, sign_m, rail_m, end_m, crossing', [
+  ('stop', 140., 146., 180., ['residential']),  # 6 m before the tracks, a junction 34 m past them
+  ('stop', 140., 146., 500., []),               # Jim Town Road (22011112:b): no junction for 354 m past the tracks
+  ('stop', 140., 157., 180., ['residential']),  # 556607000:f: the tracks 17 m past the sign (gates, bell, lights)
+  ('stop', 140., 169., 500., ['residential']),  # 29 m
+  ('stop', 140., 142., 180., ['residential']),  # a sign mapped 2 m from the tracks' node: the stop RAIL_CLEAR_M short of it
+  ('stop', 166., 168., 180., ['residential']),  # near its edge's end (14 m), where the end less 11 m is past the tracks
+  ('yield', 140., 150., 180., ['residential']),
+])
+def test_sg1a_an_orphan_sign_before_a_rail_crossing_stops_the_car_short_of_the_tracks(tmp_path, kind, sign_m, rail_m, end_m, crossing):
+  """The residual skeptic's: a sidecar stop or yield tied to no junction (an orphan) because it guards a railroad level
+  crossing (Indianapolis: 37 of the 152 Valhalla-unflagged orphans ORPHAN_NEAR_M left out stand 2-29 m before one; the
+  other direction's sign is just past the tracks). Rail crossings reach the car only through a stop or yield's junction
+  railDistance (certify's geometry, then SG2's reroute or an unavoidable stop and handback, C7), so leaving it out let the
+  car cross the tracks at speed past a mapped STOP sign with nothing said. A rail crossing within RAIL_M past the sign on
+  the route confirms its direction tag (a reversed one has the tracks behind it), so it stops the car at its sign, never
+  nearer the crossing's node than RAIL_CLEAR_M, whatever its edge's end, and its junction carries the rail crossing."""
+  v = StubValhalla([(0., 100., {}), (100., end_m, {'way_id': 77, 'crossing': crossing}), (end_m, 800., {})], total=800.)
+  side = rail_dir(tmp_path, [pt(rail_m)], {'77:f': [entry(kind, sign_m, junction=0)]})
+  with patch.object(controls_module, 'cloudlog') as log:
+    controls, status = route_controls(v, steps((400., 400.)), sidecar_dir=side)
+  line = min(sign_m, rail_m - controls_module.RAIL_CLEAR_M)
   assert status == 'ok'
-  assert [(c.kind, round(c.route_m, 1), c.osm_node, c.line_source, round(c.osm_sign_m, 1)) for c in controls] == \
-    [('stop', 180. - OFF, 0, 'default', 140.)]
+  assert [(c.kind, round(c.route_m, 1), c.osm_node, round(c.osm_sign_m, 1), c.line_source) for c in controls] == \
+    [(kind, round(line - MAP_MARGIN_M, 1), 0, sign_m, 'default')]
+  j = controls[0].junction_info
+  assert abs(j.rail_distance - (end_m - rail_m)) < 0.5 and j.stop_point_source == 'default'
+  said = [str(c.args[0]) for c in log.info.call_args_list]
+  assert any('rail crossing' in s and '77:f' in s for s in said) and not any('left out' in s for s in said)
+
+
+def test_sg1a_a_rail_orphan_is_its_own_stop_before_valhallas_flag_and_never_moved_on_by_a_survey(tmp_path):
+  """Valhalla's own flag on the edge stays where it was (its edge's end less CONTROL_LINE_M, past the tracks) and the
+  rail orphan is a second stop at its sign before it (controls at different places never merge). A counting survey of
+  the junction at its edge's end, matched on our approach, moves that junction's stop point, never the rail orphan's."""
+  v = StubValhalla([(0., 100., {}), (100., 180., {'way_id': 77, 'stop': True}), (180., 800., {})], total=800.)
+  side = rail_dir(tmp_path / 'flag', [pt(146.)], {'77:f': [entry('stop', 140., junction=0)]})
+  controls, _ = route_controls(v, steps((400., 400.)), sidecar_dir=side)
+  line = min(140., 146. - controls_module.RAIL_CLEAR_M)
+  assert [(c.kind, round(c.route_m, 1)) for c in controls] == [('stop', round(line - MAP_MARGIN_M, 1)), ('stop', 180. - OFF)]
+  assert all(abs(c.junction_info.rail_distance - 34.) < 0.5 for c in controls)
+  side = allway(tmp_path / 'survey')
+  cell = level2_index(LON0, LAT0)
+  shard = json.loads((side / 'osm_controls' / f'{cell}.json').read_text())
+  shard['controls']['50:f'].append(entry('stop', 60., junction=0))
+  shard['rail'] = [{'lat': pt(66.)[0], 'lon': pt(66.)[1], 'ways': [50]}]
+  (side / 'osm_controls' / f'{cell}.json').write_text(json.dumps(shard))
+  v = StubJunction([(0., 100., {'stop': True, 'way_id': 50}), (100., 400., {})], four())
+  controls, _ = route_controls(v, steps(), sidecar_dir=side, context=context([survey(stop_point=9.8)]))
+  line = min(60., 66. - controls_module.RAIL_CLEAR_M)
+  assert [(c.kind, round(c.route_m, 1), c.junction_info.stop_point_source, c.junction_info.surveyed) for c in controls] == \
+    [('stop', round(line - MAP_MARGIN_M, 1), 'default', True), ('stop', 90.2, 'survey', True)]
+
+
+def test_sg1a_a_rail_orphan_in_a_median_stops_the_car_before_the_first_carriageway_and_carries_its_crossing(tmp_path):
+  """An orphan on an internal-intersection edge (a divided road's median) with a rail crossing ahead: its stop is the
+  preceding junction's line, before the first carriageway, as any control in a median is, and its junction carries the
+  crossing however far past the node it is (rail_distance alone finds none more than RAIL_M from it off our edge)."""
+  v = StubValhalla([(0., 100., {}), (100., 115., {'way_id': 77, 'internal': True}), (115., 800., {})], total=800.)
+  side = rail_dir(tmp_path, [pt(138.)], {'77:f': [entry('stop', 110., junction=0)]})
+  controls, status = route_controls(v, steps((400., 400.)), sidecar_dir=side)
+  assert status == 'ok' and [(c.kind, round(c.route_m, 1), round(c.osm_sign_m, 1)) for c in controls] == [('stop', 100. - OFF, 110.)]
+  assert abs(controls[0].junction_info.rail_distance - 38.) < 0.5
+
+
+@pytest.mark.parametrize('rail', [
+  pt(134.),                                         # 6 m behind the sign: the other direction's sign shape (a reversed tag)
+  pt(175.),                                         # 35 m past it, further than RAIL_M
+  (pt(150.)[0], LON0 + 10. / (M_PER_DEG * 0.7687)),  # 10 m off the route: another road's crossing
+])
+def test_sg1a_a_far_orphan_without_a_rail_crossing_just_past_its_sign_stays_left_out(tmp_path, rail):
+  v = StubValhalla([(0., 100., {}), (100., 180., {'way_id': 77, 'crossing': ['residential']}), (180., 800., {})], total=800.)
+  controls, status = route_controls(v, steps((400., 400.)), sidecar_dir=rail_dir(tmp_path, [rail], {'77:f': [entry('stop', 140., junction=0)]}))
+  assert status == 'ok' and controls == []
 
 
 def test_a_junction_node_stop_from_the_sidecar_is_on_the_edge_ending_there(tmp_path):
@@ -806,6 +918,48 @@ def test_n5_one_junction_across_a_median_valhalla_does_not_flag(name, fields, wa
   assert kinds(route_controls(v, steps())[0]) == want, name
 
 
+def carriageways():
+  """A divided primary crossing a tertiary: its near carriageway at 100 m, its far one at 110 m."""
+  return {100.: primary_cross({90: {'drive': 'forward'}, 270: {'drive': 'backward'}}),
+          110.: primary_cross({90: {'drive': 'backward'}, 270: {'drive': 'forward'}})}
+
+
+@pytest.mark.parametrize('name, median, want', [
+  ('the signal at the far carriageway only', [(100., 105., {'crossing': []}), (105., 110., {'node_signal': True})], [('signal', 3, False)]),
+  ('a directed signal there', [(100., 105., {'crossing': []}), (105., 110., {'edge_signal': True})], [('signal', 3, False)]),
+  ('the signal on the median split node', [(100., 105., {'crossing': [], 'node_signal': True}), (105., 110., {})], [('signal', 2, False)]),
+  # what isn't this junction's signal, or isn't a signal, leaves the suspected stop: a stop mapped at the far carriageway
+  # only (the near one's cross traffic is still there), and a signal on the stop-line node of another junction past it
+  ('a stop at the far carriageway only', [(100., 105., {'crossing': []}), (105., 110., {'stop': True})], [('stop', 1, True), ('stop', 3, False)]),
+])
+def test_pa_a_signal_across_the_median_valhalla_does_not_flag_is_the_junctions(name, median, want):
+  """The mirror of approach_edges' SAME_JUNCTION_M: a divided primary whose median a node splits (Valhalla flags neither half
+  internal, Indianapolis routes 60 and 73), with the signal mapped only at the far carriageway's node or on the median's
+  split node. The junction is signalled: no suspected stop at the near carriageway, which was a stop on a green (the
+  skeptic's pa and pb: [('stop', 1, 88.8, suspected), ('signal', 3, 99.0)]). Only a signal counts, and only one whose
+  node, or the first road junction after it, is within SAME_JUNCTION_M and crossed as the near carriageway is (every road
+  there outranking ours by two classes: the same cross road's far carriageway)."""
+  edges = [(0., 87., {'road_class': 'tertiary', 'crossing': []}), (87., 100., {'road_class': 'tertiary'})] + \
+    [(b, e, {'road_class': 'tertiary'} | f) for b, e, f in median] + [(110., 400., {'road_class': 'tertiary'})]
+  assert kinds(route_controls(StubJunction(edges, carriageways()), steps())[0]) == want, name
+
+
+@pytest.mark.parametrize('name, past, junctions, want', [
+  ('a signal at a minor junction 20 m on', [(100., 120., {'node_signal': True})], {120.: [leg(90.), leg(270.)]},
+   [('stop', 0, True), ('signal', 1, False)]),
+  ("another junction's stop-line node 15 m on, its junction 28 m on", [(100., 115., {'node_signal': True, 'crossing': []}), (115., 128., {})],
+   {128.: primary_cross()}, [('stop', 0, True), ('signal', 1, False)]),
+])
+def test_pa_a_signal_past_the_junction_that_is_not_its_own_leaves_the_suspected_stop(name, past, junctions, want):
+  """A signal past a suspected stop's junction belongs to it only as its far carriageway: one at a minor road's junction
+  20 m on, or on the stop-line node of a junction further on than SAME_JUNCTION_M, leaves the suspected stop (rolling
+  through an unmapped stop onto a primary is the worse error)."""
+  edges = [(0., 100., {'road_class': 'tertiary'})] + [(b, e, {'road_class': 'tertiary'} | f) for b, e, f in past] + \
+    [(past[-1][1], 400., {'road_class': 'tertiary'})]
+  got = kinds(route_controls(StubJunction(edges, {100.: primary_cross()} | junctions), steps())[0])
+  assert got[0] == ('stop', 0, True) and got == want, name
+
+
 def test_n5_through_a_green_without_slowing_where_the_signal_is_on_the_approach_node():
   """Closed loop (map_controls' point-mass car, the sim's green): what navd sends for route 60's junction, a signal on our
   approach's stop-line node 13 m short of a primary, takes the car through at its speed, never stopped at the line."""
@@ -820,6 +974,124 @@ def test_n5_through_a_green_without_slowing_where_the_signal_is_on_the_approach_
     _, dec, _ = car.step(lights=oracle('green'))
     assert not dec.should_stop
   assert car.s > 120. + 150. and min(r[2] for r in car.rows) > v0 - 0.1
+
+
+class StubBehind(StubJunction):
+  """StubJunction with the road behind the route's start, due north like the route: the first edge really begins at begin
+  m (0 or less) and behind [(begin m, end m, fields)] runs up to it (fields: node_signal and edge_signal at its end node,
+  crossing: the classes of other roads meeting there, none by default). locate (radius 1) at a point on the first edge
+  answers it with its whole shape from begin; at a node behind (the end of a behind edge), the edges there: the one
+  arriving, the one leaving, both reversed and each crossing road both ways, with the node's traffic_signal (found False:
+  nothing at a node behind); anything else as StubJunction."""
+
+  def __init__(self, edges, junctions, begin, behind, found=True, **kw):
+    super().__init__(edges, junctions, **kw)
+    self.begin, self.behind, self.found = begin, behind, found
+
+  @staticmethod
+  def cand(eid, b, e, pa, heading, fields=None, way=60):
+    fields = fields or {}
+    shape = [{'lat': pt(x)[0], 'lon': pt(x)[1]} for x in ((b, e) if heading == 0. else (e, b))]
+    return {'edge_id': {'value': eid}, 'percent_along': pa, 'heading': heading, 'distance': 0.,
+            'edge': {'forward': heading == 0., 'traffic_signal': bool(fields.get('edge_signal')) and pa == 1. and heading == 0.,
+                     'classification': {'classification': fields.get('class', 'tertiary'), 'use': fields.get('use', 'road')}},
+            'edge_info': {'way_id': way, 'shape': shape}}
+
+  def answer(self, loc):
+    m = (loc['lat'] - LAT0) * M_PER_DEG
+    first = self.edges[0][0]
+    end0 = first['end_shape_index'] * self.every
+    if loc.get('radius') == 1 and 'heading' not in loc and m < 0.5:
+      for k, (b, e, f) in enumerate(self.behind):
+        if abs(m - e) < 0.5:
+          if not self.found:
+            return {'edges': [], 'nodes': []}
+          nb, ne = (self.behind[k + 1][:2] if k + 1 < len(self.behind) else (self.begin, end0))
+          out = [self.cand(5000 + k, b, e, 1., 0., f), self.cand(5000 + k, b, e, 0., 180.),
+                 self.cand(5001 + k if k + 1 < len(self.behind) else first['id'], nb, ne, 0., 0.),
+                 self.cand(5001 + k if k + 1 < len(self.behind) else first['id'], nb, ne, 1., 180.)]
+          for c in f.get('crossing', []):
+            for h in (90., 270.):
+              x = toward(pt(e), h, 50.)
+              out += [{'edge_id': {'value': 7000 + int(h)}, 'percent_along': pa, 'heading': h if pa == 0. else (h + 180.) % 360.,
+                       'distance': 0., 'edge': {'classification': {'classification': c, 'use': 'road'}},
+                       'edge_info': {'way_id': 71, 'shape': [{'lat': q[0], 'lon': q[1]} for q in ((pt(e), x) if pa == 0. else (x, pt(e)))]}}
+                      for pa in (0., 1.)]
+          return {'edges': out, 'nodes': [{'lat': pt(e)[0], 'lon': pt(e)[1], 'traffic_signal': bool(f.get('node_signal'))}]}
+    out = super().answer(loc)
+    if loc.get('radius') == 1 and 'heading' not in loc and 0. < m < end0:
+      for c in out.get('edges') or []:
+        if (c.get('edge_id') or {}).get('value') == first['id']:
+          c |= self.cand(first['id'], self.begin, end0, (m - self.begin) / (end0 - self.begin), 0., way=first['way_id'])
+          c['edge'] = {**c['edge'], 'stop_sign': out['edges'][0]['edge'].get('stop_sign', False)}
+    return out
+
+
+def pg_road(stub, behind, found=True, begin=-1.):
+  """A tertiary whose route or lookup starts 1 m past a node (begin), the first edge ending at a primary stub m on from
+  that node, the road behind it behind."""
+  edges = [(0., stub + begin, {'road_class': 'tertiary'}), (stub + begin, 400., {'road_class': 'tertiary'})]
+  return StubBehind(edges, {stub + begin: primary_cross()}, begin, behind, found=found, every=1.)
+
+
+@pytest.mark.parametrize('ahead', [False, True])
+@pytest.mark.parametrize('stub', [13., 20., 24.])
+@pytest.mark.parametrize('name, behind', [
+  ('a signal on the node', [(-80., -1., {'node_signal': True})]),
+  ('a directed signal there', [(-80., -1., {'edge_signal': True})]),  # Indianapolis route 1's 11.8 m stub is mapped so
+  ('a signal back past a crosswalk node', [(-80., -30., {'node_signal': True}), (-30., -1., {})]),
+])
+def test_pg_a_route_or_lookup_starting_past_a_signals_stop_line_node_sees_the_signal(name, behind, stub, ahead):
+  """A route (a reroute starts at the car too) or a lookup ahead (controls_ahead's road starts at the car) starting 1 m past
+  the stop-line node OSM maps a junction's signal on, stub m short of a primary: approach_edges reaches the trace's first
+  edge with nothing mapped and the signal just behind the start. signal_behind walks back from that edge's begin node and
+  finds it: no suspected stop, so no stop on a green (it was a suspected stop 0, 6 and 10 m ahead; on Indianapolis route 1,
+  a lookup 1.5 m past the node of an 11.8 m stub gave one 0 m ahead)."""
+  controls, status = controls_module._route_controls(pg_road(stub, behind), steps(every=1.), None, ahead=ahead)
+  assert status == 'ok' and kinds(controls) == [], name
+
+
+@pytest.mark.parametrize('name, behind, found', [
+  ('nothing mapped back to a road junction', [(-80., -40., {'crossing': ['residential']}), (-40., -1., {})], True),
+  ('a signal at the road junction behind is its own', [(-80., -40., {'node_signal': True, 'crossing': ['residential']}), (-40., -1., {})], True),
+  ('a signal past JUNCTION_AHEAD_M', [(-120., -45., {'node_signal': True}), (-45., -1., {})], True),
+  ('the road behind not found', [(-80., -1., {'node_signal': True})], False),
+])
+@pytest.mark.parametrize('ahead', [False, True])
+def test_pg_the_suspected_stop_stays_with_nothing_mapped_behind_the_start_or_the_road_there_unknown(name, behind, found, ahead):
+  """The same look behind the start keeps a real suspected stop: one the car is already inside the approach of (a lookup
+  ahead every second must not drop it as the car closes in), one whose signal behind belongs to the road junction before,
+  or past JUNCTION_AHEAD_M, and one whose road behind the start can't be read, logged (the safer side: a stop on a green
+  is a -2.0 m/s^2 stop and a handback, rolling through an unmapped stop onto a primary isn't)."""
+  with patch.object(controls_module, 'cloudlog') as log:
+    controls, status = controls_module._route_controls(pg_road(20., behind, found), steps(every=1.), None, ahead=ahead)
+  assert status == 'ok' and kinds(controls) == [('stop', 0, True)], name
+  assert found or any('unknown' in str(c.args[0]) for c in log.warning.call_args_list)
+
+
+def test_pg_a_lookup_ahead_reads_the_road_behind_once():
+  """Off the route navd looks again every second: the look behind the start is kept in the LocateCache by the first edge
+  and the junction's edge, so the next lookup asks nothing more for it."""
+  v = pg_road(20., [(-80., -1., {'node_signal': True})])
+  cache = controls_module.LocateCache()
+  assert kinds(controls_module._route_controls(v, steps(every=1.), None, ahead=True, cache=cache)[0]) == []
+  n = len(v.requests)
+  assert kinds(controls_module._route_controls(v, steps(every=1.), None, ahead=True, cache=cache)[0]) == []
+  assert [r for e, r in v.requests[n:] if e == 'locate'] == []
+
+
+def test_pg_through_a_green_without_slowing_from_a_route_starting_past_the_stop_line_node():
+  """Closed loop (map_controls' point-mass car): a route that starts 1 m past the stop-line node of a signal 20 m short of a
+  primary (the light green, its line behind the car) takes the car through the junction at its speed; the suspected stop
+  it had 6 m ahead braked it at -2.0 m/s^2 into cannotStopComfortably and stopOverrun."""
+  from openpilot.common.realtime import DT_MDL
+  from openpilot.selfdrive.turnpilot.tests.test_map_controls import Car
+  controls, _ = route_controls(pg_road(20., [(-80., -1., {'node_signal': True})]), steps(every=1.))
+  car = Car([(c.route_m, c.kind, c.line_mapped, c.junction, c.cross_suspect) for c in controls], v=11.)
+  for _ in range(int(10. / DT_MDL)):
+    _, dec, _ = car.step()
+    assert not dec.should_stop
+  assert car.s > 100. and min(r[2] for r in car.rows) > 11. - 0.1
 
 
 def rail_dir(tmp_path, rail, controls=None):

@@ -12,10 +12,21 @@ quarter of the OSM-mapped stop approaches (research_allway.md section 0). Its en
 ("<way_id>:<f|b>", a list, since a way passes several junctions) are the edge's when the entry's line, the OSM stop node,
 projects inside the edge's span on the route within LINE_TOL_M of it (past SPAN_START_M from its start, which is the
 previous edge's end), or, for a stop on the junction node (no line), when that node is within NODE_TOL_M of the edge's
-end. The edge's stops and yields are the union of both. One exception: Valhalla flags both directions of a stop on a
-graph node it can't direct (a crosswalk's, shared with a footway), so the other direction's directed stop sitting ON the
-edge's end node (within PHANTOM_NODE_M) makes a phantom of our flag of its kind there: dropped, and logged, but only when
-the sidecar has nothing of ours on the edge (any kind, directed, both-ways, undirected, with a junction or none) and no
+end. The edge's stops and yields are the union of both, but for an orphan (an entry the sidecar ties to no junction,
+junction_node 0: a mid-block trail or rail crossing, or a reversed direction tag) whose sign is more than ORPHAN_NEAR_M
+before its anchor edge's end: that end less CONTROL_LINE_M would stop the car where there is no sign, up to a kilometre
+past the real one (Indianapolis: 146 of the 176 such orphans more than 15 m past), so it is left out and logged (route_audit
+lists it as uncovered), as the base had it; never placed at its sign instead, since a reversed tag would then stop the car
+past a junction. But an orphan, near its edge's end or far, with a mapped rail crossing within RAIL_M past its sign on the
+route (rail_ahead: the tracks ahead confirm its direction tag; a reversed one has them behind it) stops the car at its sign,
+never nearer the crossing's node than RAIL_CLEAR_M (one in a median before the first carriageway, as below): a stop or
+yield of its own there (that edge's end may be past the tracks), never moved on by a survey of the junction at that end,
+whose junction always carries the rail crossing (railDistance: certify's geometry, so SG2 routes around it, or an
+unavoidable one is a stop and a handback, C7); rail crossings reach the car only that way. Either is still ours on the
+edge for phantom(). One exception: Valhalla flags both directions of a stop on a graph node it can't direct (a
+crosswalk's, shared with a footway), so the other direction's directed stop sitting ON the edge's end node (within
+PHANTOM_NODE_M) makes a phantom of our flag of its kind there: dropped, and logged, but only when the sidecar has nothing
+of ours on the edge (any kind, directed, both-ways, undirected, with a junction or none) and no
 undirected or both-ways one keyed the other way inside it (phantom()). A missing entry for us proves nothing by itself
 (the sidecar may not have tied the stop to a junction), so every other case keeps Valhalla's flag: an extra stop is
 cheap, a dropped real one isn't.
@@ -50,12 +61,18 @@ The junction (SG1b): each stop and yield carries its junction (junction_info, ro
 road the route leaves by, their controls, lanes, limits and all-way tiers, the survey, the maneuver, the rail distance),
 read from trace_attributes and Q2, one more batched verbose locate per route that also carries the opposing roads' probes
 (opposing_roads, for the unprotected left: given an Opposing, a route makes Q1 and Q2 and no third). A failed Q2 leaves
-every leg unknown and the junction failed. A suspected unmapped stop (N5: every road crossing outranks ours by two classes
-or more, junctions.suspected_stop, and nothing mapped on our whole approach, approach_edges: no signal, stop or yield from
-Valhalla or the sidecar back to the previous road junction or JUNCTION_AHEAD_M, and no suspected stop already at a junction
-within SAME_JUNCTION_M before it) is emitted as a stop at the default stop point, its junction flagged suspected. Mapped
-controls at different nodes still never merge. A TurnPilotJunctionOverrides navd can't read fails every stop and yield junction
-and makes the status partial, logged. Off the route a LocateCache keeps Q1 and Q2 by edge id between the 1 Hz lookups.
+every leg unknown and the junction failed. A suspected unmapped stop (N5: every road crossing outranks ours by two
+classes or more, junctions.suspected_stop, and nothing mapped on our whole approach, approach_edges: no signal, stop or
+yield from Valhalla or the sidecar back to the previous road junction or JUNCTION_AHEAD_M, and no suspected stop already
+at a junction within SAME_JUNCTION_M before it, and no signal across a median Valhalla doesn't flag, signal_across: at
+the far carriageway of the same cross road or on the median's split node, within SAME_JUNCTION_M on) is emitted as a
+stop at the default stop point, its junction flagged suspected. A route, a reroute and a lookup ahead all start at the
+car, so where that walk reaches the trace's start within JUNCTION_AHEAD_M the rest of the approach is behind the car:
+signal_behind walks it back by locate, and a signal there (the car is past its stop-line node) means no suspected stop,
+so none on a green; nothing there, or a road behind that can't be read (logged), keeps the stop. Mapped controls at
+different nodes still never merge. A TurnPilotJunctionOverrides navd can't read fails every stop and yield junction and
+makes the status partial, logged. Off the route a LocateCache keeps Q1, Q2 and signal_behind's answers by edge id
+between the 1 Hz lookups.
 navd's own Control also carries, for SG2's avoidance loop, its approach edge's key, its exclusion point and whether that
 edge is the route's first or last.
 """
@@ -73,6 +90,13 @@ from openpilot.selfdrive.turnpilot.routing.guidance import opposing_leg
 
 CONTROL_LINE_M = 10.    # m before the junction node a stop line is taken to be, without a mapped one
 MAP_MARGIN_M = 1.       # m short of the line the car stops
+ORPHAN_NEAR_M = CONTROL_LINE_M + 5.  # m: a sidecar stop or yield tied to no junction (junction_node 0, an orphan) whose sign
+                                     # is further than this before its anchor edge's end is left out (SG1a): that end less
+                                     # CONTROL_LINE_M would put it that far past its sign, where there is none
+RAIL_CLEAR_M = 4.6 + 0.7 + jn.POS_ERR_M  # m: an orphan stopping the car before a rail crossing (rail_ahead) never stops it nearer
+                                         # the crossing's node than this: 15 ft from the nearest rail, the least US law allows
+                                         # (UVC 11-701), half a standard gauge (the node is on the track's centreline), and the
+                                         # car's along-track position error
 PARTIAL_UNMATCHED = 0.10
 LINE_TOL_M = 5.         # m: a sidecar line further than this from the route isn't on it
 NODE_TOL_M = 5.         # m: a junction-node control's node this close to an edge's end is that end
@@ -108,6 +132,9 @@ JUNCTION_AHEAD_M = 60.   # m on along the route the junction the sidecar says a 
 SAME_JUNCTION_M = 25.    # m: a road junction (or an internal-intersection edge) this close before a suspected stop's node is
                          # its junction's (a divided road's near carriageway, its median split by a node so that Valhalla
                          # flags neither half internal: Indianapolis routes 60 and 73, 10 m), for suspected stops only
+LOOK_BACK_EDGES = 4      # edges behind the trace's start signal_behind walks at most (a crosswalk's node, a way split)
+START_BEARING_M = 5.     # m along an edge its bearing leaving its begin node is taken over (signal_behind)
+ALONG_DEG = 15.          # deg: an edge at a node pointing this close to our road's either way is our road's (signal_behind)
 SUSPECTED_STOPS = True   # emit suspected unmapped stops (N5) as stop controls: until SG2 routes around them, each is a stop
 CACHE_MAX = 4096         # Q1 and Q2 answers a LocateCache keeps, each
 SAME_EDGE_NODE_M = 1.5   # m: an edge's end node this close to another's is the same node (surveys.SAME_NODE_M)
@@ -156,11 +183,12 @@ class Opposing:
 
 class LocateCache:
   """Q1's and Q2's locate answers by edge id, for navd's lookups ahead of the car every second (controls_ahead), which
-  mostly repeat: Q1's matched candidate per edge, Q2's answers per junction (its edges' ids). One per ValhallaSource (one
+  mostly repeat: Q1's matched candidate per edge, Q2's answers per junction (its edges' ids), and signal_behind's verdict
+  per first edge and junction edge (a known one only). One per ValhallaSource (one
   tile set). Thread-safe (RouteJob and AheadJob run apart); CACHE_MAX of each, the oldest going first."""
 
   def __init__(self, size: int = CACHE_MAX):
-    self.size, self.lock, self.data = size, threading.Lock(), {'q1': OrderedDict(), 'q2': OrderedDict()}
+    self.size, self.lock, self.data = size, threading.Lock(), {'q1': OrderedDict(), 'q2': OrderedDict(), 'back': OrderedDict()}
 
   def get(self, kind: str, key):
     with self.lock:
@@ -607,6 +635,98 @@ def approach_edges(edges, ends, a: int) -> list[int]:
   return out
 
 
+def signal_across(edges, tpts, ends, at, a: int, ahead: bool) -> int | None:
+  """The trace edge past a whose signal is the junction at a's end's own (the mirror of approach_edges' SAME_JUNCTION_M,
+  looking ahead), or None: a divided road whose median a node splits, so Valhalla flags neither half internal, with the
+  signal mapped only at the far carriageway's node or on the median's split node. An edge whose end is within
+  SAME_JUNCTION_M of a's with a signal there (`at`'s), whose node, or the first road junction after it within
+  SAME_JUNCTION_M of a's end, is crossed as a suspected stop's is (junctions.suspected_stop: the same cross road's far
+  carriageway). A signal at another junction past it, or a stop or yield there, isn't the junction's signal."""
+  for k in range(a + 1, len(edges)):
+    if ends[k][0] - ends[a][0] > SAME_JUNCTION_M:
+      return None
+    if 'signal' not in at.get(k, {}):
+      continue
+    for j in range(k, len(edges)):
+      if ends[j][0] - ends[a][0] > SAME_JUNCTION_M:
+        break
+      if road_junction(ends[j][3]):
+        _, legs, _ = jn.junction_legs(edges, tpts, j, ahead)
+        if jn.suspected_stop(edges[j], tpts, legs):
+          return k
+        break
+  return None
+
+
+def edge_shape(c) -> list[tuple[float, float]]:
+  """A locate candidate's edge_info shape [(lat, lon)] in its own direction of travel (edge_info's runs the way's)."""
+  shape = (c.get('edge_info') or {}).get('shape') or []
+  pts = decode6(shape) if isinstance(shape, str) else [(q['lat'], q['lon']) for q in shape]
+  return pts if (c.get('edge') or {}).get('forward', True) else pts[::-1]
+
+
+def start_bearing(pts) -> float:
+  """deg: the bearing pts leave their first point with, over their first START_BEARING_M or all of them if shorter."""
+  cum = cumulative(pts)
+  return bearing(pts[0], point_at(pts, cum, min(START_BEARING_M, cum[-1])))
+
+
+def away(c) -> float:
+  """deg: the way a locate candidate at a node points away from it (one leaving it its heading, one ending there reversed)."""
+  h = float(c.get('heading', 0.))
+  return h if float(c.get('percent_along', 0.)) < 0.5 else (h + 180.) % 360.
+
+
+def signal_behind(call, edges, tpts, tcum, back0: float) -> bool | None:
+  """Whether a signal is mapped on a junction's approach behind the trace's start, which approach_edges can't see: a route,
+  a reroute and a lookup ahead (controls_ahead) all start at the car, so once the car is past the stop-line node OSM maps
+  the junction's signal on (10-25 m short of it), the walk back reaches the trace's first edge with nothing mapped (N5).
+  back0: m from the trace's start on to the junction's node. From one verbose locate on the first edge (its candidate by id:
+  its whole shape, so its begin node), back node by node through one verbose locate at each (radius 1): the edge arriving
+  nearest our heading there, and the node. True at a signal on a node (the node's traffic_signal or the arriving edge's)
+  within JUNCTION_AHEAD_M of the junction, as approach_edges counts one; False past it, at a road junction more than
+  SAME_JUNCTION_M before the junction (another road's edge there, as road_junction: its signal is that junction's), or after
+  LOOK_BACK_EDGES; None unknown (a locate failed, or found nothing). Only a signal counts: a stop or yield behind the start
+  makes the junction a stop's, where the suspected stop is right."""
+  try:
+    e0 = edges[0]
+    s = min(LOCATE_BACK_M, (tcum[e0['end_shape_index']] - tcum[e0['begin_shape_index']]) / 2.)
+    p = point_at(tpts, tcum, tcum[e0['begin_shape_index']] + s)
+    loc = (call('locate', {'locations': [{'lat': p[0], 'lon': p[1], 'radius': 1}], 'costing': 'auto', 'verbose': True}) or [None])[0]
+    c = next((c for c in (loc or {}).get('edges') or [] if (c.get('edge_id') or {}).get('value') == e0.get('id') and
+              len(edge_shape(c)) >= 2), None)
+    if c is None:
+      return None
+    shape = edge_shape(c)
+    back = back0 + max(float(c.get('percent_along', 0.)) * cumulative(shape)[-1] - s, 0.)
+    node, h = shape[0], start_bearing(shape)
+    for _ in range(LOOK_BACK_EDGES):
+      if back > JUNCTION_AHEAD_M:
+        return False
+      ans = (call('locate', {'locations': [{'lat': node[0], 'lon': node[1], 'radius': 1}], 'costing': 'auto', 'verbose': True}) or [None])[0] or {}
+      cands = [x for x in ans.get('edges') or [] if len(edge_shape(x)) >= 2]
+      arriving = [x for x in cands if float(x.get('percent_along', 0.)) > 0.5 and angle_diff(float(x.get('heading', h + 180.)), h) <= NEXT_HEADING_TOL]
+      if not arriving:
+        return None
+      arr = min(arriving, key=lambda x: angle_diff(float(x['heading']), h))
+      ours = (h, (float(arr['heading']) + 180.) % 360.)
+      other = any((((x.get('edge') or {}).get('classification') or {}).get('use') or 'road') in jn.CROSSING_USES and
+                  jn.RANK.get(((x.get('edge') or {}).get('classification') or {}).get('classification') or '', 8) < 8 and
+                  all(angle_diff(away(x), o) > ALONG_DEG for o in ours) for x in cands)
+      if back > SAME_JUNCTION_M and other:
+        return False
+      if (arr.get('edge') or {}).get('traffic_signal') or any(
+          n.get('traffic_signal') for n in ans.get('nodes') or [] if haversine((float(n['lat']), float(n['lon'])), node) <= SAME_EDGE_NODE_M):
+        return True
+      shape = edge_shape(arr)
+      back += cumulative(shape)[-1]
+      node, h = shape[0], start_bearing(shape)
+    return False
+  except Exception:
+    cloudlog.exception("turnpilot controls: the look behind the start (locate) failed")
+    return None
+
+
 def maneuver_at(steps, starts, stop_s: float, node_s: float) -> str:
   """The route's maneuver at a junction (N8): the first step starting from the stop point stop_s to MANEUVER_AFTER_M past
   the node node_s (m along the route's shape), else straight."""
@@ -618,6 +738,21 @@ def maneuver_at(steps, starts, stop_s: float, node_s: float) -> str:
       modifier = m.get('modifier') or ''
       return 'uTurn' if 'uturn' in modifier else 'left' if 'left' in modifier else 'right' if 'right' in modifier else 'straight'
   return 'straight'
+
+
+def rail_ahead(osm, pts, cum, sign_m: float, sign) -> float | None:
+  """m along the route of the nearest mapped rail crossing (the sidecar's) on it (within RAIL_ON_ROUTE_M) past a sign at
+  sign_m (its position sign, (lat, lon)) by at most RAIL_M, or None. One there confirms the sign's direction tag: a
+  reversed one has the tracks behind it, as the other direction's sign just past the tracks does."""
+  best = None
+  for r in osm.rail:
+    p = (float(r['lat']), float(r['lon']))
+    if haversine(p, sign) > jn.RAIL_M + jn.RAIL_ON_ROUTE_M + LINE_TOL_M:
+      continue
+    hit = nearest(pts, cum, p, sign_m, sign_m + jn.RAIL_M)
+    if hit is not None and hit[1] <= jn.RAIL_ON_ROUTE_M and sign_m < hit[0] <= sign_m + jn.RAIL_M:
+      best = hit[0] if best is None else min(best, hit[0])
+  return best
 
 
 def rail_distance(osm, pts, cum, begin_m: float, end_m: float, node) -> float:
@@ -665,6 +800,8 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
   osm_ok = osm is not None and osm.status == 'ok'
   ends = []                   # per edge: (end m on the route, span m, key, its end node)
   at = {}                     # anchor edge -> {kind: [(source edge, osm entry or None, m along or None)]}
+  signs = {}                  # anchor edge -> [(source edge, osm entry, m along)]: every sidecar sign there, far orphans too
+  rail_stops = []             # [(anchor edge, osm entry, its sign's m along, the rail crossing's m along)]: orphans (rail_ahead)
   unmatched = anchor = 0
   for i, (e, candidate) in enumerate(zip(edges, located, strict=False)):
     internal = bool(e.get('internal_intersection'))
@@ -683,12 +820,29 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
     ends.append((end_m, span, key, e.get('end_node') or {}))
     valhalla = (['signal'] if e.get('traffic_signal') or (e.get('end_node') or {}).get('traffic_signal') else []) + \
       (['stop'] if candidate.get('stop_sign') else []) + (['yield'] if candidate.get('yield_sign') else [])
-    hits, phantoms = [], []
+    hits, phantoms, far, rails = [], [], [], []
     if osm_ok:
       for entry in osm.entries(key):
         m = osm_at(osm, entry, pts, cum, end_m - span, end_m, tpts[end_i])
         if m is not None and entry.get('kind') in ('stop', 'yield'):
           hits.append((entry, m))
+      # an orphan with a rail crossing just past its sign (rail_ahead, which confirms its direction tag) stops the car at its
+      # sign, near its edge's end or far, never at that end (which may be past the tracks); one without, far before its anchor
+      # edge's end: left out (ORPHAN_NEAR_M), never placed at the sign either (a reversed direction tag would then stop the
+      # car past a junction); either is still ours on the edge for phantom()
+      for entry, m in hits:
+        if entry.get('junction_node') or not entry.get('line'):
+          continue
+        before = ends[anchor][0] - m
+        rail_m = rail_ahead(osm, pts, cum, m, (float(entry['line'][0]), float(entry['line'][1])))
+        if rail_m is not None:
+          rails.append((entry, m, rail_m))
+          cloudlog.info(f"turnpilot controls: the sidecar's {entry['kind']} on {key} at {m:.0f} m is tied to no junction and " +
+                        f"{rail_m - m:.0f} m before a rail crossing: the car stops at its sign, {before:.0f} m before its edge's end")
+        elif before > ORPHAN_NEAR_M:
+          far.append((entry, m, before))
+          cloudlog.info(f"turnpilot controls: the sidecar's {entry['kind']} on {key} at {m:.0f} m is tied to no junction and " +
+                        f"{before:.0f} m before its edge's end: left out (that end would put it {before - CONTROL_LINE_M:.0f} m past its sign)")
       # the other direction: of our way, and, where no other road meets the end node (a way split, never a junction the
       # route may turn at), of the next edge's way (a split's sign is keyed to the way its traffic arrives on)
       split = not (e.get('end_node') or {}).get('intersecting_edges')
@@ -700,13 +854,19 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
           phantoms.append(kind)
           cloudlog.info(f"turnpilot controls: Valhalla's {kind} on {key} at {end_m:.0f} m is a phantom: the OSM sidecar's is " +
                         f"directed {' or '.join(others)}, on the edge's end node")
+    placed = [(entry, m) for entry, m in hits if not any(entry is x for x, _, _ in far + rails)]
     if audit is not None:
       audit.append({'edge': i, 'key': key, 'internal': internal, 'anchor': anchor, 'begin_m': end_m - span, 'end_m': end_m,
-                    'valhalla': list(valhalla), 'phantom': phantoms, 'osm': [dict(entry, m=m) for entry, m in hits]})
-    kinds = at.setdefault(anchor, {}) if valhalla or hits else None
+                    'valhalla': list(valhalla), 'phantom': phantoms, 'osm': [dict(entry, m=m) for entry, m in placed],
+                    'orphans': [dict(entry, m=m, before_m=before) for entry, m, before in far],
+                    'rail': [dict(entry, m=m, rail_m=rail_m) for entry, m, rail_m in rails]})
+    for entry, m in hits:
+      signs.setdefault(anchor, []).append((i, entry, m))
+    rail_stops += [(anchor, entry, m, rail_m) for entry, m, rail_m in rails]
+    kinds = at.setdefault(anchor, {}) if valhalla or placed else None
     for kind in valhalla:
       kinds.setdefault(kind, []).append((i, None, None))
-    for entry, m in hits:
+    for entry, m in placed:
       kinds.setdefault(entry['kind'], []).append((i, entry, m))
   if edges and unmatched > PARTIAL_UNMATCHED * sum(1 for e in edges if not e.get('internal_intersection')) and status == 'ok':
     status = 'partial'
@@ -734,7 +894,8 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
     ours = ROAD_CLASS_RANK.get(edges[a].get('road_class'), 8)
     cross_suspect = junction and all(ours < c for c in crossing) and kind in ('stop', 'yield')
     line_m, mapped, instance, source = end_m - CONTROL_LINE_M, False, '', 'default'
-    own = sorted(((m, entry) for i, entry, m in kinds[kind] if i == a and entry is not None and entry.get('line')), key=lambda x: x[0])
+    own = sorted(((m, entry) for i, entry, m in signs.get(a, []) if i == a and entry.get('kind') == kind and entry.get('line')),
+                 key=lambda x: x[0])
     osm_node = next((int(entry.get('junction_node') or 0) for _, entry, _ in kinds[kind] if entry is not None), 0)
     sim_entry = sim.get(key)
     if sim_entry is not None and sim_entry.get('kind') == kind and sim_entry.get('line'):
@@ -749,6 +910,15 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
     found.append({'s': line_m - MAP_MARGIN_M, 'kind': kind, 'mapped': mapped, 'junction': junction, 'cross_suspect': cross_suspect,
                   'instance': instance, 'source': source, 'osm_node': osm_node, 'status': 'failed' if failed else 'ok', 'a': a,
                   'sign_m': sign_m, 'suspected': False, 'legs': None})
+  # an orphan before a rail crossing: a stop or yield of its own at its sign, never nearer the crossing than RAIL_CLEAR_M,
+  # never merged with its edge's end (its junction there carries the rail crossing: certify's geometry, SG2's reroute); one
+  # in a median (on an internal edge, past its anchor's end) stops the car before the first carriageway, as any there does
+  for a, entry, m, rail_m in rail_stops:
+    end_m, node = ends[a][0], ends[a][3]
+    line_m = min(m, rail_m - RAIL_CLEAR_M, end_m - CONTROL_LINE_M if m > end_m else math.inf)
+    found.append({'s': line_m - MAP_MARGIN_M, 'kind': entry['kind'], 'mapped': False, 'junction': bool(node.get('intersecting_edges')),
+                  'cross_suspect': False, 'instance': '', 'source': 'default', 'osm_node': 0, 'status': 'ok', 'a': a, 'sign_m': m,
+                  'suspected': False, 'legs': None, 'rail_m': rail_m})
   # suspected unmapped stops (N5): a junction with nothing mapped on its whole approach (approach_edges) where every road
   # crossing outranks ours by two classes or more is emitted as a stop, one per junction
   suspected: set[int] = set()
@@ -759,11 +929,31 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
     nodes, legs, last = jn.junction_legs(edges, tpts, a, ahead)
     if not jn.suspected_stop(edges[a], tpts, legs):
       continue
-    mapped = next((i for i in approach_edges(edges, ends, a) if i in at or i in suspected), None)
+    approach = approach_edges(edges, ends, a)
+    mapped = next((i for i in approach if i in at or i in suspected), None)
     if mapped is not None:
       what = 'a suspected stop' if mapped in suspected else 'a ' + '/'.join(sorted(at[mapped], key=KIND_RANK.get))
       cloudlog.info(f"turnpilot controls: no suspected stop on {key} at {end_m:.0f} m: its approach has {what} at {ends[mapped][0]:.0f} m")
       continue
+    across = signal_across(edges, tpts, ends, at, a, ahead)
+    if across is not None:
+      cloudlog.info(f"turnpilot controls: no suspected stop on {key} at {end_m:.0f} m: its signal is across the median at {ends[across][0]:.0f} m")
+      continue
+    back0 = end_m - (ends[0][0] - ends[0][1])
+    if approach[-1] == 0 and back0 <= JUNCTION_AHEAD_M:
+      # the walk reached the trace's start: the rest of the approach is behind the car (signal_behind)
+      bkey = (edges[0].get('id'), edges[a].get('id'))
+      behind = cache.get('back', bkey) if cache is not None else None
+      if behind is None:
+        behind = signal_behind(call, edges, tpts, tcum, back0)
+        if behind is not None and cache is not None:
+          cache.put('back', bkey, behind)
+      if behind:
+        cloudlog.info(f"turnpilot controls: no suspected stop on {key} at {end_m:.0f} m: a signal is mapped on its approach behind the start")
+        continue
+      if behind is None:
+        cloudlog.warning(f"turnpilot controls: the approach to the suspected stop on {key} at {end_m:.0f} m behind the start is unknown " +
+                         f"({back0:.0f} m of it seen): the stop stays")
     suspected.add(a)
     cloudlog.info(f"turnpilot controls: a suspected unmapped stop on {key} at {end_m:.0f} m: every road crossing outranks ours by two classes")
     found.append({'s': end_m - CONTROL_LINE_M - MAP_MARGIN_M, 'kind': 'stop', 'mapped': False, 'junction': True, 'cross_suspect': False,
@@ -823,8 +1013,11 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
     j.osm_node_id = jn.osm_node_at(osm if osm_ok else None, f['osm_node'], nodes[0])
     jn.classify(j, osm, not f['suspected'], context)
     j.rail_distance = rail_distance(osm, pts, cum, begin_m, end_m, nodes[0])
+    if f.get('rail_m') is not None and j.rail_distance < 0.:
+      j.rail_distance = abs(f['rail_m'] - end_m)  # a rail orphan's junction always carries its crossing, however far on
     j.maneuver = 'unknown' if ahead else maneuver_at(steps, starts, f['s'], end_m)
-    sv = jn.survey_approach(j.survey if j.surveyed else None, j.our_way, j.heading_in)
+    # a rail orphan's stop is at its sign, not the junction's line: a survey of the junction never moves it on, past the tracks
+    sv = None if f.get('rail_m') is not None else jn.survey_approach(j.survey if j.surveyed else None, j.our_way, j.heading_in)
     off, j.stop_point_source = jn.stop_offset(j, end_m - f['s'], f['mapped'], sv.get('stopPointM') if sv else None)
     f['s'], j.stop_point_distance = end_m - off, off
     f['status'] = j.status
