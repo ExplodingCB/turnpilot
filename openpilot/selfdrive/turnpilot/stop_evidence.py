@@ -5,9 +5,17 @@ StopEvidence keeps, per trackId (as scene_policy keys its tracks), a history of 
 width, the view that matched it, its class and its ground point, and where our car stood (d_stop, m short of the held
 control's stop point). From it, per track, for SG4a's and SG4b's decider and for step S3's validation log:
 
-- Its lane: the side its bearing is on, then by its ground position's forward distance against each lane's s band (the
-  opposite approach's lanes beyond the cross road). The position along the lane comes from the bearing ray against the map
-  lane line, never from ground-plane range (off by about 30% at 50 m for half a degree of pitch).
+- Its lane: the side its bearing is on, then its bearing against where each lane can be seen. A lane parallel to ours (the
+  opposite approach's) is seen only under max_bearing plus ANGLE_BOUND (about 29 deg at the default junction), so a
+  track past that is in a cross lane whatever its ground range says: ground range at 50-80 deg reads 1.5-2.5x long
+  (STOP_SIGNS.md 1.2, verify.md finding 3), and by it a car through a cross lane at 12 m/s from 45 m read as an opposite
+  car standing far off (SG3b skeptic p2), and with no cross lane on that side the track is in no listed lane. Under that
+  bearing, where both can be, its ground position's forward distance decides (the opposite lanes beyond the cross road):
+  inside 40 deg, the full pass's measured domain, where a cross car is within a few metres of our path. Which lane of a
+  multi-lane cross approach it is in has no bearing cue at all (each lane is a line through the same bearings), so it is
+  the nearest s band to its forward distance, and 15% short or 30% long moves a car one lane (p8): SG4b's to close before
+  it reads a lane index. The position along the lane comes from the bearing ray against the map lane line, never from
+  ground-plane range (off by about 30% at 50 m for half a degree of pitch).
 - Distance and speed at the pessimistic ends of section 1.2 (stop_rules.fit_track): distance at sLaneMin with the bearing
   rotated toward the camera axis by ANGLE_BOUND, less 2 sigma; speed at sLaneMax with it rotated toward the frame edge, plus 2
   sigma; sigma from the fit's residuals over the trust window, the bearing noise floored at one pixel of the coarsest view
@@ -155,6 +163,15 @@ def is_cross(ln: sr.Lane) -> bool:
   return abs(abs(ln.rel_bearing) - 90.) <= CROSS_SKEW_DEG
 
 
+def max_bearing(ln: sr.Lane, d_stop: float) -> float:
+  """deg (unsigned): the largest bearing at which any point of ln, half a lane either side of its line, can be seen from
+  d_stop m short of the stop point. The bearing of a point moving along a line changes monotonically, so it is the larger of
+  its origin's, at sLaneMin and the far side of the lane, and the direction the lane leaves in: for the opposite approach's
+  lanes (parallel to ours) atan((|y| + half a lane) / sLaneMin), 26.4 deg at the default 2-lane junction."""
+  near = math.degrees(math.atan2(abs(ln.y) + sr.LANE_W_MAX / 2., max(ln.s_min + d_stop, 0.5)))
+  return max(near, abs(ln.rel_bearing))
+
+
 def junction_lanes(junction: sr.Junction, maneuver: str, setback: float, lane_edge_m: float | None = None,
                    yaw_deg: float = 0.) -> list[sr.Lane]:
   """The conflicting lanes of a held control's junction seen from its stop point (STOP_SIGNS.md 1.2, 2.1): one per physical
@@ -236,14 +253,16 @@ class StopEvidence:
         self.cache.pop(tid, None)
 
   def assign(self, s: Sample) -> sr.Lane | None:
-    """The lane a match lies in: by its bearing's side, then its forward distance against the lanes' s bands (with our
-    car's offset then), the opposite approach's lanes beyond the cross road."""
+    """The lane a match lies in (module docstring): by its bearing's side; then by its bearing, a lane that isn't a cross
+    lane (the opposite approach's) only where its bearing can reach it (max_bearing plus ANGLE_BOUND); then, where both
+    can, its forward distance against the lanes' s bands (with our car's offset then), the opposite approach's lanes beyond
+    the cross road; among the cross lanes on its side, the nearest s band to its forward distance."""
     side = 'left' if s.bearing >= 0. else 'right'
     on_side = [ln for ln in self.lanes if lane_side(ln) == side]
     if not on_side:
       return None
     cross = [ln for ln in on_side if is_cross(ln)]
-    other = [ln for ln in on_side if not is_cross(ln)]
+    other = [ln for ln in on_side if not is_cross(ln) and abs(s.bearing) <= max_bearing(ln, s.d_stop) + self.bound]
     if other and (not cross or s.x > max(ln.s_max for ln in cross) + s.d_stop + sr.LANE_W_MAX):
       return min(other, key=lambda ln: abs(abs(s.y) - abs(ln.y)))
     if not cross:

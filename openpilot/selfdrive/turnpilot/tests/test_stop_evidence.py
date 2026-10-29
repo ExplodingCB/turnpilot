@@ -251,3 +251,51 @@ def test_the_opposite_approach_is_placed_by_ground_range_at_its_near_end():
   rec = ev.records[5]
   assert rec.approaching is True and rec.stopped_at_line and not rec.through_at_speed
   assert states[-1].stopped_at_line and states[-1].v_trusted
+
+
+def ground_scaled(tid, t, d, ln, k, hits):
+  """track()'s car with its ground point read k times long along its ray, the bearing exact (verify.md finding 3: 1.5-2.5x
+  at 50-80 deg)."""
+  trk = track(tid, t, d, ln, view='sideLeft' if math.degrees(math.atan2(d, (ln.s_min + ln.s_max) / 2.)) > 52. else 'full')
+  trk.x, trk.hits = trk.x * k, hits
+  return trk
+
+
+@pytest.mark.parametrize('k', [1.0, 1.5, 1.75, 2.0, 2.5])
+def test_a_cross_car_whose_ground_range_reads_long_stays_in_its_cross_lane_by_bearing(k):
+  # SG3b skeptic p2/p3: a car through the left lane of a two-way at 12 m/s from 45 m, its ground range 2x long, was put in
+  # the opposite lane (its forward distance past the cross road) as 'far' with v_hi 0 at 33 m out, about 2.7 s from our
+  # path, and junction_validate passed the junction with it in. Its bearing above where any opposite lane's visible segment
+  # can sit (atan((|y| + half a lane) / sLaneMin) + ANGLE_BOUND, 28.9 deg here) can only be a cross lane's
+  ln = lane('left')
+  ev = evidence()
+  roles = []
+  for i in range(26):
+    t, d = 0.2 * i, 45. - 12. * 0.2 * i
+    if d < 8.:  # still past the opposite lanes' bearing
+      break
+    ev.observe([ground_scaled(1, t, d, ln, k, 2 + i)], d_stop=0.)
+    e = ev.evaluate().get(1)
+    roles.append(e.role)
+    if e.v_trusted:
+      assert e.u2 == 'notStopping' and e.v_hi > 12.
+  assert set(roles) == {'left'}
+  rec = ev.records[1]
+  assert (rec.first.role, rec.first.index) == ('left', 1) and rec.approaching is True and rec.through_at_speed
+
+
+def test_a_head_on_car_at_a_small_bearing_stays_opposite_and_a_bearing_no_listed_lane_can_reach_is_none():
+  # the rule doesn't sweep oncoming cars into a cross lane: one 40 m down the opposite lane (bearing about 4 deg), its
+  # ground range 2x long or exact, is opposite; and with no cross lane on its side, a car at 60 deg on the left is in none
+  # of the listed lanes (it was the opposite lane's)
+  opp = lane('opposite')
+  for k in (1.0, 2.0):
+    ev = evidence()
+    x, y = (opp.s_min + opp.s_max) / 2. + 40., abs(opp.y)
+    trk = SimpleNamespace(track_id=3, t_seen=0., bearing_seen=math.degrees(math.atan2(y, x)), width_seen=20., view='road', cls=CAR,
+                          x=np.array([k * x, k * y, 0., 0.]), hits=2)
+    ev.observe([trk], d_stop=0.)
+    assert ev.records[3].first.role == 'opposite'
+  ev = evidence([x for x in lanes() if x.role != 'left'])
+  ev.observe([ground_scaled(4, 0., 20., lane('left'), 2.0, 2)], d_stop=0.)
+  assert ev.assign(ev.hist[4][-1]) is None and 4 not in ev.records
