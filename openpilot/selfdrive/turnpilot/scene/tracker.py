@@ -248,6 +248,8 @@ class SceneTracker:
     self.far_key: tuple | None = None
     self.raw_by_view: dict[str, RawFrame] = {}  # the latest run of each view (view_key)
     self.new_views: set[str] = set()            # ...the views a run of which arrived in the last update_runs()
+    self.new_runs: list[tuple] = []             # ...and each run, in order: (view key, camera time, RawFrame, a side view's
+                                                # sectors [(inner, outer, quality)]), for the stop-sign evidence
     self.coast_s = MAX_COAST_S                  # SWEEP_COAST_S while a stop sweep runs (turnpilotd)
 
   def measure(self, det, camera: str, calibration) -> Measurement:
@@ -391,6 +393,8 @@ class SceneTracker:
         self.raw = None
         self.raw_by_view.pop(vkey, None)
       self.new_views.add(vkey)
+      sectors = [(float(q.inner), float(q.outer), str(q.quality)) for q in detections.sectorQuality] if view.startswith('side') else None
+      self.new_runs.append((vkey, t, self.raw, sectors))
       v_ego = float(car_state.vEgo) if car_state is not None else 0.0
       if yaw_rate is None:
         yaw_rate = default_yaw_rate(car_state, model_v2)
@@ -416,7 +420,7 @@ class SceneTracker:
     """Every detector run turnpilotd drained this tick (TurnpilotDetections readers, valid ones only), taken in camera-time
     order (module docstring): raw is the newest, raw_new whether any came, new_views the views that did. A run older than the
     newest already taken is dropped, logged: the filter only moves forward. No runs: staleness still ticks (update(None))."""
-    self.new_views = set()
+    self.new_views, self.new_runs = set(), []
     newest = self.last_t
     taken = []
     for d in sorted(runs, key=lambda d: d.timestampEof):

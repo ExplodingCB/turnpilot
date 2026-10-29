@@ -126,6 +126,7 @@ Alert priority (hooks.plan_events): handback, then fault (turnpilotUnavailable),
 change, then wrong lane. While TurnPilot isn't acting or is faulted, too fast to turn, wrong lane and lane change offers
 are never set here; the rest of the order is selfdrived's (hooks.plan_events, hooks.lane_change_events).
 """
+import datetime
 import math
 import os
 import time
@@ -150,6 +151,10 @@ from openpilot.selfdrive.turnpilot.lane_planner import (OPENPILOT_SIGNALS_BRANDS
 from openpilot.selfdrive.turnpilot.route_follower import KEEP, LEFT, TURN, UNCERTAIN_M, RouteFollower
 from openpilot.selfdrive.turnpilot.scene.lane_paint import lane_paint_from_msg
 from openpilot.selfdrive.turnpilot.scene.tracker import MAX_COAST_S, STALE_S, SWEEP_COAST_S, SceneTracker, default_yaw_rate
+from openpilot.selfdrive.turnpilot.junction_watch import JunctionWatch, detector_view, sweep_control
+from openpilot.selfdrive.turnpilot import visibility_table
+from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
+from openpilot.common.time_helpers import system_time_valid
 from openpilot.selfdrive.turnpilot.scene_policy import (HOLD_LINE_M, NO_ACCEL_CAP, ONCOMING_ENTRY_M, PATH_HALF_WIDTH_M, STOP_DECEL, ScenePolicy,
                                                          far_side_turn, in_path)
 from openpilot.selfdrive.turnpilot.turn_skip import TurnSkip, can_make_turn
@@ -331,6 +336,8 @@ class TurnPilot:
     self.go_override = GO_OVERRIDE_DEFAULT  # TurnPilotGoOverride (main())
     self.go_cert = GoCertifier()  # the go certified for plannerd's lift (go_override.py): its ids never repeat while this runs
     self.sweeping = False  # the last plan asked modeld for a stop sweep (stopSweep, stopSweepGo): the tracker coasts longer
+    self.watch = JunctionWatch()  # step S3's evidence at the swept stop or yield (junction_watch.py): logged, never acted on
+    self.tracks_now: list = []    # the tracker's tracks this frame (observe_runs), for the watch
     self.reset()
 
   def reset(self, detector: bool = True, keep_turn: bool = False):
@@ -502,6 +509,8 @@ class TurnPilot:
       self.stop('turnedOff')
       plan.state = State.disabled
       self.fill_stop_abort(plan)
+      self.sweeping = False
+      self.watch_junction(None, 0.)
       return msg
     self._stop_abort_t = 0.
 
@@ -682,6 +691,11 @@ class TurnPilot:
       (NO_JUNCTION_DATA_REASON if no_junction_data else "")
     fill_map_control(plan, mapd)
     self.fill_left(plan, decision)
+    # the stop sweep at every engaged stop and yield, engaged or not, the left's own view first (junction_watch.py)
+    sweep = sweep_control(self.map_controls.tracker.controls.values())
+    plan.detectorView = detector_view(str(plan.detectorView), sweep is not None)
+    self.sweeping = str(plan.detectorView) in ('stopSweep', 'stopSweepGo')
+    self.watch_junction(sweep, v_ego)
     if acting:
       self.go_cert.fill(plan)
     if skip.skipped and self.skip.reason == 'unprotectedRange' and upcoming is not None:
@@ -821,6 +835,28 @@ class TurnPilot:
                     far_live=self.far_live(route=True))  # on: a spell without room is waited through on its runs' freshness
     d = self.left_now = self.left.update(inp, DT_MDL)
     return LeftCommand(mode, d.go, d.creep_m, d.state == 'undecided', d.reason)
+
+  def observe_runs(self, tracker) -> None:
+    """This tick's detector runs and tracks, for the junction watch (main(), after the tracker)."""
+    try:
+      self.watch.observe_runs(tracker.new_runs, bool(tracker.available))
+      self.tracks_now = list(tracker.tracks)
+    except Exception:
+      log_error("turnpilotd.watch_failed")
+      self.tracks_now = []
+
+  def watch_junction(self, sweep, v_ego: float) -> None:
+    """The swept control's evidence and visibility, logged (junction_watch.py); a failure there never touches the plan."""
+    try:
+      if sweep is None and self.watch.key is None:
+        return
+      wall = datetime.datetime.now(datetime.UTC).timestamp() if system_time_valid() else None  # as navd.wall_clock
+      vis = visibility_table.cached() if sweep is not None else None
+      surveys = survey_file.cached() if sweep is not None else None
+      self.watch.update(sweep, v_ego, self.tracks_now, vis, surveys, wall)
+    except Exception:
+      log_error("turnpilotd.watch_failed")
+      self.watch = JunctionWatch()
 
   def fill_left(self, plan, decision) -> None:
     """turnpilotPlan.detectorView and unprotectedLeft, and the left's own prompt and alert where the map's say nothing."""
@@ -1483,6 +1519,7 @@ def main():
       if tracker is not None:
         tracker.coast_s = SWEEP_COAST_S if tp.sweeping else MAX_COAST_S
         tracker.update_runs(runs, sm['extrinsicsCalibration'], sm['carState'], sm['modelV2'])
+        tp.observe_runs(tracker)
         tracker.update_far(detector_run(sm, 'turnpilotFarDetections'), sm['extrinsicsCalibration'])
         tracker.fill_scene(scene_msg.turnpilotScene)
     except Exception:

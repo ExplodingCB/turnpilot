@@ -2513,7 +2513,7 @@ def test_a_far_crop_suspended_for_a_stop_sweep_is_on_at_route_time_but_not_readi
 class RecordingTracker:
   """A SceneTracker stand-in that records every detector run handed to it, by frameId, once each."""
   def __init__(self):
-    self.frames, self.tracks, self.raw_by_view, self.new_views, self.coast_s = [], [], {}, set(), 0.5
+    self.frames, self.tracks, self.raw_by_view, self.new_views, self.new_runs, self.coast_s = [], [], {}, set(), [], 0.5
     self.raw = self.raw_far = None
     self.raw_new = self.raw_far_new = self.available = False
 
@@ -2574,3 +2574,37 @@ def test_E13_no_detector_message_lost_at_20_hz_out_of_phase():
   batches = [sum(1 for tp, _ in published if (j - 1) * period < tp <= j * period) for j in range(frames)]
   assert max(batches) == 2 and 0 in batches[1:]  # the phase really does put two runs between some polls
   assert tracker.frames == sent  # every run, once each, in camera-time order
+
+
+def sweep_trace(sim, seconds):
+  out = []
+  for _ in range(int(seconds / DT_MDL)):
+    plan = sim.step()
+    out.append((sim.s, str(plan.detectorView)))
+  return out
+
+
+def test_the_stop_sweep_is_asked_for_from_30_m_before_a_stop_until_passed_engaged_or_not():
+  # STOP_SIGNS.md SG3b: turnpilotd asks modeld for the held cycle (stopSweep) at every stop and yield map_controls has
+  # engaged, from 30 m before it until the car has passed it, with openpilot engaged or not (step S3's dwell is driven with
+  # it off and TurnPilot on): Sim's carControl is never enabled here
+  from openpilot.selfdrive.turnpilot.junction_watch import STOP_SWEEP_M, SWEEP_PAST_M
+  sim = Sim([(1000., "turn", "right"), (2000., "turn", "left")], controls=[(200., 'stop')])
+  sim.go_taps = False
+  trace = sweep_trace(sim, 40.)
+  assert sim.v < 0.05 and 195. < sim.s < 202.
+  assert all(v == 'auto' for s, v in trace if s < 200. - STOP_SWEEP_M - 1.)
+  assert all(v == 'stopSweep' for s, v in trace if s > 200. - STOP_SWEEP_M + 1.)
+  assert sim.tp.sweeping
+  sim.go_taps, sim.take_over_on = True, ('stopSignTakeControl',)  # the driver drives on
+  trace = sweep_trace(sim, 15.)
+  # the latch holds the control's distance while it holds the car, so the sweep ends a few metres on in the sim's frame
+  assert sim.s > 230. and all(v == 'auto' for s, v in trace if s > 200. + SWEEP_PAST_M + 4.) and not sim.tp.sweeping
+  # a yield: from 30 m before it while the car runs through at the yield speed
+  sim = Sim([(1000., "turn", "right"), (2000., "turn", "left")], controls=[(200., 'yield')])
+  trace = sweep_trace(sim, 40.)
+  assert any(v == 'stopSweep' for s, v in trace if 180. < s < 199.)
+  assert all(v == 'auto' for s, v in trace if s < 200. - STOP_SWEEP_M - 1. or s > 200. + SWEEP_PAST_M + 1.)
+  # a signal never sweeps
+  sim = Sim([(1000., "turn", "right"), (2000., "turn", "left")], controls=[(200., 'signal')])
+  assert all(v == 'auto' for _, v in sweep_trace(sim, 40.))

@@ -299,3 +299,26 @@ def test_main_reads_the_go_override(value, on):
   with mock.patch.object(turnpilotd, 'TurnPilot', side_effect=make):
     run_main(frames=3, TurnPilotGoOverride=value)
   assert made[0].go_override is on
+
+
+def test_a_sweep_coasts_the_trackers_tracks_longer_and_the_watch_sees_every_run():
+  # STOP_SIGNS.md section 9: MAX_COAST_S 0.65 s while a stop sweep runs (the last plan asked for one), 0.5 s otherwise; and
+  # the junction watch gets the tracker's runs and tracks every frame
+  from openpilot.selfdrive.turnpilot.scene.tracker import MAX_COAST_S, SWEEP_COAST_S
+  tracker = mock.MagicMock()
+  tracker.raw_new, tracker.raw_far_new, tracker.new_runs, tracker.tracks = False, False, [('road', 1.0, None, None)], []
+  coasts, observed = [], []
+  real_plan = turnpilotd.TurnPilot.plan
+
+  def plan(self, *a, **k):
+    coasts.append(tracker.coast_s)
+    msg = real_plan(self, *a, **k)
+    self.sweeping = len(coasts) >= 2  # the second plan asks for a sweep
+    return msg
+
+  def observe(self, trk):
+    observed.append(list(trk.new_runs))
+  with mock.patch.object(turnpilotd.TurnPilot, 'plan', plan), mock.patch.object(turnpilotd.TurnPilot, 'observe_runs', observe):
+    run_main(frames=4, tracker=tracker)
+  assert coasts == [MAX_COAST_S, MAX_COAST_S, SWEEP_COAST_S, SWEEP_COAST_S]
+  assert observed == [[('road', 1.0, None, None)]] * 4
