@@ -163,6 +163,7 @@ class Measurement:
   xy: np.ndarray | None = None   # ground position (x forward, y left), None when it can't be ranged
   R: np.ndarray | None = None    # its covariance
   plausible: bool = True         # False for a person box that can't be a standing person; update() drops those
+  bearing: float | None = None   # deg left of the calibrated axis of its bottom centre (calibrated runs only)
 
 
 @dataclass
@@ -182,6 +183,8 @@ class Track:
   in_path: bool = False
   far_hits: int = 0            # far crop boxes matching it (update_far): never in hits
   view: str = 'full'           # the pass of its last match: full, far, sideLeft, sideRight
+  bearing_seen: float | None = None  # deg left of the calibrated axis of its last match's bottom centre (stop_evidence.py)
+  width_seen: float = 0.             # px, its last match's box width in its camera's frame
 
   @property
   def cls(self) -> int:
@@ -255,8 +258,9 @@ class SceneTracker:
       return m
     wide_euler = list(calibration.wideFromDeviceEuler) if camera == 'wide' and len(calibration.wideFromDeviceEuler) == 3 else None
     lens = self.lenses[camera]
-    xy = ground_point(lens, calib_from_view(list(calibration.rpyCalib), wide_euler), camera_height(calibration),
-                      (box[0] + box[2]) / 2, box[3])
+    rot = calib_from_view(list(calibration.rpyCalib), wide_euler)
+    m.bearing = bearing_deg(lens, rot, (box[0] + box[2]) / 2, box[3])
+    xy = ground_point(lens, rot, camera_height(calibration), (box[0] + box[2]) / 2, box[3])
     if xy is None:
       return m
     m.xy = np.array(xy)
@@ -309,6 +313,7 @@ class SceneTracker:
     trk.class_votes[m.cls] = trk.class_votes.get(m.cls, 0.0) + m.conf
     trk.hits += 1
     trk.view = view
+    trk.bearing_seen, trk.width_seen = m.bearing, float(m.box[2] - m.box[0])
     if m.xy is None:
       return
     if trk.x is None or trk.P is None:
@@ -320,8 +325,9 @@ class SceneTracker:
     trk.x = trk.x + K @ (m.xy - H @ trk.x)
     trk.P = (np.eye(4) - K @ H) @ trk.P
 
-  def new_track(self, m: Measurement, camera: str, t: float) -> None:
-    trk = Track(self.next_id, camera, m.box, m.box, t, m.conf, {m.cls: m.conf}, t=t)
+  def new_track(self, m: Measurement, camera: str, t: float, view: str = 'full') -> None:
+    trk = Track(self.next_id, camera, m.box, m.box, t, m.conf, {m.cls: m.conf}, t=t, view=view, bearing_seen=m.bearing,
+                width_seen=float(m.box[2] - m.box[0]))
     self.init_state(trk, m)
     self.next_id += 1
     self.tracks.append(trk)
@@ -393,7 +399,7 @@ class SceneTracker:
         self.correct(self.tracks[i], meas[j], camera, t, view)
       for j in unmatched:
         if meas[j].conf >= NEW_TRACK_CONF and meas[j].xy is not None:
-          self.new_track(meas[j], camera, t)
+          self.new_track(meas[j], camera, t, view)
       self.tracks = [trk for trk in self.tracks if t - trk.t_seen <= max(MAX_AGE_S, self.hold_s(trk))]
       if len(self.tracks) > MAX_TRACKS:  # a burst of false positives: the close-held pedestrian expires last, so it stays
         self.tracks = sorted(self.tracks, key=lambda trk: (trk.t_seen + self.hold_s(trk), trk.hits), reverse=True)[:MAX_TRACKS]
