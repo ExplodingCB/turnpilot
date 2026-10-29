@@ -1363,6 +1363,29 @@ def lane_paint_active(params) -> bool:
     return False
 
 
+INVALID_RUNS: dict[str, int] = {}  # detector_run: invalid runs in a row, by service
+
+
+def detector_run(sm, service: str):
+  """The latest run of a detector pass (turnpilotDetections, turnpilotFarDetections) for the tracker, None before the first
+  and while the latest is invalid. modeld publishes a run whose output wasn't finite valid False, its non-finite rows dropped
+  (no boxes, a far run's crop still set): taken as a run it is a clear one, the far crop covering the band. SubMaster sets
+  sm.valid from msg.valid even for services in ignore_valid, so an invalid run is no run (skeptic G6): the left sees none,
+  never clear (stale is its fault), and a detector that stays invalid leaves the scene unavailable (the detector's handback).
+  The first invalid run of a spell is logged, and how many there were when a valid one comes back."""
+  if not sm.seen[service]:
+    return None
+  if not sm.valid[service]:
+    if sm.updated[service]:
+      INVALID_RUNS[service] = INVALID_RUNS.get(service, 0) + 1
+      if INVALID_RUNS[service] == 1:
+        cloudlog.event("turnpilot.detector_run_invalid", error=True, service=service)
+    return None
+  if INVALID_RUNS.get(service):
+    cloudlog.event("turnpilot.detector_run_valid_again", service=service, invalid_runs=INVALID_RUNS.pop(service))
+  return sm[service]
+
+
 def main():
   params = Params()
   pm = messaging.PubMaster(['turnpilotPlan', 'turnpilotScene'])
@@ -1408,9 +1431,8 @@ def main():
         device_type = str(sm['deviceState'].deviceType)
         tracker = SceneTracker(DEVICE_CAMERAS[(device_type, str(sm['narrowRoadCameraState'].sensor))], device_type)
       if tracker is not None:
-        tracker.update(sm['turnpilotDetections'] if sm.seen['turnpilotDetections'] else None, sm['extrinsicsCalibration'],
-                       sm['carState'], sm['modelV2'])
-        tracker.update_far(sm['turnpilotFarDetections'] if sm.seen['turnpilotFarDetections'] else None, sm['extrinsicsCalibration'])
+        tracker.update(detector_run(sm, 'turnpilotDetections'), sm['extrinsicsCalibration'], sm['carState'], sm['modelV2'])
+        tracker.update_far(detector_run(sm, 'turnpilotFarDetections'), sm['extrinsicsCalibration'])
         tracker.fill_scene(scene_msg.turnpilotScene)
     except Exception:
       log_error("turnpilotd.scene_failed")
