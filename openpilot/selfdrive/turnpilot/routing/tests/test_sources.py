@@ -674,3 +674,11 @@ class TestRealCorridor(unittest.TestCase):
 
 if __name__ == '__main__':
   unittest.main()
+
+
+def test_the_overrides_param_is_a_persistent_json_key():
+  """TurnPilotJunctionOverrides (STOP_SIGNS.md 9) survives restarts: an approach downgraded on site stays avoided until
+  Kellen clears it. Unset, it is empty."""
+  import re
+  header = (Path(__file__).parents[4] / 'common' / 'params_keys.h').read_text()
+  assert re.search(r'\{"TurnPilotJunctionOverrides", \{PERSISTENT, JSON\}\}', header)
