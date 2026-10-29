@@ -7,7 +7,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_ACCEL_MIN, plan_accel
 from openpilot.selfdrive.turnpilot.map_controls import (STOP_SIGN_HANDBACK_S, GREEN_STEADY_S, LIGHT_STALE_S, MAP_DECEL_MAX, NO_LIGHTS,
                                                          OFF_ROUTE_REASON, OFF_ROUTE_SPEED, T_LAT, UNPROTECTED, YIELD_SPEED, CameraLights,
-                                                         Lights, MapControlPolicy, engage_distance, light_input, unprotected_turn)
+                                                         Lights, MapControlPolicy, StopCommand, engage_distance, light_input, unprotected_turn)
 from openpilot.selfdrive.turnpilot.route_follower import make_maneuver
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, NO_ACCEL_CAP, ScenePolicy, decide
 from openpilot.selfdrive.turnpilot.tests.synthetic import nav_instruction
@@ -41,13 +41,15 @@ class Car:
     return nav_instruction(500., route_count=self.route_count, controls=controls if self.nav_valid else [],
                            controls_status=self.status, valid=self.nav_valid, off_route=off, off_route_status=off_status)
 
-  def step(self, gas=False, lights=NO_LIGHTS, accel=None):
-    """lights: Lights, or a function of the car giving them."""
+  def step(self, gas=False, lights=NO_LIGHTS, accel=None, **kw):
+    """lights: Lights, or a function of the car giving them; kw: the stop-sign decider's for MapControlPolicy.update (release,
+    creep, stop), each a value or a function of the car."""
     lights = lights(self) if callable(lights) else lights
+    kw = {k: (v(self) if callable(v) else v) for k, v in kw.items()}
     due = self.frame % 20 == 0
     self.frame += 1
     turn = None if self.turn is None else (self.turn[1], self.turn[0] - self.s, self.turn[2])
-    out = self.policy.update(self.nav() if due else None, due, self.nav_valid, self.v, gas, lights, DT_MDL, turn=turn)
+    out = self.policy.update(self.nav() if due else None, due, self.nav_valid, self.v, gas, lights, DT_MDL, turn=turn, **kw)
     dec = decide(out.stops, self.v)
     dec.accel_cap = self.scene.ramp(dec.accel_cap, DT_MDL)
     cmd = min(plan_accel(dec.accel_cap, dec.speed_cap, self.v), (self.cruise - self.v) / 2., 1.5)
@@ -884,3 +886,83 @@ def test_the_turn_light_is_the_signal_at_the_lefts_junction_from_any_source():
   car.status = 'failed'
   car.run(1.)
   assert car.policy.turn_light(7, 250. - car.s) == 'unknown'
+
+
+# --- the stop-sign decider's latch (STOP_SIGNS.md v3 SG4a: stop_go.py through turnpilotd) ---
+
+def stand_at(car, line):
+  car.run_until(lambda out, dec: held(out, dec))
+  return car.policy.held_control()
+
+
+def test_held_control_is_the_latched_stop_and_survives_a_reroute_by_its_state():
+  car = Car([(150., 'stop'), (400., 'signal')])
+  assert car.policy.held_control() is None
+  c = stand_at(car, 150.)
+  assert c is not None and c.kind == 'stop' and c.held and c.key == car.policy.held
+  # a reroute: the new route's same control takes the latch over under its own key, the state object carried (adopt)
+  car.route_count += 1
+  car.frame = 0
+  car.run(0.1, stop=StopCommand('wait'))
+  c2 = car.policy.held_control()
+  assert c2 is not None and c2.key != c.key and c2.state is c.state
+
+
+def test_under_the_decider_a_held_stop_sign_waits_without_the_1_s_handback_and_its_faults_hand_back():
+  car = Car([(150., 'stop')])
+  stand_at(car, 150.)
+  out, dec, _ = car.run(STOP_SIGN_HANDBACK_S + 3., stop=StopCommand('wait', "Waiting: a car from the left", 'waitingCross'))
+  assert dec.should_stop and out.prompt == 'none' and out.shown.action == 'waitingCross' and dec.reason == "Waiting: a car from the left"
+  out, dec, _ = car.run(0.1, stop=StopCommand('fault', "Cross-traffic camera unavailable: take control"))
+  assert held(out, dec) and out.prompt == 'stopSignTakeControl' and dec.reason == "Cross-traffic camera unavailable: take control"
+  assert out.shown.action == 'awaitingDriver'
+  # as shadow (H4, H6, H8): the 1 s handback exactly as before, its reason saying why
+  car = Car([(150., 'stop')])
+  stand_at(car, 150.)
+  out, dec, _ = car.run(STOP_SIGN_HANDBACK_S - 0.2, stop=StopCommand('shadow', "Stop-sign go off: no camera measurements"))
+  assert held(out, dec) and out.prompt == 'none'
+  out, dec, _ = car.run(0.3, stop=StopCommand('shadow', "Stop-sign go off: no camera measurements"))
+  assert out.prompt == 'stopSignTakeControl' and dec.reason == "Stop-sign go off: no camera measurements"
+
+
+def test_the_deciders_clear_releases_the_latch_through_the_lefts_mechanism_and_never_the_stop_past_it():
+  # G11: a 'clear' releases only its own control, never a stop RELEASE_SPAN_M past it (a divided road's second line has its own
+  # decision); the release lets the car go standing (released_stopped)
+  car = Car([(150., 'stop'), (165., 'stop')])
+  c = stand_at(car, 150.)
+  car.run(1.5, stop=StopCommand('wait'))
+  out, dec, _ = car.step(stop=StopCommand('wait'), release=(c.key, 'clear'))
+  assert out.released_stopped and not dec.should_stop and car.policy.held_control() is None
+  second = next(o for o in car.policy.tracker.controls.values() if o.key != c.key)
+  assert not (second.state is not None and second.state.done)
+  # a release for another key, or none, lets nothing go
+  car = Car([(150., 'stop')])
+  c = stand_at(car, 150.)
+  out, dec, _ = car.run(1., stop=StopCommand('wait'), release=((99, 99), 'clear'))
+  assert held(out, dec)
+
+
+def test_a_held_stop_signs_stop_point_moves_on_by_the_deciders_creep_on_the_map_curve_never_should_stop():
+  # O2, V1: latched 4 m short, rolled up on the map curve (up to the creep's cap) with shouldStop false, held again there
+  car = Car([(150., 'stop')], v=5.)
+  car.lead_stop = 146.5
+  stand_at(car, 150.)
+  c = car.policy.held_control()
+  assert c.d > 3.
+  car.lead_stop = None
+  target = c.d
+  rows = []
+  for _ in range(int(8. / DT_MDL)):
+    out, dec, _ = car.step(stop=StopCommand('wait', '', 'creeping'), creep=(target, 3.0))
+    rows.append((car.v, out, dec))
+  assert all(not dec.should_stop for v, out, dec in rows[:5]) and max(v for v, _, _ in rows) <= 3.0 + 1e-6
+  assert any(s.speed_cap > 0. for s in rows[2][1].stops) and rows[2][1].shown.action == 'creeping'
+  assert abs(c.state.moved_m - target) <= 0.3 and rows[-1][2].should_stop
+  # a creep keeps its slow cap (CREEP_SPEED): the left's own
+  from openpilot.selfdrive.turnpilot.map_controls import CREEP_SPEED
+  car = Car([(150., 'stop')], v=5.)
+  car.lead_stop = 146.5
+  stand_at(car, 150.)
+  car.lead_stop = None
+  vs = [car.step(stop=StopCommand('wait'), creep=(3.0, CREEP_SPEED))[0] and car.v for _ in range(int(6. / DT_MDL))]
+  assert max(vs) <= CREEP_SPEED + 1e-6

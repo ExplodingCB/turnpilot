@@ -565,13 +565,13 @@ class StopGo:
       return
     self.crept_m = float(ctl.state.moved_m)
     target = self.rollup_target
-    if target - self.crept_m <= 0.1 + 1e-6:
+    standing = f.v_ego < STAND_V
+    if target - self.crept_m <= 0.1 + 1e-6 or (standing and abs(pos) <= LINE_M and self.crept_m > 0.5):
       # there: the full stop again, its dwell from now (the arrival is this stop)
       self.state, self.rollup_target, self.dwell_s = 'stopped', None, 0.
       d.creep = (target, ROLLUP_V_MAX)
       return
     d.creep = (target, ROLLUP_V_MAX)
-    standing = f.v_ego < STAND_V
     self.stand_s = self.stand_s + f.dt if standing else 0.
     if standing and self.stand_s >= STOP_DWELL_S and f.go_active == 'none' and self.rollups < ROLLUP_GOES and f.enabled:
       self.rollups += 1
