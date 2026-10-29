@@ -63,6 +63,27 @@ def test_b3_osm_signs_near_the_route_that_no_row_covers_are_listed(tmp_path):
   assert [g['node'] for g in route_audit.as_json(report)['signs']] == [501, 506, 504]
 
 
+def test_sg1a_an_orphan_left_out_is_listed_as_uncovered_with_how_far_before_its_edges_end(tmp_path):
+  """An orphan (a sidecar stop or yield tied to no junction) whose sign is more than ORPHAN_NEAR_M before its edge's end is
+  left out of the controls (routing/controls.py): the audit lists it among the signs no row covers, held for 'orphan (sign
+  N m before its edge's end)'. One near its edge's end is placed and covered. On an edge Valhalla flags, its row says the
+  orphan was left out."""
+  v = StubValhalla([(0., 100., {'way_id': 71}), (100., 180., {'way_id': 72}), (180., 300., {'way_id': 73, 'stop': True}),
+                    (300., 400., {'way_id': 74})])
+  side = {'71:f': [entry('stop', 92., junction=0, node=604)],    # 8 m before its edge's end: placed
+          '72:f': [entry('yield', 140., junction=0, node=601)],  # 40 m before: left out
+          '73:f': [entry('stop', 200., junction=0, node=602)]}   # 100 m before, on an edge Valhalla flags: its row has it
+  report = route_audit.audit(v, steps(), None, osm_dir(tmp_path, side))
+  assert [(g.route_m, g.node, g.kind, g.holder, g.edge, g.to_node_m) for g in report.signs] == [
+    (140., 601, 'yield', "orphan (sign 40 m before its edge's end)", '72:f', 40.),
+  ]
+  assert [(c.kind, round(c.route_m)) for c in report.controls] == [('stop', 89), ('stop', 289)]
+  rows = [(r.key, r.valhalla, r.sidecar, r.control) for r in report.rows]
+  assert rows == [('71:f', '-', 'stop (mid_directed, stop=none)', 'stop at 89 m'),
+                  ('73:f', 'stop', "stop (mid_directed, stop=none, an orphan 100 m before its edge's end: left out)", 'stop at 289 m')]
+  assert "orphan (sign 40 m before its edge's end)" in '\n'.join(route_audit.lines(report))
+
+
 def test_each_junction_lists_its_legs_tiers_limits_the_line_source_and_the_survey(tmp_path):
   """STOP_SIGNS.md SG1b: route_audit prints each stop and yield's junction: its legs with their roles, tiers, limits and
   the limit's source, the stop point's source, and the survey it matched (or why one doesn't count)."""

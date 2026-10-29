@@ -20,8 +20,9 @@ internal-intersection edge's row says which junction's control it joined.
 Then every OSM stop and give_way node within RAW_M of the route that no row covers: neither the sidecar placed it on the
 edge it lies on nor Valhalla flagged that edge with its kind. Each says who the sidecar has it for: ours (keyed to our
 edge but not placed on it), the other direction of our way (often right, but a reversed direction tag looks the same),
-another way, or no approach (unplaced: on no drivable way, or a stop=minor with no lower approach). The car stops for
-none of them; the auditor checks each.
+another way, no approach (unplaced: on no drivable way, or a stop=minor with no lower approach), or an orphan left out (tied
+to no junction, its sign more than ORPHAN_NEAR_M before its edge's end, where the edge's end would put the stop: routing/
+controls.py). The car stops for none of them; the auditor checks each.
 
 Then each stop and yield's junction (SG1b, routing/junctions.py): its OSM node, status, maneuver, where its stop point is
 and why (default, mappedLine, survey), the sidecar, the survey it matched (and whether it counts), the plausibility gate,
@@ -93,7 +94,8 @@ class Sign:
   node: int            # the OSM node id (0 for a shard without it)
   kind: str            # 'stop' or 'yield'
   tags: str            # its direction and stop tags
-  holder: str          # who the sidecar has it for: 'ours', 'other direction', 'way <keys>', 'no approach (<why>)'
+  holder: str          # who the sidecar has it for: 'ours', 'other direction', 'way <keys>', 'no approach (<why>)',
+                       # 'orphan (sign N m before its edge's end)' (left out: routing/controls.py's ORPHAN_NEAR_M)
   edge: str            # the route edge it lies on, '-' for none
   to_node_m: float     # m before that edge's end node
 
@@ -239,7 +241,9 @@ def audit(call, steps, tiles_dir, sidecar_dir, context: junctions.Context | None
     if not (e['osm'] or e['phantom'] or 'stop' in e['valhalla'] or 'yield' in e['valhalla']):
       continue
     valhalla = ' '.join(e['valhalla'] + [f"{k} (phantom: dropped)" for k in e['phantom']]) or '-'
-    sidecar = ', '.join(f"{h['kind']} ({h['evidence']}, stop={h['stop_tag']})" for h in e['osm']) or '-' if checked else 'not checked'
+    sidecar = ', '.join([f"{h['kind']} ({h['evidence']}, stop={h['stop_tag']})" for h in e['osm']] +
+                        [f"{h['kind']} ({h['evidence']}, stop={h['stop_tag']}, an orphan {h['before_m']:.0f} m before its edge's end: left out)"
+                         for h in e['orphans']]) or '-' if checked else 'not checked'
     c = by_edge.get(e['anchor'])
     osm_node = next((int(h['junction_node']) for h in e['osm'] if h.get('junction_node')), c.osm_node if c is not None else 0)
     sign_m = None if c is None or c.osm_sign_m is None else round(c.osm_sign_m, 1)
@@ -342,7 +346,11 @@ def uncovered(side, pts, edges) -> list[Sign]:
     e = next((e for e in edges if e['begin_m'] < m <= e['end_m'] + 1.), None)
     if e is not None and (any(node and h.get('node') == node for h in e['osm']) or kind in e['valhalla'] or kind in e['phantom']):
       continue  # its edge's row has it
-    if why:
+    orphan = next((h for h in e['orphans'] if (node and h.get('node') == node) or (not node and h.get('line') and
+                   (round(h['line'][0], 7), round(h['line'][1], 7)) == (round(pos[0], 7), round(pos[1], 7)))), None) if e is not None else None
+    if orphan is not None:
+      holder = f"orphan (sign {orphan['before_m']:.0f} m before its edge's end)"
+    elif why:
       holder = f"no approach ({why})"
     elif e is not None and e['key'] in keys:
       holder = 'ours'

@@ -380,15 +380,50 @@ def test_b2_an_osm_stop_node_never_moves_the_stop_point(tmp_path, kind, sign_m):
     [(kind, 100. - OFF, False, 'default', 900, sign_m)]
 
 
-def test_b3_a_sidecar_stop_tied_to_no_junction_is_still_a_stop(tmp_path):
+def test_b3_a_sidecar_stop_tied_to_no_junction_near_its_edges_end_is_still_a_stop(tmp_path):
   """The sidecar keeps a stop it ties to no junction within 60 m (a mid-block trail or rail crossing) with junction_node
-  0: where Valhalla doesn't flag it either, the union is the car's only source for it. It stops at its edge's default
-  stop point, with no OSM junction node, its sign carried as data."""
+  0, an orphan: where Valhalla doesn't flag it either, the union is the car's only source for it. With its sign within
+  ORPHAN_NEAR_M (CONTROL_LINE_M + 5 m) of its edge's end it stops at the edge's default stop point, at most 4 m past the
+  sign, with no OSM junction node, its sign carried as data."""
+  assert controls_module.ORPHAN_NEAR_M == CONTROL_LINE_M + 5.
   v = StubValhalla([(0., 100., {}), (100., 180., {'way_id': 77}), (180., 400., {})])
-  controls, status = route_controls(v, steps(), sidecar_dir=osm_dir(tmp_path, {'77:f': [entry('stop', 140., junction=0)]}))
-  assert status == 'ok'
-  assert [(c.kind, round(c.route_m, 1), c.osm_node, c.line_source, round(c.osm_sign_m, 1)) for c in controls] == \
-    [('stop', 180. - OFF, 0, 'default', 140.)]
+  for sign_m in (176., 166.):
+    controls, status = route_controls(v, steps(), sidecar_dir=osm_dir(tmp_path / str(sign_m), {'77:f': [entry('stop', sign_m, junction=0)]}))
+    assert status == 'ok'
+    assert [(c.kind, round(c.route_m, 1), c.osm_node, c.line_source, round(c.osm_sign_m, 1)) for c in controls] == \
+      [('stop', 180. - OFF, 0, 'default', sign_m)]
+
+
+@pytest.mark.parametrize('kind, sign_m, end_m, crossing', [
+  ('stop', 140., 180., ['residential']),  # the old B3 shape: 40 m before a junction
+  ('stop', 140., 500., []),               # 360 m before a node no other road meets: the stop would be mid-block
+  ('stop', 140., 500., ['residential']),  # 360 m before a junction (Jim Town Road, 635 m)
+  ('stop', 240., 300., ['residential']),  # 60 m (4th St NW, a reversed direction tag: 62 m)
+  ('yield', 140., 180., ['residential']),
+])
+def test_sg1a_an_orphan_sign_far_before_its_edges_end_is_left_out(tmp_path, kind, sign_m, end_m, crossing):
+  """An orphan's sign further than ORPHAN_NEAR_M before its Valhalla edge's end: the edge's end less CONTROL_LINE_M would
+  put the stop (or the yield's cap) that far past the sign, where there is none, often mid-block, and the car would drive
+  past the real sign unslowed and then stop there (Indianapolis: 146 of 176 such orphans more than 15 m past their sign,
+  the furthest 1119 m). It is left out of the controls and logged, as the base had it (route_audit lists it as uncovered);
+  never placed at its sign either, since a reversed direction tag would then stop the car past a junction (4th St NW)."""
+  v = StubValhalla([(0., 100., {}), (100., end_m, {'way_id': 77, 'crossing': crossing}), (end_m, 800., {})], total=800.)
+  with patch.object(controls_module, 'cloudlog') as log:
+    controls, status = route_controls(v, steps((400., 400.)), sidecar_dir=osm_dir(tmp_path, {'77:f': [entry(kind, sign_m, junction=0)]}))
+  assert status == 'ok' and controls == []
+  assert any('left out' in str(c.args[0]) and '77:f' in str(c.args[0]) for c in log.info.call_args_list)
+
+
+def test_sg1a_a_far_orphan_neither_drops_nor_moves_valhallas_own_flag(tmp_path):
+  """Valhalla's own flag on the edge stays where it was (its edge's end less CONTROL_LINE_M), the far orphan's sign carried
+  as data (osm_sign_m), and a far orphan of ours still counts as ours on the edge for the phantom check (C14)."""
+  v = StubValhalla([(0., 100., {}), (100., 180., {'way_id': 77, 'stop': True}), (180., 400., {})])
+  controls, _ = route_controls(v, steps(), sidecar_dir=osm_dir(tmp_path / 'flag', {'77:f': [entry('stop', 140., junction=0)]}))
+  assert [(c.kind, round(c.route_m, 1), c.osm_node, round(c.osm_sign_m, 1)) for c in controls] == [('stop', 180. - OFF, 0, 140.)]
+  edges = [(0., 100., {}), (100., 150., {'stop': True, 'way_id': 77, 'forward': False}), (150., 400., {})]
+  side = {'77:f': [entry('stop', 150., junction=900)], '77:b': [entry('stop', 120., junction=0)]}
+  controls, _ = route_controls(StubValhalla(edges, every=2.), steps(every=2.), sidecar_dir=osm_dir(tmp_path / 'phantom', side))
+  assert [(c.kind, round(c.route_m, 1)) for c in controls] == [('stop', 150. - OFF)]
 
 
 def test_a_junction_node_stop_from_the_sidecar_is_on_the_edge_ending_there(tmp_path):

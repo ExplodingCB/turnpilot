@@ -12,7 +12,12 @@ quarter of the OSM-mapped stop approaches (research_allway.md section 0). Its en
 ("<way_id>:<f|b>", a list, since a way passes several junctions) are the edge's when the entry's line, the OSM stop node,
 projects inside the edge's span on the route within LINE_TOL_M of it (past SPAN_START_M from its start, which is the
 previous edge's end), or, for a stop on the junction node (no line), when that node is within NODE_TOL_M of the edge's
-end. The edge's stops and yields are the union of both. One exception: Valhalla flags both directions of a stop on a
+end. The edge's stops and yields are the union of both, but for an orphan (an entry the sidecar ties to no junction,
+junction_node 0: a mid-block trail or rail crossing, or a reversed direction tag) whose sign is more than ORPHAN_NEAR_M
+before its anchor edge's end: that end less CONTROL_LINE_M would stop the car where there is no sign, up to a kilometre
+past the real one (Indianapolis: 146 of the 176 such orphans more than 15 m past), so it is left out and logged (route_audit
+lists it as uncovered), as the base had it; never placed at its sign instead, since a reversed tag would then stop the car
+past a junction. It is still ours on the edge for phantom(). One exception: Valhalla flags both directions of a stop on a
 graph node it can't direct (a crosswalk's, shared with a footway), so the other direction's directed stop sitting ON the
 edge's end node (within PHANTOM_NODE_M) makes a phantom of our flag of its kind there: dropped, and logged, but only when
 the sidecar has nothing of ours on the edge (any kind, directed, both-ways, undirected, with a junction or none) and no
@@ -73,6 +78,9 @@ from openpilot.selfdrive.turnpilot.routing.guidance import opposing_leg
 
 CONTROL_LINE_M = 10.    # m before the junction node a stop line is taken to be, without a mapped one
 MAP_MARGIN_M = 1.       # m short of the line the car stops
+ORPHAN_NEAR_M = CONTROL_LINE_M + 5.  # m: a sidecar stop or yield tied to no junction (junction_node 0, an orphan) whose sign
+                                     # is further than this before its anchor edge's end is left out (SG1a): that end less
+                                     # CONTROL_LINE_M would put it that far past its sign, where there is none
 PARTIAL_UNMATCHED = 0.10
 LINE_TOL_M = 5.         # m: a sidecar line further than this from the route isn't on it
 NODE_TOL_M = 5.         # m: a junction-node control's node this close to an edge's end is that end
@@ -665,6 +673,7 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
   osm_ok = osm is not None and osm.status == 'ok'
   ends = []                   # per edge: (end m on the route, span m, key, its end node)
   at = {}                     # anchor edge -> {kind: [(source edge, osm entry or None, m along or None)]}
+  signs = {}                  # anchor edge -> [(source edge, osm entry, m along)]: every sidecar sign there, far orphans too
   unmatched = anchor = 0
   for i, (e, candidate) in enumerate(zip(edges, located, strict=False)):
     internal = bool(e.get('internal_intersection'))
@@ -683,12 +692,20 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
     ends.append((end_m, span, key, e.get('end_node') or {}))
     valhalla = (['signal'] if e.get('traffic_signal') or (e.get('end_node') or {}).get('traffic_signal') else []) + \
       (['stop'] if candidate.get('stop_sign') else []) + (['yield'] if candidate.get('yield_sign') else [])
-    hits, phantoms = [], []
+    hits, phantoms, far = [], [], []
     if osm_ok:
       for entry in osm.entries(key):
         m = osm_at(osm, entry, pts, cum, end_m - span, end_m, tpts[end_i])
         if m is not None and entry.get('kind') in ('stop', 'yield'):
           hits.append((entry, m))
+      # an orphan whose sign is far before its anchor edge's end: left out (ORPHAN_NEAR_M), never placed at the sign either
+      # (a reversed direction tag would then stop the car past a junction); still ours on the edge for phantom()
+      for entry, m in hits:
+        before = ends[anchor][0] - m
+        if not entry.get('junction_node') and entry.get('line') and before > ORPHAN_NEAR_M:
+          far.append((entry, m, before))
+          cloudlog.info(f"turnpilot controls: the sidecar's {entry['kind']} on {key} at {m:.0f} m is tied to no junction and " +
+                        f"{before:.0f} m before its edge's end: left out (that end would put it {before - CONTROL_LINE_M:.0f} m past its sign)")
       # the other direction: of our way, and, where no other road meets the end node (a way split, never a junction the
       # route may turn at), of the next edge's way (a split's sign is keyed to the way its traffic arrives on)
       split = not (e.get('end_node') or {}).get('intersecting_edges')
@@ -700,13 +717,17 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
           phantoms.append(kind)
           cloudlog.info(f"turnpilot controls: Valhalla's {kind} on {key} at {end_m:.0f} m is a phantom: the OSM sidecar's is " +
                         f"directed {' or '.join(others)}, on the edge's end node")
+    placed = [(entry, m) for entry, m in hits if not any(entry is x for x, _, _ in far)]
     if audit is not None:
       audit.append({'edge': i, 'key': key, 'internal': internal, 'anchor': anchor, 'begin_m': end_m - span, 'end_m': end_m,
-                    'valhalla': list(valhalla), 'phantom': phantoms, 'osm': [dict(entry, m=m) for entry, m in hits]})
-    kinds = at.setdefault(anchor, {}) if valhalla or hits else None
+                    'valhalla': list(valhalla), 'phantom': phantoms, 'osm': [dict(entry, m=m) for entry, m in placed],
+                    'orphans': [dict(entry, m=m, before_m=before) for entry, m, before in far]})
+    for entry, m in hits:
+      signs.setdefault(anchor, []).append((i, entry, m))
+    kinds = at.setdefault(anchor, {}) if valhalla or placed else None
     for kind in valhalla:
       kinds.setdefault(kind, []).append((i, None, None))
-    for entry, m in hits:
+    for entry, m in placed:
       kinds.setdefault(entry['kind'], []).append((i, entry, m))
   if edges and unmatched > PARTIAL_UNMATCHED * sum(1 for e in edges if not e.get('internal_intersection')) and status == 'ok':
     status = 'partial'
@@ -734,7 +755,8 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
     ours = ROAD_CLASS_RANK.get(edges[a].get('road_class'), 8)
     cross_suspect = junction and all(ours < c for c in crossing) and kind in ('stop', 'yield')
     line_m, mapped, instance, source = end_m - CONTROL_LINE_M, False, '', 'default'
-    own = sorted(((m, entry) for i, entry, m in kinds[kind] if i == a and entry is not None and entry.get('line')), key=lambda x: x[0])
+    own = sorted(((m, entry) for i, entry, m in signs.get(a, []) if i == a and entry.get('kind') == kind and entry.get('line')),
+                 key=lambda x: x[0])
     osm_node = next((int(entry.get('junction_node') or 0) for _, entry, _ in kinds[kind] if entry is not None), 0)
     sim_entry = sim.get(key)
     if sim_entry is not None and sim_entry.get('kind') == kind and sim_entry.get('line'):
