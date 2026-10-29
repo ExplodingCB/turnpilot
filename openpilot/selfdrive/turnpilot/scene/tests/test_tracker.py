@@ -513,3 +513,9 @@ def test_far_matches_tag_tracks_and_never_feed_confirmation():
     fresh.update_far(far_run(fresh, crop, 2. + 0.1 * k, [(PERSON, 10., 0., 0.9)], frame_id=k), cal, now=2. + 0.1 * k)
     assert fresh.update(None, cal, car_state(), now=2. + 0.1 * k) == [] and not fresh.available
   assert fresh.tracks == [] and fresh.raw is None and fresh.raw_far is not None
+
+
+def test_the_tracker_says_which_lens_it_uses():
+  from openpilot.selfdrive.turnpilot.scene.ranging import wide_lens
+  tracker = SceneTracker(CAMS, 'mici')
+  assert tracker.lens_spec == wide_lens(CAMS.wide_road, 'mici').spec == tracker.lenses['wide'].spec

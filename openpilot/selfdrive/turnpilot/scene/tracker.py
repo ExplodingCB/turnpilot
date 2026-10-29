@@ -211,6 +211,8 @@ class SceneTracker:
   def __init__(self, device_camera: DeviceCameraConfig, device_type: str = ''):
     """device_camera: DEVICE_CAMERAS[(deviceType, sensor)]. The wide camera's lens follows device_type (the sim's is a pinhole)."""
     self.lenses: dict[str, Lens] = {'road': road_lens(device_camera.narrow_road), 'wide': wide_lens(device_camera.wide_road, device_type)}
+    self.lens_spec = self.lenses['wide'].spec  # the wide lens ranging and RawBox bearings use (ranging.py: one lens)
+    cloudlog.info(f"turnpilot tracker: wide lens {self.lens_spec}")
     self.sizes = {'road': device_camera.narrow_road.size, 'wide': device_camera.wide_road.size}
     self.tracks: list[Track] = []
     self.next_id = 1
