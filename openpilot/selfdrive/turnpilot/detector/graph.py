@@ -10,6 +10,11 @@ it is at 115 m in the full pass). A box maps back with the window's offset alone
 recompile: the graph takes two views of modeld's frame buffer, the crop's luma rows and its chroma rows (crop_views),
 so where it looks is which views it is given, and inside the graph every index is a constant (reshapes and slices, no
 gather). The luma is at native resolution, the chroma nearest on its half-resolution grid.
+
+The side views (STOP_SIGNS.md section 1.3, sideview.py) are a third graph: a 768x512 level pinhole of the wide frame, the
+model input as it is, gathered through maps that are graph inputs (luma_idx, chroma_idx, weights: the luma's bilinear
+base index and weights and whether the pixel is inside the frame, the chroma's nearest index), so one compiled graph serves
+both views and any calibration. A box maps back through sideview.SideGeometry.box_to_fisheye.
 """
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +30,7 @@ FAR_CROP_SIZE = (640, 384)  # the far crop (w, h): native resolution, the YOLO i
 FAR_HORIZON_ROW = 256       # the calibrated horizon this many rows down the crop (2/3): the ground from about 11 m out
                             # below it, signal heads from about 21 m out above it (4.8 m over the camera)
 FAR_ALIGN_X = 32            # the crop's x0 a multiple of this, so its views' offsets stay aligned (strides are of 128)
+SIDE_INPUT_SIZE = (768, 512)  # the side views (sideview.SIDE_SIZE): the YOLO input as it is
 
 
 @dataclass(frozen=True)
@@ -121,6 +127,29 @@ def make_prepare_crop(cam_w: int, cam_h: int, size: tuple[int, int] = FAR_CROP_S
   return prepare
 
 
+def make_prepare_side(cam_w: int, cam_h: int, size: tuple[int, int] = SIDE_INPUT_SIZE):
+  """(input_frame, luma_idx, chroma_idx, weights) -> (1, 3, h, w) RGB 0-1: the frame (modeld's NV12 view of the wide camera)
+  gathered through a side view's maps (sideview.SideMap): luma bilinear from its base index (the taps +1, +stride,
+  +stride+1) with weights x, y of 255, chroma nearest, a pixel whose weights[2] is 0 the letterbox's gray."""
+  from tinygrad import Tensor, dtypes
+  stride, _, _, _ = get_nv12_info(cam_w, cam_h)
+  w, h = size
+
+  def prepare(input_frame: Tensor, luma_idx: Tensor, chroma_idx: Tensor, weights: Tensor) -> Tensor:
+    frame = input_frame.cast(dtypes.float32)
+    wt = weights.cast(dtypes.float32)
+    fx, fy = wt[0] / 255, wt[1] / 255
+    top = frame[luma_idx] * (1 - fx) + frame[luma_idx + 1] * fx
+    bottom = frame[luma_idx + stride] * (1 - fx) + frame[luma_idx + stride + 1] * fx
+    luma = top * (1 - fy) + bottom * fy
+    u, v = frame[chroma_idx] - 128, frame[chroma_idx + 1] - 128
+    # BT.601 limited range, the inverse of camerad's RGB to NV12 (as make_prepare)
+    c = (luma - 16) * 1.164
+    rgb = Tensor.stack(c + 1.596 * v, c - 0.392 * u - 0.813 * v, c + 2.017 * u).div(255).clip(0, 1)
+    return (wt[2] > 0.5).where(rgb, PAD_VALUE / 255).reshape(3, h, w).unsqueeze(0)
+  return prepare
+
+
 def letterbox(cam_w: int, cam_h: int, in_size: tuple[int, int] | None = None) -> Letterbox:
   in_w, in_h = in_size or INPUT_SIZES[(cam_w, cam_h)]
   return Letterbox(cam_w, cam_h, in_w, in_h)
@@ -169,6 +198,26 @@ def detector_pkl_path(cam_w: int, cam_h: int, chestnut: bool, models_dir: Path =
 def far_detector_pkl_path(cam_w: int, cam_h: int, chestnut: bool, models_dir: Path = MODELS_DIR) -> Path:
   """The compiled far crop for a camera size (detector_pkl_path's naming)."""
   return models_dir / f'{"big_" if chestnut else ""}far_detector_{cam_w}x{cam_h}_tinygrad.pkl'
+
+
+def side_detector_pkl_path(cam_w: int, cam_h: int, chestnut: bool, models_dir: Path = MODELS_DIR) -> Path:
+  """The compiled side views for a camera size (detector_pkl_path's naming)."""
+  return models_dir / f'{"big_" if chestnut else ""}side_detector_{cam_w}x{cam_h}_tinygrad.pkl'
+
+
+def make_side_detector(cam_w: int, cam_h: int, model: str = DEFAULT_MODEL, size: tuple[int, int] = SIDE_INPUT_SIZE):
+  """detect(input_frame, luma_idx, chroma_idx, weights) -> (1, 300, 6) Tensor in side view input pixels, conf, COCO class."""
+  from tinygrad import Context
+  from tinygrad.nn.onnx import OnnxRunner
+  prepare = make_prepare_side(cam_w, cam_h, size)
+  runner = OnnxRunner(onnx_path(model))
+  input_name = next(iter(runner.graph_inputs))
+
+  def detect(input_frame, luma_idx, chroma_idx, weights):
+    with Context(SPLIT_REDUCEOP=0):  # the gathers lower to plain indexed loads
+      img = prepare(input_frame, luma_idx, chroma_idx, weights).realize()
+    return next(iter(runner({input_name: img}).values()))
+  return detect
 
 
 def make_far_detector(cam_w: int, cam_h: int, model: str = DEFAULT_MODEL, size: tuple[int, int] = FAR_CROP_SIZE):
