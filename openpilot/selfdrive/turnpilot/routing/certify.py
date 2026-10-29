@@ -105,6 +105,25 @@ def _per_lane(value, role: str, index: int):
   return None
 
 
+def lane_cap(lane: sr.Lane, entry: dict | None) -> tuple[float, str]:
+  """(m along the lane, why) the survey caps a lane at (1.4 rule 6): its approach's sight distance and the first legal
+  parking on its binding curb (module docstring); 0 for a lane whose approach the survey doesn't have."""
+  sv = survey_approach(entry, lane.approach.way_id, (lane.approach.bearing + 180.) % 360.) if entry and lane.approach is not None else None
+  if sv is None:
+    return 0., 'not surveyed'
+  caps = [(float(sv['sightM']), f"sight {float(sv['sightM']):.0f} m")]
+  curb = BINDING_CURB.get(lane.role)
+  if curb is not None:
+    p = float(sv['nearestParkingM'][curb])
+    caps.append((sr.parking_cap(lane.s_min, p), f"parking {p:.1f} m on its {curb} curb"))
+  return min(caps)
+
+
+def lane_need(lane: sr.Lane, edges: sr.Edges, a_launch: float = sr.A_LAUNCH_PLAN) -> float:
+  """m of seen lane it needs: all-way for a stopping approach's, else two-way."""
+  return sr.reach_needed_allway(lane.limit) if lane.stopping else sr.reach_needed_two_way(lane.limit, edges.d_max, a_launch)
+
+
 def pick_stamp(entry: dict, row: str, heading_in: float) -> dict | None:
   """The newest passing stamp for a lighting row, measured from our approach (or any)."""
   fits = [v for v in entry.get('validations') or [] if isinstance(v, dict) and v.get('lighting') == row and v.get('verdict') == 'pass' and
@@ -192,12 +211,9 @@ def assess(junction: sr.Junction, maneuver: str, visibility, surveys, eta: float
   rot = sr.angle_bound(edges.nominal is not None, runtime.yaw_offset_deg)
   out, short = [], []
   for ln in lanes:
-    sv = survey_approach(entry, ln.approach.way_id, (ln.approach.bearing + 180.) % 360.) if ln.approach is not None else None
-    caps = [float(sv['sightM'])] if sv is not None else [0.]
-    curb = BINDING_CURB.get(ln.role)
-    if sv is not None and curb is not None:
-      caps.append(sr.parking_cap(ln.s_min, float(sv['nearestParkingM'][curb])))
-    need = sr.reach_needed_allway(ln.limit) if ln.stopping else sr.reach_needed_two_way(ln.limit, edges.d_max, runtime.a_launch)
+    cap, _ = lane_cap(ln, entry)
+    caps = [cap]
+    need = lane_need(ln, edges, runtime.a_launch)
     reach = float('inf')
     for row, st in stamps.items():
       if runtime.side_views:

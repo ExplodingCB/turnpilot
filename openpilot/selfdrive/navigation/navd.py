@@ -41,17 +41,6 @@ AVOID_TIME_S = 4.0
 AVOID_PARAM = 'TurnPilotAvoidStops'
 
 
-def time_at(steps, route_m: float) -> float:
-  """s along the route steps to route_m (navd's step frame), from their durations, as timeRemaining reckons."""
-  t = acc = 0.
-  for st in steps:
-    dist, dur = float(st.get('distance', 0.)), float(st.get('duration', 0.))
-    if route_m <= acc + dist:
-      return t + dur * max(route_m - acc, 0.) / max(dist, 1.)
-    t, acc = t + dur, acc + dist
-  return t
-
-
 def wall_clock() -> float | None:
   """TurnPilot: Unix time for the sun's position at a control's ETA, or None while the system clock isn't valid yet (before
   GPS time), when the certifier can't place the sun and fails the light check."""
@@ -369,12 +358,12 @@ class RouteEngine:
     now = self.clock()
     if self.avoid_rerun or self.route is None or now is None:
       return
-    t_car = time_at(self.route, car_along)
+    t_car = avoid.time_at(self.route, car_along)
     for c in self.controls:
       window = getattr(c, 'eta_window', None)
       if window is None or c.route_m < car_along:
         continue
-      eta = now + time_at(self.route, c.route_m) - t_car
+      eta = now + avoid.time_at(self.route, c.route_m) - t_car
       if not window[0] <= eta <= window[1]:
         cloudlog.event("navd.stop_eta_drift", control=c.id, eta=round(eta, 1), window=[round(w, 1) for w in window])
         self.avoid_rerun = True

@@ -34,21 +34,42 @@ surveyed_junctions.json other than the shipped one; --overrides a JSON file hold
 road there tiered mapStrong or better): what the map knows filled in (the OSM node, its position, and per approach the
 way, the OSM bearing toward the junction and, as hintTaggedMph, the tagged limit), and every field Kellen measures null,
 so the entry doesn't load until it is filled (STOP_SIGNS.md 4.3, step S2).
+
+SG2 (STOP_SIGNS.md 3.2-3.5): each junction's certification and reason (routing/certify.py, against --visibility, by default
+the shipped file, with --mode and the side views as navd would have them once SG4a publishes them: auto and on by default,
+and the light at the ETA from --eta, by default now); its predicted reach per conflicting lane from PV1's conservative and
+optimistic tables with the survey's caps, at the closest stop point section 1.2 allows and at node - 13 m (candidates for a
+survey: PV1 nominates, validation decides); navd's avoidance loop on the trip (routing/avoid.py) and the time it added; for
+each certified all-way where the route turns, the first stop or yield straight on from it (a missed turn runs straight);
+and the TurnPilotJunctionOverrides entries with their evidence.
+
+  python -m openpilot.tools.turnpilot.route_audit --check-survey FILE      the schema check and each junction's predicted
+                                                                           reach, per arriving approach, with its caps
+  python -m openpilot.tools.turnpilot.route_audit --overrides FILE --list-overrides | --clear APPROACH
+                                                  (--params in place of --overrides on the car: the param itself)
+--clear removes one override after Kellen has looked at its evidence (decision D11); an approach not there is said.
 """
 import argparse
 import json
+import math
 import sys
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
+from openpilot.selfdrive.turnpilot import stop_rules as sr
+from openpilot.selfdrive.turnpilot import visibility_table
 from openpilot.selfdrive.turnpilot.maps import surveys
-from openpilot.selfdrive.turnpilot.routing import junctions, osm_sidecar
-from openpilot.selfdrive.turnpilot.routing.controls import MARKER, cumulative, nearest, route_controls, route_shape
+from openpilot.selfdrive.turnpilot.routing import avoid, certify, junctions, osm_sidecar
+from openpilot.selfdrive.turnpilot.routing.controls import MARKER, controls_ahead, cumulative, nearest, route_controls, route_shape
 
 RAW_M = 5.           # m from the route an OSM stop or give_way node is listed within
 M_PER_DEG = 111195.
 MPH = 0.44704
 CANDIDATE_TIERS = ('mapStrong', 'surveyed')  # a junction whose every other inbound road is one of these is a survey candidate
+DEFAULT_SETBACK_M = 1.9  # m, the camera setback STOP_SIGNS.md's tables use until step S1 measures it
+NODE_13_M = 13.          # m, the default stop point on a 2-lane cross road, where predicted reach is also given
+CHECK_MANEUVER = 'straight'  # --check-survey's lanes: both cross lanes and the opposing approach
 
 
 @dataclass
@@ -97,6 +118,10 @@ class JunctionRow:
   plausible: bool      # the plausibility gate (STOP_SIGNS.md 4.2)
   survey: str          # 'none', 'matched, counts' or "matched, doesn't count: <why>"
   legs: list[dict] = field(default_factory=list)  # per road: role, bearing, rel, class, use, in/out, lanes, controls, tier, limits, way
+  certification: str = 'unchecked'  # routing/certify.py (SG2)
+  cert_reason: str = 'none'
+  cert_detail: str = ''
+  predicted: list[dict] = field(default_factory=list)  # per stop point, bound and conflicting lane: reach, need, cap (PV1)
 
 
 @dataclass
@@ -108,6 +133,12 @@ class Report:
   route_m: float = 0.
   signs: list[Sign] = field(default_factory=list)  # OSM stop and give_way nodes near the route that no row covers
   junctions: list[JunctionRow] = field(default_factory=list)  # each stop and yield's junction
+  overrides: dict = field(default_factory=dict)  # TurnPilotJunctionOverrides: approach -> {kind, evidence}
+  continuations: list[dict] = field(default_factory=list)  # straight on from each certified all-way where the route turns
+  visibility: object = None
+  runtime: object = None
+  eta: float | None = None
+  entries: list = field(default_factory=list)
 
 
 def junction_row(c) -> JunctionRow:
@@ -120,6 +151,50 @@ def junction_row(c) -> JunctionRow:
   return JunctionRow(round(c.route_m, 1), c.kind, j.osm_node_id, round(j.lat, 7), round(j.lon, 7), j.status, j.maneuver,
                      round(j.turn_angle, 1), j.stop_point_source, round(j.stop_point_distance, 1), j.sidecar, j.suspected, j.divided,
                      j.roundabout, round(j.rail_distance, 1), j.plausible, survey, legs)
+
+
+def predicted_reach(j: sr.Junction, maneuver: str, visibility, entry: dict | None) -> list[dict]:
+  """Each conflicting lane's predicted reach from PV1 (the provisional tables, read as candidates) and the survey's caps,
+  conservative and optimistic, at the closest stop point section 1.2 allows (the surveyed edge + 5.8 m, else the default
+  rule) and at node - 13 m, with the setback S1 measured or DEFAULT_SETBACK_M (STOP_SIGNS.md 2.8)."""
+  setback = visibility.setback if visibility is not None and visibility.setback is not None else DEFAULT_SETBACK_M
+  ours = junctions.survey_approach(entry, j.our_way, j.heading_in) if entry else None
+  lane_edge = ours.get('laneEdgeM') if ours else None
+  n = certify.cross_lanes(j)
+  if lane_edge is not None:
+    closest = lane_edge + surveys.STOP_CLEAR_M + surveys.POS_ERR_M + surveys.SURVEY_ERR_M
+  else:
+    closest = max(11., (n or sr.DEFAULT_CROSS_LANES) * sr.LANE_W_MAX / 2. + sr.SHOULDER_M + sr.NODE_ERR_M + sr.POS_ERR_M + surveys.STOP_CLEAR_M)
+  rot = sr.angle_bound(lane_edge is not None)
+  out = []
+  for stop_m in sorted({round(closest, 1), NODE_13_M}):
+    edges = sr.edge_band(stop_m, n, lane_edge)
+    lanes = sr.conflict_lanes(j, maneuver, edges, float(setback))
+    for bound in ('conservative', 'optimistic'):
+      views = visibility.views('day', bound, candidates=True) if visibility is not None else {}
+      sight = visibility.sight(views) if visibility is not None else sr.Sight({'left': visibility_table.DEFAULT_EDGE_DEG,
+                                                                               'right': visibility_table.DEFAULT_EDGE_DEG}, views)
+      for ln in lanes:
+        cap, why = certify.lane_cap(ln, entry) if entry else (None, 'no survey')
+        reach = sr.reach_walk(ln, sight, rot, cap_m=cap)
+        out.append({'stop_m': stop_m, 'bound': bound, 'role': ln.role, 'index': ln.index, 'movement': ln.movement,
+                    'reach': round(reach, 1), 'need': round(certify.lane_need(ln, edges), 1), 'cap': why,
+                    'capped': cap is not None and reach + sr.WALK_STEP_M >= cap})
+  return out
+
+
+def predicted_lines(predicted: list[dict], indent: str = '    ') -> list[str]:
+  out = []
+  for stop_m in sorted({p['stop_m'] for p in predicted}):
+    out.append(f"{indent}predicted reach (PV1) with the stop point at node - {stop_m:.1f} m:")
+    rows = [p for p in predicted if p['stop_m'] == stop_m]
+    for key in dict.fromkeys((p['role'], p['index'], p['movement']) for p in rows):
+      cons = next(p for p in rows if (p['role'], p['index'], p['movement']) == key and p['bound'] == 'conservative')
+      opt = next(p for p in rows if (p['role'], p['index'], p['movement']) == key and p['bound'] == 'optimistic')
+      capped = f", capped by {cons['cap']}" if cons['capped'] or opt['capped'] else f" ({cons['cap']})"
+      out.append(f"{indent}  {key[0]} lane {key[1]} {key[2]}: {cons['reach']:.1f} m conservative, {opt['reach']:.1f} m optimistic, " +
+                 f"of {cons['need']:.1f} m needed{capped}")
+  return out
 
 
 def survey_template(report: Report) -> list[dict]:
@@ -141,11 +216,21 @@ def survey_template(report: Report) -> list[dict]:
   return out
 
 
-def audit(call, steps, tiles_dir, sidecar_dir, context: junctions.Context | None = None) -> Report:
+def audit(call, steps, tiles_dir, sidecar_dir, context: junctions.Context | None = None, visibility=None, runtime=None,
+          eta: float | None = None) -> Report:
   """The rows for a route's steps, through call (routing/controls.py's actor_call or http_call); context: the surveys and
-  overrides the junctions are read against (none by default)."""
+  overrides the junctions are read against (none by default); visibility (the shipped file by default), runtime (auto, the
+  side views on) and eta (Unix time at the route's start, now by default): what each junction is certified against."""
   edges: list[dict] = []
   controls, status = route_controls(call, steps, tiles_dir, sidecar_dir, audit=edges, context=context)
+  if visibility is None:
+    try:
+      visibility = visibility_table.load(visibility_table.SHIPPED)
+    except visibility_table.VisibilityError:
+      visibility = None
+  runtime = runtime if runtime is not None else certify.Runtime(mode='auto', side_views=True)
+  eta = eta if eta is not None else datetime.now(UTC).timestamp()
+  entries = list(context.surveys) if context is not None else []
   side = osm_sidecar.load(sidecar_dir, route_shape(steps)) if sidecar_dir is not None else None
   checked = side is not None and side.status == 'ok'
   by_edge = {c.edge: c for c in controls}
@@ -162,8 +247,62 @@ def audit(call, steps, tiles_dir, sidecar_dir, context: junctions.Context | None
                     f"{c.kind} at {c.route_m:.0f} m" if c is not None else '-', e['anchor'] if e['internal'] else -1, sign_m))
   detail = 'none expected' if side is None else side.status + (f" ({side.detail})" if side.detail else '')
   total = sum(float(s.get('distance', 0.)) for s in steps)
-  return Report(status, detail, rows, controls, total, uncovered(side, route_shape(steps), edges) if checked else [],
-                [junction_row(c) for c in controls if c.junction_info is not None])
+  rows_j = []
+  for c in controls:
+    if c.junction_info is None:
+      continue
+    row = junction_row(c)
+    j = sr.junction_from_control(c)
+    v = certify.assess(j, j.maneuver, visibility, entries, eta + avoid.time_at(steps, c.route_m), runtime)
+    c.junction_info.certification, c.junction_info.cert_reason, c.junction_info.cert_detail = v.certification, v.reason, v.detail
+    c.certification, c.cert_reason = v.certification, v.reason
+    row.certification, row.cert_reason, row.cert_detail = v.certification, v.reason, v.detail
+    entry = surveys.match(entries, j.osm_node_id, (j.lat, j.lon))
+    row.predicted = predicted_reach(j, j.maneuver, visibility, entry)
+    rows_j.append(row)
+  return Report(status, detail, rows, controls, total, uncovered(side, route_shape(steps), edges) if checked else [], rows_j,
+                dict(context.overrides) if context is not None else {}, [], visibility, runtime, eta, entries)
+
+
+def audit_avoidance(report: Report, steps, reroute, route_controls, eta: float | None = None, headings=None) -> avoid.AvoidResult:
+  """navd's avoidance loop (routing/avoid.py) on the report's route, certified as the report was; reroute(exclude) -> steps."""
+  eta = report.eta if eta is None else eta
+
+  def certify_one(c, on_steps):
+    return certify.certify_control(c, report.visibility, report.entries, eta + avoid.time_at(on_steps, c.route_m), report.runtime)
+  return avoid.run(steps, list(report.controls), report.status, avoid.AvoidSet(), certify=certify_one, reroute=reroute,
+                   route_controls=route_controls, own_edge=lambda: None, cancelled=lambda: False, deadline=math.inf,
+                   headings=headings or (lambda points: [None for _ in points]))
+
+
+def avoidance_lines(result: avoid.AvoidResult) -> list[str]:
+  n = result.avoided
+  out = [f"avoidance: {result.status}, {n} stop{'' if n == 1 else 's'} routed around in {result.iterations} reroutes, " +
+         f"{result.added_s:+.0f} s on the route"]
+  left = [c for c in avoid.stops(result.controls) if c.certification == 'unavoidable']
+  if left:
+    out.append(f"  {len(left)} left on the route need the driver: " + ', '.join(f"{c.kind} at {c.route_m:.0f} m" for c in left))
+  return out
+
+
+def continuations(controls, lookahead, certify) -> list[dict]:
+  """For each certified all-way where the route turns, the first stop or yield straight on from its node (a missed turn
+  runs straight, N12): lookahead(position (lat, lon), heading) -> (controls, status, road) as navd's lookup ahead;
+  certify(control) -> (certification, reason), for the union of maneuvers."""
+  out = []
+  for c in controls:
+    j = c.junction_info
+    if j is None or j.certification != 'certifiable' or j.maneuver not in ('left', 'right'):
+      continue
+    ahead, _, _ = lookahead((j.lat, j.lon), j.heading_in)
+    nxt = next((x for x in sorted(ahead, key=lambda x: x.route_m) if x.kind in ('stop', 'yield')), None)
+    row = {'control': c.id, 'route_m': round(c.route_m, 1), 'maneuver': j.maneuver, 'next': 'none', 'next_m': None,
+           'certification': 'none', 'reason': 'none'}
+    if nxt is not None:
+      cert, reason = certify(nxt)
+      row |= {'next': nxt.kind, 'next_m': round(nxt.route_m, 1), 'certification': cert, 'reason': reason}
+    out.append(row)
+  return out
 
 
 def signs_of(side) -> list[tuple[int, str, tuple[float, float], str, set[str], str]]:
@@ -248,12 +387,27 @@ def lines(report: Report) -> list[str]:
       limit = f"{a['assumed_mph']:.0f} mph ({a['speed_source']})"
       out.append(f"    {a['role']:<9} {a['bearing']:>7.0f} {a['rel']:>+5.0f}  {a['class']:<13} {a['use']:<12} {way:<7} " +
                  f"{a['lanes_in']}/{a['lanes_out']:<4} {a['valhalla']:<9} {a['osm_stop']:<9} {a['tier']:<10} {limit:<24} {a['way_id'] or '-'}")
+    out.append(f"    certification: {j.certification} ({j.cert_reason})" + (f": {j.cert_detail}" if j.cert_detail else ''))
+    out += predicted_lines(j.predicted)
+  for r in report.continuations:
+    nxt = 'nothing within the lookup' if r['next'] == 'none' else \
+      f"{r['next']} {r['next_m']:.0f} m on, {r['certification']} ({r['reason']})"
+    out.append(f"straight on from the certified all-way at {r['route_m']:.0f} m (the route turns {r['maneuver']}): {nxt}")
+  out += override_lines(report.overrides)
+  return out
+
+
+def override_lines(overrides: dict) -> list[str]:
+  out = [f"TurnPilotJunctionOverrides: {len(overrides)}"]
+  for key, o in overrides.items():
+    out.append(f"  {key} {o['kind']}: evidence {o.get('evidence')!r}  (route_audit --clear {key} once looked at)")
   return out
 
 
 def as_json(report: Report) -> dict:
   return {'status': report.status, 'sidecar': report.sidecar, 'route_m': report.route_m, 'rows': [asdict(r) for r in report.rows],
           'signs': [asdict(g) for g in report.signs], 'junctions': [asdict(j) for j in report.junctions],
+          'continuations': report.continuations, 'overrides': report.overrides,
           'controls': [{'kind': c.kind, 'route_m': round(c.route_m, 1), 'line_source': c.line_source, 'osm_node': c.osm_node,
                         'osm_sign_m': None if c.osm_sign_m is None else round(c.osm_sign_m, 1), 'junction_status': c.junction_status}
                        for c in report.controls]}
@@ -264,23 +418,120 @@ def point(text: str) -> tuple[float, float]:
   return lat, lon
 
 
+def survey_junction(entry: dict, ours: dict) -> sr.Junction:
+  """A surveyed junction as the certifier sees it from one arriving approach (ours): the other approaches by their
+  bearings, one lane each (a survey has no lane counts), stopping as surveyed, at their posted limit (D8's 30 mph if none)."""
+  heading = float(ours['bearingDeg'])
+  approaches = []
+  for a in entry['approaches']:
+    if a is ours:
+      continue
+    leg = (float(a['bearingDeg']) + 180.) % 360.
+    rel = junctions.rel(leg, heading)
+    mph = a['postedMph'] if a['postedMph'] is not None else sr.class_limit_mph('residential')
+    approaches.append(sr.Approach(leg, rel, junctions.role_of(rel), 'residential', 'road', True, True, 1, 1, 'stop' if a['stops'] else 'none',
+                                  'surveyed' if a['stops'] else 'no', mph * sr.MPH, int(a['wayId'])))
+  return sr.Junction(osm_node_id=int(entry['osmNodeId']), lat=float(entry['lat']), lon=float(entry['lon']), heading_in=heading,
+                     maneuver=CHECK_MANEUVER, rail_distance=-1., surveyed=True, our_way=int(ours['wayId']), approaches=approaches)
+
+
+def check_survey(path: Path, visibility=None) -> int:
+  """--check-survey: 0 when every entry loads, else 1; prints each loaded junction's predicted reach per arriving approach."""
+  loaded = surveys.load(path)
+  for e in loaded.errors:
+    print(f"error: {e}")
+  print(f"{path}: {'schema ok' if not loaded.errors else 'errors above'}, {len(loaded.entries)} junctions load")
+  for entry in loaded.entries:
+    print(f"junction {entry['osmNodeId']} ({entry['lat']:.6f}, {entry['lon']:.6f}), surveyed {entry['date']} ({entry['source']}):")
+    for ours in entry['approaches']:
+      j = survey_junction(entry, ours)
+      limits = sorted({round(a.assumed_limit / sr.MPH) for a in j.approaches if a.tier == 'surveyed'})
+      print(f"  arriving heading {ours['bearingDeg']:.0f} (way {ours['wayId']}), cross traffic at {', '.join(f'{m} mph' for m in limits) or '-'}" +
+            (f", its stopPointM {ours['stopPointM']:.1f} m" if ours.get('stopPointM') is not None else ''))
+      for line in predicted_lines(predicted_reach(j, CHECK_MANEUVER, visibility, entry), '    '):
+        print(line)
+  return 1 if loaded.errors else 0
+
+
+def clear_override_file(path: Path, key: str) -> bool:
+  """Remove approach key from a file holding a TurnPilotJunctionOverrides value; False (nothing written) if not there."""
+  items = json.loads(Path(path).read_text() or '[]')
+  kept = [o for o in items if o.get('approach') != key]
+  if len(kept) == len(items):
+    return False
+  Path(path).write_text(json.dumps(kept))
+  return True
+
+
+def clear_override_param(params, key: str) -> bool:
+  """The same on the car's TurnPilotJunctionOverrides param (a STRING key navd parses, json.dumps of the list)."""
+  raw = params.get(junctions.OVERRIDES_PARAM)
+  items = json.loads(raw.decode() if isinstance(raw, bytes) else raw or '[]')
+  kept = [o for o in items if o.get('approach') != key]
+  if len(kept) == len(items):
+    return False
+  params.put(junctions.OVERRIDES_PARAM, json.dumps(kept))
+  return True
+
+
 def main(argv=None):
   from openpilot.selfdrive.turnpilot.routing.valhalla_source import ValhallaSource
   ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-  ap.add_argument('origin', type=point, help='lat,lon')
-  ap.add_argument('destination', type=point, help='lat,lon')
-  ap.add_argument('--tiles', required=True, help="what TurnPilotValhallaTiles takes: the tiles' directory, tiles.tar or valhalla.json")
+  ap.add_argument('origin', type=point, nargs='?', help='lat,lon')
+  ap.add_argument('destination', type=point, nargs='?', help='lat,lon')
+  ap.add_argument('--tiles', help="what TurnPilotValhallaTiles takes: the tiles' directory, tiles.tar or valhalla.json")
   ap.add_argument('--sidecar', help="the directory with osm_controls/ and the tiles' stamp (default: the tiles' own)")
   ap.add_argument('--json', action='store_true')
   ap.add_argument('--surveys', help='a surveyed_junctions.json (default: the shipped one)')
   ap.add_argument('--overrides', help="a JSON file holding a TurnPilotJunctionOverrides value (default: none)")
+  ap.add_argument('--params', action='store_true', help="read (and --clear) the car's TurnPilotJunctionOverrides param itself")
   ap.add_argument('--survey-template', action='store_true', help='print survey entries for the candidate all-ways instead')
+  ap.add_argument('--check-survey', metavar='FILE', help='check a surveyed_junctions.json and print its predicted reach')
+  ap.add_argument('--list-overrides', action='store_true', help='print the overrides with their evidence')
+  ap.add_argument('--clear', metavar='APPROACH', help="remove one override (<OSM node>:<way>:<f|b>) after looking at its evidence")
+  ap.add_argument('--visibility', help='a visibility.json (default: the shipped one)')
+  ap.add_argument('--mode', default='auto', choices=certify.MODES, help='TurnPilotStopSignGo to certify for (default auto)')
+  ap.add_argument('--no-side-views', action='store_true', help='certify as with the side views off')
+  ap.add_argument('--eta', help="the route's start, ISO time with its zone (default now)")
   args = ap.parse_args(argv)
+  visibility = visibility_table.load(Path(args.visibility)) if args.visibility else None
+  if args.check_survey:
+    return check_survey(Path(args.check_survey), visibility or visibility_table.load(visibility_table.SHIPPED))
+  if args.clear:
+    if args.params:
+      from openpilot.common.params import Params
+      done, where = clear_override_param(Params(), args.clear), 'the TurnPilotJunctionOverrides param'
+    elif args.overrides:
+      done, where = clear_override_file(Path(args.overrides), args.clear), args.overrides
+    else:
+      ap.error('--clear needs --overrides FILE or --params')
+    if not done:
+      print(f"{args.clear} is not in {where}: nothing cleared", file=sys.stderr)
+      return 1
+    print(f"cleared {args.clear} from {where}")
+    return 0
+  if args.list_overrides:
+    if args.params:
+      from openpilot.common.params import Params
+      overrides, ok, why = junctions.read_overrides(Params())
+    else:
+      overrides, ok, why = junctions.read_overrides(type('File', (), {'get': staticmethod(lambda key: Path(args.overrides).read_text())})())
+    if not ok:
+      print(f"overrides: {why}", file=sys.stderr)
+      return 1
+    print('\n'.join(override_lines(overrides)))
+    return 0
+  if args.origin is None or args.destination is None or not args.tiles:
+    ap.error('a route needs ORIGIN, DESTINATION and --tiles')
   loaded = surveys.load(Path(args.surveys) if args.surveys else surveys.SHIPPED)
   for e in loaded.errors:
     print(f"surveys: {e}", file=sys.stderr)
-  overrides, ok, why = ({}, True, '') if not args.overrides else \
-    junctions.read_overrides(type('File', (), {'get': staticmethod(lambda key: Path(args.overrides).read_text())})())
+  if args.params:
+    from openpilot.common.params import Params
+    overrides, ok, why = junctions.read_overrides(Params())
+  else:
+    overrides, ok, why = ({}, True, '') if not args.overrides else \
+      junctions.read_overrides(type('File', (), {'get': staticmethod(lambda key: Path(args.overrides).read_text())})())
   if not ok:
     print(f"overrides: {why}", file=sys.stderr)
   context = junctions.Context(loaded.entries, overrides, ok, why)
@@ -297,12 +548,31 @@ def main(argv=None):
   steps = source.route((olon, olat), (dlon, dlat), None, None)
   if not steps:
     raise SystemExit("no route between them on these tiles")
-  report = audit(source._call(), steps, tiles_dir, sidecar_dir, context)
+  eta = datetime.fromisoformat(args.eta).timestamp() if args.eta else None
+  call = source._call()
+  report = audit(call, steps, tiles_dir, sidecar_dir, context, visibility,
+                 certify.Runtime(mode=args.mode, side_views=not args.no_side_views), eta)
   if args.survey_template:
     print(json.dumps(survey_template(report), indent=1))
+    return 0
+
+  def lookahead(position, heading):
+    return controls_ahead(call, position, heading, tiles_dir, sidecar_dir, context=context)
+
+  def certify_ahead(c):
+    j = sr.junction_from_control(c)
+    return certify.certify(j, 'unknown', report.visibility, report.entries, report.eta, report.runtime)
+  report.continuations = continuations(report.controls, lookahead, certify_ahead)
+  result = audit_avoidance(report, steps, lambda exclude: source.route((olon, olat), (dlon, dlat), None, None, exclude=exclude),
+                           lambda s: route_controls(call, s, tiles_dir, sidecar_dir, context=context), headings=source.exclusion_headings)
+  if args.json:
+    doc = as_json(report)
+    doc['avoidance'] = {'status': result.status, 'avoided': result.avoided, 'iterations': result.iterations, 'added_s': round(result.added_s, 1)}
+    print(json.dumps(doc, indent=1))
   else:
-    print(json.dumps(as_json(report), indent=1) if args.json else '\n'.join(lines(report)))
+    print('\n'.join(lines(report) + avoidance_lines(result)))
+  return 0
 
 
 if __name__ == '__main__':
-  main()
+  sys.exit(main())

@@ -93,6 +93,17 @@ class AvoidResult:
   sent: set = field(default_factory=set)
 
 
+def time_at(steps, route_m: float) -> float:
+  """s along the route steps to route_m (navd's step frame), from their durations, as navd reckons timeRemaining."""
+  t = acc = 0.
+  for st in steps:
+    dist, dur = float(st.get('distance', 0.)), float(st.get('duration', 0.))
+    if route_m <= acc + dist:
+      return t + dur * max(route_m - acc, 0.) / max(dist, 1.)
+    t, acc = t + dur, acc + dist
+  return t
+
+
 def duration(steps) -> float:
   return float(sum(float(s.get('duration', 0.)) for s in steps or []))
 
