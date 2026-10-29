@@ -508,35 +508,52 @@ def reach_walk(lane: Lane, sight: Sight, rotation_deg: float, validated_m: float
   from its origin (a validation stamp) in place of the views' range bound only: some running, fresh view must still cover
   each point's bearing, the inner band by its rule (1.4 rules 1 and 3a hold at a validated junction too). cap_m bounds the
   distance along the lane as well (survey sight distance, parking)."""
-  d = lane.conflict_m
+  return reach_walk_why(lane, sight, rotation_deg, validated_m, cap_m, step, max_m)[0]
+
+
+def reach_walk_why(lane: Lane, sight: Sight, rotation_deg: float, validated_m: float | None = None, cap_m: float | None = None,
+                   step: float = WALK_STEP_M, max_m: float = WALK_MAX_M) -> tuple[float, str]:
+  """reach_walk's reach and what ended it (the lane's binding limit, SG3b's visibility log): 'frameEdge', 'zero' (or the
+  string sight.zero returned: a sector that wasn't ok, the sun), 'mask', 'noView' (no running, fresh view covers the
+  bearing, the inner band by its rule), 'range' (the views' range bound), 'validated', 'cap', 'occluder' or 'max'."""
+  d, why = lane.conflict_m, 'max'
   while d < max_m:
     nd = d + step
     x, y = lane.point(nd, 'min')
     side = 'left' if y < 0. else 'right'
     bearing = math.degrees(math.atan2(abs(y), x)) + rotation_deg
     if bearing > sight.edge_deg.get(side, 0.) - EDGE_MARGIN_DEG:
+      why = 'frameEdge'
       break
-    if sight.zero is not None and sight.zero(side, bearing):
+    zero = sight.zero(side, bearing) if sight.zero is not None else False
+    if zero:
+      why = zero if isinstance(zero, str) else 'zero'
       break
     xm, ym = lane.point(nd, 'max')
     rng = math.hypot(xm, ym)
     if sight.mask is not None and not sight.mask(side, bearing, rng):
+      why = 'mask'
       break
     limit = range_limit(sight, side, bearing)
     if limit <= 0.:
+      why = 'noView'
       break  # no running, fresh view covers the bearing (the inner band by its rule), validated or not
     if validated_m is not None:
       if nd > validated_m + 1e-9:
+        why = 'validated'
         break
     elif rng > limit + 1e-9:
+      why = 'range'
       break
     if cap_m is not None and nd > cap_m + 1e-9:
+      why = 'cap'
       break
     if any(o.side == side and o.lo_deg <= bearing <= o.hi_deg and (o.range_m is None or o.range_m < math.hypot(x, y))
            for o in sight.occluders):
+      why = 'occluder'
       break
     d = nd
-  return max(d - lane.conflict_m, 0.)
+  return max(d - lane.conflict_m, 0.), why
 
 
 def footprint_ok(mask: dict | None, side: str, bearing: float, rng: float, height_m: float) -> bool:
