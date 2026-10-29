@@ -15,6 +15,13 @@ says which bearings it covered at the horizon (cover_deg). A far box matching a 
 farHits) and does nothing else: it never starts a track, never counts as a hit (TrackedObject.age, which a hard stop's
 confirmation reads: scene_policy), never moves the filter, never keeps a track alive, never makes the scene fresh. So the
 full pass alone feeds every stop, as before the far crop.
+
+The stop sweep's runs (STOP_SIGNS.md 1.3, SG3b) say their view too: a side view's boxes (sideLeft, sideRight) are in the wide
+camera's fisheye pixels, so they range, bear and match as the wide camera's. The latest RawFrame of each view is kept in
+raw_by_view (view_key: road, full, sideLeft, sideRight, far), a track says the view and camera time of its last match
+(TrackedObject.view, tSeen), and turnpilotd hands every run it drains to update_runs, which takes them in camera-time
+order. A track coasts MAX_COAST_S after its last match, SWEEP_COAST_S while a stop sweep runs (coast_s, set by turnpilotd):
+two missed passes of a 5 Hz view.
 """
 import time
 from dataclasses import dataclass, field
@@ -45,6 +52,7 @@ GROUND_GATE_M = 2.0      # third pass: max distance between predicted and measur
 GROUND_GATE_FRAC = 0.15  # plus this fraction of the range
 MIN_HITS = 2             # a track is published after this many matched detections
 MAX_COAST_S = 0.5        # and for this long after its last match;
+SWEEP_COAST_S = 0.65     # (while a stop sweep runs: two missed passes of a 5 Hz side view, 0.6 s between its hits)
 MAX_AGE_S = 1.5          # it's dropped after this
 MAX_TRACKS = 3 * MAX_DETECTIONS // 2  # a full message's worth and then some coasting; past it, the soonest to expire go
 # a pedestrian in the path this close can drop out of view (feet below the frame, or YOLO loses a person filling the
@@ -114,7 +122,7 @@ class RawBox:
   xy: tuple | None         # ground point (x forward, y left), not capped at ranging.MAX_RANGE; None unranged
   near_m: float | None     # nearest plausible range (the box bottom NEAR_PX lower), None unranged
   box: tuple = ()          # x0, y0, x1, y1 normalized in its camera's frame
-  view: str = 'full'       # 'full', or 'far' for the far crop's (camera 'road')
+  view: str = 'full'       # 'full', 'far' for the far crop's (camera 'road'), 'sideLeft' or 'sideRight' (camera 'wide')
 
 
 @dataclass
@@ -122,8 +130,16 @@ class RawFrame:
   boxes: list              # [RawBox]: every detection of a road user in one detector run
   camera: str
   t: float                 # the run's camera time, s
-  view: str = 'full'       # 'far': a far crop run (update_far)
+  view: str = 'full'       # 'far': a far crop run (update_far); 'sideLeft', 'sideRight': a stop sweep's side view
   cover_deg: tuple | None = None  # a far run's (right, left) bearings at the horizon; None if the horizon isn't inside it
+
+
+def view_key(camera: str, view: str) -> str:
+  """raw_by_view's key for a run: the full pass on the road camera is 'road', on the wide camera 'full'; a far crop or a
+  side view is its view."""
+  if view == 'full':
+    return 'road' if camera == 'road' else 'full'
+  return view
 
 
 def ground_xy(lens: Lens, rot: np.ndarray, height: float, u: float, v: float) -> tuple[float, float] | None:
@@ -165,7 +181,7 @@ class Track:
   P: np.ndarray | None = None
   in_path: bool = False
   far_hits: int = 0            # far crop boxes matching it (update_far): never in hits
-  view: str = 'full'           # the pass of its last match
+  view: str = 'full'           # the pass of its last match: full, far, sideLeft, sideRight
 
   @property
   def cls(self) -> int:
@@ -225,6 +241,9 @@ class SceneTracker:
     self.raw_far: RawFrame | None = None  # the latest far crop run's boxes (update_far)
     self.raw_far_new = False              # ...which arrived in the last update_far()
     self.far_key: tuple | None = None
+    self.raw_by_view: dict[str, RawFrame] = {}  # the latest run of each view (view_key)
+    self.new_views: set[str] = set()            # ...the views a run of which arrived in the last update_runs()
+    self.coast_s = MAX_COAST_S                  # SWEEP_COAST_S while a stop sweep runs (turnpilotd)
 
   def measure(self, det, camera: str, calibration) -> Measurement:
     box = np.array([det.x0, det.y0, det.x1, det.y1], dtype=np.float64)
@@ -283,13 +302,13 @@ class SceneTracker:
     trk.P[:2, :2] = m.R
     trk.P[2, 2] = trk.P[3, 3] = VEL_STD0 ** 2
 
-  def correct(self, trk: Track, m: Measurement, camera: str, t: float) -> None:
+  def correct(self, trk: Track, m: Measurement, camera: str, t: float, view: str = 'full') -> None:
     dt = t - trk.t_seen
     trk.box_vel = 0.5 * trk.box_vel + 0.5 * (m.box - trk.box_seen) / dt if trk.camera == camera and dt > 1e-3 else np.zeros(4)
     trk.box, trk.box_seen, trk.camera, trk.t_seen, trk.conf = m.box, m.box, camera, t, m.conf
     trk.class_votes[m.cls] = trk.class_votes.get(m.cls, 0.0) + m.conf
     trk.hits += 1
-    trk.view = 'full'
+    trk.view = view
     if m.xy is None:
       return
     if trk.x is None or trk.P is None:
@@ -347,26 +366,31 @@ class SceneTracker:
     now: the caller's clock in s, for staleness (default time.monotonic()). yaw_rate: rad/s, left positive (default
     default_yaw_rate()). Returns the tracks to publish."""
     now = time.monotonic() if now is None else now
-    key = (str(detections.camera), detections.frameId, detections.timestampEof) if detections is not None else None
+    view = str(detections.view) if detections is not None else 'full'
+    key = (str(detections.camera), view, detections.frameId, detections.timestampEof) if detections is not None else None
     self.raw_new = False
     if key is not None and key != self.last_key and detections.timestampEof > 0:
       self.last_key, self.last_recv = key, now
       t = detections.timestampEof * 1e-9
+      camera = 'wide' if str(detections.camera) == 'wide' else 'road'
+      vkey = view_key(camera, view)
       try:
-        self.raw, self.raw_new = self.raw_frame(detections, 'wide' if str(detections.camera) == 'wide' else 'road', calibration, t), True
+        self.raw, self.raw_new = self.raw_frame(detections, camera, calibration, t, view), True
+        self.raw_by_view[vkey] = self.raw
       except Exception:
         cloudlog.exception("turnpilot tracker: raw boxes failed")  # the left then has no fresh road run: never clear
         self.raw = None
+        self.raw_by_view.pop(vkey, None)
+      self.new_views.add(vkey)
       v_ego = float(car_state.vEgo) if car_state is not None else 0.0
       if yaw_rate is None:
         yaw_rate = default_yaw_rate(car_state, model_v2)
-      camera = 'wide' if str(detections.camera) == 'wide' else 'road'
       for trk in self.tracks:
         self.predict(trk, t, v_ego, yaw_rate)
       meas = [m for m in (self.measure(d, camera, calibration) for d in detections.detections if int(d.cls) in OBJECT_CLASS) if m.plausible]
       pairs, unmatched = self.associate(meas, camera)
       for i, j in pairs:
-        self.correct(self.tracks[i], meas[j], camera, t)
+        self.correct(self.tracks[i], meas[j], camera, t, view)
       for j in unmatched:
         if meas[j].conf >= NEW_TRACK_CONF and meas[j].xy is not None:
           self.new_track(meas[j], camera, t)
@@ -377,6 +401,30 @@ class SceneTracker:
       self.update_in_path(model_v2)
     self.available = self.last_recv is not None and now - self.last_recv <= STALE_S
     return self.published()
+
+  def update_runs(self, runs, calibration, car_state, model_v2=None, now: float | None = None,
+                  yaw_rate: float | None = None) -> list[Track]:
+    """Every detector run turnpilotd drained this tick (TurnpilotDetections readers, valid ones only), taken in camera-time
+    order (module docstring): raw is the newest, raw_new whether any came, new_views the views that did. A run older than the
+    newest already taken is dropped, logged: the filter only moves forward. No runs: staleness still ticks (update(None))."""
+    self.new_views = set()
+    newest = self.last_t
+    taken = []
+    for d in sorted(runs, key=lambda d: d.timestampEof):
+      t = d.timestampEof * 1e-9
+      if newest is not None and t < newest:
+        cloudlog.event("turnpilot.tracker_run_out_of_order", view=str(d.view), camera=str(d.camera), t=t, newest=newest)
+        continue
+      newest = t
+      taken.append(d)
+    if not taken:
+      return self.update(None, calibration, car_state, model_v2, now, yaw_rate)
+    tracks, any_new = [], False
+    for d in taken:
+      tracks = self.update(d, calibration, car_state, model_v2, now, yaw_rate)
+      any_new = any_new or self.raw_new
+    self.raw_new = any_new
+    return tracks
 
   def update_far(self, far, calibration, now: float | None = None) -> None:
     """far: the latest TurnpilotFarDetections (None before the first). A new run comes out as raw_far (raw_far_new), and
@@ -391,9 +439,11 @@ class SceneTracker:
     t = run.timestampEof * 1e-9
     try:
       self.raw_far, self.raw_far_new = self.raw_frame(run, 'road', calibration, t, 'far', tuple(far.crop)), True
+      self.raw_by_view['far'] = self.raw_far
     except Exception:
       cloudlog.exception("turnpilot tracker: far boxes failed")  # the left then has no fresh far run: never clear
       self.raw_far = None
+      self.raw_by_view.pop('far', None)
       return
     self.tag_far(run, t)
 
@@ -451,11 +501,11 @@ class SceneTracker:
       trk.in_path = bool(trk.x is not None and 0 < trk.x[0] <= PATH_X and
                          abs(trk.x[1] - np.interp(trk.x[0], path_x, path_y)) <= CORRIDOR_HALF_WIDTH)
 
-  @staticmethod
-  def hold_s(trk: Track) -> float:
-    """How long a track is kept after its last match: longer for a pedestrian close in the path who was matched enough times."""
+  def hold_s(self, trk: Track) -> float:
+    """How long a track is kept after its last match: longer for a pedestrian close in the path who was matched enough
+    times; coast_s otherwise (MAX_COAST_S, SWEEP_COAST_S while a stop sweep runs)."""
     close = trk.cls == PERSON and trk.in_path and trk.x is not None and trk.x[0] < CLOSE_HOLD_M and trk.hits >= CLOSE_HOLD_MIN_HITS
-    return CLOSE_HOLD_S if close else MAX_COAST_S
+    return CLOSE_HOLD_S if close else self.coast_s
 
   def published(self) -> list[Track]:
     if self.last_t is None:
@@ -477,5 +527,6 @@ class SceneTracker:
       o.age = trk.hits
       o.inPath = trk.in_path
       o.camera = Camera.wide if trk.camera == 'wide' else Camera.road
-      o.view, o.farHits = View.far if trk.view == 'far' else View.full, trk.far_hits
+      o.view, o.farHits = getattr(View, trk.view, View.full), trk.far_hits
+      o.tSeen = float(trk.t_seen)
       o.box = [float(np.clip(v / s, 0, 1)) for v, s in zip(trk.box_seen, (w, h, w, h), strict=True)]

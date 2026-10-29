@@ -441,6 +441,9 @@ struct TurnpilotScene @0xf35cc4560bbf6ec2 {
     box @10 :List(Float32);  # x0, y0, x1, y1 normalized 0-1 in that camera's frame, for the UI
     view @11 :TurnpilotDetections.View;  # the pass of its last match: far for the far crop (its camera is road)
     farHits @12 :UInt32;     # matches in the far crop; age counts the full pass's alone (a hard stop's confirmation reads age)
+    # STOP_SIGNS.md 1.3: the camera time of its last match (TurnpilotDetections.timestampEof, s), the stop-sign evidence's
+    # clock (never turnpilotd's). view above is the pass of that match: sideLeft or sideRight for a side view's
+    tSeen @13 :Float64;
   }
   available @0 :Bool;          # false when detections are stale; never read as "nothing there"
   objects @1 :List(TrackedObject);
