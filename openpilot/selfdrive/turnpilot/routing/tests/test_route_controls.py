@@ -726,6 +726,102 @@ def test_n5_driveways_and_alleys_are_no_crossing_roads():
   assert route_controls(v, steps())[0] == []
 
 
+def kinds(controls):
+  """(kind, its edge, suspected) per control."""
+  return [(c.kind, c.edge, bool(c.junction_info and c.junction_info.suspected)) for c in controls]
+
+
+def primary_cross(over=None):
+  """Legs at a tertiary's junction with a primary road crossing it (left and right), the route straight on; over: {heading:
+  leg fields}."""
+  over = over or {}
+  return [leg(90., **({'class': 'primary'} | over.get(90, {}))), leg(270., **({'class': 'primary'} | over.get(270, {}))),
+          leg(0., exit=True, **{'class': 'tertiary'})]
+
+
+@pytest.mark.parametrize('name, approach, extra, want', [
+  # Indianapolis route 60 (and 66): OSM maps the junction's signal on our approach's stop-line node, 13 m before it,
+  # a node no other road meets
+  ('a signal on the stop-line node', [(0., 87., {'node_signal': True, 'crossing': []}), (87., 100., {})], {}, [('signal', 0, False)]),
+  ('a directed signal there', [(0., 88., {'edge_signal': True, 'crossing': []}), (88., 100., {})], {}, [('signal', 0, False)]),
+  # routes 33, 54 and 59: Valhalla's stop on an edge ending 8 m short of the junction, with nothing in the sidecar
+  ('a stop at a node short of it', [(0., 92., {'stop': True, 'crossing': []}), (92., 100., {})], {}, [('stop', 0, False)]),
+  ('a yield there', [(0., 92., {'yield': True, 'crossing': []}), (92., 100., {})], {}, [('yield', 0, False)]),
+  # an alley or a driveway is no junction: the approach goes on back past it
+  ('a signal back past an alley', [(0., 75., {'node_signal': True, 'crossing': []}), (75., 90., {}), (90., 100., {})],
+   {90.: [leg(90., use='alley', **{'class': 'service_other'})]}, [('signal', 0, False)]),
+  # the approach ends at the road junction before (40 m back) or JUNCTION_AHEAD_M back: what is mapped there isn't ours
+  ('a signal at the junction before', [(0., 50., {'node_signal': True, 'crossing': []}), (50., 60., {}), (60., 100., {})],
+   {60.: [leg(90.), leg(270.)]}, [('signal', 0, False), ('stop', 2, True)]),
+  ('a signal 70 m back', [(0., 30., {'node_signal': True, 'crossing': []}), (30., 100., {})], {}, [('signal', 0, False), ('stop', 1, True)]),
+  ('nothing', [(0., 87., {'crossing': []}), (87., 100., {})], {}, [('stop', 1, True)]),
+])
+def test_n5_anything_mapped_on_the_approach_means_no_suspected_stop(name, approach, extra, want):
+  """N5's 'nothing mapped on our approach' holds over the whole approach: the junction's own edge and each one before it
+  back to the previous road junction or JUNCTION_AHEAD_M (an alley, a driveway, a crosswalk or a signal's stop-line node is
+  no junction). A signal, stop or yield anywhere on it means the junction is mapped, so no suspected stop: the car never
+  stops at a green for one (Indianapolis route 60: a signal 13 m short of a primary, the suspected stop at its line)."""
+  edges = [(b, e, {'road_class': 'tertiary'} | f) for b, e, f in approach] + [(100., 400., {'road_class': 'tertiary'})]
+  v = StubJunction(edges, {100.: primary_cross()} | extra)
+  controls, status = route_controls(v, steps())
+  assert status == 'ok' and kinds(controls) == want, name
+
+
+def test_n5_a_signal_on_the_stop_line_node_of_a_left_onto_a_major_road():
+  """The left of the same shape (the skeptic's probe): a residential street's signal 20 m short of a secondary it turns left
+  onto, the junction's crossing roads all secondaries."""
+  legs = [leg(90., **{'class': 'secondary'}), leg(0., **{'class': 'secondary'}), leg(270., exit=True, **{'class': 'secondary'})]
+  v = StubJunction([(0., 80., {'node_signal': True, 'crossing': []}), (80., 100., {}), (100., 400., {})], {100.: legs})
+  assert kinds(route_controls(v, turn_steps(100., 'left'))[0]) == [('signal', 0, False)]
+
+
+def test_n5_a_sidecar_stop_short_of_its_junction_is_its_only_stop(tmp_path):
+  """Indianapolis node 1710705057's shape at a secondary: the sidecar's stop is on the edge ending at a crosswalk node 16 m
+  short of the junction it governs. That junction has its mapped stop and no second, suspected one 14 m on."""
+  edges = [(0., 84., {'way_id': 50, 'crossing': []}), (84., 100., {'way_id': 50}), (100., 400., {})]
+  side = {'50:f': [entry('stop', 80., junction=900)]}
+  at = {'900': {'pos': list(pt(100.)), 'approaches': []}}
+  v = StubJunction(edges, four({90: {'class': 'secondary'}, 270: {'class': 'secondary'}}), every=2.)
+  controls, _ = route_controls(v, steps(every=2.), sidecar_dir=osm_dir(tmp_path, side, at))
+  assert kinds(controls) == [('stop', 0, False)]
+  assert haversine((controls[0].junction_info.lat, controls[0].junction_info.lon), pt(100.)) < 0.5
+
+
+@pytest.mark.parametrize('name, fields, want', [
+  ('a signal on the stop-line node', {'node_signal': True}, [('signal', 0, False)]),
+  ('nothing mapped', {}, [('stop', 1, True)]),
+  ('a stop at the near carriageway', None, [('stop', 1, False)]),
+])
+def test_n5_one_junction_across_a_median_valhalla_does_not_flag(name, fields, want):
+  """Indianapolis routes 60 and 73: a divided primary whose median edge a node splits (5 m and 5 m), so Valhalla flags
+  neither half internal. The far carriageway 10 m on is the same junction: no suspected stop of its own, whether the near
+  one is signalled, mapped, or suspected itself (one stop, never two 10 m apart)."""
+  near = {'road_class': 'tertiary'} | ({'stop': True} if fields is None else {})
+  edges = [(0., 87., {'road_class': 'tertiary', 'crossing': []} | (fields or {})), (87., 100., near),
+           (100., 105., {'road_class': 'tertiary', 'crossing': []}), (105., 110., {'road_class': 'tertiary'}),
+           (110., 400., {'road_class': 'tertiary'})]
+  carriageways = {100.: primary_cross({90: {'drive': 'forward'}, 270: {'drive': 'backward'}}),
+                  110.: primary_cross({90: {'drive': 'backward'}, 270: {'drive': 'forward'}})}
+  v = StubJunction(edges, carriageways)
+  assert kinds(route_controls(v, steps())[0]) == want, name
+
+
+def test_n5_through_a_green_without_slowing_where_the_signal_is_on_the_approach_node():
+  """Closed loop (map_controls' point-mass car, the sim's green): what navd sends for route 60's junction, a signal on our
+  approach's stop-line node 13 m short of a primary, takes the car through at its speed, never stopped at the line."""
+  from openpilot.common.realtime import DT_MDL
+  from openpilot.selfdrive.turnpilot.tests.test_map_controls import Car, oracle
+  edges = [(0., 87., {'road_class': 'tertiary', 'node_signal': True, 'crossing': []}), (87., 100., {'road_class': 'tertiary'}),
+           (100., 400., {'road_class': 'tertiary'})]
+  controls, _ = route_controls(StubJunction(edges, {100.: primary_cross()}), steps())
+  car = Car([(120. + c.route_m, c.kind, c.line_mapped, c.junction, c.cross_suspect) for c in controls])
+  v0 = car.v
+  for _ in range(int(25. / DT_MDL)):
+    _, dec, _ = car.step(lights=oracle('green'))
+    assert not dec.should_stop
+  assert car.s > 120. + 150. and min(r[2] for r in car.rows) > v0 - 0.1
+
+
 def rail_dir(tmp_path, rail, controls=None):
   d = osm_dir(tmp_path, controls)
   cell = level2_index(LON0, LAT0)

@@ -50,9 +50,11 @@ The junction (SG1b): each stop and yield carries its junction (junction_info, ro
 road the route leaves by, their controls, lanes, limits and all-way tiers, the survey, the maneuver, the rail distance),
 read from trace_attributes and Q2, one more batched verbose locate per route that also carries the opposing roads' probes
 (opposing_roads, for the unprotected left: given an Opposing, a route makes Q1 and Q2 and no third). A failed Q2 leaves
-every leg unknown and the junction failed. A suspected unmapped stop (N5: nothing mapped on our approach, no signal there,
-and every road crossing outranks ours by two classes or more; junctions.suspected_stop) is emitted as a stop at the default
-stop point, its junction flagged suspected. A TurnPilotJunctionOverrides navd can't read fails every stop and yield junction
+every leg unknown and the junction failed. A suspected unmapped stop (N5: every road crossing outranks ours by two classes
+or more, junctions.suspected_stop, and nothing mapped on our whole approach, approach_edges: no signal, stop or yield from
+Valhalla or the sidecar back to the previous road junction or JUNCTION_AHEAD_M, and no suspected stop already at a junction
+within SAME_JUNCTION_M before it) is emitted as a stop at the default stop point, its junction flagged suspected. Mapped
+controls at different nodes still never merge. A TurnPilotJunctionOverrides navd can't read fails every stop and yield junction
 and makes the status partial, logged. Off the route a LocateCache keeps Q1 and Q2 by edge id between the 1 Hz lookups.
 navd's own Control also carries, for SG2's avoidance loop, its approach edge's key, its exclusion point and whether that
 edge is the route's first or last.
@@ -101,7 +103,11 @@ ATTRIBUTES = ['edge.id', 'edge.way_id', 'edge.forward', 'edge.length', 'edge.beg
               'node.intersecting_edge.begin_heading', 'node.intersecting_edge.driveability', 'node.intersecting_edge.use',
               'node.intersecting_edge.cyclability', 'edge.traversability']
 EXCLUDE_BACK_M = 12.     # m back from the node an approach's exclusion point goes, at most half its edge (SG2, 3.3)
-JUNCTION_AHEAD_M = 60.   # m on along the route the junction the sidecar says a stop governs is looked for (its MAXD)
+JUNCTION_AHEAD_M = 60.   # m on along the route the junction the sidecar says a stop governs is looked for (its MAXD), and
+                         # back along it a suspected stop's approach is looked over for anything mapped (N5)
+SAME_JUNCTION_M = 25.    # m: a road junction (or an internal-intersection edge) this close before a suspected stop's node is
+                         # its junction's (a divided road's near carriageway, its median split by a node so that Valhalla
+                         # flags neither half internal: Indianapolis routes 60 and 73, 10 m), for suspected stops only
 SUSPECTED_STOPS = True   # emit suspected unmapped stops (N5) as stop controls: until SG2 routes around them, each is a stop
 CACHE_MAX = 4096         # Q1 and Q2 answers a LocateCache keeps, each
 
@@ -530,6 +536,31 @@ def governed_node(edges, tpts, ends, a: int, pos) -> int:
   return a
 
 
+def road_junction(node) -> bool:
+  """Another road meets at this end node: one of jn.CROSSING_USES and a known class, which cars aren't barred from (an
+  alley, a driveway, a parking aisle or a path is none, and so is a node only our road passes: a crosswalk's, a signal's
+  stop line, a way split). A driveability Valhalla leaves out counts as drivable here: the approach then ends sooner, which
+  leaves the suspected stop as it was."""
+  return any((x.get('use') or 'road') in jn.CROSSING_USES and x.get('driveability') != 'none' and
+             jn.RANK.get(x.get('road_class') or '', 8) < 8 for x in node.get('intersecting_edges') or [])
+
+
+def approach_edges(edges, ends, a: int) -> list[int]:
+  """The trace edges of the approach to the junction at edge a's end, which a suspected stop there (N5) needs nothing
+  mapped on: a, then each edge before it back to the previous road junction (road_junction) or JUNCTION_AHEAD_M, through
+  the nodes no other road meets (OSM maps a signal on each approach's stop-line node, 10-15 m short of the junction, and
+  Valhalla splits an approach at a crosswalk, an alley or a driveway). A road junction or an internal-intersection edge
+  within SAME_JUNCTION_M of a's end is a's own junction (a divided road whose median Valhalla doesn't flag internal) and
+  the walk goes on past it."""
+  out = [a]
+  for i in range(a - 1, -1, -1):
+    back = ends[a][0] - ends[i][0]
+    if back > JUNCTION_AHEAD_M or (back > SAME_JUNCTION_M and (edges[i].get('internal_intersection') or road_junction(ends[i][3]))):
+      break
+    out.append(i)
+  return out
+
+
 def maneuver_at(steps, starts, stop_s: float, node_s: float) -> str:
   """The route's maneuver at a junction (N8): the first step starting from the stop point stop_s to MANEUVER_AFTER_M past
   the node node_s (m along the route's shape), else straight."""
@@ -672,18 +703,26 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
     found.append({'s': line_m - MAP_MARGIN_M, 'kind': kind, 'mapped': mapped, 'junction': junction, 'cross_suspect': cross_suspect,
                   'instance': instance, 'source': source, 'osm_node': osm_node, 'status': 'failed' if failed else 'ok', 'a': a,
                   'sign_m': sign_m, 'suspected': False, 'legs': None})
-  # suspected unmapped stops (N5): a junction with nothing mapped on our approach where every road crossing outranks ours by
-  # two classes or more is emitted as a stop
+  # suspected unmapped stops (N5): a junction with nothing mapped on its whole approach (approach_edges) where every road
+  # crossing outranks ours by two classes or more is emitted as a stop, one per junction
+  suspected: set[int] = set()
   for a in real if SUSPECTED_STOPS else []:
     end_m, span, key, node = ends[a]
     if a in at or not node.get('intersecting_edges') or (end_m > cum[-1] - END_OF_ROUTE_M and not ahead):
       continue
     nodes, legs, last = jn.junction_legs(edges, tpts, a, ahead)
-    if jn.suspected_stop(edges[a], tpts, legs):
-      cloudlog.info(f"turnpilot controls: a suspected unmapped stop on {key} at {end_m:.0f} m: every road crossing outranks ours by two classes")
-      found.append({'s': end_m - CONTROL_LINE_M - MAP_MARGIN_M, 'kind': 'stop', 'mapped': False, 'junction': True, 'cross_suspect': False,
-                    'instance': '', 'source': 'default', 'osm_node': 0, 'status': 'failed' if osm is not None and not osm_ok else 'ok',
-                    'a': a, 'sign_m': None, 'suspected': True, 'legs': (nodes, legs, last)})
+    if not jn.suspected_stop(edges[a], tpts, legs):
+      continue
+    mapped = next((i for i in approach_edges(edges, ends, a) if i in at or i in suspected), None)
+    if mapped is not None:
+      what = 'a suspected stop' if mapped in suspected else 'a ' + '/'.join(sorted(at[mapped], key=KIND_RANK.get))
+      cloudlog.info(f"turnpilot controls: no suspected stop on {key} at {end_m:.0f} m: its approach has {what} at {ends[mapped][0]:.0f} m")
+      continue
+    suspected.add(a)
+    cloudlog.info(f"turnpilot controls: a suspected unmapped stop on {key} at {end_m:.0f} m: every road crossing outranks ours by two classes")
+    found.append({'s': end_m - CONTROL_LINE_M - MAP_MARGIN_M, 'kind': 'stop', 'mapped': False, 'junction': True, 'cross_suspect': False,
+                  'instance': '', 'source': 'default', 'osm_node': 0, 'status': 'failed' if osm is not None and not osm_ok else 'ok',
+                  'a': a, 'sign_m': None, 'suspected': True, 'legs': (nodes, legs, last)})
 
   # Q2: every stop and yield's junction, in one batched verbose locate with the route's opposing roads. A control whose
   # edge ends short of the junction the sidecar says it governs (Valhalla splits an approach at a crosswalk or an alley) is

@@ -327,7 +327,7 @@ def junction_legs(edges, tpts, a: int, ahead: bool) -> tuple[list[tuple[float, f
 def suspected_stop(edge, tpts, legs) -> bool:
   """A suspected unmapped stop (N5) at the end of our edge: every road crossing there (left or right of our heading in at
   the control's node, the exit included when the route turns onto it; a driveway, alley or path is no road) outranks our
-  edge's class by two or more. The caller has checked that nothing is mapped on our approach."""
+  edge's class by two or more. The caller checks that nothing is mapped on our whole approach (controls.approach_edges)."""
   ours = RANK.get(edge.get('road_class') or '', 8)
   if ours >= 8:
     return False
