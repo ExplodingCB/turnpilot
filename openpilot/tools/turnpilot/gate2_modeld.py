@@ -4,7 +4,9 @@
 It publishes the minimal inputs modeld needs (road and wide frames, camera states, deviceState pc,
 carState, extrinsicsCalibration), starts modeld --demo in its own OPENPILOT_PREFIX, collects modelV2,
 then stops modeld and checks that chestnut is released. Nothing else may hold chestnut while it runs.
-With --detector it sets TurnPilotEnabled, so modeld also runs the TurnPilot detector, and reports its time and rate.
+With --detector it sets TurnPilotEnabled, so modeld also runs the TurnPilot detector, and reports its time and rate, and
+the far crop's (turnpilotFarDetections, DESIGN phase 4 G5) when its pkl is in selfdrive/turnpilot/models: its runs on the
+frames between the full pass's, its time, and what the full pass's messages say it is doing (farStatus).
   python -m openpilot.tools.turnpilot.gate2_modeld [--frames 600] [--detector]
 """
 import argparse
@@ -40,13 +42,14 @@ def run(n_frames: int, timeout: float, detector: bool) -> int:
   model_sock = messaging.sub_sock('modelV2', conflate=False)
   gpu_sock = messaging.sub_sock('chestnutGpuState', conflate=False)
   det_sock = messaging.sub_sock('turnpilotDetections', conflate=False)
+  far_sock = messaging.sub_sock('turnpilotFarDetections', conflate=False)
   params = Params()
   params.remove("ChestnutRetry")
   params.put_bool("TurnPilotEnabled", detector)
 
   modeld = subprocess.Popen([sys.executable, "-m", "openpilot.selfdrive.modeld.modeld", "--demo"])
   road, wide = gray_nv12(seed=0), gray_nv12(seed=1)
-  msgs, dets, gpu_msgs, sent_at_first = [], [], 0, None
+  msgs, dets, fars, gpu_msgs, sent_at_first = [], [], [], 0, None
   rk = Ratekeeper(20, print_delay_threshold=None)
   st = time.monotonic()
   try:
@@ -71,6 +74,7 @@ def run(n_frames: int, timeout: float, detector: bool) -> int:
         msgs.append(m)
       gpu_msgs += len(messaging.drain_sock(gpu_sock))
       dets += [m for m in messaging.drain_sock(det_sock) if msgs and len(msgs) > WARMUP]
+      fars += [m for m in messaging.drain_sock(far_sock) if msgs and len(msgs) > WARMUP]
       rk.keep_time()
     chestnut_active = params.get("ChestnutActive")
   finally:
@@ -106,6 +110,13 @@ def run(n_frames: int, timeout: float, detector: bool) -> int:
     rate = len(dets) / len(meas) * 20
     print(f"turnpilotDetections: {len(dets)} over {len(meas)} model frames ({rate:.2f} Hz at 20 Hz frames)" +
           (f", executionTime median {np.median(det_ex):.2f} ms, p95 {pct(det_ex, 95):.2f} ms, max {det_ex.max():.2f} ms" if len(dets) else ""))
+    far_ex = np.array([f.turnpilotFarDetections.run.executionTime for f in fars]) * 1e3
+    statuses = {}
+    for d in dets:
+      statuses[str(d.turnpilotDetections.farStatus)] = statuses.get(str(d.turnpilotDetections.farStatus), 0) + 1
+    print(f"turnpilotFarDetections: {len(fars)} over {len(meas)} model frames ({len(fars) / len(meas) * 20:.2f} Hz)" +
+          (f", executionTime median {np.median(far_ex):.2f} ms, p95 {pct(far_ex, 95):.2f} ms, max {far_ex.max():.2f} ms" if len(fars) else "") +
+          f"; farStatus on the full pass's messages {statuses}")
   print(f"modeld exit code {modeld.returncode}, chestnut user clients after exit: {chestnut_user_clients()}")
   return 0 if big and chestnut_active and (not detector or dets) else 1
 

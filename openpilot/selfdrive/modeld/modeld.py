@@ -325,7 +325,7 @@ def main(demo=False):
 
   # messaging
   pub_socks = ["modelV2", "drivingModelData", "cameraOdometry"] + (["chestnutGpuState"] if CHESTNUT else [])
-  pub_socks += ["turnpilotDetections"] if detector is not None else []
+  pub_socks += ["turnpilotDetections", "turnpilotFarDetections"] if detector is not None else []
   pm = PubMaster(pub_socks)
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState",
                   "carControl", "controlsState", "lateralDelay", "turnpilotPlan"],
@@ -505,8 +505,9 @@ def main(demo=False):
     if detector is not None and model_output is not None:
       tp_fresh = fresh_plan(sm)  # the camera TurnPilot asks for (DESIGN phase 4 G4): read in shadow too, where it steers nothing
       view = str(tp_fresh.detectorView) if tp_fresh is not None else 'auto'
+      far_bearing = float(tp_fresh.farCropBearing) if tp_fresh is not None else 0.  # where the far crop looks (G5)
       detector.step(pm, model, model_execution_time, prev_action.desiredCurvature, desire, [meta_main, meta_extra], sm['carControl'].enabled,
-                    view)
+                    view, far_bearing)
 
 if __name__ == "__main__":
   try:

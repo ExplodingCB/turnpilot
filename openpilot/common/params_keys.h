@@ -110,6 +110,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"TurnPilotAutoLeft", {PERSISTENT, STRING, "auto"}},
     {"TurnPilotLeftRangeM", {PERSISTENT, FLOAT, "0.0"}},
     {"TurnPilotGoOverride", {PERSISTENT, BOOL, "1"}},
+    {"TurnPilotFarCrop", {PERSISTENT, BOOL, "1"}},
     {"NetworkMetered", {PERSISTENT, BOOL}},
     {"ObdMultiplexingChanged", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, BOOL}},
     {"ObdMultiplexingEnabled", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, BOOL}},

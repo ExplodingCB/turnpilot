@@ -17,6 +17,18 @@ and modelV2 off the bus, into the message's lights (source camera, shadow unless
 own budget too: a failure, or a median read slower than LIGHT_BUDGET_S, turns the lights off for the drive
 (lightStatus disabled, which turnpilotd raises once), and the detector keeps running. TurnPilotCameraLights off reads none.
 
+The far crop (DESIGN phase 4 G5, FarCrop): a FAR_CROP_SIZE window of the road camera's frame at native resolution
+(graph.Crop: twice the full pass's pixel density, a car 1.8 m wide is 9 px at 230 m), run on the model frames between the
+full pass's runs and published apart (turnpilotFarDetections), so it never takes a frame the full pass is due on, forced or
+not: the full pass always wins. It is aimed by turnpilotPlan.farCropBearing (read through fresh_plan, shadow too: the
+unprotected left aims it up the oncoming approach, else straight ahead) at the calibrated horizon (FAR_HORIZON_ROW down
+the crop), and one compiled graph serves every aim: it takes two byte windows of modeld's device copy of the frame
+(crop_view_offsets). Its own budget: a run only where the model's time and its estimate fit STEP_BUDGET_S; a failure, a
+median run over FAR_BUDGET_S, or FAR_OVERRUNS of its last TIME_WINDOW runs pushing the step past STEP_BUDGET_S turn it off
+for the drive, logged, said by every full pass message (farStatus disabled, which turnpilotd raises once), and nothing of
+the full pass's (its runs, its backoff) changes. Its class-9 boxes go to a light reader of its own, always in shadow.
+TurnPilotFarCrop off, or no far pkl, runs none (farStatus off).
+
 Nothing here runs unless TurnPilotEnabled is set and the compiled pkl for this device and camera size exists
 (compile_detector.py builds it; the pkls are not in git).
 
@@ -34,11 +46,13 @@ import numpy as np
 from openpilot.cereal import custom, log, messaging
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
-from openpilot.selfdrive.turnpilot.detector.decoder import decode, decode_lights, fill_detections
-from openpilot.selfdrive.turnpilot.detector.graph import detector_pkl_path, letterbox
+from openpilot.common.params import UnknownKeyName
+from openpilot.selfdrive.turnpilot.detector.decoder import decode, decode_far, decode_far_lights, decode_lights, fill_detections, fill_far
+from openpilot.selfdrive.turnpilot.detector.graph import (Crop, crop_at, crop_views, detector_pkl_path, far_detector_pkl_path,
+                                                         letterbox)
 from openpilot.selfdrive.turnpilot.detector.light_state import LIGHT_MODE_DEFAULT, LightHead, LightReader, camera_lights_mode
 from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN, LanePaintClassifier, LinePaint, fill_lane_paint
-from openpilot.selfdrive.turnpilot.scene.ranging import camera_height, road_lens
+from openpilot.selfdrive.turnpilot.scene.ranging import Lens, calib_from_view, camera_height, road_lens
 from openpilot.selfdrive.turnpilot.scene.tracker import predicted_path
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 
@@ -67,8 +81,16 @@ RETRY_MAX_S = 60.          # ...to this
 PARAM_CHECK_S = 1.0        # TurnPilotEnabled is read this often
 PAINT_BUDGET_S = 0.005     # the lane paint read's median over TIME_WINDOW reads above this turns it off for the drive
 LIGHT_BUDGET_S = 0.004     # the light read's median over TIME_WINDOW reads above this turns the lights off for the drive
+# the far crop (FarCrop). Chestnut, 2026-10-28, yolo26n on the 640x384 crop alone: 6.0 ms (the full pass 5.9 ms alone, 7.9 ms
+# beside the big model); a median run over FAR_BUDGET_S is more than the frames between the full runs were measured to hold
+FAR_BUDGET_S = 0.012
+FAR_OVERRUNS = 3           # of its last TIME_WINDOW runs pushing the step past STEP_BUDGET_S: off for the drive
+FAR_STATUS_S = 0.5         # farStatus read: it ran within this
+FAR_VIEW_CACHE = 64        # device views kept, one per crop position (graph.crop_at aligns them to a coarse grid)
+FAR_CROP_DEFAULT = True    # TurnPilotFarCrop unset or unknown to this build
 LanePaintStatus = custom.TurnpilotDetections.LanePaintStatus
 LightStatus = custom.TurnpilotDetections.LightStatus
+FarStatus = custom.TurnpilotDetections.FarStatus
 
 
 def frame_view(model_state, index: int):
@@ -79,6 +101,40 @@ def frame_view(model_state, index: int):
   offset = model_state.packed_input.nbytes - 2 * size + index * size
   view = model_state.input_device.view(size, offset).ensure_allocated()
   return Tensor(UOp.from_buffer(view, dtypes.uint8))
+
+
+def crop_view_offsets(packed_nbytes: int, frame_size: int, index: int, crop: Crop) -> tuple[tuple[int, int], tuple[int, int]]:
+  """(offset, size) in modeld's packed input of the far crop's two views (graph.crop_views) of packed frame `index`."""
+  base = packed_nbytes - 2 * frame_size + index * frame_size
+  (lo, ln), (co, cn) = crop_views(crop)
+  return (base + lo, ln), (base + co, cn)
+
+
+def crop_frame_views(model_state, index: int):
+  """Crop -> (luma, chroma) uint8 device views of packed frame `index`, what the far crop's graph takes."""
+  from tinygrad import Tensor, dtypes
+  from tinygrad.uop.ops import UOp
+
+  def views(crop: Crop):
+    out = []
+    for offset, size in crop_view_offsets(model_state.packed_input.nbytes, model_state.frame_copy_size, index, crop):
+      out.append(Tensor(UOp.from_buffer(model_state.input_device.view(size, offset).ensure_allocated(), dtypes.uint8)))
+    return tuple(out)
+  return views
+
+
+def far_crop_on(params) -> bool:
+  """TurnPilotFarCrop: FAR_CROP_DEFAULT (on) if unset or unknown to this build's params (said)."""
+  try:
+    value = params.get("TurnPilotFarCrop")
+  except UnknownKeyName:
+    cloudlog.error(f"turnpilot: TurnPilotFarCrop unknown to this build's params, far crop {'on' if FAR_CROP_DEFAULT else 'off'}; run scons")
+    return FAR_CROP_DEFAULT
+  if value is None:
+    return FAR_CROP_DEFAULT
+  if isinstance(value, (bytes, str)):
+    return (value.decode() if isinstance(value, bytes) else value).strip() == '1'
+  return bool(value)
 
 
 def frame_bus():
@@ -138,6 +194,85 @@ class CameraLightReader:
     return heads, LightStatus.read
 
 
+class FarCrop:
+  """The far crop pass (module docstring): its compiled graph run(luma=, chroma=), views (Crop -> the two device views),
+  its aim from the bus's calibration, its own time estimate and budget, and its own light reader."""
+  def __init__(self, run, cam_w: int, cam_h: int, views, sm=None):
+    self.run, self.cam_w, self.cam_h, self.views_fn, self.sm = run, cam_w, cam_h, views, sm
+    self.lens: Lens | None = None
+    self.times: deque[float] = deque(maxlen=TIME_WINDOW)
+    self.overruns: deque[bool] = deque(maxlen=TIME_WINDOW)
+    self.light_times: deque[float] = deque(maxlen=TIME_WINDOW)
+    self.warmup_s = 0.              # the load's warm-up runs' time, the estimate before its first run
+    self.disabled = False           # failed or over budget: off for the drive
+    self.last_run_t: float | None = None  # time.monotonic() of its last run
+    self.why = FarStatus.noRoom     # what kept it from running last
+    self.lights: CameraLightReader | None = None  # its own (None: off, or failed)
+    self.lights_failed = False
+    self._views: dict = {}
+
+  def calibration(self) -> list | None:
+    """rpyCalib when calibrated (and the road lens, once the device is known), else None."""
+    sm = self.sm
+    sm.update(0)
+    if self.lens is None:
+      if not (sm.seen['deviceState'] and sm.seen['narrowRoadCameraState']):
+        return None
+      self.lens = road_lens(DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['narrowRoadCameraState'].sensor))].narrow_road)
+    cal = sm['extrinsicsCalibration']
+    if not (sm.seen['extrinsicsCalibration'] and cal.calStatus == log.ExtrinsicsCalibration.Status.calibrated):
+      return None
+    return list(cal.rpyCalib)
+
+  @staticmethod
+  def view_ray(bearing_deg: float, rpy) -> np.ndarray:
+    """The road camera's view-frame ray to the horizon bearing_deg left of the calibrated forward axis."""
+    b = np.radians(bearing_deg)
+    return calib_from_view(list(rpy)).T @ np.array([np.cos(b), -np.sin(b), 0.])  # calib frame: x forward, y right, z down
+
+  def aim(self, bearing_deg: float, rpy) -> Crop:
+    """The crop centred on the horizon bearing_deg left of the calibrated forward axis (graph.crop_at)."""
+    assert self.lens is not None
+    u, v = self.lens.project(self.view_ray(bearing_deg, rpy))
+    return crop_at(self.cam_w, self.cam_h, float(u), float(v))
+
+  def views(self, crop: Crop):
+    key = (crop.x0, crop.y0)
+    if key not in self._views:
+      if len(self._views) >= FAR_VIEW_CACHE:
+        self._views.clear()
+      self._views[key] = self.views_fn(crop)
+    return self._views[key]
+
+  def estimate(self, lights_on: bool) -> float:
+    est = float(np.median(self.times)) if self.times else self.warmup_s
+    if lights_on and self.lights is not None and self.light_times:
+      est += float(np.median(self.light_times))
+    return est
+
+  def status(self, now: float) -> int:
+    if self.disabled:
+      return FarStatus.disabled
+    if self.last_run_t is not None and now - self.last_run_t <= FAR_STATUS_S:
+      return FarStatus.read
+    return self.why
+
+  def disable(self, why: str) -> None:
+    if not self.disabled:
+      cloudlog.error(f"turnpilot far crop {why}, off for this drive")
+    self.disabled = True
+
+  def ran(self, now: float, dt: float, overran: bool) -> None:
+    """A run of dt s at now; overran: with the model's time it pushed the step past STEP_BUDGET_S."""
+    self.last_run_t = now
+    self.times.append(dt)
+    self.overruns.append(overran)
+    if len(self.times) == TIME_WINDOW and float(np.median(self.times)) > FAR_BUDGET_S:
+      self.disable(f"over budget ({np.median(self.times) * 1e3:.1f} ms)")
+    elif sum(self.overruns) >= FAR_OVERRUNS:
+      self.disable(f"pushed the step past {STEP_BUDGET_S * 1e3:.0f} ms {sum(self.overruns)} times in {len(self.overruns)} runs")
+
+
 def fill_lights(tl, heads: list[LightHead], shadow: bool) -> None:
   """A TurnpilotLights builder from the camera's heads."""
   tl.source, tl.shadow = custom.TurnpilotLights.Source.camera, shadow
@@ -155,6 +290,8 @@ class ModeldDetector:
   lights: CameraLightReader | None = None  # None: no road camera, or failed (lights_failed)
   lights_failed = False
   view_runs = 0                   # runs under the roadAndWide view, for its one wide run in WIDE_EVERY
+  far: FarCrop | None = None      # the far crop (None: no road camera, no far pkl, or it failed to load)
+  far_on = FAR_CROP_DEFAULT       # TurnPilotFarCrop, set by DetectorHost
 
   def __init__(self, model_state, cam_w: int, cam_h: int, cameras: dict[str, int]):
     """cameras: 'road' and/or 'wide' -> index of its frame in modeld's packed input."""
@@ -181,6 +318,8 @@ class ModeldDetector:
     bus = frame_bus() if 'road' in cameras else None
     self.lane_paint = LanePaintReader(cam_w, cam_h, bus) if 'road' in cameras else None
     self.lights = CameraLightReader(bus) if 'road' in cameras else None
+    self.far = load_far(model_state, cam_w, cam_h, cameras['road'], bus) if 'road' in cameras else None
+
 
   def choose_camera(self, desired_curvature: float, desire: int, now: float, view: str = 'auto') -> str:
     """The camera for this run: the wide one in a turn or on a curve and WIDE_HOLD_S after, else the road one; the plan's
@@ -215,14 +354,18 @@ class ModeldDetector:
     return True
 
   def step(self, pm, model_state, model_execution_time: float, desired_curvature: float, desire: int, metas: list,
-           view: str = 'auto') -> None:
+           view: str = 'auto', far_bearing: float = 0.) -> None:
     """Called once per model frame after modelV2 is sent, with the driving model this detector was loaded for.
-    metas: FrameMeta of packed frames 0 and 1; view: turnpilotPlan.detectorView (choose_camera)."""
+    metas: FrameMeta of packed frames 0 and 1; view: turnpilotPlan.detectorView (choose_camera); far_bearing:
+    turnpilotPlan.farCropBearing (FarCrop)."""
     if model_state is not self.model_state:
       # DetectorHost picks the detector by model, so this is a bug: raise for the host to log and retry, never a quiet off
       raise ValueError("turnpilot detector stepped with a driving model it wasn't loaded for")
     self.since_run += 1
-    if self.since_run < RUN_EVERY or time.monotonic() < self.retry_at or not self.room(model_execution_time):
+    if self.since_run < RUN_EVERY:
+      self.far_step(pm, model_state, model_execution_time, metas, far_bearing)  # a frame between the full runs
+      return
+    if time.monotonic() < self.retry_at or not self.room(model_execution_time):
       return
     try:
       cam = self.choose_camera(desired_curvature, desire, time.monotonic(), view)
@@ -241,6 +384,7 @@ class ModeldDetector:
       else:
         msg.turnpilotDetections.lanePaintStatus = LanePaintStatus.wideCamera if 'road' in self.cameras else LanePaintStatus.disabled
         msg.turnpilotDetections.lightStatus = self.light_status() if self.light_status() != LightStatus.read else LightStatus.wideCamera
+      msg.turnpilotDetections.farStatus = self.far_status()
       pm.send('turnpilotDetections', msg)
       self.failures = 0
     except Exception:
@@ -248,6 +392,72 @@ class ModeldDetector:
       delay = min(RETRY_S * 2 ** (self.failures - 1), RETRY_MAX_S)
       self.retry_at = time.monotonic() + delay
       cloudlog.exception(f"turnpilot detector failed ({self.failures} in a row), retrying in {delay:.0f} s")
+
+  def far_status(self) -> int:
+    """farStatus for the full pass's messages: off with TurnPilotFarCrop off or no far crop, else the far crop's own."""
+    if self.far is None or (not self.far_on and not self.far.disabled):
+      return FarStatus.off
+    return self.far.status(time.monotonic())
+
+  def far_step(self, pm, model_state, model_execution_time: float, metas: list, bearing: float) -> None:
+    """The far crop on this frame between the full runs, where it has room (module docstring). Its failures turn it off for
+    the drive and touch nothing of the full pass's."""
+    far = self.far
+    if far is None or far.disabled or not self.far_on:
+      return
+    try:
+      rpy = far.calibration()
+      if rpy is None:
+        far.why = FarStatus.noCalibration
+        return
+      lights_on = far.lights is not None and self.light_mode != 'off'
+      if model_execution_time + far.estimate(lights_on) > STEP_BUDGET_S:
+        far.why = FarStatus.noRoom
+        return
+      crop = far.aim(bearing, rpy)
+      luma, chroma = far.views(crop)
+      t0 = time.perf_counter()
+      raw = far.run(luma=luma, chroma=chroma).numpy()
+      dt = time.perf_counter() - t0
+      i = self.cameras['road']
+      meta = metas[i]
+      msg = messaging.new_message('turnpilotFarDetections', valid=bool(np.isfinite(raw).all()))
+      fill_far(msg.turnpilotFarDetections, decode_far(raw, crop), crop, bearing, meta.frame_id, meta.timestamp_eof, dt)
+      light_dt = self.read_far_lights(msg.turnpilotFarDetections.run, model_state, metas, raw, crop)
+      pm.send('turnpilotFarDetections', msg)
+      far.ran(time.monotonic(), dt, model_execution_time + dt + light_dt > STEP_BUDGET_S)
+    except Exception:
+      cloudlog.exception("turnpilot far crop failed")
+      far.disable("failed")
+
+  def read_far_lights(self, td, model_state, metas: list, raw: np.ndarray, crop: Crop) -> float:
+    """The far crop's class-9 boxes through its own reader, always shadow: td.lights, lightStatus, lightTime. A failure or
+    reads over LIGHT_BUDGET_S turn off only the far crop's lights, for the drive. Returns the time it took."""
+    far = self.far
+    assert far is not None
+    if far.lights_failed:
+      td.lightStatus = LightStatus.disabled
+      return 0.
+    if far.lights is None or self.light_mode == 'off':
+      td.lightStatus = LightStatus.off
+      return 0.
+    t0 = time.perf_counter()
+    try:
+      i = self.cameras['road']
+      heads, status = far.lights.read(model_state.frames[i], metas[i], decode_far_lights(raw, crop))
+    except Exception:
+      cloudlog.exception("turnpilot far crop lights failed, off for this drive")
+      far.lights, far.lights_failed = None, True
+      td.lightStatus = LightStatus.disabled
+      return time.perf_counter() - t0
+    dt = time.perf_counter() - t0
+    fill_lights(td.lights, heads, True)
+    td.lightStatus, td.lightTime = status, dt
+    far.light_times.append(dt)
+    if len(far.light_times) == TIME_WINDOW and float(np.median(far.light_times)) > LIGHT_BUDGET_S:
+      cloudlog.error(f"turnpilot far crop lights over budget ({np.median(far.light_times) * 1e3:.1f} ms), off for this drive")
+      far.lights, far.lights_failed = None, True
+    return dt
 
   def read_lane_paint(self, td, model_state, metas: list, boxes: np.ndarray) -> None:
     """Fill td.lanePaint, lanePaintStatus and lanePaintTime from the road camera's frame, behind this run's detections on
@@ -305,6 +515,39 @@ class ModeldDetector:
       self.lights, self.lights_failed = None, True
 
 
+def load_far(model_state, cam_w: int, cam_h: int, index: int, bus) -> FarCrop | None:
+  """The far crop for the road camera, packed frame `index`, or None: no far pkl for this device (logged), or it failed to
+  load (logged); the full pass runs either way."""
+  try:
+    from tinygrad.engine.realize import lower_and_compile
+    from openpilot.selfdrive.modeld.helpers import load_oob
+    path = far_detector_pkl_path(cam_w, cam_h, model_state.chestnut)
+    if not path.is_file():
+      cloudlog.warning(f"turnpilot far crop: no {path.name}, far crop off")
+      return None
+    art = load_oob(path, model_state.chestnut)
+    centre = crop_at(cam_w, cam_h, cam_w / 2, cam_h / 2)
+    (_, ln), (_, cn) = crop_views(centre)
+    specs = art['input_specs']
+    if art['metadata'].get('kind') != 'far' or specs['luma'][0] != (ln,) or specs['chroma'][0] != (cn,):
+      raise ValueError(f"far crop compiled for {art['metadata']}, {specs}; this camera's views are {ln} and {cn} bytes")
+    run = art['run']
+    run.captured._linear = lower_and_compile(run.captured._linear)
+    far = FarCrop(run, cam_w, cam_h, crop_frame_views(model_state, index), bus)
+    times = []
+    for _ in range(3):  # warm up, and a first time estimate
+      t0 = time.perf_counter()
+      run(**dict(zip(('luma', 'chroma'), far.views(centre), strict=True))).numpy()
+      times.append(time.perf_counter() - t0)
+    far.warmup_s = float(np.median(times))
+    far.lights = CameraLightReader(bus)
+    cloudlog.warning(f"turnpilot far crop loaded ({1e3 * far.warmup_s:.1f} ms warm)")
+    return far
+  except Exception:
+    cloudlog.exception("turnpilot far crop failed to load, far crop off")
+    return None
+
+
 def load(model_state, cam_w: int, cam_h: int, main_wide_camera: bool, use_extra_client: bool) -> ModeldDetector | None:
   """The detector for one driving model's device, or None. DetectorHost only calls this with TurnPilotEnabled set."""
   try:
@@ -337,6 +580,7 @@ class DetectorHost:
     self.detectors: list[tuple] | None = None  # (driving model, its detector or None), once loaded
     self.enabled = False
     self.light_mode = LIGHT_MODE_DEFAULT  # TurnPilotCameraLights, read with TurnPilotEnabled
+    self.far_on = FAR_CROP_DEFAULT        # TurnPilotFarCrop, read with TurnPilotEnabled
     self.next_check = 0.0
     self.missing = None  # the driving model last reported as having no detector
     self.failures = 0    # host failures in a row
@@ -346,14 +590,16 @@ class DetectorHost:
       self.next_check = now + PARAM_CHECK_S
       self.enabled = self.params.get_bool("TurnPilotEnabled")
       self.light_mode = camera_lights_mode(self.params)
+      self.far_on = far_crop_on(self.params)
     return self.enabled
 
   def load(self) -> None:
     self.detectors = [(m, self.load_fn(m, *self.args)) for m in self.models]
 
   def step(self, pm, model_state, model_execution_time: float, desired_curvature: float, desire: int, metas: list,
-           engaged: bool, view: str = 'auto') -> None:
-    """Called once per model frame after modelV2 is sent, with the model that made it. view: turnpilotPlan.detectorView."""
+           engaged: bool, view: str = 'auto', far_bearing: float = 0.) -> None:
+    """Called once per model frame after modelV2 is sent, with the model that made it. view: turnpilotPlan.detectorView;
+    far_bearing: turnpilotPlan.farCropBearing."""
     try:
       if not self.check_enabled(time.monotonic()):
         return
@@ -368,8 +614,8 @@ class DetectorHost:
           self.missing = model_state
           cloudlog.warning("turnpilot detector: none for the driving model modeld is running, detector off")
         return
-      det.light_mode = self.light_mode
-      det.step(pm, model_state, model_execution_time, desired_curvature, desire, metas, view)
+      det.light_mode, det.far_on = self.light_mode, self.far_on
+      det.step(pm, model_state, model_execution_time, desired_curvature, desire, metas, view, far_bearing)
       self.failures = 0
     except Exception:
       # never take modeld down: off until the next TurnPilotEnabled check, after a wait doubling from RETRY_S. turnpilotd
