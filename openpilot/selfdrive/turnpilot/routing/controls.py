@@ -55,15 +55,17 @@ The junction (SG1b): each stop and yield carries its junction (junction_info, ro
 road the route leaves by, their controls, lanes, limits and all-way tiers, the survey, the maneuver, the rail distance),
 read from trace_attributes and Q2, one more batched verbose locate per route that also carries the opposing roads' probes
 (opposing_roads, for the unprotected left: given an Opposing, a route makes Q1 and Q2 and no third). A failed Q2 leaves
-every leg unknown and the junction failed. A suspected unmapped stop (N5: every road crossing outranks ours by two classes
-or more, junctions.suspected_stop, and nothing mapped on our whole approach, approach_edges: no signal, stop or yield from
-Valhalla or the sidecar back to the previous road junction or JUNCTION_AHEAD_M, and no suspected stop already at a junction
-within SAME_JUNCTION_M before it) is emitted as a stop at the default stop point, its junction flagged suspected. A route, a
-reroute and a lookup ahead all start at the car, so where that walk reaches the trace's start within JUNCTION_AHEAD_M the
-rest of the approach is behind the car: signal_behind walks it back by locate, and a signal there (the car is past its
-stop-line node) means no suspected stop, so none on a green; nothing there, or a road behind that can't be read (logged),
-keeps the stop. Mapped controls at different nodes still never merge. A TurnPilotJunctionOverrides navd can't read fails every stop and yield junction
-and makes the status partial, logged. Off the route a LocateCache keeps Q1, Q2 and signal_behind's answers by edge id
+every leg unknown and the junction failed. A suspected unmapped stop (N5: every road crossing outranks ours by two
+classes or more, junctions.suspected_stop, and nothing mapped on our whole approach, approach_edges: no signal, stop or
+yield from Valhalla or the sidecar back to the previous road junction or JUNCTION_AHEAD_M, and no suspected stop already
+at a junction within SAME_JUNCTION_M before it, and no signal across a median Valhalla doesn't flag, signal_across: at
+the far carriageway of the same cross road or on the median's split node, within SAME_JUNCTION_M on) is emitted as a
+stop at the default stop point, its junction flagged suspected. A route, a reroute and a lookup ahead all start at the
+car, so where that walk reaches the trace's start within JUNCTION_AHEAD_M the rest of the approach is behind the car:
+signal_behind walks it back by locate, and a signal there (the car is past its stop-line node) means no suspected stop,
+so none on a green; nothing there, or a road behind that can't be read (logged), keeps the stop. Mapped controls at
+different nodes still never merge. A TurnPilotJunctionOverrides navd can't read fails every stop and yield junction and
+makes the status partial, logged. Off the route a LocateCache keeps Q1, Q2 and signal_behind's answers by edge id
 between the 1 Hz lookups.
 navd's own Control also carries, for SG2's avoidance loop, its approach edge's key, its exclusion point and whether that
 edge is the route's first or last.
@@ -623,6 +625,29 @@ def approach_edges(edges, ends, a: int) -> list[int]:
   return out
 
 
+def signal_across(edges, tpts, ends, at, a: int, ahead: bool) -> int | None:
+  """The trace edge past a whose signal is the junction at a's end's own (the mirror of approach_edges' SAME_JUNCTION_M,
+  looking ahead), or None: a divided road whose median a node splits, so Valhalla flags neither half internal, with the
+  signal mapped only at the far carriageway's node or on the median's split node. An edge whose end is within
+  SAME_JUNCTION_M of a's with a signal there (`at`'s), whose node, or the first road junction after it within
+  SAME_JUNCTION_M of a's end, is crossed as a suspected stop's is (junctions.suspected_stop: the same cross road's far
+  carriageway). A signal at another junction past it, or a stop or yield there, isn't the junction's signal."""
+  for k in range(a + 1, len(edges)):
+    if ends[k][0] - ends[a][0] > SAME_JUNCTION_M:
+      return None
+    if 'signal' not in at.get(k, {}):
+      continue
+    for j in range(k, len(edges)):
+      if ends[j][0] - ends[a][0] > SAME_JUNCTION_M:
+        break
+      if road_junction(ends[j][3]):
+        _, legs, _ = jn.junction_legs(edges, tpts, j, ahead)
+        if jn.suspected_stop(edges[j], tpts, legs):
+          return k
+        break
+  return None
+
+
 def edge_shape(c) -> list[tuple[float, float]]:
   """A locate candidate's edge_info shape [(lat, lon)] in its own direction of travel (edge_info's runs the way's)."""
   shape = (c.get('edge_info') or {}).get('shape') or []
@@ -863,6 +888,10 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
     if mapped is not None:
       what = 'a suspected stop' if mapped in suspected else 'a ' + '/'.join(sorted(at[mapped], key=KIND_RANK.get))
       cloudlog.info(f"turnpilot controls: no suspected stop on {key} at {end_m:.0f} m: its approach has {what} at {ends[mapped][0]:.0f} m")
+      continue
+    across = signal_across(edges, tpts, ends, at, a, ahead)
+    if across is not None:
+      cloudlog.info(f"turnpilot controls: no suspected stop on {key} at {end_m:.0f} m: its signal is across the median at {ends[across][0]:.0f} m")
       continue
     back0 = end_m - (ends[0][0] - ends[0][1])
     if approach[-1] == 0 and back0 <= JUNCTION_AHEAD_M:

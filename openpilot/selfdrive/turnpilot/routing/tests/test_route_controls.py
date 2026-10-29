@@ -841,6 +841,48 @@ def test_n5_one_junction_across_a_median_valhalla_does_not_flag(name, fields, wa
   assert kinds(route_controls(v, steps())[0]) == want, name
 
 
+def carriageways():
+  """A divided primary crossing a tertiary: its near carriageway at 100 m, its far one at 110 m."""
+  return {100.: primary_cross({90: {'drive': 'forward'}, 270: {'drive': 'backward'}}),
+          110.: primary_cross({90: {'drive': 'backward'}, 270: {'drive': 'forward'}})}
+
+
+@pytest.mark.parametrize('name, median, want', [
+  ('the signal at the far carriageway only', [(100., 105., {'crossing': []}), (105., 110., {'node_signal': True})], [('signal', 3, False)]),
+  ('a directed signal there', [(100., 105., {'crossing': []}), (105., 110., {'edge_signal': True})], [('signal', 3, False)]),
+  ('the signal on the median split node', [(100., 105., {'crossing': [], 'node_signal': True}), (105., 110., {})], [('signal', 2, False)]),
+  # what isn't this junction's signal, or isn't a signal, leaves the suspected stop: a stop mapped at the far carriageway
+  # only (the near one's cross traffic is still there), and a signal on the stop-line node of another junction past it
+  ('a stop at the far carriageway only', [(100., 105., {'crossing': []}), (105., 110., {'stop': True})], [('stop', 1, True), ('stop', 3, False)]),
+])
+def test_pa_a_signal_across_the_median_valhalla_does_not_flag_is_the_junctions(name, median, want):
+  """The mirror of approach_edges' SAME_JUNCTION_M: a divided primary whose median a node splits (Valhalla flags neither half
+  internal, Indianapolis routes 60 and 73), with the signal mapped only at the far carriageway's node or on the median's
+  split node. The junction is signalled: no suspected stop at the near carriageway, which was a stop on a green (the
+  skeptic's pa and pb: [('stop', 1, 88.8, suspected), ('signal', 3, 99.0)]). Only a signal counts, and only one whose
+  node, or the first road junction after it, is within SAME_JUNCTION_M and crossed as the near carriageway is (every road
+  there outranking ours by two classes: the same cross road's far carriageway)."""
+  edges = [(0., 87., {'road_class': 'tertiary', 'crossing': []}), (87., 100., {'road_class': 'tertiary'})] + \
+    [(b, e, {'road_class': 'tertiary'} | f) for b, e, f in median] + [(110., 400., {'road_class': 'tertiary'})]
+  assert kinds(route_controls(StubJunction(edges, carriageways()), steps())[0]) == want, name
+
+
+@pytest.mark.parametrize('name, past, junctions, want', [
+  ('a signal at a minor junction 20 m on', [(100., 120., {'node_signal': True})], {120.: [leg(90.), leg(270.)]},
+   [('stop', 0, True), ('signal', 1, False)]),
+  ("another junction's stop-line node 15 m on, its junction 28 m on", [(100., 115., {'node_signal': True, 'crossing': []}), (115., 128., {})],
+   {128.: primary_cross()}, [('stop', 0, True), ('signal', 1, False)]),
+])
+def test_pa_a_signal_past_the_junction_that_is_not_its_own_leaves_the_suspected_stop(name, past, junctions, want):
+  """A signal past a suspected stop's junction belongs to it only as its far carriageway: one at a minor road's junction
+  20 m on, or on the stop-line node of a junction further on than SAME_JUNCTION_M, leaves the suspected stop (rolling
+  through an unmapped stop onto a primary is the worse error)."""
+  edges = [(0., 100., {'road_class': 'tertiary'})] + [(b, e, {'road_class': 'tertiary'} | f) for b, e, f in past] + \
+    [(past[-1][1], 400., {'road_class': 'tertiary'})]
+  got = kinds(route_controls(StubJunction(edges, {100.: primary_cross()} | junctions), steps())[0])
+  assert got[0] == ('stop', 0, True) and got == want, name
+
+
 def test_n5_through_a_green_without_slowing_where_the_signal_is_on_the_approach_node():
   """Closed loop (map_controls' point-mass car, the sim's green): what navd sends for route 60's junction, a signal on our
   approach's stop-line node 13 m short of a primary, takes the car through at its speed, never stopped at the line."""
