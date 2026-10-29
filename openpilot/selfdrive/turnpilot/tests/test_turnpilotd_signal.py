@@ -501,7 +501,7 @@ def test_a_veto_at_the_autonomous_lefts_line_never_signals_the_left_again(driver
   sim, state, vetoed = auto_left_at_its_line(driver)
   assert any(str(p.controlPrompt) == 'leftUndecidedTakeControl' for p in vetoed), {str(p.controlPrompt) for p in vetoed}
   assert all(p.shouldStop and not p.tooFastToTurn for p in vetoed), "the latch let go of the car at the line"
-  assert all(p.turnSignal.side == LaneChange.none for p in vetoed[1:]), "the request for the left outlived the veto"
+  assert all(p.turnSignal.side == LaneChange.none for p in vetoed), "the request for the left outlived the veto"
   state['driver'] = 'none'  # the driver puts their lamp out, still held at the line, handed back
   later = drive(sim, 5.)
   relit = [i for i, p in enumerate(later) if p.turnSignal.side == LaneChange.left]
@@ -538,7 +538,7 @@ def test_a_veto_at_g1s_line_never_relights_the_left():
   vetoed = [sim.step(engaged=True) for _ in range(int(3. / DT_MDL))]
   state['driver'] = 'none'
   later = [sim.step(engaged=True) for _ in range(int(3. / DT_MDL))]
-  assert all(p.turnSignal.side == LaneChange.none for p in vetoed[1:] + later), \
+  assert all(p.turnSignal.side == LaneChange.none for p in vetoed + later), \
     f"the car signals left on {sum(p.turnSignal.side == LaneChange.left for p in later)} of {len(later)} plans after the veto"
   assert all(p.shouldStop and p.controlPrompt == 'unprotectedTurnTakeControl' for p in vetoed + later)
   assert not any(p.tooFastToTurn or p.turnSignal.prompt != LaneChange.none for p in vetoed + later)
