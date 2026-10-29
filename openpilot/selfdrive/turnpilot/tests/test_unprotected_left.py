@@ -645,3 +645,81 @@ def test_a_far_box_withdraws_a_go_before_its_commit():
   assert d.go
   d = j.step(far=[raw(260., 3.6)], far_range_m=300., far_live=True)
   assert not d.go and d.state == 'waitGap' and d.alert == 'oncomingHolding' and d.stops
+
+
+def far_blocked_wait(j, seconds, x, y, seen_every=1, light='none', **kw):
+  """Held at a far-needed left's line: full runs on every other frame, the far crop's on the frames between with a car
+  standing at (x, y) found on one far run in seen_every. Stops at a go or undecided."""
+  d, far_n = None, 0
+  for k in range(round(seconds / DT_MDL)):
+    args = {'raw_new': k % 2 == 0, 'far_range_m': 300., 'far_live': True, 'light': light, **kw}
+    if k % 2 == 1:
+      far_n += 1
+      args['far'] = [raw(x, y, conf=0.5)] if far_n % seen_every == 0 else []
+    d = j.step(**args)
+    if d.go or d.state == 'undecided':
+      break
+  return d
+
+
+def test_a_far_car_standing_in_the_band_is_undecided_out_loud_never_an_endless_wait():
+  # skeptic G6: any far box in the band blocks at any range (math.inf: its range can't clear it), so a car standing far up
+  # the road in the band (parked on the oncoming side, queued at the next light in the car's own lanes, or just far up
+  # them) held a 45-55 mph left at its line for good, silently (waitingForGap). Moving traffic reaches the full pass's range
+  # within FAR_BLOCKED_UNDECIDED_S; waiting on far boxes alone for that long, the car can't tell standing from coming: out
+  # loud (leftUndecidedTakeControl, the handback chime, the car held), never a go
+  from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
+  from openpilot.selfdrive.turnpilot.unprotected_left import FAR_BLOCKED_UNDECIDED_S
+  assert 30. <= FAR_BLOCKED_UNDECIDED_S <= 45.  # DESIGN's no gap in 45 s, scoped to the far crop's boxes alone
+  for v in (V_45, V_55):
+    for x, y in ((280., 5.4), (300., 0.), (400., 0.)):
+      for seen_every in (1, 2, 10):  # every far run, half of them (the far recall G6 is built for), one a second
+        j = Junction(v_limit=v)
+        d = far_blocked_wait(j, FAR_BLOCKED_UNDECIDED_S + 5., x, y, seen_every)
+        case = (v, x, y, seen_every, d.state, d.why, round(j.t, 1))
+        assert not any(x.go for x in j.decisions), case
+        assert d.state == 'undecided' and d.why == 'farBlocked' and d.prompt in TAKE_CONTROL_PROMPTS, case
+        assert FAR_BLOCKED_UNDECIDED_S - 0.1 <= j.t <= FAR_BLOCKED_UNDECIDED_S + 2 * seen_every * DT_MDL + 0.1, case  # from its first sighting
+        assert all(x.state == 'waitGap' and x.prompt == 'waitingForGap' for x in j.decisions[:-1]), case
+        assert d.reason and d.reason != "Waiting for a gap", case
+
+
+def test_moving_traffic_and_other_holds_never_make_a_far_car_a_fault():
+  from openpilot.selfdrive.turnpilot.unprotected_left import FAR_BLOCKED_UNDECIDED_S
+
+  def stream(v_car, headway, first_x, seconds):
+    """Cars coming down the oncoming lane at v_car, headway s apart, the first first_x m out: the far crop finds every one
+    in the band at any range, the full pass those within its range."""
+    j = Junction(v_limit=V_45)
+    for k in range(round(seconds / DT_MDL)):
+      t = k * DT_MDL
+      xs = [first_x + n * headway * v_car - v_car * t for n in range(40)]
+      xs = [x for x in xs if HOLD_D - 5. < x < 450.]
+      args = {'raw_new': k % 2 == 0, 'far_range_m': 300., 'far_live': True}
+      if k % 2 == 0:
+        args['boxes'] = [raw(x, 3.6) for x in xs if x < RANGE]
+      else:
+        args['far'] = [raw(x, 3.6) for x in xs if x >= RANGE]
+      d = j.step(**args)
+      if d.go:
+        break
+    return j
+  # a 45 mph stream at an 8 s headway (no gap of T_req): waited through, however long, never a fault
+  j = stream(V_45, 8., 400., 3. * FAR_BLOCKED_UNDECIDED_S)
+  assert not any(x.state == 'undecided' for x in j.decisions)
+  # one slow car (8 m/s) from 400 m: in the full pass's range within FAR_BLOCKED_UNDECIDED_S, then past: no fault, and a go
+  # once it has passed
+  j = stream(8., 1000., 400., (400. + 20.) / 8. + CLEAR_WINDOW_S + 1.)
+  assert not any(x.state == 'undecided' for x in j.decisions) and j.decisions[-1].go
+  # another hold keeps the car where it is (a red: LIGHT_RED_MAX_S): the far car isn't what holds it, never a fault under
+  # it; at the green the wait on the far car alone starts from there
+  j = Junction(v_limit=V_45)
+  d = far_blocked_wait(j, 2. * FAR_BLOCKED_UNDECIDED_S, 280., 5.4, light='red')
+  assert d.state == 'waitGap' and not any(x.state == 'undecided' for x in j.decisions)
+  t_green = j.t
+  d = far_blocked_wait(j, FAR_BLOCKED_UNDECIDED_S + 5., 280., 5.4, light='green')
+  assert d.state == 'undecided' and d.why == 'farBlocked' and j.t - t_green >= FAR_BLOCKED_UNDECIDED_S - 0.1
+  # the far crop not needed (25 mph): a far box blocks only within R_req, as the full pass's do; beyond it, a go
+  j = Junction()
+  d = far_blocked_wait(j, CLEAR_WINDOW_S + 1., 280., 5.4)
+  assert d.go

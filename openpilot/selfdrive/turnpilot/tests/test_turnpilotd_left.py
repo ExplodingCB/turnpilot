@@ -679,3 +679,26 @@ def test_main_reads_the_far_range():
   assert left_far_range_for(Params({'TurnPilotLeftFarRangeM': b'bad'})) == 0.
   assert left_far_range_for(Params({'TurnPilotLeftFarRangeM': 1e4})) <= 400.
   assert left_far_range_for(Params({}, unknown=True)) == 0.
+
+
+def test_a_car_standing_far_up_the_road_is_a_loud_handback_never_an_endless_wait():
+  # skeptic G6: a car parked on the oncoming side 280 m up the road, in the band, found only by the far crop (which blocks
+  # at any range): the 45 mph left stood at its line for good, silently (waitingForGap). Now, waiting on the far crop's boxes
+  # alone FAR_BLOCKED_UNDECIDED_S, it is undecided out loud (farBlocked, the take-control prompt), held at its line within
+  # -2.0, never a go
+  from openpilot.selfdrive.turnpilot.unprotected_left import FAR_BLOCKED_UNDECIDED_S
+  sim = far_sim()
+  sim.raw, sim.raw_far = road_runs(), far_runs(lambda sim: [(JUNCTION + 280., 5.4)])
+  plans = []
+  while sim.t < 40. + FAR_BLOCKED_UNDECIDED_S:  # ~29 s to stand at the line
+    plans += drive(sim, DT_MDL)
+  states = [str(p.unprotectedLeft.state) for p in plans]
+  stand = states.index('waitGap')
+  first_und = states.index('undecided')
+  assert FAR_BLOCKED_UNDECIDED_S - 0.1 <= (first_und - stand) * DT_MDL <= FAR_BLOCKED_UNDECIDED_S + 0.5
+  assert all(p.controlPrompt == 'waitingForGap' for p in plans[stand:first_und])
+  und = plans[first_und:]
+  assert all(str(p.unprotectedLeft.state) == 'undecided' and p.unprotectedLeft.why == 'farBlocked' for p in und)
+  assert all(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS and p.shouldStop for p in und)
+  assert not any(p.desire == Desire.turnLeft for p in plans) and sim.s <= LINE + 0.1 and sim.v < 0.1
+  assert min(p.accelCap for p in plans) >= -2.0 - 1e-6

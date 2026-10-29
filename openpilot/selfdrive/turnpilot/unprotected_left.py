@@ -6,8 +6,10 @@ the junction it waits at the hold line for a gap it can certify, however long th
 and never hands back for ordinary waiting. A handback (UNDECIDED: leftUndecidedTakeControl, the handback chime, the car
 held) is only for a fault: road camera frames stale, the junction's position unknown, its reach past the detector's proven
 range (route time should have rerouted it: turnpilotd), the car standing yawed past YAW_UNDECIDED_DEG, the view still
-blocked BLOCKED_UNDECIDED_S after the full creep, or a creep the car hasn't made after standing CREEP_STALL_S in it with
-nothing else holding it (the model holding a standstill). A missing frame is never clear.
+blocked BLOCKED_UNDECIDED_S after the full creep, a creep the car hasn't made after standing CREEP_STALL_S in it with
+nothing else holding it (the model holding a standstill), or a far-needed left waiting FAR_BLOCKED_UNDECIDED_S on the far
+crop's boxes alone (farBlocked: a car standing far up the road can't be told from one coming). A missing frame is never
+clear.
 
 TurnPilotAutoLeft (turnpilotd) picks the mode: auto (the default), announce (the car stops at the hold line and says
 whether it would go, then hands back as before: debugging only), or off (the hold line's handback, G1's).
@@ -34,8 +36,11 @@ past that range). An R_req past the full pass's range (far_needed)
 is then judged on its runs too: one covering those bearings (far_covers, its cover_deg) every FAR_FRESH_S or the window
 starts over, STALE_UNDECIDED_S without one a fault (farStale), and any vehicle box of its in the band blocks at any range
 (at 230-280 m one pixel of box bottom is 40-56 m and 0.15 deg of pitch is NEAR_PX's whole margin: it never clears a car by
-its range). Not needed, a far box blocks as the full pass's do. A full pass box blocks whatever the far runs say. Past both
-ranges, the far range unmeasured, or the far crop off, it is undecided, saying which (range, farUnmeasured, farOff).
+its range). So waiting on them alone, no band box of a road run within the full pass's range (no traffic reaching it) and
+nothing else holding the car, for FAR_BLOCKED_UNDECIDED_S (a far box FAR_BLOCK_RECENT_S apart keeps the count going) is a
+fault, farBlocked, never an endless silent wait. Not needed, a far box blocks as the full pass's do. A full pass box
+blocks whatever the far runs say. Past both ranges, the far range unmeasured, or the far crop off, it is undecided, saying
+which (range, farUnmeasured, farOff).
 Nothing here checks the junction's own sightline (a curve or crest short of R_req): the demo junction is chosen by eye for
 a clear sightline of R_req or more. Held
 short of its line (the latch reaches LATCH_NEAR_M short), where the longer crossing puts R_req past the range, the car rolls
@@ -107,6 +112,15 @@ ROAD_FRESH_S = 0.3         # road runs further apart than this start the window 
 FAR_FRESH_S = 0.3          # needed, far runs covering the band further apart than this start it over
 FAR_AIM_MAX_DEG = 14.      # the far crop's aim, either side of straight ahead (its half-width is 15.7 deg on a comma four)
 STALE_UNDECIDED_S = 2.     # no road run this long while waiting: a fault
+# waiting at its line on the far crop's boxes alone this long (no band box of a road run within the full pass's range: no
+# traffic reaching it), with nothing else holding the car: the farBlocked fault. Any far box in the band blocks at any range,
+# so a car standing far up the road in it (parked on the oncoming side, queued at the next light in the car's own lanes)
+# would hold a far-needed left for good. The far crop finds a car out to about 400 m (1.8 m wide is ~5 px at its native
+# 1141 px focal length); one closing at 8 m/s (18 mph, under half a far-needed road's 45-55 mph) reaches the full pass's
+# 120-150 m from there in 31-35 s. Waiting longer on far boxes alone, the car can't tell standing from coming: out loud
+FAR_BLOCKED_UNDECIDED_S = 35.
+FAR_BLOCK_RECENT_S = CLEAR_WINDOW_S  # a far box in the band this recently keeps that count going (the far crop finds a far
+                                    # car on one run in several; further apart, the window fills between them instead)
 YAW_UNDECIDED_DEG = 15.    # standing yawed further either way (after a withdrawn go): the road camera isn't up the oncoming approach
 
 STAND_SPEED = 1.           # m/s: a velocity-trusted track slower than this stands
@@ -369,6 +383,8 @@ class UnprotectedLeft:
     self.far_run_age = math.inf   # s since the last far run
     self.far_blocked = False      # the last far run had a car in the band
     self.far_stale = 0.           # s at its line without a far run covering the band
+    self.far_block_age = math.inf # s since the last far run with a car in the band
+    self.far_only_s = 0.          # s waiting at its line on the far crop's boxes alone (FAR_BLOCKED_UNDECIDED_S)
 
   def update(self, inp: LeftInput, dt: float) -> LeftDecision:
     if inp.mode not in (AUTO, ANNOUNCE):
@@ -395,6 +411,8 @@ class UnprotectedLeft:
       self.road_age = 0.
       self.blocked = bool(raw_blockers)
       self.clear_s = 0. if self.blocked or not fresh_run else self.clear_s + dt
+      if any(b.xy is not None and math.hypot(*b.xy) <= inp.range_m for b in raw_blockers):
+        self.far_only_s = 0.  # traffic within the full pass's range: not waiting on far boxes alone
     elif self.road_age > ROAD_FRESH_S or self.blocked or not inp.scene_clear:
       self.clear_s = 0.
     else:
@@ -405,11 +423,14 @@ class UnprotectedLeft:
     self.far_age += dt
     self.far_run_age += dt
     self.far_stale += dt
+    self.far_block_age += dt
     far_blockers = None
     if inp.far is not None and inp.far.view == 'far' and inp.far.camera == 'road':
       exempt = [b for b in inp.far.boxes if any(matches(b, o) for o in occ)]
       far_blockers = band_blockers(inp.far.boxes, inp.heading_deg, side, math.inf if far_needed else rreq, inp.distance, exempt)
       self.far_blocked, self.far_run_age = bool(far_blockers), 0.
+      if far_blockers:
+        self.far_block_age = 0.
       if far_covers(inp.far.cover_deg, inp.heading_deg, side, inp.range_m):
         self.far_age = self.far_stale = 0.
     if (self.far_blocked and self.far_run_age <= FAR_FRESH_S) or (far_needed and self.far_age > FAR_FRESH_S):
@@ -462,7 +483,7 @@ class UnprotectedLeft:
       return out
     if self.latch_d is None:
       # held at the line: the window starts here (hold, then judge), never carried over from the approach
-      self.latch_d, self.clear_s, self.far_stale = inp.distance, 0., 0.
+      self.latch_d, self.clear_s, self.far_stale, self.far_only_s = inp.distance, 0., 0., 0.
       out.clear_s = 0.
     certified = self.clear_s >= CLEAR_WINDOW_S - 1e-6 and not blocked_view and crosswalk and inp.scene_clear and not held_else
     out.view = 'roadAndWide'
@@ -528,11 +549,18 @@ class UnprotectedLeft:
         return self._undecided(out, 'blocked')
       if self.creep_stall >= CREEP_STALL_S - 1e-6:
         return self._undecided(out, 'creepStall')
+      self.far_only_s = 0.
       out.state = self.state = 'creep'
       out.prompt, out.reason, out.creep_m = 'creepingForView', "Creeping for a view", self.creep_to
       return out
     # waiting: crept no further than it has (a car in the band stops the creep where it is)
     self.blocked_s = self.creep_stall = 0.
+    # on the far crop's boxes alone (traffic within the full pass's range starts it over), nothing else holding the car: a
+    # car standing far up the road in the band is never an endless silent wait (skeptic G6)
+    far_only = far_needed and self.far_block_age <= FAR_BLOCK_RECENT_S and not held_else
+    self.far_only_s = self.far_only_s + dt if far_only else 0.
+    if self.far_only_s >= FAR_BLOCKED_UNDECIDED_S - 1e-6:
+      return self._undecided(out, 'farBlocked')
     self.creep_to = min(self.creep_to, max(crept, 0.))
     out.state = self.state = 'waitGap'
     out.prompt, out.reason, out.creep_m = 'waitingForGap', "Waiting for a gap", self.creep_to
@@ -541,7 +569,7 @@ class UnprotectedLeft:
     return out
 
   def _go(self, inp: LeftInput, out: LeftDecision, rreq: float) -> LeftDecision:
-    self.went, self.moved, self.hold_here, self.go_t = True, False, False, 0.
+    self.went, self.moved, self.hold_here, self.go_t, self.far_only_s = True, False, False, 0., 0.
     cloudlog.event("turnpilot.left_go", distance=round(inp.distance, 1), r_req=round(rreq, 1), clear_s=round(self.clear_s, 1),
                    v_limit=round(out.v_limit, 1), heading_deg=round(inp.heading_deg, 1))
     out.state = self.state = 'go'
@@ -617,6 +645,7 @@ UNDECIDED_REASON = {
   'farUnmeasured': "Far camera range not measured: take control",
   'farOff': "Far camera off: take control",
   'farStale': "Far camera not seeing oncoming traffic: take control",
+  'farBlocked': "Can't tell if far traffic is coming: take control",
   'position': "Junction position unsure: take control",
   'stale': "Camera not seeing oncoming traffic: take control",
   'yaw': "Not facing oncoming traffic: take control",
