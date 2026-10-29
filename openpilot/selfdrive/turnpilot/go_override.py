@@ -180,8 +180,10 @@ class GoCertifier:
     return self.cause != 'none'
 
   def start(self, cause: str, **evidence) -> bool:
-    """A certified go (cause: CAUSES) from now, or False while one is out."""
-    assert cause in CAUSES, cause
+    """A certified go (cause: CAUSES) from now, or False while one is out. A cause the schema hasn't: ValueError (turnpilotd's
+    fault path, out loud), never a go."""
+    if cause not in CAUSES:
+      raise ValueError(f"no such go cause: {cause!r}")
     if self.active:
       cloudlog.event("turnpilot.go_refused", cause=cause, out=self.cause, go_id=self.id, t=round(self.t, 2))
       return False

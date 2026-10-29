@@ -537,3 +537,11 @@ def test_closed_loop_withdrawn_mid_lift_or_braked_ends_it_that_frame():
   rows, lp = closed_loop(holding_model, lead_at=WARM_S + 1.)
   at = next(i for i, r in enumerate(rows) if r[0] >= WARM_S + 1. - 1e-6)
   assert not any(r[4] for r in rows[at:]) and lp.go_lift.end == 'lead'
+
+
+def test_certifier_refuses_a_cause_the_schema_doesnt_have():
+  import pytest
+  gc = GoCertifier()
+  with pytest.raises(ValueError):
+    gc.start('gasTap')
+  assert not gc.active and gc.id == 0
