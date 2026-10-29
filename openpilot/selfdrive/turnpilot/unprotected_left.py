@@ -28,7 +28,7 @@ A left whose R_req is past the detector's proven range (TurnPilotLeftRangeM; uns
 never attempted: turnpilotd skips it at route time (turn_skip: unprotectedRange, chimed, navd reroutes) and it is undecided
 here should it reach its hold.
 The far crop (DESIGN phase 4 G5; modeld's FarCrop, tracker.update_far) reaches further: a native-resolution window of the
-road frame, aimed (far_aim) at the band's bearings past the full pass's range. While it reads (far_live) its own proven
+road frame, aimed (far_aim) at the band's bearings past the full pass's range. While it is on (far_live) its own proven
 range (TurnPilotLeftFarRangeM, unset: unmeasured, none) extends the reach, the full pass's measured (it covers the band only
 past that range). An R_req past the full pass's range (far_needed)
 is then judged on its runs too: one covering those bearings (far_covers, its cover_deg) every FAR_FRESH_S or the window
@@ -172,7 +172,8 @@ class LeftInput:
                                  # unknown
   far: RawFrame | None = None    # a far crop run that arrived this frame (tracker.update_far: view far), None if none did
   far_range_m: float = 0.        # the far crop's proven range (TurnPilotLeftFarRangeM): 0 unmeasured
-  far_live: bool = False         # the far crop reading (the full pass's latest farStatus read)
+  far_live: bool = False         # the far crop on (the full pass's latest farStatus read, noRoom or noCalibration): its runs'
+                                 # freshness is judged here (FAR_FRESH_S, farStale)
 
 
 @dataclass

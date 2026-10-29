@@ -633,6 +633,35 @@ def test_without_the_far_crop_a_45_mph_left_is_skipped_and_its_loss_at_the_line_
   assert not any(p.desire == Desire.turnLeft for p in plans) and sim.s < LINE + 0.1
 
 
+def test_a_far_crop_spell_without_room_at_the_line_is_waited_through():
+  # the far crop on but without room for 0.6 s (farStatus noRoom, no far runs: a slow spell of the model's) while the car
+  # waits at its line: the window starts over and the car waits on, never a handback for a transient; it goes after
+  spell = [None]
+  runs = far_runs()
+
+  def status(sim):
+    return 'noRoom' if spell[0] is not None and spell[0] <= sim.t < spell[0] + 0.6 else 'read'
+
+  def raw_far(sim):
+    run = runs(sim)
+    return None if status(sim) == 'noRoom' else run
+  stream = [JUNCTION + 120. + k * 30. for k in range(3)]  # standing cars ahead in the band: it waits until they go
+  sim = far_sim(cars=lambda sim: [(s, 3.6) for s in stream] if spell[0] is None or sim.t < spell[0] + 1. else [],
+                status=status)
+  sim.raw_far = raw_far
+  sim.raw = road_runs(lambda sim: [(s, 3.6) for s in stream] if spell[0] is None or sim.t < spell[0] + 1. else [])
+  plans = []
+  while sim.s < JUNCTION + 30. and sim.t < 90.:
+    plans += drive(sim, DT_MDL)
+    if spell[0] is None and plans[-1].shouldStop and sim.v < 0.1 and str(plans[-1].unprotectedLeft.state) == 'waitGap':
+      spell[0] = sim.t + 1.
+  assert spell[0] is not None
+  assert not any(str(p.unprotectedLeft.state) == 'undecided' or str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  assert not any(str(p.controlAlert) == 'farViewOff' for p in plans)
+  go = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
+  assert go * DT_MDL > spell[0] + 0.6 + CLEAR_WINDOW_S - 0.1 and sim.s > JUNCTION + 30.
+
+
 def test_main_reads_the_far_range():
   from openpilot.common.params import UnknownKeyName
   from openpilot.selfdrive.turnpilot.turnpilotd import left_far_range_for

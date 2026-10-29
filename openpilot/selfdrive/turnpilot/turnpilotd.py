@@ -768,8 +768,9 @@ class TurnPilot:
         self.far_lights = heads
 
   def far_live(self, route: bool = False) -> bool:
-    """The far crop reads: the full pass's latest farStatus, fresh. route: at route time, on (reading, or waiting for room
-    or calibration), not off nor off for the drive."""
+    """The far crop reads: the full pass's latest farStatus, fresh. route: on (reading, or waiting for room or calibration),
+    not off nor off for the drive: what route time and the left take, the left judging its runs' own freshness (a spell
+    without room at its line starts its window over and, past STALE_UNDECIDED_S, is its farStale fault, never farOff)."""
     return self.far_status in (FAR_ON if route else ('read',)) and self.far_status_age <= FAR_STATUS_STALE_S
 
   def left_reach_m(self, route: bool = False) -> float:
@@ -803,7 +804,7 @@ class TurnPilot:
                     go_withdrawn=self.go_withdrawn, committed=rf.maneuver_id in (scene.committed_id, scene.released_id),
                     spread_m=rf.junction_spread, other_hold=stop_d is not None and stop_d <= rf.distance + PROTECT_PAST_M,
                     light=self.map_controls.turn_light(int(turn[0]), turn[1]), far=raw_far, far_range_m=self.left_far_range_m,
-                    far_live=self.far_live())
+                    far_live=self.far_live(route=True))  # on: a spell without room is waited through on its runs' freshness
     d = self.left_now = self.left.update(inp, DT_MDL)
     return LeftCommand(mode, d.go, d.creep_m, d.state == 'undecided', d.reason)
 
