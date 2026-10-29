@@ -460,3 +460,85 @@ def test_selfdrived_never_says_finishing_then_cancelled_for_a_veto_braking_for_a
   cancelled = [s for s in shown if s[1].startswith("Turn Cancelled")]
   assert cancelled, {s[1] for s in shown}
   assert not any(s[2] == "Finishing the turn" for s in shown), sorted({(s[1], s[2]) for s in shown})
+
+
+# ---------------------------------------------------------------- a veto at the unprotected left's line ends its request (B8)
+
+def auto_left_at_its_line(driver):
+  """TurnPilotAutoLeft auto (the demo default), the car signalling: standing at the left's hold line through an oncoming
+  stream (waitGap), the left lit. driver(state) overrules the car there: state['driver'] 'right' or 'hazards' for 3 s.
+  Returns (sim, state, the plans of the veto)."""
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import JUNCTION, V_25, drive, left_sim
+  stream = [JUNCTION + 60. + k * 6. * V_25 for k in range(3)]
+  t0 = [None]
+
+  def cars(sim):
+    if t0[0] is None and JUNCTION - sim.s < 60.:
+      t0[0] = sim.t
+    dt = sim.t - t0[0] if t0[0] is not None else 0.
+    return [(s - V_25 * dt, 3.6) for s in stream]
+  sim = left_sim(cars)
+  sim.answers_prompt = False
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  state = {'driver': 'none'}
+  sim.car_signal = overruling_port(state, LaneChange.left)
+  while not (sim.trace and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
+    drive(sim, DT_MDL)
+    assert sim.t < 90.
+  drive(sim, 1.)
+  assert sim.v < 0.3 and sim.trace[-1][2].turnSignal.side == LaneChange.left and sim.trace[-1][2].shouldStop
+  state['driver'] = driver
+  vetoed = drive(sim, 3.)
+  return sim, state, vetoed
+
+
+@pytest.mark.parametrize("driver", ['right', 'hazards'])
+def test_a_veto_at_the_autonomous_lefts_line_never_signals_the_left_again(driver):
+  """The left hands back at its line on the driver's veto (6.6's exception), the car held. The request for the left ends
+  with it: when the driver puts their lamp out (still deciding, held, handed back) nothing claims the left again, so the
+  car never signals the side the driver just overruled."""
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import drive
+  sim, state, vetoed = auto_left_at_its_line(driver)
+  assert any(str(p.controlPrompt) == 'leftUndecidedTakeControl' for p in vetoed), {str(p.controlPrompt) for p in vetoed}
+  assert all(p.shouldStop and not p.tooFastToTurn for p in vetoed), "the latch let go of the car at the line"
+  assert all(p.turnSignal.side == LaneChange.none for p in vetoed[1:]), "the request for the left outlived the veto"
+  state['driver'] = 'none'  # the driver puts their lamp out, still held at the line, handed back
+  later = drive(sim, 5.)
+  relit = [i for i, p in enumerate(later) if p.turnSignal.side == LaneChange.left]
+  assert not relit, f"the car signals left again {relit[0] * DT_MDL:.2f} s after the driver's {driver} went out"
+  assert not any(p.turnSignal.prompt != LaneChange.none for p in vetoed + later)
+  assert not any(p.desire == Desire.turnLeft for p in vetoed + later), "the left went after the driver overruled it"
+  assert all(p.shouldStop for p in later)
+
+
+def test_taking_over_after_a_veto_at_the_lefts_line_never_asks_for_the_overruled_side():
+  sim, state, _ = auto_left_at_its_line('right')
+  state['driver'] = 'none'
+  [sim.step(engaged=True) for _ in range(int(2. / DT_MDL))]
+  told = [p for p in (sim.step(engaged=False) for _ in range(int(4. / DT_MDL))) if p.turnSignal.handedOver != LaneChange.none]
+  assert not told, f"'Signal Off / Signal {told[0].turnSignal.handedOver} yourself' after the driver overruled the left"
+
+
+def test_a_veto_at_g1s_line_never_relights_the_left():
+  """TurnPilotAutoLeft off (G1): the latch holds the car at the left's line, handed back (unprotectedTurnTakeControl). The
+  driver's right lamp there ends the request for the left: once their lamp is out the car never signals left again."""
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import TURNS_AHEAD
+  sim = Sim(TURNS_AHEAD, driver_signals=None)
+  sim.go_taps = False
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  state = {'driver': 'none'}
+  sim.car_signal = overruling_port(state, LaneChange.left)
+  while not (sim.v < 0.05 and sim.s > 250.):
+    sim.step(engaged=True)
+    assert sim.t < 60.
+  for _ in range(int(1. / DT_MDL)):
+    sim.step(engaged=True)
+  assert sim.trace[-1][2].controlPrompt == 'unprotectedTurnTakeControl' and sim.trace[-1][2].turnSignal.side == LaneChange.left
+  state['driver'] = 'right'
+  vetoed = [sim.step(engaged=True) for _ in range(int(3. / DT_MDL))]
+  state['driver'] = 'none'
+  later = [sim.step(engaged=True) for _ in range(int(3. / DT_MDL))]
+  assert all(p.turnSignal.side == LaneChange.none for p in vetoed[1:] + later), \
+    f"the car signals left on {sum(p.turnSignal.side == LaneChange.left for p in later)} of {len(later)} plans after the veto"
+  assert all(p.shouldStop and p.controlPrompt == 'unprotectedTurnTakeControl' for p in vetoed + later)
+  assert not any(p.tooFastToTurn or p.turnSignal.prompt != LaneChange.none for p in vetoed + later)

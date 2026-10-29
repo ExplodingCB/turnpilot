@@ -316,6 +316,31 @@ def test_veto_at_the_left_line_hands_back():
   assert out.skip == 'none' and out.left_veto == 'driverSignal'
 
 
+@pytest.mark.parametrize("p", [port(block='otherSide', right_lamp=True), port(block='hazard', hazard=True),
+                               port(status='failed', fault='lampLost')])
+def test_a_veto_at_the_left_line_ends_the_request_for_good(p):
+  """The left hands back at its line on the driver's veto (6.6's exception): the request for the left ends with it, from
+  the veto's frame. Never signalled again once the driver's lamp is out (the port would claim the left they overruled),
+  never prompted, and never "Signal left yourself" when the driver takes over."""
+  drive = Drive(m=maneuver("turn", "left"), distance=12., v=3.)
+  drive.d = desires(started=True)
+  drive.step()
+  drive.v, drive.distance = 0., 8.
+  drive.port = port(status='lit', left=True, left_lamp=True)
+  assert drive.step(20, at_left_line=True, standing=True, left_lamp=True).side == LaneChange.left
+  drive.status, drive.port = (Status.failed if p.status == 'failed' else Status.ready), p
+  out = drive.step(at_left_line=True, standing=True)
+  assert out.left_veto == 'driverSignal' and out.skip == 'none' and out.side == LaneChange.none
+  drive.status, drive.port = Status.ready, port()  # the driver's lamp out, nothing holding the port off
+  outs = [drive.step(at_left_line=True, standing=True) for _ in range(100)]
+  assert all(o.side == LaneChange.none and o.prompt == LaneChange.none and o.left_veto == '' for o in outs)
+  drive.status, drive.port = Status.failed, port(status='failed', fault='lampTimeout')  # the car's signal gone too
+  assert all(o.prompt == LaneChange.none for o in [drive.step(at_left_line=True, standing=True) for _ in range(20)])
+  drive.status, drive.port = Status.ready, port()
+  outs = [drive.step(at_left_line=True, standing=True, engaged=False) for _ in range(100)]  # the driver takes over
+  assert all(o.handed_over == LaneChange.none and o.side == LaneChange.none for o in outs)
+
+
 def test_a_lamp_on_when_the_turn_arms_vetoes():
   drive = Drive(distance=200.)
   drive.port = port(block='otherSide', right_lamp=True)

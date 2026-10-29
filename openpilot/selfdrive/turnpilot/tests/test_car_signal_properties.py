@@ -333,3 +333,54 @@ def test_intent_never_both_sides_never_opposite_never_after_a_veto(seed):
     assert vetoed_at is None
   if changed_expected:
     assert intent.notice == 'changedMidTurn'
+
+
+@pytest.mark.parametrize("veto", ['stalk', 'hazards'])
+@pytest.mark.parametrize("seed", range(3))
+def test_a_veto_at_the_lefts_line_never_relights_the_left_through_the_port(veto, seed):
+  """B8 end to end: the intent (at 20 Hz) gives the port its want (controlsd's command_side), behind the real panda and
+  the body model. Standing at the unprotected left's line with our left lit, the driver's right stalk or the hazards
+  overrule it: the left hands back and its request ends, so once the driver's lamp is out the port never claims or
+  lights the left again, and taking over never asks for it."""
+  rng = random.Random(seed)
+  body = BodyModel(semantics='level', on_latency=0.2, rng=rng, glitch_rate=0., early_rate=0.)
+  h = PortHarness(new_port(), body=body, rng=rng)
+  h.engaged = True
+  intent = TurnSignalIntent()
+  m = maneuver("left")
+  d = types.SimpleNamespace(maneuver_id=0, started=True, done=False, turned_deg=0.)  # G1's desire out on the approach
+  outs = []
+
+  def frame(engaged=True):
+    p = h.port
+    port = types.SimpleNamespace(status=p.status, left=p.side == LEFT and p.phase != 'idle', right=p.side == RIGHT and p.phase != 'idle',
+                                 block=p.block, fault=p.fault, hazard=p.mask.hazard, leftLamp=p.mask.lamp[LEFT],
+                                 rightLamp=p.mask.lamp[RIGHT], checkWhy='')
+    status = intent.status_for(int(TeslaFlags.CAR_SIGNALS), 'on', port, 0.05)
+    _, left, right = h.blinkers[-1] if h.blinkers else (0., False, False)
+    out = intent.update(status=status, port=port, gates_ok=True, engaged=engaged, lane_side=LaneChange.none, lane_pending=False,
+                        maneuver=m, maneuver_id=0, distance=8., desires=d, missed=False, v_ego=0., dt=0.05,
+                        left_lamp=left or port.leftLamp, right_lamp=right or port.rightLamp, at_left_line=True, standing=True)
+    h.engaged = engaged
+    h.want = {LaneChange.left: LEFT, LaneChange.right: RIGHT}.get(out.side, NONE) if status == Status.ready else NONE
+    h.step(5)
+    outs.append(out)
+    return out
+
+  def run(seconds, **kw):
+    return [frame(**kw) for _ in range(int(round(seconds / 0.05)))]
+  run(1.)
+  while h.port.phase != 'lit':
+    frame()
+    assert h.t < 120.
+  run(1.5)  # past DRIVER_AFTER_S: the other side is the driver's
+  (body.driver_stalk(RIGHT, True) if veto == 'stalk' else body.hazards(True))
+  vetoed = run(2.)
+  assert any(o.left_veto for o in vetoed), "no handback at the line on the driver's veto"
+  (body.driver_stalk(RIGHT, False) if veto == 'stalk' else body.hazards(False))
+  later = run(3.)
+  assert h.port.phase not in ('requesting', 'lit') and not h.port.mask.lamp[LEFT], \
+    f"the port claimed the left again after the driver's {veto} went out: phase {h.port.phase}"
+  assert all(o.side == LaneChange.none and o.prompt == LaneChange.none for o in later)
+  told = run(3., engaged=False)  # the driver takes over at the line
+  assert all(o.handed_over == LaneChange.none for o in told)

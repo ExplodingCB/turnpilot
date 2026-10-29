@@ -19,7 +19,8 @@ or more; a turn the maneuver ended (done, skipped, passed, missed) never does.
 With the car signalling, the driver overrules it before the turn starts, or while a TurnPilot stop brings the car to
 rest short of the junction, braking toward it or standing at it, under TURN_STARTED_DEG into the turn (their lamp on the
 other side, hazards, or our lamp put out): the turn is skipped out loud and navd reroutes, except at the unprotected
-left's hold line, where the left hands back (a skip there would let go of the car in a left-turn position). Once the turn
+left's hold line, where the left hands back (a skip there would let go of the car in a left-turn position) and the
+request for the left ends there: never signalled again, prompted or handed over for that maneuver. Once the turn
 has started (moving into it with its desire out and no stop in force) it finishes, said ("Turn Signal Changed"), and a
 stop that then has the car never skips it: one veto, one decision per maneuver. A wrongSide fault with the other side's
 lamp lit (ours on the wrong side, or the driver's) is a veto too: the car never turns with the other side lit.
@@ -377,6 +378,31 @@ class TurnSignalIntent:
       self.arm_travel += v_ego * dt
       out.arm_m = self.arm_m
 
+    # the driver overrules the car's signal (DESIGN 6.6): before the turn starts, or while a stop brings the car to rest
+    # short of the junction (braking toward it or standing at it) under TURN_STARTED_DEG into the turn (its desire out
+    # from the approach or not), a skip out loud; at the unprotected left's line, its handback, which ends the request
+    # for the left from this frame (never claimed again once the driver's lamp is out, never handed over); once started
+    # (moving into it with its desire out and no stop in force, or TURN_STARTED_DEG into it), finished and said. Decided
+    # once per maneuver: a turn said to be finishing is never skipped after (a stop that then has the car, the lamp on)
+    started = d_this and desires.started and (not (standing or stopping) or desires.turned_deg >= TURN_STARTED_DEG)
+    turn_side = self.arm_side if lane_side == LaneChange.none else LaneChange.none
+    if turn_side != LaneChange.none and self.armed_id is not None:
+      veto = self._veto(port, status, turn_side, lamps)
+      if veto:
+        if at_left_line:
+          out.left_veto = 'driverSignal'
+          cloudlog.event("turnpilot.turn_signal_ended", why='vetoed at the left line', veto=veto, lit_m=round(self.lit_m, 1),
+                         arm_m=round(self.arm_m, 1))
+          self.ended_id = self.armed_id  # never armed again for this maneuver
+          self.armed_id, self.arm_side = None, LaneChange.none
+        elif started or self.changed_id == self.armed_id:
+          if self.changed_id != self.armed_id:
+            self.changed_id = self.armed_id
+            self._notice('changedMidTurn')
+            cloudlog.event("turnpilot.turn_signal_changed", why=veto, lit_m=round(self.lit_m, 1))
+        else:
+          out.skip = veto
+
     # the side, whoever signals it: a lane change outranks the turn (usually the same side, into the turn lane)
     side = LaneChange.none
     if gates_ok and engaged:
@@ -399,26 +425,6 @@ class TurnSignalIntent:
       short = self.lit_m < lead
       cloudlog.event("turnpilot.turn_signal", error=short, lit_m=round(self.lit_m, 1), lead_m=round(lead, 1),
                      arm_m=round(self.arm_m, 1))
-
-    # the driver overrules the car's signal (DESIGN 6.6): before the turn starts, or while a stop brings the car to rest
-    # short of the junction (braking toward it or standing at it) under TURN_STARTED_DEG into the turn (its desire out
-    # from the approach or not), a skip out loud; at the unprotected left's line, its handback; once started (moving into
-    # it with its desire out and no stop in force, or TURN_STARTED_DEG into it), finished and said. Decided once per
-    # maneuver: a turn said to be finishing is never skipped after (a stop that then has the car, the lamp still on)
-    started = d_this and desires.started and (not (standing or stopping) or desires.turned_deg >= TURN_STARTED_DEG)
-    turn_side = self.arm_side if lane_side == LaneChange.none else LaneChange.none
-    if turn_side != LaneChange.none and self.armed_id is not None:
-      veto = self._veto(port, status, turn_side, lamps)
-      if veto:
-        if at_left_line:
-          out.left_veto = 'driverSignal'
-        elif started or self.changed_id == self.armed_id:
-          if self.changed_id != self.armed_id:
-            self.changed_id = self.armed_id
-            self._notice('changedMidTurn')
-            cloudlog.event("turnpilot.turn_signal_changed", why=veto, lit_m=round(self.lit_m, 1))
-        else:
-          out.skip = veto
 
     # the driver signals instead (DESIGN 6.5): every armed turn while the car isn't signalling, under D15's holds; never
     # one this frame's veto skips (our lamp put out fails the port on the veto's own frame)
