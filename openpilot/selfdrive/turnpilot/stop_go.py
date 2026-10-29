@@ -115,6 +115,12 @@ H2_SPREAD_M = 2. * sr.POS_ERR_M
 CROSS_DONE_YAW_DEG = 60.
 DRIVE_OFF_M, DRIVE_OFF_V = 2., 2.  # the driver drove a decider's own hold off (map_controls' DRIVE_OFF_M, COMMIT_SPEED)
 PED_STILL_V = 0.4               # m/s: a person moving slower stands (D3's measure, as a speed)
+PED_STILL_M, PED_STILL_S = 0.4, 1.0  # m of displacement in the last s under which a person stands still (D3; the arrival clause)
+PED_ARRIVE_MARGIN_S = 2.0       # s our rear bumper must clear a crosswalk on our path before a person heading for it arrives
+PED_V_UNTRUSTED = 2.0           # m/s a person is taken to walk at until their speed is trusted (VEL_TRUST_S, 5 samples)
+PED_HISTORY_S = 2.0             # s of each person's ground positions kept (the arrival clause's fit)
+RAW_PED_RUNS, RAW_PED_OF = 2, 3  # a raw person box counts for the arrival clause seen on 2 of the last 3 runs of its view
+RAW_PED_SAME_M = 1.5            # m: a raw box this near a person track, or a box of another run, is the same person
 PED_RANGE_BAND = 0.3            # a person's ranging band, plus or minus this of range
 RAW_PERSON_CONF = 0.35
 MOVING_V = 0.5                  # m/s: a vehicle moving
@@ -333,6 +339,9 @@ class StopGo:
     self.front: dict[int, dict] = {}       # person trackId: in the front zone, its y and vy, lost
     self.front_s = 0.
     self.front_ended: list = []            # (t, y) of front-zone tracks that ended at its side moving sideways
+    self.peds: dict[int, deque] = {}       # person trackId: (t, x ground, y) the last PED_HISTORY_S (the arrival clause)
+    self.raw_peds: dict[str, deque] = {}   # view key: the person boxes' (x ground, y) of its last RAW_PED_OF runs
+    self.ped_carry_on = False              # the launch carries on across the near crosswalk (the arrival clause, 2.6)
     self.bike_t: float | None = None
     self.large_left: dict[str, float] = {}  # lane role: when a large vehicle last left it
     self.large_seen: dict[int, str] = {}
@@ -528,6 +537,21 @@ class StopGo:
       cloudlog.event("turnpilot.stop_go_signal_head", error=True, key=list(self.key), osmNodeId=j.osm_node_id if j is not None else 0,
                      runs=list(self.lights))
       self.on_signal_seen(j)
+    seen_peds = set()
+    for o in f.objects or ():
+      if class_name(o.cls) == PERSON:
+        h = self.peds.setdefault(o.trackId, deque())
+        h.append((self.t, float(o.x) + pos, float(o.y)))
+        while h and h[0][0] < self.t - PED_HISTORY_S - 1e-9:
+          h.popleft()
+        seen_peds.add(o.trackId)
+    for tid in [k for k, h in self.peds.items() if k not in seen_peds and (not h or h[-1][0] < self.t - PED_STILL_S)]:
+      del self.peds[tid]
+    for key, _t, raw, _sectors in f.runs or ():
+      if raw is not None and key != 'far':
+        boxes = [(float(b.xy[0]) + pos, float(b.xy[1])) for b in raw.boxes
+                 if b.cls == PERSON and b.conf >= RAW_PERSON_CONF and b.xy is not None]
+        self.raw_peds.setdefault(key, deque(maxlen=RAW_PED_OF)).append(boxes)
     for o in f.objects or ():
       # a cyclist beside or behind us on the right (P7): a right turn waits until it has reappeared ahead or BIKE_PASS_MEMORY_S
       if class_name(o.cls) in CYCLISTS and float(o.y) < -0.9:
@@ -668,7 +692,7 @@ class StopGo:
                'tracks': self._known_tracks(f)}
     self.takeover.reset()
     self.takeover_s, self.uncommit_s = -1., 0.
-    self.state, self.clear_s, self.went = 'going', 0., True
+    self.state, self.clear_s, self.went, self.ped_carry_on = 'going', 0., True, False
     self.static_s = self.dynamic_s = 0.
     self.next_chime = WAIT_INFO_S
     d.release = (self.key, 'clear') if ctl is not None else None
@@ -698,9 +722,23 @@ class StopGo:
       return
     holds = self.go_holds(f, pos, launch=True)
     d.holds = holds
-    why, detail = '', ''
-    if holds:
-      why, detail = holds[0].key, holds[0].reason
+    # a person heading for the near crosswalk (the arrival clause, P16): it lies between the stop point and dEdgeMin, so the
+    # capped stop targets its earliest plausible near edge less M_EDGE where it can end there at -2.0 or gentler; where it
+    # can't, the car carries on across at STOP_GO_V_MAX or less rather than stop on it (scene_policy's in-path stop armed)
+    near_ped = [h for h in holds if h.key.startswith('pedArrive') and h.key.endswith(':near')]
+    others = [h for h in holds if h not in near_ped]
+    why, detail, to = '', '', None
+    if others:
+      why, detail = others[0].key, others[0].reason
+    elif near_ped:
+      edge = self.edges.d_min - CROSSWALK_M - sr.M_EDGE
+      if not self.ped_carry_on and sr.abort_distance(f.v_ego, f.t_abort, a_now) <= edge - pos:
+        why, detail, to = near_ped[0].key, near_ped[0].reason, edge
+      elif not self.ped_carry_on:
+        self.ped_carry_on = True
+        cloudlog.event("turnpilot.stop_go_ped_carry_on", key=list(self.key), pos=round(pos, 2), v=round(f.v_ego, 2), why=near_ped[0].key)
+    if why:
+      pass  # a go condition failed: withdrawn for it
     elif not taken_over and sr.gate_reached(pos, f.v_ego, f.t_abort, self.edges, a_now):
       why = 'gate'
     elif not taken_over and (d.go_t >= GO_WINDOW_S - 1e-6 or (f.go_active == 'none' and f.go_end == 'window')):
@@ -711,7 +749,7 @@ class StopGo:
     else:
       self.uncommit_s = 0.
     if why:
-      self._withdraw(f, d, pos, why, detail)
+      self._withdraw(f, d, pos, why, detail, to)
 
   def _committed(self, f: Frame, d: StopGoDecision, pos: float) -> None:
     d.detector_view, d.action, d.committed = 'stopSweepGo', 'committed', True
@@ -1071,7 +1109,8 @@ class StopGo:
   def _people_holds(self, f: Frame, pos: float) -> list[Hold]:
     """2.4 item 7, the conservative zones (P1, P2, P10): any person track or raw person box in the near or far crosswalk band
     (our half of the road plus one lane, its ranging band of plus or minus PED_RANGE_BAND included) or in the box blocks the
-    go; moving, a dynamic wait, standing, a static one (the curb rule is SG4c's, the arrival clause P16's). The front zone (P6)."""
+    go; moving, a dynamic wait, standing, a static one (the curb rule is SG4c's). A person heading for a crosswalk on our path
+    (the arrival clause, P16: _arrival_holds). The front zone (P6)."""
     holds = []
     near0, near1 = self._x(0., pos) - 1., self._x(self.edges.d_max, pos)
     box0, box1 = self._x(self.edges.d_min, pos), self._x(self._far_edge(), pos)
@@ -1104,7 +1143,90 @@ class StopGo:
             if zone(x * (1. - PED_RANGE_BAND), x * (1. + PED_RANGE_BAND), y):
               holds.append(Hold(f'pedRaw:{key}', "a person at the crosswalk", DYNAMIC))
               break
+    holds += self._arrival_holds(f, pos, ((near0, near1, self.edges.d_min, 'near'),) +
+                                 (((far0, far1, self._far_edge() + CROSSWALK_M + 1., 'far'),) if f.maneuver in ('straight', 'unknown') else ()))
     holds += self._front_zone(f)
+    return holds
+
+  def t_clear(self, f: Frame, pos: float, far_edge: float) -> float:
+    """s until our rear bumper is past far_edge (m past the stop point; 2.4 item 7's t_clear): T_GO_LAT from rest, then the G5
+    nudge's A_LAUNCH_PLAN (the slowest launch a go can produce) up to STOP_GO_V_MAX, from the car's speed now once moving."""
+    d = far_edge - pos + CAR_LEN_M
+    if d <= 0.:
+      return 0.
+    a, vmax = sr.A_LAUNCH_PLAN, sr.STOP_GO_V_MAX
+    v0 = min(max(f.v_ego, 0.), vmax)
+    lat = sr.T_GO_LAT if f.v_ego < STAND_V else 0.
+    d_acc = (vmax * vmax - v0 * v0) / (2. * a)
+    if d <= d_acc:
+      return lat + (math.sqrt(v0 * v0 + 2. * a * d) - v0) / a
+    return lat + (vmax - v0) / a + (d - d_acc) / vmax
+
+  def _arrival_holds(self, f: Frame, pos: float, walks) -> list[Hold]:
+    """2.4 item 7's arrival clause (P16): a person not standing still, a track or a raw box seen on RAW_PED_RUNS of the last
+    RAW_PED_OF runs of its view, that would reach a crosswalk on our path (walks: (x0, x1 camera x, its far edge m past the stop
+    point, which)) before our rear bumper has cleared it plus PED_ARRIVE_MARGIN_S blocks the go: t_arr = d_lo / v_hi, d_lo its
+    distance to the crosswalk at the near end of its ranging band, v_hi its speed toward it plus 2 sigma once trusted
+    (VEL_TRUST_S with VEL_TRUST_SAMPLES), PED_V_UNTRUSTED before. One moving away doesn't block; one standing still (under
+    PED_STILL_M in PED_STILL_S) is D3's (P3). A dynamic wait; during the launch the re-check withdraws the go (_going)."""
+    holds = []
+    clears = [(x0, x1, self.t_clear(f, pos, edge) + PED_ARRIVE_MARGIN_S, which) for x0, x1, edge, which in walks]
+
+    def dist(x, y, x0, x1) -> float:
+      dx = max(x0 - x, 0., x - x1)
+      dy = max(-HALF_RIGHT_M - y, 0., y - HALF_LEFT_M)
+      return math.hypot(dx, dy)
+
+    def d_lo(x, y, x0, x1) -> float:
+      return min(dist(k * x, k * y, x0, x1) for k in (1. - PED_RANGE_BAND, 1. - PED_RANGE_BAND / 2., 1., 1. + PED_RANGE_BAND / 2.,
+                                                       1. + PED_RANGE_BAND))
+
+    people = []
+    for o in f.objects or ():
+      if class_name(o.cls) != PERSON:
+        continue
+      h = list(self.peds.get(o.trackId, ()))
+      window = [s for s in h if s[0] >= self.t - sr.VEL_TRUST_S - 1e-9]
+      trusted = len(window) >= sr.VEL_TRUST_SAMPLES and h and h[-1][0] - h[0][0] >= sr.VEL_TRUST_S - 1e-9
+      if trusted:
+        then = next(s for s in h if s[0] >= self.t - PED_STILL_S - 1e-9)
+        if math.hypot(h[-1][1] - then[1], h[-1][2] - then[2]) < PED_STILL_M:
+          continue  # standing still: D3's (the curb rule), not an arrival
+      people.append((f'pedArrive:{o.trackId}', float(o.x), float(o.y), window if trusted else None))
+    tracked = [(x, y) for _, x, y, _ in people] + [(float(o.x), float(o.y)) for o in f.objects or () if class_name(o.cls) == PERSON]
+    for key, runs in self.raw_peds.items():
+      if not runs or (f.live is not None and not f.live.fresh_key(key)):
+        continue
+      for xg, y in runs[-1]:
+        x = xg - pos
+        if any(math.hypot(x - tx, y - ty) <= RAW_PED_SAME_M for tx, ty in tracked):
+          continue  # a person track's own box: the track decides
+        seen = sum(any(math.hypot(xg - bx, y - by) <= RAW_PED_SAME_M for bx, by in boxes) for boxes in runs)
+        if seen >= RAW_PED_RUNS:
+          people.append((f'pedArriveRaw:{key}', x, y, None))
+    for key, x, y, window in people:
+      for x0, x1, need, which in clears:
+        lo = d_lo(x, y, x0, x1)
+        if lo <= 0.:
+          # its ranging band (along the ray: range and offset together) reaches into the crosswalk, wherever it walks
+          holds.append(Hold(f'{key}:{which}', f"a person at the {'far ' if which == 'far' else ''}crosswalk", DYNAMIC))
+          break
+        if window is None:
+          v_hi = PED_V_UNTRUSTED
+        else:
+          ts = [s[0] for s in window]
+          ds = [dist(s[1] - pos, s[2], x0, x1) for s in window]
+          t_bar = sum(ts) / len(ts)
+          stt = sum((t - t_bar) ** 2 for t in ts)
+          slope = sum((t - t_bar) * (d - sum(ds) / len(ds)) for t, d in zip(ts, ds, strict=True)) / max(stt, 1e-9)
+          res = [d - (sum(ds) / len(ds) + slope * (t - t_bar)) for t, d in zip(ts, ds, strict=True)]
+          sigma = math.sqrt(sum(r * r for r in res) / max(len(res) - 2, 1) / max(stt, 1e-9))
+          v_hi = -slope + 2. * sigma
+        if v_hi <= 0.05:
+          continue  # moving away from it, or along it
+        if lo / v_hi < need:
+          holds.append(Hold(f'{key}:{which}', f"a person heading for the {'far ' if which == 'far' else ''}crosswalk", DYNAMIC))
+          break
     return holds
 
   def _front_zone(self, f: Frame) -> list[Hold]:
@@ -1228,15 +1350,16 @@ class StopGo:
 
   # -------------------------------------------------------------------------------------------------- withdraw and abort
 
-  def _withdraw(self, f: Frame, d: StopGoDecision, pos: float, why: str, detail: str = '') -> None:
-    """The go withdrawn before commit: G5's go ends this frame, the capped abort to M_EDGE short of dEdgeMin, and observe
-    again, the rank kept (2.6); GO_RETRIES retries while GO_ROOM_M remains, then H5."""
+  def _withdraw(self, f: Frame, d: StopGoDecision, pos: float, why: str, detail: str = '', to: float | None = None) -> None:
+    """The go withdrawn before commit: G5's go ends this frame, the capped abort to M_EDGE short of dEdgeMin (or to, m past
+    the stop point: short of the near crosswalk), and observe again, the rank kept (2.6); GO_RETRIES retries while GO_ROOM_M
+    remains, then H5."""
     self.retries += 1
     self.withdrawn = why
     cloudlog.event("turnpilot.stop_go_withdrawn", key=list(self.key), why=why, detail=detail, pos=round(pos, 2), v=round(f.v_ego, 2),
                    go_t=round(self.t - self.go['t'], 2), retries=self.retries, takeover_s=round(self.takeover_s, 2))
     self.go = None
-    self.aborting = {'to': self.edges.d_min - sr.M_EDGE, 'why': detail or why}
+    self.aborting = {'to': self.edges.d_min - sr.M_EDGE if to is None else to, 'why': detail or why}
     self.state, self.clear_s = 'observe', 0.
     d.withdraw, d.prompt, d.speed_cap, d.action = why, 'waitingForCross', NO_SPEED_CAP, 'waitingCross'
     d.reason = f"Stopping short: {detail or why}"

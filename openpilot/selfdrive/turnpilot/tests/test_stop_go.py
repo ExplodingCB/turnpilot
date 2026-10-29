@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.turnpilot import stop_go as sg
 from openpilot.selfdrive.turnpilot import stop_rules as sr
 from openpilot.selfdrive.turnpilot.go_override import GO_ACCEL, GO_END_SPEED, GoCertifier
 from openpilot.selfdrive.turnpilot.hooks import plan_accel
@@ -1125,6 +1126,84 @@ def test_P1_P10_people_crossing_in_front_are_a_dynamic_wait_with_no_timeout_and_
   assert len(chimes) == 2 and all(out[k].reason == "Waiting for cross traffic" for k in chimes)
   w.objects = lambda ww: ()
   assert first_go(w.run(3.)) is not None
+
+
+def walker(tid, d_along, y0, vy, t0=0.):
+  """World.objects: a person walking across our road's line d_along m past the stop point, from y0 m left of our axis at
+  vy m/s from t0 on, seen from where the car is now."""
+  def objects(w):
+    t = w.t_cam - 100.
+    if t < t0:
+      return ()
+    pos = w.sg.pos_ref + (w.odo - w.sg.odo_ref) if w.sg.token is not None else -w.control.d
+    return (person(tid, w.sg.setback + d_along - pos, y0 + vy * (t - t0), vy=vy),)
+  return objects
+
+
+def test_P16_a_person_heading_for_the_near_crosswalk_blocks_the_go_until_they_have_crossed(tmp_path):
+  # 2.4 item 7's arrival clause: on the right sidewalk 15 m out walking at 1.4 m/s toward the near crosswalk (between the
+  # stop point and dEdgeMin, where the capped abort may not end short of it). With only the zones the go came at 3 s with
+  # the person 10.8 m out, 5 s before they reached the crosswalk our car was still on
+  w = World(tmp_path)
+  w.objects = walker(50, 5.5, -15., 1.4)
+  out = w.run(24.)
+  i = first_go(out)
+  assert i is not None
+  y_go = -15. + 1.4 * (i + 1) * DT_MDL
+  assert y_go > sg.HALF_LEFT_M  # across our path and on its way
+  approaching = out[round(1.2 / DT_MDL):round(7. / DT_MDL)]
+  assert all(any(h.key.startswith('pedArrive:50') for h in d.holds) and d.ledger == 'dynamic' for d in approaching)
+  assert all(s.accel_cap >= -2. - 1e-9 for d in out for s in d.stops)
+  # moving away from it, or standing still at the curb (D3, the curb rule's), doesn't block: the go at the usual time
+  calm = first_go(World(tmp_path).run(5.))
+  for walk in (walker(51, 5.5, -6., -1.4), walker(52, 5.5, -7., 0.)):
+    w = World(tmp_path)
+    w.objects = walk
+    out = w.run(6.)
+    assert first_go(out) == calm, [h.key for h in out[calm].holds]
+  # a raw person box no track explains, on 2 of the last 3 runs of its view, is taken at PED_V_UNTRUSTED: it blocks; one
+  # seen on a single run doesn't
+  box = dataclasses.replace(raw_box(-50., conf=0.5, xy=(7.9, -9.), view='full'), cls='pedestrian')
+  w = World(tmp_path)
+  w.boxes = lambda ww: {'full': [box]}
+  out = w.run(6.)
+  assert first_go(out) is None and any(h.key.startswith('pedArriveRaw:full') for h in out[-1].holds)
+  w = World(tmp_path)
+  n = {'k': 0}
+
+  def blip(ww):
+    n['k'] += 1
+    return {'full': [box]} if n['k'] == 9 else {}
+  w.boxes = blip
+  assert first_go(w.run(6.)) == calm
+
+
+def test_P16_a_person_heading_for_the_near_crosswalk_during_the_launch_stops_us_short_of_it_or_we_carry_on_across(tmp_path):
+  # 2.6: the arrival clause re-checked to commit. Seen early in the launch, the capped stop ends short of the crosswalk's
+  # earliest plausible near edge (dEdgeMin less its depth) less M_EDGE, never below -2.0; seen where that stop can't end
+  # short of it, the car carries on at STOP_GO_V_MAX or less rather than stop on it
+  near_edge = None
+  for early in (True, False):
+    w = Drive(tmp_path, behaviour=lambda w: 'goes', lag_s=0.3)
+    near_edge = w.sg.edges.d_min - sg.CROSSWALK_M - sr.M_EDGE if near_edge is None else near_edge
+    out = []
+    for _ in range(round(14. / DT_MDL)):
+      d = w.step()
+      out.append(d)
+      pos = w.sg.pos_ref + (w.odo - w.sg.odo_ref)
+      if d.state == 'going' and w.objects(w) == () and (d.go_t >= 0.3 if early else pos >= near_edge - 0.8):
+        w.objects = walker(60, 5.5, -9., 1.4, t0=w.t_cam - 100.)
+    near_edge = w.sg.edges.d_min - sg.CROSSWALK_M - sr.M_EDGE
+    wd = [d for d in out if d.withdraw]
+    assert all(c[3] >= -2. - 1e-9 for c in w.cmds)
+    if early:
+      assert wd and wd[0].withdraw.startswith('pedArrive:60')
+      stood = next(k for k in range(out.index(wd[0]), len(out)) if out[k].state == 'observe' and w.cmds[k][1] < 0.05)
+      assert out[stood].position_m <= near_edge + 1e-6
+    else:
+      assert not [d.withdraw for d in out if d.withdraw.startswith('pedArrive')]
+      assert any(d.state in ('committed', 'inLane') for d in out)
+      assert all(c[1] <= sr.STOP_GO_V_MAX + 0.1 for c in w.cmds if c[6] == 'going')
 
 
 def test_P2_a_person_in_the_far_crosswalk_holds_a_straight_crossing_not_a_right(tmp_path):
