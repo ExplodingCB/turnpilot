@@ -61,8 +61,10 @@ def self_signed(ip='127.0.0.1'):
           key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode())
 
 
-def make_pack(files: dict[str, bytes], region='indianapolis', version='2026-10-27', manifest_files=None, extra=(), manifest=True):
-  """A corridor tar. manifest_files overrides the listed checksums; extra is a list of TarInfo-building callables."""
+def make_pack(files: dict[str, bytes], region='indianapolis', version='2026-10-27', manifest_files=None, extra=(), manifest=True,
+              manifest_extra=None):
+  """A corridor tar. manifest_files overrides the listed checksums; extra is a list of TarInfo-building callables;
+  manifest_extra more manifest keys (the server's osm_timestamp)."""
   listed = manifest_files if manifest_files is not None else {n: hashlib.sha256(d).hexdigest() for n, d in files.items()}
   buf = io.BytesIO()
   with tarfile.open(fileobj=buf, mode='w') as tar:
@@ -71,7 +73,8 @@ def make_pack(files: dict[str, bytes], region='indianapolis', version='2026-10-2
       info.size = len(data)
       tar.addfile(info, io.BytesIO(data))
     if manifest:
-      add('manifest.json', json.dumps({'region': region, 'version': version, 'route_km': 4.2, 'files': listed}).encode())
+      add('manifest.json', json.dumps({'region': region, 'version': version, 'route_km': 4.2, 'files': listed,
+                                       **(manifest_extra or {})}).encode())
     for name, data in files.items():
       add(name, data)
     for build in extra:

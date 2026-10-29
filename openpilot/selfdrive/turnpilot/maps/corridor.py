@@ -1,8 +1,11 @@
 """A corridor pack from /v1/corridor: verified against its manifest, unpacked to its own directory, old ones pruned.
 
-The pack is a tar of manifest.json and a Valhalla tile hierarchy under tiles/. Every member is checked before anything
-is written: regular files and directories only, relative paths with no '..', nothing outside manifest.json and tiles/,
-and exactly the files the manifest lists, each with its SHA-256. Any problem rejects the whole pack.
+The pack is a tar of manifest.json, a Valhalla tile hierarchy under tiles/, and the OSM stop-sign sidecar's shards for
+those tiles under osm_controls/ (<level-2 tile index>.json, routing/osm_sidecar.py; a server from before the sidecar sends
+none, which navd then says out loud). The manifest carries the region's osm_timestamp, the stamp the shards must bear. Every
+member is checked before anything is written: regular files and directories only, relative paths with no '..', nothing
+outside manifest.json, tiles/ and osm_controls/<digits>.json, and exactly the files the manifest lists, each with its
+SHA-256. Any problem rejects the whole pack.
 """
 import gzip
 import hashlib
@@ -20,6 +23,7 @@ from openpilot.selfdrive.turnpilot.maps.client import MapError, storage_error
 
 MANIFEST = 'manifest.json'
 TILES = 'tiles'
+SHARDS = 'osm_controls'  # the OSM stop-sign sidecar (routing/osm_sidecar.py)
 KEEP_PACKS = 3
 STALE_DOWNLOAD_S = 3600.  # a download this old was cut off by a crash or a restart
 MAX_MANIFEST = 16 * 1024 * 1024
@@ -78,9 +82,15 @@ def member_path(name: str) -> str:
   if any(len(p.encode()) > 255 for p in parts):  # longer than a filename can be: the server's mistake, not the comma's storage
     raise bad_pack(f"path component too long in {name[:80]!r}")
   path = '/'.join(parts)
-  if path != MANIFEST and parts[0] != TILES:
+  if path != MANIFEST and parts[0] != TILES and not (parts[0] == SHARDS and (len(parts) == 1 or is_shard(path))):
     raise bad_pack(f"unexpected file {path!r}")
   return path
+
+
+def is_shard(path: str) -> bool:
+  """'osm_controls/756425.json': a sidecar shard, named for the level-2 tile it covers."""
+  parts = path.split('/')
+  return len(parts) == 2 and parts[0] == SHARDS and parts[1].endswith('.json') and parts[1][:-5].isdigit() and parts[1][:-5].isascii()
 
 
 def read_manifest(tar: tarfile.TarFile, member: tarfile.TarInfo) -> dict:
@@ -96,7 +106,7 @@ def read_manifest(tar: tarfile.TarFile, member: tarfile.TarInfo) -> dict:
   if not isinstance(manifest.get('region'), str) or not isinstance(manifest.get('version'), str):
     raise bad_pack("manifest has no region or version")
   for name, digest in manifest['files'].items():
-    if member_path(name) != name or name == MANIFEST or not name.startswith(TILES + '/'):
+    if member_path(name) != name or name == MANIFEST or not (name.startswith(TILES + '/') or is_shard(name)):
       raise bad_pack(f"manifest lists {name!r}")
     if not (isinstance(digest, str) and len(digest) == 64 and all(c in '0123456789abcdef' for c in digest.lower())):
       raise bad_pack(f"manifest checksum for {name!r} is not SHA-256")

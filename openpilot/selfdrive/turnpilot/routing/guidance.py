@@ -179,12 +179,22 @@ def fill_guidance(instruction, steps, step_idx, distance_to_maneuver, opposing=N
   instruction.throughLanes, instruction.throughLanesDistance = through_lanes(steps, step_idx, distance_to_maneuver)
 
 
+def control_msg(c, distance: float, ident: int) -> dict:
+  """A NavInstruction.MapControl for a route's or a lookup's control (routing/controls.py), with its junction when it has
+  one (a stop or yield: MapJunction, routing/junctions.py)."""
+  out = {'id': ident, 'kind': c.kind, 'distance': float(distance), 'lineMapped': c.line_mapped, 'junction': c.junction,
+         'crossSuspect': c.cross_suspect}
+  info = getattr(c, 'junction_info', None)
+  if info is not None:
+    out['junctionInfo'] = info.to_msg()
+  return out
+
+
 def fill_controls(instruction, controls, status: str, car_along: float):
   """navInstruction.controls and controlsStatus: the route's controls (routing/controls.py) from CONTROLS_BEHIND_M behind
   the car to CONTROLS_AHEAD_M ahead, nearest first along the route, at most MAX_CONTROLS, their distances in
-  maneuverDistance's frame (car_along: the steps before the car's, then along its step)."""
+  maneuverDistance's frame (car_along: the steps before the car's, then along its step), each with its junction."""
   instruction.controlsStatus = status
   near = sorted(((c.route_m - car_along, c) for c in controls if -CONTROLS_BEHIND_M < c.route_m - car_along < CONTROLS_AHEAD_M),
                 key=lambda dc: dc[0])[:MAX_CONTROLS]
-  instruction.controls = [{'id': c.id, 'kind': c.kind, 'distance': float(d), 'lineMapped': c.line_mapped, 'junction': c.junction,
-                           'crossSuspect': c.cross_suspect} for d, c in near]
+  instruction.controls = [control_msg(c, d, c.id) for d, c in near]

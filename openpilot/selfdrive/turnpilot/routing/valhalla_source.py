@@ -1,5 +1,14 @@
-"""Valhalla as a route source: pyvalhalla in this process when it imports, else a local valhalla_service."""
+"""Valhalla as a route source: pyvalhalla in this process when it imports, else a local valhalla_service.
+
+route() takes exclude, the stop-sign avoidance loop's points (navd, routing/certify.py; STOP_SIGNS.md 3.3): each
+{lat, lon, heading} goes out as an exclude_location with heading_tolerance EXCLUDE_HEADING_TOL, the heading the approach
+edge's local bearing at the point, so only the direction that arrives at the stop is excluded. Valhalla's limit on them,
+service_limits.max_exclude_locations (50 by default), is raised to MAX_EXCLUDE_LOCATIONS on both config paths: the
+get_config() dict a corridor's or a tile directory's Actor is built from, and a valhalla.json, loaded and edited first.
+A valhalla_service (the HTTP fallback) keeps its own config: it is a developer's, and refuses past its limit out loud.
+"""
 import importlib
+import json
 import math
 import os
 import sys
@@ -9,7 +18,9 @@ from pathlib import Path
 import requests
 
 from openpilot.common.swaglog import cloudlog
-from openpilot.selfdrive.turnpilot.routing.controls import actor_call, controls_ahead, http_call, opposing_roads, route_controls
+from openpilot.selfdrive.turnpilot.routing.controls import (LocateCache, Opposing, actor_call, controls_ahead, exclusion_headings, http_call,
+                                                            opposing_roads, own_edge, route_controls)
+from openpilot.selfdrive.turnpilot.stop_rules import EXCLUDE_HEADING_TOL, MAX_EXCLUDE_LOCATIONS
 
 # tools/turnpilot/install_valhalla_device.sh puts pyvalhalla here, since the system venv is read-only
 DEVICE_PYVALHALLA = '/data/turnpilot/pyvalhalla'
@@ -43,6 +54,12 @@ def locate(tiles) -> dict | None:
   if any(child.is_dir() and child.name.isdigit() for child in path.iterdir()):  # a tile hierarchy: 0/, 1/, 2/
     return {'extract': '', 'dir': str(path)}
   return None
+
+
+def with_exclude_limit(config: dict) -> dict:
+  """A Valhalla config with service_limits.max_exclude_locations raised to MAX_EXCLUDE_LOCATIONS (module docstring)."""
+  config.setdefault('service_limits', {})['max_exclude_locations'] = MAX_EXCLUDE_LOCATIONS
+  return config
 
 
 def tiles_usable(tiles) -> bool:
@@ -87,6 +104,8 @@ class ValhallaSource:
     self.actor = None
     # navd's route job and its off-route lookup run in threads of their own: one call into the actor at a time
     self.lock = threading.Lock()
+    self.cache = LocateCache()  # Q1 and Q2 for the lookups ahead, by edge id: this source's tiles only
+    self.opposing_of: tuple | None = None  # (steps, their opposing roads) from the last controls() that read them
     if self.url:
       return
     valhalla = import_valhalla()
@@ -94,12 +113,12 @@ class ValhallaSource:
       self.url = os.environ.get('TURNPILOT_VALHALLA_URL', DEFAULT_URL)
       cloudlog.warning(f"pyvalhalla is not installed: routing through valhalla_service at {self.url}")
     elif 'config' in where:
-      self.actor = valhalla.Actor(where['config'])
+      self.actor = valhalla.Actor(with_exclude_limit(json.loads(Path(where['config']).read_text())))
     else:
-      self.actor = valhalla.Actor(valhalla.get_config(tile_extract=where['extract'], tile_dir=where['dir']))
+      self.actor = valhalla.Actor(with_exclude_limit(valhalla.get_config(tile_extract=where['extract'], tile_dir=where['dir'])))
 
-  def request(self, start, destination, bearing, language) -> dict:
-    """Valhalla's /route request for what navd gives Mapbox, with the bearing as the start's heading."""
+  def request(self, start, destination, bearing, language, exclude=None) -> dict:
+    """Valhalla's /route request for what navd gives Mapbox, with the bearing as the start's heading, and the exclusions."""
     origin = {'lon': start[0], 'lat': start[1]}
     if bearing is not None and math.isfinite(bearing):  # a GPS fix without a heading can report NaN
       origin.update(heading=round(bearing) % 360, heading_tolerance=HEADING_TOLERANCE)
@@ -114,10 +133,13 @@ class ValhallaSource:
     }
     if language is not None:
       request['language'] = language
+    if exclude:
+      request['exclude_locations'] = [{'lat': float(p['lat']), 'lon': float(p['lon']), 'heading': round(float(p['heading'])) % 360,
+                                       'heading_tolerance': EXCLUDE_HEADING_TOL} for p in exclude]
     return request
 
-  def route(self, start, destination, bearing, language):
-    request = self.request(start, destination, bearing, language)
+  def route(self, start, destination, bearing, language, exclude=None):
+    request = self.request(start, destination, bearing, language, exclude)
     if self.actor is not None:
       with self.lock:
         r = self.actor.route(request)
@@ -127,20 +149,39 @@ class ValhallaSource:
       r = resp.json()
     return r['routes'][0]['legs'][0]['steps'] if len(r.get('routes', [])) else []
 
-  def controls(self, steps, tiles_dir=None):
+  def controls(self, steps, tiles_dir=None, *, sidecar_dir, context=None):
     """(controls, status) along the route steps (routing/controls.py). tiles_dir: the tiles' directory when their
     controls must be checked for (local tiles: the controls_built marker and the sim's sidecar), None when the tiles come
-    from real OSM."""
-    return route_controls(self._call(), steps, tiles_dir)
+    from real OSM. sidecar_dir: where the OSM stop-sign sidecar and the tiles' stamp are (routing/osm_sidecar.py), always
+    given (sources.py), so no route goes without it unsaid. context: the surveys and overrides the junctions are read
+    against (routing/junctions.py). The opposing roads are read in the same batched locate, for opposing()."""
+    out = Opposing()
+    result = route_controls(self._call(), steps, tiles_dir, sidecar_dir, opposing=out, context=context)
+    self.opposing_of = (steps, out.roads) if out.roads is not None else None
+    return result
 
   def opposing(self, steps):
-    """{step index: (m/s, lanes)} of the roads straight across the route's maneuvers (routing/controls.py: opposing_roads)."""
+    """{step index: (m/s, lanes)} of the roads straight across the route's maneuvers (routing/controls.py: opposing_roads):
+    the last controls()' for these very steps, else read alone (it didn't run its batched locate, or other steps)."""
+    done = self.opposing_of
+    if done is not None and done[0] is steps:
+      return dict(done[1])
     return opposing_roads(self._call(), steps)
 
-  def controls_ahead(self, position, heading, tiles_dir=None):
+  def controls_ahead(self, position, heading, tiles_dir=None, *, sidecar_dir, context=None):
     """(controls, status, road) ahead of the car at position (lat, lon) heading that way (routing/controls.py:
-    controls_ahead), each with its stop point. tiles_dir: as for controls()."""
-    return controls_ahead(self._call(), position, heading, tiles_dir)
+    controls_ahead), each with its stop point. tiles_dir, sidecar_dir and context: as for controls(); Q1 and Q2 kept in
+    this source's cache between lookups."""
+    return controls_ahead(self._call(), position, heading, tiles_dir, sidecar_dir, context=context, cache=self.cache)
+
+  def own_edge(self, position, heading):
+    """(way id, forward, end node (lat, lon)) of the edge the car at position (lat, lon) heading that way is on, or None
+    (routing/controls.py: own_edge)."""
+    return own_edge(self._call(), position, heading)
+
+  def exclusion_headings(self, points):
+    """Valhalla's own heading at each exclusion point [(lat, lon, way id, forward)], or None (routing/controls.py)."""
+    return exclusion_headings(self._call(), points)
 
   def _call(self):
     if self.actor is None:

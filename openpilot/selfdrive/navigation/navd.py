@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
+import datetime
+import os
 import threading
+import time
 
 import numpy as np
 
@@ -7,11 +10,16 @@ import openpilot.cereal.messaging as messaging
 from openpilot.common.params import Params
 from openpilot.common.realtime import Ratekeeper
 from openpilot.common.swaglog import cloudlog
+from openpilot.common.time_helpers import system_time_valid
 from openpilot.selfdrive.navigation.helpers import latest_gps_source
 from openpilot.selfdrive.navigation.route import along_path, local_meters
 from openpilot.selfdrive.turnpilot.routing.controls import haversine
-from openpilot.selfdrive.turnpilot.routing.guidance import CONTROLS_AHEAD_M, CONTROLS_BEHIND_M, MAX_CONTROLS, fill_controls, fill_guidance
+from openpilot.selfdrive.turnpilot.routing.guidance import (CONTROLS_AHEAD_M, CONTROLS_BEHIND_M, MAX_CONTROLS, control_msg, fill_controls,
+                                                            fill_guidance)
 from openpilot.selfdrive.turnpilot.maps.client import MapError
+from openpilot.selfdrive.turnpilot.maps import surveys
+from openpilot.selfdrive.turnpilot import stop_rules, visibility_table
+from openpilot.selfdrive.turnpilot.routing import avoid, certify
 from openpilot.selfdrive.turnpilot.routing.sources import MapRouter
 
 REROUTE_DISTANCE = 25
@@ -23,6 +31,31 @@ ROUTE_RESEND_PERIOD = 10  # updates (seconds); a restarted mapsd gets the route 
 RECOMPUTE_HOLD = 10  # updates (seconds) between route requests
 SKIP_MATCH_M = 50.  # TurnPilot: a skipped turn is this step's maneuver if turnpilotd's distance to it is this close to navd's
 OFF_ROUTE_MATCH_M = 20.  # TurnPilot: a lookup's control this close to one of the last lookup's, of its kind, is that one
+# TurnPilot (stop signs, STOP_SIGNS.md 3.3): the avoidance loop's time bound, checked between its reroutes (navd sends invalid
+# instructions while a route job runs, and a long loop on a reroute can trip off_route_unknown's 5 m/s cap). Measured
+# 2026-10-28 on Kellen's Mac (Apple silicon; the comma four at 192.168.43.1 didn't answer): one iteration (a reroute with its
+# exclusions, then the route's controls: trace_attributes and two batched locates) on the Indianapolis region tiles took a
+# median 0.051 s, p90 0.074 s, max 0.080 s over 101 iterations on 36 trips. Allowing the comma four 6x the Mac's worst, all
+# MAX_AVOID_ITER (8) iterations take 3.8 s.
+AVOID_TIME_S = 4.0
+AVOID_PARAM = 'TurnPilotAvoidStops'
+
+
+def wall_clock() -> float | None:
+  """TurnPilot: Unix time for the sun's position at a control's ETA, or None while the system clock isn't valid yet (before
+  GPS time), when the certifier can't place the sun and fails the light check."""
+  return datetime.datetime.now(datetime.UTC).timestamp() if system_time_valid() else None
+
+
+def eta_of(steps, control, now: float | None) -> float | None:
+  """Unix time the car starting the route steps now reaches control (its step and the m along it); None without a clock."""
+  if now is None:
+    return None
+  t = sum(float(st.get('duration', 0.)) for st in steps[:control.step_idx])
+  if 0 <= control.step_idx < len(steps):
+    st = steps[control.step_idx]
+    t += float(st.get('duration', 0.)) * min(max(control.along_step_m / max(float(st.get('distance', 0.)), 1.), 0.), 1.)
+  return now + t
 
 
 def set_banner(instruction, banners, distance_to_maneuver):
@@ -54,6 +87,12 @@ class RouteJob(threading.Thread):
     self.controls: list = []  # TurnPilot: the route's stop signs, yields and signals (turnpilot/routing/controls.py)
     self.controls_status = 'none'
     self.opposing: dict = {}  # TurnPilot: {step index: (m/s, lanes)} of the roads across its maneuvers (routing/controls.py)
+    # TurnPilot (stop signs): the destination's exclusions, whether to avoid, the runtime inputs the route is certified
+    # with, and what the avoidance loop did (routing/avoid.py)
+    self.avoid = engine.avoid_set(destination)
+    self.avoid_on = engine.avoid_stops_on()
+    self.runtime = engine.runtime_inputs()
+    self.avoid_status, self.avoided, self.avoid_added_s = 'none', 0, 0.
 
   def run(self):
     router, destination = self.engine.router, self.destination
@@ -75,6 +114,13 @@ class RouteJob(threading.Thread):
       except Exception:
         cloudlog.exception("navd: route controls failed")
         self.controls, self.controls_status = [], 'failed'
+      # TurnPilot: every stop and yield the certifier can't certify is routed around (routing/avoid.py), here off navd's
+      # loop; a failure keeps the route and says so (avoidStatus failed)
+      try:
+        self.avoid_stops(router)
+      except Exception:
+        cloudlog.exception("navd: stop-sign avoidance failed")
+        self.avoid_status = 'failed'
       # the opposing roads' mapped speeds, for the unprotected left's required clear range: unknown on a failure (the left then
       # takes 45 mph and is skipped past the detector's range), never a guess lower
       try:
@@ -82,6 +128,36 @@ class RouteJob(threading.Thread):
       except Exception:
         cloudlog.exception("navd: route opposing roads failed")
         self.opposing = {}
+
+
+  def avoid_stops(self, router):
+    engine, destination, language = self.engine, self.destination, self.language
+    now = engine.clock()
+
+    def certify_one(control, steps):
+      eta = eta_of(steps, control, now)
+      result = engine.certifier(control, eta, self.runtime)
+      control.eta_window = (eta - self.runtime.window[0], eta + self.runtime.window[1]) if result[0] == 'certifiable' and eta is not None else None
+      return result
+
+    def reroute(exclude):
+      if not hasattr(router, 'reroute'):
+        return None
+      position, bearing = engine.position()
+      return router.reroute(position, destination, bearing, language, exclude)
+
+    def own_edge():
+      position, bearing = engine.position()
+      return router.own_edge(position, bearing) if hasattr(router, 'own_edge') and position is not None else None
+
+    def headings(points):
+      return router.exclusion_headings(points) if hasattr(router, 'exclusion_headings') else [None for _ in points]
+
+    result = avoid.run(self.steps, self.controls, self.controls_status, self.avoid, certify=certify_one, reroute=reroute,
+                       route_controls=router.controls, own_edge=own_edge, cancelled=self.cancel.is_set,
+                       deadline=engine.monotonic() + AVOID_TIME_S, monotonic=engine.monotonic, enabled=self.avoid_on, headings=headings)
+    self.steps, self.controls, self.controls_status = result.steps, result.controls, result.controls_status
+    self.avoid_status, self.avoided, self.avoid_added_s = result.status, result.avoided, result.added_s
 
 
 class AheadJob(threading.Thread):
@@ -102,10 +178,20 @@ class AheadJob(threading.Thread):
 
 
 class RouteEngine:
-  def __init__(self, sm, pm, params=None, router=None, background=True):
+  def __init__(self, sm, pm, params=None, router=None, background=True, clock=wall_clock, monotonic=time.monotonic, certifier=None):
     self.sm = sm
     self.pm = pm
     self.params = params if params is not None else Params()
+    # TurnPilot (stop signs, STOP_SIGNS.md 3.2-3.3): the wall clock (the sun's position at each control's ETA), the monotonic
+    # one (AVOID_TIME_S), the certifier (certifier(control, eta, runtime) -> (certification, reason); routing/certify.py on
+    # maps/visibility.json and maps/surveyed_junctions.json by default), the exclusions per destination, what the last
+    # route's avoidance did, the runtime inputs it was certified with, and a re-run pending (an ETA left its window)
+    self.clock, self.monotonic = clock, monotonic
+    self.certifier = certifier if certifier is not None else self.certify_default
+    self.avoid_sets: dict = {}
+    self.avoid_status, self.avoided, self.avoid_added_s = 'none', 0, 0.
+    self.route_runtime = None
+    self.avoid_rerun = False
 
     self.last_position = None  # (longitude, latitude)
     self.last_bearing = None
@@ -195,6 +281,94 @@ class RouteEngine:
     """(position, bearing) now, for a route job that finishes a download."""
     return self.last_position, self.last_bearing
 
+  def avoid_set(self, destination) -> avoid.AvoidSet:
+    """TurnPilot: the stop-sign exclusions for destination, kept across every route to it; a new destination clears them."""
+    if destination not in self.avoid_sets:
+      self.avoid_sets = {destination: avoid.AvoidSet()}
+    return self.avoid_sets[destination]
+
+  def avoid_stops_on(self) -> bool:
+    """TurnPilot: TurnPilotAvoidStops (on unless set off; step S3 sets it off to keep the junctions it validates). A build
+    whose params don't know it avoids, said."""
+    try:
+      value = self.params.get(AVOID_PARAM)
+    except Exception as e:
+      cloudlog.warning(f"navd: {AVOID_PARAM} unreadable ({type(e).__name__}): avoiding stops")
+      return True
+    if isinstance(value, bytes):
+      value = value.decode(errors='replace')
+    return value not in (False, 0, '0', 'false', 'False', 'off')
+
+  def runtime_inputs(self) -> certify.Runtime:
+    """TurnPilot: what the certifier reads at route time besides the files: the mode turnpilotd acts in and whether its side
+    views are live (turnpilotPlan.stopGo, SG4a; until it publishes them, the mode from TurnPilotStopSignGo and the side views
+    off), and TurnPilotStopLaunch."""
+    mode, side = certify.stop_sign_mode(self.params), False
+    if 'turnpilotPlan' in self.sm.data and self.sm.valid.get('turnpilotPlan', False):
+      try:
+        go = self.sm['turnpilotPlan'].stopGo
+        side, mode = bool(go.sideViewsLive), str(go.mode) or mode
+      except Exception:
+        pass
+    return certify.Runtime(mode=mode, side_views=side, a_launch=stop_rules.a_launch_plan(self.params))
+
+  @staticmethod
+  def runtime_key(runtime: certify.Runtime) -> tuple:
+    return runtime.mode, runtime.side_views, runtime.a_launch
+
+  def certify_default(self, control, eta, runtime):
+    """TurnPilot: routing/certify.py on the shipped visibility and survey files (a sim table only where the sim says so)."""
+    visibility = visibility_table.cached(visibility_table.SHIPPED, sim_ok=self.sim_tables_ok())
+    return certify.certify_control(control, visibility, surveys.cached(surveys.SHIPPED).entries, eta, runtime)
+
+  def sim_tables_ok(self) -> bool:
+    """TurnPilot: a sim visibility table is read only with SIMULATION=1, TurnPilotSimLightOracle and a sim car."""
+    if os.environ.get('SIMULATION') != '1':
+      return False
+    try:
+      from opendbc.car.structs import car  # card.py's CarParams (openpilot.cereal has no car)
+      oracle = self.params.get(visibility_table.SIM_PARAM)
+      raw = self.params.get('CarParams')
+      if not raw:
+        return visibility_table.sim_accepted(os.environ, oracle, None)
+      with car.CarParams.from_bytes(raw) as cp:  # read inside: the reader is gone once the message is closed
+        return visibility_table.sim_accepted(os.environ, oracle, cp)
+    except Exception:
+      cloudlog.exception("navd: the sim's CarParams don't read: no sim visibility table")
+      return False
+
+  def avoid_rerun_due(self) -> bool:
+    """TurnPilot: the stop-sign avoidance must run again for this route (STOP_SIGNS.md 3.2): a runtime input it was
+    certified with changed (N11), or a certified control's ETA left the window its light check passed for (N14). Once."""
+    if self.route is None or self.job is not None:
+      return False
+    if self.avoid_rerun:
+      self.avoid_rerun = False
+      return True
+    key = self.runtime_key(self.runtime_inputs())
+    if self.route_runtime is not None and key != self.route_runtime:
+      cloudlog.event("navd.stop_runtime_changed", was=list(self.route_runtime), now=list(key))
+      self.route_runtime = key
+      return True
+    return False
+
+  def check_eta_drift(self, car_along: float) -> None:
+    """TurnPilot: N14, each certified control still ahead: its ETA now (the route's durations, as timeRemaining) outside the
+    window its light check passed for queues the avoidance loop again (a re-run route certifies at the new ETAs)."""
+    now = self.clock()
+    if self.avoid_rerun or self.route is None or now is None:
+      return
+    t_car = avoid.time_at(self.route, car_along)
+    for c in self.controls:
+      window = getattr(c, 'eta_window', None)
+      if window is None or c.route_m < car_along:
+        continue
+      eta = now + avoid.time_at(self.route, c.route_m) - t_car
+      if not window[0] <= eta <= window[1]:
+        cloudlog.event("navd.stop_eta_drift", control=c.id, eta=round(eta, 1), window=[round(w, 1) for w in window])
+        self.avoid_rerun = True
+        return
+
   def recompute_route(self, gps_ok: bool):
     if self.last_position is None:
       return
@@ -226,7 +400,8 @@ class RouteEngine:
     self.recompute_hold -= 1
     skipped_past = self.skipped_turn_passed() or self.missed_off_route()  # TurnPilot: a reroute past a skipped or missed
                                                                           # turn waits for nothing
-    if skipped_past or new_destination != self.requested_destination or (self.should_recompute() and self.recompute_hold <= 0):
+    rerun = self.avoid_rerun_due()  # TurnPilot: nor does a stop-sign certification that changed
+    if skipped_past or rerun or new_destination != self.requested_destination or (self.should_recompute() and self.recompute_hold <= 0):
       self.recompute_hold = RECOMPUTE_HOLD
       self.calculate_route(new_destination)
       self.reroute_counter = 0
@@ -266,6 +441,8 @@ class RouteEngine:
     self.route = job.steps
     self.controls, self.controls_status = job.controls, job.controls_status
     self.opposing = job.opposing
+    self.avoid_status, self.avoided, self.avoid_added_s = job.avoid_status, job.avoided, job.avoid_added_s
+    self.route_runtime, self.avoid_rerun = self.runtime_key(job.runtime), False
     self.route_count += 1
     self.route_geometry = [np.array(step['geometry']['coordinates'], dtype=np.float64).reshape((-1, 2)) for step in self.route]
     self.step_idx = 0
@@ -278,6 +455,9 @@ class RouteEngine:
     msg.navInstruction.routeCount = self.route_count
     # and the controls' status on every message too; an invalid one carries no controls
     msg.navInstruction.controlsStatus = self.controls_status if self.route is not None else 'none'
+    # and what the stop-sign avoidance did for this route (routing/avoid.py)
+    msg.navInstruction.avoidStatus = self.avoid_status if self.route is not None else 'none'
+    msg.navInstruction.avoidedControls = min(self.avoided, 65535) if self.route is not None else 0
 
     # TurnPilot: a job while there is a route is a reroute for the same destination (a new one clears the route), as when
     # the car left the corridor and a new one downloads for minutes. The car is off this route meanwhile: its distances
@@ -320,6 +500,7 @@ class RouteEngine:
     # TurnPilot: the controls in maneuverDistance's frame, the steps' distances and then along this step's geometry
     car_along = sum(s['distance'] for s in self.route[:self.step_idx]) + along_geometry
     fill_controls(msg.navInstruction, self.controls, self.controls_status, car_along)
+    self.check_eta_drift(car_along)
 
     # Total remaining distance and time: the rest of this step, then every step after it
     remaining = 1.0 - along_geometry / max(step['distance'], 1)
@@ -369,8 +550,7 @@ class RouteEngine:
     along, _ = along_path(self.off_road, self.last_position)
     near = sorted(((c.route_m - along, i, c) for i, c in self.off_controls if -CONTROLS_BEHIND_M < c.route_m - along < CONTROLS_AHEAD_M),
                   key=lambda dic: dic[0])[:MAX_CONTROLS]
-    ni.offRouteControls = [{'id': i, 'kind': c.kind, 'distance': float(d), 'lineMapped': c.line_mapped, 'junction': c.junction,
-                            'crossSuspect': c.cross_suspect} for d, i, c in near]
+    ni.offRouteControls = [control_msg(c, d, i) for d, i, c in near]
 
   def collect_ahead(self):
     """TurnPilot: a finished lookup ahead becomes the off-route controls; one the last lookup had (its kind, its stop point

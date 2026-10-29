@@ -44,7 +44,8 @@ def make_region(root, rid, geometry, files, router):
     p = d / rel
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(data)
-    level, idx = tiles.parse_path(rel.removeprefix('tiles/'))
+    # a sidecar shard (osm_controls/<level-2 tile>.json) is indexed as the level-2 tile it covers, as build_region.py does
+    level, idx = (2, int(Path(rel).stem)) if rel.startswith('osm_controls/') else tiles.parse_path(rel.removeprefix('tiles/'))
     index[rel] = [level, idx, hashlib.sha256(data).hexdigest(), len(data)]
   (d / 'fence.geojson').write_text(json.dumps({'type': 'Feature', 'geometry': geometry, 'properties': {}}))
   (d / 'meta.json').write_text(json.dumps({'id': rid, 'name': rid.title(), 'osm_timestamp': 't', 'built_at': 'b'}))
@@ -134,6 +135,40 @@ def test_corridor_returns_nearby_tiles_with_checksums(server):
       assert hashlib.sha256(tar.extractfile(rel).read()).hexdigest() == sha
   assert set(manifest['files']) == set(names[1:])
   assert manifest['region'] == 'indianapolis' and manifest['route_km'] == 12.35
+
+
+def shard_rel(lon, lat):
+  return f"osm_controls/{tiles.parse_path(tile_rel(2, lon, lat).removeprefix('tiles/'))[1]}.json"
+
+
+def test_corridor_carries_the_sidecar_shards_of_its_tiles_when_asked(tmp_path):
+  """The OSM stop-sign sidecar's shards go with the corridor's own level-2 tiles, listed with their SHA-256, and the
+  manifest carries the region's osm_timestamp the car checks them against. Only a car that asks gets them: an older car's
+  corridor.py refuses any file outside tiles/, so shards sent unasked would fail every download it makes."""
+  near, far = tile_rel(2, -86.1, 39.8), tile_rel(2, -80.1, 45.8)
+  files = {near: b'near', far: b'far', shard_rel(-86.1, 39.8): b'{"near": 1}', shard_rel(-80.1, 45.8): b'{"far": 1}'}
+  maps = Maps([make_region(tmp_path, 'indianapolis', SQUARE, files, FakeRouter([[-86.2, 39.7], [-86.0, 39.9]]))], KEY)
+  _, manifest, paths = maps.corridor((-86.2, 39.7), (-86.0, 39.9), osm_controls=True)
+  assert paths == sorted([near, shard_rel(-86.1, 39.8)])
+  assert manifest['files'][shard_rel(-86.1, 39.8)] == hashlib.sha256(b'{"near": 1}').hexdigest()
+  assert manifest['osm_timestamp'] == 't'
+  _, manifest, paths = maps.corridor((-86.2, 39.7), (-86.0, 39.9))
+  assert paths == [near] and manifest['osm_timestamp'] == 't'
+
+
+def test_corridor_request_asks_for_the_sidecar_over_http(server):
+  base, maps, near, _ = server
+  shard = shard_rel(-86.1, 39.8)
+  region = maps.regions[0]
+  (region.path / 'osm_controls').mkdir()
+  (region.path / shard).write_bytes(b'{}')
+  region.index[shard] = (2, int(Path(shard).stem), hashlib.sha256(b'{}').hexdigest(), 2)
+  for ask in (True, False):
+    body = {'start': [-86.2, 39.7], 'destination': [-86.0, 39.9]} | ({'osm_controls': True} if ask else {})
+    r = requests.post(base + '/v1/corridor', json=body, headers=auth(), timeout=5)
+    with tarfile.open(fileobj=io.BytesIO(r.content)) as tar:
+      names = tar.getnames()
+      assert near in names and (shard in names) == ask and [n for n in names if n.startswith('osm_controls/')] == ([shard] if ask else [])
 
 
 @pytest.mark.parametrize('start,dest,which', [

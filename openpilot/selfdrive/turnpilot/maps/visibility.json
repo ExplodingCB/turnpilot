@@ -1,0 +1,21 @@
+{
+ "cameraSetbackM": null,
+ "lateralOffsetM": null,
+ "heightM": null,
+ "lens": null,
+ "mask": null,
+ "darkThreshold": null,
+ "veil": "unmeasured",
+ "actuatorDelayS": null,
+ "allowProvisionalFor": "allWay",
+ "tables": [
+  {"source": "provisional", "bound": "conservative", "view": "road", "lighting": "day", "bins": [[0, 150], [20, 0]], "cars": 0,
+   "date": "2026-10-28", "note": "PV1 (STOP_SIGNS.md 1.6): the road camera under 20 deg, unprotected_left.ROAD_RANGE_M's provisional 150 m, unmeasured"},
+  {"source": "provisional", "bound": "conservative", "view": "full", "lighting": "day", "bins": [[0, 28], [40, 0]], "cars": 0,
+   "date": "2026-10-28", "note": "PV1: the full wide pass 28 m to 40 deg (PV0's value, unmeasured), 0 past it (R_SEEN.md 1: under 80% per frame)"},
+  {"source": "provisional", "bound": "conservative", "view": "side", "lighting": "day", "bins": [[0, 0], [52.5, 32]], "cars": 0,
+   "date": "2026-10-28", "note": "PV1: the side views from their inner edge, R_SEEN.md's 80%-per-frame reach, conservative; 40-52.5 deg is the inner band (rule 3a)"},
+  {"source": "provisional", "bound": "optimistic", "view": "side", "lighting": "day", "bins": [[0, 0], [52.5, 44]], "cars": 0,
+   "date": "2026-10-28", "note": "PV1, optimistic: read only by route_audit's predicted reach"}
+ ]
+}

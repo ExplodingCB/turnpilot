@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import requests
 
 from openpilot.selfdrive.navigation.navd import RouteEngine
@@ -20,6 +21,7 @@ from openpilot.selfdrive.turnpilot.maps.status import STATUS_PARAM, read_status
 from openpilot.selfdrive.turnpilot.maps.tests.fakes import (CHICAGO, INDY_EAST, KEY, SEATTLE, MapServer, coverage_doc, level2_tile, make_pack,
                                                             self_signed, tile_files)
 from openpilot.selfdrive.turnpilot.routing import valhalla_source
+from openpilot.selfdrive.turnpilot.routing.osm_sidecar import NO_DIRECTORY
 from openpilot.selfdrive.turnpilot.routing.sources import PACKS_DIR, REFUSED_RETRY_SECONDS, RETRY_SECONDS, MapRouter
 from openpilot.selfdrive.turnpilot.routing.tests.test_valhalla_routing import HAVE_VALHALLA, TURN_LANES_OSM, build_tiles
 from openpilot.selfdrive.turnpilot.routing.valhalla_source import ValhallaSource, locate, tiles_usable
@@ -97,10 +99,32 @@ class TestValhalla(unittest.TestCase):
     self.assertEqual(source.request(START, DESTINATION, 300.2, None)['locations'][0]['heading'], 300)
 
   def test_config_file(self):
+    # the local-tiles path builds its Actor from a config file: loaded and edited, so exclude_locations take 200 points
     with patch.object(valhalla_source, 'import_valhalla', fake_valhalla), tempfile.TemporaryDirectory() as directory:
       config = Path(directory) / 'valhalla.json'
-      config.write_text('{}')
-      self.assertEqual(ValhallaSource(str(config)).actor.config, str(config))
+      config.write_text(json.dumps({'mjolnir': {'tile_dir': '/t'}, 'service_limits': {'max_exclude_locations': 50, 'auto': {'max_distance': 9}}}))
+      got = ValhallaSource(str(config)).actor.config
+    self.assertEqual(got, {'mjolnir': {'tile_dir': '/t'}, 'service_limits': {'max_exclude_locations': 200, 'auto': {'max_distance': 9}}})
+
+  def test_corridor_config_raises_the_exclude_limit(self):
+    # a corridor's (or a tile directory's) Actor is built from get_config(): the limit is raised in that dict
+    with patch.object(valhalla_source, 'import_valhalla', fake_valhalla), tempfile.TemporaryDirectory() as tiles:
+      (Path(tiles) / 'tiles').mkdir()
+      config = ValhallaSource(tiles).actor.config
+    self.assertEqual(config['service_limits']['max_exclude_locations'], 200)
+    self.assertEqual(config['tile_dir'], str(Path(tiles) / 'tiles'))
+
+  def test_exclude_locations_carry_the_approach_edges_bearing(self):
+    with patch.object(valhalla_source, 'import_valhalla', fake_valhalla), tempfile.TemporaryDirectory() as tiles:
+      (Path(tiles) / 'tiles').mkdir()
+      source = ValhallaSource(tiles)
+      source.route(START, DESTINATION, 92.4, 'en', exclude=[{'lat': 39.771, 'lon': -86.165, 'heading': 271.6},
+                                                             {'lat': 39.772, 'lon': -86.163, 'heading': 359.7}])
+    self.assertEqual(source.actor.requests[0]['exclude_locations'],
+                     [{'lat': 39.771, 'lon': -86.165, 'heading': 272, 'heading_tolerance': 30},
+                      {'lat': 39.772, 'lon': -86.163, 'heading': 0, 'heading_tolerance': 30}])
+    self.assertNotIn('exclude_locations', source.request(START, DESTINATION, 90, None))
+    self.assertNotIn('exclude_locations', source.request(START, DESTINATION, 90, None, exclude=[]))
 
   def test_http_fallback(self):
     response = MagicMock(status_code=200)
@@ -141,6 +165,48 @@ class TestValhalla(unittest.TestCase):
       self.assertEqual(path, sys.path)
 
 
+class TestValhallaJunctions(unittest.TestCase):
+  """ValhallaSource's side of the junctions (SG1b): a route's opposing roads come from its controls' one batched Q2 locate,
+  read alone only when that didn't run, and its lookups ahead keep Q1 and Q2 in the source's own LocateCache."""
+
+  def source(self):
+    from openpilot.selfdrive.turnpilot.routing.tests.test_route_controls import StubJunction, leg
+    stub = StubJunction([(0., 100., {'stop': True}), (100., 200., {}), (200., 400., {})],
+                        {100.: [leg(90.), leg(270.)], 200.: [leg(0., kph=56, **{'in': 2}), leg(90.), leg(270., exit=True)]})
+    with patch.object(valhalla_source, 'import_valhalla', return_value=None):
+      source = ValhallaSource('http://127.0.0.1:1')
+    source._call = lambda: stub
+    return source, stub
+
+  def test_the_opposing_roads_ride_in_the_controls_q2(self):
+    from openpilot.selfdrive.turnpilot.routing.tests.test_route_controls import opposing_steps
+    source, stub = self.source()
+    steps = opposing_steps()
+    controls, status = source.controls(steps, sidecar_dir=None)
+    self.assertEqual((status, [c.kind for c in controls]), ('ok', ['stop']))
+    before = len(stub.requests)
+    self.assertEqual(source.opposing(steps), {0: (56 / 3.6, 2)})
+    self.assertEqual(len(stub.requests), before)  # no third call
+    self.assertEqual(source.opposing(list(steps)), {0: (56 / 3.6, 2)})  # other steps: read alone
+    self.assertEqual(len(stub.requests), before + 1)
+    with tempfile.TemporaryDirectory() as unmarked:  # unsupported tiles: no Q2, the opposing roads read alone all the same
+      steps = opposing_steps()
+      self.assertEqual(source.controls(steps, unmarked, sidecar_dir=None), ([], 'unsupported'))
+      self.assertEqual(source.opposing(steps), {0: (56 / 3.6, 2)})
+
+  def test_lookups_ahead_keep_q1_and_q2_in_the_sources_cache(self):
+    from openpilot.selfdrive.turnpilot.routing.tests.test_route_controls import StubRoadJunction, leg, pt
+    source, _ = self.source()
+    stub = StubRoadJunction([(0., 100., {'stop': True}), (100., 400., {})], road=[(0., 100.), (100., 400.)],
+                            junctions={100.: [leg(90.), leg(270.)]})
+    source._call = lambda: stub
+    first = source.controls_ahead(pt(0.), 3., sidecar_dir=None)
+    stub.requests.clear()
+    again = source.controls_ahead(pt(4.), 3., sidecar_dir=None)
+    self.assertEqual([c.kind for c in again[0]], [c.kind for c in first[0]])
+    self.assertEqual([r for e, r in stub.requests if e == 'locate' and 'heading' not in r['locations'][0]], [])
+
+
 class FakeValhalla:
   """Stands in for ValhallaSource on a corridor or the local tiles: records what it was built on and routed."""
 
@@ -150,16 +216,19 @@ class FakeValhalla:
   def __call__(self, tiles):
     if self.test.broken_tiles:
       raise RuntimeError('tiles do not load')
-    source = SimpleNamespace(tiles=tiles, calls=[], tiles_dir=tiles, controls_calls=[])
+    # as ValhallaSource: a valhalla_service URL has no tiles directory
+    source = SimpleNamespace(tiles=tiles, calls=[], tiles_dir=None if tiles.startswith('http') else tiles, controls_calls=[], contexts=[])
 
-    def controls(steps, tiles_dir=None):
-      source.controls_calls.append((steps, tiles_dir))
+    def controls(steps, tiles_dir=None, *, sidecar_dir, context=None):
+      source.controls_calls.append((steps, tiles_dir, sidecar_dir))
+      source.contexts.append(context)
       return [], 'ok'
 
     source.controls = controls
 
-    def controls_ahead(position, heading, tiles_dir=None):
-      source.controls_calls.append(('ahead', position, heading, tiles_dir))
+    def controls_ahead(position, heading, tiles_dir=None, *, sidecar_dir, context=None):
+      source.controls_calls.append(('ahead', position, heading, tiles_dir, sidecar_dir))
+      source.contexts.append(context)
       return [], 'ok', [position, position]
 
     source.controls_ahead = controls_ahead
@@ -170,13 +239,27 @@ class FakeValhalla:
 
     source.opposing = opposing
 
-    def route(start, destination, bearing, language):
+    def route(start, destination, bearing, language, exclude=None):
       source.calls.append((start, destination, bearing, language))
+      source.excludes.append(exclude)
       if self.test.route_error is not None:
         raise self.test.route_error
       return self.test.steps
 
     source.route = route
+    source.excludes = []
+
+    def own_edge(position, heading):
+      source.controls_calls.append(('own', position, heading))
+      return self.test.own
+
+    source.own_edge = own_edge
+
+    def exclusion_headings(points):
+      source.controls_calls.append(('headings', list(points)))
+      return [349. for _ in points]
+
+    source.exclusion_headings = exclusion_headings
     self.test.built.append(source)
     return source
 
@@ -194,6 +277,7 @@ class RouterCase(unittest.TestCase):
     self.server.corridor = (200, make_pack({level2_tile(*START): b'tile'}), 'application/x-tar')
     self.params = self.server.params()
     self.steps, self.route_error, self.broken_tiles, self.built = STEPS, None, False, []
+    self.own = (812, True, (39.77, -86.16))
     self.router = MapRouter(self.params, self.maps, valhalla=FakeValhalla(self))
     # Mapbox went through requests.get; the map client only uses requests.request
     self.enterContext(patch('requests.get', side_effect=AssertionError('nothing may call requests.get (Mapbox)')))
@@ -216,7 +300,7 @@ class RouterCase(unittest.TestCase):
 class TestMapRouter(RouterCase):
   def test_routes_on_the_downloaded_corridor(self):
     self.assertEqual(self.router.route(START, DESTINATION, 90, 'en'), STEPS)
-    self.assertEqual(self.server.corridor_requests(), [{'start': list(START), 'destination': list(DESTINATION)}])
+    self.assertEqual(self.server.corridor_requests(), [{'start': list(START), 'destination': list(DESTINATION), 'osm_controls': True}])
     (source,) = self.built
     pack = Path(source.tiles)
     self.assertEqual(pack.parent, self.maps / PACKS_DIR)
@@ -230,10 +314,15 @@ class TestMapRouter(RouterCase):
     self.assertEqual(downloads[-1]['progress'], 1.0)
     self.assertEqual(list((self.maps / PACKS_DIR).glob('.download-*')), [])  # the tar is gone once unpacked
 
-  def test_corridor_controls_need_no_marker(self):
+  def test_corridor_controls_need_no_marker_and_read_the_packs_sidecar(self):
+    # tiles from real OSM carry their controls (no marker); the OSM stop-sign sidecar is the pack's own osm_controls/,
+    # checked against its manifest's osm_timestamp (routing/osm_sidecar.py), for the route and the road ahead off it
     steps = self.router.route(START, DESTINATION, 90, 'en')
     self.router.controls(steps)
-    self.assertEqual(self.built[0].controls_calls, [(steps, None)])
+    pack = self.router.corridor.pack.path
+    self.assertEqual(self.built[0].controls_calls, [(steps, None, pack)])
+    self.router.controls_ahead(START, 90.)
+    self.assertEqual(self.built[0].controls_calls[-1], ('ahead', START[::-1], 90., None, pack))
 
   def test_reroutes_on_the_same_corridor(self):
     self.router.route(START, DESTINATION, 90, 'en')
@@ -250,7 +339,7 @@ class TestMapRouter(RouterCase):
     self.server.corridor = (200, make_pack({level2_tile(*START): b'tile', level2_tile(*outside): b'more'}), 'application/x-tar')
     self.params.writes.clear()
     self.assertEqual(self.router.route(outside, DESTINATION, 0, 'en'), STEPS)
-    self.assertEqual(self.server.corridor_requests()[-1], {'start': list(outside), 'destination': list(DESTINATION)})
+    self.assertEqual(self.server.corridor_requests()[-1], {'start': list(outside), 'destination': list(DESTINATION), 'osm_controls': True})
     self.assertEqual(self.built[-1].calls, [(outside, DESTINATION, 0, 'en')])
     self.assertEqual(self.states(), ['downloading', 'downloading', 'ready'])  # the driver sees the new download
     self.assertEqual(self.status()['destination'], list(DESTINATION))
@@ -279,7 +368,7 @@ class TestMapRouter(RouterCase):
   def test_routes_from_where_the_car_is_once_the_download_is_done(self):
     later = (-86.165, 39.771)
     self.assertEqual(self.router.route(START, DESTINATION, 90, 'en', position=lambda: (later, 45)), STEPS)
-    self.assertEqual(self.server.corridor_requests(), [{'start': list(START), 'destination': list(DESTINATION)}])
+    self.assertEqual(self.server.corridor_requests(), [{'start': list(START), 'destination': list(DESTINATION), 'osm_controls': True}])
     self.assertEqual(self.built[0].calls, [(later, DESTINATION, 45, 'en')])
 
   def test_a_cancelled_download_stops_quietly(self):
@@ -457,6 +546,74 @@ class TestMapRouter(RouterCase):
     self.assertEqual(self.status()['state'], 'idle')
 
 
+class TestReroute(RouterCase):
+  """reroute(): the avoidance loop's route with exclusions (STOP_SIGNS.md 3.3), status-neutral: it never writes
+  TurnPilotMapStatus and never downloads; a route that leaves the corridor, or any routing failure, is None (a failed
+  iteration) and leaves the served route alone."""
+  EXCLUDE = [{'lat': 39.771, 'lon': -86.165, 'heading': 271.6}]
+
+  def test_on_the_corridor(self):
+    first = self.router.route(START, DESTINATION, 90, 'en')
+    self.params.writes.clear()
+    self.steps = [dict(s) for s in STEPS]  # another route
+    got = self.router.reroute(START, DESTINATION, 90, 'en', self.EXCLUDE)
+    self.assertIs(got, self.steps)
+    self.assertEqual(self.built[0].excludes[-1], self.EXCLUDE)
+    self.assertEqual(self.params.writes, [])  # no status
+    self.assertEqual(len(self.server.corridor_requests()), 1)  # no download
+    self.assertEqual(self.router.controls(got), ([], 'ok'))  # served: its controls come from the same source
+    self.assertEqual(self.router.controls(first), ([], 'failed'))
+
+  def test_leaving_the_corridor_is_a_failed_iteration_not_a_download(self):
+    first = self.router.route(START, DESTINATION, 90, 'en')
+    self.params.writes.clear()
+    self.steps = [{**STEPS[0], 'geometry': {'type': 'LineString', 'coordinates': [list(START), [-85.9, 39.8]]}}] + STEPS[1:]
+    self.assertIsNone(self.router.reroute(START, DESTINATION, 90, 'en', self.EXCLUDE))
+    self.assertEqual((self.params.writes, len(self.server.corridor_requests())), ([], 1))
+    self.assertEqual(self.router.controls(first), ([], 'ok'))  # the previous route is still the served one
+    outside = (-86.4, 40.25)
+    self.steps = STEPS
+    self.assertIsNone(self.router.reroute(outside, DESTINATION, 90, 'en', self.EXCLUDE))  # the car off the corridor
+    self.assertEqual((self.params.writes, len(self.server.corridor_requests())), ([], 1))
+
+  def test_a_routing_failure_or_no_route_is_a_failed_iteration(self):
+    first = self.router.route(START, DESTINATION, 90, 'en')
+    self.params.writes.clear()
+    self.route_error = RuntimeError('No path could be found for input')
+    self.assertIsNone(self.router.reroute(START, DESTINATION, 90, 'en', self.EXCLUDE))
+    self.route_error, self.steps = None, []
+    self.assertIsNone(self.router.reroute(START, DESTINATION, 90, 'en', self.EXCLUDE))
+    self.assertEqual(self.params.writes, [])
+    self.assertEqual(self.router.controls(first), ([], 'ok'))
+
+  def test_another_destination_or_nothing_routed_yet_is_a_failed_iteration(self):
+    self.assertIsNone(self.router.reroute(START, DESTINATION, 90, 'en', self.EXCLUDE))
+    self.router.route(START, DESTINATION, 90, 'en')
+    self.assertIsNone(self.router.reroute(START, (-86.161, 39.775), 90, 'en', self.EXCLUDE))
+    self.assertEqual(len(self.server.corridor_requests()), 1)
+
+  def test_on_local_tiles(self):
+    self.params.values['TurnPilotValhallaTiles'] = '/sim/tiles'
+    coverage_path(self.maps).unlink()
+    self.router.route(CHICAGO, CHICAGO, 90, 'en')
+    self.params.writes.clear()
+    got = self.router.reroute(CHICAGO, CHICAGO, 90, 'en', self.EXCLUDE)
+    self.assertIs(got, self.steps)
+    self.assertEqual((self.built[0].excludes[-1], self.params.writes), (self.EXCLUDE, []))
+
+  def test_exclusion_headings_from_the_source_that_routed(self):
+    self.assertEqual(self.router.exclusion_headings([(39.8, -86.1, 5, True)]), [None])  # nothing routed: the shape's bearing stays
+    self.router.route(START, DESTINATION, 90, 'en')
+    self.assertEqual(self.router.exclusion_headings([(39.8, -86.1, 5, True)]), [349.])
+    self.assertEqual(self.built[0].controls_calls[-1], ('headings', [(39.8, -86.1, 5, True)]))
+
+  def test_own_edge_from_the_source_that_routed(self):
+    self.assertIsNone(self.router.own_edge(START, 90.))  # nothing routed
+    self.router.route(START, DESTINATION, 90, 'en')
+    self.assertEqual(self.router.own_edge(START, 90.), self.own)
+    self.assertEqual(self.built[0].controls_calls[-1], ('own', START[::-1], 90.))
+
+
 class TestLocalOverride(RouterCase):
   def test_local_tiles_skip_the_geofence_and_the_download(self):
     self.params.values['TurnPilotValhallaTiles'] = '/sim/tiles'
@@ -485,8 +642,39 @@ class TestLocalOverride(RouterCase):
     coverage_path(self.maps).unlink()
     steps = self.router.route(CHICAGO, CHICAGO, 90, 'en')
     self.assertEqual(self.router.controls(steps), ([], 'ok'))
-    self.assertEqual(self.built[0].controls_calls, [(steps, '/sim/tiles')])
+    self.assertEqual(self.built[0].controls_calls, [(steps, '/sim/tiles', '/sim/tiles')])  # the local tiles hold their sidecar
     self.assertEqual(self.router.controls(list(steps)), ([], 'failed'))
+
+  def test_the_junctions_read_the_surveys_and_the_overrides_param(self):
+    """The controls' junctions are read against surveyed_junctions.json and TurnPilotJunctionOverrides, on the route and
+    off it; a param this build doesn't know is not readable, which controls.py says (every junction failed, partial)."""
+    from openpilot.common.params import UnknownKeyName
+    from openpilot.selfdrive.turnpilot.maps import surveys
+    self.params.values['TurnPilotValhallaTiles'] = '/sim/tiles'
+    self.params.values['TurnPilotJunctionOverrides'] = json.dumps([{'approach': '900:790:f', 'kind': 'no', 'evidence': 'a runner at 8 m/s'}])
+    coverage_path(self.maps).unlink()
+    entry = {'osmNodeId': 900, 'lat': 39.8, 'lon': -86.15, 'date': '2026-10-20', 'source': 'inPerson', 'confirmedBy': [],
+             'approaches': [{'wayId': 1, 'bearingDeg': 0, 'stops': True, 'plaque': True, 'postedMph': 20, 'laneEdgeM': 4.,
+                             'lineM': 7., 'nearestParkingM': {'left': 40., 'right': 40.}, 'sightM': 60.}], 'validations': []}
+    with tempfile.TemporaryDirectory() as d:
+      path = Path(d) / 'surveyed_junctions.json'
+      path.write_text(json.dumps([entry]))
+      with patch.object(surveys, 'SHIPPED', path):
+        steps = self.router.route(CHICAGO, CHICAGO, 90, 'en')
+        self.router.controls(steps)
+        self.router.controls_ahead((-87.6, 41.8), 90.)
+    for ctx in self.built[0].contexts:
+      self.assertEqual((ctx.overrides_ok, set(ctx.overrides), [e['osmNodeId'] for e in ctx.surveys]), (True, {'900:790:f'}, [900]))
+
+    def unknown(key, *args, **kwargs):
+      if key == 'TurnPilotJunctionOverrides':
+        raise UnknownKeyName(key)
+      return self.params.values.get(key)
+    with patch.object(self.params, 'get', side_effect=unknown):
+      self.router.controls(steps)
+    ctx = self.built[0].contexts[-1]
+    self.assertFalse(ctx.overrides_ok)
+    self.assertIn('unknown to this build', ctx.overrides_error)
 
   def test_controls_ahead_on_the_local_tiles_before_any_route(self):
     """Off the route before the first route is in (navd's off-route lookup), the local tiles answer: the sim's first
@@ -494,9 +682,17 @@ class TestLocalOverride(RouterCase):
     self.assertEqual(self.router.controls_ahead((-87.6, 41.8), 90.)[:2], ([], 'failed'))
     self.params.values['TurnPilotValhallaTiles'] = '/sim/tiles'
     self.assertEqual(self.router.controls_ahead((-87.6, 41.8), 90.)[:2], ([], 'ok'))
-    self.assertEqual(self.built[0].controls_calls, [('ahead', (41.8, -87.6), 90., '/sim/tiles')])
+    self.assertEqual(self.built[0].controls_calls, [('ahead', (41.8, -87.6), 90., '/sim/tiles', '/sim/tiles')])
     self.router.route(CHICAGO, CHICAGO, 90, 'en')
     self.assertEqual(len(self.built), 1)  # the same actor routes
+
+  def test_a_valhalla_service_has_no_directory_for_a_sidecar_which_is_said(self):
+    # a sidecar is expected everywhere: a valhalla_service URL has none to read, which controls.py says (partial)
+    self.params.values['TurnPilotValhallaTiles'] = 'http://127.0.0.1:8002'
+    coverage_path(self.maps).unlink()
+    steps = self.router.route(CHICAGO, CHICAGO, 90, 'en')
+    self.router.controls(steps)
+    self.assertEqual(self.built[0].controls_calls, [(steps, None, NO_DIRECTORY)])
 
   def test_local_tiles_fail_loudly(self):
     self.params.values['TurnPilotValhallaTiles'] = '/sim/tiles'
@@ -584,3 +780,77 @@ class TestRealCorridor(unittest.TestCase):
 
 if __name__ == '__main__':
   unittest.main()
+
+
+def test_the_overrides_param_is_a_persistent_string_key():
+  """TurnPilotJunctionOverrides (STOP_SIGNS.md 9) survives restarts: an approach downgraded on site stays avoided until
+  Kellen clears it. Unset, it is empty. It is STRING, JSON text navd parses itself: a JSON key's Params.get reads a value
+  that doesn't parse as unset (a cloudlog warning, None), which would silently clear every downgrade."""
+  import re
+  header = (Path(__file__).parents[4] / 'common' / 'params_keys.h').read_text()
+  assert re.search(r'\{"TurnPilotJunctionOverrides", \{PERSISTENT, STRING\}\}', header)
+
+
+class StandIn:
+  """The real Params, TurnPilotJunctionOverrides read from another key of the type wanted: this worktree's libparams
+  predates the key (scons isn't run here; the header test above pins its type)."""
+  def __init__(self, params, key):
+    self.params, self.key = params, key
+
+  def get(self, key, *args, **kwargs):
+    assert key == 'TurnPilotJunctionOverrides'
+    return self.params.get(self.key)
+
+  def get_type(self, key):
+    return self.params.get_type(self.key)
+
+  def get_param_path(self, key=''):
+    return self.params.get_param_path(self.key)
+
+
+OVERRIDE = [{'approach': '900:790:f', 'kind': 'no', 'evidence': {'speed': 8.2}}]
+CORRUPT = (b'[{"approach": "900:790:f", "kind": "no", "evid', b'', b'\xff\xfe[]', b'{"approach": "900:790:f"}', b'[{"approach": 1}]')
+
+
+def test_an_overrides_value_that_does_not_parse_is_unreadable_on_the_real_params(tmp_path):
+  """On the real Params (STRING, as params_keys.h declares it): unset is empty and readable, a value written as SG4b writes
+  one reads back, and any value that doesn't parse as the list (a truncated write, an empty file, bytes that aren't UTF-8,
+  which a STRING key's Params.get also reads as unset, or a wrong shape) is unreadable, never an empty list, so navd says
+  partial and fails every junction. The key as SG1b first declared it (JSON) was read as unset when it didn't parse: a
+  build whose params declare it anything but STRING is unreadable too."""
+  from openpilot.common.params import Params
+  from openpilot.selfdrive.turnpilot.routing.junctions import read_overrides
+  params = Params(str(tmp_path))
+  real = StandIn(params, 'TurnPilotValhallaTiles')
+  assert params.get_type('TurnPilotValhallaTiles').name == 'STRING'
+  assert read_overrides(real) == ({}, True, '')
+  params.put('TurnPilotValhallaTiles', json.dumps(OVERRIDE), block=True)
+  assert read_overrides(real) == ({'900:790:f': {'kind': 'no', 'evidence': {'speed': 8.2}}}, True, '')
+  path = Path(params.get_param_path('TurnPilotValhallaTiles'))
+  for bad in CORRUPT:
+    path.write_bytes(bad)
+    overrides, ok, why = read_overrides(real)
+    assert (overrides, ok) == ({}, False) and "TurnPilotJunctionOverrides doesn't parse" in why, bad
+  as_json = StandIn(params, 'TurnPilotFavorites')
+  params.put('TurnPilotFavorites', OVERRIDE, block=True)
+  Path(params.get_param_path('TurnPilotFavorites')).write_bytes(CORRUPT[0])
+  assert params.get('TurnPilotFavorites') is None  # what made a corrupt value silent
+  overrides, ok, why = read_overrides(as_json)
+  assert (overrides, ok) == ({}, False) and 'JSON' in why and 'STRING' in why
+
+
+def test_the_overrides_param_itself_on_the_real_params(tmp_path):
+  """The key itself, once libparams is built from this params_keys.h (scons; skipped where it predates the key)."""
+  from openpilot.common.params import Params, UnknownKeyName
+  from openpilot.selfdrive.turnpilot.routing.junctions import read_overrides
+  params = Params(str(tmp_path))
+  try:
+    params.check_key('TurnPilotJunctionOverrides')
+  except UnknownKeyName:
+    pytest.skip("this build's libparams predates TurnPilotJunctionOverrides: run scons")
+  assert read_overrides(params) == ({}, True, '')
+  params.put('TurnPilotJunctionOverrides', json.dumps(OVERRIDE), block=True)
+  assert read_overrides(params)[:2] == ({'900:790:f': {'kind': 'no', 'evidence': {'speed': 8.2}}}, True)
+  for bad in CORRUPT:
+    Path(params.get_param_path('TurnPilotJunctionOverrides')).write_bytes(bad)
+    assert read_overrides(params)[:2] == ({}, False), bad

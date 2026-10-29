@@ -370,6 +370,16 @@ def test_controls_status_not_ok_is_loud():
   assert out.alert == 'none' and out.reason == ''
 
 
+def test_partial_controls_still_stop_and_are_said():
+  """navd's partial (STOP_SIGNS.md N7: the OSM stop-sign sidecar missing or stale, so the stops Valhalla doesn't flag are
+  unknown; routing/controls.py): Valhalla's own stops are still stopped for, and the status is said all the way."""
+  car = Car([(150., 'stop')], status='partial')
+  out, dec, _ = car.step()
+  assert out.alert == 'mapControlsUnavailable' and out.reason == 'Map stops/signals: partial'
+  out, dec = car.run_until(held)
+  assert 140. < car.s < 150.
+
+
 def test_light_rejected_alert():
   car = Car([(300., 'signal')])
   out, dec, _ = car.step(lights=Lights(None, 'simOracle', rejected=True))

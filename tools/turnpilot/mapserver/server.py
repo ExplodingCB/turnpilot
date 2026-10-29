@@ -3,10 +3,14 @@
 
   GET  /v1/health     {"ok": true, "regions": [...]}, no key needed
   GET  /v1/coverage   the drivable areas as a GeoJSON FeatureCollection, with a "version"
-  POST /v1/corridor   {"start": [lon, lat], "destination": [lon, lat]} -> a tar of manifest.json and tiles/
+  POST /v1/corridor   {"start": [lon, lat], "destination": [lon, lat], "osm_controls": true}
+                      -> a tar of manifest.json, tiles/ and, when asked, osm_controls/
 
 Every /v1 call but health needs "Authorization: Bearer <key>". A corridor is every tile within BUFFER_KM of
-the route, so the car can reroute locally without a connection. Start and destination must both be inside
+the route, so the car can reroute locally without a connection. With "osm_controls": true it also carries the OSM
+stop-sign sidecar's shards for its level-2 tiles (osm_controls.py), which the index lists beside the tiles; a car from
+before the sidecar doesn't ask, and gets the tiles alone, which its pack check accepts. The manifest carries the region's
+osm_timestamp, the stamp the car checks the shards against. Start and destination must both be inside
 one region's fence, or the server refuses with a 422 that says why. The corridor is built in a temp file before
 anything is sent, so it goes out with a Content-Length the car checks, and any failure is a clean 5xx.
 
@@ -18,8 +22,10 @@ server, lock the cars out, or exhaust its 1 GB.
 Each region is a directory under --regions, written by build_region.py:
   fence.geojson  the drivable area, a Feature with a Polygon or MultiPolygon
   meta.json      {"id", "name", "osm_timestamp", "built_at"}
-  index.json     {"tiles/2/000/756/425.gph": [level, index, sha256, size], ...}
+  index.json     {"tiles/2/000/756/425.gph": [level, index, sha256, size], ...,
+                  "osm_controls/756425.json": [2, level-2 index, sha256, size], ...}
   tiles/         the tile hierarchy
+  osm_controls/  the sidecar's shards, one per level-2 tile
   tiles.tar      the same tiles as one extract, which Valhalla routes from
 """
 import argparse
@@ -56,6 +62,7 @@ REQUEST_TIMEOUT = 60.  # s a client may stall on one socket write while a respon
 MAX_CONNECTIONS = 32  # open connections; more are closed at once, so idle sockets can't exhaust threads or memory
 MAX_PER_ADDRESS = 4  # open connections from one address: a car needs one or two, and one host can't take all 32
 MAX_CORRIDORS = 2  # corridors built or sent at once; each is a temp file of up to a few hundred MB
+SHARDS = 'osm_controls'  # the OSM stop-sign sidecar's shards (osm_controls.py)
 SEND_CHUNK = 256 * 1024
 
 log = logging.getLogger("turnpilot-maps")
@@ -151,13 +158,14 @@ class Maps:
       raise Refusal(422, {'error': 'different_regions'})
     return shared[0]
 
-  def corridor(self, start, destination) -> tuple[Region, dict, list[str]]:
+  def corridor(self, start, destination, osm_controls: bool = False) -> tuple[Region, dict, list[str]]:
+    """osm_controls: the sidecar's shards too, for the same level-2 tiles."""
     region = self.region_for(start, destination)
     line, km = region.route_line(start, destination)
-    grid = {rel: (v[0], v[1]) for rel, v in region.index.items()}
+    grid = {rel: (v[0], v[1]) for rel, v in region.index.items() if osm_controls or not rel.startswith(SHARDS + '/')}
     paths = tiles.needed(grid, line, BUFFER_KM)
     manifest = {'region': region.id, 'version': self.version, 'route_km': round(km, 2), 'buffer_km': BUFFER_KM,
-                'files': {rel: region.index[rel][2] for rel in paths}}
+                'osm_timestamp': region.meta.get('osm_timestamp'), 'files': {rel: region.index[rel][2] for rel in paths}}
     return region, manifest, paths
 
 
@@ -342,9 +350,11 @@ def make_handler(maps: Maps, request_timeout: float = REQUEST_TIMEOUT, header_ti
         raise Refusal(400, {'error': 'bad_request', 'detail': 'body is not JSON'}) from e
       if not isinstance(body, dict):
         raise Refusal(400, {'error': 'bad_request'})
-      region, manifest, paths = maps.corridor(point(body.get('start')), point(body.get('destination')))
+      region, manifest, paths = maps.corridor(point(body.get('start')), point(body.get('destination')), body.get('osm_controls') is True)
       size = sum(region.index[rel][3] for rel in paths)
-      log.info("corridor %s: %.1f km, %d tiles, %.1f MB", region.id, manifest['route_km'], len(paths), size / 1e6)
+      shards = sum(1 for rel in paths if rel.startswith(SHARDS + '/'))
+      log.info("corridor %s: %.1f km, %d tiles, %d sidecar shards, %.1f MB", region.id, manifest['route_km'], len(paths) - shards, shards,
+               size / 1e6)
 
       # built in a temp file first, so a failure is a proper error response, and the car gets a Content-Length that
       # shows it whether the download broke off

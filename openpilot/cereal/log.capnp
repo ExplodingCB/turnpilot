@@ -2496,6 +2496,10 @@ struct NavInstruction {
   # the road straight across the junction (routing/controls.py: opposing_legs)
   maneuverOpposingSpeed @25 :Float32;
   maneuverOpposingLanes @26 :UInt8;
+  # TurnPilot (stop signs, SG2 fills both; navd before SG2 sends 0 and none): how many stop and yield controls the route's
+  # avoidance loop routed around (excluded and rerouted, turnpilot/routing/certify.py), and how the loop ended
+  avoidedControls @27 :UInt16;
+  avoidStatus @28 :AvoidStatus;
 
   enum Opposing {
     unknown @0;  # no intersection data for the junction (or a navd from before the field)
@@ -2508,8 +2512,166 @@ struct NavInstruction {
     kind @1 :ControlKind;
     distance @2 :Float32;     # m to the stop point (the line less a margin)
     lineMapped @3 :Bool;      # the line came from mapped data (the sim sidecar), not the junction less 10 m
-    junction @4 :Bool;        # other roads meet the route at its node
+    junction @4 :Bool;        # other roads meet the route at its node (its own edge's end: a stop read at the junction
+                              # it governs further on can be false here; junctionInfo says what is at that junction)
     crossSuspect @5 :Bool;    # the route's road outranks every crossing one: a stop/yield likely for the cross road
+    # TurnPilot (stop signs, SG1b): the junction at a stop or yield control's node and every road there
+    # (turnpilot/routing/junctions.py); unset (status none) on a signal, and from a navd before it
+    junctionInfo @6 :MapJunction;
+  }
+
+  # TurnPilot (STOP_SIGNS.md 3.1): a stop or yield control's junction. Units: m, deg from north (clockwise), m/s.
+  struct MapJunction {
+    status @0 :JunctionStatus;
+    osmNodeId @1 :UInt64;             # the OSM junction node (the sidecar's), 0 when not known
+    lat @2 :Float64;                  # the junction node (Valhalla's, the end of the control's edge)
+    lon @3 :Float64;
+    stopPointDistance @4 :Float32;    # m from the control's stop point (MapControl.distance's point) to the node
+    stopPointSource @5 :LineSource;
+    headingIn @6 :Float32;            # deg, the route's heading into the node (the control edge's end heading)
+    maneuver @7 :JunctionManeuver;    # the route's maneuver here (the route step within 30 m after the control, else straight)
+    turnAngle @8 :Float32;            # deg, from headingIn to the road the route leaves by (+ right, -180 to 180)
+    roundabout @9 :Bool;              # the road the route leaves by is a roundabout's
+    divided @10 :Bool;                # the junction spans more than one node (internal-intersection edges: a divided road)
+    railDistance @11 :Float32;        # m to the nearest mapped rail level crossing (the OSM sidecar's): along the route for one
+                                      # on the control's own edge however far back, else straight-line from the node within 30 m;
+                                      # -1 none; -2 unknown (no current sidecar)
+    sidecar @12 :Bool;                # the OSM stop-sign sidecar was there and current for this junction
+    suspected @13 :Bool;              # a suspected unmapped stop: every road crossing outranks ours by two or more classes and
+                                      # nothing is mapped on our approach (the control's kind is stop)
+    surveyed @14 :Bool;               # a surveyed_junctions.json entry matched this node and counts (dated within a year)
+    validated @15 :Bool;              # its validation stamp covers the lighting at the ETA (SG2; false before it)
+    certification @16 :Certification; # route time (SG2; unchecked before it)
+    certReason @17 :CertReason;
+    approaches @18 :List(JunctionApproach);  # every other road at the node(s), and the road the route leaves by (exit)
+  }
+
+  # one road at a junction, by the leg leaving the node
+  struct JunctionApproach {
+    bearing @0 :Float32;              # deg, the leg's heading leaving the node (Valhalla's begin_heading)
+    relBearing @1 :Float32;           # deg from headingIn: + right, - left, 0 straight on (-180 to 180)
+    role @2 :ApproachRole;
+    roadClass @3 :RoadClass;
+    use @4 :RoadUse;
+    inbound @5 :Bool;                 # cars come into the junction on it
+    outbound @6 :Bool;                # cars leave the junction on it
+    lanesIn @7 :UInt8;                # lanes coming in; 0 none or not known
+    lanesOut @8 :UInt8;               # lanes going out; 0 none or not known
+    valhallaControl @9 :ApproachControl;  # Valhalla's on the inbound edge; unknown when it wasn't matched (never none)
+    osmStop @10 :OsmStop;             # the OSM sidecar's stop on this approach (a give_way is none here)
+    tier @11 :AllWayTier;             # whether this approach stops (STOP_SIGNS.md 4.1)
+    taggedLimit @12 :Float32;         # m/s, the mapped maxspeed; 0 untagged or not known
+    assumedLimit @13 :Float32;        # m/s, the speed the certifier assumes (before its 1.15 factor)
+    speedSource @14 :SpeedSource;
+    wayId @15 :UInt64;                # the OSM way of its inbound edge (else its outbound); 0 not known
+    bikeLane @16 :Bool;               # a mapped bike lane (cycle_lane dedicated or separated) or contraflow cycling on it
+    shoulderM @17 :Float32;           # m: 1.5 where the map has a shoulder (no width is mapped; 1.5 m is wide enough to pass
+                                      # in), 0 where it has none, -1 not known (the inbound edge wasn't matched)
+  }
+  enum JunctionStatus {
+    none @0;          # no junction data: a signal, or a navd before SG1b
+    ok @1;
+    failed @2;        # the OSM sidecar missing or stale, the junction lookup (locate) failed, the overrides unreadable, or
+                      # the control at a node no other road meets with no junction found ahead for it
+  }
+  enum LineSource {
+    default @0;       # node less max(11 m or the mapped line, the cross road's near edge + 2 m position error + 3.3 m)
+    mappedLine @1;    # the sim's mapped line (the rule above still applies)
+    survey @2;        # the survey's stopPointM
+  }
+  enum JunctionManeuver {
+    unknown @0;       # off the route (offRouteControls): the union of maneuvers
+    straight @1;
+    left @2;          # left, slight left and sharp left
+    right @3;
+    uTurn @4;
+  }
+  enum ApproachRole {
+    left @0;          # relBearing -135 to -45: traffic from the left
+    right @1;         # 45 to 135
+    opposite @2;      # within 45 of straight on: oncoming traffic
+    exit @3;          # the road the route leaves by (off the route: the road straight on)
+    other @4;         # behind us, past 135 either way
+  }
+  enum RoadClass {
+    unknown @0;
+    motorway @1;
+    trunk @2;
+    primary @3;
+    secondary @4;
+    tertiary @5;
+    unclassified @6;
+    residential @7;
+    serviceOther @8;
+  }
+  enum RoadUse {
+    unknown @0;
+    road @1;
+    ramp @2;
+    turnChannel @3;
+    livingStreet @4;
+    serviceRoad @5;
+    driveway @6;
+    alley @7;
+    parkingAisle @8;
+    track @9;
+    cycleway @10;
+    footway @11;
+    path @12;
+    other @13;
+  }
+  enum ApproachControl {
+    none @0;
+    stop @1;
+    yield @2;
+    signal @3;
+    unknown @4;       # the leg's inbound edge wasn't matched: never read as none
+  }
+  enum OsmStop {
+    none @0;          # the sidecar shows no stop on this approach
+    stop @1;          # a stop with no stop= tag
+    all @2;           # stop=all
+    minor @3;         # stop=minor
+    unknown @4;       # no current sidecar, or the approach not matched to it
+  }
+  enum AllWayTier {
+    unknown @0;       # nothing mapped at the junction, or no current sidecar
+    no @1;            # mapped unstopped while another approach stops, stop=minor, or an override
+    mapWeak @2;       # a junction-node stop with no stop=all, an undirected one, a Valhalla flag alone, contradicting tags
+    mapStrong @3;     # a directed stop on the approach, or stop=all
+    surveyed @4;      # a counting survey records it stopping
+  }
+  enum SpeedSource {
+    survey @0;        # the survey's posted sign
+    tagged @1;        # the mapped maxspeed
+    classDefault @2;  # 30 mph residential, unclassified, service, living street; 35 tertiary; 45 secondary; 55 above
+  }
+  enum Certification {
+    unchecked @0;
+    certifiable @1;
+    uncertifiable @2;
+    unavoidable @3;
+  }
+  enum CertReason {
+    none @0;
+    noTable @1;
+    modeOff @2;
+    noLaunch @3;
+    geometry @4;
+    skew @5;
+    unknownLeg @6;
+    notSurveyed @7;
+    override @8;
+    light @9;
+    notValidated @10;
+    reach @11;
+  }
+  enum AvoidStatus {
+    none @0;          # no avoidance ran (a navd before SG2, or no route)
+    clean @1;
+    unavoidable @2;
+    failed @3;
+    keptBest @4;
   }
   enum ControlKind {
     stop @0;
@@ -2520,7 +2682,8 @@ struct NavInstruction {
     none @0;         # no route, or an old navd
     ok @1;
     walkOrSnap @2;   # the route didn't edge_walk, matched by walk_or_snap
-    partial @3;      # over 10% of the route's edges unmatched by locate
+    partial @3;      # over 10% of the route's edges unmatched by locate, or the OSM stop-sign sidecar missing or stale
+                     # (not stamped with the tiles' osm_timestamp): the stops Valhalla doesn't flag are unknown
     failed @4;       # no controls: trace_attributes failed, or an exception (the route still publishes)
     unsupported @5;  # the tiles carry no control data (no controls_built marker)
     pending @6;      # offRouteControlsStatus only: off the route, the first lookup ahead of the car not back yet

@@ -104,7 +104,8 @@ def test_corridor_download(server, tmp_path, compressed):
   wire = len(gzip.compress(pack)) if compressed else len(pack)
   assert seen[-1] == (wire, wire)  # progress counts bytes off the wire against Content-Length
   assert (wire < len(pack)) == compressed
-  assert server.corridor_requests() == [{'start': list(INDY), 'destination': list(INDY_EAST)}]
+  # the OSM stop-sign sidecar is asked for: an older car, which can't unpack it, doesn't get it
+  assert server.corridor_requests() == [{'start': list(INDY), 'destination': list(INDY_EAST), 'osm_controls': True}]
 
 
 @pytest.mark.parametrize('body,code,words', [
@@ -150,10 +151,11 @@ def test_real_map_server_corridor_through_the_client_and_unpack(tmp_path):
   from tools.turnpilot.mapserver.server import Maps, make_server
   from tools.turnpilot.mapserver.tests.test_server import SQUARE, FakeRouter, make_region, tile_rel
 
-  near = tile_rel(2, -86.1, 39.8)
+  from tools.turnpilot.mapserver.tests.test_server import shard_rel
+  near, shard = tile_rel(2, -86.1, 39.8), shard_rel(-86.1, 39.8)
   root = tmp_path / 'regions'
   root.mkdir()
-  region = make_region(root, 'indianapolis', SQUARE, {near: b'near tile ' * 5000, tile_rel(0, -86, 40): b'hw'},
+  region = make_region(root, 'indianapolis', SQUARE, {near: b'near tile ' * 5000, tile_rel(0, -86, 40): b'hw', shard: b'{"osm": 1}'},
                        FakeRouter([[-86.2, 39.7], [-86.0, 39.9]]))
   cert, key = self_signed()
   (tmp_path / 'cert.pem').write_text(cert)
@@ -167,6 +169,7 @@ def test_real_map_server_corridor_through_the_client_and_unpack(tmp_path):
     assert seen[-1][1] is not None and seen[-1][0] == seen[-1][1]  # the progress has a total, and reached it
     pack = corridor.unpack(tmp_path / 'out.tar', tmp_path / 'packs')
     assert (pack.tiles / near.removeprefix('tiles/')).read_bytes() == b'near tile ' * 5000
+    assert (pack.path / shard).read_bytes() == b'{"osm": 1}' and pack.manifest['osm_timestamp'] == 't'
   finally:
     httpd.shutdown()
     httpd.server_close()
