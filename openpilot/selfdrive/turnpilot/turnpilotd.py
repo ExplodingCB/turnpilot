@@ -1068,6 +1068,10 @@ class TurnPilot:
     if str(plan.controlPrompt) == 'none' and sg.prompt != 'none':
       plan.controlPrompt = sg.prompt
       plan.reason = sg.reason if sg.prompt in ('stopGo', 'waitingForCross') or not decision.reason else decision.reason
+    elif sg.state == 'approach' and str(sg.ledger) == 'static':
+      # standing short of a line it never latched, nothing else of TurnPilot's holding the car, waiting on its roll-up
+      # (its bound's wait, stop_go._short_wait): said over the map control's approach text
+      plan.reason = sg.reason
     if sg.alert != 'none' and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS:
       plan.controlAlert = sg.alert
     if sg.state in ('going', 'committed', 'inLane') or (sg.state in ('observe', 'ladder') and self.map_controls.held_control() is None):
