@@ -51,8 +51,9 @@ st[0-9A-Za-z][0-9A-Za-z][0-9A-Za-z][0-9A-Za-z][0-9A-Za-z][0-9A-Za-z]
 *.pkl
 *.pkl*
 !openpilot/selfdrive/modeld/models/big_*_tinygrad.pkl
-# the car needs the chestnut detector and the installer can't build it
+# the car needs the chestnut detector and its far crop, and the installer can't build them
 !openpilot/selfdrive/turnpilot/models/big_detector_1344x760_tinygrad.pkl
+!openpilot/selfdrive/turnpilot/models/big_far_detector_1344x760_tinygrad.pkl
 config.json
 compile_commands.json
 compare_runtime*.html
