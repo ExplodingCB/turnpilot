@@ -410,6 +410,34 @@ def test_property_closed_loop_every_withdrawn_go_ends_short_of_d_edge_min_and_ev
   assert withdrawn >= 5
 
 
+def test_property_closed_loop_a_go_withdrawn_on_its_last_frames_before_commit_still_ends_short_of_d_edge_min(tmp_path):
+  """The boundary of the same property (O17): the go withdrawn on its last frames before the decider's own commit point (found
+  by a first run, then replayed with a box in the near lane 1-5 frames before it), the car launching as hard as the model
+  does (MODEL_LAUNCH under the STOP_GO_V_MAX cap), for true lags 0.2-0.6 s known to T_ABORT: the capped abort ends standing
+  short of dEdgeMin every time, never below -2.0."""
+  vis = visibility(tmp_path)
+  ends = []
+  for lag in (0.2, 0.3, 0.4, 0.5, 0.6):
+    def run(box_at=None, lag=lag):
+      w = Drive(tmp_path, lag_s=lag, behaviour=lambda w: 'goes', vis=vis)
+      for i in range(round(12. / DT_MDL)):
+        if box_at is not None and i == box_at:
+          w.boxes = lambda ww: lane_box(ww, 'left', 15., views=('full', 'road'))
+        w.step()
+      return w
+    first = run()
+    commit = next(i for i, x in enumerate(first.trace) if x.state == 'committed')
+    for k in (1, 2, 3, 5):
+      w = run(commit - k)
+      pos = w.sg.pos_ref + (w.odo - w.sg.odo_ref)
+      if 'committed' in [x.state for x in w.trace]:
+        continue  # the box's first run came after the commit point: the band's (the next test's)
+      ends.append((lag, k, round(w.sg.edges.d_min - pos, 2)))
+      assert pos <= w.sg.edges.d_min + 1e-6, (lag, k, pos, w.sg.edges)
+      assert all(c[3] >= -2. - 1e-9 for c in w.cmds)
+  assert len(ends) >= 12 and min(e[2] for e in ends) < 1.0, ends  # withdrawn at the boundary, some close to the edge
+
+
 def test_property_every_held_state_has_a_reason_and_a_bound_or_a_dynamic_cause(tmp_path):
   """8.1 / 4.6: across random scenes every frame the decider holds the car (stopped, rolling up, observing, a fault's handback)
   says why, and its wait is dynamic (no bound: something moves), or static and ends in the ladder within STATIC_WAIT_S, or a
