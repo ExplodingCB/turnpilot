@@ -324,7 +324,10 @@ certification, as the left's go rests on its gap: the junction's signal read gre
 oracle), checked at the go and on every frame of it (`turnpilot.go_not_certified` why `light`, `turnpilot.go_end` reason
 `light`). The camera's shadow reader never certifies one (its red or yellow keeps one off), and with no signal mapped at
 the junction there is none (`RELEASE_UNSIGNALIZED` in `turnpilotd.py`). On the car, where no light source is accepted,
-a walker clearing at a signal is the model's go or the no-move handback, as before G5.
+a walker clearing at a signal is the model's go or the no-move handback, as before G5. Nor is a `turnRelease` ever
+certified for a turn across the oncoming road (its go is the left's, on its gap) or for a far-side turn released in the
+junction (why `unprotected`, `junction`): nothing the lift checks sees the lanes it crosses, and the stall's handback
+(`stalledTakeControl`) covers that stand.
 
 A go the model never takes over is withdrawn at its 3 s and handed back (`cantStartTakeControl`, the car stopped at 1.5
 m/s^2 and held): with a model that holds, the car ends about 3.0 m past its line. A go the car doesn't move on within 2.0 s

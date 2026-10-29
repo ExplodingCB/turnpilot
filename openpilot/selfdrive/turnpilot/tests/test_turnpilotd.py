@@ -1913,9 +1913,9 @@ def test_a_turn_lane_a_map_stop_leaves_no_room_for_is_skipped_out_loud_never_tur
 LEFT_AT_A_RED = [(300., "turn", "left", T_LEFT), (1500., "turn", "right", junction_of("right"))]
 
 
-def go_from_a_red(sim, s_signal=290., wait=1., limit=60.):
+def go_from_a_red(sim, s_signal=290., wait=1., limit=60., desire=Desire.turnLeft):
   """Held at the signal s_signal, red in the sim's light oracle, for wait s, then its green: the hold lets go at
-  standstill. Returns the plan that let go."""
+  standstill, pulsing desire. Returns the plan that let go."""
   sim.go_taps = False
   sim.tp.oracle_ok = True
   light = {'state': 'red'}
@@ -1933,7 +1933,7 @@ def go_from_a_red(sim, s_signal=290., wait=1., limit=60.):
     sim.step(engaged=True)
     assert sim.t < limit + wait + 5.
   plan = sim.trace[-1][2]
-  assert plan.desire == Desire.turnLeft  # the go pulse, at standstill
+  assert plan.desire == desire  # the go pulse, at standstill
   return plan
 
 

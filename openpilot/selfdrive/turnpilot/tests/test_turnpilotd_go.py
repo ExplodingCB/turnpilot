@@ -2,6 +2,7 @@
 asserted to plannerd (turnpilotPlan.goCertified) for its bounded lift only when nothing in the car's path within 15 m, no
 lead and no hold of TurnPilot's is there, the driver isn't on a pedal, and TurnPilotGoOverride is on; it is withdrawn the
 frame any of that stops holding, and it ends on its own at 3 s, 3 m/s or the model's takeover."""
+import dataclasses
 from collections import deque
 
 from openpilot.cereal import messaging
@@ -10,14 +11,14 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.go_override import GO_ACCEL, GO_CLEAR_M, GO_WINDOW_S, TAKEOVER_S
 from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.scene.tracker import RawBox, RawFrame
-from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M, SceneDecision
+from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, ONCOMING_ENTRY_M, SceneDecision
 from openpilot.selfdrive.turnpilot.tests.synthetic import model_v2
 from openpilot.selfdrive.turnpilot.tests.test_go_override import WARM_S, new_planner, planner_sm
-from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, WALKER, FakeParams, Sim, go_from_the_hold, junction_of,
-                                                                 oracle_lights, stand, stop_at, walker_stops_the_car)
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, WALKER, FakeParams, Sim, go_from_a_red, go_from_the_hold,
+                                                                 junction_of, oracle_lights, stand, stop_at, walker_stops_the_car)
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import JUNCTION, V_25, drive, left_sim
 from openpilot.selfdrive.turnpilot.turnpilotd import (GO_OVERRIDE_DEFAULT, LEFT_LAUNCH_SPEED, LEFT_LIFT_ROOM_M, NO_MOVE_REASON, NO_MOVE_S,
-                                                       RELEASE_UNSIGNALIZED, go_override_for)
+                                                       RELEASE_UNSIGNALIZED, STALL_PROMPT_S, go_override_for)
 from openpilot.selfdrive.turnpilot.unprotected_left import LINE_D
 
 Desire = messaging.log.Desire
@@ -59,11 +60,12 @@ def test_the_go_ends_on_the_models_takeover():
 
 
 def test_the_go_ends_at_its_window():
-  # in the junction (never withdrawn for not moving, G3): the model holds 3 s, the go's window ends it there
-  sim = held_at_the_red()
-  go_from_the_hold(sim)
+  # in the junction (never withdrawn for not moving, G3): the model holds 3 s, the go's window ends it there. A curb-side
+  # turn's: a far-side one released in the junction is never certified (skeptic G5)
+  sim = Sim(RIGHT_AT_A_SIGNAL, controls=[(290., 'signal')])
+  go_from_a_red(sim, desire=Desire.turnRight)
   while sim.tp.desires.turned_deg < 45.:
-    sim.step(engaged=True, yaw_rate=0.3 if sim.v > 0.5 else 0.)
+    sim.step(engaged=True, yaw_rate=-0.3 if sim.v > 0.5 else 0.)
     assert sim.t < 200.
   walker_stops_the_car(sim)
   plans = stand(sim, GO_WINDOW_S + 0.5)
@@ -485,3 +487,92 @@ def test_a_shadow_camera_red_coming_mid_go_withdraws_it():
   camera['state'] = 'red'
   q = stand(sim, DT_MDL)[0]
   assert go(q)[0] == 'none' and sim.tp.go_cert.end == 'light'
+
+
+# --- skeptic G5: a far-side turn released in the junction is never lifted ---
+
+def committed_left_stopped_by_a_walker(signal=False):
+  """Skeptic G5 probe: the autonomous left committed (it can no longer stop short of the oncoming lanes on the comfortable
+  curve), then a walker in the path stops it short of them, plannerd in the loop with the model holding. An oncoming car
+  45 m up the road at 25 mph as the walker clears; the model holds for it. signal: the junction has a signal the sim's
+  oracle reads green (an accepted source: the oncoming road has its green too). Returns (sim, the plans from the walker
+  clearing, the car's s there, the oncoming car's s at sim.t)."""
+  state = {'car': None}
+
+  def cars(sim):
+    return [] if state['car'] is None else [(state['car'] - V_25 * (sim.t - state['t']), 3.6)]
+
+  def sim_cls(maneuvers):
+    sim = Sim(maneuvers, controls=[(JUNCTION - HOLD_LINE_M - 2., 'signal')] if signal else ())
+    if signal:
+      sim.tp.oracle_ok, sim.lights = True, oracle_lights('green', JUNCTION - HOLD_LINE_M - 2.)
+    return sim
+  sim = left_sim(cars, sim_cls=sim_cls)
+  plans = []
+  while not (plans and str(plans[-1].unprotectedLeft.state) == 'committed'):
+    plans += drive(sim, DT_MDL)
+    assert sim.t < 90.
+  assert go(plans[-1])[0] in ('unprotectedLeft', 'none')
+  attach_planner(sim, holding)
+  stand(sim, 2.5, objects=WALKER)  # stand pins the car where the walker stops it
+  assert JUNCTION - sim.s - ONCOMING_ENTRY_M > 1.
+  state['car'], state['t'] = sim.s + 45., sim.t
+  s0 = sim.s
+  return sim, drive(sim, 6.), s0, lambda: state['car'] - V_25 * (sim.t - state['t'])
+
+
+def test_a_committed_far_side_turn_released_in_the_junction_is_never_lifted():
+  """Skeptic G5 blocker 2: the walker cleared and turnRelease was certified in the junction (no 'room' check, no 'left'
+  withdrawal: after the commit every oncoming hold drops, and the path corridor never sees a car in the oncoming lane), so
+  plannerd lifted the model's hold for the oncoming car and moved the car 3.23 m, 0.9 m into the oncoming lane at 1.4 m/s,
+  as the oncoming car reached it. A far-side turn released in the junction is never certified (why junction): the car stands
+  where the walker stopped it, short of the oncoming lanes, and the stall's handback comes, as on 109215f. At a signal the
+  oracle reads green too (the light certified, the oncoming road on its green)."""
+  for signal in (False, True):
+    sim, plans, s0, oncoming = committed_left_stopped_by_a_walker(signal)
+    assert all(go(p)[0] == 'none' for p in plans), signal
+    assert not any(lifted for _, _, lifted in sim.planned[-len(plans):]), signal
+    assert sim.s - s0 < 0.1 and JUNCTION - sim.s > ONCOMING_ENTRY_M, signal
+    assert oncoming() < sim.s  # the oncoming car went by
+    stalled = next(i for i, p in enumerate(plans) if p.controlPrompt == 'stalledTakeControl')
+    assert stalled * DT_MDL <= STALL_PROMPT_S + 0.2, signal
+
+
+def test_a_curb_side_turn_released_in_the_junction_at_a_green_is_certified_and_a_far_side_one_isnt():
+  """In the junction the go of a curb-side turn at a green (no oncoming lanes to cross, its cross traffic on its red) is
+  certified; the far-side one (LEFT_AT_A_RED's, from a T's stem: its cross traffic crossed) isn't, and stands to the stall's
+  handback."""
+  def released_in_the_junction(maneuvers, desire, side):
+    sim = Sim(maneuvers, controls=[(290., 'signal')])
+    assert go(go_from_a_red(sim, desire=desire))[0] == 'turnRelease'  # from its line, on the oracle's green
+    while sim.tp.desires.turned_deg < 45.:
+      sim.step(engaged=True, yaw_rate=-0.3 * side if sim.v > 0.5 else 0.)
+      assert sim.t < 200.
+    walker_stops_the_car(sim)
+    plans = stand(sim, DT_MDL)  # the walker clears: the hold lets go in the junction
+    assert not plans[0].shouldStop and sim.tp.go_in_junction
+    return sim, plans + stand(sim, STALL_PROMPT_S + 0.5)
+  sim, plans = released_in_the_junction(RIGHT_AT_A_SIGNAL, Desire.turnRight, 1)
+  assert go(plans[0])[0] == 'turnRelease'
+  sim, plans = released_in_the_junction(LEFT_AT_A_RED, Desire.turnLeft, -1)
+  assert all(go(p)[0] == 'none' for p in plans)
+  assert any(p.controlPrompt == 'stalledTakeControl' for p in plans)
+
+
+def test_a_release_of_a_turn_across_the_oncoming_road_is_never_certified():
+  """A turn across the oncoming road goes only on the left's own go (unprotectedLeft, its gap certified): a release of
+  TurnPilot's hold there, even from its line at a green, is never a turnRelease (why unprotected)."""
+  sim = left_sim()
+  while not (sim.trace and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
+    drive(sim, DT_MDL)
+    assert sim.t < 60.
+  sim.tp.left_now.go = False
+  sim.tp.map_controls.release_light = lambda distance: 'green'
+  upcoming = sim.tp.follower.upcoming
+  sim.tp.go_in_junction = False
+  sim.tp.certify_go(sim.sm, sim.sm['carState'], True, [], None, SceneDecision(), False, LINE_D, upcoming, True)
+  assert sim.tp.go_cert.cause == 'none' and not sim.tp.go_lifted
+  # the same release of a T's stem left (no oncoming approach) is
+  sim.tp.certify_go(sim.sm, sim.sm['carState'], True, [], None, SceneDecision(), False, LINE_D,
+                    dataclasses.replace(upcoming, opposing='none'), True)
+  assert sim.tp.go_cert.cause == 'turnRelease'

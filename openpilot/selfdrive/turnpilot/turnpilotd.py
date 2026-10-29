@@ -95,11 +95,13 @@ it ends on its own at GO_WINDOW_S, GO_END_SPEED or the model's takeover (go_over
 model's hold, +0.5 m/s^2 at most, while the model alone holds the car. A turnRelease rests on its junction's own
 certification, as the left's go rests on its gap: the junction's signal read green by an accepted source, never the
 camera's shadow green (release_blocked, RELEASE_UNSIGNALIZED; skeptic G5: a walker clearing at a red the model alone held
-for had the lift roll the car into the junction), so on the car this week none. Uncertified (the param off, a blocker, no
-green), the go is as before: the model pulls away, or the no-move handback below comes. The left's go is lifted only from
-LEFT_LIFT_ROOM_M or more short of the oncoming lanes (its line, not a creep), and is followed into them only by a launch
-(left_launch): short of LEFT_LAUNCH_SPEED with LEFT_LAUNCH_ROOM_M left to stop short of them, it is withdrawn and handed
-back, never a coast across them on the lift's speed.
+for had the lift roll the car into the junction), so on the car this week none. Never for a turn across the oncoming road
+(its go is the left's) nor for a far-side turn released in the junction (a committed left lifted into the oncoming lane as
+an oncoming car closed: nothing the lift checks sees those lanes; the stall's handback covers that stand). Uncertified (the
+param off, a blocker, no green), the go is as before: the model pulls away, or the no-move handback below comes. The left's
+go is lifted only from LEFT_LIFT_ROOM_M or more short of the oncoming lanes (its line, not a creep), and is followed into
+them only by a launch (left_launch): short of LEFT_LAUNCH_SPEED with LEFT_LAUNCH_ROOM_M left to stop short of them, it is
+withdrawn and handed back, never a coast across them on the lift's speed.
 Standing engaged with nothing of TurnPilot's holding the car (no shouldStop, no cap biting), no lead from the model within
 STOPPED_LEAD_M (one further on doesn't hold a standing car), gas and brake off, the model stopped on its own: said on the
 status line after STOPPED_NOTE_S (STOPPED_NOTE), and handed back loudly (controlPrompt carStoppedTakeControl) after
@@ -143,7 +145,7 @@ from openpilot.selfdrive.turnpilot.route_follower import KEEP, LEFT, TURN, UNCER
 from openpilot.selfdrive.turnpilot.scene.lane_paint import lane_paint_from_msg
 from openpilot.selfdrive.turnpilot.scene.tracker import STALE_S, SceneTracker, default_yaw_rate
 from openpilot.selfdrive.turnpilot.scene_policy import (HOLD_LINE_M, NO_ACCEL_CAP, ONCOMING_ENTRY_M, PATH_HALF_WIDTH_M, STOP_DECEL, ScenePolicy,
-                                                         in_path)
+                                                         far_side_turn, in_path)
 from openpilot.selfdrive.turnpilot.turn_skip import TurnSkip, can_make_turn
 from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
 from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, OFF, ROAD_RANGE_M, LeftInput, UnprotectedLeft,
@@ -598,7 +600,7 @@ class TurnPilot:
       self.go_in_junction = not self.go_at_line(rf.distance)
       if sm['carControl'].enabled and not took_over:  # TurnPilot's go; the driver driving off a hold is the driver's
         self.start_post_go(upcoming, rf.distance, d.turned_deg, right_hand_traffic)
-        self.certify_go(sm, cs, available, objects, raw, decision, took_over, rf.distance)
+        self.certify_go(sm, cs, available, objects, raw, decision, took_over, rf.distance, upcoming, right_hand_traffic)
     elif self.post_go is not None:
       self.post_go.update(v_ego, default_yaw_rate(cs, model), DT_MDL)
     if held and desire not in (Desire.none, CLEAR_DESIRE) and desire != self.last_desire:
@@ -823,17 +825,25 @@ class TurnPilot:
       return 'lead'
     return 'inPath' if path_blocker(objects, raw) else ''
 
-  def certify_go(self, sm, cs, available: bool, objects, raw, decision, took_over: bool, distance: float) -> None:
+  def certify_go(self, sm, cs, available: bool, objects, raw, decision, took_over: bool, distance: float, maneuver=None,
+                 right_hand_traffic: bool = True) -> None:
     """TurnPilot's go from a standstill (start_post_go's, at the hold line or in the junction: finishing a turn beats standing
     in it) certified for plannerd's bounded lift (turnpilotPlan.goCertified), cause unprotectedLeft for the autonomous left's,
     turnRelease for any other turn released from TurnPilot's hold at a junction whose light is read green (release_blocked);
-    or, TurnPilotGoOverride off, go_blocked or no green, not, logged with why. Uncertified, the go is as before G5: the model
-    pulls away or the no-move handback comes."""
+    or, TurnPilotGoOverride off, go_blocked or no green, not, logged with why. Never turnRelease for a turn across the
+    oncoming road (unprotected_turn: its go is the left's, on its gap), nor for a far-side turn released in the junction
+    (go_in_junction: its lanes crossed or to cross, which nothing the lift checks sees; the stall's handback covers that
+    stand). Uncertified, the go is as before G5: the model pulls away or the no-move handback comes. maneuver: the route's
+    turn."""
     self.go_lifted = False
     cause = 'unprotectedLeft' if self.left_now is not None and self.left_now.go else 'turnRelease'
     why = 'param' if not self.go_override else self.go_blocked(sm, cs, available, objects, raw, decision, took_over)
     if not why and cause == 'unprotectedLeft' and distance - ONCOMING_ENTRY_M < LEFT_LIFT_ROOM_M:
       why = 'room'  # nearer the oncoming lanes than the lift's nudge and its stop: never lifted into them (LEFT_LIFT_ROOM_M)
+    if not why and cause == 'turnRelease' and unprotected_turn(maneuver, right_hand_traffic):
+      why = 'unprotected'  # skeptic G5: the oncoming lanes' certification is the left's gap, which a release never has
+    if not why and cause == 'turnRelease' and self.go_in_junction and far_side_turn(maneuver, right_hand_traffic):
+      why = 'junction'  # skeptic G5: a committed left lifted into the oncoming lane as an oncoming car closed
     if not why and cause == 'turnRelease':
       why = self.release_blocked(distance)
     if why:
