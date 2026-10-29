@@ -61,6 +61,8 @@ class Sim:
     # the default) is test_turnpilotd_left's
     self.tp.auto_left = 'off'
     self.raw = None  # the detector's raw boxes (scene.tracker.RawFrame) of this frame's run, a function of the sim, or None
+    self.raw_far = None  # the far crop's run (RawFrame, view far) of this frame, a function of the sim, or None
+    self.far_status = None  # turnpilotDetections.farStatus to send each frame (a full pass message), a function of the sim
     self.lights = None  # turnpilotLights to send each frame, a function of the sim
     self.paint, self.paint_rule, self.inputs_valid = paint, paint_rule, True
     self.s, self.v, self.cruise, self.t = 0., cruise, cruise, 0.
@@ -104,8 +106,13 @@ class Sim:
                   model_v2(*self.model_lanes, big=self.big, holds=self.model_holds, **self.model_kw))
     if self.lights is not None:
       self.sm.put('turnpilotLights', self.lights(self))
+    if self.far_status is not None:
+      td = messaging.new_message('turnpilotDetections')
+      td.turnpilotDetections.farStatus = self.far_status(self)
+      self.sm.put('turnpilotDetections', td.as_reader().turnpilotDetections)
     plan = self.tp.plan(self.sm, scene(objects, available), True, self.shadow, self.driver_signals, paint=self.paint,
                         paint_rule=self.paint_rule, inputs_valid=self.inputs_valid, raw=self.raw(self) if self.raw is not None else None,
+                        raw_far=self.raw_far(self) if self.raw_far is not None else None,
                         long_control=self.long_control, disengage_on_accel=self.disengage_on_accel).as_reader().turnpilotPlan
     a = min(plan_accel(plan.accelCap, plan.speedCap, self.v), (self.cruise - self.v) / 2., 1.5)
     if plan.shouldStop:

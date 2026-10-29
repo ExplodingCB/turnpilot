@@ -302,6 +302,16 @@ done
 | --- | --- | --- |
 | `TurnPilotAutoLeft` | `off` (hand back at the line, G1), `announce` (hold, say whether it would go, hand back), `auto` | `auto` |
 | `TurnPilotLeftRangeM` | m, 0 to 400: the detector's proven range for oncoming traffic, from a measurement; a left whose R_req is past it is skipped at route time | `0.0` (unmeasured: every autonomous left skipped and rerouted) |
+| `TurnPilotLeftFarRangeM` | m, 0 to 400: the far crop's proven range (below); while the far crop reads it extends the reach, so a 45-55 mph left (R_req 231-296 m) needs it | `0.0` (unmeasured: no left past `TurnPilotLeftRangeM`) |
+| `TurnPilotFarCrop` | the far crop on (`1`) or off (`0`) in modeld | `1` (runs when its pkl is in `selfdrive/turnpilot/models`) |
+
+The far crop (DESIGN phase 4 G5): modeld runs a 640x384 window of the road frame at native resolution (twice the full pass's
+pixel density) on the frames between the full pass's runs, aimed up the oncoming approach while a left is in hand
+(`turnpilotPlan.farCropBearing`), published as `turnpilotFarDetections`; the full pass's messages say what it is doing
+(`farStatus`). An R_req past `TurnPilotLeftRangeM` is judged on its runs too: one covering the band past that range every
+0.3 s, and any car it sees in the band blocks at any range. It going off for the drive is said once (`farViewOff`) and a left
+needing it hands back at its line (`farOff`). `unprotectedLeft.farNeeded`, `farRangeM` and `farBlockers` log it. In the sim
+it sees BeamNG's frames; its range there is no measure of the car's.
 
 The model may hold the car at its go (G0: 14 of 24 tapless goes stood). G5's bounded go (next section) lifts that hold;
 with `TurnPilotGoOverride` off, or a go the car doesn't follow, the go is withdrawn and handed back (`cantStartTakeControl`),

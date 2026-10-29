@@ -528,3 +528,121 @@ def test_an_unmeasured_detector_range_attempts_no_left_blind():
   assert any(p.tooFastToTurn for p in plans) and 'unprotectedRange' in reasons
   assert not any(p.shouldStop or p.desire != Desire.none for p in plans)
   assert all(str(p.unprotectedLeft.state) == 'skipped' for p in plans[2:] if p.maneuverDistance > 0. and str(p.maneuverModifier) == 'left')
+
+
+# DESIGN phase 4 G5 (this run's G6): the far crop's runs, between the full pass's
+V_45 = 20.1
+LEFT_45 = [(JUNCTION, "turn", "left", (0., 270., 2, 'present', V_45, 1)), (1500., "turn", "right", junction_of("right"))]
+FAR_RANGE_M = 300.  # TurnPilotLeftFarRangeM as a drive that measured it would set it (the default is unmeasured, 0)
+
+
+def far_runs(cars=lambda sim: (), cover=(-15.6, 15.6)):
+  """A far crop run on the frames between road_runs' (modeld), of cars at absolute road positions (s, y), covering cover."""
+  import dataclasses
+  frame = [0]
+
+  def raw(sim):
+    frame[0] += 1
+    if not frame[0] % 2:
+      return None
+    boxes = [dataclasses.replace(raw_box(s - sim.s, y), view='far') for s, y in cars(sim) if -5. < s - sim.s < 800.]
+    return RawFrame(boxes, 'road', sim.t, 'far', cover)
+  return raw
+
+
+def far_sim(cars=lambda sim: (), status='read', far_range=FAR_RANGE_M):
+  sim = Sim(LEFT_45)
+  sim.tp.auto_left, sim.tp.left_range_m, sim.tp.left_far_range_m = 'auto', TEST_RANGE_M, far_range
+  sim.go_taps = False
+  sim.raw, sim.raw_far = road_runs(cars), far_runs(cars)
+  sim.far_status = status if callable(status) else (lambda sim: status)
+  return sim
+
+
+def test_a_45_mph_left_is_taken_on_the_far_crops_runs():
+  from openpilot.selfdrive.turnpilot.unprotected_left import far_aim
+  sim = far_sim()
+  plans = []
+  while sim.s < JUNCTION + 30. and sim.t < 90.:
+    plans += drive(sim, DT_MDL)
+  assert sim.s > JUNCTION + 30. and not any(p.tooFastToTurn for p in plans)
+  go = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
+  ul = plans[go].unprotectedLeft
+  assert str(ul.state) == 'go' and ul.rReq > TEST_RANGE_M and ul.farNeeded and ul.farRangeM == FAR_RANGE_M
+  assert sim.trace[go - 1][1] < 0.3 and LINE - 1. < sim.trace[go][0] <= LINE + 0.1
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  # the far crop aimed up the oncoming approach while the left is in hand, straight ahead once it isn't
+  assert abs(plans[go - 1].farCropBearing - far_aim(0., 1, TEST_RANGE_M)) < 1e-4 and plans[go - 1].farCropBearing > 1.
+  assert plans[0].farCropBearing != 0. and drive(sim, 1.)[-1].farCropBearing == 0.
+
+
+def test_a_car_far_up_the_oncoming_road_seen_only_by_the_far_crop_holds_it():
+  # one oncoming car at the limit, seen only by the far crop (the full pass never sees it): the car waits for it
+  s0 = [None]
+
+  def cars(sim):
+    if s0[0] is None and JUNCTION - sim.s < 40.:
+      s0[0] = sim.t
+    dt = sim.t - s0[0] if s0[0] is not None else 0.
+    return [(JUNCTION + 260. - V_45 * dt, 3.6)]
+  sim = far_sim()
+  sim.raw = road_runs()  # the full pass sees nothing
+  sim.raw_far = far_runs(cars)
+  plans = []
+  while sim.s < JUNCTION + 30. and sim.t < 120.:
+    plans += drive(sim, DT_MDL)
+  go = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
+  passed = s0[0] + (260. + HOLD_LINE_M) / V_45  # the car past the line
+  assert go * DT_MDL > passed and any(p.unprotectedLeft.farBlockers for p in plans[:go])
+
+
+def test_without_the_far_crop_a_45_mph_left_is_skipped_and_its_loss_at_the_line_is_loud():
+  # the far crop off (no pkl, the param, off for the drive) or its range unmeasured: skipped at route time and rerouted
+  for status, far_range in (('off', FAR_RANGE_M), ('disabled', FAR_RANGE_M), ('read', 0.)):
+    sim = far_sim(status=status, far_range=far_range)
+    plans = drive(sim, 3.)
+    assert plans[-1].tooFastToTurn and str(plans[-1].unprotectedLeft.state) == 'skipped', status
+    assert plans[-1].unprotectedLeft.farRangeM == (far_range if status == 'read' else 0.) and plans[-1].unprotectedLeft.farNeeded
+  # on but waiting for room or calibration at route time (a spell): not skipped, judged at the line
+  for status in ('noRoom', 'noCalibration'):
+    sim = far_sim(status=status)
+    assert not any(p.tooFastToTurn for p in drive(sim, 3.)), status
+  # it goes off for the drive while the car waits at its line: said once (farViewOff), and the left hands back (farOff)
+  stream = [JUNCTION + 200. + k * 30. for k in range(40)]
+  off_at = [None]
+
+  def status(sim):
+    return 'disabled' if off_at[0] is not None and sim.t >= off_at[0] else 'read'
+  sim = far_sim(cars=lambda sim: [(s, 3.6) for s in stream], status=status)
+  plans = []
+  while sim.t < 60.:
+    plans += drive(sim, DT_MDL)
+    if off_at[0] is None and plans[-1].shouldStop and sim.v < 0.1 and str(plans[-1].unprotectedLeft.state) == 'waitGap':
+      off_at[0] = sim.t + 2.
+  assert off_at[0] is not None
+  after = [p for p, (_, _, _) in zip(plans, sim.trace, strict=True) if p is not None][-int(round((sim.t - off_at[0]) / DT_MDL)):]
+  assert any(str(p.controlAlert) == 'farViewOff' for p in after[:3])
+  assert sum(str(p.controlAlert) == 'farViewOff' for p in plans) * DT_MDL <= 2.1  # said once
+  # held at the line and handed back, never skipped and rerouted from it
+  assert all(str(p.unprotectedLeft.state) == 'undecided' and p.unprotectedLeft.why == 'farOff' for p in after[2:])
+  assert all(str(p.controlPrompt) == 'leftUndecidedTakeControl' and p.shouldStop and not p.tooFastToTurn for p in after[2:])
+  assert not any(p.desire == Desire.turnLeft for p in plans) and sim.s < LINE + 0.1
+
+
+def test_main_reads_the_far_range():
+  from openpilot.common.params import UnknownKeyName
+  from openpilot.selfdrive.turnpilot.turnpilotd import left_far_range_for
+
+  class Params:
+    def __init__(self, values, unknown=False):
+      self.values, self.unknown = values, unknown
+
+    def get(self, key):
+      if self.unknown:
+        raise UnknownKeyName(key)
+      return self.values.get(key)
+  assert left_far_range_for(Params({})) == 0. and TurnPilot().left_far_range_m == 0.
+  assert left_far_range_for(Params({'TurnPilotLeftFarRangeM': 280.})) == 280.
+  assert left_far_range_for(Params({'TurnPilotLeftFarRangeM': b'bad'})) == 0.
+  assert left_far_range_for(Params({'TurnPilotLeftFarRangeM': 1e4})) <= 400.
+  assert left_far_range_for(Params({}, unknown=True)) == 0.

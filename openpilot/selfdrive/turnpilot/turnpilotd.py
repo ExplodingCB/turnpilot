@@ -84,6 +84,12 @@ the latch (map_controls.LeftCommand: hold, creep, go, or a fault's handback), it
 scene's stops, and no turn pulse goes on its approach (may_start off; turn_skip's pulse_at_go): its go from the line is the
 first. It asks modeld for the road camera (turnpilotPlan.detectorView) and publishes its state (unprotectedLeft); its wait
 is silent (waitingForGap, creepingForView), its go a chime, and it hands back (leftUndecidedTakeControl) only for a fault.
+Its reach past the full pass's range is the far crop's (DESIGN phase 4 G5): modeld's far crop runs (main(): SceneTracker.raw_far)
+are fed to it with TurnPilotLeftFarRangeM (the far crop's proven range; unset: unmeasured, 0) while the full pass's latest
+farStatus says it reads (watch_far), at route time too; turnpilotPlan.farCropBearing aims it up the oncoming approach while
+the left is in hand (unprotected_left.far_aim), else straight ahead. The far crop going off for the drive (farStatus
+disabled) is said once (controlAlert farViewOff, a status line) and logged; a left needing it then hands back (farOff).
+Its class-9 heads are logged in shadow only (turnpilot.far_light_shadow), never acted on.
 Its go is TurnPilot's like any hold's: the left's post-go profile and LEFT_NO_MOVE_S below.
 TurnPilot's go from a standstill (any of the above: a turn its hold let go of, at the line or in the junction, or the left's)
 is certified for plannerd's bounded lift (go_override.py; DESIGN phase 4 decision 1, G5) under TurnPilotGoOverride (on by
@@ -150,6 +156,10 @@ from openpilot.selfdrive.turnpilot.turn_skip import TurnSkip, can_make_turn
 from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
 from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, OFF, ROAD_RANGE_M, LeftInput, UnprotectedLeft,
                                                            left_mode_for, reach_at_line)
+
+FAR_OFF_ALERT_S = ABORT_HOLD_S  # farViewOff is shown this long, once, when the far crop goes off for the drive
+FAR_STATUS_STALE_S = 1.         # the full pass's farStatus older than this: the far crop isn't known to read
+FAR_ON = ('read', 'noRoom', 'noCalibration')  # farStatus of a far crop that is on (route time: far_live)
 
 Desire = log.Desire
 State = custom.TurnpilotPlan.State
@@ -307,6 +317,11 @@ class TurnPilot:
     self.no_move_s = NO_MOVE_S  # TurnPilotNoMoveS (main()): a standstill turn's no-move limit (an unprotected turn's is fixed)
     self.auto_left = AUTO  # TurnPilotAutoLeft (main()): the unprotected left's mode (unprotected_left.py)
     self.left_range_m = ROAD_RANGE_M  # TurnPilotLeftRangeM (main()): the detector's proven range its R_req is checked against
+    self.left_far_range_m = 0.  # TurnPilotLeftFarRangeM (main()): the far crop's proven range (unmeasured: 0, none)
+    self.far_status = 'off'     # the full pass's latest farStatus (watch_far)
+    self.far_status_age = float('inf')
+    self.far_off_t = 0.         # s farViewOff has left to show
+    self.far_lights: tuple = ()  # the far crop's governing heads last logged (watch_far)
     self.left_now = None  # this frame's unprotected left decision (unprotected_left.LeftDecision), once update() has made it
     self._rf_ticked = self._yaw_ticked = False  # update() dead-reckoned the route, and counted the yaw, this frame
     self.go_override = GO_OVERRIDE_DEFAULT  # TurnPilotGoOverride (main())
@@ -466,10 +481,11 @@ class TurnPilot:
       plan.laneChangeAbort = self.stop_abort
 
   def update(self, sm, scene, enabled: bool, shadow: bool, driver_signals: bool = True, right_hand_traffic: bool = True, paint=(),
-             paint_rule: bool = True, inputs_valid: bool = True, raw=None):
+             paint_rule: bool = True, inputs_valid: bool = True, raw=None, raw_far=None):
     """A turnpilotPlan message from sm's carState, navInstruction and modelV2, a TurnpilotScene, and the lane paint of
     modelV2's four lane lines (empty when unknown). paint_rule: TurnPilotLanePaintActive; inputs_valid: carState and
-    modelV2 pass their checks; raw: the detector run that arrived this frame (scene.tracker.RawFrame), or None."""
+    modelV2 pass their checks; raw: the detector run that arrived this frame (scene.tracker.RawFrame), or None; raw_far:
+    the far crop's run that arrived this frame (view far), or None."""
     self.handback_now = self.scene_now = self.map_now = self.left_now = None
     msg = messaging.new_message('turnpilotPlan')
     plan = msg.turnpilotPlan
@@ -486,6 +502,7 @@ class TurnPilot:
 
     cs, model = sm['carState'], sm['modelV2']
     v_ego = max(cs.vEgo, 0.)
+    self.watch_far(sm)
     rf = self.follower
     rf.update(sm['navInstruction'], sm.updated['navInstruction'], sm.valid['navInstruction'], v_ego, DT_MDL,
               committed=self.turn_committed)
@@ -540,7 +557,7 @@ class TurnPilot:
         stop_infeasible = True
     elif engaged and upcoming is None:
       turn = KEEP_TURN  # the route gone with the handback: it carries on, dead-reckoned
-    left_cmd = self.unprotected_left(turn, upcoming, rf, v_ego, acting, objects, raw)
+    left_cmd = self.unprotected_left(turn, upcoming, rf, v_ego, acting, objects, raw, raw_far)
     mapd = self.map_update(sm, v_ego, cs.gasPressed, turn, left_cmd)
     took_over = cs.gasPressed and not sm['carControl'].enabled  # the driver driving, never a go (module docstring)
     # the autonomous left holds its turn's pulse until its go from the line (unprotected_left.py: approach), so its first pulse
@@ -552,8 +569,11 @@ class TurnPilot:
     desire_out = self.desires.maneuver_id == rf.maneuver_id and self.desires.started
     # an autonomous left the detector can't see far enough for (its R_req from the opposing road's mapped speed past
     # TurnPilotLeftRangeM): never attempted, skipped as soon as it is the maneuver and rerouted (turn_skip.py)
-    out_of_range = acting and self.auto_left == AUTO and unprotected_turn(upcoming, right_hand_traffic) and \
-      reach_at_line(upcoming.opposing_speed, upcoming.opposing_lanes or None) > self.left_range_m
+    # The far crop counts here while it is on (reading, or waiting for room or calibration), and once the left's stop is engaged
+    # nothing here skips it: a reach lost there (the far crop off for the drive) is the left's own handback at its line
+    # (unprotected_left: farOff), the car held, never a skip and a reroute from the line
+    out_of_range = acting and self.auto_left == AUTO and unprotected_turn(upcoming, right_hand_traffic) and not engaged and \
+      reach_at_line(upcoming.opposing_speed, upcoming.opposing_lanes or None) > self.left_reach_m(route=True)
     skip = self.skip.update(upcoming, rf.distance, rf.maneuver_id, v_ego, desire_out, right_hand_traffic, lat_active,
                             rf.ahead, rf.ahead_distance, stop_d=self.map_controls.stop_ahead(), stop_infeasible=stop_infeasible,
                             pulse_at_go=pulse_at_go, out_of_range=out_of_range)
@@ -664,6 +684,10 @@ class TurnPilot:
       ul.state, ul.rangeM = 'skipped', float(self.left_range_m)
       ul.vLimit = float(upcoming.opposing_speed or DEFAULT_OPPOSING_SPEED)
       ul.rReq = float(reach_at_line(upcoming.opposing_speed, upcoming.opposing_lanes or None))
+      ul.farRangeM, ul.farNeeded = float(self.left_far_range_m if self.far_live(route=True) else 0.), ul.rReq > self.left_range_m
+    if self.far_off_t > 0. and str(plan.controlAlert) == 'none':  # the far crop off for the drive: said once, a status line
+      plan.controlAlert = 'farViewOff'
+    self.far_off_t = max(self.far_off_t - DT_MDL, 0.)
     if decision.hard_brake:  # a confirmed track's hard stop outranks the map's alerts (scene_policy.py)
       plan.controlAlert = 'hardBrake'
     stalled = self.stalled_in_turn(sm, cs, v_ego, acting, decision, mapd)
@@ -725,7 +749,35 @@ class TurnPilot:
       cloudlog.event("turnpilot_turn_missed", error=True, turned_deg=round(d.turned_deg, 1), v_ego=round(v_ego, 2),
                      distance=round(rf.distance, 1))
 
-  def unprotected_left(self, turn, upcoming, rf, v_ego: float, acting: bool, objects, raw) -> LeftCommand | None:
+  def watch_far(self, sm) -> None:
+    """The far crop's state from the full pass's latest farStatus: read, or off for the drive (said once, farViewOff,
+    and logged). Its shadow heads are logged on every change of what they read (never acted on)."""
+    data = getattr(sm, 'data', {})
+    self.far_status_age += DT_MDL
+    if 'turnpilotDetections' in data and sm.updated['turnpilotDetections']:
+      status = str(sm['turnpilotDetections'].farStatus)
+      if status == 'disabled' and self.far_status != 'disabled':
+        self.far_off_t = FAR_OFF_ALERT_S
+        cloudlog.event("turnpilot.far_view_off", error=True, was=self.far_status)
+      self.far_status, self.far_status_age = status, 0.
+    if 'turnpilotFarDetections' in data and sm.updated['turnpilotFarDetections']:
+      run = sm['turnpilotFarDetections'].run
+      heads = tuple(sorted((str(h.state), round(float(h.distance))) for h in run.lights.lights if h.governs))
+      if heads != self.far_lights:
+        cloudlog.event("turnpilot.far_light_shadow", heads=[list(h) for h in heads], status=str(run.lightStatus))
+        self.far_lights = heads
+
+  def far_live(self, route: bool = False) -> bool:
+    """The far crop reads: the full pass's latest farStatus, fresh. route: at route time, on (reading, or waiting for room
+    or calibration), not off nor off for the drive."""
+    return self.far_status in (FAR_ON if route else ('read',)) and self.far_status_age <= FAR_STATUS_STALE_S
+
+  def left_reach_m(self, route: bool = False) -> float:
+    """The range an unprotected left's R_req may reach: the full pass's proven range, or the far crop's while it reads (route:
+    while it is on, far_live)."""
+    return max(self.left_range_m, self.left_far_range_m) if self.far_live(route) else self.left_range_m
+
+  def unprotected_left(self, turn, upcoming, rf, v_ego: float, acting: bool, objects, raw, raw_far=None) -> LeftCommand | None:
     """This frame's autonomous unprotected left (unprotected_left.py; left_now) for the route's unprotected turn the car is
     taking (turn, map_controls' tuple), and its command for the hold line's latch. TurnPilotAutoLeft off, or TurnPilot not
     acting (handed back): off, the latch handed back as G1's. Fed the last frame's latch and scene (whether they held)."""
@@ -749,7 +801,8 @@ class TurnPilot:
                     junction_uncertain=rf.junction_spread > UNCERTAIN_M or stray,
                     go_withdrawn=self.go_withdrawn, committed=rf.maneuver_id in (scene.committed_id, scene.released_id),
                     spread_m=rf.junction_spread, other_hold=stop_d is not None and stop_d <= rf.distance + PROTECT_PAST_M,
-                    light=self.map_controls.turn_light(int(turn[0]), turn[1]))
+                    light=self.map_controls.turn_light(int(turn[0]), turn[1]), far=raw_far, far_range_m=self.left_far_range_m,
+                    far_live=self.far_live())
     d = self.left_now = self.left.update(inp, DT_MDL)
     return LeftCommand(mode, d.go, d.creep_m, d.state == 'undecided', d.reason)
 
@@ -759,10 +812,13 @@ class TurnPilot:
     if d is None:
       return
     plan.detectorView = d.view if d.view != 'none' else 'auto'
+    if d.state != 'off':
+      plan.farCropBearing = float(d.far_bearing)  # up the oncoming approach while the left is in hand
     ul = plan.unprotectedLeft
     ul.state, ul.tReq, ul.rReq, ul.vLimit, ul.rangeM = d.state, float(d.t_req), float(d.r_req), float(d.v_limit), float(self.left_range_m)
     ul.clearS, ul.blockers, ul.viewBlocked, ul.crosswalkClear = float(d.clear_s), min(d.blockers, 255), d.view_blocked, d.crosswalk_clear
     ul.creepM, ul.why = float(d.creep_m), d.why or d.verdict
+    ul.farRangeM, ul.farNeeded, ul.farBlockers = float(d.far_range_m), d.far_needed, min(d.far_blockers, 255)
     if str(plan.controlPrompt) == 'none' and d.prompt != 'none':
       plan.controlPrompt = d.prompt
       plan.reason = decision.reason or d.reason
@@ -1214,6 +1270,22 @@ def left_range_for(params) -> float:
     return ROAD_RANGE_M
 
 
+def left_far_range_for(params) -> float:
+  """TurnPilotLeftFarRangeM, the far crop's proven range for oncoming traffic, clamped to 0..LEFT_RANGE_MAX_M; 0 (unmeasured:
+  the far crop extends no left's reach) if unset, not a number (said) or unknown to this build."""
+  try:
+    value = params.get("TurnPilotLeftFarRangeM")
+  except UnknownKeyName:
+    log_error("turnpilotd: TurnPilotLeftFarRangeM unknown to this build's params; run scons")
+    return 0.
+  try:
+    value = value.decode() if isinstance(value, bytes) else value
+    return min(max(float(value), 0.), LEFT_RANGE_MAX_M) if value is not None else 0.
+  except (TypeError, ValueError):
+    log_error(f"turnpilotd: TurnPilotLeftFarRangeM {value!r} isn't a number, unmeasured instead")
+    return 0.
+
+
 def no_move_for(params) -> float:
   """TurnPilotNoMoveS, clamped to NO_MOVE_S..NO_MOVE_MAX_S; NO_MOVE_S if unset, unreadable or unknown to this build."""
   try:
@@ -1294,9 +1366,9 @@ def main():
   pm = messaging.PubMaster(['turnpilotPlan', 'turnpilotScene'])
   # no route, no detector (TurnPilotEnabled off, no pkl), no light source (only the sim's oracle publishes one; the
   # camera's lights ride in turnpilotDetections, shadow unless TurnPilotCameraLights is addOnly)
-  optional = ['navInstruction', 'turnpilotDetections', 'turnpilotLights']
+  optional = ['navInstruction', 'turnpilotDetections', 'turnpilotLights', 'turnpilotFarDetections']
   sm = messaging.SubMaster(['carState', 'carControl', 'navInstruction', 'modelV2', 'turnpilotDetections', 'extrinsicsCalibration',
-                            'deviceState', 'narrowRoadCameraState', 'turnpilotLights'],
+                            'deviceState', 'narrowRoadCameraState', 'turnpilotLights', 'turnpilotFarDetections'],
                            ignore_alive=optional, ignore_avg_freq=optional, ignore_valid=optional)
   rk = Ratekeeper(1. / DT_MDL, print_delay_threshold=None)
   tp = TurnPilot()
@@ -1323,6 +1395,7 @@ def main():
       tp.no_move_s = no_move_for(params)
       tp.auto_left = auto_left_for(params)
       tp.left_range_m = left_range_for(params)
+      tp.left_far_range_m = left_far_range_for(params)
       tp.go_override = go_override_for(params)
       if params.get("ChestnutActive") is False:  # None: no big model expected this drive
         tp.big_model_failed(enabled)
@@ -1335,6 +1408,7 @@ def main():
       if tracker is not None:
         tracker.update(sm['turnpilotDetections'] if sm.seen['turnpilotDetections'] else None, sm['extrinsicsCalibration'],
                        sm['carState'], sm['modelV2'])
+        tracker.update_far(sm['turnpilotFarDetections'] if sm.seen['turnpilotFarDetections'] else None, sm['extrinsicsCalibration'])
         tracker.fill_scene(scene_msg.turnpilotScene)
     except Exception:
       log_error("turnpilotd.scene_failed")
@@ -1346,8 +1420,9 @@ def main():
     # the lane planner takes this frame's checks (an offered change aborts at once); the plan's valid has a grace
     valid = sm.all_checks(['carState', 'modelV2'])
     raw = tracker.raw if tracker is not None and tracker.raw_new else None  # this frame's run, for the unprotected left
+    raw_far = tracker.raw_far if tracker is not None and tracker.raw_far_new else None  # ...and the far crop's
     msg = tp.plan(sm, scene, enabled, shadow, driver_signals, right_hand_traffic, paint, paint_rule, valid, long_control=long_control,
-                  disengage_on_accel=disengage_on_accel, raw=raw)
+                  disengage_on_accel=disengage_on_accel, raw=raw, raw_far=raw_far)
     invalid_frames = 0 if valid else invalid_frames + 1
     msg.valid = invalid_frames < PLAN_INPUT_GRACE_FRAMES
     pm.send('turnpilotPlan', msg)

@@ -62,7 +62,7 @@ class LoopSM:
       self.data[service] = getattr(messaging.new_message(service).as_reader(), service)
     self.updated = dict.fromkeys(self.data, False)
     self.valid = dict.fromkeys(self.data, True)
-    self.seen = {'deviceState': True, 'narrowRoadCameraState': True, 'turnpilotDetections': False}
+    self.seen = {'deviceState': True, 'narrowRoadCameraState': True, 'turnpilotDetections': False, 'turnpilotFarDetections': False}
     self.frame, self.failing_frames, self.checks = -1, failing_frames, checks
 
   def update(self, timeout):
@@ -115,6 +115,30 @@ def test_disengage_on_accelerator_off_faults_out_loud():
   assert all(p.state == State.disabled and p.fault == custom.TurnpilotPlan.Fault.disengageOnAccelerator and
              p.reason == turnpilotd.GAS_DISENGAGE_REASON for p in plans)
   assert not errors
+
+
+def test_the_far_crops_runs_go_to_the_tracker_and_its_raw_run_to_the_plan():
+  # DESIGN phase 4 G5: turnpilotFarDetections (optional) to SceneTracker.update_far with the calibration, never to update();
+  # a new far run to the plan as raw_far (the unprotected left's), TurnPilotLeftFarRangeM read with the other params
+  tracker = mock.MagicMock()
+  tracker.raw_new, tracker.raw_far_new = False, True
+  far = messaging.new_message('turnpilotFarDetections').as_reader().turnpilotFarDetections
+  got = {}
+  real_plan = turnpilotd.TurnPilot.plan
+
+  def plan(self, *a, **k):
+    got.update(k, far_range=self.left_far_range_m)
+    return real_plan(self, *a, **k)
+  orig = LoopSM.__init__
+
+  def init(self, *a, **k):
+    orig(self, *a, **k)
+    self.data['turnpilotFarDetections'], self.seen['turnpilotFarDetections'] = far, True
+  with mock.patch.object(LoopSM, '__init__', init), mock.patch.object(turnpilotd.TurnPilot, 'plan', plan):
+    run_main(frames=3, tracker=tracker, TurnPilotLeftFarRangeM=260.)
+  args = tracker.update_far.call_args.args
+  assert args[0] is far and len(args) == 2
+  assert got['raw_far'] is tracker.raw_far and got['raw'] is None and got['far_range'] == 260.
 
 
 def test_scene_failure_publishes_an_empty_scene_and_goes_on():
