@@ -249,6 +249,19 @@ class TestConflictSets:
     assert self.moves(four_way(), 'unknown') == [('left', 'cross'), ('opposite', 'leftTurners'), ('opposite', 'straightRight'),
                                                  ('right', 'cross'), ('right', 'swing')]
 
+  def test_leg_skew_every_road_in_its_bin_one_per_role(self):
+    assert sr.leg_skew(four_way()) is None
+    j = four_way()
+    j.approaches.append(approach('other', -150., inbound=False))  # cars only leave by it: still a road
+    assert 'behind the side bins' in sr.leg_skew(j)
+    j.approaches[-1].outbound = False  # a path
+    assert sr.leg_skew(j) is None
+    j.approaches[2].rel_bearing = 16.  # the exit, straight on
+    assert 'off straight on' in sr.leg_skew(j)
+    j = four_way()
+    j.approaches.append(approach('right', 95.))
+    assert 'two right roads' in sr.leg_skew(j)
+
   def test_an_approach_cars_only_leave_by_conflicts_with_nothing(self):
     j = sr.Junction(approaches=[approach('left', -90., inbound=False), approach('right', 90.)])
     assert self.moves(j, 'straight') == [('right', 'cross')]

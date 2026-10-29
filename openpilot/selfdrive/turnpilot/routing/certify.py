@@ -10,7 +10,9 @@ certify(junction, maneuver, visibility, surveys, eta, runtime) returns (certific
    3 noLaunch      no launchVerified stamp (step S4a), unless the mode is trial
    4 geometry      roundabout, a turn_channel approach, a rail crossing within RAIL_M or on our approach (or not known), a
                    divided cross road, a U-turn
-   5 skew          a conflicting left or right approach outside 75-105 deg
+   5 skew          a road a car uses there (stop_rules.leg_skew: inbound or outbound, the exit leg included) that isn't the
+                   left or right one within 75-105 deg or the opposite one within OPPOSITE_SKEW_DEG 15 deg of straight on,
+                   a road behind the side bins (role other), or a second road in one role
    6 unknownLeg    a conflicting leg (the exit leg included) whose control is unknown, the junction failed, or no conflicting
                    approach found at all
    7 notSurveyed   the junction's survey doesn't count, or a conflicting approach isn't surveyed as stopping (decision D10)
@@ -162,10 +164,10 @@ def assess(junction: sr.Junction, maneuver: str, visibility, surveys, eta: float
   if j.rail_distance != -1.:
     return _fail('geometry', 'a rail crossing: not known (no current sidecar)' if j.rail_distance < -1.5 else
                  f"a rail crossing {j.rail_distance:.0f} m away")
-  # 5 skew
-  for m in moves:
-    if m.role in ('left', 'right') and not sr.SKEW_MIN_DEG <= abs(m.approach.rel_bearing) <= sr.SKEW_MAX_DEG:
-      return _fail('skew', f"the {m.role} approach at {m.approach.rel_bearing:+.0f} deg")
+  # 5 skew: every road there, not only the conflicting movements (a road behind the side bins is in none)
+  skew = sr.leg_skew(j)
+  if skew:
+    return _fail('skew', skew)
   # 6 unknown legs
   if j.status != 'ok':
     return _fail('unknownLeg', f"the junction is {j.status}")

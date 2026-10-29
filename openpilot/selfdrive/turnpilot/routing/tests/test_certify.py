@@ -307,6 +307,50 @@ class TestCatalogue:
     j.approaches[0].rel_bearing = -70.
     assert check(tmp_path, j) == ('uncertifiable', 'skew')
 
+  @pytest.mark.parametrize('maneuver', ['straight', 'left', 'right'])
+  @pytest.mark.parametrize('skew', [40., 30., 20.])
+  def test_G6_G7_a_cross_road_skewed_into_the_opposite_and_other_bins(self, tmp_path, skew, maneuver):
+    # a skewed X: the cross road's legs at +skew (read opposite) and skew - 180 (read other), every one surveyed stopping and
+    # validated. The 75-105 deg rule looked only at the left and right bins: the +skew leg was walked as an opposing lane
+    # parallel to ours and the other one's traffic was in no conflict set
+    j = junction()
+    j.approaches = [approach('opposite', 0., 0., 13, exit_=maneuver == 'straight'), approach('opposite', skew, skew, 12),
+                    approach('other', skew - 180., (skew + 180.) % 360., 11)]
+    s = survey()
+    s['approaches'][1]['bearingDeg'] = skew % 360.            # way 11 toward the node
+    s['approaches'][2]['bearingDeg'] = (skew + 180.) % 360.   # way 12
+    assert check(tmp_path, j, s, maneuver=maneuver) == ('uncertifiable', 'skew')
+
+  @pytest.mark.parametrize('maneuver', ['straight', 'left', 'right'])
+  @pytest.mark.parametrize('rel', [-150., 150.])
+  def test_C3_a_fifth_road_behind_the_side_bins(self, tmp_path, rel, maneuver):
+    # a 4-way all-way with a fifth road at rel deg, 45 mph, no stop: its traffic is in no conflict set, so nothing checks it
+    j = junction(maneuver=maneuver)
+    j.approaches.append(approach('other', rel, rel % 360., 14, tier='no', control='none', mph=45))
+    assert check(tmp_path, j, maneuver=maneuver) == ('uncertifiable', 'skew')
+    # cars only leaving by it: still a road the reach model doesn't have
+    j.approaches[-1].inbound = False
+    assert check(tmp_path, j, maneuver=maneuver) == ('uncertifiable', 'skew')
+    # a footway or path there is no road
+    j.approaches[-1].outbound = False
+    assert check(tmp_path, j, maneuver=maneuver) == ('certifiable' if maneuver != 'right' else 'uncertifiable',
+                                                     'none' if maneuver != 'right' else 'reach')
+
+  def test_an_opposite_road_more_than_15_deg_off_straight_on(self, tmp_path):
+    j = junction()
+    j.approaches[2].rel_bearing = 20.
+    assert check(tmp_path, j) == ('uncertifiable', 'skew')
+    j.approaches[2].rel_bearing = -sr.OPPOSITE_SKEW_DEG
+    assert check(tmp_path, j) == ('certifiable', 'none')
+
+  @pytest.mark.parametrize('role, rel', [('right', 100.), ('left', -80.), ('opposite', 5.)])
+  def test_a_second_road_in_one_role(self, tmp_path, role, rel):
+    # each role is one road to the reach model: a second would be walked as the first
+    j = junction()
+    j.approaches.append(approach(role, rel, rel % 360., 14))
+    v = ce.assess(j, 'straight', visibility(tmp_path), [survey()], ETA, RUN)
+    assert (v.certification, v.reason, f'two {role} roads' in v.detail) == ('uncertifiable', 'skew', True), v.detail
+
   def test_G11_G12_divided_cross_road(self, tmp_path):
     assert check(tmp_path, junction(divided=True)) == ('uncertifiable', 'geometry')
 

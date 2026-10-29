@@ -82,6 +82,7 @@ SURVEY_ANGLE_DEG = 1.0    # deg, a surveyed approach bearing
 CAL_ANGLE_DEG = 0.5
 ROUTE_YAW_DEG = 1.0       # deg of yaw offset at the line assumed at route time (section 2.8's 3.5 and 2.5 deg)
 SKEW_MIN_DEG, SKEW_MAX_DEG = 75., 105.
+OPPOSITE_SKEW_DEG = 15.   # deg off straight on the opposite road may be (the side roads' 90 +- 15)
 RAIL_M = 30.
 UNION_YAW_DEG = 15.       # deg of yaw before a turn's conflict set drops the straight set (2.1)
 SWING_ZONE_M = 15.        # m to the right of our path a wide right reaches into the far lanes
@@ -325,6 +326,30 @@ def effective_role(a: Approach) -> str:
   if r <= ROLE_SIDE_DEG:
     return 'right' if a.rel_bearing > 0 else 'left'
   return 'other'
+
+
+def leg_skew(j: Junction) -> str | None:
+  """Why the junction's roads aren't the shape the conflict sets and the reach model were made for (3.2 check 5), or None.
+  Every road a car uses there (inbound or outbound, the exit leg by its bearing; a path no car drives is none) must be the
+  left or right one within SKEW_MIN_DEG to SKEW_MAX_DEG of our heading in, or the opposite one within OPPOSITE_SKEW_DEG of
+  straight on, and one road per role. A road behind the side bins (role other) is in no conflict set, so its traffic would
+  never be checked; a cross road skewed into the opposite and other bins would be walked as an opposing lane parallel to
+  ours; a second road in a role would be walked as the first."""
+  seen: dict[str, float] = {}
+  for a in j.approaches:
+    if not (a.inbound or a.outbound):
+      continue
+    role, rel = effective_role(a), a.rel_bearing
+    if role == 'other':
+      return f"a road at {rel:+.0f} deg, behind the side bins: its traffic is in no conflict set"
+    if role in ('left', 'right') and not SKEW_MIN_DEG <= abs(rel) <= SKEW_MAX_DEG:
+      return f"the {role} approach at {rel:+.0f} deg"
+    if role == 'opposite' and abs(rel) > OPPOSITE_SKEW_DEG + 1e-9:
+      return f"the opposite approach {rel:+.0f} deg off straight on"
+    if role in seen:
+      return f"two {role} roads, at {seen[role]:+.0f} and {rel:+.0f} deg"
+    seen[role] = rel
+  return None
 
 
 @dataclass
