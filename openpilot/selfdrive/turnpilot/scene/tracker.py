@@ -8,6 +8,13 @@ position, with the car's own motion taken out in the predict step, so velocities
 Every run's boxes also come out as they are (raw, raw_new: RawFrame), tracked or not, with their bearing and ground range
 uncapped, for the unprotected left's gap rule: a distant car that never scores NEW_TRACK_CONF never becomes a track, so
 track absence certifies nothing (CRITIQUE REQUIRED 2).
+
+The far crop's runs (DESIGN phase 4 G5: turnpilotFarDetections, update_far) come out the same way (raw_far, raw_far_new),
+view far: their boxes are in the road camera's full-frame pixels, so they range and bear with the road lens, and the run
+says which bearings it covered at the horizon (cover_deg). A far box matching a track by its box tags it (view far,
+farHits) and does nothing else: it never starts a track, never counts as a hit (TrackedObject.age, which a hard stop's
+confirmation reads: scene_policy), never moves the filter, never keeps a track alive, never makes the scene fresh. So the
+full pass alone feeds every stop, as before the far crop.
 """
 import time
 from dataclasses import dataclass, field
@@ -18,10 +25,12 @@ from openpilot.cereal import custom
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.transformations.camera import DeviceCameraConfig
 from openpilot.selfdrive.turnpilot.detector.decoder import BICYCLE, BUS, CAR, MAX_DETECTIONS, MOTORCYCLE, PERSON, TRUCK
+from openpilot.selfdrive.turnpilot.detector.graph import FAR_HORIZON_ROW
 from openpilot.selfdrive.turnpilot.scene.ranging import Lens, calib_from_view, camera_height, ground_point, road_lens, wide_lens
 
 ObjectClass = custom.TurnpilotScene.ObjectClass
 Camera = custom.TurnpilotDetections.Camera
+View = custom.TurnpilotDetections.View
 OBJECT_CLASS = {PERSON: ObjectClass.pedestrian, BICYCLE: ObjectClass.cyclist, CAR: ObjectClass.car,
                 MOTORCYCLE: ObjectClass.motorcycle, BUS: ObjectClass.bus, TRUCK: ObjectClass.truck}
 OBJECT_CLASS_NAME = {PERSON: 'pedestrian', BICYCLE: 'cyclist', CAR: 'car', MOTORCYCLE: 'motorcycle', BUS: 'bus', TRUCK: 'truck'}
@@ -59,6 +68,8 @@ MAX_PERSON_GROUND_HEIGHT = 12.  # m, ground range x box height / focal length: p
 # every run's boxes, tracked or not, for the unprotected left's gap rule (unprotected_left.py; CRITIQUE REQUIRED 2): a box's
 # nearest plausible range is its ground range with the box bottom this many pixels lower (about 1.5 px at the YOLO input)
 NEAR_PX = 3.
+FAR_COVER_MARGIN_PX = 16  # a far run covers its bearings only with the horizon this far inside its rows (the band's far cars are
+                          # within ~10 px under it)
 ACCEL_STD = 3.0          # m/s^2, the filter's process noise
 VEL_STD0 = 5.0           # m/s, a new track's velocity uncertainty
 
@@ -103,6 +114,7 @@ class RawBox:
   xy: tuple | None         # ground point (x forward, y left), not capped at ranging.MAX_RANGE; None unranged
   near_m: float | None     # nearest plausible range (the box bottom NEAR_PX lower), None unranged
   box: tuple = ()          # x0, y0, x1, y1 normalized in its camera's frame
+  view: str = 'full'       # 'full', or 'far' for the far crop's (camera 'road')
 
 
 @dataclass
@@ -110,6 +122,8 @@ class RawFrame:
   boxes: list              # [RawBox]: every detection of a road user in one detector run
   camera: str
   t: float                 # the run's camera time, s
+  view: str = 'full'       # 'far': a far crop run (update_far)
+  cover_deg: tuple | None = None  # a far run's (right, left) bearings at the horizon; None if the horizon isn't inside it
 
 
 def ground_xy(lens: Lens, rot: np.ndarray, height: float, u: float, v: float) -> tuple[float, float] | None:
@@ -150,6 +164,8 @@ class Track:
   x: np.ndarray | None = None  # x, y, vx, vy: ground position and velocity over the ground, car frame
   P: np.ndarray | None = None
   in_path: bool = False
+  far_hits: int = 0            # far crop boxes matching it (update_far): never in hits
+  view: str = 'full'           # the pass of its last match
 
   @property
   def cls(self) -> int:
@@ -204,6 +220,9 @@ class SceneTracker:
     self.available = False
     self.raw: RawFrame | None = None     # the latest run's boxes (raw_frame)
     self.raw_new = False                 # ...which arrived in the last update()
+    self.raw_far: RawFrame | None = None  # the latest far crop run's boxes (update_far)
+    self.raw_far_new = False              # ...which arrived in the last update_far()
+    self.far_key: tuple | None = None
 
   def measure(self, det, camera: str, calibration) -> Measurement:
     box = np.array([det.x0, det.y0, det.x1, det.y1], dtype=np.float64)
@@ -268,6 +287,7 @@ class SceneTracker:
     trk.box, trk.box_seen, trk.camera, trk.t_seen, trk.conf = m.box, m.box, camera, t, m.conf
     trk.class_votes[m.cls] = trk.class_votes.get(m.cls, 0.0) + m.conf
     trk.hits += 1
+    trk.view = 'full'
     if m.xy is None:
       return
     if trk.x is None or trk.P is None:
@@ -356,8 +376,51 @@ class SceneTracker:
     self.available = self.last_recv is not None and now - self.last_recv <= STALE_S
     return self.published()
 
-  def raw_frame(self, detections, camera: str, calibration, t: float) -> RawFrame:
-    """Every road user's box in this run, ranged where its bottom is below the horizon (RawBox), tracked or not."""
+  def update_far(self, far, calibration, now: float | None = None) -> None:
+    """far: the latest TurnpilotFarDetections (None before the first). A new run comes out as raw_far (raw_far_new), and
+    its boxes tag the tracks they match by box (module docstring): nothing else here changes."""
+    now = time.monotonic() if now is None else now
+    run = far.run if far is not None else None
+    key = (run.frameId, run.timestampEof) if run is not None else None
+    self.raw_far_new = False
+    if key is None or key == self.far_key or run.timestampEof <= 0:
+      return
+    self.far_key = key
+    t = run.timestampEof * 1e-9
+    try:
+      self.raw_far, self.raw_far_new = self.raw_frame(run, 'road', calibration, t, 'far', tuple(far.crop)), True
+    except Exception:
+      cloudlog.exception("turnpilot tracker: far boxes failed")  # the left then has no fresh far run: never clear
+      self.raw_far = None
+      return
+    self.tag_far(run, t)
+
+  def tag_far(self, run, t: float) -> None:
+    """Tag the road camera's tracks the far run's boxes match by box, predicted to its time (view far, farHits)."""
+    tracks = [trk for trk in self.tracks if trk.camera == 'road']
+    dets = [d for d in run.detections if int(d.cls) in OBJECT_CLASS]
+    if not tracks or not dets:
+      return
+    boxes = np.array([[d.x0, d.y0, d.x1, d.y1] for d in dets], dtype=np.float64)
+    predicted = np.array([trk.box_seen + trk.box_vel * (t - trk.t_seen) for trk in tracks])
+    same_group = np.array([CLASS_GROUP[trk.cls] for trk in tracks])[:, None] == np.array([CLASS_GROUP[int(d.cls)] for d in dets])[None]
+    for i, _ in greedy_match(np.where(same_group, iou(predicted, boxes), -1.), IOU_FIRST):
+      tracks[i].far_hits += 1
+      tracks[i].view = 'far'
+
+  def far_cover(self, crop, rot: np.ndarray) -> tuple | None:
+    """(right, left) bearings of the far crop's edges at the horizon, None if the horizon isn't FAR_COVER_MARGIN_PX inside it."""
+    x0, y0, x1, y1 = crop
+    lens = self.lenses['road']
+    u, v = lens.project(rot.T @ np.array([1., 0., 0.]))  # the horizon straight ahead: x forward in the calibrated frame
+    if not (y0 + FAR_COVER_MARGIN_PX <= v <= y1 - FAR_COVER_MARGIN_PX):
+      return None
+    row = y0 + FAR_HORIZON_ROW if y0 + FAR_COVER_MARGIN_PX <= y0 + FAR_HORIZON_ROW <= y1 - FAR_COVER_MARGIN_PX else v
+    return bearing_deg(lens, rot, x1, row), bearing_deg(lens, rot, x0, row)
+
+  def raw_frame(self, detections, camera: str, calibration, t: float, view: str = 'full', crop=None) -> RawFrame:
+    """Every road user's box in this run, ranged where its bottom is below the horizon (RawBox), tracked or not. A far run
+    (view far) also says what it covers (far_cover of crop)."""
     boxes = []
     calibrated = calibration is not None and len(calibration.rpyCalib) == 3
     lens, (w, h) = self.lenses[camera], self.sizes[camera]
@@ -376,8 +439,9 @@ class SceneTracker:
       boxes.append(RawBox(camera, OBJECT_CLASS_NAME[cls], float(d.conf), bearing_deg(lens, rot, u, d.y1),
                           (bearing_deg(lens, rot, d.x1, d.y1), bearing_deg(lens, rot, d.x0, d.y1)), xy,
                           float(np.hypot(*near)) if near is not None else None,
-                          (float(d.x0 / w), float(d.y0 / h), float(d.x1 / w), float(d.y1 / h))))
-    return RawFrame(boxes, camera, t)
+                          (float(d.x0 / w), float(d.y0 / h), float(d.x1 / w), float(d.y1 / h)), view))
+    cover = self.far_cover(crop, rot) if view == 'far' and crop is not None and len(crop) == 4 and rot is not None else None
+    return RawFrame(boxes, camera, t, view, cover)
 
   def update_in_path(self, model_v2) -> None:
     path_x, path_y = predicted_path(model_v2)
@@ -411,4 +475,5 @@ class SceneTracker:
       o.age = trk.hits
       o.inPath = trk.in_path
       o.camera = Camera.wide if trk.camera == 'wide' else Camera.road
+      o.view, o.farHits = View.far if trk.view == 'far' else View.full, trk.far_hits
       o.box = [float(np.clip(v / s, 0, 1)) for v, s in zip(trk.box_seen, (w, h, w, h), strict=True)]
