@@ -27,15 +27,16 @@ certify(junction, maneuver, visibility, surveys, eta, runtime) returns (certific
                    curb, at the junction's stop point; with the side views off, the road and full-pass tables instead
 ('unchecked', 'none') for a signal (not this certifier's).
 
-A validation stamp (written by junction_validate.py, SG3b) is {lighting, date, passes, approachBearingDeg (optional: our
-approach's heading toward the junction it was measured from; absent, any), cars: {left, right, opposite}, minFirstTrackM and
-maxDropoutS: {left, right, opposite} each a list per binding lane, nearest first (or one number for all), allStopped,
-verdict: pass}. Lanes are named by where their traffic comes from, relative to our approach.
+A validation stamp (written by junction_validate.py, SG3b) is {lighting, date, passes, approachBearingDeg (required: the
+heading toward the junction of the approach it was measured from; a stamp without it validates no approach), cars: {left,
+right, opposite}, minFirstTrackM and maxDropoutS: {left, right, opposite} each a list per binding lane, nearest first (or
+one number for all), allStopped, verdict: pass}. Lanes are named by where their traffic comes from, relative to our approach.
 
 The binding curb of a lane (1.4 rule 6, nearestParkingM {left, right} along each curb of the approach, left and right as a
 car on it toward the junction sees them): the left approach's right curb (the near side, between us and its lanes) and the
 right approach's left curb; parking on the far curbs hides neither lane.
 """
+import math
 from dataclasses import dataclass, field
 
 from openpilot.common.swaglog import cloudlog
@@ -126,11 +127,17 @@ def lane_need(lane: sr.Lane, edges: sr.Edges, a_launch: float = sr.A_LAUNCH_PLAN
   return sr.reach_needed_allway(lane.limit) if lane.stopping else sr.reach_needed_two_way(lane.limit, edges.d_max, a_launch)
 
 
+def stamp_approach(v: dict) -> float | None:
+  """deg, the heading toward the junction of the approach a stamp was measured from; None when it doesn't say (no number)."""
+  a = v.get('approachBearingDeg')
+  return float(a) if isinstance(a, (int, float)) and not isinstance(a, bool) and math.isfinite(a) else None
+
+
 def pick_stamp(entry: dict, row: str, heading_in: float) -> dict | None:
-  """The newest passing stamp for a lighting row, measured from our approach (or any)."""
+  """The newest passing stamp for a lighting row, measured from our approach. A stamp that doesn't say its approach
+  validates none: its reaches were measured from some approach's stop point and sightlines."""
   fits = [v for v in entry.get('validations') or [] if isinstance(v, dict) and v.get('lighting') == row and v.get('verdict') == 'pass' and
-          v.get('allStopped') is True and (v.get('approachBearingDeg') is None or
-                                          sr.angle_diff(float(v['approachBearingDeg']), heading_in) <= LEG_HEADING_TOL)]
+          v.get('allStopped') is True and (a := stamp_approach(v)) is not None and sr.angle_diff(a, heading_in) <= LEG_HEADING_TOL]
   return max(fits, key=lambda v: str(v.get('date'))) if fits else None
 
 
@@ -201,7 +208,9 @@ def assess(junction: sr.Junction, maneuver: str, visibility, surveys, eta: float
   for row in sorted(rows):
     st = pick_stamp(entry, row, j.heading_in)
     if st is None:
-      return _fail('notValidated', f"no passing validation stamp for {row} from this approach", rows=rows)
+      blind = sum(1 for v in entry.get('validations') or [] if isinstance(v, dict) and stamp_approach(v) is None)
+      return _fail('notValidated', f"no passing validation stamp for {row} from this approach" +
+                   (f" ({blind} without approachBearingDeg, which validate no approach)" if blind else ''), rows=rows)
     for ln in lanes:
       first, drop = _per_lane(st.get('minFirstTrackM'), ln.role, ln.index), _per_lane(st.get('maxDropoutS'), ln.role, ln.index)
       if first is None or drop is None:

@@ -13,8 +13,10 @@ map knows and leaves null what must be measured). The shipped file is an empty l
                    "laneEdgeM" (node to the cross road's near travel-lane edge, m), "lineM" (node to the painted line, 0 none),
                    "nearestParkingM": {"left", "right"} (m along each curb to the first legal space), "sightM" (m),
                    "stopPointM" (optional: node to where a car on this approach stops)}, ...],
-   "validations": [{"lighting", "date", "passes", "cars": {"left", "right", "opposite"}, "minFirstTrackM", "maxDropoutS",
-                    "allStopped", "verdict"}, ...] (written by junction_validate.py, never by hand)}
+   "validations": [{"lighting", "date", "passes", "approachBearingDeg" (the heading toward the junction of the approach it
+                    was measured from: always written, a stamp without it validates no approach), "cars": {"left", "right",
+                    "opposite"}, "minFirstTrackM", "maxDropoutS", "allStopped", "verdict"}, ...] (written by
+                    junction_validate.py, never by hand)}
 
 An example, for a made-up junction (its node id can't match anything, and none of its numbers may be copied):
 

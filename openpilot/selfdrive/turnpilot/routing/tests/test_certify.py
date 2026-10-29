@@ -38,7 +38,7 @@ def visibility(tmp_path, **changes):
 
 
 def stamp(m=48., lighting='day', dropout=0.4, lanes=1, **kw):
-  out = {'lighting': lighting, 'date': '2026-10-27', 'passes': 3, 'cars': {'left': 12, 'right': 12, 'opposite': 10},
+  out = {'lighting': lighting, 'date': '2026-10-27', 'passes': 3, 'approachBearingDeg': 0., 'cars': {'left': 12, 'right': 12, 'opposite': 10},
          'minFirstTrackM': {'left': [m] * lanes, 'right': [m] * lanes, 'opposite': [80.] * lanes},
          'maxDropoutS': {'left': [dropout] * lanes, 'right': [dropout] * lanes, 'opposite': [0.3] * lanes}, 'allStopped': True,
          'verdict': 'pass'}
@@ -171,6 +171,19 @@ class TestReachAndValidation:
   def test_a_stamp_for_another_approach_does_not_validate_ours(self, tmp_path):
     assert check(tmp_path, s=survey(validations=[stamp(approachBearingDeg=180.)])) == ('uncertifiable', 'notValidated')
     assert check(tmp_path, s=survey(validations=[stamp(approachBearingDeg=0.)])) == ('certifiable', 'none')
+
+  def test_a_stamp_without_its_approach_validates_no_approach(self, tmp_path):
+    # its reaches were measured from some approach's stop point and sightlines; without approachBearingDeg nobody can say whose
+    st = stamp()
+    del st['approachBearingDeg']
+    v = ce.assess(junction(), 'straight', visibility(tmp_path), [survey(validations=[st])], ETA, RUN)
+    assert (v.certification, v.reason) == ('uncertifiable', 'notValidated')
+    assert 'without approachBearingDeg' in v.detail, v.detail
+    # arriving from the west (heading 90), where the stamp's left, right and opposite reaches aren't ours
+    j = junction(heading_in=90., our_way=12)
+    assert check(tmp_path, j, survey(validations=[st])) == ('uncertifiable', 'notValidated')
+    for bad in (None, 'north', True):
+      assert check(tmp_path, s=survey(validations=[stamp(approachBearingDeg=bad)])) == ('uncertifiable', 'notValidated')
 
   def test_a_stamp_missing_a_binding_lane_does_not_validate(self, tmp_path):
     st = stamp()
