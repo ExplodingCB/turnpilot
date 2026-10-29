@@ -973,3 +973,57 @@ class TestMapHoldStatus(OpenpilotTestCase):
     # an old snapshot without map fields still reads
     snap["plan"] = {"state": "holding", "reason": "pedestrian in path", "shadow": False}
     assert status.format_status(snap, None, True, False, now=101.)["turnpilot"]["label"] == "Holding"
+
+
+class TestCarSignals(WebTestCase):
+  """The car turn signal card (DESIGN phase4/blinker 7.8): the mode, Start in Drive, the outside-lamp answer."""
+
+  def pending_check(self, check_id="ab12cd34"):
+    check = {"pass": True, "step": "done", "why": "", "checkId": check_id, "exterior": "pending",
+             "record": {"onReason": 8, "gear": "P", "onSeparates": False}, "vin": "5YJ3E1EA8KF000001"}
+    self.params.put("TurnPilotCarSignalsCheck", check, block=True)
+    return check
+
+  def test_get(self):
+    assert self.call("GET", "/api/car-signals")[1] == {"mode": "off", "check": None, "verified": False, "verified_vin": None}
+    self.pending_check()
+    self.params.put("TurnPilotCarSignalsVerified", {"vin": "5YJ3E1EA8KF000001"}, block=True)
+    body = self.call("GET", "/api/car-signals")[1]
+    assert body["check"]["checkId"] == "ab12cd34" and body["check"]["exterior"] == "pending" and body["check"]["gear"] == "P"
+    assert body["verified"] and body["verified_vin"] == "5YJ3E1EA8KF000001"
+
+  def test_mode(self):
+    for mode in ("check", "on", "off"):
+      code, body, _ = self.call("POST", "/api/car-signals", {"mode": mode})
+      assert code == 200 and body["mode"] == mode and self.params.get("TurnPilotCarSignals") == mode
+    for bad in ("ON", "", None, 1):
+      assert self.call("POST", "/api/car-signals", {"mode": bad})[0] == 400
+    assert self.params.get("TurnPilotCarSignals") == "off"
+
+  def test_start_in_drive(self):
+    assert self.call("POST", "/api/car-signals", {"startInDrive": True})[0] == 200
+    assert self.params.get_bool("TurnPilotCarSignalsCheckNow")
+    assert self.call("POST", "/api/car-signals", {"startInDrive": "yes"})[0] == 400
+
+  def test_exterior_answer(self):
+    self.pending_check()
+    assert self.call("POST", "/api/car-signals", {"exterior": "yes", "checkId": "stale000"})[0] == 409
+    assert self.params.get("TurnPilotCarSignalsExterior") is None
+    assert self.call("POST", "/api/car-signals", {"exterior": "maybe", "checkId": "ab12cd34"})[0] == 400
+    code, _, _ = self.call("POST", "/api/car-signals", {"exterior": "yes", "checkId": "ab12cd34"})
+    assert code == 200 and self.params.get("TurnPilotCarSignalsExterior") == "yes:ab12cd34"
+    # the page writes no record itself: card's resolver promotes it at the next ignition
+    assert self.params.get("TurnPilotCarSignalsVerified") is None
+
+  def test_no_pending_check(self):
+    assert self.call("POST", "/api/car-signals", {"exterior": "yes", "checkId": "ab12cd34"})[0] == 409
+    self.params.put("TurnPilotCarSignalsCheck", {"pass": False, "step": "release", "why": "x"}, block=True)
+    assert self.call("POST", "/api/car-signals", {"exterior": "yes", "checkId": None})[0] == 409
+
+  def test_needs_the_token(self):
+    for method, body in (("GET", None), ("POST", {"mode": "on"})):
+      assert self.call(method, "/api/car-signals", body, auth=None)[0] == 401
+    assert self.params.get("TurnPilotCarSignals") is None
+
+  def test_empty_body(self):
+    assert self.call("POST", "/api/car-signals", {})[0] == 400
