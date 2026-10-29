@@ -704,6 +704,16 @@ def test_n5_a_suspected_unmapped_stop_is_emitted_as_a_stop_control(tmp_path, our
   assert j.status == 'ok' and all(a.tier == 'unknown' for a in j.approaches)
 
 
+def test_n5_suspected_stops_have_a_switch():
+  """SUSPECTED_STOPS (on, as the design has it) is the one constant that turns suspected stops off: until SG2 routes around
+  them, each is a full stop the car makes."""
+  legs = [leg(90., **{'class': 'secondary'}), leg(270., **{'class': 'secondary'})]
+  v = StubJunction([(0., 100., {}), (100., 400., {})], {100.: legs})
+  assert controls_module.SUSPECTED_STOPS is True and [c.kind for c in route_controls(v, steps())[0]] == ['stop']
+  with patch.object(controls_module, 'SUSPECTED_STOPS', False):
+    assert route_controls(v, steps())[0] == []
+
+
 def test_n5_driveways_and_alleys_are_no_crossing_roads():
   """Only roads count as crossing ones: an alley or a driveway beside our residential street at a secondary doesn't make it
   less suspect, and a residential street crossing makes it no suspect."""
@@ -783,7 +793,7 @@ def test_tiers_of_a_mapped_all_way(tmp_path, name, ours, others, want):
   undirected one mapWeak; none of them stops this week, only surveyed does."""
   v = StubJunction([(0., 100., {'stop': True, 'way_id': 50}), (100., 400., {})], four())
   _, j = junction_of(route_controls(v, steps(), sidecar_dir=allway(tmp_path, ours, others))[0])
-  assert j.osm_node_id == 900 and j.sidecar and tiers(j) == {0: want, 90: want, 270: want}, name
+  assert j.osm_node_id == 900 and j.sidecar and len(j.approaches) == 3 and tiers(j) == {0: want, 90: want, 270: want}, name
   assert {a.osm_stop for a in j.approaches} == {'all' if ours[2] == 'all' else 'stop'}
 
 

@@ -2508,7 +2508,8 @@ struct NavInstruction {
     kind @1 :ControlKind;
     distance @2 :Float32;     # m to the stop point (the line less a margin)
     lineMapped @3 :Bool;      # the line came from mapped data (the sim sidecar), not the junction less 10 m
-    junction @4 :Bool;        # other roads meet the route at its node
+    junction @4 :Bool;        # other roads meet the route at its node (its own edge's end: a stop read at the junction
+                              # it governs further on can be false here; junctionInfo says what is at that junction)
     crossSuspect @5 :Bool;    # the route's road outranks every crossing one: a stop/yield likely for the cross road
     # TurnPilot (stop signs, SG1b): the junction at a stop or yield control's node and every road there
     # (turnpilot/routing/junctions.py); unset (status none) on a signal, and from a navd before it

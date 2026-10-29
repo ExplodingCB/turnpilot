@@ -102,6 +102,7 @@ ATTRIBUTES = ['edge.id', 'edge.way_id', 'edge.forward', 'edge.length', 'edge.beg
               'node.intersecting_edge.cyclability', 'edge.traversability']
 EXCLUDE_BACK_M = 12.     # m back from the node an approach's exclusion point goes, at most half its edge (SG2, 3.3)
 JUNCTION_AHEAD_M = 60.   # m on along the route the junction the sidecar says a stop governs is looked for (its MAXD)
+SUSPECTED_STOPS = True   # emit suspected unmapped stops (N5) as stop controls: until SG2 routes around them, each is a stop
 CACHE_MAX = 4096         # Q1 and Q2 answers a LocateCache keeps, each
 
 
@@ -673,7 +674,7 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
                   'sign_m': sign_m, 'suspected': False, 'legs': None})
   # suspected unmapped stops (N5): a junction with nothing mapped on our approach where every road crossing outranks ours by
   # two classes or more is emitted as a stop
-  for a in real:
+  for a in real if SUSPECTED_STOPS else []:
     end_m, span, key, node = ends[a]
     if a in at or not node.get('intersecting_edges') or (end_m > cum[-1] - END_OF_ROUTE_M and not ahead):
       continue
