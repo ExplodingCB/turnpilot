@@ -98,7 +98,7 @@ _services: dict[str, tuple] = {
 
   # turnpilot
   "turnpilotPlan": (True, 20., 5),
-  "turnpilotDetections": (True, 10.),
+  "turnpilotDetections": (True, 20.),  # a view on every model frame while a stop sweep holds the car (STOP_SIGNS.md 1.3)
   "turnpilotScene": (True, 20., 5),
   "turnpilotLights": (True, 4.),
   "turnpilotFarDetections": (True, 10.),

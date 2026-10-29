@@ -249,3 +249,10 @@ def test_a_left_skipped_for_the_detectors_range_says_so():
   msg.turnpilotPlan.unprotectedLeft.state = 'skipped'
   a, = alerts(EventName.turnpilotTooFastToTurn, FakeSM(msg.as_reader().turnpilotPlan))
   assert a.alert_text_1 == "Can't See Far Enough to Turn" and a.alert_text_2 == 'Rerouting' and a.audible_alert == AudibleAlert.tpTooFastTurn
+
+
+def test_side_cameras_off_is_a_status_line():
+  from openpilot.selfdrive.turnpilot.hooks import CONTROL_ALERT_TEXT, CONTROL_STATUS_ALERTS
+  a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='sideCamerasOff')))
+  assert a.alert_text_1 == 'Side Cameras Off' and a.alert_text_2 == CONTROL_ALERT_TEXT['sideCamerasOff']
+  assert 'sideCamerasOff' in CONTROL_STATUS_ALERTS

@@ -188,6 +188,8 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     oncomingHolding @10;        # an unprotected left's go withdrawn before its commit for a car in the oncoming band:
                                 # stopping short of the oncoming lanes on the comfortable curve, waiting again
     farViewOff @11;             # the far crop went off for the drive (failed or over budget): no unprotected left needing it
+    sideCamerasOff @12;         # the side views went off for the drive (failed or overran, turnpilotDetections.sideViewStatus
+                                # disabled): stop sweeps run the full wide pass and the road camera only (STOP_SIGNS.md 1.3)
   }
   mapControl @24 :MapControlStatus;
   controlPrompt @25 :ControlPrompt;
@@ -225,6 +227,10 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     road @1;         # the road camera only: an unprotected left from its go to its commit (CRITIQUE REQUIRED 3)
     roadAndWide @2;  # the road camera, the wide camera one run in WIDE_EVERY: held at an unprotected left's line (its exit
                      # crosswalk)
+    # The stop sweeps (STOP_SIGNS.md section 1.3): the detector's even steps run the forward views, its odd steps the side
+    # views (only at or under SIDE_VIEW_V_MAX); lane paint and the far crop are off, lights read only near a mapped signal
+    stopSweep @3;    # held at a stop or yield: full wide, side left, road, side right
+    stopSweepGo @4;  # crossing, from the commit point: full wide, side left, full wide, side right
   }
   detectorView @30 :DetectorView;
   # The autonomous unprotected left's decision (unprotected_left.py), for the logs and the sim's scorer
@@ -324,6 +330,7 @@ struct TurnpilotDetections @0xaedffd8f31e7b55d {
     wideCamera @2;   # this run was on the wide camera; the paint is only read on the road camera
     noModel @3;      # no modelV2 for this very frame yet, or no device type to pick the lens
     disabled @4;     # the paint failed earlier and is off for the drive, or modeld has no road camera
+    sweep @5;        # a stop sweep runs (turnpilotPlan.detectorView): no paint read
   }
   lanePaintStatus @6 :LanePaintStatus;
   lanePaintTime @7 :Float32;      # s spent reading the paint in this step, 0 when not read; executionTime is the detector's alone
@@ -337,6 +344,7 @@ struct TurnpilotDetections @0xaedffd8f31e7b55d {
     noCalibration @3;  # no calibration yet, so no horizon to gate the boxes by: nothing read
     disabled @4;     # the reader failed or ran over its budget earlier and is off for the drive
     off @5;          # TurnPilotCameraLights off, or modeld has no road camera
+    sweep @6;        # a stop sweep runs with no signal mapped within SWEEP_SIGNAL_M (60 m): no colour read (lightBoxes are)
   }
   lightStatus @9 :LightStatus;
   lightTime @10 :Float32;         # s spent reading the lights in this step, 0 when not read
@@ -344,8 +352,13 @@ struct TurnpilotDetections @0xaedffd8f31e7b55d {
   # the model frames between the full pass's runs and published apart (turnpilotFarDetections), its run a TurnpilotDetections
   # of the road camera with view far: boxes in the road camera's full-frame pixels, so they range with its lens
   enum View {
-    full @0;         # the whole camera frame, letterboxed (turnpilotDetections)
+    full @0;         # the whole camera frame, letterboxed (turnpilotDetections); with camera road it is the sweep's road slot
     far @1;          # the far crop (turnpilotFarDetections.run)
+    # STOP_SIGNS.md section 1.3, the stop sweep's side views (detector/sideview.py): a level pinhole at yaw 75 deg left or
+    # right of the calibrated forward axis, f 904 px, 768x512, gathered from the wide frame; camera wide, boxes mapped back
+    # to the wide camera's fisheye pixels
+    sideLeft @2;
+    sideRight @3;
   }
   view @11 :View;
   enum FarStatus {
@@ -355,8 +368,53 @@ struct TurnpilotDetections @0xaedffd8f31e7b55d {
     disabled @3;       # it failed, or ran over its budget or the step's: off for the drive (logged, said once)
     noCalibration @4;  # no calibrated horizon to aim it by yet
     noRoom @5;         # on, but no frame between the full runs had room for it within FAR_STATUS_S
+    sweep @6;          # on, suspended while a stop sweep runs (its frames are the side views')
   }
   farStatus @12 :FarStatus;  # the full pass's messages say what the far crop is doing
+  # STOP_SIGNS.md SG3a. Stop signs (COCO 11), decoded apart like the lights and never into detections: in shadow
+  # (TurnPilotCameraStopSigns), read by no stop, cap or release; the luma below each, for labelling all-way plaques
+  struct Sign {
+    box @0 :Detection;             # full-frame pixels of this run's camera
+    plaque @1 :Data;               # luma (0-255, the camera's own range), row-major, plaqueW x plaqueH, subsampled
+    plaqueW @2 :UInt16;
+    plaqueH @3 :UInt16;
+    plaqueRect @4 :List(Float32);  # x0, y0, x1, y1 of the plaque crop in full-frame pixels
+  }
+  signs @13 :List(Sign);
+  # Image quality per 5 deg of bearing on a side view's horizon band (STOP_SIGNS.md section 1.3; detector/sideview.py
+  # SectorQuality), on that view's messages: anything but ok has zero reach
+  struct Sector {
+    enum Quality {
+      unknown @0;
+      ok @1;
+      degraded @2;   # contrast ratio under 0.5 of the full wide frame's 10-35 deg band
+      washed @3;     # 5th-percentile lift over 50 DN with contrast under 0.35, or 30% of pixels saturated
+      dark @4;       # median luma under the dark threshold
+      frozen @5;     # no frame-to-frame change over the noise floor for 1.0 s
+      blocked @6;    # half its pixels static and dark
+    }
+    inner @0 :Float32;   # deg left of the calibrated forward axis of its edge nearer the axis (a right one's negative)
+    outer @1 :Float32;   # ...and of its edge farther out
+    quality @2 :Quality;
+  }
+  sectorQuality @14 :List(Sector);
+  # What the side views are doing, on every message: the stop-sign decider counts a side view's freshness only while the
+  # gate runs them (running, noRoom)
+  enum SideViewStatus {
+    unset @0;          # a log from before the field
+    off @1;            # no side-view pkl for this device, or no wide camera
+    idle @2;           # no stop sweep asked for
+    running @3;        # a sweep at or under SIDE_VIEW_V_MAX: the odd steps alternate the side views
+    speedGated @4;     # a sweep above SIDE_VIEW_V_MAX: the odd steps idle, no side view
+    noCalibration @5;  # no calibration to map the views by yet
+    mapsStale @6;      # the calibration moved more than 0.3 deg from the maps': invalid until they are recomputed
+    noRoom @7;         # running, but no side view had room within SIDE_STATUS_S
+    disabled @8;       # failed or overran: off for the drive (sideCamerasOff, said once)
+  }
+  sideViewStatus @15 :SideViewStatus;
+  lightBoxes @16 :List(Detection);  # every forward run's traffic light boxes (COCO 9), read or not: a signal head at a junction
+  lens @17 :Text;                   # the wide lens a side view was mapped with (ranging.Lens.spec); empty on forward runs
+  sectorTime @18 :Float32;          # s spent on sectorQuality in this step
 }
 
 struct TurnpilotScene @0xf35cc4560bbf6ec2 {

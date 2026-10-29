@@ -63,6 +63,7 @@ class Sim:
     self.raw = None  # the detector's raw boxes (scene.tracker.RawFrame) of this frame's run, a function of the sim, or None
     self.raw_far = None  # the far crop's run (RawFrame, view far) of this frame, a function of the sim, or None
     self.far_status = None  # turnpilotDetections.farStatus to send each frame (a full pass message), a function of the sim
+    self.side_status = None  # turnpilotDetections.sideViewStatus to send each frame, a function of the sim
     self.lights = None  # turnpilotLights to send each frame, a function of the sim
     self.paint, self.paint_rule, self.inputs_valid = paint, paint_rule, True
     self.s, self.v, self.cruise, self.t = 0., cruise, cruise, 0.
@@ -106,9 +107,12 @@ class Sim:
                   model_v2(*self.model_lanes, big=self.big, holds=self.model_holds, **self.model_kw))
     if self.lights is not None:
       self.sm.put('turnpilotLights', self.lights(self))
-    if self.far_status is not None:
+    if self.far_status is not None or self.side_status is not None:
       td = messaging.new_message('turnpilotDetections')
-      td.turnpilotDetections.farStatus = self.far_status(self)
+      if self.far_status is not None:
+        td.turnpilotDetections.farStatus = self.far_status(self)
+      if self.side_status is not None:
+        td.turnpilotDetections.sideViewStatus = self.side_status(self)
       self.sm.put('turnpilotDetections', td.as_reader().turnpilotDetections)
     plan = self.tp.plan(self.sm, scene(objects, available), True, self.shadow, self.driver_signals, paint=self.paint,
                         paint_rule=self.paint_rule, inputs_valid=self.inputs_valid, raw=self.raw(self) if self.raw is not None else None,
@@ -2481,3 +2485,26 @@ def test_the_no_move_limit_is_a_param_for_the_sweep():
   assert tp.no_move_limit == 20.
   tp.start_post_go(left, 9., 0., True)
   assert tp.no_move_limit == LEFT_NO_MOVE_S
+
+
+def test_side_cameras_going_off_is_said_once():
+  # STOP_SIGNS.md row E9: modeld turns the side views off for the drive when they overrun (sideViewStatus disabled): said
+  # once (controlAlert sideCamerasOff, a status line, about ABORT_HOLD_S) and logged, never again for the drive
+  sim = Sim([(3000., "turn", "right")])
+  sim.side_status = lambda sim: 'disabled' if sim.t >= 2. else 'running'
+  with mock.patch('openpilot.selfdrive.turnpilot.turnpilotd.cloudlog.event') as event:
+    sim.run(8.)
+  plans = [p for _, _, p in sim.trace]
+  said = [i for i, p in enumerate(plans) if str(p.controlAlert) == 'sideCamerasOff']
+  assert said and abs(said[0] * DT_MDL - 2.) < 0.1 and said == list(range(said[0], said[0] + len(said)))
+  assert abs(len(said) * DT_MDL - ABORT_HOLD_S) < 0.11
+  assert [c.args[0] for c in event.call_args_list].count('turnpilot.side_cameras_off') == 1
+
+
+def test_a_far_crop_suspended_for_a_stop_sweep_is_on_at_route_time_but_not_reading():
+  # a sweep suspends G6's far crop (farStatus sweep): route time still counts it on, so a 45-55 mph left beyond a stop
+  # isn't skipped for it; the left itself needs it reading
+  sim = Sim([(3000., "turn", "right")])
+  sim.far_status = lambda sim: 'sweep'
+  sim.run(1.)
+  assert sim.tp.far_live(route=True) and not sim.tp.far_live()

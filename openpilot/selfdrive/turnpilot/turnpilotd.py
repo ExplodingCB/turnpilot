@@ -159,7 +159,9 @@ from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSI
 
 FAR_OFF_ALERT_S = ABORT_HOLD_S  # farViewOff is shown this long, once, when the far crop goes off for the drive
 FAR_STATUS_STALE_S = 1.         # the full pass's farStatus older than this: the far crop isn't known to read
-FAR_ON = ('read', 'noRoom', 'noCalibration')  # farStatus of a far crop that is on (route time: far_live)
+# farStatus of a far crop that is on (route time: far_live); a stop sweep suspends it (sweep) without turning it off
+FAR_ON = ('read', 'noRoom', 'noCalibration', 'sweep')
+SIDE_OFF_ALERT_S = ABORT_HOLD_S  # sideCamerasOff is shown this long, once, when the side views go off for the drive
 
 Desire = log.Desire
 State = custom.TurnpilotPlan.State
@@ -321,6 +323,8 @@ class TurnPilot:
     self.far_status = 'off'     # the full pass's latest farStatus (watch_far)
     self.far_status_age = float('inf')
     self.far_off_t = 0.         # s farViewOff has left to show
+    self.side_status = 'unset'  # the detector's latest sideViewStatus (watch_far)
+    self.side_off_t = 0.        # s sideCamerasOff has left to show
     self.far_lights: tuple = ()  # the far crop's governing heads last logged (watch_far)
     self.left_now = None  # this frame's unprotected left decision (unprotected_left.LeftDecision), once update() has made it
     self._rf_ticked = self._yaw_ticked = False  # update() dead-reckoned the route, and counted the yaw, this frame
@@ -688,6 +692,9 @@ class TurnPilot:
     if self.far_off_t > 0. and str(plan.controlAlert) == 'none':  # the far crop off for the drive: said once, a status line
       plan.controlAlert = 'farViewOff'
     self.far_off_t = max(self.far_off_t - DT_MDL, 0.)
+    if self.side_off_t > 0. and str(plan.controlAlert) == 'none':  # the side views off for the drive: said once, a status line,
+      plan.controlAlert = 'sideCamerasOff'                            # its time running only while it is shown
+      self.side_off_t = max(self.side_off_t - DT_MDL, 0.)
     if decision.hard_brake:  # a confirmed track's hard stop outranks the map's alerts (scene_policy.py)
       plan.controlAlert = 'hardBrake'
     stalled = self.stalled_in_turn(sm, cs, v_ego, acting, decision, mapd)
@@ -751,7 +758,8 @@ class TurnPilot:
 
   def watch_far(self, sm) -> None:
     """The far crop's state from the full pass's latest farStatus: read, or off for the drive (said once, farViewOff,
-    and logged). Its shadow heads are logged on every change of what they read (never acted on)."""
+    and logged). Its shadow heads are logged on every change of what they read (never acted on). The side views going off
+    for the drive (sideViewStatus disabled, STOP_SIGNS.md row E9) is said the same way (sideCamerasOff)."""
     data = getattr(sm, 'data', {})
     self.far_status_age += DT_MDL
     if 'turnpilotDetections' in data and sm.updated['turnpilotDetections']:
@@ -760,6 +768,11 @@ class TurnPilot:
         self.far_off_t = FAR_OFF_ALERT_S
         cloudlog.event("turnpilot.far_view_off", error=True, was=self.far_status)
       self.far_status, self.far_status_age = status, 0.
+      side = str(sm['turnpilotDetections'].sideViewStatus)
+      if side == 'disabled' and self.side_status != 'disabled':
+        self.side_off_t = SIDE_OFF_ALERT_S
+        cloudlog.event("turnpilot.side_cameras_off", error=True, was=self.side_status)
+      self.side_status = side
     if 'turnpilotFarDetections' in data and sm.updated['turnpilotFarDetections']:
       run = sm['turnpilotFarDetections'].run
       heads = tuple(sorted((str(h.state), round(float(h.distance))) for h in run.lights.lights if h.governs))
