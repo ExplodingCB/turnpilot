@@ -257,3 +257,51 @@ class TestOpposingRoad(unittest.TestCase):
     self.assertEqual(instruction.allManeuvers[1].opposingSpeed, 0.)
     fill_guidance(instruction, steps, 1, 300, opposing={0: (11.11, 1)})
     self.assertEqual((instruction.maneuverOpposingSpeed, instruction.maneuverOpposingLanes), (0., 0))
+
+
+class TestJunctionSchema(unittest.TestCase):
+  """navInstruction's junction for a stop or yield control (MapControl.junctionInfo, STOP_SIGNS.md 3.1, SG1b) and the
+  avoidance fields SG2 fills: every field and enum value round-trips, and an unset junction reads none, never ok."""
+
+  def test_every_field_and_enum_round_trips(self):
+    msg = messaging.new_message('navInstruction')
+    ni = msg.navInstruction
+    ni.avoidedControls = 3
+    ni.avoidStatus = 'keptBest'
+    approach = {'bearing': 270., 'relBearing': -90., 'role': 'exit', 'roadClass': 'secondary', 'use': 'road', 'inbound': True,
+                'outbound': True, 'lanesIn': 2, 'lanesOut': 1, 'valhallaControl': 'unknown', 'osmStop': 'all', 'tier': 'mapStrong',
+                'taggedLimit': 13.4, 'assumedLimit': 20.1, 'speedSource': 'classDefault', 'wayId': 2 ** 40, 'bikeLane': True,
+                'shoulderM': -1.}
+    junction = {'status': 'failed', 'osmNodeId': 180786870, 'lat': 39.77, 'lon': -86.16, 'stopPointDistance': 16.7,
+                'stopPointSource': 'survey', 'headingIn': 359.5, 'maneuver': 'uTurn', 'turnAngle': -170., 'roundabout': True,
+                'divided': True, 'railDistance': 12.5, 'sidecar': True, 'suspected': True, 'surveyed': True, 'validated': True,
+                'certification': 'unavoidable', 'certReason': 'notValidated', 'approaches': [approach]}
+    ni.controls = [{'id': 1, 'kind': 'stop', 'distance': 40., 'junction': True, 'junctionInfo': junction}]
+    back = messaging.log_from_bytes(msg.to_bytes()).navInstruction
+    self.assertEqual((back.avoidedControls, str(back.avoidStatus)), (3, 'keptBest'))
+    got = back.controls[0].junctionInfo.to_dict()
+    for k, v in junction.items():
+      if k != 'approaches':
+        self.assertAlmostEqual(got[k], v, places=4) if isinstance(v, float) else self.assertEqual(got[k], v, k)
+    for k, v in approach.items():
+      self.assertAlmostEqual(got['approaches'][0][k], v, places=4) if isinstance(v, float) else self.assertEqual(got['approaches'][0][k], v, k)
+    schema = messaging.log.NavInstruction
+    self.assertEqual(list(schema.ApproachControl.schema.enumerants), ['none', 'stop', 'yield', 'signal', 'unknown'])
+    self.assertEqual(list(schema.OsmStop.schema.enumerants), ['none', 'stop', 'all', 'minor', 'unknown'])
+    self.assertEqual(list(schema.AllWayTier.schema.enumerants), ['unknown', 'no', 'mapWeak', 'mapStrong', 'surveyed'])
+    self.assertEqual(list(schema.SpeedSource.schema.enumerants), ['survey', 'tagged', 'classDefault'])
+    self.assertEqual(list(schema.ApproachRole.schema.enumerants), ['left', 'right', 'opposite', 'exit', 'other'])
+    self.assertEqual(list(schema.LineSource.schema.enumerants), ['default', 'mappedLine', 'survey'])
+    self.assertEqual(list(schema.Certification.schema.enumerants), ['unchecked', 'certifiable', 'uncertifiable', 'unavoidable'])
+    self.assertEqual(list(schema.CertReason.schema.enumerants), ['none', 'noTable', 'modeOff', 'noLaunch', 'geometry', 'skew', 'unknownLeg',
+                                                                  'notSurveyed', 'override', 'light', 'notValidated', 'reach'])
+    self.assertEqual(list(schema.AvoidStatus.schema.enumerants), ['none', 'clean', 'unavoidable', 'failed', 'keptBest'])
+
+  def test_an_unset_junction_reads_none(self):
+    ni = messaging.new_message('navInstruction').navInstruction
+    ni.controls = [{'id': 0, 'kind': 'signal', 'distance': 10.}]
+    c = ni.controls[0]
+    self.assertFalse(c._has('junctionInfo'))
+    self.assertEqual((str(c.junctionInfo.status), str(c.junctionInfo.maneuver), str(c.junctionInfo.certification)),
+                     ('none', 'unknown', 'unchecked'))
+    self.assertEqual(str(ni.avoidStatus), 'none')
