@@ -195,7 +195,7 @@ class SignalDrive:
 
 class TestTeslaCanCarSignals:
   def test_idle_body_controls_on_bus_2(self):
-    car = TeslaCan(car_signals=True)
+    car = TeslaCan(car_signals=True, body=BodyModel(rng=random.Random(1)))  # the DAS's jitter and early frames on
     d = SignalDrive(car).run(20.)
     assert 36 <= len(d.stock) <= 46  # 2 Hz, with the measured early frames
     counters = [dat[6] >> 4 for _, dat in d.stock]
@@ -243,6 +243,20 @@ class TestTeslaCanCarSignals:
     none_t = [t for t, dat in d.sent if body_controls_request(dat)[0] == REQ_NONE][0]
     assert not d.lit(1, since=none_t + 0.11)
     assert d.echoes[-1][2] == 128
+
+  def test_none_after_the_ownership_window_still_ends_it(self):
+    """As the panda: a NONE is accepted while ours is the last request, however long ago (only the stock frame's
+    block times out at 750 ms)."""
+    car = TeslaCan(car_signals=True, body=quiet_body())
+    car.engage(10.0)
+    d = SignalDrive(car).run(0.5).run(1.5, request=REQ_LEFT).run(0.6, request=REQ_CANCEL, once=True).run(1.0)
+    cancel_t = [t for t, dat in d.sent if body_controls_request(dat)[0] == REQ_CANCEL][0]
+    d.run(0.6, request=REQ_NONE, once=True)
+    none_t, none = [(t, dat) for t, dat in d.sent if body_controls_request(dat)[0] == REQ_NONE][0]
+    assert none_t - cancel_t > BODY_OWN_S
+    assert [e[2] for e in d.echoes if e[1] == none] == [128] and not car.body_owned
+    d.run(0.6, request=REQ_NONE, once=True)  # but not once ours has ended
+    assert d.echoes[-1][2] == 192
 
   def test_disengaged_request_lights_nothing(self):
     car = TeslaCan(car_signals=True, body=quiet_body())
@@ -304,26 +318,29 @@ class TestTeslaCanCarSignals:
                                           car_signals=CarSignalsConfig(mode='on'))
     CI = interfaces[CANDIDATE](CP)
     car.engage(10.0)
-    msg = car_cc(left=True)
-    cs, lit_cs = None, []
-    for k in range(600):
+    cs, lit_cs, blinkers = None, [], []
+    for k in range(1200):  # 6 s wanting left, then 6 s not: the port's own CANCEL and NONE through the stand-in
       tick = 3000 + k
       t = tick * DT
       frames = car.step(car_state(), tick, now=t)
       cs = CI.update([(int(t * 1e9), [CanData(*f) for f in frames])])
-      _, can_sends = CI.CC.update(msg, CI.CS, int(t * 1e9))
+      _, can_sends = CI.CC.update(car_cc(left=k < 600), CI.CS, int(t * 1e9))
       car.parse_sendcan([(int(t * 1e9), [CanData(*m) for m in can_sends])], now=t)
+      blinkers.append(cs.leftBlinker or cs.rightBlinker)
       if car.body.lit(1):
         lit_cs.append(cs)
+      if k == 599:
+        assert str(cs.carSignal.status) == 'lit' and cs.carSignal.leftLamp and str(cs.carSignal.fault) == 'none'
     assert lit_cs, "the port's request lit the bridge's lamp"
-    assert not any(c.leftBlinker or c.rightBlinker for c in lit_cs), "and carState never reads it as the driver's"
-    assert str(cs.carSignal.status) == 'lit' and cs.carSignal.leftLamp and str(cs.carSignal.fault) == 'none'
-    assert cs.carSignal.rejected == 0
+    assert not any(blinkers), "and carState never reads it as the driver's, lit or released"
+    assert str(cs.carSignal.status) == 'ready' and not cs.carSignal.leftLamp and str(cs.carSignal.fault) == 'none'
+    assert cs.carSignal.rejected == 0 and not car.body_owned and not car.body.lit(1)
+    assert car.body.cancels_received == 1, "the port's release: one CANCEL, then NONE"
+    assert body_controls_request(car.body.frames_received[-1][1])[0] == REQ_NONE
 
 
 def car_cc(left=False, right=False):
-  msg = car.CarControl.new_message(enabled=True, latActive=True, longActive=True, leftBlinker=left, rightBlinker=right)
-  return msg.as_reader()
+  return car.CarControl.new_message(enabled=True, latActive=True, longActive=True, leftBlinker=left, rightBlinker=right).as_reader()
 
 
 def test_sim_record_matches_the_sim_car_only_in_the_sim():

@@ -183,19 +183,21 @@ class TeslaCan:
 
   # *** TurnPilot's commanded turn signal: the body (car_signals) ***
   def body_owns(self, now: float) -> bool:
+    """The stock frame is blocked from the body: ours is the last request, sent within BODY_OWN_S."""
     return self.body_owned and now - self.body_tx_t < BODY_OWN_S
 
   def body_tx(self, dat: bytes, now: float) -> None:
     """Our DAS_bodyControls from sendcan, through the stand-in for the panda: LEFT and RIGHT only while cruise is
-    engaged, a CANCEL only shortly after one (twice at most), a NONE only while ours owns the message. Accepted frames
-    reach the body and come back on src 128, refused ones on 192, as pandad returns them."""
+    engaged, a CANCEL only shortly after one (twice at most), a NONE only while ours is the last request (however long
+    ago: only the stock frame's block times out). Accepted frames reach the body and come back on src 128, refused ones
+    on 192, as pandad returns them."""
     request, _ = body_controls_request(dat)
     if request in (REQ_LEFT, REQ_RIGHT):
       ok = self.engaged
     elif request == REQ_CANCEL:
       ok = now - self.body_req_t < BODY_CANCEL_WINDOW_S and self.body_cancels < BODY_CANCEL_MAX
     elif request == REQ_NONE:
-      ok = self.body_owns(now)
+      ok = self.body_owned
     else:
       ok = False
     self.body_out.append((BODY_CONTROLS_ADDR, dat, ECHO_ACCEPTED if ok else ECHO_REJECTED))
