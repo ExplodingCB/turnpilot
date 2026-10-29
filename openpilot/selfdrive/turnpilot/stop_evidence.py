@@ -26,7 +26,8 @@ control's stop point). From it, per track, for SG4a's and SG4b's decider and for
   cross-check, and the box expansion's time to contact (to the camera).
 - U2 (stop_rules.u2_state), stopped at its line (trusted speed under SHIELD_V with its front within its line region, 3 m
   before its stop point to 2 m past it), the shield (stop_rules.shield_ok: a motor vehicle so for SHIELD_STOP_S, seen on
-  every cycle of its view, not moved SHIELD_MOVE_M, on a stopping approach), and through at speed (a motor vehicle whose
+  every cycle of its view, not moved SHIELD_MOVE_M, on a stopping approach with no mapped bike lane and no shoulder of
+  SHOULDER_PASS_M to pass it in: stop_rules.shield_lane_ok), and through at speed (a motor vehicle whose
   front passed its line at DOWNGRADE_V or more without dropping under it in the DOWNGRADE_WINDOW_M before: SG4b's downgrade,
   and a validation failure).
 
@@ -374,8 +375,9 @@ class StopEvidence:
     window = [s for s in here if s.t >= last.t - sr.SHIELD_STOP_S - 1e-9]
     gaps = [b.t - a.t for a, b in zip(window, window[1:], strict=False)]
     seen_every = (self.newest_t is None or self.newest_t - last.t <= CYCLE_GAP_S) and all(g <= CYCLE_GAP_S + 1e-9 for g in gaps)
-    shield = ln.stopping and at_line and sr.shield_ok(last.cls, stopped_s, fit.v_hi, len([s for s in here if s.t >= last.t - sr.VEL_TRUST_S - 1e-9]),
-                                                      front_from_line, seen_every, moved)
+    shield = ln.stopping and at_line and sr.shield_lane_ok(ln.approach) and \
+      sr.shield_ok(last.cls, stopped_s, fit.v_hi, len([s for s in here if s.t >= last.t - sr.VEL_TRUST_S - 1e-9]), front_from_line,
+                   seen_every, moved)
     through = self._through(st, ln, here, s_nom, line, last.cls, cross)
     return TrackEvidence(tid, last.cls, ln.role, ln.index, last.view, last.t, len(here), fit.d_lo, fit.v_hi, fit.v_trusted, fit.a_lo,
                          fit.a_trusted, fit.tau_dot, fit.expansion_agrees, d_nom, v_nom,

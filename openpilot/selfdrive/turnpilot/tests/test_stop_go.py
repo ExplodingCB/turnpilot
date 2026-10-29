@@ -1002,6 +1002,28 @@ def test_V25_a_car_waiting_at_another_line_when_it_is_our_turn_shields_its_lane(
   assert left.r_seen < left.r_req  # the shield, not reach, satisfies it (it hides the lane behind it)
 
 
+@pytest.mark.parametrize('approach,shields', [({'bike_lane': True}, False), ({'shoulder_m': 2.0}, False), ({'shoulder_m': 1.5}, False),
+                                              ({'shoulder_m': 0.}, True), ({'shoulder_m': -1.}, True)])
+def test_V25_a_mapped_bike_lane_or_a_shoulder_wide_enough_to_pass_in_leaves_a_car_at_its_line_no_shield(tmp_path, approach, shields):
+  # 2.3: the shield blocks its own lane only; a mapped bike lane or a shoulder of 1.5 m or more (Valhalla's cycle_lane and
+  # shoulder, junctions.SHOULDER_MAPPED_M) lets a cyclist or a car pass it. Approach.bike_lane and shoulder_m were read and
+  # used nowhere: the left lane was shielded and the car went
+  j = junction()
+  for a in j.approaches:
+    if a.role == 'left':
+      for k, v in approach.items():
+        setattr(a, k, v)
+  w = World(tmp_path, j=j)
+  w.tracks = cars((8, 'left', at_line(t0=1.5, d0=10.5, v0=2.)))
+  out = w.run(8.)
+  i = first_go(out)
+  lanes = out[i - 1].lanes if i else out[-1].lanes
+  assert [x.shielded for x in lanes if x.role == 'left'] == [shields]
+  assert (i is not None) == shields  # unshielded, the lane it hides is short of reach: no go
+  e = w.sg.ev[8]
+  assert e.stopped_at_line and e.shield == shields
+
+
 def track_boxes(tracks_fn):
   """World.boxes for scripted tracks: each one's own raw box in its view (the detection its track is made of), from where
   the car is now."""

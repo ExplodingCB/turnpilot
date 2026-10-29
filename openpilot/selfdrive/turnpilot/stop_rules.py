@@ -54,6 +54,7 @@ U2_LINE_M = 3.0           # m short of our path a stopping car must be able to s
 SHIELD_STOP_S, SHIELD_V, SHIELD_MOVE_M = 1.0, 0.5, 0.3
 SHIELD_BEFORE_M, SHIELD_PAST_M = 3.0, 2.0  # the line region: 3 m before its stop point to 2 m past it
 SHIELD_KINDS = ('car', 'truck', 'bus')
+SHOULDER_PASS_M = 1.5           # m: a shoulder this wide lets a car pass a shield in it (2.3; junctions.SHOULDER_MAPPED_M)
 
 # the launch and the band (2.6)
 STOP_GO_V_MAX = 2.0       # m/s, TurnPilot's cap from the go to commit
@@ -760,6 +761,14 @@ def tracked_ok(fit: TrackFit, maneuver: str, cue_s: float, v_c: float, extra_lan
   if fit.d_lo < tracked_r_req(v, cue_s):
     return False
   return v <= 0. or fit.d_lo / v >= t_gap(maneuver, extra_lanes)
+
+
+def shield_lane_ok(approach) -> bool:
+  """Whether a vehicle stopped at this approach's line can shield its lane at all (2.3): not where a mapped bike lane or a
+  shoulder of SHOULDER_PASS_M or more (Valhalla's cycle_lane and shoulder) lets something pass it. An unknown shoulder (-1)
+  or none (0) doesn't exclude it."""
+  return approach is None or not (bool(getattr(approach, 'bike_lane', False)) or
+                                  float(getattr(approach, 'shoulder_m', -1.)) >= SHOULDER_PASS_M - 1e-9)
 
 
 def shield_ok(kind: str, stopped_s: float, v_hi: float, samples: int, front_from_line_m: float, seen_every_cycle: bool,
