@@ -298,6 +298,7 @@ class TurnPilot:
       self.turn_cap_id: int | None = None  # ...whose turn speed cap stays, its desire having gone out
       self.turn_held_id: int | None = None  # ...whose turn desire was out: held to its clear, never cancelled
       self.skip_cap_id: int | None = None  # a dropped turn skipped on taking it up: its cap stays until it is passed
+      self.veto_hold_id: int | None = None  # a turn vetoed standing at a hold: the hold keeps it until it lets go
       self.go_id: int | None = None  # the turn a hold let go of at standstill: checked for a miss and a stall
       self.post_go: PostGo | None = None  # ...and driven under its post-go profile (start_post_go)
       self.no_move_limit = NO_MOVE_S       # ...withdrawn if the car hasn't moved this long after it (no_move)
@@ -527,10 +528,17 @@ class TurnPilot:
     if cap_on is None and rf.maneuver_id == self.skip_cap_id:
       cap_on = upcoming  # the skipped turn's pulse may have been taken before it was cleared: never sped up into it
 
-    # the scene's holds only ever brake, so they keep the real maneuver through a handback
+    # the scene's holds only ever brake, so they keep the real maneuver through a handback, and through a veto's skip
+    # standing at a hold until that hold lets go: the veto never pulls the car away, the hold's go does (straight on)
     left_stops = self.left_now.stops if self.left_now is not None else []
-    decision = self.scene_now = self.scene.update(objects, available, maneuver, rf.distance, v_ego, right_hand_traffic, rf.maneuver_id,
-                                                 took_over, extra_stops=mapd.stops + left_stops, heading_deg=self.approach_yaw_deg)
+    if self.veto_hold_id is not None and self.veto_hold_id != rf.maneuver_id:
+      self.veto_hold_id = None
+    scene_maneuver = upcoming if self.veto_hold_id is not None else maneuver
+    decision = self.scene_now = self.scene.update(objects, available, scene_maneuver, rf.distance, v_ego, right_hand_traffic,
+                                                 rf.maneuver_id, took_over, extra_stops=mapd.stops + left_stops,
+                                                 heading_deg=self.approach_yaw_deg)
+    if not decision.should_stop:
+      self.veto_hold_id = None
     # a hold let go with the car standing (the walker cleared, a stop's go): the model won't pull away on its own, and the
     # turn's pulse is long forgotten, so it goes again in this very plan, the one that lets the car go: held, the desire
     # was dropped to none, so it is a fresh edge (desire_timing.py). BeamNG: let go a frame before its pulse, the car drove
@@ -608,7 +616,11 @@ class TurnPilot:
 
     # the turn signal (car_signals.py): the side, the prompt, the driver overruling the car, the lamp's lead
     left_d = self.left_now
-    at_left_line = left_d is not None and left_d.state in ('waitGap', 'creep', 'undecided', 'announce')
+    # the unprotected left at its hold line: the autonomous left's wait there, or the line's latch holding the car (G1's
+    # handback, TurnPilotAutoLeft off): a veto there is the left's handback, never a skip that lets go of the latch
+    tc = self.map_controls.turn
+    at_left_line = (left_d is not None and left_d.state in ('waitGap', 'creep', 'undecided', 'announce')) or \
+      (tc is not None and tc.held and self.map_controls.turn_engaged(rf.maneuver_id))
     ts = self.turn_signal.update(status=signal_status, port=port, gates_ok=acting and not shadow, engaged=sm['carControl'].enabled,
                                  lane_side=self.lanes.signal_side, lane_pending=self.lanes.phase != Phase.IDLE or
                                  (lc.want != 0 and lc.wait in LANE_PENDING_WAITS),
@@ -621,10 +633,23 @@ class TurnPilot:
                                  passed=rf.valid and rf.upcoming is None)
     self.signal_out = ts
     ts.fill(plan.turnSignal)
-    if ts.skip != 'none' and act_on is not None and not committed and not self.skip.skipped:
-      # the driver overruled the car's signal before the turn: skipped out loud, navd reroutes (never a committed turn)
-      self.skip.skip(act_on, rf.distance, rf.maneuver_id, v_ego, ts.skip)
-      plan.tooFastToTurn = True
+    # a turn whose desire is out is skipped only standing held short of the junction, under TURN_STARTED_DEG into it
+    # (the intent's own rule): a right turn pulses 40 m out, so every hold short of it finds its desire out
+    standing_veto = decision.should_stop and not at_left_line and self.desires.turned_deg < TURN_STARTED_DEG
+    if ts.skip != 'none' and act_on is not None and not self.skip.skipped:
+      if not committed or standing_veto:
+        # the driver overruled the car's signal: skipped out loud, navd reroutes. A desire out from the approach comes
+        # out of the model's queue now (CLEAR_DESIRE) and the turn's cap stays until it is passed, as for a dropped turn
+        # too close to pulse again: the hold's go is never the vetoed turn
+        self.skip.skip(act_on, rf.distance, rf.maneuver_id, v_ego, ts.skip)
+        plan.tooFastToTurn = True
+        if committed:
+          self.desires.cancel()
+          self.skip_cap_id = rf.maneuver_id
+        if decision.should_stop:
+          self.veto_hold_id = rf.maneuver_id
+      else:
+        cloudlog.event("turnpilot.turn_signal_veto_dropped", error=True, why=ts.skip, turned_deg=round(self.desires.turned_deg, 1))
     signal_skip = self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id and \
       self.skip.reason in ('driverSignal', 'hazards', 'signalLost', 'sideUncertain')
     plan.turnSignal.skip = self.skip.reason if signal_skip else 'none'

@@ -1,15 +1,20 @@
 """turnpilotd's turn signal in closed loop (car_signals.py, DESIGN phase4/blinker 11.3): the status from CarParams and the
 port, the side it publishes for controlsd, the prompt, the driver overruling the car (a skip and a reroute), the side in
 doubt, and the lane planner's lead gate on the car's own lamp."""
+import pytest
+
 from opendbc.car.tesla.values import TeslaFlags
-from openpilot.cereal import custom
+from openpilot.cereal import custom, log
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.car_signals import ARM_LAG_S, LEAD_LONG_M
+from openpilot.selfdrive.turnpilot.desire_timing import TURN_STARTED_DEG
+from openpilot.selfdrive.turnpilot.hooks import CLEAR_DESIRE
 from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Sim
 
 Status = custom.TurnpilotPlan.TurnSignal.Status
 LaneChange = custom.TurnpilotPlan.LaneChange
+Desire = log.Desire
 RIGHT_TURN = [(400., "turn", "right", junction_of("right")), (2000., "turn", "left", junction_of("left"))]
 
 
@@ -227,3 +232,97 @@ def test_selfdrived_says_nothing_about_signalling_after_a_too_fast_skip():
   assert any(text1 == "Too Fast to Turn" or text1.startswith("Turn") for _, text1, _ in shown), {s[1] for s in shown}
   bad = [s for s in shown if "yourself" in s[2]]
   assert not bad, f"after the too-fast skip selfdrived shows {bad[0][1]!r} / {bad[0][2]!r} at {bad[0][0]:.1f} m/s"
+
+
+# ---------------------------------------------------------------- the driver overrules the car at a hold (6.6)
+
+def held_at_walker(driver: str, turned_deg: float = 0.):
+  """A right turn at 300 m, the car signalling it, its desire out on the approach, held short of the junction for a walker
+  in the crosswalk. driver: 'left' (the driver's lamp the other way: our lamp released with NONE, the port held off) or
+  'hazards', 2 s after the car stopped, for 3 s standing; then the walker leaves and the hold lets go. Returns (sim, the
+  standing plans, the plans after the walker left). turned_deg: how far into the turn the car stands (yawed on the
+  approach from its pulse)."""
+  sim = Sim([(300., "turn", "right"), (1500., "turn", "left")], driver_signals=None)
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  state = {'driver': 'none'}
+  walker = {'on': True}
+
+  def port(s):
+    if state['driver'] == 'left':
+      return {'status': 'ready', 'block': 'otherSide', 'leftLamp': True}
+    if state['driver'] == 'hazards':
+      return {'status': 'ready', 'block': 'hazard', 'hazard': True, 'leftLamp': True, 'rightLamp': True}
+    lit = s.tp.signal_out.side == LaneChange.right
+    return {'status': 'lit' if lit else 'ready', 'right': lit, 'rightLamp': lit}
+  sim.car_signal = port
+
+  def objects(s):
+    return ({'cls': 'pedestrian', 'x': 300. - s.s + 3., 'y': -5., 'age': 5 + int(s.t * 10.)},) if walker['on'] else ()
+
+  while not (sim.v < 0.05 and sim.s > 250.):
+    d = sim.tp.desires
+    sim.step(objects(sim), engaged=True, yaw_rate=-0.3 if d.started and d.turned_deg < turned_deg else 0.)
+    assert sim.t < 60.
+  assert sim.tp.desires.started and sim.tp.turn_committed, "the right turn's desire went out on the approach"
+  assert sim.trace[-1][2].shouldStop and sim.trace[-1][2].turnSignal.side == LaneChange.right
+  for _ in range(int(2. / DT_MDL)):
+    sim.step(objects(sim), engaged=True)
+  state['driver'] = driver
+  standing = [sim.step(objects(sim), engaged=True, blinker=driver == 'left') for _ in range(int(3. / DT_MDL))]
+  walker['on'] = False
+  after = [sim.step(objects(sim), engaged=True, blinker=driver == 'left') for _ in range(int(5. / DT_MDL))]
+  return sim, standing, after
+
+
+@pytest.mark.parametrize("driver,skip", [('left', 'driverSignal'), ('hazards', 'hazards')])
+def test_the_driver_overruling_the_car_at_a_hold_skips_the_turn_out_loud(driver, skip):
+  """DESIGN 6.6: a veto while the car stands at a line holding it skips the turn out loud, its desire out or not. The
+  desire that went out on the approach is cleared from the model's queue, so the hold's go is never the vetoed turn."""
+  sim, standing, after = held_at_walker(driver)
+  said = [p for p in standing if p.tooFastToTurn and str(p.turnSignal.skip) == skip]
+  assert said, f"{driver} at the line: nothing said, no skip, no handback while standing"
+  assert said[0] is standing[0], "skipped on the frame the driver overruled it"
+  assert all(p.tooFastToTurn and str(p.turnSignal.skip) == skip for p in standing), "said for as long as it stands"
+  # the hold that had the car keeps it while the walker is there: the veto never pulls the car away, the hold's go does
+  assert all(p.shouldStop for p in standing), "the car pulled away on the veto, the walker still in the crosswalk"
+  assert not after[-1].shouldStop and sim.trace[-1][1] > 1.
+  assert any(p.desire == CLEAR_DESIRE for p in standing), "the approach's pulse is cleared from the model's queue"
+  assert not any(p.desire == Desire.turnRight for p in standing + after), "the hold let go into the vetoed turn"
+  assert all(p.speedCap < 15. for p in after if p.tooFastToTurn), "the skipped turn's cap kept until it is passed"
+
+
+def test_overruled_at_a_hold_standing_in_the_turn_finishes_it_out_loud():
+  """Standing at the hold TURN_STARTED_DEG into the turn, the car has started it: never sent straight from there, it
+  finishes the turn and says so ("Turn Signal Changed" / "Finishing the turn"), as a veto after the start does."""
+  sim, standing, after = held_at_walker('left', turned_deg=25.)
+  assert TURN_STARTED_DEG <= sim.tp.desires.turned_deg < 35.
+  assert not any(p.tooFastToTurn or str(p.turnSignal.skip) != 'none' for p in standing + after)
+  assert any(str(p.turnSignal.notice) == 'changedMidTurn' for p in standing)
+
+
+def test_overruled_at_an_unprotected_turns_line_keeps_its_handback():
+  """TurnPilotAutoLeft off (G1): the unprotected left stands at its hold line, handed back (take control), its desire out
+  from the approach. A veto there is no skip: a skip would release the latch with the car in a left-turn position (6.6's
+  exception); the car stays held and handed back."""
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import TURNS_AHEAD
+  sim = Sim(TURNS_AHEAD, driver_signals=None)
+  sim.go_taps = False
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  driver = {'right': False}
+
+  def port(s):
+    if driver['right']:
+      return {'status': 'ready', 'block': 'otherSide', 'rightLamp': True}
+    lit = s.tp.signal_out.side == LaneChange.left
+    return {'status': 'lit' if lit else 'ready', 'left': lit, 'leftLamp': lit}
+  sim.car_signal = port
+  while not (sim.v < 0.05 and sim.s > 250.):
+    sim.step(engaged=True)
+    assert sim.t < 60.
+  for _ in range(int(1. / DT_MDL)):
+    sim.step(engaged=True)
+  assert sim.trace[-1][2].controlPrompt == 'unprotectedTurnTakeControl' and sim.tp.desires.started
+  driver['right'] = True
+  plans = [sim.step(engaged=True) for _ in range(int(5. / DT_MDL))]
+  assert not any(p.tooFastToTurn or str(p.turnSignal.skip) != 'none' for p in plans)
+  assert all(p.shouldStop and p.controlPrompt == 'unprotectedTurnTakeControl' for p in plans)

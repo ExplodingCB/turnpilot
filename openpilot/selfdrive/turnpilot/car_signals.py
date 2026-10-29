@@ -16,9 +16,10 @@ never went out also ends PASSED_DIST_M past its junction (passed straight). Only
 maneuver still ahead, tells the driver to signal it ("Signal Off", handedOver), and never while openpilot steers at 20 mph
 or more; a turn the maneuver ended (done, skipped, passed, missed) never does.
 
-With the car signalling, the driver overrules it before the turn starts (their lamp on the other side, hazards, or our
-lamp put out): the turn is skipped out loud and navd reroutes, except at the unprotected left's hold line, where the
-left hands back (a skip there would let go of the car in a left-turn position).
+With the car signalling, the driver overrules it before the turn starts, or while a hold has the car standing short of
+TURN_STARTED_DEG into it (their lamp on the other side, hazards, or our lamp put out): the turn is skipped out loud and
+navd reroutes, except at the unprotected left's hold line, where the left hands back (a skip there would let go of the
+car in a left-turn position). Once the turn has started it finishes, said ("Turn Signal Changed").
 """
 import datetime
 import json
@@ -394,19 +395,21 @@ class TurnSignalIntent:
       cloudlog.event("turnpilot.turn_signal", error=short, lit_m=round(self.lit_m, 1), lead_m=round(lead, 1),
                      arm_m=round(self.arm_m, 1))
 
-    # the driver overrules the car's signal (DESIGN 6.6)
-    started = d_this and desires.started and not standing
+    # the driver overrules the car's signal (DESIGN 6.6): before the turn starts, or standing held at a line short of
+    # TURN_STARTED_DEG into it (its desire out from the approach or not), a skip out loud; at the unprotected left's
+    # line, its handback; once started (moving with its desire out, or standing in it), finished and said
+    started = d_this and desires.started and (not standing or desires.turned_deg >= TURN_STARTED_DEG)
     turn_side = self.arm_side if lane_side == LaneChange.none else LaneChange.none
     if turn_side != LaneChange.none and self.armed_id is not None:
       veto = self._veto(port, status, turn_side, lamps)
       if veto:
-        if started:
+        if at_left_line:
+          out.left_veto = 'driverSignal'
+        elif started:
           if self.changed_id != self.armed_id:
             self.changed_id = self.armed_id
             self._notice('changedMidTurn')
             cloudlog.event("turnpilot.turn_signal_changed", why=veto, lit_m=round(self.lit_m, 1))
-        elif at_left_line:
-          out.left_veto = 'driverSignal'
         else:
           out.skip = veto
 

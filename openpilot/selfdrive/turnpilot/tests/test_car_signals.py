@@ -293,6 +293,22 @@ def test_after_the_turn_starts_no_skip_but_a_notice():
   assert out.skip == 'none' and out.notice == 'changedMidTurn'
 
 
+def test_standing_in_the_turn_a_veto_is_no_skip():
+  """Held at a line TURN_STARTED_DEG into the turn (a walker in the crosswalk of the road it turns into), the turn has
+  started: a veto finishes it out loud, never a skip that would send the car straight from there."""
+  drive = Drive(distance=5., v=0.)
+  drive.d = desires(started=True, turned=20.)
+  drive.step(standing=True)
+  drive.port = port(block='otherSide')
+  out = drive.step(standing=True, left_lamp=False, right_lamp=True)
+  assert out.skip == 'none' and out.notice == 'changedMidTurn'
+  drive2 = Drive(distance=5., v=0.)  # short of it: still a skip
+  drive2.d = desires(started=True, turned=10.)
+  drive2.step(standing=True)
+  drive2.port = port(block='otherSide')
+  assert drive2.step(standing=True, right_lamp=True).skip == 'driverSignal'
+
+
 def test_nothing_vetoes_unless_ready():
   drive = Drive(distance=60., status=Status.off)
   drive.port = port(status='off', block='otherSide')
