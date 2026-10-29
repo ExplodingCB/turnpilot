@@ -503,11 +503,12 @@ def main(demo=False):
     last_vipc_frame_id = meta_main.frame_id
 
     if detector is not None and model_output is not None:
-      tp_fresh = fresh_plan(sm)  # the camera TurnPilot asks for (DESIGN phase 4 G4): read in shadow too, where it steers nothing
-      view = str(tp_fresh.detectorView) if tp_fresh is not None else 'auto'
-      far_bearing = float(tp_fresh.farCropBearing) if tp_fresh is not None else 0.  # where the far crop looks (G5)
+      from openpilot.selfdrive.turnpilot.detector.modeld_detector import plan_inputs
+      # the camera TurnPilot asks for (DESIGN phase 4 G4, the stop sweeps), where the far crop looks (G5) and whether a signal
+      # is mapped near: read in shadow too, where it steers nothing
+      view, far_bearing, signal_near = plan_inputs(fresh_plan(sm))
       detector.step(pm, model, model_execution_time, prev_action.desiredCurvature, desire, [meta_main, meta_extra], sm['carControl'].enabled,
-                    view, far_bearing)
+                    view, far_bearing, v_ego, signal_near)
 
 if __name__ == "__main__":
   try:
