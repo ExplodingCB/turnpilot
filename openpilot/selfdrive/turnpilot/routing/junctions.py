@@ -20,7 +20,7 @@ the outbound edge lanes out. A leg whose inbound edge isn't matched has control 
 only leave by (none to match: read the control with inbound).
 
 Per approach: the assumed limit is the survey's posted sign, else the tagged maxspeed (Valhalla's speed_limit, else the
-sidecar's), else CLASS_LIMIT_MPH by road class (decision D8), never Valhalla's classified speed. The tier (4.1), against the
+sidecar's), else stop_rules.CLASS_LIMIT_MPH by road class (decision D8), never Valhalla's classified speed. The tier (4.1), against the
 OSM stop-sign sidecar's junction record: an override (TurnPilotJunctionOverrides) is no; a counting survey's approach is
 surveyed if it stops, else no; a sidecar stop on the approach is mapStrong when directed or stop=all (its own or the
 junction node's), mapWeak when a plain junction-node or undirected stop, or the junction's tags contradict (stop=all beside
@@ -44,6 +44,7 @@ from datetime import date
 from pathlib import Path
 
 from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
+from openpilot.selfdrive.turnpilot.stop_rules import class_limit_mph
 from openpilot.selfdrive.turnpilot.maps.surveys import POS_ERR_M, STOP_CLEAR_M
 
 LEG_PROBE_M = 8.        # m out along a leg its probe point goes
@@ -64,9 +65,6 @@ RAIL_NONE = -1.          # railDistance: none within RAIL_M nor on our edge
 RAIL_UNKNOWN = -2.       # railDistance: no current sidecar to say
 SHOULDER_MAPPED_M = 1.5  # m a mapped shoulder is taken as (no width is mapped; 1.5 m is wide enough to pass in, 2.3)
 MPH = 0.44704
-CLASS_LIMIT_MPH = {'motorway': 55, 'trunk': 55, 'primary': 55, 'secondary': 45, 'tertiary': 35, 'unclassified': 30,
-                   'residential': 30, 'service_other': 30}
-UNKNOWN_CLASS_MPH = 55   # a class not known: the highest default
 UNLIMITED_KPH = 255      # Valhalla's speed_limit for no limit
 RANK = {'motorway': 0, 'trunk': 1, 'primary': 2, 'secondary': 3, 'tertiary': 4, 'unclassified': 5, 'residential': 6, 'service_other': 7}
 PLAUSIBLE_TOP_RANK = 2   # primary: an approach this class or above beside one two ranks lower is an implausible all-way
@@ -140,10 +138,8 @@ def role_of(rel_bearing: float) -> str:
 
 
 def class_limit(road_class: str | None, use: str | None = None) -> float:
-  """m/s: decision D8's default for an untagged road of road_class."""
-  if use == 'living_street':
-    return 30 * MPH
-  return CLASS_LIMIT_MPH.get(road_class or '', UNKNOWN_CLASS_MPH) * MPH
+  """m/s: decision D8's default for an untagged road of road_class (stop_rules.CLASS_LIMIT_MPH, shared with turnpilotd)."""
+  return class_limit_mph(road_class, use) * MPH
 
 
 def kph(limit) -> float:
