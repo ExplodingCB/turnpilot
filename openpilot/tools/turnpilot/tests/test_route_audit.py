@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from openpilot.selfdrive.turnpilot.routing.tests.test_route_controls import LON0, M_PER_DEG, StubValhalla, entry, osm_dir, pt, steps
+from openpilot.selfdrive.turnpilot.routing.tests.test_route_controls import LON0, M_PER_DEG, StubValhalla, entry, osm_dir, pt, rail_dir, steps
 from openpilot.tools.turnpilot import route_audit
 
 
@@ -82,6 +82,22 @@ def test_sg1a_an_orphan_left_out_is_listed_as_uncovered_with_how_far_before_its_
   assert rows == [('71:f', '-', 'stop (mid_directed, stop=none)', 'stop at 89 m'),
                   ('73:f', 'stop', "stop (mid_directed, stop=none, an orphan 100 m before its edge's end: left out)", 'stop at 289 m')]
   assert "orphan (sign 40 m before its edge's end)" in '\n'.join(route_audit.lines(report))
+
+
+def test_sg1a_an_orphan_before_a_rail_crossing_is_on_its_edges_row_with_its_stop(tmp_path):
+  """An orphan with a rail crossing within RAIL_M past its sign stops the car at its sign (routing/controls.py): its
+  edge's row says so and lists that stop beside any at the edge's end; it isn't among the signs no row covers."""
+  v = StubValhalla([(0., 100., {'way_id': 71}), (100., 180., {'way_id': 72}), (180., 300., {'way_id': 73, 'stop': True}),
+                    (300., 400., {'way_id': 74})])
+  side = rail_dir(tmp_path, [pt(146.), pt(226.)], {'72:f': [entry('stop', 140., junction=0, node=601)],
+                                                   '73:f': [entry('stop', 220., junction=0, node=602)]})
+  report = route_audit.audit(v, steps(), None, side)
+  assert report.signs == []
+  assert [(c.kind, round(c.route_m, 1)) for c in report.controls] == [('stop', 137.7), ('stop', 217.7), ('stop', 289.)]
+  rows = [(r.key, r.valhalla, r.sidecar, r.control) for r in report.rows]
+  assert rows == [('72:f', '-', 'stop (mid_directed, stop=none, an orphan 6 m before a rail crossing: stops at its sign)', 'stop at 138 m'),
+                  ('73:f', 'stop', 'stop (mid_directed, stop=none, an orphan 6 m before a rail crossing: stops at its sign)',
+                   'stop at 218 m, stop at 289 m')]
 
 
 def test_each_junction_lists_its_legs_tiers_limits_the_line_source_and_the_survey(tmp_path):

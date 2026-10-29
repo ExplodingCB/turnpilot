@@ -17,10 +17,16 @@ junction_node 0: a mid-block trail or rail crossing, or a reversed direction tag
 before its anchor edge's end: that end less CONTROL_LINE_M would stop the car where there is no sign, up to a kilometre
 past the real one (Indianapolis: 146 of the 176 such orphans more than 15 m past), so it is left out and logged (route_audit
 lists it as uncovered), as the base had it; never placed at its sign instead, since a reversed tag would then stop the car
-past a junction. It is still ours on the edge for phantom(). One exception: Valhalla flags both directions of a stop on a
-graph node it can't direct (a crosswalk's, shared with a footway), so the other direction's directed stop sitting ON the
-edge's end node (within PHANTOM_NODE_M) makes a phantom of our flag of its kind there: dropped, and logged, but only when
-the sidecar has nothing of ours on the edge (any kind, directed, both-ways, undirected, with a junction or none) and no
+past a junction. But an orphan, near its edge's end or far, with a mapped rail crossing within RAIL_M past its sign on the
+route (rail_ahead: the tracks ahead confirm its direction tag; a reversed one has them behind it) stops the car at its sign,
+never nearer the crossing's node than RAIL_CLEAR_M (one in a median before the first carriageway, as below): a stop or
+yield of its own there (that edge's end may be past the tracks), never moved on by a survey of the junction at that end,
+whose junction always carries the rail crossing (railDistance: certify's geometry, so SG2 routes around it, or an
+unavoidable one is a stop and a handback, C7); rail crossings reach the car only that way. Either is still ours on the
+edge for phantom(). One exception: Valhalla flags both directions of a stop on a graph node it can't direct (a
+crosswalk's, shared with a footway), so the other direction's directed stop sitting ON the edge's end node (within
+PHANTOM_NODE_M) makes a phantom of our flag of its kind there: dropped, and logged, but only when the sidecar has nothing
+of ours on the edge (any kind, directed, both-ways, undirected, with a junction or none) and no
 undirected or both-ways one keyed the other way inside it (phantom()). A missing entry for us proves nothing by itself
 (the sidecar may not have tied the stop to a junction), so every other case keeps Valhalla's flag: an extra stop is
 cheap, a dropped real one isn't.
@@ -87,6 +93,10 @@ MAP_MARGIN_M = 1.       # m short of the line the car stops
 ORPHAN_NEAR_M = CONTROL_LINE_M + 5.  # m: a sidecar stop or yield tied to no junction (junction_node 0, an orphan) whose sign
                                      # is further than this before its anchor edge's end is left out (SG1a): that end less
                                      # CONTROL_LINE_M would put it that far past its sign, where there is none
+RAIL_CLEAR_M = 4.6 + 0.7 + jn.POS_ERR_M  # m: an orphan stopping the car before a rail crossing (rail_ahead) never stops it nearer
+                                         # the crossing's node than this: 15 ft from the nearest rail, the least US law allows
+                                         # (UVC 11-701), half a standard gauge (the node is on the track's centreline), and the
+                                         # car's along-track position error
 PARTIAL_UNMATCHED = 0.10
 LINE_TOL_M = 5.         # m: a sidecar line further than this from the route isn't on it
 NODE_TOL_M = 5.         # m: a junction-node control's node this close to an edge's end is that end
@@ -730,6 +740,21 @@ def maneuver_at(steps, starts, stop_s: float, node_s: float) -> str:
   return 'straight'
 
 
+def rail_ahead(osm, pts, cum, sign_m: float, sign) -> float | None:
+  """m along the route of the nearest mapped rail crossing (the sidecar's) on it (within RAIL_ON_ROUTE_M) past a sign at
+  sign_m (its position sign, (lat, lon)) by at most RAIL_M, or None. One there confirms the sign's direction tag: a
+  reversed one has the tracks behind it, as the other direction's sign just past the tracks does."""
+  best = None
+  for r in osm.rail:
+    p = (float(r['lat']), float(r['lon']))
+    if haversine(p, sign) > jn.RAIL_M + jn.RAIL_ON_ROUTE_M + LINE_TOL_M:
+      continue
+    hit = nearest(pts, cum, p, sign_m, sign_m + jn.RAIL_M)
+    if hit is not None and hit[1] <= jn.RAIL_ON_ROUTE_M and sign_m < hit[0] <= sign_m + jn.RAIL_M:
+      best = hit[0] if best is None else min(best, hit[0])
+  return best
+
+
 def rail_distance(osm, pts, cum, begin_m: float, end_m: float, node) -> float:
   """MapJunction.railDistance: m to the nearest mapped rail crossing (the sidecar's), along the route for one on the
   control's own edge (begin_m to end_m) however far back, else straight-line from the node within RAIL_M; RAIL_NONE without
@@ -776,6 +801,7 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
   ends = []                   # per edge: (end m on the route, span m, key, its end node)
   at = {}                     # anchor edge -> {kind: [(source edge, osm entry or None, m along or None)]}
   signs = {}                  # anchor edge -> [(source edge, osm entry, m along)]: every sidecar sign there, far orphans too
+  rail_stops = []             # [(anchor edge, osm entry, its sign's m along, the rail crossing's m along)]: orphans (rail_ahead)
   unmatched = anchor = 0
   for i, (e, candidate) in enumerate(zip(edges, located, strict=False)):
     internal = bool(e.get('internal_intersection'))
@@ -794,17 +820,26 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
     ends.append((end_m, span, key, e.get('end_node') or {}))
     valhalla = (['signal'] if e.get('traffic_signal') or (e.get('end_node') or {}).get('traffic_signal') else []) + \
       (['stop'] if candidate.get('stop_sign') else []) + (['yield'] if candidate.get('yield_sign') else [])
-    hits, phantoms, far = [], [], []
+    hits, phantoms, far, rails = [], [], [], []
     if osm_ok:
       for entry in osm.entries(key):
         m = osm_at(osm, entry, pts, cum, end_m - span, end_m, tpts[end_i])
         if m is not None and entry.get('kind') in ('stop', 'yield'):
           hits.append((entry, m))
-      # an orphan whose sign is far before its anchor edge's end: left out (ORPHAN_NEAR_M), never placed at the sign either
-      # (a reversed direction tag would then stop the car past a junction); still ours on the edge for phantom()
+      # an orphan with a rail crossing just past its sign (rail_ahead, which confirms its direction tag) stops the car at its
+      # sign, near its edge's end or far, never at that end (which may be past the tracks); one without, far before its anchor
+      # edge's end: left out (ORPHAN_NEAR_M), never placed at the sign either (a reversed direction tag would then stop the
+      # car past a junction); either is still ours on the edge for phantom()
       for entry, m in hits:
+        if entry.get('junction_node') or not entry.get('line'):
+          continue
         before = ends[anchor][0] - m
-        if not entry.get('junction_node') and entry.get('line') and before > ORPHAN_NEAR_M:
+        rail_m = rail_ahead(osm, pts, cum, m, (float(entry['line'][0]), float(entry['line'][1])))
+        if rail_m is not None:
+          rails.append((entry, m, rail_m))
+          cloudlog.info(f"turnpilot controls: the sidecar's {entry['kind']} on {key} at {m:.0f} m is tied to no junction and " +
+                        f"{rail_m - m:.0f} m before a rail crossing: the car stops at its sign, {before:.0f} m before its edge's end")
+        elif before > ORPHAN_NEAR_M:
           far.append((entry, m, before))
           cloudlog.info(f"turnpilot controls: the sidecar's {entry['kind']} on {key} at {m:.0f} m is tied to no junction and " +
                         f"{before:.0f} m before its edge's end: left out (that end would put it {before - CONTROL_LINE_M:.0f} m past its sign)")
@@ -819,13 +854,15 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
           phantoms.append(kind)
           cloudlog.info(f"turnpilot controls: Valhalla's {kind} on {key} at {end_m:.0f} m is a phantom: the OSM sidecar's is " +
                         f"directed {' or '.join(others)}, on the edge's end node")
-    placed = [(entry, m) for entry, m in hits if not any(entry is x for x, _, _ in far)]
+    placed = [(entry, m) for entry, m in hits if not any(entry is x for x, _, _ in far + rails)]
     if audit is not None:
       audit.append({'edge': i, 'key': key, 'internal': internal, 'anchor': anchor, 'begin_m': end_m - span, 'end_m': end_m,
                     'valhalla': list(valhalla), 'phantom': phantoms, 'osm': [dict(entry, m=m) for entry, m in placed],
-                    'orphans': [dict(entry, m=m, before_m=before) for entry, m, before in far]})
+                    'orphans': [dict(entry, m=m, before_m=before) for entry, m, before in far],
+                    'rail': [dict(entry, m=m, rail_m=rail_m) for entry, m, rail_m in rails]})
     for entry, m in hits:
       signs.setdefault(anchor, []).append((i, entry, m))
+    rail_stops += [(anchor, entry, m, rail_m) for entry, m, rail_m in rails]
     kinds = at.setdefault(anchor, {}) if valhalla or placed else None
     for kind in valhalla:
       kinds.setdefault(kind, []).append((i, None, None))
@@ -873,6 +910,15 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
     found.append({'s': line_m - MAP_MARGIN_M, 'kind': kind, 'mapped': mapped, 'junction': junction, 'cross_suspect': cross_suspect,
                   'instance': instance, 'source': source, 'osm_node': osm_node, 'status': 'failed' if failed else 'ok', 'a': a,
                   'sign_m': sign_m, 'suspected': False, 'legs': None})
+  # an orphan before a rail crossing: a stop or yield of its own at its sign, never nearer the crossing than RAIL_CLEAR_M,
+  # never merged with its edge's end (its junction there carries the rail crossing: certify's geometry, SG2's reroute); one
+  # in a median (on an internal edge, past its anchor's end) stops the car before the first carriageway, as any there does
+  for a, entry, m, rail_m in rail_stops:
+    end_m, node = ends[a][0], ends[a][3]
+    line_m = min(m, rail_m - RAIL_CLEAR_M, end_m - CONTROL_LINE_M if m > end_m else math.inf)
+    found.append({'s': line_m - MAP_MARGIN_M, 'kind': entry['kind'], 'mapped': False, 'junction': bool(node.get('intersecting_edges')),
+                  'cross_suspect': False, 'instance': '', 'source': 'default', 'osm_node': 0, 'status': 'ok', 'a': a, 'sign_m': m,
+                  'suspected': False, 'legs': None, 'rail_m': rail_m})
   # suspected unmapped stops (N5): a junction with nothing mapped on its whole approach (approach_edges) where every road
   # crossing outranks ours by two classes or more is emitted as a stop, one per junction
   suspected: set[int] = set()
@@ -967,8 +1013,11 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
     j.osm_node_id = jn.osm_node_at(osm if osm_ok else None, f['osm_node'], nodes[0])
     jn.classify(j, osm, not f['suspected'], context)
     j.rail_distance = rail_distance(osm, pts, cum, begin_m, end_m, nodes[0])
+    if f.get('rail_m') is not None and j.rail_distance < 0.:
+      j.rail_distance = abs(f['rail_m'] - end_m)  # a rail orphan's junction always carries its crossing, however far on
     j.maneuver = 'unknown' if ahead else maneuver_at(steps, starts, f['s'], end_m)
-    sv = jn.survey_approach(j.survey if j.surveyed else None, j.our_way, j.heading_in)
+    # a rail orphan's stop is at its sign, not the junction's line: a survey of the junction never moves it on, past the tracks
+    sv = None if f.get('rail_m') is not None else jn.survey_approach(j.survey if j.surveyed else None, j.our_way, j.heading_in)
     off, j.stop_point_source = jn.stop_offset(j, end_m - f['s'], f['mapped'], sv.get('stopPointM') if sv else None)
     f['s'], j.stop_point_distance = end_m - off, off
     f['status'] = j.status

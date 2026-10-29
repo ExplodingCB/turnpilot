@@ -22,7 +22,9 @@ edge it lies on nor Valhalla flagged that edge with its kind. Each says who the 
 edge but not placed on it), the other direction of our way (often right, but a reversed direction tag looks the same),
 another way, no approach (unplaced: on no drivable way, or a stop=minor with no lower approach), or an orphan left out (tied
 to no junction, its sign more than ORPHAN_NEAR_M before its edge's end, where the edge's end would put the stop: routing/
-controls.py). The car stops for none of them; the auditor checks each.
+controls.py). The car stops for none of them; the auditor checks each. An orphan with a rail crossing within RAIL_M past
+its sign is no such sign: it stops the car at its sign, and its edge's row says so, listing that stop beside any at the
+edge's end.
 
 Then each stop and yield's junction (SG1b, routing/junctions.py): its OSM node, status, maneuver, where its stop point is
 and why (default, mappedLine, survey), the sidecar, the survey it matched (and whether it counts), the plausibility gate,
@@ -82,7 +84,7 @@ class Row:
   sidecar: str         # the sidecar's entries for it, '-' for none, 'not checked' without a valid sidecar
   line_source: str     # the control's line source there, '-' with no control
   osm_node: int        # the OSM junction node the sidecar names (0 none)
-  control: str         # the control navd sends there, '-' for none
+  control: str         # the controls navd sends there (a rail orphan's at its sign, then the edge's end's), '-' for none
   joins: int = -1      # an internal edge's: the trace edge whose junction its control is
   sign_m: float | None = None  # m along the route of the OSM stop node on the control's edge (data only), None for none
 
@@ -95,7 +97,8 @@ class Sign:
   kind: str            # 'stop' or 'yield'
   tags: str            # its direction and stop tags
   holder: str          # who the sidecar has it for: 'ours', 'other direction', 'way <keys>', 'no approach (<why>)',
-                       # 'orphan (sign N m before its edge's end)' (left out: routing/controls.py's ORPHAN_NEAR_M)
+                       # 'orphan (sign N m before its edge's end)' (left out: routing/controls.py's ORPHAN_NEAR_M; one
+                       # before a rail crossing is placed, on its edge's row)
   edge: str            # the route edge it lies on, '-' for none
   to_node_m: float     # m before that edge's end node
 
@@ -238,17 +241,20 @@ def audit(call, steps, tiles_dir, sidecar_dir, context: junctions.Context | None
   by_edge = {c.edge: c for c in controls}
   rows = []
   for e in edges:
-    if not (e['osm'] or e['phantom'] or 'stop' in e['valhalla'] or 'yield' in e['valhalla']):
+    if not (e['osm'] or e['rail'] or e['phantom'] or 'stop' in e['valhalla'] or 'yield' in e['valhalla']):
       continue
     valhalla = ' '.join(e['valhalla'] + [f"{k} (phantom: dropped)" for k in e['phantom']]) or '-'
     sidecar = ', '.join([f"{h['kind']} ({h['evidence']}, stop={h['stop_tag']})" for h in e['osm']] +
+                        [f"{h['kind']} ({h['evidence']}, stop={h['stop_tag']}, an orphan {h['rail_m'] - h['m']:.0f} m before a rail crossing: " +
+                         "stops at its sign)" for h in e['rail']] +
                         [f"{h['kind']} ({h['evidence']}, stop={h['stop_tag']}, an orphan {h['before_m']:.0f} m before its edge's end: left out)"
                          for h in e['orphans']]) or '-' if checked else 'not checked'
     c = by_edge.get(e['anchor'])
     osm_node = next((int(h['junction_node']) for h in e['osm'] if h.get('junction_node')), c.osm_node if c is not None else 0)
     sign_m = None if c is None or c.osm_sign_m is None else round(c.osm_sign_m, 1)
+    sent = ', '.join(f"{x.kind} at {x.route_m:.0f} m" for x in controls if x.edge == e['anchor']) or '-'
     rows.append(Row(round(e['end_m'], 1), e['key'], e['internal'], valhalla, sidecar, c.line_source if c is not None else '-', osm_node,
-                    f"{c.kind} at {c.route_m:.0f} m" if c is not None else '-', e['anchor'] if e['internal'] else -1, sign_m))
+                    sent, e['anchor'] if e['internal'] else -1, sign_m))
   detail = 'none expected' if side is None else side.status + (f" ({side.detail})" if side.detail else '')
   total = sum(float(s.get('distance', 0.)) for s in steps)
   rows_j = []
@@ -344,7 +350,7 @@ def uncovered(side, pts, edges) -> list[Sign]:
       continue
     m, off = hit
     e = next((e for e in edges if e['begin_m'] < m <= e['end_m'] + 1.), None)
-    if e is not None and (any(node and h.get('node') == node for h in e['osm']) or kind in e['valhalla'] or kind in e['phantom']):
+    if e is not None and (any(node and h.get('node') == node for h in e['osm'] + e['rail']) or kind in e['valhalla'] or kind in e['phantom']):
       continue  # its edge's row has it
     orphan = next((h for h in e['orphans'] if (node and h.get('node') == node) or (not node and h.get('line') and
                    (round(h['line'][0], 7), round(h['line'][1], 7)) == (round(pos[0], 7), round(pos[1], 7)))), None) if e is not None else None

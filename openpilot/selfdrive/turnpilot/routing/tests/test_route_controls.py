@@ -405,8 +405,9 @@ def test_sg1a_an_orphan_sign_far_before_its_edges_end_is_left_out(tmp_path, kind
   """An orphan's sign further than ORPHAN_NEAR_M before its Valhalla edge's end: the edge's end less CONTROL_LINE_M would
   put the stop (or the yield's cap) that far past the sign, where there is none, often mid-block, and the car would drive
   past the real sign unslowed and then stop there (Indianapolis: 146 of 176 such orphans more than 15 m past their sign,
-  the furthest 1119 m). It is left out of the controls and logged, as the base had it (route_audit lists it as uncovered);
-  never placed at its sign either, since a reversed direction tag would then stop the car past a junction (4th St NW)."""
+  the furthest 1119 m). Without a rail crossing just past its sign (the next tests) it is left out of the controls and
+  logged, as the base had it (route_audit lists it as uncovered); never placed at its sign either, since a reversed
+  direction tag would then stop the car past a junction (4th St NW)."""
   v = StubValhalla([(0., 100., {}), (100., end_m, {'way_id': 77, 'crossing': crossing}), (end_m, 800., {})], total=800.)
   with patch.object(controls_module, 'cloudlog') as log:
     controls, status = route_controls(v, steps((400., 400.)), sidecar_dir=osm_dir(tmp_path, {'77:f': [entry(kind, sign_m, junction=0)]}))
@@ -424,6 +425,82 @@ def test_sg1a_a_far_orphan_neither_drops_nor_moves_valhallas_own_flag(tmp_path):
   side = {'77:f': [entry('stop', 150., junction=900)], '77:b': [entry('stop', 120., junction=0)]}
   controls, _ = route_controls(StubValhalla(edges, every=2.), steps(every=2.), sidecar_dir=osm_dir(tmp_path / 'phantom', side))
   assert [(c.kind, round(c.route_m, 1)) for c in controls] == [('stop', 150. - OFF)]
+
+
+@pytest.mark.parametrize('kind, sign_m, rail_m, end_m, crossing', [
+  ('stop', 140., 146., 180., ['residential']),  # 6 m before the tracks, a junction 34 m past them
+  ('stop', 140., 146., 500., []),               # Jim Town Road (22011112:b): no junction for 354 m past the tracks
+  ('stop', 140., 157., 180., ['residential']),  # 556607000:f: the tracks 17 m past the sign (gates, bell, lights)
+  ('stop', 140., 169., 500., ['residential']),  # 29 m
+  ('stop', 140., 142., 180., ['residential']),  # a sign mapped 2 m from the tracks' node: the stop RAIL_CLEAR_M short of it
+  ('stop', 166., 168., 180., ['residential']),  # near its edge's end (14 m), where the end less 11 m is past the tracks
+  ('yield', 140., 150., 180., ['residential']),
+])
+def test_sg1a_an_orphan_sign_before_a_rail_crossing_stops_the_car_short_of_the_tracks(tmp_path, kind, sign_m, rail_m, end_m, crossing):
+  """The residual skeptic's: a sidecar stop or yield tied to no junction (an orphan) because it guards a railroad level
+  crossing (Indianapolis: 37 of the 152 Valhalla-unflagged orphans ORPHAN_NEAR_M left out stand 2-29 m before one; the
+  other direction's sign is just past the tracks). Rail crossings reach the car only through a stop or yield's junction
+  railDistance (certify's geometry, then SG2's reroute or an unavoidable stop and handback, C7), so leaving it out let the
+  car cross the tracks at speed past a mapped STOP sign with nothing said. A rail crossing within RAIL_M past the sign on
+  the route confirms its direction tag (a reversed one has the tracks behind it), so it stops the car at its sign, never
+  nearer the crossing's node than RAIL_CLEAR_M, whatever its edge's end, and its junction carries the rail crossing."""
+  v = StubValhalla([(0., 100., {}), (100., end_m, {'way_id': 77, 'crossing': crossing}), (end_m, 800., {})], total=800.)
+  side = rail_dir(tmp_path, [pt(rail_m)], {'77:f': [entry(kind, sign_m, junction=0)]})
+  with patch.object(controls_module, 'cloudlog') as log:
+    controls, status = route_controls(v, steps((400., 400.)), sidecar_dir=side)
+  line = min(sign_m, rail_m - controls_module.RAIL_CLEAR_M)
+  assert status == 'ok'
+  assert [(c.kind, round(c.route_m, 1), c.osm_node, round(c.osm_sign_m, 1), c.line_source) for c in controls] == \
+    [(kind, round(line - MAP_MARGIN_M, 1), 0, sign_m, 'default')]
+  j = controls[0].junction_info
+  assert abs(j.rail_distance - (end_m - rail_m)) < 0.5 and j.stop_point_source == 'default'
+  said = [str(c.args[0]) for c in log.info.call_args_list]
+  assert any('rail crossing' in s and '77:f' in s for s in said) and not any('left out' in s for s in said)
+
+
+def test_sg1a_a_rail_orphan_is_its_own_stop_before_valhallas_flag_and_never_moved_on_by_a_survey(tmp_path):
+  """Valhalla's own flag on the edge stays where it was (its edge's end less CONTROL_LINE_M, past the tracks) and the
+  rail orphan is a second stop at its sign before it (controls at different places never merge). A counting survey of
+  the junction at its edge's end, matched on our approach, moves that junction's stop point, never the rail orphan's."""
+  v = StubValhalla([(0., 100., {}), (100., 180., {'way_id': 77, 'stop': True}), (180., 800., {})], total=800.)
+  side = rail_dir(tmp_path / 'flag', [pt(146.)], {'77:f': [entry('stop', 140., junction=0)]})
+  controls, _ = route_controls(v, steps((400., 400.)), sidecar_dir=side)
+  line = min(140., 146. - controls_module.RAIL_CLEAR_M)
+  assert [(c.kind, round(c.route_m, 1)) for c in controls] == [('stop', round(line - MAP_MARGIN_M, 1)), ('stop', 180. - OFF)]
+  assert all(abs(c.junction_info.rail_distance - 34.) < 0.5 for c in controls)
+  side = allway(tmp_path / 'survey')
+  cell = level2_index(LON0, LAT0)
+  shard = json.loads((side / 'osm_controls' / f'{cell}.json').read_text())
+  shard['controls']['50:f'].append(entry('stop', 60., junction=0))
+  shard['rail'] = [{'lat': pt(66.)[0], 'lon': pt(66.)[1], 'ways': [50]}]
+  (side / 'osm_controls' / f'{cell}.json').write_text(json.dumps(shard))
+  v = StubJunction([(0., 100., {'stop': True, 'way_id': 50}), (100., 400., {})], four())
+  controls, _ = route_controls(v, steps(), sidecar_dir=side, context=context([survey(stop_point=9.8)]))
+  line = min(60., 66. - controls_module.RAIL_CLEAR_M)
+  assert [(c.kind, round(c.route_m, 1), c.junction_info.stop_point_source, c.junction_info.surveyed) for c in controls] == \
+    [('stop', round(line - MAP_MARGIN_M, 1), 'default', True), ('stop', 90.2, 'survey', True)]
+
+
+def test_sg1a_a_rail_orphan_in_a_median_stops_the_car_before_the_first_carriageway_and_carries_its_crossing(tmp_path):
+  """An orphan on an internal-intersection edge (a divided road's median) with a rail crossing ahead: its stop is the
+  preceding junction's line, before the first carriageway, as any control in a median is, and its junction carries the
+  crossing however far past the node it is (rail_distance alone finds none more than RAIL_M from it off our edge)."""
+  v = StubValhalla([(0., 100., {}), (100., 115., {'way_id': 77, 'internal': True}), (115., 800., {})], total=800.)
+  side = rail_dir(tmp_path, [pt(138.)], {'77:f': [entry('stop', 110., junction=0)]})
+  controls, status = route_controls(v, steps((400., 400.)), sidecar_dir=side)
+  assert status == 'ok' and [(c.kind, round(c.route_m, 1), round(c.osm_sign_m, 1)) for c in controls] == [('stop', 100. - OFF, 110.)]
+  assert abs(controls[0].junction_info.rail_distance - 38.) < 0.5
+
+
+@pytest.mark.parametrize('rail', [
+  pt(134.),                                         # 6 m behind the sign: the other direction's sign shape (a reversed tag)
+  pt(175.),                                         # 35 m past it, further than RAIL_M
+  (pt(150.)[0], LON0 + 10. / (M_PER_DEG * 0.7687)),  # 10 m off the route: another road's crossing
+])
+def test_sg1a_a_far_orphan_without_a_rail_crossing_just_past_its_sign_stays_left_out(tmp_path, rail):
+  v = StubValhalla([(0., 100., {}), (100., 180., {'way_id': 77, 'crossing': ['residential']}), (180., 800., {})], total=800.)
+  controls, status = route_controls(v, steps((400., 400.)), sidecar_dir=rail_dir(tmp_path, [rail], {'77:f': [entry('stop', 140., junction=0)]}))
+  assert status == 'ok' and controls == []
 
 
 def test_a_junction_node_stop_from_the_sidecar_is_on_the_edge_ending_there(tmp_path):
