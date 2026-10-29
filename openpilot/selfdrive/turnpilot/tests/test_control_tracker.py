@@ -74,6 +74,25 @@ def test_new_route_drops_unengaged_and_carries_engaged():
   assert [c.key for c in out] == [(2, 4), (3, 0)]
 
 
+def test_junction_info_rides_with_the_control_and_a_reroute_brings_its_own():
+  """A stop or yield's junction (MapControl.junctionInfo) is copied to the tracked control as a plain dict (the message's
+  buffer isn't kept); a signal has none. A reroute's same control takes over an engaged one's state, and the junction
+  it carries is the new route's own (its maneuver may have changed); the lookups ahead off the route carry theirs."""
+  tr = ControlTracker()
+  left = {'status': 'ok', 'osmNodeId': 900, 'maneuver': 'left', 'approaches': [{'role': 'exit', 'tier': 'no', 'wayId': 812}]}
+  stop, signal = step(tr, nav([(0, 'stop', 50., False, True, False, left), (1, 'signal', 300.)]), v=0.)
+  assert isinstance(stop.junction_info, dict) and stop.junction_info['osmNodeId'] == 900 and signal.junction_info is None
+  a = stop.junction_info['approaches'][0]
+  assert (a['role'], a['tier'], a['wayId']) == ('exit', 'no', 812)
+  stop.engaged, stop.state = True, 'mine'
+  straight = left | {'maneuver': 'straight'}
+  out = step(tr, nav([(4, 'stop', 58., False, True, False, straight)], route_count=2), v=0.)
+  assert out[0].key == (2, 4) and out[0].state == 'mine' and out[0].junction_info['maneuver'] == 'straight'
+  ahead = {'status': 'ok', 'osmNodeId': 901, 'maneuver': 'unknown'}
+  out = step(tr, nav([], valid=False, off=[(7, 'stop', 40., False, True, False, ahead)]), valid=False, v=0.)
+  assert [c.junction_info['osmNodeId'] for c in out if c.key[0] == OFF_ROUTE] == [901]
+
+
 def test_dropped_once_past():
   tr = ControlTracker()
   step(tr, nav([(0, 'yield', 1.)]), v=0.)

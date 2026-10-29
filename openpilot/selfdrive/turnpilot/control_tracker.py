@@ -59,18 +59,21 @@ class TrackedControl:
   jumped: bool = False       # re-initialised by a jump this frame
   misses: int = 0            # off-route lookups in a row it was missing from
   state: Any = None          # the policy's own state for it
+  junction_info: dict | None = None  # a stop or yield's MapControl.junctionInfo as a dict (routing/junctions.py); None a signal's
 
 
 def from_msg(route_count: int, c) -> TrackedControl:
+  """A tracked control from navd's MapControl c; its junction copied out (the message's buffer isn't kept)."""
   return TrackedControl((route_count, int(c.id)), str(c.kind), float(c.distance), bool(c.lineMapped), bool(c.junction),
-                        bool(c.crossSuspect))
+                        bool(c.crossSuspect), junction_info=c.junctionInfo.to_dict() if c._has('junctionInfo') else None)
 
 
 def adopt(o: TrackedControl, candidates, measured: bool = False) -> bool:
   """An engaged or held control o handed to the same-kind one of candidates (another route's, or a lookup's) within ADOPT_M
   that has no state of its own: it is the same control. False when there is none. measured: the candidate's own distance
   is kept (a lookup's, on the road the car is on, over the stale route's dead-reckoned one), jumped when it moves the
-  stop by more than a fix would, so the policy re-checks it."""
+  stop by more than a fix would, so the policy re-checks it. The candidate keeps its own junction_info: the new message's
+  (a reroute may change the maneuver there)."""
   same = [n for n in candidates if n.kind == o.kind and n.state is None and not n.engaged and abs(n.d - o.d) < ADOPT_M]
   if not same:
     return False
