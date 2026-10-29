@@ -74,6 +74,19 @@ def test_crosswalk_hold_on_right_turn():
   assert not policy([ped(8., -6.)], maneuver=RIGHT_TURN, distance=HOLD_LINE_M - 3., v_ego=4.).holding
 
 
+def test_a_stop_to_rest_is_said_while_braking_toward_it():
+  """decision.rest_d: where the nearest stop in force brings the car to rest (shouldStop at its end), braking toward it
+  or standing at it; never a following gap (turnpilotd: a veto then is decided as standing at the stop, car_signals.py)."""
+  assert policy().rest_d is None
+  d = policy([ped(36., -6.)], maneuver=RIGHT_TURN, distance=33., v_ego=7.)  # a walker's hold, the car still rolling
+  assert d.holding and not d.should_stop and d.rest_d == 33. - HOLD_LINE_M
+  d = policy([ped(30., 0.2, in_path=True)], v_ego=10.)
+  assert not d.should_stop and d.rest_d == 30. - PED_STOP_GAP_M
+  # a confirmed walker moving along the path is followed, never stopped for: no rest at the end of it
+  d = policy([ped(30., 0.2, vx=1.5, in_path=True)], v_ego=10.)
+  assert d.holding and d.rest_d is None
+
+
 def test_oncoming_car_holds_unprotected_left():
   d = policy([car(60., 5., vx=-12.)], maneuver=LEFT_TURN, distance=15., v_ego=4.)
   assert d.holding and d.reason == "waiting for oncoming"

@@ -267,6 +267,16 @@ def test_lamp_lost_vetoes():
   assert drive.step().skip == 'signalLost'
 
 
+def test_a_veto_never_prompts_for_the_turn_it_skips():
+  """Under 20 mph our lamp put out is a veto on the frame the port fails: that frame skips the turn and never also asks
+  "Signal Left" for it (the prompt's chime would sound for a turn being cancelled)."""
+  drive = Drive(distance=30., v=5.)
+  drive.step()
+  drive.status, drive.port = Status.failed, port(status='failed', fault='lampLost')
+  out = drive.step()
+  assert out.skip == 'signalLost' and out.prompt == LaneChange.none, (out.skip, out.prompt)
+
+
 @pytest.mark.parametrize("hazard,veto", [(False, 'driverSignal'), (True, 'hazards')])
 def test_wrong_side_with_the_other_lamp_lit_vetoes(hazard, veto):
   """The port faults wrongSide when the side it didn't ask for lights in the request's first second: ours on the wrong
@@ -338,6 +348,39 @@ def test_standing_in_the_turn_a_veto_is_no_skip():
   drive2.step(standing=True)
   drive2.port = port(block='otherSide')
   assert drive2.step(standing=True, right_lamp=True).skip == 'driverSignal'
+
+
+@pytest.mark.parametrize("p,kw,veto", [
+  (port(block='otherSide'), {'right_lamp': True}, 'driverSignal'), (port(block='hazard', hazard=True), {}, 'hazards'),
+  (port(status='failed', fault='lampLost'), {}, 'signalLost'),
+])
+def test_braking_for_a_stop_short_of_the_turn_a_veto_skips(p, kw, veto):
+  """A TurnPilot stop in force brings the car to rest short of the junction (stopping: a walker's hold braking it on the
+  speed cap's curve, shouldStop still false) with the turn's desire out: a veto there is decided as standing at the
+  stop, a skip under TURN_STARTED_DEG into the turn and the notice from it; never the notice for being on the move."""
+  for turned, skips in ((0., True), (10., True), (20., False)):
+    drive = Drive(distance=30., v=6.)
+    drive.d = desires(started=True, turned=turned)
+    drive.step(stopping=True)
+    drive.status, drive.port = (Status.failed if p.status == 'failed' else Status.ready), p
+    out = drive.step(stopping=True, **kw)
+    assert (out.skip, out.notice) == ((veto, 'none') if skips else ('none', 'changedMidTurn')), (turned, out.skip, out.notice)
+
+
+def test_a_veto_is_decided_once_per_maneuver():
+  """The driver's lamp the other way with the turn's desire out and the car rolling into it, no stop in force: "Finishing
+  the turn". A stop then brings the car to rest short of it with the lamp still on: still finishing, never a skip after
+  the notice (one veto, one decision)."""
+  drive = Drive(distance=35., v=6.)
+  drive.d = desires(started=True)
+  drive.step()
+  drive.port = port(block='otherSide')
+  out = drive.step(right_lamp=True)
+  assert out.skip == 'none' and out.notice == 'changedMidTurn'
+  drive.step(10, right_lamp=True, stopping=True)
+  drive.v = 0.
+  outs = [drive.step(right_lamp=True, standing=True, stopping=True) for _ in range(40)]
+  assert all(o.skip == 'none' for o in outs), [o.skip for o in outs]
 
 
 def test_nothing_vetoes_unless_ready():

@@ -143,6 +143,9 @@ class SceneDecision:
   should_stop: bool = False
   holding: bool = False   # the limits bite now
   reason: str = ""
+  # m to where the nearest stop in force brings the car to rest (should_stop at its end), braking toward it or standing at
+  # it; None when none does. A cap (a yield, off route) or a following gap is no rest
+  rest_d: float | None = None
   hard_brake: bool = False  # the accel cap asks for more than SPEED_CAP_ACCEL_MIN: a confirmed track's hard stop
   evidence: dict | None = None  # ...the track it is for (Stop.evidence)
 
@@ -157,6 +160,7 @@ class Stop:
   v_lead: float = 0.
   confirmed: bool = True
   evidence: dict | None = None  # the track it is for (track_evidence()), logged with a hard brake
+  rest: bool = False      # it ends with the car at rest at d_stop (should_stop there), not a speed cap or a following gap
 
 
 def stop_command(v_ego: float, d_stop: float) -> tuple[float, float, bool]:
@@ -182,7 +186,7 @@ def stop(v_ego: float, d_stop: float, reason: str, confirmed: bool = True, v_lea
   speed_cap += v_lead
   if not confirmed and accel_cap < NO_ACCEL_CAP:
     accel_cap, speed_cap = NO_ACCEL_CAP, max(speed_cap, v_ego - STOP_DECEL * SPEED_CAP_TAU)
-  return Stop(accel_cap, speed_cap, should_stop and v_lead <= 0., reason, d_stop, v_lead, confirmed, evidence)
+  return Stop(accel_cap, speed_cap, should_stop and v_lead <= 0., reason, d_stop, v_lead, confirmed, evidence, v_lead <= 0.)
 
 
 def velocity_trusted(obj) -> bool:
@@ -346,7 +350,8 @@ def decide(stops: list[Stop], v_ego: float) -> SceneDecision:
   should_stop = any(s.should_stop for s in stops)
   reason = min(stops, key=lambda s: (not s.should_stop, plan_accel(s.accel_cap, s.speed_cap, v_ego))).reason
   holding = should_stop or accel_cap < NO_ACCEL_CAP or speed_cap < v_ego + 0.5
-  return SceneDecision(accel_cap, speed_cap, should_stop, holding, reason)
+  rests = [s.d_stop for s in stops if s.rest]
+  return SceneDecision(accel_cap, speed_cap, should_stop, holding, reason, rest_d=min(rests) if rests else None)
 
 
 def scene_policy(objects, available: bool, maneuver, distance: float, v_ego: float,

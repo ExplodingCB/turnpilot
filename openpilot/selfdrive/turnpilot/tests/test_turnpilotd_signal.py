@@ -215,42 +215,11 @@ def test_a_turn_the_car_took_ended_by_the_pass_is_never_handed_over():
 
 
 def test_selfdrived_says_nothing_about_signalling_after_a_too_fast_skip():
-  """Through selfdrived's own Events, the real alert callbacks and AlertManager: what the screen shows and soundd plays
-  after the too-fast skip, at about 44 mph."""
-  import types
-
-  import openpilot.selfdrive.selfdrived.events as events_mod
-  from openpilot.cereal import log
-  from openpilot.common.realtime import DT_CTRL
-  from openpilot.selfdrive.selfdrived.alertmanager import AlertManager
-  from openpilot.selfdrive.selfdrived.events import ET, Events
-  from openpilot.selfdrive.turnpilot import hooks
-  EventName = log.OnroadEvent.EventName
+  """Through selfdrived's own Events, the real alert callbacks and AlertManager (shown_alerts): what the screen shows and
+  soundd plays after the too-fast skip, at about 44 mph."""
   sim, plans = too_fast_plans()
-  ev = hooks.CarSignalEvents()
-  current = {'plan': None}
-  saved = events_mod.CAR_SIGNAL_EVENTS, events_mod.shown_plan
-  events_mod.CAR_SIGNAL_EVENTS, events_mod.shown_plan = ev, lambda sm, now=None: current['plan']
-  try:
-    am = AlertManager()
-    port = types.SimpleNamespace(status='ready', fault='none', check='idle', checkWhy='', stillOn=False, rejected=0)
-    shown, frame = [], 0
-    start = len(sim.trace) - len(plans)
-    for i, p in enumerate(plans):
-      current['plan'] = p
-      for _ in range(5):  # selfdrived's 100 Hz over turnpilotd's 20 Hz
-        events = Events()
-        if p.tooFastToTurn or p.turnMissed:
-          events.add(EventName.turnpilotTooFastToTurn)
-        for name in ev.update(p, port, int(TeslaFlags.CAR_SIGNALS | TeslaFlags.CAR_SIGNALS_RECHECK), DT_CTRL):
-          events.add(getattr(EventName, name))
-        am.add_many(frame, events.create_alerts([ET.PERMANENT, ET.WARNING], [None, None, None, False, 0, None]))
-        am.process_alerts(frame, set())
-        a = am.current_alert
-        shown.append((sim.trace[start + i][1], a.alert_text_1, a.alert_text_2))
-        frame += 1
-  finally:
-    events_mod.CAR_SIGNAL_EVENTS, events_mod.shown_plan = saved
+  start = len(sim.trace) - len(plans)
+  shown = [(sim.trace[start + i][1], text1, text2) for i, text1, text2, _ in shown_alerts(plans)]
   assert any(text1 == "Too Fast to Turn" or text1.startswith("Turn") for _, text1, _ in shown), {s[1] for s in shown}
   bad = [s for s in shown if "yourself" in s[2]]
   assert not bad, f"after the too-fast skip selfdrived shows {bad[0][1]!r} / {bad[0][2]!r} at {bad[0][0]:.1f} m/s"
@@ -348,3 +317,146 @@ def test_overruled_at_an_unprotected_turns_line_keeps_its_handback():
   plans = [sim.step(engaged=True) for _ in range(int(5. / DT_MDL))]
   assert not any(p.tooFastToTurn or str(p.turnSignal.skip) != 'none' for p in plans)
   assert all(p.shouldStop and p.controlPrompt == 'unprotectedTurnTakeControl' for p in plans)
+
+
+# ---------------------------------------------------------------- ...and while a hold brakes the car to rest short of it (B7)
+
+def overruling_port(state, side=LaneChange.right):
+  """The port as TeslaCarSignal reports it at this level: state['driver'] 'left' or 'right' (the driver's lamp, the port
+  held off), 'hazards', 'lost' (our lamp put out: lampLost, released), else lit on the plan's side while it asks."""
+  def port(s):
+    v = state['driver']
+    if v in ('left', 'right'):
+      return {'status': 'ready', 'block': 'otherSide', f'{v}Lamp': True}
+    if v == 'hazards':
+      return {'status': 'ready', 'block': 'hazard', 'hazard': True, 'leftLamp': True, 'rightLamp': True}
+    if v == 'lost':
+      return {'status': 'failed', 'fault': 'lampLost'}
+    lit = s.tp.signal_out.side == side
+    key = 'left' if side == LaneChange.left else 'right'
+    return {'status': 'lit' if lit else 'ready', key: lit, f'{key}Lamp': lit}
+  return port
+
+
+def braking_to_walker(driver: str, veto_after_s: float = 1., walker_at: float = 38., veto_at: float | None = None):
+  """A right turn at 300 m, the car signalling it, its desire out on the approach (40 m). A walker steps into its
+  crosswalk walker_at m out and TurnPilot brakes the car to rest at the hold line on the speed cap's curve: shouldStop is
+  false until about standstill (the plan 'holding' from about 33 m at 7 m/s). driver ('left', 'hazards', or 'lost': our
+  lamp put out) overrules the car veto_after_s into that braking, the car still rolling; veto_at (m), instead, overrules it
+  there, before the walker. Returns (sim, the plans from the veto to 3 s standing, the plans after the walker left)."""
+  sim = Sim([(300., "turn", "right"), (1500., "turn", "left")], driver_signals=None)
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  state = {'driver': 'none'}
+  sim.car_signal = overruling_port(state)
+  walker = {'on': False}
+
+  def objects(s):
+    return ({'cls': 'pedestrian', 'x': 300. - s.s + 3., 'y': -5., 'age': 5 + int(s.t * 10.)},) if walker['on'] else ()
+
+  def step():
+    return sim.step(objects(sim), engaged=True, blinker=state['driver'] == 'left')
+  plans = []
+  if veto_at is not None:
+    while sim.distance() > veto_at:
+      step()
+    assert sim.tp.desires.started, "the right turn's desire went out on the approach (40 m)"
+    state['driver'] = driver
+    plans += [step() for _ in range(int(0.5 / DT_MDL))]
+  while sim.distance() > walker_at:
+    plans.append(step()) if veto_at is not None else step()
+  assert sim.tp.desires.started, "the right turn's desire went out on the approach (40 m)"
+  walker['on'] = True
+  while str(sim.trace[-1][2].state) != 'holding':
+    plans.append(step()) if veto_at is not None else step()
+  if veto_at is None:
+    for _ in range(int(veto_after_s / DT_MDL)):
+      step()
+    assert sim.v > 1.5 and not sim.trace[-1][2].shouldStop, "braking toward the hold, not yet standing"
+    assert sim.trace[-1][2].turnSignal.side == LaneChange.right
+    state['driver'] = driver
+  while sim.v > 0.05:
+    plans.append(step())
+    assert sim.t < 60.
+  plans += [step() for _ in range(int(3. / DT_MDL))]
+  walker['on'] = False
+  after = [step() for _ in range(int(8. / DT_MDL))]
+  return sim, plans, after
+
+
+@pytest.mark.parametrize("driver,skip", [('left', 'driverSignal'), ('hazards', 'hazards'), ('lost', 'signalLost')])
+def test_the_driver_overruling_the_car_braking_for_a_hold_skips_the_turn_out_loud(driver, skip):
+  """DESIGN 6.6: a veto while a TurnPilot stop brings the car to rest short of the junction (a walker's hold braking it on
+  the speed cap's curve, shouldStop still false) is decided as a veto standing there is: skipped out loud from the veto's
+  frame, the approach's desire cleared, the hold kept until it lets go, and its go straight on. Never "Finishing the turn"
+  first, and our lamp put out (a one-frame veto on the port's ready to failed edge) is never lost before the car stands."""
+  sim, plans, after = braking_to_walker(driver)
+  assert plans[0].tooFastToTurn and str(plans[0].turnSignal.skip) == skip, \
+    (plans[0].tooFastToTurn, str(plans[0].turnSignal.skip), str(plans[0].turnSignal.notice))
+  assert all(p.tooFastToTurn and str(p.turnSignal.skip) == skip for p in plans), "said for as long as the hold has the car"
+  assert not any(str(p.turnSignal.notice) == 'changedMidTurn' for p in plans + after), "'Finishing the turn' for a skipped turn"
+  assert any(p.desire == CLEAR_DESIRE for p in plans), "the approach's pulse is cleared from the model's queue"
+  stood = sim.trace[-len(after) - 1]
+  assert stood[2].shouldStop and stood[1] < 0.05 and stood[0] < 300. - 5., "the walker's hold let go of the car on the veto"
+  # the veto's own frame still carries the desire out since 40 m (its plan's desire is set before the veto is read); from
+  # the next frame it is cleared, and the hold's go is straight on
+  assert plans[1].desire == CLEAR_DESIRE
+  assert not any(p.desire == Desire.turnRight for p in plans[1:] + after), "the hold let go into the vetoed turn"
+  assert all(p.turnSignal.side == LaneChange.none for p in plans[1:] + after), "our request outlived the skipped turn"
+  assert all(p.turnSignal.prompt == LaneChange.none for p in plans + after), "asked to signal a skipped turn"
+  assert not after[-1].shouldStop and sim.trace[-1][1] > 1., "the hold's go never came"
+
+
+def test_a_veto_moving_into_the_turn_is_never_a_skip_once_a_hold_stops_the_car():
+  """Decided once per maneuver: the driver's left lamp with the right turn's desire out, the car rolling into it with no
+  stop in force, is "Turn Signal Changed" / "Finishing the turn". A walker then stops the car short of the turn, the lamp
+  still on: never a skip after it ("Turn Cancelled"), one veto never two contradictory decisions."""
+  sim, plans, after = braking_to_walker('left', walker_at=34., veto_at=37.)
+  assert str(plans[0].turnSignal.notice) == 'changedMidTurn', str(plans[0].turnSignal.notice)
+  assert any(p.shouldStop for p in plans), "the walker's hold never stopped the car"
+  assert not any(p.tooFastToTurn or str(p.turnSignal.skip) != 'none' for p in plans + after), \
+    "'Finishing the turn', then 'Turn Cancelled' for the same veto"
+
+
+def shown_alerts(plans):
+  """What selfdrived shows and plays for these plans, through its own Events, the real alert callbacks and AlertManager at
+  its 100 Hz over turnpilotd's 20 Hz: (plan index, alertText1, alertText2, audibleAlert) per selfdrived frame."""
+  import types
+
+  import openpilot.selfdrive.selfdrived.events as events_mod
+  from openpilot.common.realtime import DT_CTRL
+  from openpilot.selfdrive.selfdrived.alertmanager import AlertManager
+  from openpilot.selfdrive.selfdrived.events import ET, Events
+  from openpilot.selfdrive.turnpilot import hooks
+  EventName = log.OnroadEvent.EventName
+  ev = hooks.CarSignalEvents()
+  current = {'plan': None}
+  saved = events_mod.CAR_SIGNAL_EVENTS, events_mod.shown_plan
+  events_mod.CAR_SIGNAL_EVENTS, events_mod.shown_plan = ev, lambda sm, now=None: current['plan']
+  shown, frame = [], 0
+  try:
+    am = AlertManager()
+    port = types.SimpleNamespace(status='ready', fault='none', check='idle', checkWhy='', stillOn=False, rejected=0)
+    for i, p in enumerate(plans):
+      current['plan'] = p
+      for _ in range(5):
+        events = Events()
+        if p.tooFastToTurn or p.turnMissed:
+          events.add(EventName.turnpilotTooFastToTurn)
+        for name in ev.update(p, port, int(TeslaFlags.CAR_SIGNALS | TeslaFlags.CAR_SIGNALS_RECHECK), DT_CTRL):
+          events.add(getattr(EventName, name))
+        am.add_many(frame, events.create_alerts([ET.PERMANENT, ET.WARNING], [None, None, None, False, 0, None]))
+        am.process_alerts(frame, set())
+        a = am.current_alert
+        shown.append((i, a.alert_text_1, a.alert_text_2, str(a.audible_alert)))
+        frame += 1
+  finally:
+    events_mod.CAR_SIGNAL_EVENTS, events_mod.shown_plan = saved
+  return shown
+
+
+def test_selfdrived_never_says_finishing_then_cancelled_for_a_veto_braking_for_a_hold():
+  sim, plans, after = braking_to_walker('left')
+  shown = shown_alerts(plans + after)
+  cancelled = [s for s in shown if s[1].startswith("Turn Cancelled")]
+  assert cancelled, {s[1] for s in shown}
+  assert not any(s[2] == "Finishing the turn" for s in shown), sorted({(s[1], s[2]) for s in shown})
