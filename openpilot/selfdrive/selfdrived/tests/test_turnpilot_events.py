@@ -256,3 +256,47 @@ def test_side_cameras_off_is_a_status_line():
   a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='sideCamerasOff')))
   assert a.alert_text_1 == 'Side Cameras Off' and a.alert_text_2 == CONTROL_ALERT_TEXT['sideCamerasOff']
   assert 'sideCamerasOff' in CONTROL_STATUS_ALERTS
+
+
+def test_the_stop_sign_deciders_schema_is_appended_in_order():
+  # STOP_SIGNS.md v3 SG4a, appended only: the plan's stopGo @34 after farCropBearing @33, MapControlStatus.Action @9-@12 after
+  # infeasible @8, ControlPrompt @15-@16 after leftUndecidedTakeControl @14, ControlAlert @13-@15 after sideCamerasOff @12
+  from openpilot.cereal import custom
+  tp = custom.TurnpilotPlan
+  assert tp.schema.fields['stopGo'].proto.ordinal.explicit == 34
+  actions = tp.MapControlStatus.Action.schema.enumerants
+  assert [actions[a] for a in ('waitingCross', 'creeping', 'going', 'committed')] == [9, 10, 11, 12]
+  prompts = tp.ControlPrompt.schema.enumerants
+  assert (prompts['waitingForCross'], prompts['stopGo']) == (15, 16)
+  alerts_ = tp.ControlAlert.schema.enumerants
+  assert [alerts_[a] for a in ('crossTrafficAfterCommit', 'cameraPaused', 'stalledInJunction')] == [13, 14, 15]
+  fields = list(tp.StopGoStatus.schema.fields)
+  for f in ('state', 'reason', 'ledger', 'wouldGo', 'maneuver', 'lanes', 'arrivalRank', 'dEdgeMin', 'dEdgeMax', 'committed', 'inLane',
+            'retries', 'creptM', 'sideViewsLive', 'mapsValid', 'mode'):
+    assert f in fields, f
+  assert list(tp.StopGoStatus.Lane.schema.fields)[:7] == ['role', 'index', 'approach', 'rSeen', 'rReq', 'binding', 'shielded']
+
+
+def test_the_stop_sign_wait_is_silent_its_go_chimes_and_its_faults_hand_back():
+  # SG4a: waiting for cross traffic is ordinary (visual only), with an info chime at WAIT_INFO_S (stopGo.chime); the go is a
+  # short chime as the left's; a fault is stopSignTakeControl with its reason line; the alerts after commit and while the
+  # camera is paused are said, never a handback
+  from openpilot.selfdrive.turnpilot.hooks import CONTROL_ALERT_TEXT, SILENT_PROMPTS, TAKE_CONTROL_PROMPTS, plan_events
+  a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt='waitingForCross', reason='Waiting: car from the left')))
+  assert a.alert_text_1 == 'Waiting: car from the left' and a.audible_alert == AudibleAlert.none and a.visual_alert == VisualAlert.none
+  assert 'waitingForCross' in SILENT_PROMPTS and 'waitingForCross' not in TAKE_CONTROL_PROMPTS
+  msg = messaging.new_message('turnpilotPlan')
+  msg.turnpilotPlan.controlPrompt, msg.turnpilotPlan.reason = 'waitingForCross', 'Waiting for cross traffic'
+  msg.turnpilotPlan.stopGo.chime = True
+  a, = alerts(EventName.turnpilotControlPrompt, FakeSM(msg.as_reader().turnpilotPlan))
+  assert a.audible_alert == AudibleAlert.prompt
+  a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt='stopGo', reason='Going')))
+  assert a.alert_text_1 == 'Going' and a.audible_alert == AudibleAlert.prompt and 'stopGo' not in TAKE_CONTROL_PROMPTS
+  a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt='stopSignTakeControl',
+                                                            reason='Cross-traffic camera unavailable: take control')))
+  assert a.alert_text_1 == 'Cross-traffic camera unavailable: take control' and a.audible_alert == AudibleAlert.tpHandback
+  for kind, title in (('crossTrafficAfterCommit', 'Cross Traffic'), ('cameraPaused', 'Camera Paused'),
+                      ('stalledInJunction', 'Stalled in Junction')):
+    a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert=kind)))
+    assert a.alert_text_1 == title and a.audible_alert == AudibleAlert.prompt and a.alert_text_2 == CONTROL_ALERT_TEXT[kind], kind
+    assert plan_events(FakeSM(plan(controlAlert=kind))) == ['turnpilotControlAlert']

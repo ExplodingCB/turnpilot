@@ -51,12 +51,16 @@ def limits_plan(sm, now: float | None = None):
   return plan if plan.state != custom.TurnpilotPlan.State.disabled or plan.fault != custom.TurnpilotPlan.Fault.none else None
 
 
-CONTROL_ALERT_FIRST = ('hardBrake', 'cannotStopComfortably', 'offRouteStopsUnknown', 'oncomingHolding')  # above too fast to turn
+# above too fast to turn. The stop-sign decider's (stop_go.py): a cross vehicle met in a lane, the cross-traffic camera paused
+# while held, stalled past the in-lane point: said with a chime, never a handback themselves
+CONTROL_ALERT_FIRST = ('hardBrake', 'cannotStopComfortably', 'offRouteStopsUnknown', 'oncomingHolding', 'crossTrafficAfterCommit',
+                       'cameraPaused', 'stalledInJunction')
 # handbacks: the car held while the driver is told to take control (map_controls.py, turnpilotd.py), above too fast to turn
 TAKE_CONTROL_PROMPTS = ('stopSignTakeControl', 'unprotectedTurnTakeControl', 'carStoppedTakeControl', 'stalledTakeControl',
                         'cantStartTakeControl', 'leftUndecidedTakeControl')
-# shown, never heard: the unprotected left waiting at its line or creeping for a view is ordinary (no intervention)
-SILENT_PROMPTS = ('none', 'yieldAhead', 'waitingForGap', 'creepingForView')
+# shown, never heard: the unprotected left waiting at its line or creeping for a view, and a stop sign waiting for cross traffic,
+# are ordinary (no intervention); the stop sign's wait chimes once a WAIT_INFO_S (turnpilotPlan.stopGo.chime: stop_go.py)
+SILENT_PROMPTS = ('none', 'yieldAhead', 'waitingForGap', 'creepingForView', 'waitingForCross')
 # never sent since gas go went (2026-10-28), kept in the append-only schema: the driver's gas tap as a go, and going on red
 RETIRED_PROMPTS = ('stopSignGo', 'signalGo', 'unprotectedTurnGo', 'carStoppedGo')
 RETIRED_ALERTS = ('goingOnRed',)
@@ -142,6 +146,8 @@ CONTROL_PROMPT_TEXT = {
   'creepingForView': 'Creeping forward for a view of oncoming traffic',
   'leftGo': 'Turning across oncoming traffic',
   'leftUndecidedTakeControl': 'TurnPilot can\'t judge oncoming traffic',
+  'waitingForCross': 'Waiting for cross traffic',
+  'stopGo': 'Going from the stop sign',
 }
 CONTROL_ALERT_TEXT = {
   'cannotStopComfortably': 'Cannot stop gently for the stop/signal',
@@ -155,6 +161,9 @@ CONTROL_ALERT_TEXT = {
   'oncomingHolding': 'Oncoming traffic: holding short of its lanes',
   'farViewOff': 'Far view off for this drive: no lefts across fast oncoming traffic',
   'sideCamerasOff': 'Side cameras off for this drive: stop signs see less cross traffic',
+  'crossTrafficAfterCommit': 'Cross traffic: carrying on through the junction',
+  'cameraPaused': 'Cross-traffic camera paused: holding',
+  'stalledInJunction': 'Stalled in the junction: going again',
 }
 
 

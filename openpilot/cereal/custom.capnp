@@ -116,6 +116,11 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
       proceedingOnYellow @6; # a yellow too late to stop for: committed, no cap
       overrun @7;            # passed the line moving, never released: dropped (logged, alerted)
       infeasible @8;         # can't stop at -2.0 m/s^2: braking at the floor, alert
+      # STOP_SIGNS.md v3 SG4a, the stop-sign decider (stop_go.py) at a held stop sign
+      waitingCross @9;       # held: the decider waits for its go conditions (its reason on the plan)
+      creeping @10;          # held, its stop point moved on: a roll-up to the stop point (and SG4b's creeps)
+      going @11;             # released on the decider's go, under STOP_GO_V_MAX, short of the commit point
+      committed @12;         # past the commit point (the band, then in a lane): never braked for a cross car in a lane
     }
     enum LightState {
       unknown @0;
@@ -170,6 +175,11 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     leftGo @13;                     # going: a short chime
     leftUndecidedTakeControl @14;   # can't judge the oncoming traffic (stale camera, position unknown, beyond the detector's
                                     # range, yawed, view blocked after the full creep): held, take control
+    # STOP_SIGNS.md v3 SG4a: the stop-sign decider's wait and go. stopSignTakeControl @6 is now its faults only (H1-H8 and the
+    # ladder's end, the reason line saying which); under TurnPilotStopSignGo shadow or off it is the 1 s handback, as before
+    waitingForCross @15;            # held at a stop sign for the go conditions, the reason saying for what (visual only;
+                                    # stopGo.chime: the wait's info chime at WAIT_INFO_S and every WAIT_INFO_S after)
+    stopGo @16;                     # going from the stop sign: a short chime
   }
   enum ControlAlert {
     none @0;
@@ -190,6 +200,10 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     farViewOff @11;             # the far crop went off for the drive (failed or over budget): no unprotected left needing it
     sideCamerasOff @12;         # the side views went off for the drive (failed or overran, turnpilotDetections.sideViewStatus
                                 # disabled): stop sweeps run the full wide pass and the road camera only (STOP_SIGNS.md 1.3)
+    # STOP_SIGNS.md v3 SG4a, the stop-sign decider
+    crossTrafficAfterCommit @13; # a cross vehicle met past the in-lane point: said, never braked for (stopping in a lane is worse)
+    cameraPaused @14;           # a view the decider needs hasn't run for DET_FAULT_S: held, waiting FAULT_GRACE_S for it (H1 after)
+    stalledInJunction @15;      # standing past the in-lane point: a clearBox go (up to CLEAR_BOX_GOES), then H5
   }
   mapControl @24 :MapControlStatus;
   controlPrompt @25 :ControlPrompt;
@@ -284,6 +298,69 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
   # The far crop's aim (DESIGN phase 4 G5, detector/modeld_detector.py): deg left of the calibrated forward axis, read by
   # modeld through fresh_plan (shadow too). 0 is straight ahead; an unprotected left aims it up the oncoming approach
   farCropBearing @33 :Float32;
+
+  # STOP_SIGNS.md v3 SG4a: the stop-sign decider (selfdrive/turnpilot/stop_go.py) at the stop control in hand, every frame; what
+  # step S4a's launch_verify.py reads per go (goT, takeoverS, retries, withdrawn), and the runtime inputs navd's certifier reads
+  # (sideViewsLive, mapsValid, mode)
+  struct StopGoStatus {
+    enum State {
+      off @0;        # no stop control in hand
+      approach @1;   # an engaged stop sign within STOP_SWEEP_M, not yet held (a queue's roll-up goes from here)
+      stopped @2;    # held at its line: the full stop's dwell (STOP_DWELL_S)
+      rollUp @3;     # held short of its stop point: its stop point moved on to it (map_controls' creep path)
+      observe @4;    # the go conditions (section 2.4) every frame; CLEAR_S of them and our turn is the go
+      going @5;      # released: the launch under STOP_GO_V_MAX, short of the commit point, every object re-checked
+      committed @6;  # the band: past the commit point, short of the in-lane point
+      inLane @7;     # past the in-lane point: carried on, never braked for a cross car
+      done @8;       # its rear bumper past the farthest conflicting lane (or 60 deg turned)
+      ladder @9;     # a handback (H1-H8, the ladder's end): held, stopSignTakeControl with the reason
+    }
+    enum Ledger {
+      none @0;
+      dynamic @1;    # traffic taking turns, people moving, a queue: no bound, an info chime at WAIT_INFO_S
+      static @2;     # nothing moving that would end it: STATIC_WAIT_S, then the ladder
+      fault @3;      # a fault's grace or its handback
+    }
+    enum Mode {
+      off @0;
+      shadow @1;
+      trial @2;
+      auto @3;
+    }
+    struct Lane {
+      role @0 :Text;       # left, right, opposite (where its traffic comes from)
+      index @1 :UInt8;     # 1 nearest
+      approach @2 :UInt8;  # its approach's index in the control's junctionInfo.approaches
+      rSeen @3 :Float32;   # m seen down it from our conflict point, less v_c T_LAT (at the go position once going)
+      rReq @4 :Float32;    # m it needs (all-way or two-way)
+      binding @5 :Text;    # what ended its reach walk (stop_rules.reach_walk_why), or why it isn't walked
+      shielded @6 :Bool;   # a vehicle stopped at its line satisfies it (section 2.3)
+    }
+    state @0 :State;
+    reason @1 :Text;          # what it waits for, or why it goes, or its fault
+    ledger @2 :Ledger;
+    wouldGo @3 :Bool;         # every go condition held CLEAR_S and our turn: what auto would do (logged in shadow)
+    maneuver @4 :Text;        # straight, left, right or unknown (off the route)
+    lanes @5 :List(Lane);
+    arrivalRank @6 :UInt8;    # earlier arrivals still to go before us
+    dEdgeMin @7 :Float32;     # m from the stop point to the closest plausible edge of the first conflicting lane
+    dEdgeMax @8 :Float32;     # ...and to its farthest plausible edge
+    committed @9 :Bool;
+    inLane @10 :Bool;
+    retries @11 :UInt8;       # goes withdrawn this encounter
+    creptM @12 :Float32;      # m the car moved on from where it latched (a roll-up)
+    sideViewsLive @13 :Bool;  # the side views run (turnpilotDetections.sideViewStatus running or noRoom, fresh)
+    mapsValid @14 :Bool;      # the side views' maps match the calibration (sideViewStatus not mapsStale)
+    mode @15 :Mode;           # TurnPilotStopSignGo as acted on: auto without its data acts as shadow (H4, H8)
+    clearS @16 :Float32;      # s the go conditions have held
+    goT @17 :Float32;         # s since the decider's go, 0 with none
+    takeoverS @18 :Float32;   # s from the go to the model's takeover (go_override.model_takes_over held TAKEOVER_S), -1 not yet
+    withdrawn @19 :Text;      # why the last go was withdrawn ('' none)
+    positionM @20 :Float32;   # m the car's bumper is past the stop point (negative: short of it)
+    chime @21 :Bool;          # the dynamic wait's info chime is due (with waitingForCross)
+    fault @22 :Text;          # the fault in hand (H1-H8), '' none
+  }
+  stopGo @34 :StopGoStatus;
 }
 
 struct TurnpilotDetections @0xaedffd8f31e7b55d {
