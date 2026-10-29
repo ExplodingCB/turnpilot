@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import requests
 
 from openpilot.selfdrive.navigation.navd import RouteEngine
@@ -545,7 +546,7 @@ class TestLocalOverride(RouterCase):
     from openpilot.common.params import UnknownKeyName
     from openpilot.selfdrive.turnpilot.maps import surveys
     self.params.values['TurnPilotValhallaTiles'] = '/sim/tiles'
-    self.params.values['TurnPilotJunctionOverrides'] = [{'approach': '900:790:f', 'kind': 'no', 'evidence': 'a runner at 8 m/s'}]
+    self.params.values['TurnPilotJunctionOverrides'] = json.dumps([{'approach': '900:790:f', 'kind': 'no', 'evidence': 'a runner at 8 m/s'}])
     coverage_path(self.maps).unlink()
     entry = {'osmNodeId': 900, 'lat': 39.8, 'lon': -86.15, 'date': '2026-10-20', 'source': 'inPerson', 'confirmedBy': [],
              'approaches': [{'wayId': 1, 'bearingDeg': 0, 'stops': True, 'plaque': True, 'postedMph': 20, 'laneEdgeM': 4.,
@@ -676,9 +677,75 @@ if __name__ == '__main__':
   unittest.main()
 
 
-def test_the_overrides_param_is_a_persistent_json_key():
+def test_the_overrides_param_is_a_persistent_string_key():
   """TurnPilotJunctionOverrides (STOP_SIGNS.md 9) survives restarts: an approach downgraded on site stays avoided until
-  Kellen clears it. Unset, it is empty."""
+  Kellen clears it. Unset, it is empty. It is STRING, JSON text navd parses itself: a JSON key's Params.get reads a value
+  that doesn't parse as unset (a cloudlog warning, None), which would silently clear every downgrade."""
   import re
   header = (Path(__file__).parents[4] / 'common' / 'params_keys.h').read_text()
-  assert re.search(r'\{"TurnPilotJunctionOverrides", \{PERSISTENT, JSON\}\}', header)
+  assert re.search(r'\{"TurnPilotJunctionOverrides", \{PERSISTENT, STRING\}\}', header)
+
+
+class StandIn:
+  """The real Params, TurnPilotJunctionOverrides read from another key of the type wanted: this worktree's libparams
+  predates the key (scons isn't run here; the header test above pins its type)."""
+  def __init__(self, params, key):
+    self.params, self.key = params, key
+
+  def get(self, key, *args, **kwargs):
+    assert key == 'TurnPilotJunctionOverrides'
+    return self.params.get(self.key)
+
+  def get_type(self, key):
+    return self.params.get_type(self.key)
+
+  def get_param_path(self, key=''):
+    return self.params.get_param_path(self.key)
+
+
+OVERRIDE = [{'approach': '900:790:f', 'kind': 'no', 'evidence': {'speed': 8.2}}]
+CORRUPT = (b'[{"approach": "900:790:f", "kind": "no", "evid', b'', b'\xff\xfe[]', b'{"approach": "900:790:f"}', b'[{"approach": 1}]')
+
+
+def test_an_overrides_value_that_does_not_parse_is_unreadable_on_the_real_params(tmp_path):
+  """On the real Params (STRING, as params_keys.h declares it): unset is empty and readable, a value written as SG4b writes
+  one reads back, and any value that doesn't parse as the list (a truncated write, an empty file, bytes that aren't UTF-8,
+  which a STRING key's Params.get also reads as unset, or a wrong shape) is unreadable, never an empty list, so navd says
+  partial and fails every junction. The key as SG1b first declared it (JSON) was read as unset when it didn't parse: a
+  build whose params declare it anything but STRING is unreadable too."""
+  from openpilot.common.params import Params
+  from openpilot.selfdrive.turnpilot.routing.junctions import read_overrides
+  params = Params(str(tmp_path))
+  real = StandIn(params, 'TurnPilotValhallaTiles')
+  assert params.get_type('TurnPilotValhallaTiles').name == 'STRING'
+  assert read_overrides(real) == ({}, True, '')
+  params.put('TurnPilotValhallaTiles', json.dumps(OVERRIDE), block=True)
+  assert read_overrides(real) == ({'900:790:f': {'kind': 'no', 'evidence': {'speed': 8.2}}}, True, '')
+  path = Path(params.get_param_path('TurnPilotValhallaTiles'))
+  for bad in CORRUPT:
+    path.write_bytes(bad)
+    overrides, ok, why = read_overrides(real)
+    assert (overrides, ok) == ({}, False) and "TurnPilotJunctionOverrides doesn't parse" in why, bad
+  as_json = StandIn(params, 'TurnPilotFavorites')
+  params.put('TurnPilotFavorites', OVERRIDE, block=True)
+  Path(params.get_param_path('TurnPilotFavorites')).write_bytes(CORRUPT[0])
+  assert params.get('TurnPilotFavorites') is None  # what made a corrupt value silent
+  overrides, ok, why = read_overrides(as_json)
+  assert (overrides, ok) == ({}, False) and 'JSON' in why and 'STRING' in why
+
+
+def test_the_overrides_param_itself_on_the_real_params(tmp_path):
+  """The key itself, once libparams is built from this params_keys.h (scons; skipped where it predates the key)."""
+  from openpilot.common.params import Params, UnknownKeyName
+  from openpilot.selfdrive.turnpilot.routing.junctions import read_overrides
+  params = Params(str(tmp_path))
+  try:
+    params.check_key('TurnPilotJunctionOverrides')
+  except UnknownKeyName:
+    pytest.skip("this build's libparams predates TurnPilotJunctionOverrides: run scons")
+  assert read_overrides(params) == ({}, True, '')
+  params.put('TurnPilotJunctionOverrides', json.dumps(OVERRIDE), block=True)
+  assert read_overrides(params)[:2] == ({'900:790:f': {'kind': 'no', 'evidence': {'speed': 8.2}}}, True)
+  for bad in CORRUPT:
+    Path(params.get_param_path('TurnPilotJunctionOverrides')).write_bytes(bad)
+    assert read_overrides(params)[:2] == ({}, False), bad

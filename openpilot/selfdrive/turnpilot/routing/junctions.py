@@ -41,6 +41,7 @@ import json
 import math
 from dataclasses import dataclass, field
 from datetime import date
+from pathlib import Path
 
 from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
 from openpilot.selfdrive.turnpilot.maps.surveys import POS_ERR_M, STOP_CLEAR_M
@@ -267,21 +268,32 @@ def approach_key(osm_node_id: int, way_id: int, forward: bool) -> str:
 
 
 def read_overrides(params) -> tuple[dict[str, dict], bool, str]:
-  """(overrides by approach key, readable, why not) from TurnPilotJunctionOverrides: a JSON list of {approach, kind (no or
-  signalSeen), evidence}. A param the build doesn't know, or one that doesn't parse (any item: one bad item may be the
-  downgrade that matters), is not readable, which navd says out loud (routing/controls.py); unset is empty."""
-  from openpilot.common.params import UnknownKeyName
+  """(overrides by approach key, readable, why not) from TurnPilotJunctionOverrides: JSON text (a STRING key, written as
+  json.dumps of the list) of a list of {approach, kind (no or signalSeen), evidence}. A param the build doesn't know, one
+  its params declare anything but STRING, or one that doesn't parse (any item: one bad item may be the downgrade that
+  matters) is not readable, which navd says out loud (routing/controls.py); unset is empty. navd parses it itself: a JSON
+  key's Params.get, and a STRING key's for bytes that aren't UTF-8, logs a warning and reads such a value as unset, which
+  would silently restore every approach it downgraded. So where Params.get gives nothing but the file is there (empty,
+  or not UTF-8), the file's own bytes are what doesn't parse. params: Params, or anything with its get."""
+  from openpilot.common.params import ParamKeyType, UnknownKeyName
   try:
+    kind = params.get_type(OVERRIDES_PARAM) if hasattr(params, 'get_type') else ParamKeyType.STRING
     raw = params.get(OVERRIDES_PARAM)
   except UnknownKeyName:
     return {}, False, f"{OVERRIDES_PARAM} is unknown to this build's params (run scons)"
-  if raw is None:
-    return {}, True, ''
+  if kind != ParamKeyType.STRING:
+    return {}, False, f"{OVERRIDES_PARAM} is declared {getattr(kind, 'name', kind)} in this build's params, not STRING (run scons)"
   try:
+    if raw is None and hasattr(params, 'get_param_path'):
+      path = Path(params.get_param_path(OVERRIDES_PARAM))
+      raw = path.read_bytes() if path.is_file() else None
+    if raw is None:
+      return {}, True, ''
     if isinstance(raw, bytes):
       raw = raw.decode()
-    if isinstance(raw, str):
-      raw = json.loads(raw) if raw.strip() else []
+    if not isinstance(raw, str):
+      raise ValueError(f"read as {type(raw).__name__}, not JSON text")
+    raw = json.loads(raw)
     if not isinstance(raw, list):
       raise ValueError("not a list")
     out = {}
@@ -291,7 +303,7 @@ def read_overrides(params) -> tuple[dict[str, dict], bool, str]:
         raise ValueError(f"bad item {o!r}")
       out[o['approach']] = {'kind': o['kind'], 'evidence': o.get('evidence')}
     return out, True, ''
-  except (ValueError, UnicodeDecodeError) as e:
+  except (ValueError, UnicodeDecodeError, OSError) as e:
     return {}, False, f"{OVERRIDES_PARAM} doesn't parse: {e}"
 
 

@@ -1011,8 +1011,8 @@ def test_an_override_makes_its_approach_no_and_an_unreadable_one_is_loud(tmp_pat
   from openpilot.common.params import UnknownKeyName
   from openpilot.selfdrive.turnpilot.routing.junctions import read_overrides
   v = StubJunction([(0., 100., {'stop': True, 'way_id': 50}), (100., 400., {})], four())
-  params = {'TurnPilotJunctionOverrides': [{'approach': '900:790:f', 'kind': 'no', 'evidence': {'speed': 8.2}},
-                                           {'approach': '900:970:f', 'kind': 'signalSeen', 'evidence': None}]}
+  params = {'TurnPilotJunctionOverrides': json.dumps([{'approach': '900:790:f', 'kind': 'no', 'evidence': {'speed': 8.2}},
+                                                      {'approach': '900:970:f', 'kind': 'signalSeen', 'evidence': None}])}
   overrides, ok, _ = read_overrides(SimpleNamespace(get=params.get))
   assert ok and set(overrides) == {'900:790:f', '900:970:f'}
   ctx = context([survey()], overrides)
@@ -1021,8 +1021,10 @@ def test_an_override_makes_its_approach_no_and_an_unreadable_one_is_loud(tmp_pat
 
   def unknown(key):
     raise UnknownKeyName(key)
+  # the last a list, what a JSON key's get gives (it reads a value that doesn't parse as unset): not the STRING key's text
   for bad in (SimpleNamespace(get=unknown), SimpleNamespace(get=lambda k: '{"not": "a list"}'),
-              SimpleNamespace(get=lambda k: [{'approach': '900:790:f', 'kind': 'maybe'}])):
+              SimpleNamespace(get=lambda k: json.dumps([{'approach': '900:790:f', 'kind': 'maybe'}])),
+              SimpleNamespace(get=lambda k: [{'approach': '900:790:f', 'kind': 'no'}])):
     overrides, ok, why = read_overrides(bad)
     assert not ok and overrides == {} and 'TurnPilotJunctionOverrides' in why
     with patch.object(controls_module, 'cloudlog') as log:
