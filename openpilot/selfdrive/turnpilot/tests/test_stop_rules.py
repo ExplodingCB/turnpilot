@@ -209,10 +209,50 @@ class TestCaps:
     assert sr.parking_cap(10.4, 0.) == 0.
 
 
+def capped_abort_overrun(v0: float, a0: float, td: float, t_abort_s: float, dt: float = 0.001) -> float:
+  """m past dEdgeMin a go withdrawn on the last model step before commit ends (STOP_SIGNS.md 2.6): the car at v0, still
+  accelerating at a0, the remaining distance to dEdgeMin just over abort_distance(v0, T_ABORT, a0) + M_EDGE, and the capped
+  abort max(needed(v, d_remaining - M_EDGE), -2.0) issued every model step and applied after the true delay td (a pure delay)."""
+  edge = sr.abort_distance(v0, t_abort_s, a0) + sr.M_EDGE + 1e-6
+  x, v, t, nxt, a, cmds = 0., v0, 0., 0., a0, []
+  while v > 0. and t < 20.:
+    if t + 1e-12 >= nxt:
+      d_rem = edge - x - sr.M_EDGE
+      need = -(v * v) / (2. * d_rem) if d_rem > 0.01 else -99.
+      cmds.append((t + td, max(need, -sr.A_ABORT)))
+      nxt += sr.DT_MDL
+    while cmds and cmds[0][0] <= t:
+      a = cmds.pop(0)[1]
+    v = max(v + a * dt, 0.)
+    x += v * dt
+    t += dt
+  return x - edge
+
+
 class TestAbort:
   @pytest.mark.parametrize('v', sorted(ABORT_055))
   def test_abort_distance(self, v):
     assert sr.abort_distance(v, 0.55) == pytest.approx(ABORT_055[v], abs=0.01)
+    assert sr.abort_distance(v, 0.55, -1.0) == pytest.approx(ABORT_055[v], abs=0.01)  # braking already: no credit taken
+
+  def test_abort_distance_while_still_accelerating(self):
+    # v T + a T^2 / 2 + (v + a T)^2 / (2 A_ABORT): the car keeps its launch through the delay
+    assert sr.abort_distance(1.0, 0.55, 0.5) == pytest.approx(0.55 + 0.5 * 0.55 ** 2 / 2 + (1.0 + 0.5 * 0.55) ** 2 / 4.)
+    assert sr.abort_distance(2.0, 0.55, 1.5) == pytest.approx(1.1 + 1.5 * 0.55 ** 2 / 2 + (2.0 + 1.5 * 0.55) ** 2 / 4.)
+
+  @pytest.mark.parametrize('td', [0.15, 0.40, 0.55])
+  def test_a_go_withdrawn_while_the_car_accelerates_stops_short_of_the_closest_edge(self, td):
+    # the skeptic's probe: with a = 0 the abort ended up to 0.98 m past dEdgeMin at a launch of 1.5 m/s^2 (delay 0.55 s known)
+    t = sr.t_abort(0.15, td)  # the delay S4a measured, in visibility.json's actuatorDelayS
+    over = {(v0, a0): capped_abort_overrun(v0, a0, td, t) for v0 in (0.5, 1.0, 1.5, 2.0) for a0 in (0., 0.5, 1.0, 1.5)}
+    assert max(over.values()) <= 0., over
+
+  def test_the_commit_and_gate_points_take_the_current_acceleration(self):
+    e = sr.edge_band(13.0, 2, lane_edge_m=3.5)  # dEdgeMin 7.0
+    # at 1.5 m/s the abort is 1.39 m coasting and 2.03 m still launching at 1.0 m/s^2: commit 0.64 m sooner
+    assert not sr.committed(5.0, 1.5, 0.55, e, 0.) and sr.committed(5.0, 1.5, 0.55, e, 1.0)
+    assert not sr.gate_reached(4.7, 1.5, 0.55, e, 0.) and sr.gate_reached(4.7, 1.5, 0.55, e, 1.0)
+    assert sr.committed(5.0, 1.5, 0.55, e, -1.0) == sr.committed(5.0, 1.5, 0.55, e, 0.)
 
   def test_t_abort_takes_the_larger_delay(self):
     assert sr.t_abort(0.40) == pytest.approx(0.55)
@@ -221,15 +261,19 @@ class TestAbort:
     assert sr.t_abort(0.40, None) == pytest.approx(0.55)
 
   def test_go_room(self):
-    assert sr.go_room_m(0.55) == pytest.approx(2.4, abs=0.01)
-    assert sr.go_room_m(0.55, right=True) == pytest.approx(2.9, abs=0.01)
+    # the nudge's 1.0 m, the abort from the 1.0 m/s it reaches while still accelerating at 0.5 m/s^2 (1.03 m), M_EDGE and the
+    # takeover margin: 2.63 m (2.4 m before the launch was counted)
+    assert sr.go_room_m(0.55) == pytest.approx(1.0 + sr.abort_distance(1.0, 0.55, 0.5) + 0.6, abs=1e-9)
+    assert sr.go_room_m(0.55) == pytest.approx(2.63, abs=0.01)
+    assert sr.go_room_m(0.55, right=True) == pytest.approx(3.13, abs=0.01)
+    assert sr.go_room_m(0.55, a_launch=1.5) > sr.go_room_m(0.55)
 
   def test_points_along_the_path(self):
     e = sr.edge_band(13.0, 2, lane_edge_m=3.5)  # dEdgeMin 7.0, dEdgeMax 12.0, nominal 9.5
     # at 1.5 m/s, abort 1.39 m: commit at 1.69 m to dEdgeMin, gate at 1.99 m (the first argument: m moved from the stop point)
-    assert not sr.gate_reached(4.9, 1.5, 0.55, e)
-    assert sr.gate_reached(5.1, 1.5, 0.55, e) and not sr.committed(5.1, 1.5, 0.55, e)
-    assert sr.committed(5.4, 1.5, 0.55, e)
+    assert not sr.gate_reached(4.9, 1.5, 0.55, e, 0.)
+    assert sr.gate_reached(5.1, 1.5, 0.55, e, 0.) and not sr.committed(5.1, 1.5, 0.55, e, 0.)
+    assert sr.committed(5.4, 1.5, 0.55, e, 0.)
     assert sr.band_midpoint(e) == pytest.approx(9.5)  # the nominal surveyed edge
     assert sr.band_midpoint(sr.edge_band(13.0, 2)) == pytest.approx((3.3 + 13.0) / 2)
     assert not sr.in_lane(11.9, e) and sr.in_lane(12.1, e)

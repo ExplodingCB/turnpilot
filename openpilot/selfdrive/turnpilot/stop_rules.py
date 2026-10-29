@@ -563,25 +563,32 @@ def t_abort(cp_delay: float, file_delay: float | None = None) -> float:
   return max(float(cp_delay), float(file_delay) if file_delay is not None else 0.) + DT_MDL + T_ABORT_PAD_S
 
 
-def abort_distance(v: float, t_abort_s: float) -> float:
-  """m the capped abort (-A_ABORT after T_ABORT) needs from v."""
-  return v * t_abort_s + v * v / (2. * A_ABORT)
+def abort_distance(v: float, t_abort_s: float, a: float = 0.) -> float:
+  """m the capped abort (-A_ABORT after T_ABORT) needs from v while the car accelerates at a (m/s^2; a launch keeps going
+  through the delay, so the brake starts from v + a T_ABORT): v T + a T^2 / 2 + (v + a T)^2 / (2 A_ABORT). A car already
+  braking (a < 0) takes no credit for it."""
+  a = max(float(a), 0.)
+  v1 = v + a * t_abort_s
+  return v * t_abort_s + a * t_abort_s * t_abort_s / 2. + v1 * v1 / (2. * A_ABORT)
 
 
-def go_room_m(t_abort_s: float, right: bool = False) -> float:
-  """m to the closest plausible edge a go (and the creep floor) needs: the nudge, the abort from GO_ROOM_V, M_EDGE and the
+def go_room_m(t_abort_s: float, right: bool = False, a_launch: float = A_LAUNCH_PLAN) -> float:
+  """m to the closest plausible edge a go (and the creep floor) needs: the nudge, the abort from GO_ROOM_V while still
+  accelerating at a_launch (the G5 nudge's A_LAUNCH_PLAN; pass the measured launch where it is larger), M_EDGE and the
   takeover margin (2.6), and GO_ROOM_RIGHT_M more for a right."""
-  return GO_NUDGE_M + abort_distance(GO_ROOM_V, t_abort_s) + M_EDGE + TAKEOVER_MARGIN_M + (GO_ROOM_RIGHT_M if right else 0.)
+  return GO_NUDGE_M + abort_distance(GO_ROOM_V, t_abort_s, a_launch) + M_EDGE + TAKEOVER_MARGIN_M + (GO_ROOM_RIGHT_M if right else 0.)
 
 
-def gate_reached(moved_m: float, v: float, t_abort_s: float, edges: Edges) -> bool:
-  """The gate point: the model must have taken over by here (moved_m: m moved from the stop point)."""
-  return edges.d_min - moved_m <= abort_distance(v, t_abort_s) + M_EDGE + TAKEOVER_MARGIN_M
+def gate_reached(moved_m: float, v: float, t_abort_s: float, edges: Edges, a_now: float) -> bool:
+  """The gate point: the model must have taken over by here (moved_m: m moved from the stop point; a_now: the car's
+  acceleration now, m/s^2, or the measured maximum launch: never left out, the abort starts from where the launch has
+  carried the car after T_ABORT)."""
+  return edges.d_min - moved_m <= abort_distance(v, t_abort_s, a_now) + M_EDGE + TAKEOVER_MARGIN_M
 
 
-def committed(moved_m: float, v: float, t_abort_s: float, edges: Edges) -> bool:
-  """The commit point: the capped abort can no longer stop short of the closest plausible edge."""
-  return edges.d_min - moved_m <= abort_distance(v, t_abort_s) + M_EDGE
+def committed(moved_m: float, v: float, t_abort_s: float, edges: Edges, a_now: float) -> bool:
+  """The commit point: the capped abort can no longer stop short of the closest plausible edge (a_now as gate_reached)."""
+  return edges.d_min - moved_m <= abort_distance(v, t_abort_s, a_now) + M_EDGE
 
 
 def band_midpoint(edges: Edges) -> float:
