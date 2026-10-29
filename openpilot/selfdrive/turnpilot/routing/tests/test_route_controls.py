@@ -857,6 +857,124 @@ def test_n5_through_a_green_without_slowing_where_the_signal_is_on_the_approach_
   assert car.s > 120. + 150. and min(r[2] for r in car.rows) > v0 - 0.1
 
 
+class StubBehind(StubJunction):
+  """StubJunction with the road behind the route's start, due north like the route: the first edge really begins at begin
+  m (0 or less) and behind [(begin m, end m, fields)] runs up to it (fields: node_signal and edge_signal at its end node,
+  crossing: the classes of other roads meeting there, none by default). locate (radius 1) at a point on the first edge
+  answers it with its whole shape from begin; at a node behind (the end of a behind edge), the edges there: the one
+  arriving, the one leaving, both reversed and each crossing road both ways, with the node's traffic_signal (found False:
+  nothing at a node behind); anything else as StubJunction."""
+
+  def __init__(self, edges, junctions, begin, behind, found=True, **kw):
+    super().__init__(edges, junctions, **kw)
+    self.begin, self.behind, self.found = begin, behind, found
+
+  @staticmethod
+  def cand(eid, b, e, pa, heading, fields=None, way=60):
+    fields = fields or {}
+    shape = [{'lat': pt(x)[0], 'lon': pt(x)[1]} for x in ((b, e) if heading == 0. else (e, b))]
+    return {'edge_id': {'value': eid}, 'percent_along': pa, 'heading': heading, 'distance': 0.,
+            'edge': {'forward': heading == 0., 'traffic_signal': bool(fields.get('edge_signal')) and pa == 1. and heading == 0.,
+                     'classification': {'classification': fields.get('class', 'tertiary'), 'use': fields.get('use', 'road')}},
+            'edge_info': {'way_id': way, 'shape': shape}}
+
+  def answer(self, loc):
+    m = (loc['lat'] - LAT0) * M_PER_DEG
+    first = self.edges[0][0]
+    end0 = first['end_shape_index'] * self.every
+    if loc.get('radius') == 1 and 'heading' not in loc and m < 0.5:
+      for k, (b, e, f) in enumerate(self.behind):
+        if abs(m - e) < 0.5:
+          if not self.found:
+            return {'edges': [], 'nodes': []}
+          nb, ne = (self.behind[k + 1][:2] if k + 1 < len(self.behind) else (self.begin, end0))
+          out = [self.cand(5000 + k, b, e, 1., 0., f), self.cand(5000 + k, b, e, 0., 180.),
+                 self.cand(5001 + k if k + 1 < len(self.behind) else first['id'], nb, ne, 0., 0.),
+                 self.cand(5001 + k if k + 1 < len(self.behind) else first['id'], nb, ne, 1., 180.)]
+          for c in f.get('crossing', []):
+            for h in (90., 270.):
+              x = toward(pt(e), h, 50.)
+              out += [{'edge_id': {'value': 7000 + int(h)}, 'percent_along': pa, 'heading': h if pa == 0. else (h + 180.) % 360.,
+                       'distance': 0., 'edge': {'classification': {'classification': c, 'use': 'road'}},
+                       'edge_info': {'way_id': 71, 'shape': [{'lat': q[0], 'lon': q[1]} for q in ((pt(e), x) if pa == 0. else (x, pt(e)))]}}
+                      for pa in (0., 1.)]
+          return {'edges': out, 'nodes': [{'lat': pt(e)[0], 'lon': pt(e)[1], 'traffic_signal': bool(f.get('node_signal'))}]}
+    out = super().answer(loc)
+    if loc.get('radius') == 1 and 'heading' not in loc and 0. < m < end0:
+      for c in out.get('edges') or []:
+        if (c.get('edge_id') or {}).get('value') == first['id']:
+          c |= self.cand(first['id'], self.begin, end0, (m - self.begin) / (end0 - self.begin), 0., way=first['way_id'])
+          c['edge'] = {**c['edge'], 'stop_sign': out['edges'][0]['edge'].get('stop_sign', False)}
+    return out
+
+
+def pg_road(stub, behind, found=True, begin=-1.):
+  """A tertiary whose route or lookup starts 1 m past a node (begin), the first edge ending at a primary stub m on from
+  that node, the road behind it behind."""
+  edges = [(0., stub + begin, {'road_class': 'tertiary'}), (stub + begin, 400., {'road_class': 'tertiary'})]
+  return StubBehind(edges, {stub + begin: primary_cross()}, begin, behind, found=found, every=1.)
+
+
+@pytest.mark.parametrize('ahead', [False, True])
+@pytest.mark.parametrize('stub', [13., 20., 24.])
+@pytest.mark.parametrize('name, behind', [
+  ('a signal on the node', [(-80., -1., {'node_signal': True})]),
+  ('a directed signal there', [(-80., -1., {'edge_signal': True})]),  # Indianapolis route 1's 11.8 m stub is mapped so
+  ('a signal back past a crosswalk node', [(-80., -30., {'node_signal': True}), (-30., -1., {})]),
+])
+def test_pg_a_route_or_lookup_starting_past_a_signals_stop_line_node_sees_the_signal(name, behind, stub, ahead):
+  """A route (a reroute starts at the car too) or a lookup ahead (controls_ahead's road starts at the car) starting 1 m past
+  the stop-line node OSM maps a junction's signal on, stub m short of a primary: approach_edges reaches the trace's first
+  edge with nothing mapped and the signal just behind the start. signal_behind walks back from that edge's begin node and
+  finds it: no suspected stop, so no stop on a green (it was a suspected stop 0, 6 and 10 m ahead; on Indianapolis route 1,
+  a lookup 1.5 m past the node of an 11.8 m stub gave one 0 m ahead)."""
+  controls, status = controls_module._route_controls(pg_road(stub, behind), steps(every=1.), None, ahead=ahead)
+  assert status == 'ok' and kinds(controls) == [], name
+
+
+@pytest.mark.parametrize('name, behind, found', [
+  ('nothing mapped back to a road junction', [(-80., -40., {'crossing': ['residential']}), (-40., -1., {})], True),
+  ('a signal at the road junction behind is its own', [(-80., -40., {'node_signal': True, 'crossing': ['residential']}), (-40., -1., {})], True),
+  ('a signal past JUNCTION_AHEAD_M', [(-120., -45., {'node_signal': True}), (-45., -1., {})], True),
+  ('the road behind not found', [(-80., -1., {'node_signal': True})], False),
+])
+@pytest.mark.parametrize('ahead', [False, True])
+def test_pg_the_suspected_stop_stays_with_nothing_mapped_behind_the_start_or_the_road_there_unknown(name, behind, found, ahead):
+  """The same look behind the start keeps a real suspected stop: one the car is already inside the approach of (a lookup
+  ahead every second must not drop it as the car closes in), one whose signal behind belongs to the road junction before,
+  or past JUNCTION_AHEAD_M, and one whose road behind the start can't be read, logged (the safer side: a stop on a green
+  is a -2.0 m/s^2 stop and a handback, rolling through an unmapped stop onto a primary isn't)."""
+  with patch.object(controls_module, 'cloudlog') as log:
+    controls, status = controls_module._route_controls(pg_road(20., behind, found), steps(every=1.), None, ahead=ahead)
+  assert status == 'ok' and kinds(controls) == [('stop', 0, True)], name
+  assert found or any('unknown' in str(c.args[0]) for c in log.warning.call_args_list)
+
+
+def test_pg_a_lookup_ahead_reads_the_road_behind_once():
+  """Off the route navd looks again every second: the look behind the start is kept in the LocateCache by the first edge
+  and the junction's edge, so the next lookup asks nothing more for it."""
+  v = pg_road(20., [(-80., -1., {'node_signal': True})])
+  cache = controls_module.LocateCache()
+  assert kinds(controls_module._route_controls(v, steps(every=1.), None, ahead=True, cache=cache)[0]) == []
+  n = len(v.requests)
+  assert kinds(controls_module._route_controls(v, steps(every=1.), None, ahead=True, cache=cache)[0]) == []
+  assert [r for e, r in v.requests[n:] if e == 'locate'] == []
+
+
+def test_pg_through_a_green_without_slowing_from_a_route_starting_past_the_stop_line_node():
+  """Closed loop (map_controls' point-mass car): a route that starts 1 m past the stop-line node of a signal 20 m short of a
+  primary (the light green, its line behind the car) takes the car through the junction at its speed; the suspected stop
+  it had 6 m ahead braked it at -2.0 m/s^2 into cannotStopComfortably and stopOverrun."""
+  from openpilot.common.realtime import DT_MDL
+  from openpilot.selfdrive.turnpilot.tests.test_map_controls import Car
+  controls, _ = route_controls(pg_road(20., [(-80., -1., {'node_signal': True})]), steps(every=1.))
+  car = Car([(c.route_m, c.kind, c.line_mapped, c.junction, c.cross_suspect) for c in controls], v=11.)
+  for _ in range(int(10. / DT_MDL)):
+    _, dec, _ = car.step()
+    assert not dec.should_stop
+  assert car.s > 100. and min(r[2] for r in car.rows) > 11. - 0.1
+
+
 def rail_dir(tmp_path, rail, controls=None):
   d = osm_dir(tmp_path, controls)
   cell = level2_index(LON0, LAT0)

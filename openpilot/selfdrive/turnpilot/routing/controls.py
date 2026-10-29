@@ -58,9 +58,13 @@ read from trace_attributes and Q2, one more batched verbose locate per route tha
 every leg unknown and the junction failed. A suspected unmapped stop (N5: every road crossing outranks ours by two classes
 or more, junctions.suspected_stop, and nothing mapped on our whole approach, approach_edges: no signal, stop or yield from
 Valhalla or the sidecar back to the previous road junction or JUNCTION_AHEAD_M, and no suspected stop already at a junction
-within SAME_JUNCTION_M before it) is emitted as a stop at the default stop point, its junction flagged suspected. Mapped
-controls at different nodes still never merge. A TurnPilotJunctionOverrides navd can't read fails every stop and yield junction
-and makes the status partial, logged. Off the route a LocateCache keeps Q1 and Q2 by edge id between the 1 Hz lookups.
+within SAME_JUNCTION_M before it) is emitted as a stop at the default stop point, its junction flagged suspected. A route, a
+reroute and a lookup ahead all start at the car, so where that walk reaches the trace's start within JUNCTION_AHEAD_M the
+rest of the approach is behind the car: signal_behind walks it back by locate, and a signal there (the car is past its
+stop-line node) means no suspected stop, so none on a green; nothing there, or a road behind that can't be read (logged),
+keeps the stop. Mapped controls at different nodes still never merge. A TurnPilotJunctionOverrides navd can't read fails every stop and yield junction
+and makes the status partial, logged. Off the route a LocateCache keeps Q1, Q2 and signal_behind's answers by edge id
+between the 1 Hz lookups.
 navd's own Control also carries, for SG2's avoidance loop, its approach edge's key, its exclusion point and whether that
 edge is the route's first or last.
 """
@@ -116,6 +120,9 @@ JUNCTION_AHEAD_M = 60.   # m on along the route the junction the sidecar says a 
 SAME_JUNCTION_M = 25.    # m: a road junction (or an internal-intersection edge) this close before a suspected stop's node is
                          # its junction's (a divided road's near carriageway, its median split by a node so that Valhalla
                          # flags neither half internal: Indianapolis routes 60 and 73, 10 m), for suspected stops only
+LOOK_BACK_EDGES = 4      # edges behind the trace's start signal_behind walks at most (a crosswalk's node, a way split)
+START_BEARING_M = 5.     # m along an edge its bearing leaving its begin node is taken over (signal_behind)
+ALONG_DEG = 15.          # deg: an edge at a node pointing this close to our road's either way is our road's (signal_behind)
 SUSPECTED_STOPS = True   # emit suspected unmapped stops (N5) as stop controls: until SG2 routes around them, each is a stop
 CACHE_MAX = 4096         # Q1 and Q2 answers a LocateCache keeps, each
 SAME_EDGE_NODE_M = 1.5   # m: an edge's end node this close to another's is the same node (surveys.SAME_NODE_M)
@@ -164,11 +171,12 @@ class Opposing:
 
 class LocateCache:
   """Q1's and Q2's locate answers by edge id, for navd's lookups ahead of the car every second (controls_ahead), which
-  mostly repeat: Q1's matched candidate per edge, Q2's answers per junction (its edges' ids). One per ValhallaSource (one
+  mostly repeat: Q1's matched candidate per edge, Q2's answers per junction (its edges' ids), and signal_behind's verdict
+  per first edge and junction edge (a known one only). One per ValhallaSource (one
   tile set). Thread-safe (RouteJob and AheadJob run apart); CACHE_MAX of each, the oldest going first."""
 
   def __init__(self, size: int = CACHE_MAX):
-    self.size, self.lock, self.data = size, threading.Lock(), {'q1': OrderedDict(), 'q2': OrderedDict()}
+    self.size, self.lock, self.data = size, threading.Lock(), {'q1': OrderedDict(), 'q2': OrderedDict(), 'back': OrderedDict()}
 
   def get(self, kind: str, key):
     with self.lock:
@@ -615,6 +623,75 @@ def approach_edges(edges, ends, a: int) -> list[int]:
   return out
 
 
+def edge_shape(c) -> list[tuple[float, float]]:
+  """A locate candidate's edge_info shape [(lat, lon)] in its own direction of travel (edge_info's runs the way's)."""
+  shape = (c.get('edge_info') or {}).get('shape') or []
+  pts = decode6(shape) if isinstance(shape, str) else [(q['lat'], q['lon']) for q in shape]
+  return pts if (c.get('edge') or {}).get('forward', True) else pts[::-1]
+
+
+def start_bearing(pts) -> float:
+  """deg: the bearing pts leave their first point with, over their first START_BEARING_M or all of them if shorter."""
+  cum = cumulative(pts)
+  return bearing(pts[0], point_at(pts, cum, min(START_BEARING_M, cum[-1])))
+
+
+def away(c) -> float:
+  """deg: the way a locate candidate at a node points away from it (one leaving it its heading, one ending there reversed)."""
+  h = float(c.get('heading', 0.))
+  return h if float(c.get('percent_along', 0.)) < 0.5 else (h + 180.) % 360.
+
+
+def signal_behind(call, edges, tpts, tcum, back0: float) -> bool | None:
+  """Whether a signal is mapped on a junction's approach behind the trace's start, which approach_edges can't see: a route,
+  a reroute and a lookup ahead (controls_ahead) all start at the car, so once the car is past the stop-line node OSM maps
+  the junction's signal on (10-25 m short of it), the walk back reaches the trace's first edge with nothing mapped (N5).
+  back0: m from the trace's start on to the junction's node. From one verbose locate on the first edge (its candidate by id:
+  its whole shape, so its begin node), back node by node through one verbose locate at each (radius 1): the edge arriving
+  nearest our heading there, and the node. True at a signal on a node (the node's traffic_signal or the arriving edge's)
+  within JUNCTION_AHEAD_M of the junction, as approach_edges counts one; False past it, at a road junction more than
+  SAME_JUNCTION_M before the junction (another road's edge there, as road_junction: its signal is that junction's), or after
+  LOOK_BACK_EDGES; None unknown (a locate failed, or found nothing). Only a signal counts: a stop or yield behind the start
+  makes the junction a stop's, where the suspected stop is right."""
+  try:
+    e0 = edges[0]
+    s = min(LOCATE_BACK_M, (tcum[e0['end_shape_index']] - tcum[e0['begin_shape_index']]) / 2.)
+    p = point_at(tpts, tcum, tcum[e0['begin_shape_index']] + s)
+    loc = (call('locate', {'locations': [{'lat': p[0], 'lon': p[1], 'radius': 1}], 'costing': 'auto', 'verbose': True}) or [None])[0]
+    c = next((c for c in (loc or {}).get('edges') or [] if (c.get('edge_id') or {}).get('value') == e0.get('id') and
+              len(edge_shape(c)) >= 2), None)
+    if c is None:
+      return None
+    shape = edge_shape(c)
+    back = back0 + max(float(c.get('percent_along', 0.)) * cumulative(shape)[-1] - s, 0.)
+    node, h = shape[0], start_bearing(shape)
+    for _ in range(LOOK_BACK_EDGES):
+      if back > JUNCTION_AHEAD_M:
+        return False
+      ans = (call('locate', {'locations': [{'lat': node[0], 'lon': node[1], 'radius': 1}], 'costing': 'auto', 'verbose': True}) or [None])[0] or {}
+      cands = [x for x in ans.get('edges') or [] if len(edge_shape(x)) >= 2]
+      arriving = [x for x in cands if float(x.get('percent_along', 0.)) > 0.5 and angle_diff(float(x.get('heading', h + 180.)), h) <= NEXT_HEADING_TOL]
+      if not arriving:
+        return None
+      arr = min(arriving, key=lambda x: angle_diff(float(x['heading']), h))
+      ours = (h, (float(arr['heading']) + 180.) % 360.)
+      other = any((((x.get('edge') or {}).get('classification') or {}).get('use') or 'road') in jn.CROSSING_USES and
+                  jn.RANK.get(((x.get('edge') or {}).get('classification') or {}).get('classification') or '', 8) < 8 and
+                  all(angle_diff(away(x), o) > ALONG_DEG for o in ours) for x in cands)
+      if back > SAME_JUNCTION_M and other:
+        return False
+      if (arr.get('edge') or {}).get('traffic_signal') or any(
+          n.get('traffic_signal') for n in ans.get('nodes') or [] if haversine((float(n['lat']), float(n['lon'])), node) <= SAME_EDGE_NODE_M):
+        return True
+      shape = edge_shape(arr)
+      back += cumulative(shape)[-1]
+      node, h = shape[0], start_bearing(shape)
+    return False
+  except Exception:
+    cloudlog.exception("turnpilot controls: the look behind the start (locate) failed")
+    return None
+
+
 def maneuver_at(steps, starts, stop_s: float, node_s: float) -> str:
   """The route's maneuver at a junction (N8): the first step starting from the stop point stop_s to MANEUVER_AFTER_M past
   the node node_s (m along the route's shape), else straight."""
@@ -781,11 +858,27 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
     nodes, legs, last = jn.junction_legs(edges, tpts, a, ahead)
     if not jn.suspected_stop(edges[a], tpts, legs):
       continue
-    mapped = next((i for i in approach_edges(edges, ends, a) if i in at or i in suspected), None)
+    approach = approach_edges(edges, ends, a)
+    mapped = next((i for i in approach if i in at or i in suspected), None)
     if mapped is not None:
       what = 'a suspected stop' if mapped in suspected else 'a ' + '/'.join(sorted(at[mapped], key=KIND_RANK.get))
       cloudlog.info(f"turnpilot controls: no suspected stop on {key} at {end_m:.0f} m: its approach has {what} at {ends[mapped][0]:.0f} m")
       continue
+    back0 = end_m - (ends[0][0] - ends[0][1])
+    if approach[-1] == 0 and back0 <= JUNCTION_AHEAD_M:
+      # the walk reached the trace's start: the rest of the approach is behind the car (signal_behind)
+      bkey = (edges[0].get('id'), edges[a].get('id'))
+      behind = cache.get('back', bkey) if cache is not None else None
+      if behind is None:
+        behind = signal_behind(call, edges, tpts, tcum, back0)
+        if behind is not None and cache is not None:
+          cache.put('back', bkey, behind)
+      if behind:
+        cloudlog.info(f"turnpilot controls: no suspected stop on {key} at {end_m:.0f} m: a signal is mapped on its approach behind the start")
+        continue
+      if behind is None:
+        cloudlog.warning(f"turnpilot controls: the approach to the suspected stop on {key} at {end_m:.0f} m behind the start is unknown " +
+                         f"({back0:.0f} m of it seen): the stop stays")
     suspected.add(a)
     cloudlog.info(f"turnpilot controls: a suspected unmapped stop on {key} at {end_m:.0f} m: every road crossing outranks ours by two classes")
     found.append({'s': end_m - CONTROL_LINE_M - MAP_MARGIN_M, 'kind': 'stop', 'mapped': False, 'junction': True, 'cross_suspect': False,
