@@ -9,7 +9,8 @@ from pathlib import Path
 import requests
 
 from openpilot.common.swaglog import cloudlog
-from openpilot.selfdrive.turnpilot.routing.controls import actor_call, controls_ahead, http_call, opposing_roads, route_controls
+from openpilot.selfdrive.turnpilot.routing.controls import (LocateCache, Opposing, actor_call, controls_ahead, http_call, opposing_roads,
+                                                            route_controls)
 
 # tools/turnpilot/install_valhalla_device.sh puts pyvalhalla here, since the system venv is read-only
 DEVICE_PYVALHALLA = '/data/turnpilot/pyvalhalla'
@@ -87,6 +88,8 @@ class ValhallaSource:
     self.actor = None
     # navd's route job and its off-route lookup run in threads of their own: one call into the actor at a time
     self.lock = threading.Lock()
+    self.cache = LocateCache()  # Q1 and Q2 for the lookups ahead, by edge id: this source's tiles only
+    self.opposing_of: tuple | None = None  # (steps, their opposing roads) from the last controls() that read them
     if self.url:
       return
     valhalla = import_valhalla()
@@ -127,21 +130,30 @@ class ValhallaSource:
       r = resp.json()
     return r['routes'][0]['legs'][0]['steps'] if len(r.get('routes', [])) else []
 
-  def controls(self, steps, tiles_dir=None, *, sidecar_dir):
+  def controls(self, steps, tiles_dir=None, *, sidecar_dir, context=None):
     """(controls, status) along the route steps (routing/controls.py). tiles_dir: the tiles' directory when their
     controls must be checked for (local tiles: the controls_built marker and the sim's sidecar), None when the tiles come
     from real OSM. sidecar_dir: where the OSM stop-sign sidecar and the tiles' stamp are (routing/osm_sidecar.py), always
-    given (sources.py), so no route goes without it unsaid."""
-    return route_controls(self._call(), steps, tiles_dir, sidecar_dir)
+    given (sources.py), so no route goes without it unsaid. context: the surveys and overrides the junctions are read
+    against (routing/junctions.py). The opposing roads are read in the same batched locate, for opposing()."""
+    out = Opposing()
+    result = route_controls(self._call(), steps, tiles_dir, sidecar_dir, opposing=out, context=context)
+    self.opposing_of = (steps, out.roads) if out.roads is not None else None
+    return result
 
   def opposing(self, steps):
-    """{step index: (m/s, lanes)} of the roads straight across the route's maneuvers (routing/controls.py: opposing_roads)."""
+    """{step index: (m/s, lanes)} of the roads straight across the route's maneuvers (routing/controls.py: opposing_roads):
+    the last controls()' for these very steps, else read alone (it didn't run its batched locate, or other steps)."""
+    done = self.opposing_of
+    if done is not None and done[0] is steps:
+      return dict(done[1])
     return opposing_roads(self._call(), steps)
 
-  def controls_ahead(self, position, heading, tiles_dir=None, *, sidecar_dir):
+  def controls_ahead(self, position, heading, tiles_dir=None, *, sidecar_dir, context=None):
     """(controls, status, road) ahead of the car at position (lat, lon) heading that way (routing/controls.py:
-    controls_ahead), each with its stop point. tiles_dir and sidecar_dir: as for controls()."""
-    return controls_ahead(self._call(), position, heading, tiles_dir, sidecar_dir)
+    controls_ahead), each with its stop point. tiles_dir, sidecar_dir and context: as for controls(); Q1 and Q2 kept in
+    this source's cache between lookups."""
+    return controls_ahead(self._call(), position, heading, tiles_dir, sidecar_dir, context=context, cache=self.cache)
 
   def _call(self):
     if self.actor is None:

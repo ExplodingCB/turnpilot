@@ -10,7 +10,8 @@ with no geofence and no download.
 The route's controls (routing/controls.py) come from the source that routed it, with the OSM stop-sign sidecar from the
 same place (routing/osm_sidecar.py): a corridor's pack directory (its osm_controls/ and the manifest's osm_timestamp), or
 the local tiles' own directory (osm_controls/ and meta.json); a valhalla_service URL has none, which is said. A sidecar is
-always expected: a missing or stale one makes the controls' status partial, out loud.
+always expected: a missing or stale one makes the controls' status partial, out loud. Their junctions are read against
+the surveys (maps/surveyed_junctions.json) and TurnPilotJunctionOverrides, read for each lookup (routing/junctions.py).
 """
 import time
 import uuid
@@ -23,7 +24,9 @@ from openpilot.selfdrive.turnpilot.maps.client import MapClient, MapError, Throt
 from openpilot.selfdrive.turnpilot.maps.coverage import CoverageCache, check_trip, no_coverage, refresh
 from openpilot.selfdrive.turnpilot.maps.geofence import Region
 from openpilot.selfdrive.turnpilot.maps.paths import maps_dir
+from openpilot.selfdrive.turnpilot.maps import surveys
 from openpilot.selfdrive.turnpilot.maps.status import NavStatus
+from openpilot.selfdrive.turnpilot.routing import junctions
 from openpilot.selfdrive.turnpilot.routing.osm_sidecar import NO_DIRECTORY
 from openpilot.selfdrive.turnpilot.routing.valhalla_source import ValhallaSource
 
@@ -89,6 +92,12 @@ class MapRouter:
   def config(self) -> tuple:
     return tuple(self.params.get(k) for k in CONFIG_KEYS)
 
+  def junction_context(self) -> junctions.Context:
+    """The surveys and the overrides param the junctions are read against, now (a param the build doesn't know is
+    unreadable: controls.py fails every junction and says partial)."""
+    overrides, ok, why = junctions.read_overrides(self.params)
+    return junctions.Context(surveys.cached(surveys.SHIPPED).entries, overrides, ok, why)
+
   def controls(self, steps) -> tuple[list, str]:
     """(controls, status) for steps, the last route this router gave (routing/controls.py), from the source that routed it:
     local tiles are checked for their controls (the controls_built marker, the sim's sidecar), a corridor from real OSM
@@ -98,7 +107,7 @@ class MapRouter:
     if served is None or served[0] is not steps:
       cloudlog.error("turnpilot: controls asked for a route this router didn't give")
       return [], 'failed'
-    return served[1].controls(steps, tiles_dir=served[2], sidecar_dir=served[3])
+    return served[1].controls(steps, tiles_dir=served[2], sidecar_dir=served[3], context=self.junction_context())
 
   def opposing(self, steps) -> dict:
     """{step index: (m/s, lanes)} of the roads straight across the route's maneuvers (routing/controls.py: opposing_roads),
@@ -124,7 +133,8 @@ class MapRouter:
     if source is None:
       cloudlog.warning("turnpilot: controls ahead asked for with no map source yet")
       return [], 'failed', []
-    return source[0].controls_ahead((position[1], position[0]), bearing, tiles_dir=source[1], sidecar_dir=source[2])
+    return source[0].controls_ahead((position[1], position[0]), bearing, tiles_dir=source[1], sidecar_dir=source[2],
+                                    context=self.junction_context())
 
   @staticmethod
   def local_served(source) -> tuple:

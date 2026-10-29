@@ -142,6 +142,48 @@ class TestValhalla(unittest.TestCase):
       self.assertEqual(path, sys.path)
 
 
+class TestValhallaJunctions(unittest.TestCase):
+  """ValhallaSource's side of the junctions (SG1b): a route's opposing roads come from its controls' one batched Q2 locate,
+  read alone only when that didn't run, and its lookups ahead keep Q1 and Q2 in the source's own LocateCache."""
+
+  def source(self):
+    from openpilot.selfdrive.turnpilot.routing.tests.test_route_controls import StubJunction, leg
+    stub = StubJunction([(0., 100., {'stop': True}), (100., 200., {}), (200., 400., {})],
+                        {100.: [leg(90.), leg(270.)], 200.: [leg(0., kph=56, **{'in': 2}), leg(90.), leg(270., exit=True)]})
+    with patch.object(valhalla_source, 'import_valhalla', return_value=None):
+      source = ValhallaSource('http://127.0.0.1:1')
+    source._call = lambda: stub
+    return source, stub
+
+  def test_the_opposing_roads_ride_in_the_controls_q2(self):
+    from openpilot.selfdrive.turnpilot.routing.tests.test_route_controls import opposing_steps
+    source, stub = self.source()
+    steps = opposing_steps()
+    controls, status = source.controls(steps, sidecar_dir=None)
+    self.assertEqual((status, [c.kind for c in controls]), ('ok', ['stop']))
+    before = len(stub.requests)
+    self.assertEqual(source.opposing(steps), {0: (56 / 3.6, 2)})
+    self.assertEqual(len(stub.requests), before)  # no third call
+    self.assertEqual(source.opposing(list(steps)), {0: (56 / 3.6, 2)})  # other steps: read alone
+    self.assertEqual(len(stub.requests), before + 1)
+    with tempfile.TemporaryDirectory() as unmarked:  # unsupported tiles: no Q2, the opposing roads read alone all the same
+      steps = opposing_steps()
+      self.assertEqual(source.controls(steps, unmarked, sidecar_dir=None), ([], 'unsupported'))
+      self.assertEqual(source.opposing(steps), {0: (56 / 3.6, 2)})
+
+  def test_lookups_ahead_keep_q1_and_q2_in_the_sources_cache(self):
+    from openpilot.selfdrive.turnpilot.routing.tests.test_route_controls import StubRoadJunction, leg, pt
+    source, _ = self.source()
+    stub = StubRoadJunction([(0., 100., {'stop': True}), (100., 400., {})], road=[(0., 100.), (100., 400.)],
+                            junctions={100.: [leg(90.), leg(270.)]})
+    source._call = lambda: stub
+    first = source.controls_ahead(pt(0.), 3., sidecar_dir=None)
+    stub.requests.clear()
+    again = source.controls_ahead(pt(4.), 3., sidecar_dir=None)
+    self.assertEqual([c.kind for c in again[0]], [c.kind for c in first[0]])
+    self.assertEqual([r for e, r in stub.requests if e == 'locate' and 'heading' not in r['locations'][0]], [])
+
+
 class FakeValhalla:
   """Stands in for ValhallaSource on a corridor or the local tiles: records what it was built on and routed."""
 
@@ -152,16 +194,18 @@ class FakeValhalla:
     if self.test.broken_tiles:
       raise RuntimeError('tiles do not load')
     # as ValhallaSource: a valhalla_service URL has no tiles directory
-    source = SimpleNamespace(tiles=tiles, calls=[], tiles_dir=None if tiles.startswith('http') else tiles, controls_calls=[])
+    source = SimpleNamespace(tiles=tiles, calls=[], tiles_dir=None if tiles.startswith('http') else tiles, controls_calls=[], contexts=[])
 
-    def controls(steps, tiles_dir=None, *, sidecar_dir):
+    def controls(steps, tiles_dir=None, *, sidecar_dir, context=None):
       source.controls_calls.append((steps, tiles_dir, sidecar_dir))
+      source.contexts.append(context)
       return [], 'ok'
 
     source.controls = controls
 
-    def controls_ahead(position, heading, tiles_dir=None, *, sidecar_dir):
+    def controls_ahead(position, heading, tiles_dir=None, *, sidecar_dir, context=None):
       source.controls_calls.append(('ahead', position, heading, tiles_dir, sidecar_dir))
+      source.contexts.append(context)
       return [], 'ok', [position, position]
 
     source.controls_ahead = controls_ahead
@@ -494,6 +538,37 @@ class TestLocalOverride(RouterCase):
     self.assertEqual(self.router.controls(steps), ([], 'ok'))
     self.assertEqual(self.built[0].controls_calls, [(steps, '/sim/tiles', '/sim/tiles')])  # the local tiles hold their sidecar
     self.assertEqual(self.router.controls(list(steps)), ([], 'failed'))
+
+  def test_the_junctions_read_the_surveys_and_the_overrides_param(self):
+    """The controls' junctions are read against surveyed_junctions.json and TurnPilotJunctionOverrides, on the route and
+    off it; a param this build doesn't know is not readable, which controls.py says (every junction failed, partial)."""
+    from openpilot.common.params import UnknownKeyName
+    from openpilot.selfdrive.turnpilot.maps import surveys
+    self.params.values['TurnPilotValhallaTiles'] = '/sim/tiles'
+    self.params.values['TurnPilotJunctionOverrides'] = [{'approach': '900:790:f', 'kind': 'no', 'evidence': 'a runner at 8 m/s'}]
+    coverage_path(self.maps).unlink()
+    entry = {'osmNodeId': 900, 'lat': 39.8, 'lon': -86.15, 'date': '2026-10-20', 'source': 'inPerson', 'confirmedBy': [],
+             'approaches': [{'wayId': 1, 'bearingDeg': 0, 'stops': True, 'plaque': True, 'postedMph': 20, 'laneEdgeM': 4.,
+                             'lineM': 7., 'nearestParkingM': {'left': 40., 'right': 40.}, 'sightM': 60.}], 'validations': []}
+    with tempfile.TemporaryDirectory() as d:
+      path = Path(d) / 'surveyed_junctions.json'
+      path.write_text(json.dumps([entry]))
+      with patch.object(surveys, 'SHIPPED', path):
+        steps = self.router.route(CHICAGO, CHICAGO, 90, 'en')
+        self.router.controls(steps)
+        self.router.controls_ahead((-87.6, 41.8), 90.)
+    for ctx in self.built[0].contexts:
+      self.assertEqual((ctx.overrides_ok, set(ctx.overrides), [e['osmNodeId'] for e in ctx.surveys]), (True, {'900:790:f'}, [900]))
+
+    def unknown(key, *args, **kwargs):
+      if key == 'TurnPilotJunctionOverrides':
+        raise UnknownKeyName(key)
+      return self.params.values.get(key)
+    with patch.object(self.params, 'get', side_effect=unknown):
+      self.router.controls(steps)
+    ctx = self.built[0].contexts[-1]
+    self.assertFalse(ctx.overrides_ok)
+    self.assertIn('unknown to this build', ctx.overrides_error)
 
   def test_controls_ahead_on_the_local_tiles_before_any_route(self):
     """Off the route before the first route is in (navd's off-route lookup), the local tiles answer: the sim's first

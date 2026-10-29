@@ -104,3 +104,11 @@ def test_matched_by_osm_node_id_never_by_a_20_m_radius(tmp_path):
   assert match(no_id, 0, node) is no_id[0]               # no id on either side: the node it is on
   assert match(no_id, 0, neighbour) is None
   assert match(no_id, 1002, node) is None                # the junction has an id: only the id matches
+
+
+def test_cached_reads_again_only_when_the_file_changes(tmp_path):
+  path = write(tmp_path, [EXAMPLE])
+  first = surveys.cached(path)
+  assert surveys.cached(path) is first and len(first.entries) == 1
+  path.write_text(json.dumps([EXAMPLE, EXAMPLE]))
+  assert len(surveys.cached(path).entries) == 2

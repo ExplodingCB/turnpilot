@@ -159,6 +159,26 @@ def load(path: Path = SHIPPED) -> Surveys:
   return out
 
 
+_cache: dict[Path, tuple[tuple, Surveys]] = {}
+
+
+def cached(path: Path = SHIPPED) -> Surveys:
+  """load(path), read again only when the file changes (navd asks every second, off the route): its errors are logged
+  once per change of the file."""
+  path = Path(path)
+  try:
+    st = path.stat()
+    stamp = (st.st_mtime_ns, st.st_size)
+  except OSError:
+    stamp = None
+  hit = _cache.get(path)
+  if hit is not None and hit[0] == stamp and stamp is not None:
+    return hit[1]
+  out = load(path)
+  _cache[path] = (stamp, out)
+  return out
+
+
 def counts(entry: dict, today: date) -> tuple[bool, str]:
   """(whether the entry counts today, why not)."""
   surveyed = parse_date(entry.get('date'))
