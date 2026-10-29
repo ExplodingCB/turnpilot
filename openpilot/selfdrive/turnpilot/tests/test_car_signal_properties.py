@@ -4,7 +4,7 @@ fed the carState blinkers the port publishes.
 
 1. A car-commanded blinker never starts a lane change: DesireHelper enters preLaneChange only toward a side whose lamp a
    driver input caused, never from a lamp a request caused, never while the hazard button is on; with no driver input it
-   never leaves off.
+   never leaves off, a wrong-side lamp put out late (WrongSideHoldBody) included.
 2. A request never outlives its want: within one stock period and a card cycle (and the release's own frames) of the
    intent ending, the port has no request out, and no request lasts past REQUEST_CAP_S.
 3. No TX alters a non-turn field: every 0x3E9 the port sends differs from the stock frame it copies only in the request,
@@ -22,7 +22,7 @@ import pytest
 
 from opendbc.car import structs
 from opendbc.car.car_signal import LEFT, NONE, REQUEST_CAP_S, RIGHT
-from opendbc.car.tesla.body_model import SEMANTICS, BodyModel
+from opendbc.car.tesla.body_model import SEMANTICS, BodyModel, WrongSideHoldBody
 from opendbc.car.tesla.car_signal import REQ_CANCEL, TeslaCarSignal
 from opendbc.car.tesla.teslacan import body_controls_request
 from opendbc.car.tesla.tests.panda_gate import PortHarness
@@ -50,11 +50,12 @@ def new_port():
 class World:
   """Card, the panda and the car around the port, a DesireHelper on the published blinkers, and a driver."""
 
-  def __init__(self, seed: int, semantics: str | None = None, driver: bool = True):
+  def __init__(self, seed: int, semantics: str | None = None, driver: bool = True, body: BodyModel | None = None):
     self.rng = rng = random.Random(seed)
-    self.semantics = semantics or rng.choice(SEMANTICS)
-    body = BodyModel(semantics=self.semantics, on_latency=rng.uniform(0.02, 0.9), rng=rng, glitch_rate=rng.choice((0., 0.01)),
-                     early_rate=rng.choice((38 / 2717, 0.05)), on_bits=rng.choice(('driver', 'any')))
+    self.semantics = semantics or (body.semantics if body is not None else rng.choice(SEMANTICS))
+    if body is None:
+      body = BodyModel(semantics=self.semantics, on_latency=rng.uniform(0.02, 0.9), rng=rng, glitch_rate=rng.choice((0., 0.01)),
+                       early_rate=rng.choice((38 / 2717, 0.05)), on_bits=rng.choice(('driver', 'any')))
     self.h = PortHarness(new_port(), body=body, rng=rng)
     self.h.engaged = True
     self.dh = DesireHelper()
@@ -177,6 +178,29 @@ def test_no_driver_input_no_lane_change(seed):
     if rng.random() < 0.1:
       w.restart_card()
   assert not w.pre_entries and w.dh.lane_change_state == LaneChangeState.off, (w.semantics, w.pre_entries[:3])
+
+
+@pytest.mark.parametrize("none_delay", [None, 1.2, 5.])
+@pytest.mark.parametrize("seed", range(4))
+def test_wrong_side_lamp_put_out_late_never_starts_a_lane_change(seed, none_delay):
+  """Property 1 on an intermittent wrong side (the case the wrongSide fault exists for; the lamp check fails a body that
+  always does it) whose lamp outlasts our side's mask: NONE ignored, or obeyed 1.2 s (inside the check's own NONE_OFF_S)
+  or 5 s late. At 25 m/s with a hand resting on the wheel, no blinker is published and DesireHelper never leaves off."""
+  body = WrongSideHoldBody(none_delay, rng=random.Random(seed + 1000), on_latency=0.2, glitch_rate=0., early_rate=0.)
+  w = World(seed, driver=False, body=body)
+  w.v = 25.
+  w.run(1.)
+  w.h.want = LEFT  # a turn signal for a left turn ahead
+  for _ in range(250):
+    w.step()
+    if w.h.port.fault != 'none':
+      break
+  w.h.want = NONE  # the intent drops it with the fault
+  w.run(8.)
+  assert w.h.port.fault == 'wrongSide'
+  leaks = [(round(t, 2), left, right) for t, left, right in w.h.blinkers if left or right]
+  assert not leaks, f"our wrong-side lamp published as the driver's: {leaks[:3]}, {len(leaks)} cycles"
+  assert not w.pre_entries and w.dh.lane_change_state == LaneChangeState.off, w.pre_entries[:3]
 
 
 @pytest.mark.parametrize("seed", range(12))
