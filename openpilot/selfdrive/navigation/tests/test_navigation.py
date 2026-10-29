@@ -17,6 +17,7 @@ import requests
 import openpilot.cereal.messaging as messaging
 from openpilot.common.prefix import OpenpilotPrefix
 from openpilot.selfdrive.navigation.mapsd import MapsD
+from openpilot.selfdrive.turnpilot.routing import certify
 from openpilot.selfdrive.navigation.navd import RECOMPUTE_HOLD, REROUTE_COUNTER_MIN, ROUTE_RESEND_PERIOD, RouteEngine, set_banner
 from openpilot.selfdrive.navigation.pmtiles import PMTiles, decode_directory, tile_id
 from openpilot.selfdrive.navigation.renderer import MAJOR, MEDIUM, MINOR, SIZE, STREET, TRACK, MapRenderer, draw_segments, mercator, project, stroke_widths
@@ -599,6 +600,9 @@ class TestRouteEngine(unittest.TestCase):
     self.load_route()
     msg = messaging.new_message('turnpilotPlan')
     self.plan = msg.turnpilotPlan
+    # turnpilotd's runtime inputs ride on every plan (SG4a, STOP_SIGNS.md 3.2): the mode the param says (on a device manager
+    # writes TurnPilotStopSignGo's default, so navd and turnpilotd read the same) and the side views off: nothing re-runs
+    self.plan.stopGo.mode = certify.stop_sign_mode(self.engine.params)
     gps = self.sm.__getitem__.return_value
     self.sm.data = {'turnpilotPlan': None}
     self.sm.updated = {'turnpilotPlan': True}

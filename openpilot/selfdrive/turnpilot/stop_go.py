@@ -125,6 +125,7 @@ MOTOR = ('car', 'truck', 'bus', 'motorcycle')
 CYCLISTS = ('cyclist', 'bicycle')
 PERSON = 'pedestrian'
 SIDE_LIVE = ('running', 'noRoom')  # sideViewStatus with the side views run (the speed gate's)
+SIDE_OFF = ('unset', 'off', 'disabled')  # sideViewStatus with no side views for the drive (navd's runtime input, side_views_live)
 SIDE_VIEWS = ('sideLeft', 'sideRight')
 FORWARD = ('road', 'full')
 WAITING = ('stopped', 'rollUp', 'observe')
@@ -255,6 +256,12 @@ def capped_abort(v: float, d_remaining: float, reason: str) -> Stop:
 def hold_here(v: float, reason: str) -> Stop:
   """A hold on a standing car: scene_policy.stop(confirmed=False) at its own position (shouldStop, a speed cap of 0)."""
   return stop(v, 0., reason, confirmed=False)
+
+
+def side_views_live(status: str) -> bool:
+  """turnpilotPlan.stopGo.sideViewsLive, navd's runtime input (STOP_SIGNS.md 3.2): the side views there for the drive, whatever
+  the sweep and the speed gate are doing; navd re-runs its avoidance when it changes, so never a per-stop cycle."""
+  return status not in SIDE_OFF
 
 
 def mode_for(value) -> tuple[str, bool]:

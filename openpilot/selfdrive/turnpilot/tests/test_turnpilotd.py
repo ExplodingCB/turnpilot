@@ -1446,17 +1446,26 @@ def stop_at(sim, s_line, limit=60.):
   return sim.step()
 
 
-def test_stop_sign_on_the_route_stops_and_hands_back():
+@pytest.mark.parametrize("mode, reason, fault", [
+  ('shadow', "Stop sign: take control to proceed", 'H6'),  # STOP_SIGNS.md H6: shadow and off keep today's handback
+  ('off', "Stop sign: take control to proceed", 'H6'),
+  # auto with the shipped visibility.json (no camera measurements yet): the decider can't certify a go, so it is the
+  # same 1 s handback, saying why (STOP_SIGNS.md H4); the go itself is test_turnpilotd_stop.py's
+  ('auto', "Stop-sign go off: no camera measurements", 'H4'),
+])
+def test_stop_sign_on_the_route_stops_and_hands_back(mode, reason, fault):
   sim = Sim([(1000., "turn", "right"), (2000., "turn", "left")], controls=[(200., 'stop')])
   sim.go_taps = False
+  sim.tp.stop_sign_mode = mode
   plan = stop_at(sim, 200.)
   assert -2. < 200. - sim.s < 5.
   assert plan.shouldStop and plan.state == State.holding and plan.reason == "Stopped at stop sign"
   assert plan.mapControl.kind == 'stop' and str(plan.mapControl.action) == 'held' and plan.mapControl.controlsStatus == 'ok'
   sim.run(1.5)
   plan = sim.trace[-1][2]
-  assert plan.controlPrompt == 'stopSignTakeControl' and plan.reason == "Stop sign: take control to proceed"
+  assert plan.controlPrompt == 'stopSignTakeControl' and plan.reason == reason
   assert str(plan.mapControl.action) == 'awaitingDriver'
+  assert str(plan.stopGo.mode) == mode and plan.stopGo.fault == fault and not plan.stopGo.wouldGo
   held_s = sim.s
   sim.run(20.)
   assert sim.s - held_s < 0.05 and sim.trace[-1][2].shouldStop
