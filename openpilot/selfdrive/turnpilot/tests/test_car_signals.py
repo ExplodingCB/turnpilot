@@ -267,6 +267,37 @@ def test_lamp_lost_vetoes():
   assert drive.step().skip == 'signalLost'
 
 
+@pytest.mark.parametrize("hazard,veto", [(False, 'driverSignal'), (True, 'hazards')])
+def test_wrong_side_with_the_other_lamp_lit_vetoes(hazard, veto):
+  """The port faults wrongSide when the side it didn't ask for lights in the request's first second: ours on the wrong
+  side (it may stay lit) or the driver's press the other way (DESIGN 5.2 rule 3). Either way the car never turns with the
+  other side lit: a veto, as lampLost is (7.6)."""
+  drive = Drive(distance=60.)
+  drive.step()
+  drive.status, drive.port = Status.failed, port(status='failed', fault='wrongSide', hazard=hazard)
+  out = drive.step(right_lamp=True, left_lamp=hazard)
+  assert out.skip == veto and out.prompt == LaneChange.none
+  # lit on and on, still a veto: a skip latches on its first frame in turnpilotd, and a turn armed under it is vetoed too
+  assert drive.step(right_lamp=True, left_lamp=hazard).skip == veto
+
+
+def test_wrong_side_with_the_other_lamp_out_leaves_the_turn_to_the_prompt():
+  drive = Drive(distance=60., v=5.)
+  drive.step()
+  drive.status, drive.port = Status.failed, port(status='failed', fault='wrongSide')
+  out = drive.step()
+  assert out.skip == 'none' and out.prompt == LaneChange.left
+
+
+def test_wrong_side_after_the_turn_starts_is_said():
+  drive = Drive(distance=30.)
+  drive.step()
+  drive.d = desires(started=True)
+  drive.status, drive.port = Status.failed, port(status='failed', fault='wrongSide')
+  out = drive.step(right_lamp=True)
+  assert out.skip == 'none' and out.notice == 'changedMidTurn'
+
+
 def test_veto_at_the_left_line_hands_back():
   drive = Drive(distance=10.)
   drive.step()

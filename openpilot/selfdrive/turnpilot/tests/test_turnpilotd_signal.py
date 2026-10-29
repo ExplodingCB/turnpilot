@@ -90,6 +90,28 @@ def test_hazards_skip_the_turn_and_say_why():
   assert any(str(p.turnSignal.skip) == 'hazards' for p in plans)
 
 
+def test_a_lamp_lit_on_the_other_side_with_wrong_side_skips_the_turn():
+  """The left lamp lights in the right request's first second: the port faults wrongSide and releases with NONE, the lamp
+  still lit (ours, the body obeying NONE late or never, or the driver's press the other way). TurnPilot never turns right
+  with it lit: the turn is skipped out loud (driverSignal) and rerouted, never left to the "Signal Right" prompt."""
+  sim = signal_sim()
+  state = {'wrong': False}
+
+  def port(s):
+    if state['wrong']:
+      return {'status': 'failed', 'fault': 'wrongSide', 'leftLamp': True}
+    side = s.tp.signal_out.side
+    return {'status': 'requesting' if side == LaneChange.right else 'ready', 'right': side == LaneChange.right}
+  sim.car_signal = port
+  plans = drive_to(sim, 110.)
+  assert plans[-1].turnSignal.side == LaneChange.right
+  state['wrong'] = True
+  plans = drive_to(sim, -20.)
+  assert plans[0].tooFastToTurn and str(plans[0].turnSignal.skip) == 'driverSignal'
+  assert not any(p.desire == Desire.turnRight for p in plans), "TurnPilot turned right with the left lamp lit"
+  assert not any(p.turnSignal.prompt != LaneChange.none for p in plans)
+
+
 def test_a_turn_whose_bearings_disagree_is_skipped():
   # navd says right, the junction's bearings turn left by 90: the side the car would steer and signal is in doubt
   sim = signal_sim(maneuvers=[(400., "turn", "right", junction_of("left")), (2000., "turn", "left", junction_of("left"))],

@@ -19,7 +19,9 @@ or more; a turn the maneuver ended (done, skipped, passed, missed) never does.
 With the car signalling, the driver overrules it before the turn starts, or while a hold has the car standing short of
 TURN_STARTED_DEG into it (their lamp on the other side, hazards, or our lamp put out): the turn is skipped out loud and
 navd reroutes, except at the unprotected left's hold line, where the left hands back (a skip there would let go of the
-car in a left-turn position). Once the turn has started it finishes, said ("Turn Signal Changed").
+car in a left-turn position). Once the turn has started it finishes, said ("Turn Signal Changed"). A wrongSide fault
+with the other side's lamp lit (ours on the wrong side, or the driver's) is a veto too: the car never turns with the
+other side lit.
 """
 import datetime
 import json
@@ -461,6 +463,10 @@ class TurnSignalIntent:
         return 'driverSignal'
     if fault == 'lampLost' and self.prev_status == Status.ready and status == Status.failed:
       return 'signalLost'  # our lamp put out: how a driver's touch of the stalk looks (the skip latches on this frame)
+    if fault == 'wrongSide' and status == Status.failed and lamps[other_side(side)]:
+      # the other side lit in the request's first second: ours on the wrong side, which may stay lit, or the driver's
+      # press the other way (DESIGN 5.2 rule 3). Either way the car never turns with the other side lit (7.6)
+      return 'hazards' if port.hazard else 'driverSignal'
     return ''
 
 
