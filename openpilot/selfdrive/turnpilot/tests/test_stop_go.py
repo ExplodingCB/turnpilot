@@ -455,3 +455,220 @@ def test_property_every_held_state_has_a_reason_and_a_bound_or_a_dynamic_cause(t
         assert fault <= max(FAULT_GRACE_S, FRONT_ZONE_MAX_S) + DT_MDL + 1e-6
       if d.state == 'ladder':
         assert d.prompt == 'stopSignTakeControl' and d.fault
+
+
+# ----------------------------------------------------------------------------------------------- scripted cross traffic
+
+LINE_D = 9.3  # m down its lane a cross car's box centre sits when its front is at its line (test_certify's lineM 7 + 2.3)
+
+
+def at_line(t0=-10., t_stop=None, d0=30., v0=6.):
+  """d(t) of a car that drives in at v0 from d0 and stops at its line (braking to it), there from t_stop on (or as it gets
+  there); before t0 it isn't there."""
+  def d(t):
+    if t < t0:
+      return None
+    if t_stop is not None and t >= t_stop:
+      return LINE_D
+    return max(d0 - v0 * (t - t0), LINE_D)
+  return d
+
+
+def rolling(t0, d0=40., v0=10., a=0.):
+  """d(t) of a car that doesn't stop: from d0 at v0 (slowing at a, never below 2 m/s), through our path and on."""
+  def d(t):
+    if t < t0:
+      return None
+    tt = t - t0
+    if a > 0.:
+      tb = max(v0 - 2., 0.) / a
+      gone = v0 * min(tt, tb) - 0.5 * a * min(tt, tb) ** 2 + 2. * max(tt - tb, 0.)
+    else:
+      gone = v0 * tt
+    return d0 - gone
+  return d
+
+
+def cars(*specs):
+  """World.tracks for scripted cars: (trackId, role, d(t) [, cls]), each seen from where our car is now on its side view."""
+  def tracks(w):
+    t = w.t_cam - 100.
+    pos = w.sg.pos_ref + (w.odo - w.sg.odo_ref) if w.sg.token is not None else -w.control.d
+    out = []
+    for spec in specs:
+      tid, role, d_fn = spec[:3]
+      cls = spec[3] if len(spec) > 3 else 2
+      dd = d_fn(t)
+      if dd is None or dd < -12.:
+        continue
+      ln = lanes_of(w.j)[role]
+      s = (ln.s_min + ln.s_max) / 2. - pos
+      view = 'sideLeft' if role == 'left' else 'sideRight' if role == 'right' else 'road'
+      trk = ev_track(tid, w.t_cam, max(dd, 0.3), ln, view=view, cls=cls, s=s)
+      half = math.degrees(math.atan2(0.9, math.hypot(s, dd)))
+      trk.span_seen = tuple(sorted((trk.bearing_seen - half, trk.bearing_seen + half)))
+      trk.hits = 5
+      out.append(trk)
+    return out
+  return tracks
+
+
+def person(tid, x, y, vx=0., vy=0.):
+  return SimpleNamespace(trackId=tid, cls='pedestrian', x=x, y=y, vx=vx, vy=vy)
+
+
+def vehicle(tid, x, y, vx=0., vy=0., cls='car'):
+  return SimpleNamespace(trackId=tid, cls=cls, x=x, y=y, vx=vx, vy=vy)
+
+
+def go_index(w, seconds):
+  out = w.run(seconds)
+  return first_go(out), out
+
+
+# ------------------------------------------------------------------------------------------------- cross-cutting (8.1)
+
+def test_detector_gap_a_half_second_hole_restarts_clear_s_and_two_seconds_pauses_then_h1(tmp_path):
+  # a 0.5 s hole in the right side view during CLEAR_S restarts the timer (DET_FRESH_S on camera time)
+  w = World(tmp_path)
+  w.run(2.0)  # the dwell, and a second of clear
+  assert w.trace[-1].clear_s > 0.5
+  idle = w.side
+  base = w.k
+  out = []
+  for _ in range(round(0.6 / DT_MDL)):
+    if CYCLE[w.k % 4] == 'sideRight':
+      w.k += 1  # its run dropped
+    out.append(w.step())
+  assert any(d.clear_s == 0. and any(h.key == 'stale' for h in d.holds) for d in out)
+  i, rest = go_index(w, 3.)
+  assert i is not None and (i + 1) * DT_MDL >= sr.CLEAR_S - 1e-6
+  # a 2.0 s hole while stopped: the camera paused (cameraPaused, held), and H1 FAULT_GRACE_S later
+  w = World(tmp_path)
+  w.run(1.5)
+  out = []
+  for _ in range(round(13. / DT_MDL)):
+    if CYCLE[w.k % 4] == 'sideRight':
+      w.k += 1
+    out.append(w.step())
+  paused = [k for k, d in enumerate(out) if d.alert == 'cameraPaused']
+  assert paused and abs(paused[0] * DT_MDL - 2.0) < 0.3
+  h1 = next(k for k, d in enumerate(out) if d.fault == 'H1')
+  assert abs((h1 - paused[0]) * DT_MDL - 10.) < 0.2
+  assert out[h1].prompt == 'stopSignTakeControl' and out[h1].reason == "Cross-traffic camera unavailable: take control"
+  assert all(d.go_cause == 'none' for d in out) and idle == 'running' and base >= 0
+
+
+def test_untrusted_tracks_a_cross_car_seen_0_8_s_is_never_stopping(tmp_path):
+  # a car first seen 0.8 s ago on a stopping approach, whatever it reads (even standing far out), is tested at v_c and is
+  # never stopping: the go waits for its trust
+  for d_fn in (lambda t: 40., rolling(0., d0=40., v0=1.)):
+    w = World(tmp_path)
+    w.run(1.2)
+    t_seen = w.t_cam - 100.
+    w.tracks = cars((7, 'left', lambda t, f=d_fn, t0=t_seen: f(t - t0) if t >= t0 else None))
+    out = w.run(0.8)
+    e = w.sg.ev[7]
+    assert not e.v_trusted and e.u2 == 'notStopping'
+    assert any(h.key == 'u2:7' for h in out[-1].holds) and out[-1].clear_s == 0.
+
+
+def test_raw_boxes_block_never_brake_become_occluders_when_steady_and_block_near_the_horizon(tmp_path):
+  # a 0.36 box in the near lane band, never a track, holds the go and never brakes
+  w = World(tmp_path)
+  w.run(1.2)  # stopped, looking
+  w.boxes = lambda ww: lane_box(ww, 'left', 20., conf=0.36, views=('full',))
+  out = w.run(6.)
+  assert first_go(out) is None and any(h.key.startswith('raw:left') for h in out[round(0.3 / DT_MDL)].holds)
+  assert all(s.accel_cap >= -2. and s.speed_cap >= 0. for d in out for s in d.stops)
+  # the same box held still 1.0 s is an occluder: no more a blocker (it caps the lane's reach instead)
+  steady = [d for d in out[round(1.5 / DT_MDL):] if not any(h.key.startswith('raw:') for h in d.holds)]
+  assert steady and any(h.key.startswith('reach:left') for h in steady[-1].holds)
+  # a box near the horizon on a conflicting side, outside every nominal band, still blocks
+  w = World(tmp_path)
+  far = dataclasses.replace(raw_box(70., conf=0.4, xy=(25., 68.7), view='sideLeft'), cls='car')
+  flick = {'v': 0}
+
+  def boxes(ww):
+    flick['v'] += 1
+    return {'sideLeft': [dataclasses.replace(far, bearing_deg=70. + 0.6 * (flick['v'] % 3), span_deg=(69. + 0.6 * (flick['v'] % 3), 71.))]}
+  w.boxes = boxes
+  out = w.run(5.)
+  assert first_go(out) is None and any(h.key.startswith('raw:left') for h in out[-1].holds)
+
+
+def test_takeover_a_model_that_holds_is_withdrawn_short_of_the_gate_retried_twice_then_h5(tmp_path):
+  w = Drive(tmp_path, behaviour=lambda w: 'holds')
+  out = w.run(40.)
+  gos = [k for k, d in enumerate(out) if d.go_cause == 'stopSign']
+  withdrawn = [d for d in out if d.withdraw and d.withdraw not in ('fault',)]
+  assert len(gos) == 3 and len(withdrawn) == 3  # the go and two retries
+  assert all(d.withdraw in ('window', 'gate') for d in withdrawn)
+  h5 = next(d for d in out if d.fault == 'H5')
+  assert h5.prompt == 'stopSignTakeControl' and h5.reason == "Can't start: take control"
+  pos = w.sg.pos_ref + (w.odo - w.sg.odo_ref)
+  assert pos < w.sg.edges.d_min and out[-1].state == 'ladder' and any(s.should_stop for s in out[-1].stops)
+  # each retry only after CLEAR_S of the go conditions again, standing
+  for a, b in zip(gos, gos[1:], strict=False):
+    assert (b - a) * DT_MDL >= sr.CLEAR_S
+
+
+def test_takeover_a_model_that_drives_ends_the_lift_when_the_predicate_held_0_3_s(tmp_path):
+  w = Drive(tmp_path, behaviour=lambda w: 'goes')
+  out = w.run(10.)
+  i = first_go(out)
+  assert i is not None and w.gc.end in ('takeover', 'speed') and w.gc.taken_over
+  taken = next(d for d in out[i:] if d.takeover_s >= 0.)
+  assert 0.3 - 1e-6 <= taken.takeover_s <= 3.
+  assert any(d.state in ('committed', 'inLane', 'done') for d in out[i:]) and not any(d.withdraw for d in out)
+
+
+def test_band_a_model_that_stops_in_the_band_uncommits_never_clear_box_and_goes_again_only_after_clear_s(tmp_path):
+  w = Drive(tmp_path, behaviour=lambda w: 'stops')
+  out = w.run(20.)
+  states = [d.state for d in out]
+  assert 'committed' in states
+  unc = next(k for k, d in enumerate(out) if d.state == 'observe' and k > states.index('committed'))
+  assert all(d.go_cause != 'clearBox' for d in out)
+  pos_unc = out[unc].position_m
+  assert w.sg.edges.d_min - 3. < pos_unc < w.sg.edges.d_max + 1e-6
+  again = [k for k, d in enumerate(out) if d.go_cause == 'stopSign' and k > unc]
+  if again:
+    assert (again[0] - unc) * DT_MDL >= sr.CLEAR_S - 1e-6
+
+
+def test_launch_geometry_reach_shrinking_with_our_own_motion_never_withdraws_a_box_appearing_does(tmp_path):
+  # D13: the near lane's frame-edge reach falls as the car moves on, nothing new in it: the go isn't withdrawn (reach is
+  # walked on the go position's geometry); a raw box appearing in a lane during the launch withdraws it
+  w = Drive(tmp_path, behaviour=lambda w: 'goes')
+  out = w.run(10.)
+  assert first_go(out) is not None and not any(d.withdraw for d in out) and any(d.state == 'committed' for d in out)
+  w = Drive(tmp_path, behaviour=lambda w: 'goes')
+  out = w.run(3.2)
+  i = first_go(out)
+  assert i is not None
+  w.boxes = lambda ww: lane_box(ww, 'right', 20., views=('full', 'road'))
+  out = w.run(2.)
+  assert any(d.withdraw.startswith('raw:right') for d in out)
+
+
+def test_signal_head_on_3_of_5_forward_runs_makes_the_junction_uncertifiable_and_writes_the_override(tmp_path):
+  w = World(tmp_path)
+  seen = []
+  w.sg.on_signal_seen = seen.append
+  lights = [(5., 12., 0.6)]  # bearing, elevation above the horizon, conf: a head over the junction
+  n = {'k': 0}
+
+  def frame_lights(d):
+    for key, _t, raw, _s in d.runs:
+      if key in ('road', 'full'):
+        n['k'] += 1
+        raw.lights = lights if n['k'] % 5 in (1, 2, 3) else []
+  out = []
+  for _ in range(round(6. / DT_MDL)):
+    f = w.frame()
+    frame_lights(f)
+    out.append(w.sg.update(f))
+    w.trace.append(out[-1])
+  assert first_go(out) is None and seen and w.sg.signal_seen
+  assert any(h.key == 'signal' and h.kind == 'static' for h in out[-1].holds)
