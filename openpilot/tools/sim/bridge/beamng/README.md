@@ -322,14 +322,21 @@ A go the model never takes over is withdrawn at its 3 s and handed back (`cantSt
 m/s^2 and held): with a model that holds, the car ends about 3.0 m past its line. A go the car doesn't move on within 2.0 s
 (1.0 s for the left) is withdrawn as before. With an actuator lag over about 0.4 s the lift doesn't reach 0.3 m/s inside
 the left's 1.0 s, so the left's go is withdrawn and handed back; measure the lag (`carState.aEgo` behind
-`carControl.actuators.accel`) before relying on it.
+`carControl.actuators.accel`) before relying on it. That is the total from turnpilotd's go to the wheels: the plan's hop to
+plannerd and controlsd and the CAN frame add about 0.1-0.15 s on the car to the actuator's own lag.
+
+The left's go is lifted only from its line (4.5 m or more short of the oncoming lanes: the nudge, its stop and 1.5 m), never
+from a creep, and it is followed into the oncoming lanes only by a launch: a car under 2.0 m/s with 1.5 m left to stop short
+of them is withdrawn and handed back (`turnpilot.left_not_launched`). A model that only keeps the speed the lift gave it
+satisfies the takeover predicate, and would otherwise coast across at under 1 m/s.
 
 | param | values | default |
 | --- | --- | --- |
 | `TurnPilotGoOverride` | BOOL: TurnPilot's go certified for the planner's lift | `1` (on); a build that doesn't know the key is on |
 
 The planner logs `longitudinalPlan.turnpilotGoLift` (lifted this frame) and `turnpilotGoEnd` (why the last lift ended:
-`window`, `takeover`, `speed`, `driver`, `lead`, `holder`, `modelBrake`, `withdrawn`, `replaced`), and cloudlog events
+`window`, `takeover`, `speed`, `driver`, `lead`, `holder`, `modelBrake`, `withdrawn`, `replaced`; it keeps the last go's
+reason until the next go starts), and cloudlog events
 `turnpilot.go_lift` and `turnpilot.go_lift_end`. turnpilotd logs `turnpilot.go_certified`, `turnpilot.go_not_certified`
 (with why), `turnpilot.go_end` and `turnpilot.go_not_moving`.
 

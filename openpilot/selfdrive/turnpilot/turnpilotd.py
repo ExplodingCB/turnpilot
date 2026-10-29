@@ -93,7 +93,10 @@ GO_CLEAR_M, or a road user is in the path within it (path_blocker: a track, or a
 coming during the go, TurnPilot handing back, or the left withdrawing its own go withdraws it that frame (withdraw_go), and
 it ends on its own at GO_WINDOW_S, GO_END_SPEED or the model's takeover (go_override.GoCertifier). plannerd then lifts the
 model's hold, +0.5 m/s^2 at most, while the model alone holds the car. Uncertified (the param off, a blocker), the go is
-as before: the model pulls away, or the no-move handback below comes.
+as before: the model pulls away, or the no-move handback below comes. The left's go is lifted only from LEFT_LIFT_ROOM_M or
+more short of the oncoming lanes (its line, not a creep), and is followed into them only by a launch (left_launch): short of
+LEFT_LAUNCH_SPEED with LEFT_LAUNCH_ROOM_M left to stop short of them, it is withdrawn and handed back, never a coast across
+them on the lift's speed.
 Standing engaged with nothing of TurnPilot's holding the car (no shouldStop, no cap biting), no lead from the model within
 STOPPED_LEAD_M (one further on doesn't hold a standing car), gas and brake off, the model stopped on its own: said on the
 status line after STOPPED_NOTE_S (STOPPED_NOTE), and handed back loudly (controlPrompt carStoppedTakeControl) after
@@ -124,7 +127,7 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.selfdrive.turnpilot.desire_timing import ENTRY_M, TURN_STARTED_DEG, DesireTiming
 from openpilot.selfdrive.turnpilot.control_text import STOPPED_NOTE
-from openpilot.selfdrive.turnpilot.go_override import GO_CLEAR_M, GoCertifier
+from openpilot.selfdrive.turnpilot.go_override import GO_ACCEL, GO_CLEAR_M, GO_WINDOW_S, GoCertifier
 from openpilot.selfdrive.turnpilot.handback import Handback
 from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, CLEAR_DESIRE, CONTROL_STATUS_ALERTS, TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.detector.light_state import LIGHT_MODE_DEFAULT, camera_lights_mode
@@ -136,7 +139,8 @@ from openpilot.selfdrive.turnpilot.lane_planner import (OPENPILOT_SIGNALS_BRANDS
 from openpilot.selfdrive.turnpilot.route_follower import KEEP, LEFT, TURN, UNCERTAIN_M, RouteFollower
 from openpilot.selfdrive.turnpilot.scene.lane_paint import lane_paint_from_msg
 from openpilot.selfdrive.turnpilot.scene.tracker import STALE_S, SceneTracker, default_yaw_rate
-from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, NO_ACCEL_CAP, PATH_HALF_WIDTH_M, STOP_DECEL, ScenePolicy, in_path
+from openpilot.selfdrive.turnpilot.scene_policy import (HOLD_LINE_M, NO_ACCEL_CAP, ONCOMING_ENTRY_M, PATH_HALF_WIDTH_M, STOP_DECEL, ScenePolicy,
+                                                         in_path)
 from openpilot.selfdrive.turnpilot.turn_skip import TurnSkip, can_make_turn
 from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
 from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, OFF, ROAD_RANGE_M, LeftInput, UnprotectedLeft,
@@ -220,6 +224,16 @@ YAW_MIN_SPEED = STANDSTILL_SPEED
 # phase 4 decision 1, G5). On by default: the autonomous left and the stop sign's go depend on it (Kellen, 2026-10-28)
 GO_OVERRIDE_DEFAULT = True
 LEFT_GO_STATES = ('go', 'committed')  # the unprotected left's states its certified go stays out in
+# the unprotected left's go is followed into the oncoming lanes only by a launch: its clear time (unprotected_left.t_req) is
+# for its 1.5 m/s^2 launch, and a model that 'takes over' at the speed the lift gave it (0.8 m/s) would coast 10 s across
+# them. Short of LEFT_LAUNCH_SPEED while the car can still stop LEFT_LAUNCH_ROOM_M short of them (at STOP_DECEL), the go is
+# withdrawn and handed back. A car on the left's own launch reaches that point at 2.3 m/s; one launching at 1.0 m/s^2 at 2.05.
+# Checked (and the lift certified for the left) only for a go with LEFT_LIFT_ROOM_M or more to the oncoming lanes: the lift's
+# whole nudge (2.25 m, to 1.5 m/s), its stop at STOP_DECEL and LEFT_LAUNCH_ROOM_M, so the lift alone never carries the car
+# past where it can stop short of them. A go nearer (crept for a view: ONCOMING_ENTRY_M + 1 m) gets no lift, and is G4's go
+LEFT_LAUNCH_SPEED = 2.
+LEFT_LAUNCH_ROOM_M = 1.5
+LEFT_LIFT_ROOM_M = 0.5 * GO_ACCEL * GO_WINDOW_S ** 2 + (GO_ACCEL * GO_WINDOW_S) ** 2 / (2. * STOP_DECEL) + LEFT_LAUNCH_ROOM_M
 
 
 def path_blocker(objects, raw, limit_m: float = GO_CLEAR_M) -> str:
@@ -331,6 +345,7 @@ class TurnPilot:
       self.go_lifted = False               # ...certified for plannerd's lift (certify_go)
       self.go_cert_id: int | None = None   # ...as this go (GoCertifier.id)
       self.go_moved = False                # ...and the car has rolled since (no_move)
+      self.left_launch_armed = False       # ...an unprotected left's, checked for its launch until its commit (left_launch)
       self.approach_yaw_deg = 0.           # the car's heading change toward the route's turn since its first pulse (track_yaw)
       self._yaw_id: int | None = None      # ...for this maneuver
     else:
@@ -553,7 +568,7 @@ class TurnPilot:
     # the certified go out, a frame on (its window, the model's takeover), and withdrawn the frame what it rests on goes
     self.go_cert.update(model, v_ego, DT_MDL)
     self.withdraw_go(sm, cs, acting, available, objects, raw, decision, took_over)
-    withdrawn = self.no_move(sm, cs, v_ego, acting, decision)
+    withdrawn = self.no_move(sm, cs, v_ego, acting, decision) or self.left_launch(sm, rf, v_ego)
     if withdrawn:
       self.go_cert.withdraw('noMove')
     self.release_go = self.release_go and not withdrawn  # handed back: a hold that comes and goes is no new go
@@ -777,6 +792,8 @@ class TurnPilot:
     self.no_move_limit, self.go_withdrawn = (LEFT_NO_MOVE_S if left else self.no_move_s), False
     self.go_wait_s = 0. if at_line else None  # in the junction: never withdrawn, the stall's handback covers it
     self.go_moved = False
+    # the left's go from its line followed into the oncoming lanes only by a launch (left_launch)
+    self.left_launch_armed = left and at_line and distance - ONCOMING_ENTRY_M >= LEFT_LIFT_ROOM_M
     cloudlog.event("turnpilot.post_go", profile=name, unprotected=left, turned_deg=round(turned_deg, 1), distance=round(distance, 1),
                    at_line=at_line)
 
@@ -802,6 +819,8 @@ class TurnPilot:
     self.go_lifted = False
     cause = 'unprotectedLeft' if self.left_now is not None and self.left_now.go else 'turnRelease'
     why = 'param' if not self.go_override else self.go_blocked(sm, cs, available, objects, raw, decision, took_over)
+    if not why and cause == 'unprotectedLeft' and distance - ONCOMING_ENTRY_M < LEFT_LIFT_ROOM_M:
+      why = 'room'  # nearer the oncoming lanes than the lift's nudge and its stop: never lifted into them (LEFT_LIFT_ROOM_M)
     if why:
       cloudlog.event("turnpilot.go_not_certified", cause=cause, why=why, blocker=path_blocker(objects, raw) if why == 'inPath' else '',
                      distance=round(distance, 1))
@@ -866,6 +885,28 @@ class TurnPilot:
     cloudlog.event("turnpilot.go_not_moving", error=True, stood_s=round(self.go_wait_s, 1), limit_s=self.no_move_limit,
                    turned_deg=round(turned, 1), lifted=self.go_lifted, moved=self.go_moved, window_out=window_out, v=round(v_ego, 2))
     self.go_withdrawn, self.go_wait_s = True, None
+    return True
+
+  def left_launch(self, sm, rf, v_ego: float) -> bool:
+    """The unprotected left's go from its line (LEFT_LIFT_ROOM_M or more out) withdrawn (handed back, held: no_move's
+    withdrawal) when the car rolls toward the oncoming lanes short of LEFT_LAUNCH_SPEED with only LEFT_LAUNCH_ROOM_M left to
+    stop short of them (ONCOMING_ENTRY_M, at STOP_DECEL): its clear time was certified for its own launch, not a coast on the
+    lift's speed (module constants). Checked from its go until the left commits or withdraws its go; never once committed (a
+    committed turn is never cancelled)."""
+    if not self.left_launch_armed or self.go_withdrawn:
+      return False
+    left = self.left_now
+    if not sm['carControl'].enabled or left is None or left.state != 'go':  # the driver, its commit, or its own withdrawal
+      self.left_launch_armed = False
+      return False
+    room = rf.distance - ONCOMING_ENTRY_M - v_ego ** 2 / (2. * STOP_DECEL)
+    # room under 0: a reading nearer than the car is (the follower), which the left commits on (unprotected_left: past), never
+    # a stop in the lanes the reading puts it in
+    if v_ego < STANDSTILL_SPEED or not 0. <= room < LEFT_LAUNCH_ROOM_M or v_ego >= LEFT_LAUNCH_SPEED:
+      return False
+    cloudlog.event("turnpilot.left_not_launched", error=True, v=round(v_ego, 2), distance=round(rf.distance, 1), room=round(room, 2),
+                   lifted=self.go_lifted, taken_over=self.go_cert.taken_over)
+    self.left_launch_armed, self.go_withdrawn, self.go_wait_s = False, True, None
     return True
 
   def stalled_in_turn(self, sm, cs, v_ego: float, acting: bool, decision, mapd) -> bool:

@@ -10,13 +10,15 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.go_override import GO_ACCEL, GO_CLEAR_M, GO_WINDOW_S, TAKEOVER_S
 from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.scene.tracker import RawBox, RawFrame
-from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M
+from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M, SceneDecision
 from openpilot.selfdrive.turnpilot.tests.synthetic import model_v2
 from openpilot.selfdrive.turnpilot.tests.test_go_override import WARM_S, new_planner, planner_sm
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, WALKER, FakeParams, Sim, go_from_the_hold, stand, stop_at,
                                                                  walker_stops_the_car)
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import JUNCTION, V_25, drive, left_sim
-from openpilot.selfdrive.turnpilot.turnpilotd import GO_OVERRIDE_DEFAULT, NO_MOVE_REASON, NO_MOVE_S, go_override_for
+from openpilot.selfdrive.turnpilot.turnpilotd import (GO_OVERRIDE_DEFAULT, LEFT_LAUNCH_SPEED, LEFT_LIFT_ROOM_M, NO_MOVE_REASON, NO_MOVE_S,
+                                                       go_override_for)
+from openpilot.selfdrive.turnpilot.unprotected_left import LINE_D
 
 Desire = messaging.log.Desire
 
@@ -314,3 +316,66 @@ def test_a_takeover_the_car_doesnt_move_on_is_still_the_no_move_withdrawal():
     plans.append(sim.step(engaged=True))
   assert sim.tp.go_cert.end == 'takeover' and sim.tp.go_cert.taken_over
   assert plans[-1].controlPrompt == 'cantStartTakeControl' and plans[-1].shouldStop
+
+
+def coasting(sim):
+  """Holds at a standstill; rolling, it 'takes over' and only keeps the speed the lift gave it (shouldStop false, a plan at
+  its speed, no accel): the takeover predicate holds from 0.5 m/s, but the car never launches."""
+  if sim.v < 0.3:
+    return holding(sim)
+  m = model_v2(*sim.model_lanes, accel=0., **sim.model_kw).as_builder()
+  m.velocity.x = [float(sim.v)] * len(m.velocity.x)
+  return m.as_reader()
+
+
+def launching(sim):
+  """Holds at a standstill; rolling, it goes at the left's own launch (1.5 m/s^2)."""
+  return holding(sim) if sim.v < 0.3 else model_v2(*sim.model_lanes, accel=1.5, **sim.model_kw)
+
+
+def left_go_with(model_fn):
+  sim = left_sim()
+  while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
+    drive(sim, DT_MDL)
+    assert sim.t < 60.
+  attach_planner(sim, model_fn)
+  plans = []
+  while not any(p.desire == Desire.turnLeft for p in plans[-1:]):
+    plans += drive(sim, DT_MDL)
+    assert sim.t < 90.
+  return sim
+
+
+def test_the_lefts_go_is_followed_into_the_oncoming_lanes_only_by_a_launch():
+  """Skeptic probe (advisor, G5): the lift has the car rolling at 0.78 m/s, the model's plan keeps that speed (the takeover
+  predicate holds, the lift ends) and it coasts through the oncoming lanes at 0.78 m/s, 10 s across them, nothing said; the
+  left's clear time assumed its 1.5 m/s^2 launch. So the left's go is followed into the oncoming lanes only at
+  LEFT_LAUNCH_SPEED or more: short of it, while the car can still stop LEFT_LAUNCH_ROOM_M short of them, it is withdrawn and
+  handed back. A model launching as the left assumes goes through."""
+  sim = left_go_with(coasting)
+  after = drive(sim, 15.)
+  assert sim.tp.go_cert.end == 'takeover'
+  handed = [p for p in after if p.controlPrompt == 'cantStartTakeControl']
+  assert handed and not any(str(p.unprotectedLeft.state) == 'committed' for p in after)
+  assert sim.v < 0.05 and JUNCTION - sim.s > ONCOMING_ENTRY_M and after[-1].shouldStop
+  sim = left_go_with(launching)
+  after = drive(sim, 8.)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in after)
+  assert any(str(p.unprotectedLeft.state) == 'committed' for p in after) and sim.s > JUNCTION
+  assert LEFT_LAUNCH_SPEED == 2.0
+
+
+def test_a_left_go_nearer_the_oncoming_lanes_than_the_lifts_nudge_is_never_lifted():
+  """A left crept for a view goes 1 m short of the oncoming lanes: the lift's 2.25 m nudge would carry the car past where it
+  can stop short of them with the model never having gone, so that go is never certified (why 'room'): G4's go, as before.
+  From its line (9 m, 5 m from the oncoming lanes) it is."""
+  for distance, cause in ((LINE_D, 'unprotectedLeft'), (ONCOMING_ENTRY_M + LEFT_LIFT_ROOM_M - 0.1, 'none'),
+                          (ONCOMING_ENTRY_M + 1., 'none')):
+    sim = left_sim()
+    while not (sim.trace and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
+      drive(sim, DT_MDL)
+      assert sim.t < 60.
+    sim.tp.left_now.go = True
+    sim.tp.certify_go(sim.sm, sim.sm['carState'], True, [], None, SceneDecision(), False, distance)
+    assert sim.tp.go_cert.cause == cause and sim.tp.go_lifted == (cause != 'none'), distance
+  assert LEFT_LIFT_ROOM_M == 4.5
