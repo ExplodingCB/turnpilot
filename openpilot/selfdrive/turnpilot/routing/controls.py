@@ -45,13 +45,24 @@ unknown; logged, and each stop and yield's junction_status is failed); failed (n
 exception); unsupported (tiles_dir given and it has no controls_built marker: tiles built from data with no controls, the
 old sim exports). The route publishes whatever the status: navd sends it on every message, and turnpilotd says so out loud.
 sidecar_dir None means no sidecar is expected (synthetic tests); navd's sources always pass one (routing/sources.py).
+The junction (SG1b): each stop and yield carries its junction (junction_info, routing/junctions.py: the roads there, the
+road the route leaves by, their controls, lanes, limits and all-way tiers, the survey, the maneuver, the rail distance),
+read from trace_attributes and Q2, one more batched verbose locate per route that also carries the opposing roads' probes
+(opposing_roads, for the unprotected left: given an Opposing, a route makes Q1 and Q2 and no third). A failed Q2 leaves
+every leg unknown and the junction failed. A TurnPilotJunctionOverrides navd can't read fails every stop and yield junction
+and makes the status partial, logged. Off the route a LocateCache keeps Q1 and Q2 by edge id between the 1 Hz lookups.
+navd's own Control also carries, for SG2's avoidance loop, its approach edge's key, its exclusion point and whether that
+edge is the route's first or last.
 """
 import json
 import math
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.turnpilot.routing import junctions as jn
 from openpilot.selfdrive.turnpilot.routing import osm_sidecar
 from openpilot.selfdrive.turnpilot.routing.guidance import opposing_leg
 
@@ -81,7 +92,13 @@ EARTH_R = 6371000.
 
 ATTRIBUTES = ['edge.id', 'edge.way_id', 'edge.forward', 'edge.length', 'edge.begin_shape_index', 'edge.end_shape_index',
               'edge.traffic_signal', 'edge.internal_intersection', 'edge.road_class', 'node.traffic_signal', 'node.type',
-              'node.intersecting_edge.road_class', 'shape']
+              'node.intersecting_edge.road_class', 'shape',
+              # the junctions (routing/junctions.py)
+              'edge.begin_heading', 'edge.end_heading', 'edge.roundabout', 'edge.use', 'edge.lane_count', 'edge.speed_limit',
+              'node.intersecting_edge.begin_heading', 'node.intersecting_edge.driveability', 'node.intersecting_edge.use',
+              'node.intersecting_edge.cyclability']
+EXCLUDE_BACK_M = 12.     # m back from the node an approach's exclusion point goes, at most half its edge (SG2, 3.3)
+CACHE_MAX = 4096         # Q1 and Q2 answers a LocateCache keeps, each
 
 
 @dataclass
@@ -103,6 +120,42 @@ class Control:
   junction_status: str = 'ok'  # 'failed' for a stop or yield when the OSM sidecar was missing or stale (STOP_SIGNS.md N7;
                                # MapJunction.status, SG1b)
   edge: int = -1       # the trace edge whose end it is at (route_audit.py)
+  junction_info: jn.Junction | None = None  # a stop or yield's junction (routing/junctions.py; MapControl.junctionInfo)
+  # for SG2's avoidance loop (navd's only, not on the bus): the approach edge's key (way id, forward, the node's (lat, lon)
+  # to 1e-6 deg), its exclusion point min(EXCLUDE_BACK_M, half the edge) back from the node with the route's bearing there
+  # (lat, lon, deg), and whether the edge is the route's first or last
+  approach_key: tuple | None = None
+  exclusion: tuple[float, float, float] | None = None
+  first_edge: bool = False
+  last_edge: bool = False
+
+
+@dataclass
+class Opposing:
+  """route_controls' out-parameter: the route's opposing roads ({step index: (m/s, lanes)}, opposing_roads'), read in its
+  one batched Q2 locate; None until that locate ran (unsupported tiles, an early failure: opposing_roads alone then)."""
+  roads: dict | None = None
+
+
+class LocateCache:
+  """Q1's and Q2's locate answers by edge id, for navd's lookups ahead of the car every second (controls_ahead), which
+  mostly repeat: Q1's matched candidate per edge, Q2's answers per junction (its edges' ids). One per ValhallaSource (one
+  tile set). Thread-safe (RouteJob and AheadJob run apart); CACHE_MAX of each, the oldest going first."""
+
+  def __init__(self, size: int = CACHE_MAX):
+    self.size, self.lock, self.data = size, threading.Lock(), {'q1': OrderedDict(), 'q2': OrderedDict()}
+
+  def get(self, kind: str, key):
+    with self.lock:
+      return self.data[kind].get(key)
+
+  def put(self, kind: str, key, value) -> None:
+    with self.lock:
+      d = self.data[kind]
+      d.pop(key, None)
+      d[key] = value
+      while len(d) > self.size:
+        d.popitem(last=False)
 
 
 def decode6(s: str) -> list[tuple[float, float]]:
@@ -283,46 +336,60 @@ OPPOSING_RADIUS_M = 8.
 UNLIMITED_KPH = 255         # Valhalla's speed_limit for no limit (kUnlimitedSpeedLimit)
 
 
+def opposing_probes(steps) -> tuple[dict, list[dict]]:
+  """({step index: (lat, lon, bearing)}, their locate locations) for opposing_roads: a point OPPOSING_PROBE_M out along the
+  road straight across each maneuver's junction (guidance.opposing_leg), by the heading coming into the junction."""
+  legs = {i: leg for i in range(len(steps)) if (leg := opposing_leg(steps, i)) is not None}
+  return legs, [{'lat': lat, 'lon': lon, 'heading': round((b + 180.) % 360.) % 360, 'heading_tolerance': OPPOSING_HEADING_TOL,
+                 'radius': OPPOSING_RADIUS_M} for lat, lon, b in legs.values()]
+
+
+def opposing_parse(legs: dict, located) -> dict[int, tuple[float, int]]:
+  """opposing_roads' answer from locate's answers for opposing_probes' locations."""
+  out = {}
+  for (i, (_, _, b)), loc in zip(legs.items(), located, strict=False):
+    inbound = (b + 180.) % 360.
+    cands = [c for c in (loc or {}).get('edges') or [] if angle_diff(float(c.get('heading', inbound)), inbound) <= OPPOSING_HEADING_TOL]
+    if not cands:
+      continue
+    c = min(cands, key=lambda c: (round(float(c.get('distance', 0.)), 1), angle_diff(float(c.get('heading', inbound)), inbound)))
+    limit = float((c.get('edge_info') or {}).get('speed_limit') or 0.)
+    out[i] = (limit / 3.6 if 0. < limit < UNLIMITED_KPH else 0., int((c.get('edge') or {}).get('lane_count') or 0))
+  return out
+
+
 def opposing_roads(call, steps) -> dict[int, tuple[float, int]]:
   """{step index: (speed limit m/s, lanes)} for the road straight across the junction of each maneuver that ends a step
   (guidance.opposing_leg), from one batched verbose locate OPPOSING_PROBE_M out along it: the edge coming into the junction,
   its edge_info.speed_limit (tagged maxspeed, km/h; 0 untagged and 255 unlimited are 0, unknown) and edge.lane_count (0
   unknown). A leg with no such edge has no entry; a failure is logged and gives {} (unknown everywhere: the unprotected left
-  takes 45 mph, never a guess lower)."""
+  takes 45 mph, never a guess lower). route_controls reads the same in its own batched locate (Opposing), so a route makes
+  one: this is for when it didn't."""
 
   try:
-    legs = {i: leg for i in range(len(steps)) if (leg := opposing_leg(steps, i)) is not None}
+    legs, locs = opposing_probes(steps)
     if not legs:
       return {}
-    locs = [{'lat': lat, 'lon': lon, 'heading': round((b + 180.) % 360.) % 360, 'heading_tolerance': OPPOSING_HEADING_TOL,
-             'radius': OPPOSING_RADIUS_M} for lat, lon, b in legs.values()]
-    located = call('locate', {'locations': locs, 'costing': 'auto', 'verbose': True}) or []
-    out = {}
-    for (i, (_, _, b)), loc in zip(legs.items(), located, strict=False):
-      inbound = (b + 180.) % 360.
-      cands = [c for c in (loc or {}).get('edges') or [] if angle_diff(float(c.get('heading', inbound)), inbound) <= OPPOSING_HEADING_TOL]
-      if not cands:
-        continue
-      c = min(cands, key=lambda c: (round(float(c.get('distance', 0.)), 1), angle_diff(float(c.get('heading', inbound)), inbound)))
-      limit = float((c.get('edge_info') or {}).get('speed_limit') or 0.)
-      out[i] = (limit / 3.6 if 0. < limit < UNLIMITED_KPH else 0., int((c.get('edge') or {}).get('lane_count') or 0))
-    return out
+    return opposing_parse(legs, call('locate', {'locations': locs, 'costing': 'auto', 'verbose': True}) or [])
   except Exception:
     cloudlog.exception("turnpilot opposing roads: failed")
     return {}
 
 
-def route_controls(call, steps, tiles_dir=None, sidecar_dir=None, audit: list | None = None) -> tuple[list[Control], str]:
+def route_controls(call, steps, tiles_dir=None, sidecar_dir=None, audit: list | None = None, opposing: Opposing | None = None,
+                   context: jn.Context | None = None) -> tuple[list[Control], str]:
   """(controls along the route nearest first, status). call(endpoint, request) -> response: actor_call or http_call.
   tiles_dir: the local tiles' directory, for the controls_built marker and the sim sidecar; None for tiles built from
   real OSM, which carry their own controls. sidecar_dir: the directory holding the OSM sidecar (osm_controls/) and the
   tiles' stamp (a corridor pack, a region's or the sim tiles' directory), osm_sidecar.NO_DIRECTORY when one is expected
   but the tiles have no directory, None when none is (module docstring). audit: a list every trace edge is appended to,
-  as a dict with its span on the route and both sources' stops and yields there (route_audit.py)."""
+  as a dict with its span on the route and both sources' stops and yields there (route_audit.py). opposing: given, its
+  roads are read in the junctions' batched locate (opposing_roads' answer, one call for both). context: the surveys and
+  overrides the junctions are read against (routing/junctions.py), none by default."""
   try:
     if tiles_dir is not None and not (Path(tiles_dir) / MARKER).exists():
       return [], 'unsupported'
-    return _route_controls(call, steps, tiles_dir, sidecar_dir, audit=audit)
+    return _route_controls(call, steps, tiles_dir, sidecar_dir, audit=audit, opposing=opposing, context=context)
   except Exception:
     cloudlog.exception("turnpilot controls: failed")
     return [], 'failed'
@@ -373,11 +440,13 @@ def road_ahead(call, position, heading: float) -> list[tuple[float, float]]:
   return shape if len(shape) >= 2 else []
 
 
-def controls_ahead(call, position, heading: float, tiles_dir=None, sidecar_dir=None) -> tuple[list[Control], str, list]:
+def controls_ahead(call, position, heading: float, tiles_dir=None, sidecar_dir=None, context: jn.Context | None = None,
+                   cache: LocateCache | None = None) -> tuple[list[Control], str, list]:
   """(controls on the road ahead of the car, nearest first, status, the road [(lat, lon), ...]), off the route (module
   docstring). position: (lat, lon); heading: deg; the controls' route_m are m along the road from where the car was on it,
   their point (lat, lon) set. tiles_dir, sidecar_dir and statuses as route_controls'; failed also when no road there goes
-  the car's way, or the heading is unknown."""
+  the car's way, or the heading is unknown. context as route_controls'; cache: Q1 and Q2 kept by edge id between
+  lookups (LocateCache)."""
   try:
     if tiles_dir is not None and not (Path(tiles_dir) / MARKER).exists():
       return [], 'unsupported', []
@@ -390,7 +459,7 @@ def controls_ahead(call, position, heading: float, tiles_dir=None, sidecar_dir=N
       return [], 'failed', []
     cum = cumulative(shape)
     steps = [{'geometry': {'coordinates': [[lo, la] for la, lo in shape]}, 'distance': cum[-1]}]
-    controls, status = _route_controls(call, steps, tiles_dir, sidecar_dir, ahead=True)
+    controls, status = _route_controls(call, steps, tiles_dir, sidecar_dir, ahead=True, context=context, cache=cache)
     for c in controls:
       c.point = point_at(shape, cum, c.route_m)
     return controls, status, shape
@@ -426,8 +495,64 @@ def phantom(osm, kind: str, others: list[str], hits, pts, cum, begin_m: float, e
              haversine((float(x['line'][0]), float(x['line'][1])), end_point) <= PHANTOM_NODE_M for x in entries)
 
 
-def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = False, audit: list | None = None) -> tuple[list[Control], str]:
-  """ahead: the road ahead of the car (controls_ahead), not a route: its end is no destination."""
+def _q1(call, edges, tpts, tcum, cache: LocateCache | None) -> list[dict | None]:
+  """Q1: per trace edge, locate's candidate with its own id (its edge dict: stop_sign, yield_sign), from one batched verbose
+  locate, radius 1, LOCATE_BACK_M back from its end; None unmatched. With a cache, only the edges it doesn't hold."""
+  out: list[dict | None] = [cache.get('q1', e['id']) if cache is not None else None for e in edges]
+  need = [i for i, c in enumerate(out) if c is None]
+  locs = [dict(zip(('lat', 'lon'), point_back(tpts, tcum, edges[i]['end_shape_index'], LOCATE_BACK_M), strict=True)) | {'radius': 1}
+          for i in need]
+  located = call('locate', {'locations': locs, 'costing': 'auto', 'verbose': True}) if locs else []
+  for i, loc in zip(need, located, strict=False):
+    c = next((c.get('edge') or {} for c in (loc or {}).get('edges') or [] if (c.get('edge_id') or {}).get('value') == edges[i]['id']), None)
+    out[i] = c
+    if c is not None and cache is not None:
+      cache.put('q1', edges[i]['id'], c)
+  return out
+
+
+def maneuver_at(steps, starts, stop_s: float, node_s: float) -> str:
+  """The route's maneuver at a junction (N8): the first step starting from the stop point stop_s to MANEUVER_AFTER_M past
+  the node node_s (m along the route's shape), else straight."""
+  for k in range(1, len(steps)):
+    if stop_s - 1e-6 <= starts[k][0] <= node_s + jn.MANEUVER_AFTER_M:
+      m = steps[k].get('maneuver') or {}
+      if m.get('type') in ('arrive', 'depart'):
+        return 'straight'
+      modifier = m.get('modifier') or ''
+      return 'uTurn' if 'uturn' in modifier else 'left' if 'left' in modifier else 'right' if 'right' in modifier else 'straight'
+  return 'straight'
+
+
+def rail_distance(osm, pts, cum, begin_m: float, end_m: float, node) -> float:
+  """MapJunction.railDistance: m to the nearest mapped rail crossing (the sidecar's), along the route for one on the
+  control's own edge (begin_m to end_m) however far back, else straight-line from the node within RAIL_M; RAIL_NONE without
+  one, RAIL_UNKNOWN without a current sidecar."""
+  if osm is None or osm.status != 'ok':
+    return jn.RAIL_UNKNOWN
+  best = None
+  for r in osm.rail:
+    p = (float(r['lat']), float(r['lon']))
+    straight = haversine(p, node)
+    if straight > end_m - begin_m + jn.RAIL_M + jn.RAIL_ON_ROUTE_M:
+      continue
+    hit = nearest(pts, cum, p, begin_m, end_m)
+    if hit is not None and hit[1] <= jn.RAIL_ON_ROUTE_M:
+      d = max(end_m - hit[0], 0.)
+    elif straight <= jn.RAIL_M:
+      d = straight
+    else:
+      continue
+    best = d if best is None else min(best, d)
+  return jn.RAIL_NONE if best is None else best
+
+
+def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = False, audit: list | None = None, opposing: Opposing | None = None,
+                    context: jn.Context | None = None, cache: LocateCache | None = None) -> tuple[list[Control], str]:
+  """ahead: the road ahead of the car (controls_ahead), not a route: its end is no destination, and its junctions have no
+  maneuver. opposing: filled from Q2's batched locate (a route's). context: surveys and overrides (none: neither). cache:
+  Q1 and Q2 by edge id (controls_ahead's)."""
+  context = context if context is not None else jn.Context()
   pts = route_shape(steps)
   if len(pts) < 2:
     return [], 'failed'
@@ -438,21 +563,17 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
   tcum = cumulative(tpts)
   scale = cum[-1] / tcum[-1] if tcum and tcum[-1] > 0. else 1.
   edges = t['edges']  # internal-intersection edges too: a control in a median is the junction's before it
-  locs = [dict(zip(('lat', 'lon'), point_back(tpts, tcum, e['end_shape_index'], LOCATE_BACK_M), strict=True)) | {'radius': 1}
-          for e in edges]
-  located = call('locate', {'locations': locs, 'costing': 'auto', 'verbose': True}) if locs else []
+  located = _q1(call, edges, tpts, tcum, cache)
   sim = load_sidecar(tiles_dir)
   osm = osm_sidecar.load(sidecar_dir, pts) if sidecar_dir is not None else None
   osm_ok = osm is not None and osm.status == 'ok'
   ends = []                   # per edge: (end m on the route, span m, key, its end node)
   at = {}                     # anchor edge -> {kind: [(source edge, osm entry or None, m along or None)]}
   unmatched = anchor = 0
-  for i, (e, loc) in enumerate(zip(edges, located, strict=False)):
+  for i, (e, candidate) in enumerate(zip(edges, located, strict=False)):
     internal = bool(e.get('internal_intersection'))
     if not internal or not ends:
       anchor = i
-    candidate = next((c.get('edge') or {} for c in (loc or {}).get('edges') or []
-                      if (c.get('edge_id') or {}).get('value') == e['id']), None)
     if candidate is None:
       unmatched += 0 if internal else 1
       candidate = {}
@@ -498,6 +619,11 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
                    "unknown, said as partial")
     if status in ('ok', 'walkOrSnap'):
       status = 'partial'
+  if not context.overrides_ok:
+    cloudlog.error(f"turnpilot controls: {context.overrides_error}: every stop and yield junction is failed, said as partial")
+    if status in ('ok', 'walkOrSnap'):
+      status = 'partial'
+  real = [i for i, e in enumerate(edges) if not e.get('internal_intersection')]
 
   found = []
   for a, kinds in at.items():
@@ -524,13 +650,74 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
       sign_m, entry = own[-1]  # the sign nearest the junction, if the way has two: data, never the stop point
       osm_node = int(entry.get('junction_node') or 0) or osm_node
     failed = osm is not None and not osm_ok and kind in ('stop', 'yield')
-    found.append((line_m - MAP_MARGIN_M, kind, mapped, junction, cross_suspect, instance, source, osm_node, 'failed' if failed else 'ok', a,
-                  sign_m))
+    found.append({'s': line_m - MAP_MARGIN_M, 'kind': kind, 'mapped': mapped, 'junction': junction, 'cross_suspect': cross_suspect,
+                  'instance': instance, 'source': source, 'osm_node': osm_node, 'status': 'failed' if failed else 'ok', 'a': a,
+                  'sign_m': sign_m, 'suspected': False})
+  # Q2: every stop and yield's junction, in one batched verbose locate with the route's opposing roads
+  jobs = []
+  for f in found:
+    if f['kind'] not in ('stop', 'yield'):
+      continue
+    nodes, legs, last = jn.junction_legs(edges, tpts, f['a'], ahead)
+    jobs.append((f, nodes, legs, last))
+  opp_legs, locs = opposing_probes(steps) if opposing is not None else ({}, [])
+  n_opp, spans = len(locs), []
+  for f, nodes, legs, last in jobs:
+    mine = jn.probes(nodes, legs)
+    qkey = (edges[f['a']].get('id'), tuple(edges[k].get('id') for k in range(f['a'] + 1, last + 1)),
+            edges[last + 1].get('id') if last + 1 < len(edges) else None)
+    hit = cache.get('q2', qkey) if cache is not None else None
+    spans.append((qkey, None, hit) if hit is not None else (qkey, (len(locs), len(mine)), None))
+    if hit is None:
+      locs += mine
+  answers = []
+  if locs:
+    try:
+      answers = call('locate', {'locations': locs, 'costing': 'auto', 'verbose': True}) or []
+    except Exception:
+      cloudlog.exception("turnpilot controls: the junctions' locate (Q2) failed: their legs are unknown, each junction failed")
+      answers = None
+  if opposing is not None:
+    opposing.roads = opposing_parse(opp_legs, answers[:n_opp]) if answers is not None else {}
+  for (f, nodes, legs, last), (qkey, span_, hit) in zip(jobs, spans, strict=True):
+    if hit is not None:
+      mine = hit
+    elif answers is None or len(answers) < span_[0] + span_[1]:
+      mine = None
+    else:
+      mine = answers[span_[0]:span_[0] + span_[1]]
+      if cache is not None:
+        cache.put('q2', qkey, mine)
+    a = f['a']
+    end_m, span, key, node = ends[a]
+    j = jn.build(edges, tpts, a, nodes, legs, last, mine)
+    j.suspected, j.sidecar = f['suspected'], osm_ok
+    if f['status'] == 'failed' or not context.overrides_ok:
+      j.status = 'failed'
+    j.osm_node_id = jn.osm_node_at(osm if osm_ok else None, f['osm_node'], nodes[0])
+    jn.classify(j, osm, not f['suspected'], context)
+    j.rail_distance = rail_distance(osm, pts, cum, end_m - span, end_m, nodes[0])
+    j.maneuver = 'unknown' if ahead else maneuver_at(steps, starts, f['s'], end_m)
+    j.stop_point_distance, j.stop_point_source = end_m - f['s'], 'mappedLine' if f['mapped'] else 'default'
+    f['status'] = j.status
+    f['info'] = j
+
   controls = []
-  for i, (s, kind, mapped, junction, suspect, instance, source, osm_node, jstatus, a, sign_m) in enumerate(sorted(found, key=lambda c: c[0])):
-    step_idx, along, route_m = to_step(starts, max(s, 0.))
-    controls.append(Control(i, kind, route_m, step_idx, along, mapped, junction, suspect, instance, line_source=source, osm_node=osm_node,
-                            osm_sign_m=None if sign_m is None else to_step(starts, max(sign_m, 0.))[2], junction_status=jstatus, edge=a))
+  for i, f in enumerate(sorted(found, key=lambda c: c['s'])):
+    a = f['a']
+    end_m, span, key, node = ends[a]
+    step_idx, along, route_m = to_step(starts, max(f['s'], 0.))
+    back = min(EXCLUDE_BACK_M, span / 2.)
+    ex = point_at(pts, cum, end_m - back)
+    ex_bearing = bearing(point_at(pts, cum, end_m - back - 1.), point_at(pts, cum, end_m - back + 1.))
+    nd = tpts[edges[a]['end_shape_index']]
+    controls.append(Control(i, f['kind'], route_m, step_idx, along, f['mapped'], f['junction'], f['cross_suspect'], f['instance'],
+                            line_source=f['source'], osm_node=f['osm_node'],
+                            osm_sign_m=None if f['sign_m'] is None else to_step(starts, max(f['sign_m'], 0.))[2], junction_status=f['status'],
+                            edge=a, junction_info=f.get('info'),
+                            approach_key=(int(edges[a].get('way_id') or 0), bool(edges[a].get('forward', True)), (round(nd[0], 6), round(nd[1], 6))),
+                            exclusion=(ex[0], ex[1], ex_bearing), first_edge=bool(real) and a == real[0],
+                            last_edge=bool(real) and a == real[-1]))
   side = 'none expected' if osm is None else osm.status
   cloudlog.info(f"turnpilot controls: {len(controls)} on the route ({status}), {unmatched}/{len(edges)} edges unmatched, OSM sidecar {side}")
   return controls, status

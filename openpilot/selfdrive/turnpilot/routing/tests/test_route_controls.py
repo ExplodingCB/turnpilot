@@ -2,8 +2,10 @@
 tiles with controls when they're built (tools/turnpilot/build_sim_tiles.sh into ~/turnpilot_data/valhalla/west_coast_usa_signals)."""
 import importlib.util
 import json
+import math
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -57,15 +59,15 @@ class StubValhalla:
         raise RuntimeError("no edge_walk path")
       return {'shape': [{'lat': pt(k * self.every)[0], 'lon': pt(k * self.every)[1]} for k in range(round(self.total / self.every) + 1)],
               'edges': [d for d, _, _ in self.edges]}
-    out = []
-    for loc in req['locations']:
-      m = (loc['lat'] - LAT0) * M_PER_DEG
-      hit = next(((d, s, y) for d, s, y in self.edges if d['begin_shape_index'] * self.every < m < d['end_shape_index'] * self.every), None)
-      if hit is None or hit[0]['id'] in self.unmatched:
-        out.append({'edges': [{'edge_id': {'value': 1}, 'edge': {'stop_sign': True}}]})
-      else:
-        out.append({'edges': [{'edge_id': {'value': hit[0]['id']}, 'edge': {'stop_sign': hit[1], 'yield_sign': hit[2]}}]})
-    return out
+    return [self.answer(loc) for loc in req['locations']]
+
+  def answer(self, loc):
+    """locate's answer for one location: the route edge it is inside, with its signs."""
+    m = (loc['lat'] - LAT0) * M_PER_DEG
+    hit = next(((d, s, y) for d, s, y in self.edges if d['begin_shape_index'] * self.every < m < d['end_shape_index'] * self.every), None)
+    if hit is None or hit[0]['id'] in self.unmatched:
+      return {'edges': [{'edge_id': {'value': 1}, 'edge': {'stop_sign': True}}]}
+    return {'edges': [{'edge_id': {'value': hit[0]['id']}, 'edge': {'stop_sign': hit[1], 'yield_sign': hit[2]}}]}
 
 
 class StubRoad(StubValhalla):
@@ -144,10 +146,11 @@ def test_kinds_at_the_edge_end_less_the_line_offset():
   assert summary(controls) == [('stop', 100. - off, 0, 100. - off, False, True, False),
                                ('signal', 250. - off, 1, 50. - off, False, True, False),
                                ('signal', 330. - off, 1, 130. - off, False, True, False)]
-  # one batched verbose locate, a metre back from each edge's end
+  # one batched verbose locate, a metre back from each edge's end (Q1); then one more for the stop's junction (Q2, SG1b)
   locates = [r for e, r in v.requests if e == 'locate']
-  assert len(locates) == 1 and locates[0]['verbose'] and len(locates[0]['locations']) == 4
+  assert len(locates) == 2 and locates[0]['verbose'] and len(locates[0]['locations']) == 4
   assert abs((locates[0]['locations'][0]['lat'] - LAT0) * M_PER_DEG - 99.) < 0.05
+  assert locates[1]['verbose'] and locates[1]['locations'][0]['radius'] == 1  # the stop's node first
 
 
 def test_yield_and_the_edge_at_the_destination():
@@ -186,7 +189,7 @@ def test_g11_a_stop_on_a_median_internal_edge_belongs_to_the_junction_before_it(
   v = StubValhalla([(0., 100., {}), (100., 120., {'internal': True, 'stop': True}), (120., 400., {})])
   controls, status = route_controls(v, steps())
   assert status == 'ok' and [(c.kind, round(c.route_m, 1), c.line_mapped) for c in controls] == [('stop', 100. - OFF, False)]
-  assert [len(r['locations']) for e, r in v.requests if e == 'locate'] == [3]  # the internal edge is located too
+  assert [len(r['locations']) for e, r in v.requests if e == 'locate'][0] == 3  # the internal edge is located too (Q1)
   # the junction's own control and the median's merge there, the higher kind kept
   v = StubValhalla([(0., 100., {'yield': True}), (100., 120., {'internal': True, 'stop': True}), (120., 400., {})])
   assert [(c.kind, round(c.route_m, 1)) for c in route_controls(v, steps())[0]] == [('stop', 100. - OFF)]
@@ -257,11 +260,18 @@ def osm_dir(path, controls=None, junctions=None, stamp=STAMP, tiles_stamp=STAMP,
 
 
 def replay(fixture):
-  """call() answering from a recorded trace_attributes and one batched locate."""
+  """call() answering from a recorded trace_attributes and one batched locate (Q1); a later locate (the junctions' Q2,
+  SG1b), which the fixture didn't record, finds nothing at its points."""
+  calls = []
+
   def call(endpoint, req):
     if endpoint == 'trace_attributes':
       return fixture['trace_attributes']
-    assert endpoint == 'locate' and len(req['locations']) == len(fixture['locate'])
+    assert endpoint == 'locate'
+    calls.append(req)
+    if len(calls) > 1:
+      return [{'edges': []} for _ in req['locations']]
+    assert len(req['locations']) == len(fixture['locate'])
     return fixture['locate']
   return call
 
@@ -495,3 +505,443 @@ def test_sim_controls_ahead_of_the_car_off_the_route(sim_map):
   assert haversine(first.point, (39.7724078, -86.1625586)) < 6.
   controls, status, _ = src.controls_ahead((39.7724078, -86.1625586), 45., tiles_dir=src.tiles_dir, sidecar_dir=src.tiles_dir)
   assert status == 'ok' and all(c.kind != 'signal' or c.route_m > 200. for c in controls), controls
+
+
+# --- the junction at a stop or yield (MapControl.junctionInfo, routing/junctions.py; STOP_SIGNS.md SG1b) ---
+
+def toward(p, heading, m):
+  """The point m from p (lat, lon) heading that way."""
+  r = math.radians(heading)
+  return p[0] + m * math.cos(r) / M_PER_DEG, p[1] + m * math.sin(r) / (M_PER_DEG * math.cos(math.radians(p[0])))
+
+
+def leg(h, **kw):
+  """A road leaving a stub junction heading h: class, use, drive (both, forward: cars only leave, backward: only arrive),
+  lanes in and out, kph (its tagged limit), way, its inbound edge's signs (stop, yield, signal), fwd (the inbound edge's
+  direction along its way), cycle (cycle_lane), cyclability, shoulder; match False: locate finds nothing at its probe or
+  node; exit: the road the route leaves by."""
+  return {'h': h, 'class': 'residential', 'use': 'road', 'drive': 'both', 'in': 1, 'out': 1, 'kph': None, 'way': 700 + int(h),
+          'stop': False, 'yield': False, 'signal': False, 'fwd': True, 'cycle': 'none', 'cyclability': None, 'shoulder': False,
+          'match': True, 'exit': False} | kw
+
+
+class StubJunction(StubValhalla):
+  """StubValhalla with junctions on its route due north: {node m: [leg(...), ...]}. trace_attributes gives each edge its
+  headings (north, the begin heading of an edge leaving by an exit leg its heading) and its end node's intersecting edges
+  (every leg but the exit). locate answers a leg's probe point (radius 5, near the point LEG_PROBE_M out along it) with the
+  leg's inbound and outbound edges, the node's own point (radius 1) with every leg's, and an opposing-road probe (with a
+  heading) with the inbound edge of the leg it points at; anything else as StubValhalla."""
+
+  def __init__(self, edges, junctions, **kw):
+    super().__init__(edges, **kw)
+    self.junctions = junctions
+    for d, _, _ in self.edges:
+      end_m, begin_m = d['end_shape_index'] * self.every, d['begin_shape_index'] * self.every
+      d['end_heading'] = 0.
+      out = next((x for x in junctions.get(begin_m, []) if x['exit']), None)
+      d['begin_heading'] = out['h'] if out else 0.
+      if end_m in junctions:
+        d['end_node']['intersecting_edges'] = [{'begin_heading': x['h'], 'road_class': x['class'], 'use': x['use'],
+                                                'driveability': x['drive'], 'cyclability': x['cyclability']}
+                                               for x in junctions[end_m] if not x['exit']]
+
+  def candidates(self, node_m, x):
+    node = pt(node_m)
+    far = toward(node, x['h'], 50.)
+    out = []
+    for inbound in (True, False):
+      if x['drive'] not in (('backward', 'both') if inbound else ('forward', 'both')):
+        continue
+      travel = [far, node] if inbound else [node, far]
+      forward = x['fwd'] if inbound else not x['fwd']
+      edge = {'stop_sign': inbound and x['stop'], 'yield_sign': inbound and x['yield'], 'traffic_signal': inbound and x['signal'],
+              'lane_count': x['in'] if inbound else x['out'], 'forward': forward, 'cycle_lane': x['cycle'],
+              'classification': {'classification': x['class'], 'use': x['use']}}
+      shape = [{'lat': q[0], 'lon': q[1]} for q in (travel if forward else travel[::-1])]
+      out.append({'edge_id': {'value': 9000 + int(x['h']) * 2 + inbound}, 'edge': edge, 'shoulder': x['shoulder'],
+                  'edge_info': {'way_id': x['way'], 'speed_limit': x['kph'] or 0, 'shape': shape}, 'distance': 0.5,
+                  'percent_along': 1. if inbound else 0., 'heading': (x['h'] + 180.) % 360. if inbound else x['h']})
+    return out
+
+  def answer(self, loc):
+    p = (loc['lat'], loc['lon'])
+    for node_m, legs in self.junctions.items():
+      node = pt(node_m)
+      if 'heading' in loc:  # an opposing road's probe: the inbound edge of the leg it points at
+        for x in legs:
+          if x['match'] and haversine(p, toward(node, x['h'], 15.)) < 3.:
+            return {'edges': [c for c in self.candidates(node_m, x) if c['percent_along'] == 1.]}
+      elif loc['radius'] == 1 and haversine(p, node) < 0.5:
+        return {'edges': [c for x in legs if x['match'] for c in self.candidates(node_m, x)]}
+      elif loc['radius'] == 5:
+        for x in legs:
+          if haversine(p, toward(node, x['h'], 8.)) < 3.:
+            return {'edges': self.candidates(node_m, x) if x['match'] else []}
+    return super().answer(loc)
+
+
+def turn_steps(boundary, modifier, kind='turn', total=400.):
+  """steps() split at boundary m, the second starting with that maneuver."""
+  out = steps((boundary, total - boundary))
+  out[1]['maneuver'] = {'type': kind, 'modifier': modifier}
+  return out
+
+
+def junction_of(controls, kind='stop'):
+  c = next(c for c in controls if c.kind == kind)
+  return c, c.junction_info
+
+
+def roles(j):
+  return {round(a.bearing): (a.role, round(a.rel_bearing)) for a in j.approaches}
+
+
+def test_g23_a_left_at_a_four_leg_junction_lists_the_exit_leg_with_role_exit():
+  """The road the route leaves by isn't in trace_attributes' intersecting_edges: it is added as the exit leg (for a left
+  it is the left approach, whose near lanes the left crosses first). Its inbound edge read by Q2 gives its control; one Q2
+  can't match reads unknown, never none (STOP_SIGNS.md G23)."""
+  legs = [leg(0.), leg(90.), leg(270., exit=True, stop=False, way=812)]
+  v = StubJunction([(0., 100., {'stop': True}), (100., 400., {})], {100.: legs})
+  controls, status = route_controls(v, turn_steps(100., 'left'))
+  c, j = junction_of(controls)
+  assert status == 'ok' and j.status == 'ok' and j.maneuver == 'left' and round(j.turn_angle) == -90
+  assert roles(j) == {0: ('opposite', 0), 90: ('right', 90), 270: ('exit', -90)}
+  ex = next(a for a in j.approaches if a.role == 'exit')
+  assert (ex.inbound, ex.outbound, ex.valhalla_control, ex.way_id, ex.lanes_in, ex.lanes_out) == (True, True, 'none', 812, 1, 1)
+  unmatched = [leg(0.), leg(90.), leg(270., exit=True, match=False)]
+  _, j = junction_of(route_controls(StubJunction([(0., 100., {'stop': True}), (100., 400., {})], {100.: unmatched}),
+                                    turn_steps(100., 'left'))[0])
+  ex = next(a for a in j.approaches if a.role == 'exit')
+  assert (ex.valhalla_control, ex.inbound, ex.lanes_in) == ('unknown', True, 0)
+
+
+def test_an_unmatched_leg_reads_unknown_never_none():
+  """A leg whose inbound edge Q2 doesn't match has Valhalla control unknown: never read as no sign. A matched one with no
+  sign is none, with a stop stop, and a leg cars only leave by has no inbound edge to match: unknown too (read it with
+  inbound)."""
+  legs = [leg(0., match=False), leg(90., stop=True), leg(270.), leg(300., drive='forward', **{'class': 'service_other'})]
+  v = StubJunction([(0., 100., {'stop': True}), (100., 400., {})], {100.: legs})
+  _, j = junction_of(route_controls(v, steps())[0])
+  got = {round(a.bearing): (a.valhalla_control, a.inbound, a.outbound) for a in j.approaches}
+  assert got == {0: ('unknown', True, True), 90: ('stop', True, True), 270: ('none', True, True), 300: ('unknown', False, True)}
+  assert all(c.kind != 'signal' for c in route_controls(v, steps())[0])
+
+
+@pytest.mark.parametrize('boundary, modifier, kind, want', [(110., 'right', 'turn', 'right'), (125., 'sharp left', 'turn', 'left'),
+                                                           (105., 'uturn', 'turn', 'uTurn'), (140., 'right', 'turn', 'straight'),
+                                                           (100., 'straight', 'continue', 'straight'), (95., 'left', 'turn', 'left')])
+def test_n8_the_maneuver_from_the_route_step_within_30_m_after_the_control(boundary, modifier, kind, want):
+  """The maneuver at a control is the route step's that starts from its stop point to MANEUVER_AFTER_M 30 m past its node;
+  none there is straight (STOP_SIGNS.md N8)."""
+  v = StubJunction([(0., 100., {'stop': True}), (100., 400., {})], {100.: [leg(90.), leg(270.)]})
+  _, j = junction_of(route_controls(v, turn_steps(boundary, modifier, kind))[0])
+  assert j.maneuver == want
+
+
+def rail_dir(tmp_path, rail, controls=None):
+  d = osm_dir(tmp_path, controls)
+  cell = level2_index(LON0, LAT0)
+  shard = json.loads((d / 'osm_controls' / f'{cell}.json').read_text())
+  shard['rail'] = [{'lat': la, 'lon': lo, 'ways': [1]} for la, lo in rail]
+  (d / 'osm_controls' / f'{cell}.json').write_text(json.dumps(shard))
+  return d
+
+
+def test_c7_rail_distance_from_the_sidecar(tmp_path):
+  """The distance to the nearest mapped rail level crossing, from the OSM sidecar (Valhalla has no rail node type): along
+  the route for one on the control's own edge however far back, else straight-line from the node within RAIL_M 30 m;
+  -1 none; -2 unknown without a current sidecar, never none (STOP_SIGNS.md C7)."""
+  v = StubJunction([(0., 100., {'stop': True}), (100., 400., {})], {100.: [leg(90.), leg(270.)]})
+  cases = {'beside': ([toward(pt(100.), 90., 20.)], 20.), 'on our edge': ([pt(55.)], 45.), 'far': ([toward(pt(100.), 90., 40.)], -1.),
+           'both': ([toward(pt(100.), 90., 20.), pt(88.)], 12.), 'none': ([], -1.)}
+  for name, (rail, want) in cases.items():
+    _, j = junction_of(route_controls(v, steps(), sidecar_dir=rail_dir(tmp_path / name, rail))[0])
+    assert abs(j.rail_distance - want) < 0.5, name
+  _, j = junction_of(route_controls(v, steps(), sidecar_dir=osm_dir(tmp_path / 'stale', stamp='2026-01-01T00:00:00Z'))[0])
+  assert j.rail_distance == -2. and j.status == 'failed'
+  _, j = junction_of(route_controls(v, steps())[0])  # no sidecar expected (synthetic): unknown all the same
+  assert j.rail_distance == -2.
+
+
+def allway(tmp_path, ours=None, others=None, record=None, maxspeed=None):
+  """A sidecar for a four-leg junction at the stub route's node 100 m (OSM node 900): our approach (way 50 northbound) and
+  legs at 0 (way 700), 90 (way 790) and 270 (way 970), each arriving forward along its way. ours, others: each approach's
+  (stops, evidence, stop_tag) as the sidecar's junction record and controls give it."""
+  ours = ours or (True, 'node_all', 'all')
+  others = others or {700: ours, 790: ours, 970: ours}
+  bearings = {50: 180., 700: 0., 790: 90., 970: 270.}
+  approaches, controls = [], {}
+  for way, (stops, evidence, tag) in {50: ours, **others}.items():
+    approaches.append({'way_id': way, 'dir': 'f', 'bearing_deg': bearings[way], 'class': 'residential', 'maxspeed': maxspeed,
+                       'oneway': False, 'stops': stops, 'kind': 'stop' if stops else None, 'evidence': evidence if stops else 'none',
+                       'line': None})
+    if stops:
+      line = None if evidence.startswith('node') else list(pt(92.)) if way == 50 else list(toward(pt(100.), bearings[way], 8.))
+      controls[f'{way}:f'] = [{'kind': 'stop', 'line': line, 'junction_node': 900, 'stop_tag': tag, 'evidence': evidence}]
+  rec = {'900': {'pos': list(pt(100.)), 'approaches': record if record is not None else approaches}}
+  return osm_dir(tmp_path, controls, rec)
+
+
+def four(over=None):
+  """Legs at the stub route's node 100 m: straight on (way 700), right (790), left (970); over: {heading: leg fields}."""
+  over = over or {}
+  return {100.: [leg(0., way=700, **over.get(0, {})), leg(90., way=790, **over.get(90, {})), leg(270., way=970, **over.get(270, {}))]}
+
+
+def tiers(j):
+  return {round(a.bearing): a.tier for a in j.approaches}
+
+
+@pytest.mark.parametrize('name, ours, others, want', [
+  ('stop=all on the node', (True, 'node_all', 'all'), None, 'mapStrong'),
+  ('directed signs', (True, 'mid_directed', 'none'), None, 'mapStrong'),
+  ('plain node stop', (True, 'node_untagged', 'none'), None, 'mapWeak'),
+  ('undirected', (True, 'mid_undirected', 'none'), None, 'mapWeak'),
+])
+def test_tiers_of_a_mapped_all_way(tmp_path, name, ours, others, want):
+  """Each approach's tier (STOP_SIGNS.md 4.1): a directed stop or stop=all is mapStrong, a plain junction-node stop or an
+  undirected one mapWeak; none of them stops this week, only surveyed does."""
+  v = StubJunction([(0., 100., {'stop': True, 'way_id': 50}), (100., 400., {})], four())
+  _, j = junction_of(route_controls(v, steps(), sidecar_dir=allway(tmp_path, ours, others))[0])
+  assert j.osm_node_id == 900 and j.sidecar and tiers(j) == {0: want, 90: want, 270: want}, name
+  assert {a.osm_stop for a in j.approaches} == {'all' if ours[2] == 'all' else 'stop'}
+
+
+def test_no_wins_over_unknown_at_a_two_way_and_stop_minor(tmp_path):
+  """A plain two-way: the cross approaches the sidecar shows unstopped are no, never unknown, since ours stops; so is one
+  Q2 couldn't match (its Valhalla control unknown, its tier still no from the sidecar's record by bearing). stop=minor
+  anywhere makes the stopping approaches mapWeak and the rest no; stop=all beside an unstopped approach contradicts:
+  mapWeak."""
+  unstopped = (False, 'none', 'none')
+  two_way = {700: (True, 'mid_directed', 'none'), 790: unstopped, 970: unstopped}
+  v = StubJunction([(0., 100., {'stop': True, 'way_id': 50}), (100., 400., {})], four({90: {'match': False}}))
+  _, j = junction_of(route_controls(v, steps(), sidecar_dir=allway(tmp_path / 'two', (True, 'mid_directed', 'none'), two_way))[0])
+  assert tiers(j) == {0: 'mapStrong', 90: 'no', 270: 'no'}
+  right = next(a for a in j.approaches if round(a.bearing) == 90)
+  assert (right.valhalla_control, right.osm_stop, right.tier) == ('unknown', 'none', 'no')
+  minor = {700: (True, 'mid_directed', 'minor'), 790: unstopped, 970: unstopped}
+  v = StubJunction([(0., 100., {'stop': True, 'way_id': 50}), (100., 400., {})], four())
+  _, j = junction_of(route_controls(v, steps(), sidecar_dir=allway(tmp_path / 'minor', (True, 'mid_directed', 'minor'), minor))[0])
+  assert tiers(j) == {0: 'mapWeak', 90: 'no', 270: 'no'}
+  three = {700: (True, 'mid_directed', 'all'), 790: (True, 'mid_directed', 'all'), 970: unstopped}
+  _, j = junction_of(route_controls(v, steps(), sidecar_dir=allway(tmp_path / 'contra', (True, 'mid_directed', 'all'), three))[0])
+  assert tiers(j) == {0: 'mapWeak', 90: 'mapWeak', 270: 'no'}
+
+
+def test_without_a_current_sidecar_tiers_are_unknown_or_a_valhalla_flag(tmp_path):
+  """No sidecar, or a stale one: an approach Valhalla flags is mapWeak (a Valhalla flag alone), every other unknown, never
+  no (Valhalla misses a quarter of the stops: its silence proves nothing)."""
+  v = StubJunction([(0., 100., {'stop': True, 'way_id': 50}), (100., 400., {})], four({0: {'stop': True}}))
+  _, j = junction_of(route_controls(v, steps(), sidecar_dir=osm_dir(tmp_path, shards=False))[0])
+  assert tiers(j) == {0: 'mapWeak', 90: 'unknown', 270: 'unknown'} and not j.sidecar and j.status == 'failed'
+  assert {a.osm_stop for a in j.approaches} == {'unknown'}
+  _, j = junction_of(route_controls(v, steps(), sidecar_dir=osm_dir(tmp_path / 'ok'))[0])  # current, nothing at the node
+  assert tiers(j) == {0: 'mapWeak', 90: 'no', 270: 'no'} and {a.osm_stop for a in j.approaches} == {'none'}
+
+
+@pytest.mark.parametrize('kph, maxspeed, cls, source, mph', [(48, None, 'residential', 'tagged', 48 / 3.6 / 0.44704),
+                                                            (None, 11.176, 'residential', 'tagged', 25.),
+                                                            (None, None, 'residential', 'classDefault', 30.),
+                                                            (None, None, 'tertiary', 'classDefault', 35.),
+                                                            (None, None, 'secondary', 'classDefault', 45.),
+                                                            (None, None, 'primary', 'classDefault', 55.)])
+def test_limits_tagged_else_the_class_default(tmp_path, kph, maxspeed, cls, source, mph):
+  """An approach's assumed limit: the survey's posted sign, else the tagged maxspeed (Valhalla's speed_limit, else the
+  sidecar's), else decision D8's class default (30 mph residential, 35 tertiary, 45 secondary, 55 primary and above),
+  never Valhalla's classified speed."""
+  v = StubJunction([(0., 100., {'stop': True, 'way_id': 50}), (100., 400., {})],
+                   four({90: {'kph': kph, 'class': cls}, 0: {'class': cls}, 270: {'class': cls}}))
+  _, j = junction_of(route_controls(v, steps(), sidecar_dir=allway(tmp_path, maxspeed=maxspeed))[0])
+  right = next(a for a in j.approaches if round(a.bearing) == 90)
+  assert right.speed_source == source and abs(right.assumed_limit - mph * 0.44704) < 0.01
+  assert right.tagged_limit == (0. if source == 'classDefault' else right.assumed_limit)
+
+
+def survey(node=900, date='2026-10-20', stops=(True, True, True, True), posted=20, stop_point=None, confirmed=(), lane_edge=4.0):
+  """A survey of the stub junction (OSM node node): our approach (way 50, heading 0 toward it) and the legs' (700 heading
+  180, 790 heading 270, 970 heading 90), in person."""
+  ways = [(50, 0.), (700, 180.), (790, 270.), (970, 90.)]
+  return {'osmNodeId': node, 'lat': pt(100.)[0], 'lon': LON0, 'date': date, 'source': 'inPerson', 'confirmedBy': list(confirmed),
+          'approaches': [{'wayId': w, 'bearingDeg': b, 'stops': st, 'plaque': st, 'postedMph': posted, 'laneEdgeM': lane_edge, 'lineM': 7.,
+                          'nearestParkingM': {'left': 40., 'right': 40.}, 'sightM': 60.} | ({'stopPointM': stop_point} if w == 50 and stop_point else {})
+                         for (w, b), st in zip(ways, stops, strict=True)],
+          'validations': []}
+
+
+def context(entries=(), overrides=None, ok=True, error='', today=(2026, 10, 30)):
+  from datetime import date
+
+  from openpilot.selfdrive.turnpilot.maps import surveys
+  from openpilot.selfdrive.turnpilot.routing.junctions import Context
+  loaded = []
+  for e in entries:
+    assert surveys.problem(e) == '', surveys.problem(e)
+    loaded.append(dict(e, approaches=[dict(a, stopPointM=a.get('stopPointM')) for a in e['approaches']]))
+  return Context(loaded, overrides or {}, ok, error, date(*today))
+
+
+def test_a_counting_survey_sets_the_tiers_the_posted_speed_and_the_stop_point(tmp_path):
+  """A survey matched by OSM node id and dated within a year: each approach it records stopping is surveyed (one it records
+  unstopped is no), and its posted sign is the assumed limit (source survey)."""
+  v = StubJunction([(0., 100., {'stop': True, 'way_id': 50}), (100., 400., {})], four())
+  ctx = context([survey(stops=(True, True, True, False), stop_point=9.8)])
+  c, j = junction_of(route_controls(v, steps(), sidecar_dir=allway(tmp_path), context=ctx)[0])
+  assert j.surveyed and j.survey['osmNodeId'] == 900
+  assert tiers(j) == {0: 'surveyed', 90: 'surveyed', 270: 'no'}
+  assert {(a.speed_source, round(a.assumed_limit / 0.44704)) for a in j.approaches} == {('survey', 20)}
+
+
+def test_a_survey_over_a_year_old_or_of_another_node_is_ignored(tmp_path):
+  v = StubJunction([(0., 100., {'stop': True, 'way_id': 50}), (100., 400., {})], four())
+  for name, entry in {'old': survey(date='2025-10-29'), 'another node': survey(node=901)}.items():
+    c, j = junction_of(route_controls(v, steps(), sidecar_dir=allway(tmp_path / name), context=context([entry]))[0])
+    assert not j.surveyed and tiers(j) == {0: 'mapStrong', 90: 'mapStrong', 270: 'mapStrong'}, name
+    assert j.stop_point_source == 'default' and {a.speed_source for a in j.approaches} == {'classDefault'}, name
+  _, j = junction_of(route_controls(v, steps(), sidecar_dir=allway(tmp_path / 'again'), context=context([survey(date='2025-10-29')]))[0])
+  assert j.survey is not None and 'year' in j.survey_note  # matched, said why it doesn't count
+
+
+def test_the_plausibility_gate_needs_two_looks_at_a_primary_beside_a_minor_road(tmp_path):
+  """A primary road meeting one two or more classes lower is implausible as an all-way (about 1% of such stop junctions,
+  STOP_SIGNS.md 4.2): its survey counts only with both looks (in person and street imagery) in confirmedBy."""
+  primary = four({0: {'class': 'primary'}})
+  v = StubJunction([(0., 100., {'stop': True, 'way_id': 50}), (100., 400., {})], primary)
+  _, j = junction_of(route_controls(v, steps(), sidecar_dir=allway(tmp_path / 'one'), context=context([survey()]))[0])
+  assert not j.plausible and not j.surveyed and 'implausible' in j.survey_note and 'surveyed' not in tiers(j).values()
+  both = survey(confirmed=('inPerson', 'streetImagery'))
+  _, j = junction_of(route_controls(v, steps(), sidecar_dir=allway(tmp_path / 'two'), context=context([both]))[0])
+  assert not j.plausible and j.surveyed and set(tiers(j).values()) == {'surveyed'}
+  v = StubJunction([(0., 100., {'stop': True, 'way_id': 50}), (100., 400., {})], four({0: {'class': 'tertiary'}}))
+  _, j = junction_of(route_controls(v, steps(), sidecar_dir=allway(tmp_path / 'tertiary'), context=context([survey()]))[0])
+  assert j.plausible and j.surveyed
+
+
+def test_an_override_makes_its_approach_no_and_an_unreadable_one_is_loud(tmp_path):
+  """TurnPilotJunctionOverrides (an approach downgraded on site, or a signal seen there) puts its approach in the no tier,
+  over a survey. A param this build doesn't know, or one that doesn't parse, is logged and said: every stop and yield
+  junction's status is failed and the route's controls status partial (the UI's "Map stops/signals: partial")."""
+  from openpilot.common.params import UnknownKeyName
+  from openpilot.selfdrive.turnpilot.routing.junctions import read_overrides
+  v = StubJunction([(0., 100., {'stop': True, 'way_id': 50}), (100., 400., {})], four())
+  params = {'TurnPilotJunctionOverrides': [{'approach': '900:790:f', 'kind': 'no', 'evidence': {'speed': 8.2}},
+                                           {'approach': '900:970:f', 'kind': 'signalSeen', 'evidence': None}]}
+  overrides, ok, _ = read_overrides(SimpleNamespace(get=params.get))
+  assert ok and set(overrides) == {'900:790:f', '900:970:f'}
+  ctx = context([survey()], overrides)
+  _, j = junction_of(route_controls(v, steps(), sidecar_dir=allway(tmp_path / 'o'), context=ctx)[0])
+  assert tiers(j) == {0: 'surveyed', 90: 'no', 270: 'no'} and j.status == 'ok'
+
+  def unknown(key):
+    raise UnknownKeyName(key)
+  for bad in (SimpleNamespace(get=unknown), SimpleNamespace(get=lambda k: '{"not": "a list"}'),
+              SimpleNamespace(get=lambda k: [{'approach': '900:790:f', 'kind': 'maybe'}])):
+    overrides, ok, why = read_overrides(bad)
+    assert not ok and overrides == {} and 'TurnPilotJunctionOverrides' in why
+    with patch.object(controls_module, 'cloudlog') as log:
+      controls, status = route_controls(v, steps(), sidecar_dir=allway(tmp_path / 'bad'), context=context(ok=False, error=why))
+    assert status == 'partial' and [c.junction_info.status for c in controls] == ['failed'] and controls[0].junction_status == 'failed'
+    assert any('TurnPilotJunctionOverrides' in str(c.args[0]) for c in log.error.call_args_list)
+  assert read_overrides(SimpleNamespace(get=lambda k: None)) == ({}, True, '')
+
+
+def opposing_steps():
+  """steps() whose second step starts with a left at 200 m, where a road carries on straight across (bearing 0)."""
+  out = steps()
+  lon, lat = out[1]['geometry']['coordinates'][0]
+  out[1]['maneuver'] = {'type': 'turn', 'modifier': 'left', 'bearing_before': 0, 'bearing_after': 270}
+  out[1]['intersections'] = [{'location': [lon, lat], 'bearings': [0, 90, 180, 270], 'in': 2, 'out': 3}]
+  return out
+
+
+def test_q2_rides_in_the_opposing_roads_batched_locate():
+  """e7af1fb's one batched locate per route (the opposing roads, for the unprotected left's R_req) carries the junctions'
+  probes too: a route makes Q1 and one Q2, and the opposing roads read there are opposing_roads' own answer."""
+  from openpilot.selfdrive.turnpilot.routing.controls import Opposing, opposing_roads
+  junctions = {100.: [leg(90.), leg(270.)], 200.: [leg(0., kph=56, **{'in': 2}), leg(90.), leg(270., exit=True)]}
+  v = StubJunction([(0., 100., {'stop': True}), (100., 200., {'yield': True}), (200., 400., {})], junctions)
+  alone = opposing_roads(v, opposing_steps())
+  assert alone == {0: (56 / 3.6, 2)}
+  v.requests.clear()
+  out = Opposing()
+  controls, status = route_controls(v, opposing_steps(), opposing=out)
+  assert status == 'ok' and out.roads == alone and [c.kind for c in controls] == ['stop', 'yield']
+  locates = [r for e, r in v.requests if e == 'locate']
+  assert len(locates) == 2 and 'heading' in locates[1]['locations'][0]  # Q1, then Q2 led by the opposing probe
+  assert all(c.junction_info.status == 'ok' for c in controls)
+  # unsupported tiles: no batched locate ran, the roads stay None (ValhallaSource then reads them alone)
+  out = Opposing()
+  assert route_controls(v, opposing_steps(), tiles_dir='/nonexistent', opposing=out) == ([], 'unsupported') and out.roads is None
+
+
+def test_q2_failing_leaves_every_leg_unknown_and_the_junction_failed():
+  calls = []
+  inner = StubJunction([(0., 100., {'stop': True}), (100., 400., {})], {100.: [leg(90.), leg(270.)]})
+
+  def call(endpoint, req):
+    calls.append(endpoint)
+    if endpoint == 'locate' and calls.count('locate') == 2:
+      raise ConnectionError("valhalla_service went away")
+    return inner(endpoint, req)
+  from openpilot.selfdrive.turnpilot.routing.controls import Opposing
+  out = Opposing()
+  controls, status = route_controls(call, opposing_steps(), opposing=out)
+  assert status == 'ok' and [c.kind for c in controls] == ['stop'] and out.roads == {}
+  j = controls[0].junction_info
+  assert j.status == 'failed' and controls[0].junction_status == 'failed' and {a.valhalla_control for a in j.approaches} == {'unknown'}
+
+
+def test_navds_own_control_carries_the_approach_key_and_exclusion_point():
+  """For SG2's avoidance loop (navd only, not on the bus): the approach edge's key (way, direction, node), its exclusion
+  point min(12 m, half the edge) back from the node with the route's bearing there, and whether the edge is the route's
+  first or last."""
+  v = StubJunction([(0., 100., {'stop': True, 'way_id': 61}), (100., 116., {'yield': True, 'way_id': 62, 'forward': False}),
+                    (116., 300., {'stop': True, 'way_id': 63}), (300., 400., {})], {}, every=2.)
+  controls, _ = route_controls(v, steps(every=2.))
+  got = [(c.kind, c.approach_key[:2], c.first_edge, c.last_edge) for c in controls]
+  assert got == [('stop', (61, True), True, False), ('yield', (62, False), False, False), ('stop', (63, True), False, False)]
+  assert controls[0].approach_key[2] == tuple(round(x, 6) for x in pt(100.))
+  for c, node, back in zip(controls, (100., 116., 300.), (12., 8., 12.), strict=True):
+    lat, lon, b = c.exclusion
+    assert abs(haversine((lat, lon), pt(node - back))) < 0.3 and angle(b, 0.) < 1.
+
+
+def angle(a, b):
+  return abs((a - b + 180.) % 360. - 180.)
+
+
+class StubRoadJunction(StubRoad, StubJunction):
+  """StubRoad's road ahead (locate by heading) with StubJunction's junctions."""
+
+
+def test_controls_ahead_lists_the_straight_on_leg_with_role_exit():
+  """Off the route the maneuver is unknown and the exit leg is the road the car carries on onto: the next edge of the road
+  looked up, or, at its end (where intersecting_edges lists it), the leg nearest straight on."""
+  junctions = {100.: [leg(90.), leg(270.)], 400.: [leg(2., way=744), leg(90.), leg(270.)]}
+  v = StubRoadJunction([(0., 100., {'stop': True}), (100., 250., {}), (250., 400., {'stop': True})],
+                       road=[(0., 100.), (100., 250.), (250., 400.)], junctions=junctions)
+  controls, status, _ = controls_ahead(v, pt(0.), 3.)
+  assert status == 'ok' and [round(c.route_m) for c in controls] == [89, 389]
+  first, last = (c.junction_info for c in controls)
+  assert first.maneuver == last.maneuver == 'unknown'
+  assert roles(first) == {0: ('exit', 0), 90: ('right', 90), 270: ('left', -90)}
+  assert roles(last) == {2: ('exit', 2), 90: ('right', 90), 270: ('left', -90)}
+  assert next(a for a in last.approaches if a.role == 'exit').way_id == 744
+
+
+def test_controls_ahead_keeps_q1_and_q2_by_edge_id():
+  """navd looks up the road ahead every second: with a LocateCache (one per tile set) the next lookup asks Valhalla again
+  only for the road itself (locate by heading), not for the edges' signs (Q1) nor the junctions (Q2) it already has."""
+  from openpilot.selfdrive.turnpilot.routing.controls import LocateCache
+  junctions = {100.: [leg(90.), leg(270.)]}
+  v = StubRoadJunction([(0., 100., {'stop': True}), (100., 250., {}), (250., 400., {})], road=[(0., 100.), (100., 250.), (250., 400.)],
+                       junctions=junctions)
+  cache = LocateCache()
+  first = controls_ahead(v, pt(0.), 3., cache=cache)
+  v.requests.clear()
+  again = controls_ahead(v, pt(5.), 3., cache=cache)
+  plain = [r for e, r in v.requests if e == 'locate' and 'heading' not in r['locations'][0]]
+  assert plain == [] and [c.kind for c in again[0]] == [c.kind for c in first[0]] == ['stop']
+  assert roles(again[0][0].junction_info) == roles(first[0][0].junction_info)
+  v.requests.clear()
+  controls_ahead(v, pt(5.), 3.)  # no cache: both asked again
+  assert len([r for e, r in v.requests if e == 'locate' and 'heading' not in r['locations'][0]]) == 2
