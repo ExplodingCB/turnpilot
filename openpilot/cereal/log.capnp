@@ -2735,7 +2735,7 @@ struct Event {
     turnpilotDetections @108 :Custom.TurnpilotDetections;
     turnpilotScene @109 :Custom.TurnpilotScene;
     turnpilotLights @110 :Custom.TurnpilotLights;
-    customReserved4 @111 :Custom.CustomReserved4;
+    turnpilotFarDetections @111 :Custom.TurnpilotFarDetections;
     customReserved5 @112 :Custom.CustomReserved5;
     customReserved6 @113 :Custom.CustomReserved6;
     customReserved7 @114 :Custom.CustomReserved7;

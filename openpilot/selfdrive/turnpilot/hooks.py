@@ -61,7 +61,7 @@ SILENT_PROMPTS = ('none', 'yieldAhead', 'waitingForGap', 'creepingForView')
 RETIRED_PROMPTS = ('stopSignGo', 'signalGo', 'unprotectedTurnGo', 'carStoppedGo')
 RETIRED_ALERTS = ('goingOnRed',)
 CONTROL_ALERT_EVENTS = ('stopOverrun', 'proceedingOnYellow', 'junctionUncertain')  # below the prompt, above a lane change
-CONTROL_STATUS_ALERTS = ('mapControlsUnavailable', 'lightSourceRejected')  # last of all, a status line
+CONTROL_STATUS_ALERTS = ('mapControlsUnavailable', 'lightSourceRejected', 'farViewOff')  # last of all, a status line
 
 
 def control_outranks_lane_change(plan) -> bool:
@@ -153,6 +153,7 @@ CONTROL_ALERT_TEXT = {
   'offRouteStopsUnknown': 'Map stops unknown: take control or wait for reroute',
   'hardBrake': 'Braking hard',
   'oncomingHolding': 'Oncoming traffic: holding short of its lanes',
+  'farViewOff': 'Far view off for this drive: no lefts across fast oncoming traffic',
 }
 
 

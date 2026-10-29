@@ -187,6 +187,7 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
                                 # (scene_policy.py), while it lasts; logged with its evidence (turnpilot.hard_brake)
     oncomingHolding @10;        # an unprotected left's go withdrawn before its commit for a car in the oncoming band:
                                 # stopping short of the oncoming lanes on the comfortable curve, waiting again
+    farViewOff @11;             # the far crop went off for the drive (failed or over budget): no unprotected left needing it
   }
   mapControl @24 :MapControlStatus;
   controlPrompt @25 :ControlPrompt;
@@ -250,6 +251,9 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     crosswalkClear @8 :Bool;   # the exit crosswalk and the junction box
     creepM @9 :Float32;        # m past its line the hold may creep to
     why @10 :Text;             # undecided: its fault; announce: go or wait
+    farRangeM @11 :Float32;    # the far crop's proven range (TurnPilotLeftFarRangeM), 0 when unmeasured or the crop is off
+    farNeeded @12 :Bool;       # rReq is past rangeM: the band out to rReq is judged on the far crop's runs too
+    farBlockers @13 :UInt8;    # raw boxes in the band on the last far crop run
   }
   unprotectedLeft @31 :UnprotectedLeftStatus;
   # TurnPilot's certified go (selfdrive/turnpilot/go_override.py; DESIGN phase 4 decision 1, G5): asserted on every frame of
@@ -271,6 +275,9 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     t @2 :Float32;     # s since the go
   }
   goCertified @32 :GoCertified;
+  # The far crop's aim (DESIGN phase 4 G5, detector/modeld_detector.py): deg left of the calibrated forward axis, read by
+  # modeld through fresh_plan (shadow too). 0 is straight ahead; an unprotected left aims it up the oncoming approach
+  farCropBearing @33 :Float32;
 }
 
 struct TurnpilotDetections @0xaedffd8f31e7b55d {
@@ -333,6 +340,23 @@ struct TurnpilotDetections @0xaedffd8f31e7b55d {
   }
   lightStatus @9 :LightStatus;
   lightTime @10 :Float32;         # s spent reading the lights in this step, 0 when not read
+  # DESIGN phase 4 G5, the far crop (detector/graph.py Crop): a native-resolution window of the road camera's frame, run on
+  # the model frames between the full pass's runs and published apart (turnpilotFarDetections), its run a TurnpilotDetections
+  # of the road camera with view far: boxes in the road camera's full-frame pixels, so they range with its lens
+  enum View {
+    full @0;         # the whole camera frame, letterboxed (turnpilotDetections)
+    far @1;          # the far crop (turnpilotFarDetections.run)
+  }
+  view @11 :View;
+  enum FarStatus {
+    unset @0;          # a log from before the field
+    read @1;           # the far crop ran within FAR_STATUS_S
+    off @2;            # TurnPilotFarCrop off, no far pkl for this device, or no road camera
+    disabled @3;       # it failed, or ran over its budget or the step's: off for the drive (logged, said once)
+    noCalibration @4;  # no calibrated horizon to aim it by yet
+    noRoom @5;         # on, but no frame between the full runs had room for it within FAR_STATUS_S
+  }
+  farStatus @12 :FarStatus;  # the full pass's messages say what the far crop is doing
 }
 
 struct TurnpilotScene @0xf35cc4560bbf6ec2 {
@@ -357,6 +381,8 @@ struct TurnpilotScene @0xf35cc4560bbf6ec2 {
     inPath @8 :Bool;    # inside the planned driving corridor
     camera @9 :TurnpilotDetections.Camera;
     box @10 :List(Float32);  # x0, y0, x1, y1 normalized 0-1 in that camera's frame, for the UI
+    view @11 :TurnpilotDetections.View;  # the pass of its last match: far for the far crop (its camera is road)
+    farHits @12 :UInt32;     # matches in the far crop; age counts the full pass's alone (a hard stop's confirmation reads age)
   }
   available @0 :Bool;          # false when detections are stale; never read as "nothing there"
   objects @1 :List(TrackedObject);
@@ -393,7 +419,14 @@ struct TurnpilotLights @0xda96579883444c35 {
   shadow @2 :Bool;   # source camera: logged by turnpilotd, never acted on (TurnPilotCameraLights shadow)
 }
 
-struct CustomReserved4 @0x80ae746ee2596b11 {
+struct TurnpilotFarDetections @0x80ae746ee2596b11 {
+  # The far crop's run (DESIGN phase 4 G5; detector/modeld_detector.py FarCrop), published by modeld on the model frames
+  # between the full pass's runs. Its own service, so the full pass's stream (turnpilotDetections: the scene's freshness,
+  # turnpilotd's detector deadline, the lane paint) is untouched by it.
+  run @0 :TurnpilotDetections;  # camera road, view far; detections in the road camera's full-frame pixels; lights its class-9
+                                # heads (a reader of its own, shadow unless TurnPilotCameraLights is addOnly)
+  crop @1 :List(Float32);       # x0, y0, x1, y1 of the crop, road camera full-frame pixels
+  bearing @2 :Float32;          # the aim it was given (turnpilotPlan.farCropBearing), deg left of the calibrated forward axis
 }
 
 struct CustomReserved5 @0xa5cd762cd951a455 {
