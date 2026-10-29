@@ -38,11 +38,11 @@ def run(ev, n, p, cs, flags=RECHECKED):
 def test_prompt_chimes_once_and_holds():
   ev = CarSignalEvents()
   lines = run(ev, 50, plan(prompt='left'), port())
-  assert lines[0] == ("Signal Left", "For the turn ahead", 'tpLaneChangeLeft')
-  assert all(line == ("Signal Left", "For the turn ahead", 'none') for line in lines[1:])
+  # the chime stays on the line for as long as it shows: soundd plays a one-shot sound once however long it is held
+  assert all(line == ("Signal Left", "For the turn ahead", 'tpLaneChangeLeft') for line in lines)
   assert run(ev, 1, plan(), port()) == [None]
   # back within the quiet time: no new chime; a new prompt after it: chimed again
-  assert run(ev, 1, plan(prompt='left'), port())[0][2] == 'none'
+  assert all(line[2] == 'none' for line in run(ev, 50, plan(prompt='left'), port()))
   run(ev, int(11. / DT), plan(), port())
   assert run(ev, 1, plan(prompt='left'), port())[0][2] == 'tpLaneChangeLeft'
   assert run(CarSignalEvents(), 1, plan(prompt='right'), port())[0][2] == 'tpLaneChangeRight'
@@ -51,7 +51,8 @@ def test_prompt_chimes_once_and_holds():
 def test_fault_said_once():
   ev = CarSignalEvents()
   lines = run(ev, int(5. / DT), plan('failed'), port('failed', 'lampLost'), ON)
-  assert lines[0] == ("Car Signal Failed", "Signal went out: stalk touched?. You'll be asked to signal", 'prompt')
+  said = ("Car Signal Failed", "Signal went out: stalk touched?. You'll be asked to signal", 'prompt')
+  assert all(line == said for line in lines[:int(3.9 / DT)])  # its chime on the line for the whole hold
   assert lines[int(4.5 / DT)] is None
   ev = CarSignalEvents()
   assert "panda refused it" in run(ev, 1, plan('failed'), port('failed', 'lampTimeout', rejected=3), ON)[0][1]
@@ -60,8 +61,88 @@ def test_fault_said_once():
 def test_still_on_until_off():
   ev = CarSignalEvents()
   lines = run(ev, 20, plan('ready'), port(still=True))
-  assert lines[0] == ("Turn Signal Still On", "Cancel it if you're not turning", 'prompt') and lines[-1][2] == 'none'
+  assert all(line == ("Turn Signal Still On", "Cancel it if you're not turning", 'prompt') for line in lines)
   assert run(ev, 1, plan('ready'), port()) == [None]
+
+
+def test_two_chimes_at_once_each_aired():
+  """A fault and a prompt in the same frame: the fault's line and chime first, for CHIME_S (longer than either sound, so
+  the prompt's chime never cuts it off), then the prompt's line with its own chime, never lost behind the fault's."""
+  ev = CarSignalEvents()
+  lines = run(ev, int(3. / DT), plan('failed', prompt='left'), port('failed', 'lampLost'), ON)
+  n = int(round(hooks.CHIME_S / DT))
+  assert all(line[0] == "Car Signal Failed" and line[2] == 'prompt' for line in lines[:n])
+  assert all(line == ("Signal Left", "For the turn ahead", 'tpLaneChangeLeft') for line in lines[n:])
+  # the prompt over before the fault's hold: the fault's line back, its chime already heard: silent
+  lines = run(ev, 20, plan('failed'), port('failed', 'lampLost'), ON)
+  assert all(line[0] == "Car Signal Failed" and line[2] == 'none' for line in lines)
+
+
+def test_prompt_put_aside_before_its_chime_aired_chimes_on_return():
+  ev = CarSignalEvents()
+  run(ev, 1, plan(prompt='left'), port())
+  # still on comes: its chime first, then the prompt's own (cut off after one frame), then still on's line, silent
+  lines = run(ev, int(3. / DT), plan(prompt='left'), port(still=True))
+  n = int(round(hooks.CHIME_S / DT))
+  assert all(line == ("Turn Signal Still On", "Cancel it if you're not turning", 'prompt') for line in lines[:n])
+  assert all(line == ("Signal Left", "For the turn ahead", 'tpLaneChangeLeft') for line in lines[n:2 * n - 1])
+  assert all(line == ("Turn Signal Still On", "Cancel it if you're not turning", 'none') for line in lines[2 * n:])
+  # still on over: the prompt back, its chime heard already
+  assert run(ev, 1, plan(prompt='left'), port())[0] == ("Signal Left", "For the turn ahead", 'none')
+
+
+SOUNDD_EVERY = 5  # soundd's Ratekeeper(20) over selfdrived's 100 Hz, through a conflated SubMaster: one frame in five
+
+
+def alert_sounds(frames, flags=RECHECKED):
+  """selfdriveState.alertSound per selfdrived frame for (plan, carSignal) inputs, through CarSignalEvents, the
+  turnpilotCarSignal alert and selfdrived's own Events and AlertManager."""
+  from openpilot.selfdrive.selfdrived.alertmanager import AlertManager
+  from openpilot.selfdrive.selfdrived.events import Events
+  import openpilot.selfdrive.selfdrived.events as events_mod
+  ev, old = CarSignalEvents(), events_mod.CAR_SIGNAL_EVENTS
+  events_mod.CAR_SIGNAL_EVENTS = ev
+  try:
+    am = AlertManager()
+    sounds = []
+    for frame, (p, cs) in enumerate(frames):
+      events = Events()
+      for name in ev.update(p, cs, flags, DT):
+        events.add(getattr(EventName, name))
+      am.add_many(frame, events.create_alerts([ET.PERMANENT], [car.CarParams.new_message(), car.CarState.new_message(), {}, False, 0, None]))
+      am.process_alerts(frame, set())
+      sounds.append(am.current_alert.audible_alert)
+    return sounds
+  finally:
+    events_mod.CAR_SIGNAL_EVENTS = old
+
+
+def soundd_hears(sounds, sound) -> bool:
+  """Whether soundd, reading every fifth selfdriveState, hears sound whatever its phase against selfdrived's frames."""
+  return all(sound in sounds[phase::SOUNDD_EVERY] for phase in range(SOUNDD_EVERY))
+
+
+def test_every_chime_reaches_soundd():
+  AudibleAlert = log.SelfdriveState.AudibleAlert
+  fault = [(plan('ready'), port())] * 37 + [(plan('failed'), port('failed', 'lampLost'))] * 300
+  assert soundd_hears(alert_sounds(fault, ON), AudibleAlert.prompt), "'Car Signal Failed'"
+  prompt = [(plan('failed'), port('failed', 'lampLost'))] * 700 + [(plan('failed', prompt='left'), port('failed', 'lampLost'))] * 300
+  assert soundd_hears(alert_sounds(prompt, ON)[700:], AudibleAlert.tpLaneChangeLeft), "'Signal Left'"
+  both = [(plan('failed', prompt='right'), port('failed', 'lampLost'))] * 300
+  sounds = alert_sounds(both, ON)
+  assert soundd_hears(sounds, AudibleAlert.prompt) and soundd_hears(sounds, AudibleAlert.tpLaneChangeRight), "fault and prompt"
+  still = [(plan('ready'), port(still=True))] * 300
+  assert soundd_hears(alert_sounds(still), AudibleAlert.prompt), "'Turn Signal Still On'"
+  for status, flags in (('unverified', 0), ('unavailable', ON), ('ready', ON)):
+    assert soundd_hears(alert_sounds([(plan(status), port())] * 300, flags), AudibleAlert.prompt), status
+  handed = [(plan('ready', handed='left'), port())] * 300
+  assert soundd_hears(alert_sounds(handed), AudibleAlert.prompt), "'Signal Off'"
+  for notice in ('changedMidTurn', 'ranPast'):
+    assert soundd_hears(alert_sounds([(plan('ready', notice=notice), port())] * 300), AudibleAlert.prompt), notice
+  check = ON | int(TeslaFlags.CAR_SIGNALS_CHECK)
+  for stage in ('reason', 'passed', 'failed', 'aborted'):
+    seq = [(plan('checking'), port('checking', check=stage, why='x'))] * 300
+    assert soundd_hears(alert_sounds(seq, check), AudibleAlert.prompt), stage
 
 
 def test_once_per_drive():

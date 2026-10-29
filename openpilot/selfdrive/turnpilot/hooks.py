@@ -261,6 +261,9 @@ CAR_SIGNAL_FAULT_S = 4.
 CAR_SIGNAL_ONCE_S = 6.
 CAR_SIGNAL_NOTICE_S = 3.
 PROMPT_QUIET_S = 10.  # a prompt gone this long is a new one: chimed again
+# a chime goes ahead of the lines without one until it has been on air this long: longer than any of its sounds (0.75 s),
+# so the next chime never cuts it off, and many of soundd's 20 Hz reads of selfdriveState
+CHIME_S = 1.
 SKIP_TITLE = {'hazards': "Turn Cancelled: Hazards On", 'signalLost': "Turn Cancelled: Signal Went Out",
               'sideUncertain': "Turn Side Uncertain"}
 CHECK_TITLE = {'waiting': None, 'reason': "Turn Signal Check", 'release': "Checking Left Signal", 'left': "Checking Left Signal",
@@ -277,23 +280,63 @@ def too_fast_title(plan) -> str | None:
   return SKIP_TITLE.get(skip)
 
 
+class Chime:
+  """One line's chime. soundd reads selfdriveState at 20 Hz through a conflated SubMaster, one selfdrived frame in five,
+  and plays a one-shot sound once however long alertSound holds it, so a chime stays on its line for as long as the line
+  shows, as every other TurnPilot alert keeps its sound (one 10 ms frame was heard about 1 time in 5). A line put aside
+  once its chime has been on air CHIME_S, or that ended after it was on air, comes back silent: chimed once, never again
+  for the same line."""
+  def __init__(self, sound: str = 'none'):
+    self.sound = sound
+    self.aired = 0.
+    self.on_air = False
+    self.spent = sound == 'none'
+
+  @property
+  def owed(self) -> bool:
+    """Not yet on air CHIME_S: it goes ahead of the lines without one."""
+    return not self.spent and self.aired < CHIME_S - 1e-6
+
+  def shown(self, shown: bool, dt: float) -> str:
+    """This frame's sound for the line, shown or not."""
+    if shown and not self.spent:
+      self.on_air = True
+      self.aired += dt
+      return self.sound
+    if self.on_air and not self.owed:
+      self.spent = True  # put aside once heard: silent when it comes back
+    self.on_air = False
+    return 'none'
+
+  def ended(self) -> None:
+    """The line is over: a chime that was on air at all was heard."""
+    if self.aired > 0.:
+      self.spent = True
+    self.on_air = False
+
+
 class CarSignalEvents:
   """selfdrived's turnpilotCarSignal: the turn signal's lines, their holds and once-per-drive logic (DESIGN 7.7). line is
-  the (title, text, sound) to show while the event is raised; events.py reads it."""
+  the (title, text, sound) to show while the event is raised; events.py reads it. Each line's chime (Chime) stays on it for
+  as long as it shows. A line with a chime not yet on air CHIME_S goes first (a held line's, then still on, then the
+  prompt); after that still on, the re-check, the prompt, then a held line."""
   def __init__(self):
     self.line: tuple[str, str, str] | None = None
-    self._held: tuple[str, str, str] | None = None
+    self._held: tuple[str, str] | None = None
+    self._held_chime = Chime()
     self._held_t = 0.
     self._once: set[str] = set()
     self._fault_said = False
-    self._still_said = False
+    self._still: Chime | None = None
     self._prompt_side = 'none'
     self._prompt_quiet = PROMPT_QUIET_S
+    self._prompt_chime = Chime()
     self._check_stage = 'idle'
     self._started = 0.
 
   def _hold(self, line, seconds: float) -> None:
-    self._held, self._held_t = line, seconds
+    self._held_chime.ended()
+    self._held, self._held_chime, self._held_t = line[:2], Chime(line[2]), seconds
 
   def update(self, plan, car_signal, flags: int, dt: float) -> tuple[str, ...]:
     """plan: shown_plan's (None while stale); car_signal: carState.carSignal; flags: CarParams.flags on a Tesla."""
@@ -311,9 +354,10 @@ class CarSignalEvents:
         sound = 'prompt' if stage in ('reason', 'passed', 'failed', 'aborted') else 'none'
         self._hold((title, why, sound), CAR_SIGNAL_FAULT_S if stage in ('passed', 'failed', 'aborted') else 1e9)
     self._check_stage = stage
+    recheck = None
     if flags & TeslaFlags.CAR_SIGNALS_RECHECK and not flags & TeslaFlags.CAR_SIGNALS_CHECK and stage in ('left', 'right', 'waiting') \
        and str(car_signal.status) == 'verifying':
-      self.line = ("Turn Signal Re-check", "Stay in Park" if stage != 'waiting' else str(car_signal.checkWhy), 'none')
+      recheck = ("Turn Signal Re-check", "Stay in Park" if stage != 'waiting' else str(car_signal.checkWhy))
     # a fault, said once when it happens
     if status == 'failed' and not self._fault_said:
       self._fault_said = True
@@ -349,31 +393,48 @@ class CarSignalEvents:
                  ("Turn Signal Ended", "Signal ran past the turn", 'prompt'), CAR_SIGNAL_NOTICE_S)
     elif notice == 'none':
       self._once = {o for o in self._once if not o.startswith('notice:')}
-    # a masked lamp lit past its release
+    # a masked lamp lit past its release: chimed as it starts
+    still = None
     if car_signal.stillOn:
-      if not self._still_said:
-        self._still_said = True
-        self.line = ("Turn Signal Still On", "Cancel it if you're not turning", 'prompt')
-      else:
-        self.line = ("Turn Signal Still On", "Cancel it if you're not turning", 'none')
-    else:
-      self._still_said = False
+      if self._still is None:
+        self._still = Chime('prompt')
+      still = ("Turn Signal Still On", "Cancel it if you're not turning")
+    elif self._still is not None:
+      self._still.ended()
+      self._still = None
     # the prompt (car_signals.py 6.5): while it holds, chimed once per prompt
     prompt = str(ts.prompt) if ts is not None else 'none'
+    prompt_line = None
     if prompt != 'none':
-      sound = 'none'
       if prompt != self._prompt_side or self._prompt_quiet >= PROMPT_QUIET_S:
-        sound = 'tpLaneChangeLeft' if prompt == 'left' else 'tpLaneChangeRight'
+        self._prompt_chime.ended()
+        self._prompt_chime = Chime('tpLaneChangeLeft' if prompt == 'left' else 'tpLaneChangeRight')
       self._prompt_side, self._prompt_quiet = prompt, 0.
-      if self.line is None:
-        self.line = (f"Signal {prompt.capitalize()}", "For the turn ahead", sound)
+      prompt_line = (f"Signal {prompt.capitalize()}", "For the turn ahead")
     else:
+      if self._prompt_quiet == 0.:
+        self._prompt_chime.ended()
       self._prompt_quiet += dt
+    held = None
     if self._held_t > 0.:
       self._held_t -= dt
-      if self.line is None or self._held[2] != 'none':
-        self.line = self._held
-        self._held = (self._held[0], self._held[1], 'none') if self._held_t > 0. else self._held
+      held = self._held
+    elif self._held is not None:
+      self._held_chime.ended()
+      self._held = None
+
+    # which line shows: a chime owed first, else still on, the re-check, the prompt, a held line
+    lines = [(still, self._still), (recheck, None), (prompt_line, self._prompt_chime), (held, self._held_chime)]
+    lines = [(line, chime) for line, chime in lines if line is not None]
+    owed = [(line, chime) for line, chime in ((held, self._held_chime), (still, self._still), (prompt_line, self._prompt_chime))
+            if line is not None and chime is not None and chime.owed]
+    shown = owed[0] if owed else lines[0] if lines else None
+    sound = 'none'
+    for _, chime in lines:
+      if chime is not None:
+        on = chime.shown(shown is not None and chime is shown[1], dt)
+        sound = on if shown is not None and chime is shown[1] else sound
+    self.line = (*shown[0], sound) if shown is not None else None
     return ('turnpilotCarSignal',) if self.line is not None else ()
 
 
