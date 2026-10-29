@@ -74,9 +74,12 @@ def lanes(surveyed=False):
   return junction_lanes(junction(25.), 'straight', SETBACK)
 
 
+EDGES = sr.edge_band(13., 2)  # the junction's 2-lane cross road from its default stop point 13 m before the node
+
+
 def report(lv, vis=None, **kw):
   kw.setdefault('rot_deg', ROT)
-  return lv.lanes(lanes(), 0., vis or vis_file(), **kw)
+  return lv.lanes(lanes(), 0., vis or vis_file(), edges=EDGES, **kw)
 
 
 def lane_of(rep, role, index=1):
@@ -276,8 +279,8 @@ def test_G8_a_stopped_car_in_lane_1_caps_lane_2_behind_it():
   lns = junction_lanes(j, 'straight', SETBACK)
   l1, l2 = (next(x for x in lns if (x.role, x.index) == ('left', i)) for i in (1, 2))
   car = trk(1, 9., l1)
-  rep = live().lanes(lns, 0., vis_file(), rot_deg=ROT, tracks=[car])
-  free = live().lanes(lns, 0., vis_file(), rot_deg=ROT)
+  rep = live().lanes(lns, 0., vis_file(), rot_deg=ROT, edges=EDGES, tracks=[car])
+  free = live().lanes(lns, 0., vis_file(), rot_deg=ROT, edges=EDGES)
   x1, x2 = (next(x for x in rep.lanes if (x.role, x.index) == ('left', i)) for i in (1, 2))
   lo = min(abs(b) for b in car.span_seen)
   assert x2.why == 'occluder' and x2.reach_m == pytest.approx(l2.s_min * math.tan(math.radians(lo - ROT)), abs=sr.WALK_STEP_M)
@@ -404,3 +407,11 @@ def test_ray_lane_d():
   opp = next(x for x in lanes() if x.role == 'opposite')
   x = abs(opp.y) / math.tan(math.radians(10.))
   assert ray_lane_d(opp, 10., 'min') == pytest.approx(x - opp.s_min, abs=1e-9)
+
+
+def test_a_non_stopping_lanes_need_is_the_two_way_requirement_from_the_edge_bands_far_end():
+  j = junction(25., tier='mapStrong')  # not surveyed: non-stopping this week (D10)
+  lns = junction_lanes(j, 'straight', SETBACK)
+  rep = live().lanes(lns, 0., vis_file(), rot_deg=ROT, edges=EDGES)
+  x = next(x for x in rep.lanes if x.role == 'left')
+  assert not x.stopping and x.need_m == pytest.approx(sr.reach_needed_two_way(25. * sr.MPH, EDGES.d_max), abs=1e-6)

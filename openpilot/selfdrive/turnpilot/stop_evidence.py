@@ -200,6 +200,7 @@ class StopEvidence:
     self.first: dict[int, First] = {}
     self.records: dict[int, Record] = {}
     self.states: dict[int, _State] = {}
+    self.cache: dict[int, tuple] = {}  # trackId: (its last match's camera time, TrackEvidence): nothing changes between matches
     self.newest_t: float | None = None
     self.d_stop = 0.
 
@@ -232,6 +233,7 @@ class StopEvidence:
       for tid in [k for k, h in self.hist.items() if not h or h[-1].t < self.newest_t - DROP_S]:
         del self.hist[tid]
         self.states.pop(tid, None)
+        self.cache.pop(tid, None)
 
   def assign(self, s: Sample) -> sr.Lane | None:
     """The lane a match lies in: by its bearing's side, then its forward distance against the lanes' s bands (with our
@@ -286,7 +288,13 @@ class StopEvidence:
     """Each track's evidence from its matches so far (module docstring), and its validation record brought up to date."""
     out = {}
     for tid, h in self.hist.items():
+      hit = self.cache.get(tid)
+      if hit is not None and hit[0] == h[-1].t:
+        if hit[1] is not None:
+          out[tid] = hit[1]
+        continue
       e = self._evidence(tid, h)
+      self.cache[tid] = (h[-1].t, e)
       if e is None:
         continue
       out[tid] = e

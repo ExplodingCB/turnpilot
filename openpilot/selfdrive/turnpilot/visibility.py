@@ -175,18 +175,18 @@ class LiveVisibility:
 
   # ----------------------------------------------------------------------------------------------------------- lanes
 
-  def lanes(self, lanes_at_stop: list, d_stop: float, vis, *, rot_deg: float, lighting: str = 'day', low_sun_sides=(),
-            entry: dict | None = None, stamp: dict | None = None, tracks=(), evidence: dict | None = None,
-            cam_height: float | None = None, a_launch: float = sr.A_LAUNCH_PLAN, edges: sr.Edges | None = None) -> Report:
+  def lanes(self, lanes_at_stop: list, d_stop: float, vis, *, rot_deg: float, edges: sr.Edges, lighting: str = 'day',
+            low_sun_sides=(), entry: dict | None = None, stamp: dict | None = None, tracks=(), evidence: dict | None = None,
+            cam_height: float | None = None, a_launch: float = sr.A_LAUNCH_PLAN) -> Report:
     """Each lane's reach now (module docstring). lanes_at_stop: the held control's conflicting lanes seen from its stop
     point (stop_evidence.junction_lanes); d_stop: m our car stands short of the stop point; vis: visibility_table's
     Visibility; lighting: day, sunAhead, dusk or night at the line; low_sun_sides: the sides with low sun along an approach;
     entry: the matched survey; stamp: its passing validation stamp for our approach and this lighting (certify.pick_stamp);
-    tracks: the tracker's tracks; evidence: stop_evidence's; edges: the edge band from the stop point (two-way needs)."""
+    tracks: the tracker's tracks; evidence: stop_evidence's; edges: the edge band from the stop point (stop_rules.edge_band;
+    a non-stopping lane's two-way need reads its far end)."""
     height = cam_height if cam_height is not None else (vis.height if vis.height is not None else 1.3)
     lns = [replace(ln, s_min=ln.s_min + d_stop, s_max=ln.s_max + d_stop) for ln in lanes_at_stop]
-    edges_now = sr.Edges(edges.d_min + d_stop, edges.d_max + d_stop, None if edges.nominal is None else edges.nominal + d_stop) \
-      if edges is not None else sr.Edges(d_stop, d_stop)
+    edges_now = sr.Edges(edges.d_min + d_stop, edges.d_max + d_stop, None if edges.nominal is None else edges.nominal + d_stop)
     occ = self.occluders(tracks)
     fresh = {k: self.fresh_key(k) for k in ('road', 'full', 'sideLeft', 'sideRight')}
     veil_ok = vis.veil in sr.VEIL_OK
