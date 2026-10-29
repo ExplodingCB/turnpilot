@@ -1311,6 +1311,29 @@ class TestStopAvoidance(unittest.TestCase):
     with patch('openpilot.selfdrive.navigation.navd.system_time_valid', return_value=True):
       self.assertGreater(wall_clock(), 1.7e9)
 
+  def test_a_sim_visibility_table_is_read_in_the_sim_with_the_param_and_a_sim_car(self):
+    import os
+
+    from opendbc.car.structs import car
+
+    from openpilot.selfdrive.turnpilot import visibility_table
+    from openpilot.selfdrive.turnpilot.routing.certify import Runtime
+    sim_car = car.CarParams.new_message(fingerprintSource='fixed').to_bytes()
+    real_car = car.CarParams.new_message(fingerprintSource='can', brand='tesla').to_bytes()
+    with patch.object(visibility_table.cloudlog, 'exception') as said, patch.object(visibility_table, 'cached', return_value=None) as cached:
+      cases = []
+      for env, oracle, cp in (({'SIMULATION': '1'}, True, sim_car), ({}, True, sim_car), ({'SIMULATION': '1'}, False, sim_car),
+                              ({'SIMULATION': '1'}, True, real_car), ({'SIMULATION': '1'}, True, None)):
+        self.values.update({'TurnPilotSimLightOracle': oracle, 'CarParams': cp})
+        with patch.dict(os.environ, env, clear=False):
+          if 'SIMULATION' not in env:
+            os.environ.pop('SIMULATION', None)
+          cases.append(self.engine.sim_tables_ok())
+          self.engine.certify_default(self.stop(1, 60.), self.now, Runtime())
+          self.assertEqual(cached.call_args.kwargs['sim_ok'], cases[-1])
+    self.assertEqual(cases, [True, False, False, False, False])
+    said.assert_not_called()
+
   def test_the_params_are_declared(self):
     # TurnPilotAvoidStops (on by default; step S3 sets it off) and TurnPilotStopLaunch (A_LAUNCH_PLAN, 0.5 m/s^2 until S4a)
     header = (Path(__file__).parents[3] / 'common' / 'params_keys.h').read_text()

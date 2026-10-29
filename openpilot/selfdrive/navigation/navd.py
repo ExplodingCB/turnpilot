@@ -325,14 +325,14 @@ class RouteEngine:
     """TurnPilot: a sim visibility table is read only with SIMULATION=1, TurnPilotSimLightOracle and a sim car."""
     if os.environ.get('SIMULATION') != '1':
       return False
-    car_params = None
     try:
-      from openpilot.cereal import car
+      from opendbc.car.structs import car  # card.py's CarParams (openpilot.cereal has no car)
+      oracle = self.params.get(visibility_table.SIM_PARAM)
       raw = self.params.get('CarParams')
-      if raw:
-        with car.CarParams.from_bytes(raw) as cp:
-          car_params = cp
-      return visibility_table.sim_accepted(os.environ, self.params.get(visibility_table.SIM_PARAM), car_params)
+      if not raw:
+        return visibility_table.sim_accepted(os.environ, oracle, None)
+      with car.CarParams.from_bytes(raw) as cp:  # read inside: the reader is gone once the message is closed
+        return visibility_table.sim_accepted(os.environ, oracle, cp)
     except Exception:
       cloudlog.exception("navd: the sim's CarParams don't read: no sim visibility table")
       return False
