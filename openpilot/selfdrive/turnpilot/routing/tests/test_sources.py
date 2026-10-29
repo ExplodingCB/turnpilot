@@ -854,3 +854,43 @@ def test_the_overrides_param_itself_on_the_real_params(tmp_path):
   for bad in CORRUPT:
     Path(params.get_param_path('TurnPilotJunctionOverrides')).write_bytes(bad)
     assert read_overrides(params)[:2] == ({}, False), bad
+
+
+class Writable(StandIn):
+  def put(self, key, value, *args, **kwargs):
+    assert key == 'TurnPilotJunctionOverrides'
+    self.params.put(self.key, value, block=True)
+
+
+def test_an_override_is_added_to_what_is_there_and_never_written_over_a_value_that_does_not_read(tmp_path):
+  """write_override (turnpilotd's signalSeen at a stop-sign junction): added to the entries there, an approach already named
+  keeping its first entry; never over a value that doesn't read (it may hold the downgrade that matters), nor through a
+  build whose params don't know the key: (False, why), which the caller says out loud."""
+  from openpilot.common.params import Params, UnknownKeyName
+  from openpilot.selfdrive.turnpilot.routing.junctions import read_overrides, write_override
+  params = Params(str(tmp_path))
+  real = Writable(params, 'TurnPilotValhallaTiles')
+  seen = [{'approach': '901:12:f', 'kind': 'signalSeen', 'evidence': {'source': 'stopGo signal head'}}]
+  assert write_override(real, seen) == (True, '')
+  assert read_overrides(real)[0] == {'901:12:f': {'kind': 'signalSeen', 'evidence': {'source': 'stopGo signal head'}}}
+  params.put('TurnPilotValhallaTiles', json.dumps(OVERRIDE), block=True)
+  assert write_override(real, seen) == (True, '')
+  got = read_overrides(real)[0]
+  assert set(got) == {'900:790:f', '901:12:f'} and got['900:790:f'] == {'kind': 'no', 'evidence': {'speed': 8.2}}
+  assert write_override(real, [{'approach': '900:790:f', 'kind': 'signalSeen', 'evidence': None}]) == (True, '')
+  assert read_overrides(real)[0]['900:790:f']['kind'] == 'no'
+  path = Path(params.get_param_path('TurnPilotValhallaTiles'))
+  path.write_bytes(CORRUPT[0])
+  ok, why = write_override(real, seen)
+  assert not ok and "doesn't parse" in why and path.read_bytes() == CORRUPT[0]
+
+  class Old:
+    def get(self, key):
+      raise UnknownKeyName(key)
+
+    def put(self, key, value):
+      raise UnknownKeyName(key)
+  ok, why = write_override(Old(), seen)
+  assert not ok and 'unknown' in why
+  assert write_override(None, seen)[0] is False
+  assert write_override(real, [{'approach': 'nope', 'kind': 'signalSeen'}])[0] is False

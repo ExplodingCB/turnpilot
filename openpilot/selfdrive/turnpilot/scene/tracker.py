@@ -132,6 +132,8 @@ class RawFrame:
   t: float                 # the run's camera time, s
   view: str = 'full'       # 'far': a far crop run (update_far); 'sideLeft', 'sideRight': a stop sweep's side view
   cover_deg: tuple | None = None  # a far run's (right, left) bearings at the horizon; None if the horizon isn't inside it
+  lights: tuple = ()       # a forward run's traffic-light boxes (lightBoxes, COCO 9): (bearing deg left, elevation deg above
+                           # the horizon, conf) of each box's centre, for the stop-sign decider's signal-head check (2.4 item 9)
 
 
 def view_key(camera: str, view: str) -> str:
@@ -153,6 +155,12 @@ def ground_xy(lens: Lens, rot: np.ndarray, height: float, u: float, v: float) ->
 def bearing_deg(lens: Lens, rot: np.ndarray, u: float, v: float) -> float:
   ray = rot @ lens.ray(u, v)
   return float(np.degrees(np.arctan2(-ray[1], ray[0])))
+
+
+def elevation_deg(lens: Lens, rot: np.ndarray, u: float, v: float) -> float:
+  """deg above the horizon of the pixel's ray (the calibrated frame's z is down)."""
+  ray = rot @ lens.ray(u, v)
+  return float(np.degrees(np.arctan2(-ray[2], np.hypot(ray[0], ray[1]))))
 
 
 @dataclass
@@ -485,7 +493,7 @@ class SceneTracker:
 
   def raw_frame(self, detections, camera: str, calibration, t: float, view: str = 'full', crop=None) -> RawFrame:
     """Every road user's box in this run, ranged where its bottom is below the horizon (RawBox), tracked or not. A far run
-    (view far) also says what it covers (far_cover of crop)."""
+    (view far) also says what it covers (far_cover of crop); a forward run (view full) its traffic-light boxes (lights)."""
     boxes = []
     calibrated = calibration is not None and len(calibration.rpyCalib) == 3
     lens, (w, h) = self.lenses[camera], self.sizes[camera]
@@ -506,7 +514,12 @@ class SceneTracker:
                           float(np.hypot(*near)) if near is not None else None,
                           (float(d.x0 / w), float(d.y0 / h), float(d.x1 / w), float(d.y1 / h)), view))
     cover = self.far_cover(crop, rot) if view == 'far' and crop is not None and len(crop) == 4 and rot is not None else None
-    return RawFrame(boxes, camera, t, view, cover)
+    lights = []
+    if view == 'full' and rot is not None:
+      for d in getattr(detections, 'lightBoxes', None) or ():
+        u, v = (d.x0 + d.x1) / 2, (d.y0 + d.y1) / 2
+        lights.append((bearing_deg(lens, rot, u, v), elevation_deg(lens, rot, u, v), float(d.conf)))
+    return RawFrame(boxes, camera, t, view, cover, tuple(lights))
 
   def update_in_path(self, model_v2) -> None:
     path_x, path_y = predicted_path(model_v2)

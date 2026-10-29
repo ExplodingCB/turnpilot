@@ -535,3 +535,25 @@ def test_the_tracker_says_which_lens_it_uses():
   from openpilot.selfdrive.turnpilot.scene.ranging import wide_lens
   tracker = SceneTracker(CAMS, 'mici')
   assert tracker.lens_spec == wide_lens(CAMS.wide_road, 'mici').spec == tracker.lenses['wide'].spec
+
+
+def test_a_forward_runs_traffic_light_boxes_come_with_their_bearing_and_elevation():
+  # the stop-sign decider's signal-head check (STOP_SIGNS.md 2.4 item 9, C20) reads RawFrame.lights: modeld publishes every
+  # forward run's class-9 boxes (lightBoxes), which no RawFrame carried, so the check never saw a head on the car. A head
+  # 25 m ahead, 1 m right, its centre 5.5 m above the road: its bearing, its elevation above the horizon and its conf
+  trk = SceneTracker(CAMS, 'mici')
+  cal = calibration()
+  lens = trk.lenses['road']
+  rot = calib_from_view(RPY, None).T
+  u, v = lens.project(rot @ np.array([25., 1., HEIGHT - 5.5]))
+  msg = messaging.new_message('turnpilotDetections')
+  fill_detections(msg.turnpilotDetections, np.zeros((0, 6), np.float32), 0, int(1e9), 'road', 0.005)
+  o, = msg.turnpilotDetections.init('lightBoxes', 1)
+  o.cls, o.conf, o.x0, o.y0, o.x1, o.y1 = 9, 0.7, float(u) - 4., float(v) - 10., float(u) + 4., float(v) + 10.
+  trk.update(msg.as_reader().turnpilotDetections, cal, car_state(), now=1.0)
+  (bearing, elevation, conf), = trk.raw.lights
+  assert abs(bearing - np.degrees(np.arctan2(-1., 25.))) < 0.1 and abs(elevation - np.degrees(np.arctan2(5.5 - HEIGHT, 25.))) < 0.1
+  assert abs(conf - 0.7) < 1e-6
+  # a run with none carries none
+  trk.update(detections(trk, 'road', 1.1, [(CAR, 20., 0., 0.6)], frame_id=1), cal, car_state(), now=1.1)
+  assert trk.raw.lights == ()

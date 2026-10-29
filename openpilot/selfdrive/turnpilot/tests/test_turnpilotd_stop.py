@@ -63,6 +63,7 @@ class StopSim(Sim):
     self.k, self.t_cam = 0, 100.
     self.boxes = lambda sim: {}
     self.tracks = lambda sim: ()
+    self.heads = lambda sim: ()  # a forward run's traffic-light boxes (RawFrame.lights: bearing, elevation, conf)
     self.engaged = True
     self.brake = False
     self.side_status = lambda sim: 'running'
@@ -101,7 +102,8 @@ class StopSim(Sim):
     side = view.startswith('side')
     runs = []
     if not side or self.side_status(self) in ('running', 'noRoom'):
-      raw = RawFrame(list(self.boxes(self).get(view, [])), 'road' if view == 'road' else 'wide', self.t_cam, view if side else 'full')
+      raw = RawFrame(list(self.boxes(self).get(view, [])), 'road' if view == 'road' else 'wide', self.t_cam, view if side else 'full',
+                     lights=() if side else tuple(self.heads(self)))
       runs = [(view, self.t_cam, raw, sectors(view) if side else None)]
     self.tp.side_status = self.side_status(self)
     self.tp.observe_runs(FakeTracker(runs, self.tracks(self)))
@@ -366,6 +368,48 @@ def test_O2_a_roll_up_g5_never_lifts_hands_back_h5_never_a_silent_stand(tmp_path
   assert k is not None and k * DT_MDL <= ROLLUP_WAIT_S + 6. and plans[k].reason == "Can't start: take control"
   assert all(p.shouldStop for p in plans[k + 1:]) and S_LINE - sim.s > 3.
   assert not any(p.controlPrompt == 'carStoppedTakeControl' for p in plans)
+
+
+class OverridesParam(dict):
+  """TurnPilotJunctionOverrides as Params holds it (a STRING key, json text); fail: put raises it (a build that predates the
+  key, a full disk)."""
+  def __init__(self, fail=None):
+    super().__init__()
+    self.fail = fail
+
+  def get(self, key):
+    return super().get(key)
+
+  def put(self, key, value):
+    if self.fail is not None:
+      raise self.fail
+    self[key] = value
+
+
+def test_C20_a_signal_head_at_the_junction_writes_signal_seen_for_navd_and_a_failed_write_is_said(tmp_path):
+  # 2.4 item 9: a class-9 head over the junction on 3 of 5 forward runs makes it uncertifiable for the encounter (H3 'signal
+  # at junction') and names it in TurnPilotJunctionOverrides (signalSeen), so navd routes around it from then on; StopGo's
+  # hook did nothing. Not written, it is logged and said (overrideWriteFailed), never silently lost (O16)
+  import json
+  from openpilot.common.params import UnknownKeyName
+  from openpilot.selfdrive.turnpilot.routing.junctions import read_overrides
+  for fail in (None, UnknownKeyName('TurnPilotJunctionOverrides')):
+    sim = StopSim(tmp_path)
+    sim.tp.params = OverridesParam(fail)
+    sim.heads = lambda s: ((2., 12., 0.7),)  # over the junction, above the horizon
+    run_to_line(sim)
+    sim.run(20.)
+    plans = sim.plans()
+    assert go_frame(sim) is None
+    assert any(p.controlPrompt == 'stopSignTakeControl' and p.reason == "Stop sign: signal at junction: take control" for p in plans)
+    alerts = [str(p.controlAlert) for p in plans]
+    if fail is None:
+      got, ok, _ = read_overrides(sim.tp.params)
+      assert ok and got and all(v['kind'] == 'signalSeen' for v in got.values())
+      assert {k.split(':')[0] for k in got} == {str(NODE)} and {k.split(':')[1] for k in got} == {'11', '12', '13'}
+      assert len(json.loads(sim.tp.params['TurnPilotJunctionOverrides'])) == 6 and 'overrideWriteFailed' not in alerts
+    else:
+      assert 'TurnPilotJunctionOverrides' not in sim.tp.params and 'overrideWriteFailed' in alerts
 
 
 def test_V19_a_car_backing_out_ahead_holds_the_go(tmp_path):

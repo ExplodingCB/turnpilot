@@ -204,6 +204,8 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     crossTrafficAfterCommit @13; # a cross vehicle met past the in-lane point: said, never braked for (stopping in a lane is worse)
     cameraPaused @14;           # a view the decider needs hasn't run for DET_FAULT_S: held, waiting FAULT_GRACE_S for it (H1 after)
     stalledInJunction @15;      # standing past the in-lane point: a clearBox go (up to CLEAR_BOX_GOES), then H5
+    overrideWriteFailed @16;    # a TurnPilotJunctionOverrides entry (a signal head seen at a stop-sign junction) couldn't be
+                                # written: navd may route through that junction again; logged with the entry (STOP_SIGNS.md O16)
   }
   mapControl @24 :MapControlStatus;
   controlPrompt @25 :ControlPrompt;

@@ -305,6 +305,32 @@ def read_overrides(params) -> tuple[dict[str, dict], bool, str]:
     return {}, False, f"{OVERRIDES_PARAM} doesn't parse: {e}"
 
 
+def write_override(params, entries) -> tuple[bool, str]:
+  """Add entries ({approach, kind, evidence}) to TurnPilotJunctionOverrides (turnpilotd: a signal head seen at a stop-sign
+  junction, signalSeen; STOP_SIGNS.md 2.4 item 9, C20), every entry already there kept as it is (an approach already named
+  keeps its first entry). (True, '') once written, or with nothing new; (False, why) when it can't be: no params, a param
+  this build doesn't know, a value that doesn't read (never written over: it may hold the downgrade that matters), or the
+  write itself failing. The caller says a failure out loud (O16: never silently lost)."""
+  if params is None:
+    return False, "no params to write to"
+  for e in entries:
+    if not isinstance(e.get('approach'), str) or len(e['approach'].split(':')) != 3 or e.get('kind') not in OVERRIDE_KINDS:
+      return False, f"bad entry {e!r}"
+  current, ok, why = read_overrides(params)
+  if not ok:
+    return False, why
+  new = [e for e in entries if e['approach'] not in current]
+  if not new:
+    return True, ''
+  items = [{'approach': k, 'kind': v['kind'], 'evidence': v.get('evidence')} for k, v in current.items()]
+  items += [{'approach': e['approach'], 'kind': e['kind'], 'evidence': e.get('evidence')} for e in new]
+  try:
+    params.put(OVERRIDES_PARAM, json.dumps(items))
+  except Exception as e:  # UnknownKeyName, an OSError, a value it refuses
+    return False, f"{OVERRIDES_PARAM} write failed: {type(e).__name__}: {e}"
+  return True, ''
+
+
 def junction_legs(edges, tpts, a: int, ahead: bool) -> tuple[list[tuple[float, float]], list[Leg], int]:
   """(the junction's nodes [(lat, lon)], its legs, the index of its last edge) for the control at the end of trace edge a
   (module docstring)."""

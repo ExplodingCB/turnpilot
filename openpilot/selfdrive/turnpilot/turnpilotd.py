@@ -170,6 +170,7 @@ FAR_STATUS_STALE_S = 1.         # the full pass's farStatus older than this: the
 # farStatus of a far crop that is on (route time: far_live); a stop sweep suspends it (sweep) without turning it off
 FAR_ON = ('read', 'noRoom', 'noCalibration', 'sweep')
 SIDE_OFF_ALERT_S = ABORT_HOLD_S  # sideCamerasOff is shown this long, once, when the side views go off for the drive
+OVERRIDE_FAILED_ALERT_S = 2. * ABORT_HOLD_S  # overrideWriteFailed is shown this long when an override can't be written
 
 Desire = log.Desire
 State = custom.TurnpilotPlan.State
@@ -360,6 +361,8 @@ class TurnPilot:
     self.sg_now: StopGoDecision | None = None  # this frame's decision, once update() has made it
     self.sg_turned = 0.           # deg the car has turned since the decider's go
     self.last_holding = False     # the last plan's scene held the car (the decider's clearBox waits it out)
+    self.params = None            # Params (main()): TurnPilotJunctionOverrides is written through it (signal_seen_override)
+    self.override_failed_t = 0.   # s overrideWriteFailed has left to show
     self.reset()
 
   def reset(self, detector: bool = True, keep_turn: bool = False):
@@ -383,6 +386,7 @@ class TurnPilot:
       self.engaged_wait_s = 0.     # time since the first engaged frame, before the first detection
       self.left = UnprotectedLeft()  # the autonomous unprotected left (unprotected_left.py); kept through a fault, as its latch
       self.stop_go = StopGo()  # the stop-sign decider: kept through a fault, as the latch it decides for
+      self.stop_go.on_signal_seen = self.signal_seen_override
     self.go_cert.withdraw('reset')  # a disabled plan carries no go
     self.stopped_s = 0.            # standing engaged with nothing holding the car (carStoppedTakeControl)
     self.stall_s = 0.              # standing in the turn after its go, nothing holding the car (stalledTakeControl)
@@ -763,6 +767,9 @@ class TurnPilot:
     if self.side_off_t > 0. and str(plan.controlAlert) == 'none':  # the side views off for the drive: said once, a status line,
       plan.controlAlert = 'sideCamerasOff'                            # its time running only while it is shown
       self.side_off_t = max(self.side_off_t - DT_MDL, 0.)
+    if self.override_failed_t > 0. and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS:
+      plan.controlAlert = 'overrideWriteFailed'  # a signal seen at a stop sign not saved for navd: said with a chime (O16)
+    self.override_failed_t = max(self.override_failed_t - DT_MDL, 0.)
     if decision.hard_brake:  # a confirmed track's hard stop outranks the map's alerts (scene_policy.py)
       plan.controlAlert = 'hardBrake'
     stalled = self.stalled_in_turn(sm, cs, v_ego, acting, decision, mapd)
@@ -1003,6 +1010,27 @@ class TurnPilot:
     except Exception:
       log_error("turnpilotd.stop_go_failed")
       return StopGoDecision(latch='shadow', withdraw='error')
+
+  def signal_seen_override(self, j) -> None:
+    """A signal head at a stop-sign junction (stop_go: 2.4 item 9, C20): TurnPilotJunctionOverrides names it signalSeen so
+    navd's certifier (check 8, any approach overridden) routes around it from the next lookup on; the junction may have been
+    converted to a signal since it was surveyed. The bus carries an approach's way but not its direction, so both directions of
+    every listed approach's way are written (only the real ones ever match navd's keys). Not written (no params, a param this
+    build doesn't know, a value that doesn't read, the write failing): logged and said (overrideWriteFailed), never silently
+    lost (row O16)."""
+    from openpilot.selfdrive.turnpilot.routing.junctions import approach_key, write_override
+    ways = sorted({int(a.way_id) for a in (j.approaches if j is not None else []) if a.way_id})
+    node = int(j.osm_node_id) if j is not None else 0
+    evidence = {'source': 'stopGo signal head', 'wallTime': self.wall_clock(), 'ways': ways}
+    entries = [{'approach': approach_key(node, w, fwd), 'kind': 'signalSeen', 'evidence': evidence} for w in ways for fwd in (True, False)]
+    ok, why = write_override(self.params, entries) if node and entries else (False, "the junction's node or ways unknown")
+    if ok:
+      cloudlog.event("turnpilot.override_written", kind='signalSeen', osmNodeId=node, approaches=[e['approach'] for e in entries])
+      return
+    log_error(f"turnpilotd: signal seen at junction {node} not saved to TurnPilotJunctionOverrides: {why}")
+    cloudlog.event("turnpilot.override_write_failed", error=True, kind='signalSeen', osmNodeId=node, why=why,
+                   approaches=[e['approach'] for e in entries])
+    self.override_failed_t = OVERRIDE_FAILED_ALERT_S
 
   def certify_stop_go(self, sm, cs, available: bool, objects, raw, decision, took_over: bool, sg: StopGoDecision) -> None:
     """The stop-sign decider's go (sg.go_cause: stopSign, rollUp, clearBox) certified for plannerd's bounded lift (go_override.py)
@@ -1704,6 +1732,7 @@ def main():
       tp.left_far_range_m = left_far_range_for(params)
       tp.go_override = go_override_for(params)
       tp.stop_sign_mode, tp.stop_sign_known = stop_sign_mode_for(params)
+      tp.params = params
       cp = car_params(params)
       tp.cp_delay = float(cp.longitudinalActuatorDelay) if cp is not None else tp.cp_delay
       if params.get("ChestnutActive") is False:  # None: no big model expected this drive

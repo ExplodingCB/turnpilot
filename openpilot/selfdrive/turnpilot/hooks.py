@@ -54,7 +54,7 @@ def limits_plan(sm, now: float | None = None):
 # above too fast to turn. The stop-sign decider's (stop_go.py): a cross vehicle met in a lane, the cross-traffic camera paused
 # while held, stalled past the in-lane point: said with a chime, never a handback themselves
 CONTROL_ALERT_FIRST = ('hardBrake', 'cannotStopComfortably', 'offRouteStopsUnknown', 'oncomingHolding', 'crossTrafficAfterCommit',
-                       'cameraPaused', 'stalledInJunction')
+                       'cameraPaused', 'stalledInJunction', 'overrideWriteFailed')
 # handbacks: the car held while the driver is told to take control (map_controls.py, turnpilotd.py), above too fast to turn
 TAKE_CONTROL_PROMPTS = ('stopSignTakeControl', 'unprotectedTurnTakeControl', 'carStoppedTakeControl', 'stalledTakeControl',
                         'cantStartTakeControl', 'leftUndecidedTakeControl')
@@ -164,6 +164,7 @@ CONTROL_ALERT_TEXT = {
   'crossTrafficAfterCommit': 'Cross traffic: carrying on through the junction',
   'cameraPaused': 'Cross-traffic camera paused: holding',
   'stalledInJunction': 'Stalled in the junction: going again',
+  'overrideWriteFailed': 'Signal seen at a stop sign not saved: the route may use it again',
 }
 
 

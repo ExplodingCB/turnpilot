@@ -300,3 +300,15 @@ def test_the_stop_sign_wait_is_silent_its_go_chimes_and_its_faults_hand_back():
     a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert=kind)))
     assert a.alert_text_1 == title and a.audible_alert == AudibleAlert.prompt and a.alert_text_2 == CONTROL_ALERT_TEXT[kind], kind
     assert plan_events(FakeSM(plan(controlAlert=kind))) == ['turnpilotControlAlert']
+
+
+def test_a_failed_junction_override_write_is_appended_and_said_with_a_chime():
+  # STOP_SIGNS.md O16: a TurnPilotJunctionOverrides entry turnpilotd couldn't write (a signal head seen at a stop sign) is
+  # never silently lost: ControlAlert overrideWriteFailed @16, after stalledInJunction @15, said with a chime, never a handback
+  from openpilot.cereal import custom
+  from openpilot.selfdrive.turnpilot.hooks import CONTROL_ALERT_FIRST, CONTROL_ALERT_TEXT, plan_events
+  assert custom.TurnpilotPlan.ControlAlert.schema.enumerants['overrideWriteFailed'] == 16
+  a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='overrideWriteFailed')))
+  assert a.alert_text_1 == 'Junction Not Saved' and a.alert_text_2 == CONTROL_ALERT_TEXT['overrideWriteFailed']
+  assert a.audible_alert == AudibleAlert.prompt and 'overrideWriteFailed' in CONTROL_ALERT_FIRST
+  assert plan_events(FakeSM(plan(controlAlert='overrideWriteFailed'))) == ['turnpilotControlAlert']
