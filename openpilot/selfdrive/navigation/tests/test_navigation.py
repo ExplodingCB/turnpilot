@@ -368,6 +368,36 @@ class TestRouteEngine(unittest.TestCase):
     self.assertEqual([c.id for c in ni.controls], [1])  # the signal is 52 m behind now
     self.assertAlmostEqual(ni.controls[0].distance, 50. - 0.0002 * step / 0.001, delta=0.1)
 
+  def test_navd_fills_junction_info_on_the_route_and_off_it(self):
+    """A stop or yield's junction goes out with it (MapControl.junctionInfo, STOP_SIGNS.md 3.1): on the route and in the
+    lookups ahead off it; a signal has none (status none)."""
+    from openpilot.selfdrive.turnpilot.routing.controls import Control
+    from openpilot.selfdrive.turnpilot.routing.junctions import Approach, Junction
+
+    def junction(osm, tier):
+      return Junction(osm_node_id=osm, lat=0.001, lon=0., stop_point_distance=13., heading_in=90., maneuver='left', turn_angle=-90.,
+                      rail_distance=-1., sidecar=True, approaches=[Approach(0., -90., 'exit', 'secondary', 'road', True, True, 1, 1,
+                                                                            'none', 'none', tier, 0., 20.1, 'classDefault', 812)])
+    self.engine.router.controls_result = ([Control(0, 'signal', 30., 0, 30.),
+                                           Control(1, 'stop', 60., 0, 60., junction_info=junction(900, 'no'))], 'ok')
+    self.load_route()
+    self.engine.send_instruction()
+    ni = self.last_message('navInstruction').navInstruction
+    signal, stop = ni.controls
+    self.assertEqual(str(signal.junctionInfo.status), 'none')
+    j = stop.junctionInfo
+    self.assertEqual((str(j.status), j.osmNodeId, str(j.maneuver), round(j.stopPointDistance, 1), j.sidecar), ('ok', 900, 'left', 13., True))
+    self.assertEqual([(str(a.role), str(a.roadClass), str(a.tier), a.wayId) for a in j.approaches], [('exit', 'secondary', 'no', 812)])
+    off, status, road = self.ahead([(0, 'stop', 80.)])
+    off[0].junction_info = junction(901, 'unknown')
+    off[0].junction_info.maneuver = 'unknown'
+    self.engine.router.ahead_result = (off, status, road)
+    self.engine.last_position, self.engine.last_bearing = (0.0001, 0.001), 92.
+    self.engine.send_instruction()
+    ni = self.last_message('navInstruction').navInstruction
+    j = ni.offRouteControls[0].junctionInfo
+    self.assertEqual((j.osmNodeId, str(j.maneuver), str(j.approaches[0].tier)), (901, 'unknown', 'unknown'))
+
   def test_controls_computed_by_the_route_job_once(self):
     self.engine.background = True
     self.engine.router.steps = self.response

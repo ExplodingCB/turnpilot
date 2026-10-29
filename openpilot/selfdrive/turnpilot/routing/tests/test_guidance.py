@@ -305,3 +305,15 @@ class TestJunctionSchema(unittest.TestCase):
     self.assertEqual((str(c.junctionInfo.status), str(c.junctionInfo.maneuver), str(c.junctionInfo.certification)),
                      ('none', 'unknown', 'unchecked'))
     self.assertEqual(str(ni.avoidStatus), 'none')
+
+
+class TestFillControls(unittest.TestCase):
+  def test_the_junction_rides_with_its_control(self):
+    from openpilot.selfdrive.turnpilot.routing.controls import Control
+    from openpilot.selfdrive.turnpilot.routing.guidance import fill_controls
+    from openpilot.selfdrive.turnpilot.routing.junctions import Junction
+    ni = messaging.new_message('navInstruction').navInstruction
+    fill_controls(ni, [Control(0, 'stop', 50., 0, 50., junction_info=Junction(osm_node_id=7, suspected=True, status='failed')),
+                       Control(1, 'signal', 80., 0, 80.)], 'partial', 0.)
+    self.assertEqual([(c.junctionInfo.osmNodeId, c.junctionInfo.suspected, str(c.junctionInfo.status)) for c in ni.controls],
+                     [(7, True, 'failed'), (0, False, 'none')])

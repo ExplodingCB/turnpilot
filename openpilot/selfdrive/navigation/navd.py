@@ -10,7 +10,8 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.navigation.helpers import latest_gps_source
 from openpilot.selfdrive.navigation.route import along_path, local_meters
 from openpilot.selfdrive.turnpilot.routing.controls import haversine
-from openpilot.selfdrive.turnpilot.routing.guidance import CONTROLS_AHEAD_M, CONTROLS_BEHIND_M, MAX_CONTROLS, fill_controls, fill_guidance
+from openpilot.selfdrive.turnpilot.routing.guidance import (CONTROLS_AHEAD_M, CONTROLS_BEHIND_M, MAX_CONTROLS, control_msg, fill_controls,
+                                                            fill_guidance)
 from openpilot.selfdrive.turnpilot.maps.client import MapError
 from openpilot.selfdrive.turnpilot.routing.sources import MapRouter
 
@@ -369,8 +370,7 @@ class RouteEngine:
     along, _ = along_path(self.off_road, self.last_position)
     near = sorted(((c.route_m - along, i, c) for i, c in self.off_controls if -CONTROLS_BEHIND_M < c.route_m - along < CONTROLS_AHEAD_M),
                   key=lambda dic: dic[0])[:MAX_CONTROLS]
-    ni.offRouteControls = [{'id': i, 'kind': c.kind, 'distance': float(d), 'lineMapped': c.line_mapped, 'junction': c.junction,
-                            'crossSuspect': c.cross_suspect} for d, i, c in near]
+    ni.offRouteControls = [control_msg(c, d, i) for d, i, c in near]
 
   def collect_ahead(self):
     """TurnPilot: a finished lookup ahead becomes the off-route controls; one the last lookup had (its kind, its stop point
