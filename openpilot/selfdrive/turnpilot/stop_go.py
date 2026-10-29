@@ -483,7 +483,11 @@ class StopGo:
   def _feed(self, f: Frame, pos: float) -> None:
     """The tracks into the decider's evidence (once a frame), the runs into the views' ages and the signal-head check."""
     self.evidence.observe(f.tracks or (), d_stop=-pos)
-    self.ev = self.evidence.evaluate()
+    # only the tracks the tracker publishes now (it coasts a missed one SWEEP_COAST_S): StopEvidence ages a history against
+    # its newest sample, so with no tracks left nothing would age out. An earlier arrival that vanishes stays waiting
+    # (_turn_holds), never presumed gone
+    live = {getattr(t, 'track_id', None) for t in f.tracks or ()}
+    self.ev = {tid: e for tid, e in self.evidence.evaluate().items() if tid in live}
     for tid, e in self.ev.items():
       if e.stopped_at_line:
         self.stopped_since.setdefault(tid, self.t - e.stopped_s)
@@ -593,6 +597,11 @@ class StopGo:
         d.reason = f"Stopping short: {self.aborting['why']}"
         return
       self.aborting = None
+      room, need = self.edges.d_min - pos, sr.go_room_m(f.t_abort, right=f.maneuver == 'right')
+      if acting and room < need - 1e-6:
+        # a withdrawn go come to rest with no room for another (2.6): H5, never a wait from where no go can start
+        self._fault('H5', f, d, f"no room for another go: {room:.2f} m to the closest edge, {need:.2f} needed")
+        return
     holds = self.go_holds(f, pos, launch=False)
     d.holds = holds
     self.clear_s = self.clear_s + f.dt if not holds else 0.
@@ -618,6 +627,8 @@ class StopGo:
     self.takeover.reset()
     self.takeover_s, self.uncommit_s = -1., 0.
     self.state, self.clear_s = 'going', 0.
+    self.static_s = self.dynamic_s = 0.
+    self.next_chime = WAIT_INFO_S
     d.release = (self.key, 'clear') if ctl is not None else None
     d.go_cause = 'stopSign'
     d.prompt, d.reason, d.action, d.ledger = 'stopGo', "Going", 'going', 'none'
@@ -1100,10 +1111,15 @@ class StopGo:
     info chime at WAIT_INFO_S and every WAIT_INFO_S after. Static (every hold static): STATIC_WAIT_S, then the ladder (H3).
     A fault's: its grace, then its handback. As shadow, only said (the latch's own handback stands)."""
     d.prompt = 'waitingForCross'
+    # the wait's clock (the info chime's) runs from the arrival to the go, whatever comes and goes meanwhile
+    self.dynamic_s += f.dt
+    if self.dynamic_s >= self.next_chime - 1e-6:
+      self.next_chime += WAIT_INFO_S
+      self.chime_t = INFO_CHIME_S
     if not holds:
+      # clear, CLEAR_S not yet run: the static clock keeps its count (a static cause that flickers still meets its bound)
       d.ledger, d.reason = 'none', "Cross traffic clear"
-      self.static_s = self.dynamic_s = self.paused_s = self.h2_s = 0.
-      self.next_chime = WAIT_INFO_S
+      self.paused_s = self.h2_s = 0.
       return
     top = holds[0]
     d.reason = "Waiting: " + top.reason
@@ -1135,15 +1151,14 @@ class StopGo:
       self._fault('H3', f, d, deadlock.reason)
       return
     if DYNAMIC in kinds:
+      # something moving: waiting is right, with no bound; a static cause starts its clock again once nothing moves
       d.ledger = DYNAMIC
-      self.dynamic_s += f.dt
-      if self.dynamic_s >= self.next_chime - 1e-6:
-        self.next_chime += WAIT_INFO_S
-        self.chime_t = INFO_CHIME_S
+      self.static_s = 0.
       if self.chime_t > 0.:
         self.chime_t = max(self.chime_t - f.dt, 0.)
         d.chime, d.reason = True, "Waiting for cross traffic"
       return
+    self.chime_t = 0.
     d.ledger = STATIC
     self.static_s += f.dt
     route_known = f.route_cert == 'uncertifiable' and top.key.startswith('cert:')

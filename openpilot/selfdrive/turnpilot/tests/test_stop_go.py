@@ -11,6 +11,7 @@ from collections import deque
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot import stop_rules as sr
@@ -190,8 +191,9 @@ class Drive(World):
     sc = self.scene.update([], True, None, float('inf'), self.v, extra_stops=latch + d.stops)
     speed_cap = min(sc.speed_cap, d.speed_cap)
     a_tp = plan_accel(sc.accel_cap, speed_cap, self.v)
-    lifted = self.gc.active and model_stop and not sc.should_stop and sc.accel_cap >= 10. and speed_cap > self.v + 0.5 and \
-      self.v < GO_END_SPEED
+    # GoLift: the e2e candidate lifted while the go is out, unless TurnPilot's candidate holds the car (its stop, or under 0.3
+    # m/s an accel under 0.1: go_override.holds), the model brakes past GO_MODEL_BRAKE, or the car is at GO_END_SPEED
+    lifted = self.gc.active and not sc.should_stop and not (self.v < 0.3 and a_tp < 0.1) and self.v < GO_END_SPEED and a_model >= -1.
     a_e2e = max(a_model, GO_ACCEL) if lifted else a_model
     stop_now = sc.should_stop or (model_stop and not lifted)
     a_cmd = min(a_e2e, a_tp)
@@ -503,7 +505,17 @@ def cars(*specs):
         continue
       ln = lanes_of(w.j)[role]
       s = (ln.s_min + ln.s_max) / 2. - pos
-      view = 'sideLeft' if role == 'left' else 'sideRight' if role == 'right' else 'road'
+      if role == 'opposite':
+        # a lane parallel to ours: the car's box bottom is its front, d down the lane from where it crosses our path
+        x, y = s + max(dd, 0.3), -ln.y
+        trk = SimpleNamespace(track_id=tid, t_seen=w.t_cam, bearing_seen=math.degrees(math.atan2(y, x)), width_seen=1.8 * 1141. / x,
+                              view='road', cls=cls, x=np.array([x, y, 0., 0.]))
+        half = math.degrees(math.atan2(0.9, x))
+        trk.span_seen = (trk.bearing_seen - half, trk.bearing_seen + half)
+        trk.hits = 5
+        out.append(trk)
+        continue
+      view = 'sideLeft' if role == 'left' else 'sideRight'
       trk = ev_track(tid, w.t_cam, max(dd, 0.3), ln, view=view, cls=cls, s=s)
       half = math.degrees(math.atan2(0.9, math.hypot(s, dd)))
       trk.span_seen = tuple(sorted((trk.bearing_seen - half, trk.bearing_seen + half)))
@@ -511,6 +523,16 @@ def cars(*specs):
       out.append(trk)
     return out
   return tracks
+
+
+def watch(w, seconds=2.):
+  """The car standing short of its line, the stop engaged but not yet latched, for seconds: the decider watching the
+  junction from its approach (as it does from STOP_SWEEP_M out), so a car already at its line is a trusted, stopped track by
+  the time of our full stop."""
+  w.control.held = False
+  out = w.run(seconds, approach=w.control)
+  w.control.held = True
+  return out
 
 
 def person(tid, x, y, vx=0., vy=0.):
@@ -602,7 +624,8 @@ def test_takeover_a_model_that_holds_is_withdrawn_short_of_the_gate_retried_twic
   out = w.run(40.)
   gos = [k for k, d in enumerate(out) if d.go_cause == 'stopSign']
   withdrawn = [d for d in out if d.withdraw and d.withdraw not in ('fault',)]
-  assert len(gos) == 3 and len(withdrawn) == 3  # the go and two retries
+  # the go and its retries while GO_ROOM_M remains (G5's lift carries a holding car 2.25 m each time), then H5
+  assert 2 <= len(gos) <= 3 and len(withdrawn) == len(gos)
   assert all(d.withdraw in ('window', 'gate') for d in withdrawn)
   h5 = next(d for d in out if d.fault == 'H5')
   assert h5.prompt == 'stopSignTakeControl' and h5.reason == "Can't start: take control"
@@ -672,3 +695,498 @@ def test_signal_head_on_3_of_5_forward_runs_makes_the_junction_uncertifiable_and
     w.trace.append(out[-1])
   assert first_go(out) is None and seen and w.sg.signal_seen
   assert any(h.key == 'signal' and h.kind == 'static' for h in out[-1].holds)
+
+
+class Queue(Drive):
+  """Drive with map_controls' approach and latch in the loop: the control engaged d0 m ahead (not held), its distance
+  dead-reckoned, the map curve as a cap (map_controls.curve), the latch holding the car slower than LATCH_SPEED within
+  LATCH_NEAR_M of its stop point (LATCH_PAST_M past it)."""
+  def __init__(self, tmp_path, d0=8., lead=None, **kw):
+    super().__init__(tmp_path, d0=d0, **kw)
+    self.control.held = False
+    self.lead = lead  # (world) -> m to the model's lead, or None
+
+  def frame(self, **kw):
+    from openpilot.selfdrive.turnpilot.map_controls import LATCH_NEAR_M, LATCH_PAST_M, LATCH_SPEED
+    c = self.control
+    if not c.held and self.v < LATCH_SPEED and -LATCH_PAST_M < c.d < LATCH_NEAR_M and not getattr(self, 'released', False):
+      c.held, self.state.moved_m = True, 0.
+    lead = self.lead(self) if self.lead is not None else None
+    kw.setdefault('lead_m', lead)
+    kw.setdefault('approach', None if c.held else c)
+    return super().frame(**kw)
+
+  def step(self, **kw):
+    was = self.control.held
+    d = super().step(**kw)
+    if was and not self.control.held:
+      self.released = True
+    if not self.control.held and not getattr(self, 'released', False):
+      self.control.d -= self.v * DT_MDL
+    return d
+
+
+# --------------------------------------------------------------------------------------------- the catalogue's sg rows
+
+def test_C1_all_way_order_ties_shields_u2_the_go_and_the_band(tmp_path):
+  # section 4.5 in one: an earlier arrival at the left line goes first, a later one at the right line waits (a shield), U2
+  # holds a roller until it is through, then the go, the launch and the band to the far side
+  w = Drive(tmp_path, behaviour=lambda w: 'goes')
+  w.tracks = cars((1, 'left', at_line(t0=-10.)), (2, 'right', at_line(t0=4.)))
+  watch(w)
+  first = w.run(4.)
+  assert first_go(first) is None and first[-1].rank == 1
+  w.tracks = cars((1, 'left', lambda t: LINE_D - 6. * (t - 6.) if t >= 6. else LINE_D), (2, 'right', at_line(t0=4.)))
+  out = w.run(16.)
+  i = first_go(out)
+  assert i is not None and any(d.state in ('committed', 'inLane', 'done') for d in out[i:])
+
+
+def test_C2_a_two_way_the_route_could_not_avoid_hands_back_h3_right_after_the_full_stop(tmp_path):
+  # route-known (junctionInfo.certification uncertifiable): H3 right after the 1 s full stop, rungs 1 and 2 skipped
+  w = World(tmp_path, j=two_way(), entries=[])
+  out = w.run(2.)
+  h3 = next(k for k, d in enumerate(w.trace) if d.fault == 'H3') if any(d.fault for d in out) else None
+  assert h3 is None  # met off the route: its static wait first (the phantom clear's case)
+  w = World(tmp_path, j=two_way(), entries=[])
+  out = w.run(2., route_cert='uncertifiable')
+  h3 = next(k for k, d in enumerate(out) if d.fault == 'H3')
+  assert (h3 + 1) * DT_MDL <= 1.0 + 2 * DT_MDL + 1e-6 and out[h3].reason == "Stop sign: this stop needs you: take control"
+  assert all(d.go_cause == 'none' for d in out)
+
+
+@pytest.mark.parametrize('stops_not', ['left', 'right', 'opposite'])
+@pytest.mark.parametrize('maneuver', ['straight', 'left', 'right'])
+def test_C3_a_three_way_stop_at_a_four_leg_junction_takes_no_maneuver_its_set_touches_the_unstopped_approach(tmp_path, stops_not,
+                                                                                                           maneuver):
+  # 2.1's straight union: every maneuver's set touches every other approach at a 4-leg junction, so none certifies
+  j = junction(maneuver=maneuver, tiers={stops_not: 'no'})
+  next(a for a in j.approaches if sr.effective_role(a) == stops_not).control = 'none'
+  w = World(tmp_path, j=j, maneuver=maneuver)
+  out = w.run(17.)
+  assert first_go(out) is None and out[-1].fault == 'H3'
+
+
+def t_junction(maneuver='left', exit_control='stop'):
+  """The car on a T's stem: the cross road's left and right approaches, no opposite one; the road it leaves by is the exit leg."""
+  j = junction(maneuver=maneuver)
+  j.approaches = [a for a in j.approaches if sr.effective_role(a) != 'opposite']
+  for a in j.approaches:
+    if a.role == 'exit':
+      a.control = exit_control
+  return j
+
+
+def test_C4_a_t_junction_from_its_stem_goes_with_only_its_approaches_and_an_unknown_leg_never(tmp_path):
+  w = World(tmp_path, j=t_junction('left'), maneuver='left')
+  out = w.run(5.)
+  assert first_go(out) is not None and {x.role for x in out[first_go(out) - 1].lanes} == {'left', 'right'}
+  w = World(tmp_path, j=t_junction('left', exit_control='unknown'), maneuver='left')
+  out = w.run(17.)
+  assert first_go(out) is None and any(h.key == 'cert:unknownLeg' for h in out[30].holds) and out[-1].fault == 'H3'
+
+
+def test_G23_the_exit_leg_unmatched_reads_unknown_and_the_junction_is_unknown_leg(tmp_path):
+  j = junction(maneuver='right')
+  next(a for a in j.approaches if a.role == 'exit').control = 'unknown'
+  out = World(tmp_path, j=j, maneuver='right').run(5.)
+  assert first_go(out) is None and any(h.key == 'cert:unknownLeg' for h in out[-1].holds)
+
+
+def test_C20_a_signal_head_at_a_surveyed_junction_is_uncertifiable_for_the_encounter_then_h3_signal_at_junction(tmp_path):
+  w = World(tmp_path)
+  calls = []
+  w.sg.on_signal_seen = calls.append
+  out = []
+  for _ in range(round(18. / DT_MDL)):
+    f = w.frame()
+    for key, _t, raw, _s in f.runs:
+      if key in ('road', 'full'):
+        raw.lights = [(-4., 10., 0.7)]
+    out.append(w.sg.update(f))
+  assert first_go(out) is None and len(calls) == 1
+  h3 = next(d for d in out if d.fault == 'H3')
+  assert h3.reason == "Stop sign: signal at junction: take control"
+
+
+def test_G1_an_open_perpendicular_corner_decides_from_the_stop_point(tmp_path):
+  out = World(tmp_path).run(5.)
+  i = first_go(out)
+  assert i is not None and abs(out[i].position_m - -0.5) < 1e-6
+  for x in out[i - 1].lanes:
+    assert x.binding == 'validated' and x.r_seen >= x.r_req
+
+
+def test_G24_a_right_takes_the_straight_set_until_15_deg_so_its_right_approach_must_stop(tmp_path):
+  # a right whose right approach doesn't stop (a 3-way stop): the straight union crosses that approach's far lanes
+  j = junction(maneuver='right', tiers={'right': 'no'})
+  next(a for a in j.approaches if a.role == 'exit').control = 'none'
+  out = World(tmp_path, j=j, maneuver='right').run(5.)
+  assert first_go(out) is None and any(h.key.startswith('cert:') for h in out[-1].holds)
+  # the swing zone: the right approach's lane is walked from SWING_ZONE_M out for a right past 15 deg
+  sw = [ln for ln in junction_lanes(junction(maneuver='right'), 'right', 1.9, LANE_EDGE, yaw_deg=20.) if ln.role == 'right']
+  assert sw and sw[0].movement == 'swing' and sw[0].conflict_m == sr.SWING_ZONE_M
+
+
+def test_V1_a_queue_rolls_up_on_rollup_goes_stops_at_the_line_and_counts_its_arrival_from_there(tmp_path):
+  # stopped 8 m short behind a lead, the lead leaves, the model holds: rollUp goes (G5) carry it up, the latch holds it at
+  # its line, the arrival is that stop; never a stop placed ahead of the standing car
+  w = Queue(tmp_path, d0=8., behaviour=lambda w: 'holds', lead=lambda w: 6. if w.t_cam - 100. < 1.5 else None)
+  out = w.run(16.)
+  rollups = [d for d in out if d.go_cause == 'rollUp']
+  assert 1 <= len(rollups) <= 4 and w.control.held or any(d.go_cause == 'stopSign' for d in out)
+  arrived = next(k for k, d in enumerate(out) if d.state == 'observe')
+  assert abs(out[arrived].position_m) <= 3.0 + 1e-6
+  assert all(not s.should_stop for d in out[:arrived] for s in d.stops)
+
+
+def test_O2_stopped_more_than_3_m_short_rolls_up_on_the_map_curve_and_stops_again(tmp_path):
+  w = Drive(tmp_path, d0=4.5, behaviour=lambda w: 'holds')
+  out = w.run(12.)
+  assert out[0].state == 'rollUp' and out[0].creep == (4.5, 3.0)
+  assert any(d.go_cause == 'rollUp' for d in out)
+  arrived = next(k for k, d in enumerate(out) if d.state == 'observe')
+  assert abs(out[arrived].position_m) <= 3.0 + 1e-6 and w.state.moved_m >= 1.5
+
+
+def test_V2_a_cross_car_not_slowing_is_waited_for_until_it_has_passed(tmp_path):
+  w = World(tmp_path)
+  w.tracks = cars((5, 'left', rolling(0.5, d0=45., v0=11.)))
+  out = w.run(4.)
+  assert first_go(out) is None and any(h.key == 'u2:5' for d in out for h in d.holds)
+  out = w.run(5.)
+  assert first_go(out) is not None  # through and gone: our turn
+
+
+def test_V4_a_vehicle_in_the_box_moving_is_a_dynamic_wait_standing_a_static_one_then_h3(tmp_path):
+  w = World(tmp_path)
+  w.objects = lambda ww: (vehicle(30, 12., 0.5, vx=0., vy=3.),)
+  out = w.run(4.)
+  assert first_go(out) is None and out[-1].ledger == 'dynamic' and any(h.key == 'box:30' for h in out[-1].holds)
+  w = World(tmp_path)
+  w.objects = lambda ww: (vehicle(30, 12., 0.5),)
+  out = w.run(17.)
+  assert first_go(out) is None and out[25].ledger == 'static' and out[-1].fault == 'H3'
+
+
+def test_V5_vehicles_already_stopped_at_other_lines_go_first_in_the_order_first_seen_stopped(tmp_path):
+  w = World(tmp_path)
+  w.tracks = cars((1, 'left', at_line(t0=-10.)), (2, 'right', at_line(t0=-10., d0=12.)))
+  watch(w)
+  out = w.run(3.)
+  assert out[-1].rank == 2 and set(w.sg.earlier) == {1, 2}
+  w.tracks = cars((1, 'left', lambda t: LINE_D - 6. * (t - 5.)), (2, 'right', at_line(t0=-10., d0=12.)))
+  out = w.run(4.)
+  assert first_go(out) is None and out[-1].rank == 1
+  w.tracks = cars((1, 'left', lambda t: None), (2, 'right', lambda t: LINE_D - 6. * (t - 9.)))
+  out = w.run(8.)
+  assert first_go(out) is not None
+
+
+def test_V6_simultaneous_arrival_yields_to_the_right_and_goes_before_the_left(tmp_path):
+  # a car stopping at the right line within TIE_S of our arrival: we yield; at the left line: we go first
+  w = World(tmp_path)
+  w.tracks = cars((4, 'right', at_line(t0=-3., d0=9.3 + 6. * 3.3, v0=6.)))
+  out = w.run(5.)
+  assert first_go(out) is None and 4 in w.sg.earlier
+  w = World(tmp_path)
+  w.tracks = cars((4, 'left', at_line(t0=-3., d0=9.3 + 6. * 3.3, v0=6.)))
+  out = w.run(6.)
+  assert 4 not in w.sg.earlier and first_go(out) is not None
+
+
+def test_V14_facing_each_other_our_left_yields_to_their_straight_our_straight_goes_first(tmp_path):
+  for maneuver, yields in (('left', True), ('straight', False)):
+    w = World(tmp_path, maneuver=maneuver)
+    w.tracks = cars((6, 'opposite', at_line(t0=-3., d0=9.3 + 6. * 3.3, v0=6.)))
+    w.run(5.)
+    assert (6 in w.sg.earlier) == yields, maneuver
+
+
+def test_V7_V27_a_shield_that_moves_during_our_launch_stops_us_short_rank_kept_then_a_fresh_go(tmp_path):
+  w = Drive(tmp_path, behaviour=lambda w: 'goes')
+  w.tracks = cars((8, 'left', at_line(t0=1.5, d0=10.5, v0=2.)))  # arrives after us and waits at its line
+  out = w.run(8.)
+  i = first_go(out)
+  assert i is not None and any(x.shielded for x in out[i - 1].lanes)
+  go_t = (i + 1) * DT_MDL
+  # it goes out of turn while we launch, short of our commit point: the capped abort, never below -2.0
+  w2 = Drive(tmp_path, behaviour=lambda w: 'goes')
+  w2.tracks = cars((8, 'left', lambda t: (LINE_D if t < go_t + 0.4 else LINE_D - 5. * (t - go_t - 0.4)) if t >= 1.5 else
+                    max(10.5 - 2. * (t - 1.5), LINE_D) if t >= 1.5 else None))
+  out = w2.run(16.)
+  wd = [d for d in out if d.withdraw]
+  assert wd and wd[0].withdraw.startswith(('outOfTurn', 'new', 'raw', 'reach:left'))  # its lane judged again, unshielded
+  assert all(c[3] >= -2. - 1e-9 for c in w2.cmds) and w2.sg.edges.d_min >= max(d.position_m for d in out)
+
+
+def test_V8_a_new_conflict_in_the_band_aborts_short_of_the_midpoint_and_in_a_lane_is_said_never_braked_for(tmp_path):
+  for stage in ('committed', 'inLane'):
+    w = Drive(tmp_path, behaviour=lambda w: 'goes', lag_s=0.2)
+    out = []
+    for _ in range(round(14. / DT_MDL)):
+      d = w.step()
+      out.append(d)
+      if d.state == stage and w.tracks(w) == ():
+        w.tracks = cars((9, 'right', rolling(w.t_cam - 100., d0=14., v0=8.)))
+    if stage == 'committed':
+      ab = [d for d in out if d.withdraw == 'bandAbort']
+      said = [d for d in out if d.alert == 'crossTrafficAfterCommit']
+      assert ab or said
+      if ab:
+        pos = w.sg.pos_ref + (w.odo - w.sg.odo_ref)
+        assert pos <= sr.band_midpoint(w.sg.edges) + 1e-6
+    else:
+      k = next(k for k, d in enumerate(out) if d.state == 'inLane')
+      assert any(d.alert == 'crossTrafficAfterCommit' for d in out[k:])
+      assert all(not d.stops for d in out[k:]) and not any(d.withdraw == 'bandAbort' for d in out[k:])
+
+
+def test_V17_a_large_vehicle_gone_from_a_conflicting_lane_leaves_that_side_unseen_hide_s(tmp_path):
+  w = World(tmp_path)
+  w.tracks = cars((11, 'left', lambda t: 30. - 10. * t if t < 4.2 else None, 7))  # a truck through the left lane, gone at 4.2 s
+  out = w.run(4.2)
+  out = w.run(6.)
+  hide = [k for k, d in enumerate(out) if any(h.key == 'hide:left' for h in d.holds)]
+  assert hide and abs(len(hide) * DT_MDL - 2.0) < 0.15
+  i = first_go(out)
+  assert i is not None and i > hide[-1] + round(sr.CLEAR_S / DT_MDL) - 2
+
+
+def test_V20_honking_or_a_tailgater_changes_nothing_clear_s_never_shortens(tmp_path):
+  calm = first_go(World(tmp_path).run(5.))
+  w = World(tmp_path)
+  w.objects = lambda ww: (vehicle(40, -6., 0.), )  # a car right behind us
+  assert first_go(w.run(5.)) == calm
+
+
+def test_V21_a_right_turn_waits_for_the_right_blind_spot(tmp_path):
+  w = World(tmp_path, maneuver='right')
+  out = w.run(5., right_blindspot=True)
+  assert first_go(out) is None and any(h.key == 'blindspot' for h in out[-1].holds)
+  assert first_go(w.run(3.)) is not None
+  out = World(tmp_path, maneuver='left').run(5., right_blindspot=True)
+  assert first_go(out) is not None  # a left's go never waits for it
+
+
+def test_V25_a_car_waiting_at_another_line_when_it_is_our_turn_shields_its_lane(tmp_path):
+  w = World(tmp_path)
+  w.tracks = cars((8, 'left', at_line(t0=1.5, d0=10.5, v0=2.)))  # arrives after us and waits
+  out = w.run(8.)
+  i = first_go(out)
+  assert i is not None and any(x.role == 'left' and x.shielded for x in out[i - 1].lanes)
+  left = next(x for x in out[i - 1].lanes if x.role == 'left')
+  assert left.r_seen < left.r_req  # the shield, not reach, satisfies it (it hides the lane behind it)
+
+
+def test_V26_the_model_stopping_in_the_band_uncommits_never_clear_box(tmp_path):
+  w = Drive(tmp_path, behaviour=lambda w: 'stops')
+  out = w.run(14.)
+  k = next(k for k, d in enumerate(out) if d.state == 'committed')
+  back = next(j for j in range(k, len(out)) if out[j].state == 'observe')
+  assert all(d.go_cause != 'clearBox' for d in out) and out[back].stops and out[back].stops[0].should_stop
+
+
+def test_V27_a_shield_that_starts_moving_before_our_go_is_judged_again(tmp_path):
+  w = World(tmp_path)
+  w.tracks = cars((8, 'left', lambda t: (max(10.5 - 2. * (t - 1.5), LINE_D) if t < 3.5 else LINE_D - 0.6 * (t - 3.5)) if t >= 1.5 else None))
+  out = w.run(6.)
+  assert first_go(out) is None  # creeping out of its line: no shield, its lane short (and not stopping)
+
+
+def test_P1_P10_people_crossing_in_front_are_a_dynamic_wait_with_no_timeout_and_a_chime_at_60_s(tmp_path):
+  w = World(tmp_path)
+  w.objects = lambda ww: (person(50, 6.5, 1.5 - 1.2 * ((ww.t_cam - 100.) % 6.), vy=-1.2),)  # in the crosswalk, past the front zone
+  out = w.run(130.)
+  assert first_go(out) is None and all(d.fault == '' for d in out)
+  observing = [d for d in out if d.state == 'observe']
+  assert all(d.ledger in ('dynamic', 'none') for d in observing) and sum(d.ledger == 'dynamic' for d in observing) > 0.8 * len(observing)
+  chimes = [k for k, d in enumerate(out) if d.chime and (k == 0 or not out[k - 1].chime)]
+  assert len(chimes) == 2 and all(out[k].reason == "Waiting for cross traffic" for k in chimes)
+  w.objects = lambda ww: ()
+  assert first_go(w.run(3.)) is not None
+
+
+def test_P2_a_person_in_the_far_crosswalk_holds_a_straight_crossing_not_a_right(tmp_path):
+  far = sr.edge_band(13., 2, LANE_EDGE)
+  w = World(tmp_path)
+  x_far = 1.9 + w.sg._far_edge() + 1.5 + 0.5 if w.sg.token else None
+  assert far.d_min == 7.0
+  w.run(0.05)
+  # beyond the box by its whole ranging band (0.7 x past the box's far side), in the far crosswalk's
+  x_far = (w.sg._x(w.sg._far_edge(), -0.5) + 1.5) / 0.7
+  w.objects = lambda ww: (person(51, x_far, 0.5, vy=0.8),)
+  out = w.run(5.)
+  assert first_go(out) is None and any(h.key == 'ped:51' and 'far crosswalk' in h.reason for h in out[-1].holds)
+  w = World(tmp_path, maneuver='right')
+  w.objects = lambda ww: (person(51, x_far, 0.5, vy=0.8),)
+  assert first_go(w.run(5.)) is not None
+
+
+def test_P6_a_person_into_the_front_zone_not_seen_leaving_holds_and_is_h7_after_30_s(tmp_path):
+  w = World(tmp_path)
+  w.run(1.5)
+  w.objects = lambda ww: (person(60, 1.9 + 1.5, 0.3, vy=0.),)  # in front of the bumper, then lost below the hood
+  w.run(0.5)
+  w.objects = lambda ww: ()
+  out = w.run(31.)
+  assert first_go(out) is None and any(h.key == 'front' for h in out[10].holds)
+  h7 = next(k for k, d in enumerate(out) if d.fault == 'H7')
+  assert h7 * DT_MDL >= 29. and out[h7].reason == "Something may be in front of the car: take control"
+  # seen leaving: a track ending at the zone's side moving out sideways, a person track starting outside that side within 1 s
+  w = World(tmp_path)
+  w.run(1.5)
+  w.objects = lambda ww: (person(61, 1.9 + 1.5, 0.3 + 0.9 * (ww.t_cam - 101.5), vy=0.9),)
+  w.run(0.9)
+  w.objects = lambda ww: ()
+  w.run(0.3)
+  w.objects = lambda ww: (person(62, 1.9 + 1.5, 2.4, vy=0.9),)
+  out = w.run(0.3)
+  w.objects = lambda ww: ()
+  out = w.run(3.)
+  assert first_go(out) is not None
+
+
+def test_P7_a_cyclist_passed_on_the_right_holds_a_right_turn_until_it_reappears_ahead_or_10_s(tmp_path):
+  w = World(tmp_path, maneuver='right')
+  w.objects = lambda ww: (SimpleNamespace(trackId=70, cls='cyclist', x=1.0, y=-1.5, vx=3., vy=0.),)
+  w.run(1.5)
+  w.objects = lambda ww: ()
+  out = w.run(5.)
+  assert first_go(out) is None and any(h.key == 'bikePassed' for h in out[-1].holds)
+  w.objects = lambda ww: (SimpleNamespace(trackId=71, cls='cyclist', x=8., y=-1.5, vx=3., vy=0.),)  # ahead of us now
+  w.run(0.1)
+  w.objects = lambda ww: ()
+  assert first_go(w.run(3.)) is not None
+
+
+def test_E6_a_phantom_box_delays_the_go_only_and_never_brakes(tmp_path):
+  calm = first_go(World(tmp_path).run(6.))
+  w = World(tmp_path)
+  w.run(2.0)
+  w.boxes = lambda ww: lane_box(ww, 'left', 25., conf=0.4, views=('full', 'road'))
+  out = w.run(0.2)
+  w.boxes = lambda ww: {}
+  out = out + w.run(4.)
+  i = first_go(out)
+  assert i is not None and 2.0 / DT_MDL + i > calm and all(not d.stops for d in out[:i])
+
+
+def test_E7_a_stale_view_resets_clear_s_and_no_run_for_2_s_is_the_camera_paused(tmp_path):
+  w = World(tmp_path, side='running')
+  w.run(1.5)
+  out = []
+  for _ in range(round(2.5 / DT_MDL)):
+    if CYCLE[w.k % 4] in ('sideLeft', 'sideRight'):
+      w.k += 1
+    out.append(w.step())
+  assert any(h.key == 'stale' for h in out[12].holds) and out[-1].alert == 'cameraPaused' and out[-1].ledger == 'fault'
+
+
+def test_E8_side_view_maps_stale_are_a_dynamic_wait_of_up_to_30_s_then_static(tmp_path):
+  w = World(tmp_path, side='mapsStale')
+  out = w.run(32.)
+  cal = [d for d in out if any(h.key == 'calibration' for h in d.holds)]
+  assert cal and cal[0].ledger == 'dynamic' and first_go(out) is None
+  assert any(d.ledger == 'static' for d in out[round(31.5 / DT_MDL):]) and out[-1].maps_valid is False
+
+
+def test_O1_position_uncertain_at_the_line_says_so_waits_10_s_then_h2(tmp_path):
+  w = World(tmp_path)
+  out = w.run(13., position_spread=5.)
+  assert any(d.alert == 'junctionUncertain' for d in out)
+  h2 = next(k for k, d in enumerate(out) if d.fault == 'H2')
+  assert 10.5 <= (h2 + 1) * DT_MDL <= 11.5 and out[h2].reason == "Stop sign position uncertain: take control"
+  w = World(tmp_path, j=junction(status='failed'))
+  assert next(d for d in w.run(13.) if d.fault).fault == 'H2'
+
+
+def test_O3_the_capped_abort_is_never_below_2_m_s2_and_holds_a_standing_car(tmp_path):
+  from openpilot.selfdrive.turnpilot.stop_go import capped_abort
+  for v in np.linspace(0., 2., 9):
+    for d in (-1., 0., 0.2, 0.5, 1., 2.5, 6.):
+      s = capped_abort(float(v), d, 'x')
+      assert s.accel_cap >= -2. and s.speed_cap == 0. and not s.confirmed
+      assert plan_accel(s.accel_cap, s.speed_cap, float(v)) >= -2.
+  assert capped_abort(0.05, 0.3, 'x').should_stop
+
+
+def test_O4_stalled_in_a_lane_takes_two_clear_box_goes_then_h5(tmp_path):
+  w = Drive(tmp_path, behaviour=lambda w: 'goes')
+  k = 0
+  while w.step().state != 'inLane':
+    k += 1
+    assert k < 600
+  w.behaviour = lambda w: 'holds'  # the model stops the car in the lane and holds it there
+  w.v, w.queue = 0., deque([0.] * len(w.queue))
+  out = w.run(20.)
+  boxes = [d for d in out if d.go_cause == 'clearBox']
+  assert k and len(boxes) == 2 and any(d.alert == 'stalledInJunction' for d in out)
+  assert out[-1].fault == 'H5' and out[-1].prompt == 'stopSignTakeControl'
+
+
+def test_O5_O15_a_model_that_wont_start_is_withdrawn_retried_then_h5(tmp_path):
+  w = Drive(tmp_path, behaviour=lambda w: 'holds')
+  out = w.run(40.)
+  assert [d.withdraw for d in out if d.withdraw][0] in ('window', 'gate') and out[-1].fault == 'H5'
+  assert all(d.takeover_s < 0. for d in out)
+
+
+def test_O11_O14_auto_without_its_data_acts_as_shadow_and_says_why_trial_skips_only_the_launch(tmp_path):
+  import openpilot.selfdrive.turnpilot.routing.tests.test_certify as tc
+  for changes, reason in (({'cameraSetbackM': None}, "Stop-sign go off: no camera measurements"),
+                          ({'launchVerified': None}, "Stop-sign go off: launch not verified")):
+    w = World(tmp_path, vis=tc.visibility(tmp_path, **changes))
+    out = w.run(5.)
+    assert first_go(out) is None and all(d.release is None and not d.stops for d in out)
+    held = [d for d in out if d.state == 'observe']
+    assert held and all(d.latch == 'shadow' and d.reason == reason and d.mode == 'auto' for d in held)
+    assert out[-1].would_go == ('launch' in reason)  # what auto would have done, logged
+  w = World(tmp_path, vis=tc.visibility(tmp_path, launchVerified=None), mode='trial')
+  assert first_go(w.run(5.)) is not None
+
+
+def test_O13_uncertifiable_at_the_line_with_nothing_to_wait_for_is_a_static_wait_then_h3(tmp_path):
+  w = World(tmp_path, entries=[survey(validations=[])])  # surveyed, never validated
+  out = w.run(17.)
+  observing = [d for d in out if d.state == 'observe' and not d.fault]
+  assert observing and all(d.ledger == 'static' for d in observing[1:])
+  assert out[-1].fault == 'H3' and 'notValidated' in out[-1].reason
+
+
+def test_O16_a_param_the_build_does_not_know_acts_as_shadow_out_loud(tmp_path):
+  from openpilot.selfdrive.turnpilot.stop_go import mode_for
+  assert mode_for(None) == ('auto', True) and mode_for(b'trial') == ('trial', True) and mode_for('nonsense') == ('shadow', False)
+  w = World(tmp_path)
+  out = w.run(4., mode_known=False)
+  assert first_go(out) is None and out[-1].mode == 'shadow' and out[-1].latch == 'shadow'
+  assert out[-1].reason == "Stop-sign go off: its param unknown to this build"
+
+
+def test_refusals_a_lens_one_consumer_reports_differently_from_the_file_is_refused_loudly(tmp_path):
+  w = World(tmp_path)
+  good = 'equisolid f=452.0 k=0.3 visibility.json'
+  assert first_go(w.run(5., lenses={'tracker': good, 'sideViews': good})) is not None
+  w = World(tmp_path)
+  out = w.run(5., lenses={'tracker': 'equidistant f=452.0 k=0.0 repo', 'sideViews': good})
+  assert first_go(out) is None and out[-1].reason == "Stop-sign go off: camera lens mismatch" and out[-1].latch == 'shadow'
+
+
+@pytest.mark.parametrize('stamp_m', [30., 40., 44., 48., 60.])
+def test_route_and_drive_agree_on_a_junction_whose_live_reach_is_the_tables(tmp_path, stamp_m):
+  from openpilot.selfdrive.turnpilot.routing import certify as ce
+  s = survey(validations=[stamp(m=stamp_m)])
+  vis = visibility(tmp_path)
+  route = ce.certify(junction(), 'straight', vis, [s], ETA, ce.Runtime(mode='auto', side_views=True))
+  out = World(tmp_path, entries=[s], vis=vis).run(5.)
+  assert (route == ('certifiable', 'none')) == (first_go(out) is not None), (stamp_m, route)
+
+
+def test_ledger_a_static_cause_that_flickers_still_meets_its_bound(tmp_path):
+  # 4.6: a person standing in the crosswalk, detected 1.0 s of every 1.5 s (never CLEAR_S clear): the static wait's clock
+  # isn't restarted by the gaps, so the ladder (H3) comes STATIC_WAIT_S of standing on, not never
+  w = World(tmp_path)
+  w.objects = lambda ww: (person(52, 6.5, 0.5),) if (ww.t_cam - 100.) % 1.5 < 1.0 else ()
+  out = w.run(25.)
+  h3 = next((k for k, d in enumerate(out) if d.fault == 'H3'), None)
+  assert first_go(out) is None and h3 is not None and h3 * DT_MDL <= 1.0 + STATIC_WAIT_S * 1.6
