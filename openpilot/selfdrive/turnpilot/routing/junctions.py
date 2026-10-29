@@ -69,6 +69,7 @@ UNKNOWN_CLASS_MPH = 55   # a class not known: the highest default
 UNLIMITED_KPH = 255      # Valhalla's speed_limit for no limit
 RANK = {'motorway': 0, 'trunk': 1, 'primary': 2, 'secondary': 3, 'tertiary': 4, 'unclassified': 5, 'residential': 6, 'service_other': 7}
 PLAUSIBLE_TOP_RANK = 2   # primary: an approach this class or above beside one two ranks lower is an implausible all-way
+CROSSING_USES = ('road', 'living_street')  # the roads a suspected stop's crossing ones are (not driveways, alleys, paths)
 ROAD_CLASS = {'motorway': 'motorway', 'trunk': 'trunk', 'primary': 'primary', 'secondary': 'secondary', 'tertiary': 'tertiary',
               'unclassified': 'unclassified', 'residential': 'residential', 'service_other': 'serviceOther'}
 ROAD_USE = {'road': 'road', 'ramp': 'ramp', 'turn_channel': 'turnChannel', 'living_street': 'livingStreet', 'service_road': 'serviceRoad',
@@ -319,6 +320,19 @@ def junction_legs(edges, tpts, a: int, ahead: bool) -> tuple[list[tuple[float, f
       if angle_diff(best.heading, h_in) <= EXIT_AHEAD_TOL:
         best.exit = True
   return nodes, legs, j
+
+
+def suspected_stop(edge, tpts, legs) -> bool:
+  """A suspected unmapped stop (N5) at the end of our edge: every road crossing there (left or right of our heading in at
+  the control's node, the exit included when the route turns onto it; a driveway, alley or path is no road) outranks our
+  edge's class by two or more. The caller has checked that nothing is mapped on our approach."""
+  ours = RANK.get(edge.get('road_class') or '', 8)
+  if ours >= 8:
+    return False
+  h_in = heading_in(edge, tpts)
+  cross = [leg for leg in legs if leg.node == 0 and leg.heading is not None and (leg.exit or leg.driveability) and
+           (leg.use or 'road') in CROSSING_USES and ROLE_OPPOSITE_DEG < abs(rel(leg.heading, h_in)) <= ROLE_SIDE_DEG]
+  return bool(cross) and all(RANK.get(leg.road_class or '', 8) <= ours - 2 for leg in cross)
 
 
 def heading_in(edge, tpts) -> float:

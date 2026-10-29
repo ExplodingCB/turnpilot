@@ -673,6 +673,39 @@ def test_g15_a_signals_stop_point_never_moves(tmp_path):
   assert round(100. - c.route_m, 1) == 16.7 and j.stop_point_source == 'mappedLine'
 
 
+@pytest.mark.parametrize('ours, crossing, extra, suspected', [
+  ('residential', 'secondary', {}, True), ('residential', 'tertiary', {}, True), ('residential', 'unclassified', {}, False),
+  ('unclassified', 'secondary', {}, True), ('residential', 'secondary', {'node_signal': True}, False),
+  ('residential', 'secondary', {'yield': True}, False)])
+def test_n5_a_suspected_unmapped_stop_is_emitted_as_a_stop_control(tmp_path, ours, crossing, extra, suspected):
+  """Nothing mapped on our approach (no Valhalla flag, nothing in the sidecar) where every road crossing outranks ours by two
+  classes or more: a suspected unmapped stop, emitted as a stop control flagged suspected at the default stop point, its
+  approaches' tiers unknown (nothing mapped there). A signal or a mapped yield there is no suspect (STOP_SIGNS.md N5)."""
+  legs = [leg(90., **{'class': crossing}), leg(270., **{'class': crossing}), leg(0., **{'class': ours})]
+  v = StubJunction([(0., 100., {'road_class': ours} | extra), (100., 400., {'road_class': ours})], {100.: legs})
+  controls, status = route_controls(v, steps(), sidecar_dir=osm_dir(tmp_path))
+  assert status == 'ok'
+  got = [c for c in controls if c.junction_info is not None and c.junction_info.suspected]
+  if not suspected:
+    assert got == []
+    return
+  assert [(c.kind, round(c.route_m, 1)) for c in got] == [('stop', 100. - 13.)]  # the 2-lane rule moves it from 11 m
+  j = got[0].junction_info
+  assert j.status == 'ok' and all(a.tier == 'unknown' for a in j.approaches)
+
+
+def test_n5_driveways_and_alleys_are_no_crossing_roads():
+  """Only roads count as crossing ones: an alley or a driveway beside our residential street at a secondary doesn't make it
+  less suspect, and a residential street crossing makes it no suspect."""
+  base = [leg(90., **{'class': 'secondary'}), leg(270., **{'class': 'secondary'})]
+  alley = base + [leg(100., use='alley', **{'class': 'service_other'})]
+  v = StubJunction([(0., 100., {}), (100., 400., {})], {100.: alley})
+  assert [(c.kind, c.junction_info.suspected) for c in route_controls(v, steps())[0]] == [('stop', True)]
+  across = [leg(90., **{'class': 'secondary'}), leg(270., **{'class': 'residential'})]
+  v = StubJunction([(0., 100., {}), (100., 400., {})], {100.: across})
+  assert route_controls(v, steps())[0] == []
+
+
 def rail_dir(tmp_path, rail, controls=None):
   d = osm_dir(tmp_path, controls)
   cell = level2_index(LON0, LAT0)

@@ -50,7 +50,9 @@ The junction (SG1b): each stop and yield carries its junction (junction_info, ro
 road the route leaves by, their controls, lanes, limits and all-way tiers, the survey, the maneuver, the rail distance),
 read from trace_attributes and Q2, one more batched verbose locate per route that also carries the opposing roads' probes
 (opposing_roads, for the unprotected left: given an Opposing, a route makes Q1 and Q2 and no third). A failed Q2 leaves
-every leg unknown and the junction failed. A TurnPilotJunctionOverrides navd can't read fails every stop and yield junction
+every leg unknown and the junction failed. A suspected unmapped stop (N5: nothing mapped on our approach, no signal there,
+and every road crossing outranks ours by two classes or more; junctions.suspected_stop) is emitted as a stop at the default
+stop point, its junction flagged suspected. A TurnPilotJunctionOverrides navd can't read fails every stop and yield junction
 and makes the status partial, logged. Off the route a LocateCache keeps Q1 and Q2 by edge id between the 1 Hz lookups.
 navd's own Control also carries, for SG2's avoidance loop, its approach edge's key, its exclusion point and whether that
 edge is the route's first or last.
@@ -653,13 +655,26 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
     failed = osm is not None and not osm_ok and kind in ('stop', 'yield')
     found.append({'s': line_m - MAP_MARGIN_M, 'kind': kind, 'mapped': mapped, 'junction': junction, 'cross_suspect': cross_suspect,
                   'instance': instance, 'source': source, 'osm_node': osm_node, 'status': 'failed' if failed else 'ok', 'a': a,
-                  'sign_m': sign_m, 'suspected': False})
+                  'sign_m': sign_m, 'suspected': False, 'legs': None})
+  # suspected unmapped stops (N5): a junction with nothing mapped on our approach where every road crossing outranks ours by
+  # two classes or more is emitted as a stop
+  for a in real:
+    end_m, span, key, node = ends[a]
+    if a in at or not node.get('intersecting_edges') or (end_m > cum[-1] - END_OF_ROUTE_M and not ahead):
+      continue
+    nodes, legs, last = jn.junction_legs(edges, tpts, a, ahead)
+    if jn.suspected_stop(edges[a], tpts, legs):
+      cloudlog.info(f"turnpilot controls: a suspected unmapped stop on {key} at {end_m:.0f} m: every road crossing outranks ours by two classes")
+      found.append({'s': end_m - CONTROL_LINE_M - MAP_MARGIN_M, 'kind': 'stop', 'mapped': False, 'junction': True, 'cross_suspect': False,
+                    'instance': '', 'source': 'default', 'osm_node': 0, 'status': 'failed' if osm is not None and not osm_ok else 'ok',
+                    'a': a, 'sign_m': None, 'suspected': True, 'legs': (nodes, legs, last)})
+
   # Q2: every stop and yield's junction, in one batched verbose locate with the route's opposing roads
   jobs = []
   for f in found:
     if f['kind'] not in ('stop', 'yield'):
       continue
-    nodes, legs, last = jn.junction_legs(edges, tpts, f['a'], ahead)
+    nodes, legs, last = f['legs'] or jn.junction_legs(edges, tpts, f['a'], ahead)
     jobs.append((f, nodes, legs, last))
   opp_legs, locs = opposing_probes(steps) if opposing is not None else ({}, [])
   n_opp, spans = len(locs), []
