@@ -5,6 +5,8 @@ once rolling, or stops in the band, G5's lift as plannerd applies it (read from 
 the car following its command an actuator lag late. The junction is test_certify's surveyed, validated 4-way all-way."""
 from collections import deque
 
+import pytest
+
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot import stop_rules as sr
 from openpilot.selfdrive.turnpilot.go_override import GO_ACCEL, GO_END_SPEED
@@ -22,9 +24,9 @@ S_LINE = 200.  # the stop point along the route
 MPH = sr.MPH
 
 
-def info(mph=25., maneuver='straight', tiers=None):
+def info(mph=25., maneuver='straight', tiers=None, certification=None):
   """The stop control's junctionInfo (log.capnp MapJunction) for test_certify's junction, our heading 0, its stop point 13 m
-  before the node."""
+  before the node (and navd's route-time certification when given)."""
   v, t = mph * MPH, tiers or {}
 
   def leg(bearing, rel, role, way):
@@ -34,7 +36,8 @@ def info(mph=25., maneuver='straight', tiers=None):
   return {'status': 'ok', 'osmNodeId': NODE, 'lat': LAT, 'lon': LON, 'stopPointDistance': 13., 'stopPointSource': 'default',
           'headingIn': 0., 'maneuver': maneuver, 'turnAngle': 0., 'roundabout': False, 'divided': False, 'railDistance': -1.,
           'sidecar': True, 'suspected': False, 'surveyed': True,
-          'approaches': [leg(270., -90., 'left', 11), leg(90., 90., 'right', 12), leg(0., 0., 'opposite', 13)]}
+          'approaches': [leg(270., -90., 'left', 11), leg(90., 90., 'right', 12), leg(0., 0., 'opposite', 13)],
+          **({'certification': certification} if certification else {})}
 
 
 class FakeTracker:
@@ -44,9 +47,9 @@ class FakeTracker:
 
 class StopSim(Sim):
   """test_turnpilotd's Sim at a stop sign under the decider (module docstring). model: 'holds', 'goes' or 'stops'."""
-  def __init__(self, tmp_path, mode='auto', vis=None, model='goes', lag_s=0.3, info_kw=None, entries=None, **kw):
-    super().__init__([(1000., "turn", "right"), (2000., "turn", "left")], controls=[(S_LINE, 'stop', False, True, False, info(**(info_kw or {})))],
-                     **kw)
+  def __init__(self, tmp_path, mode='auto', vis=None, model='goes', lag_s=0.3, info_kw=None, entries=None, maneuvers=None, **kw):
+    super().__init__(maneuvers or [(1000., "turn", "right"), (2000., "turn", "left")],
+                     controls=[(S_LINE, 'stop', False, True, False, info(**(info_kw or {})))], **kw)
     self.go_taps = False
     tp = self.tp
     tp.stop_sign_mode, tp.stop_sign_known = mode, True
@@ -283,6 +286,33 @@ def test_G18_a_second_stop_sign_20_m_on_never_takes_over_a_holding_encounter(tmp
   last = plans[-1]
   assert str(last.stopGo.state) == 'ladder' and last.controlPrompt == 'stopSignTakeControl' and last.shouldStop
   assert sim.s - s0 < 8.  # never carried on toward the second line
+
+
+@pytest.mark.parametrize('maneuver', ['right', 'left'])
+def test_after_the_clear_the_decider_reads_its_own_controls_maneuver_junction_and_route_certification(tmp_path, maneuver):
+  # from the frame after the go the latch has let the control go, so neither held_control() nor an engaged control ahead
+  # is it: the decider had been fed 'straight', no junction, 'unchecked' and no fix spread for every turn, so the launch's
+  # re-checks, the band and every retry ran as a straight crossing (a right's blind spot, its passing-cyclist memory and its
+  # GO_ROOM_RIGHT_M skipped, a left on straight's T_GAP) and the published stopGo.maneuver, which launch_verify reads, was wrong
+  sim = StopSim(tmp_path, model='holds', info_kw={'maneuver': maneuver, 'certification': 'certifiable'},
+                maneuvers=[(S_LINE + 13., 'turn', maneuver), (2000., 'turn', 'right' if maneuver == 'left' else 'left')])
+  seen = []
+  orig = sim.tp.stop_go.update
+
+  def update(f):
+    d = orig(f)
+    seen.append((d.state, f.maneuver, f.junction is not None and f.junction.status == 'ok', f.route_cert, f.control is not None))
+    return d
+  sim.tp.stop_go.update = update
+  run_to_line(sim)
+  sim.run(30.)
+  plans = sim.plans()
+  k = go_frame(sim)
+  assert k is not None and len({p.goCertified.id for p in plans if str(p.goCertified.cause) == 'stopSign'}) >= 2  # a retry
+  live = [x for x in seen if x[0] != 'off']
+  released = [x for x in live if not x[4]]
+  assert released and all(x[1:4] == (maneuver, True, 'certifiable') for x in live), sorted(set(live))[:6]
+  assert all(str(p.stopGo.maneuver) == maneuver for p in plans[k:] if str(p.stopGo.state) != 'off')
 
 
 def test_V19_a_car_backing_out_ahead_holds_the_go(tmp_path):

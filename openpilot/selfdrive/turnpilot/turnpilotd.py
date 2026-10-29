@@ -972,10 +972,17 @@ class TurnPilot:
                  not (c.state is not None and c.state.done) and -LATCH_PAST_M <= c.d <= STOP_SWEEP_M]
         ahead = min(cands, key=lambda c: c.d) if cands else None
       cur = ctl or ahead
-      info = (cur.junction_info or {}) if cur is not None else {}
-      junction = junction_from_info('stop', cur.junction_info) if cur is not None else None
+      # what the encounter is about: the decider's own control while it keeps its encounter. Once the latch has let it go
+      # (the 'clear'), neither held_control() nor a control ahead is it (the tracker may have dropped it as passed), and
+      # another control ahead is the next one's: its junction, maneuver, route certification and fix spread are still its
+      # own, for the launch's re-checks, the band and every retry (a right's blind spot and GO_ROOM_RIGHT_M, a left's T_GAP)
+      sg = self.stop_go
+      own = sg.control if sg.token is not None and not sg.takes(ctl, ahead) else None
+      src = own if own is not None and (cur is None or cur.state is not sg.token) else cur
+      info = (src.junction_info or {}) if src is not None else {}
+      junction = junction_from_info('stop', src.junction_info) if src is not None else None
       m = str(info.get('maneuver', 'straight'))
-      maneuver = 'unknown' if cur is not None and cur.key[0] == OFF_ROUTE else m if m in ('straight', 'left', 'right') else 'unknown'
+      maneuver = 'unknown' if src is not None and src.key[0] == OFF_ROUTE else m if m in ('straight', 'left', 'right') else 'unknown'
       vis = self.vis_source()
       lead = model.leadsV3[0] if len(model.leadsV3) else None
       lead_m = float(lead.x[0]) if lead is not None and lead.prob > STOPPED_LEAD_PROB and len(lead.x) else None
@@ -983,7 +990,7 @@ class TurnPilot:
       f = Frame(control=ctl, approach=ahead, junction=junction, route_cert=str(info.get('certification', 'unchecked')), maneuver=maneuver,
                 objects=objects, tracks=tuple(self.tracks_now), runs=tuple(self.runs_now), live=self.watch.live, vis=vis,
                 surveys=self.survey_source(), wall_t=self.wall_clock(), side_status=self.side_status, lenses=dict(self.lenses),
-                position_spread=cur.fix_spread if cur is not None else 0., v_ego=v_ego, a_ego=float(cs.aEgo), odo_m=self.odo_m,
+                position_spread=src.fix_spread if src is not None else 0., v_ego=v_ego, a_ego=float(cs.aEgo), odo_m=self.odo_m,
                 yaw20_deg=sum(y for _, y in self.yaw20), approach_yaw_deg=self.approach_yaw_deg, turned_deg=self.sg_turned,
                 steer_deg=float(cs.steeringAngleDeg), desire_out=d.maneuver_id == rf.maneuver_id and d.started and d.side != 0 and not d.done,
                 model_v2=model, lead_m=lead_m, t_abort=sr.t_abort(self.cp_delay, vis.actuator_delay_s if vis is not None else None),
