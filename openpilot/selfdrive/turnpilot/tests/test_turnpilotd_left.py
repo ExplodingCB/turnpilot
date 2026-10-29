@@ -603,6 +603,10 @@ def test_without_the_far_crop_a_45_mph_left_is_skipped_and_its_loss_at_the_line_
     plans = drive(sim, 3.)
     assert plans[-1].tooFastToTurn and str(plans[-1].unprotectedLeft.state) == 'skipped', status
     assert plans[-1].unprotectedLeft.farRangeM == (far_range if status == 'read' else 0.) and plans[-1].unprotectedLeft.farNeeded
+  # the full pass's range unmeasured: the far crop extends nothing (it covers the band only past that range)
+  sim = far_sim()
+  sim.tp.left_range_m = 0.
+  assert drive(sim, 3.)[-1].tooFastToTurn
   # on but waiting for room or calibration at route time (a spell): not skipped, judged at the line
   for status in ('noRoom', 'noCalibration'):
     sim = far_sim(status=status)

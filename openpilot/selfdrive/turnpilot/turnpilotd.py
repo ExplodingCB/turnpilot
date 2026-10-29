@@ -774,8 +774,9 @@ class TurnPilot:
 
   def left_reach_m(self, route: bool = False) -> float:
     """The range an unprotected left's R_req may reach: the full pass's proven range, or the far crop's while it reads (route:
-    while it is on, far_live)."""
-    return max(self.left_range_m, self.left_far_range_m) if self.far_live(route) else self.left_range_m
+    while it is on, far_live) and the full pass's is measured (the far crop covers the band only past it)."""
+    far = self.far_live(route) and self.left_range_m > 0.
+    return max(self.left_range_m, self.left_far_range_m) if far else self.left_range_m
 
   def unprotected_left(self, turn, upcoming, rf, v_ego: float, acting: bool, objects, raw, raw_far=None) -> LeftCommand | None:
     """This frame's autonomous unprotected left (unprotected_left.py; left_now) for the route's unprotected turn the car is

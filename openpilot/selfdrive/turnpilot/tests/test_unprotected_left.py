@@ -570,6 +570,11 @@ def test_45_and_55_mph_reach_needs_the_far_crop_and_its_measured_range():
   j = Junction()
   d = far_wait(j, CLEAR_WINDOW_S + 1., far_live=False)
   assert d.go and not d.far_needed
+  # the full pass's range unmeasured: the far crop covers the band only past it, so it extends nothing (said at once, never
+  # a stale far view two seconds later)
+  j = Junction(v_limit=V_45, rng=0.)
+  d = far_wait(j, 0.1, far_range_m=300., far_live=True)
+  assert d.state == 'undecided' and d.why == 'range'
 
 
 def test_a_far_box_in_the_band_blocks_at_any_range_when_the_far_crop_is_needed():

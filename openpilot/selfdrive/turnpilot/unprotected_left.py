@@ -29,7 +29,8 @@ never attempted: turnpilotd skips it at route time (turn_skip: unprotectedRange,
 here should it reach its hold.
 The far crop (DESIGN phase 4 G5; modeld's FarCrop, tracker.update_far) reaches further: a native-resolution window of the
 road frame, aimed (far_aim) at the band's bearings past the full pass's range. While it reads (far_live) its own proven
-range (TurnPilotLeftFarRangeM, unset: unmeasured, none) extends the reach. An R_req past the full pass's range (far_needed)
+range (TurnPilotLeftFarRangeM, unset: unmeasured, none) extends the reach, the full pass's measured (it covers the band only
+past that range). An R_req past the full pass's range (far_needed)
 is then judged on its runs too: one covering those bearings (far_covers, its cover_deg) every FAR_FRESH_S or the window
 starts over, STALE_UNDECIDED_S without one a fault (farStale), and any vehicle box of its in the band blocks at any range
 (at 230-280 m one pixel of box bottom is 40-56 m and 0.15 deg of pitch is NEAR_PX's whole margin: it never clears a car by
@@ -397,7 +398,8 @@ class UnprotectedLeft:
       self.clear_s = 0.
     else:
       self.clear_s += dt
-    range_eff = max(inp.range_m, inp.far_range_m) if inp.far_live else inp.range_m
+    # the far crop covers the band past the full pass's range only (far_covers): an unmeasured full range, it extends nothing
+    range_eff = max(inp.range_m, inp.far_range_m) if inp.far_live and inp.range_m > 0. else inp.range_m
     far_needed = rreq > inp.range_m
     self.far_age += dt
     self.far_run_age += dt
@@ -590,7 +592,10 @@ class UnprotectedLeft:
 
 
 def reach_fault(inp: LeftInput, rreq: float) -> str:
-  """Why R_req is past the reach (the module docstring): the far crop's range unmeasured, past it too, or the far crop off."""
+  """Why R_req is past the reach (the module docstring): the far crop's range unmeasured, past it too, or the far crop off.
+  The full pass's range unmeasured is 'range': the far crop covers the band only past it."""
+  if inp.range_m <= 0.:
+    return 'range'
   if inp.far_range_m <= 0.:
     return 'farUnmeasured'
   if rreq > inp.far_range_m:
