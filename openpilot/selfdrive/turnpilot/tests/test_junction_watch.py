@@ -50,6 +50,20 @@ def test_sweep_control_from_30_m_before_an_engaged_stop_or_yield_until_passed():
   assert sweep_control([far, near]) is near
 
 
+def test_the_sweep_is_asked_for_only_at_walking_pace_with_hysteresis():
+  # SG3b skeptic: the held cycle halves the road camera's rate (5 Hz), which slowed scene_policy's hard-brake confirmation
+  # on every stop approach; above SWEEP_V_MAX the car is on its approach and the side views wouldn't run anyway (modeld's
+  # SIDE_VIEW_V_MAX). Once asked, held to SWEEP_V_OFF: the go's cap is STOP_GO_V_MAX, where it would flap
+  from openpilot.selfdrive.turnpilot.detector.modeld_detector import SIDE_VIEW_V_MAX
+  from openpilot.selfdrive.turnpilot.junction_watch import SWEEP_V_MAX, SWEEP_V_OFF, sweep_wanted
+  c = control(20.)
+  assert SWEEP_V_MAX == SIDE_VIEW_V_MAX == sr.STOP_GO_V_MAX and SWEEP_V_OFF > SWEEP_V_MAX
+  assert not sweep_wanted(c, 9., False) and not sweep_wanted(c, SWEEP_V_MAX + 0.01, False)
+  assert sweep_wanted(c, SWEEP_V_MAX, False) and sweep_wanted(c, 0., False)
+  assert sweep_wanted(c, SWEEP_V_OFF, True) and not sweep_wanted(c, SWEEP_V_OFF + 0.01, True)
+  assert not sweep_wanted(None, 0., True)
+
+
 def test_the_lefts_own_view_outranks_the_sweep():
   # the unprotected left's road camera from its go to its commit (CRITIQUE REQUIRED 3) and its held roadAndWide: the sweep
   # would suspend the far crop the left needs

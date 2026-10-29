@@ -1,6 +1,9 @@
 """turnpilotd closed loop: synthetic navd, model and scene around a point-mass car that follows the plan's limits."""
 import math
+from types import SimpleNamespace
 from unittest import mock
+
+import pytest
 
 from opendbc.car.structs import car
 import openpilot.cereal.messaging as messaging
@@ -2580,31 +2583,55 @@ def sweep_trace(sim, seconds):
   out = []
   for _ in range(int(seconds / DT_MDL)):
     plan = sim.step()
-    out.append((sim.s, str(plan.detectorView)))
+    out.append((sim.s, sim.v, str(plan.detectorView)))
   return out
 
 
-def test_the_stop_sweep_is_asked_for_from_30_m_before_a_stop_until_passed_engaged_or_not():
+def test_the_stop_sweep_is_asked_for_at_walking_pace_within_30_m_of_a_stop_until_passed_engaged_or_not():
   # STOP_SIGNS.md SG3b: turnpilotd asks modeld for the held cycle (stopSweep) at every stop and yield map_controls has
   # engaged, from 30 m before it until the car has passed it, with openpilot engaged or not (step S3's dwell is driven with
-  # it off and TurnPilot on): Sim's carControl is never enabled here
-  from openpilot.selfdrive.turnpilot.junction_watch import STOP_SWEEP_M, SWEEP_PAST_M
+  # it off and TurnPilot on): Sim's carControl is never enabled here; but only at or under SWEEP_V_MAX (2.0 m/s), held to
+  # SWEEP_V_OFF once asked: the held cycle halves the road camera's rate, which the approach at road speed needs at 10 Hz
+  from openpilot.selfdrive.turnpilot.junction_watch import STOP_SWEEP_M, SWEEP_PAST_M, SWEEP_V_MAX, SWEEP_V_OFF
   sim = Sim([(1000., "turn", "right"), (2000., "turn", "left")], controls=[(200., 'stop')])
   sim.go_taps = False
   trace = sweep_trace(sim, 40.)
   assert sim.v < 0.05 and 195. < sim.s < 202.
-  assert all(v == 'auto' for s, v in trace if s < 200. - STOP_SWEEP_M - 1.)
-  assert all(v == 'stopSweep' for s, v in trace if s > 200. - STOP_SWEEP_M + 1.)
+  assert all(v == 'auto' for s, _, v in trace if s < 200. - STOP_SWEEP_M - 1.)
+  inside = [(s, ve, v) for s, ve, v in trace if s > 200. - STOP_SWEEP_M + 1.]
+  assert any(ve > SWEEP_V_OFF for _, ve, _ in inside)  # the car came into the 30 m at road speed
+  assert all(v == 'auto' for _, ve, v in inside if ve > SWEEP_V_OFF + 0.1)
+  assert all(v == 'stopSweep' for _, ve, v in inside if ve <= SWEEP_V_MAX - 0.1)
   assert sim.tp.sweeping
   sim.go_taps, sim.take_over_on = True, ('stopSignTakeControl',)  # the driver drives on
   trace = sweep_trace(sim, 15.)
   # the latch holds the control's distance while it holds the car, so the sweep ends a few metres on in the sim's frame
-  assert sim.s > 230. and all(v == 'auto' for s, v in trace if s > 200. + SWEEP_PAST_M + 4.) and not sim.tp.sweeping
-  # a yield: from 30 m before it while the car runs through at the yield speed
+  assert sim.s > 230. and all(v == 'auto' for s, _, v in trace if s > 200. + SWEEP_PAST_M + 4.) and not sim.tp.sweeping
+  assert all(v == 'auto' for _, ve, v in trace if ve > SWEEP_V_OFF + 0.1)  # pulling away: the sweep ends past SWEEP_V_OFF
+  # a yield, run through at its 5 m/s: never at walking pace, so never swept (the watch still logs it)
   sim = Sim([(1000., "turn", "right"), (2000., "turn", "left")], controls=[(200., 'yield')])
   trace = sweep_trace(sim, 40.)
-  assert any(v == 'stopSweep' for s, v in trace if 180. < s < 199.)
-  assert all(v == 'auto' for s, v in trace if s < 200. - STOP_SWEEP_M - 1. or s > 200. + SWEEP_PAST_M + 1.)
+  assert min(ve for s, ve, _ in trace if 180. < s < 199.) > SWEEP_V_OFF and all(v == 'auto' for *_, v in trace)
   # a signal never sweeps
   sim = Sim([(1000., "turn", "right"), (2000., "turn", "left")], controls=[(200., 'signal')])
-  assert all(v == 'auto' for _, v in sweep_trace(sim, 40.))
+  assert all(v == 'auto' for *_, v in sweep_trace(sim, 40.))
+
+
+def test_a_stop_approached_at_road_speed_keeps_the_road_camera_at_10_hz_for_hard_brake_confirmation():
+  # SG3b skeptic (p1_confirm_rate.py): the held cycle alternates the full wide pass and the road camera on the even steps,
+  # so the road camera ran at 5 Hz from 30 m before every stop at any speed; scene_policy confirms a hard brake on
+  # CONFIRM_RECENT_HITS hits in CONFIRM_WINDOW_S, so a pedestrian 18 m ahead of a car at 9 m/s that only the road camera
+  # sees was reached at up to 7.4 m/s. Nothing asks for the sweep above walking pace: approaching at 9 m/s, the plans fed
+  # to modeld's camera choice run the road camera on every even step (10 Hz) until the car is down to SWEEP_V_MAX
+  from openpilot.selfdrive.turnpilot.detector.modeld_detector import RUN_EVERY, ModeldDetector
+  from openpilot.selfdrive.turnpilot.junction_watch import SWEEP_V_MAX
+  from openpilot.selfdrive.turnpilot.scene_policy import CONFIRM_RECENT_HITS, CONFIRM_WINDOW_S
+  sim = Sim([(1000., "turn", "right"), (2000., "turn", "left")], cruise=9., controls=[(200., 'stop')])
+  sim.go_taps = False
+  trace = sweep_trace(sim, 40.)
+  fast = [v for s, ve, v in trace if 200. - 30. < s < 200. and ve > SWEEP_V_MAX + 0.1]
+  assert len(fast) > 40
+  det = SimpleNamespace(frames={'road': 0, 'wide': 1}, wide_until=-1., sweep_runs=0, view_runs=0)
+  cams = [ModeldDetector.choose_camera(det, 0., log.Desire.none, k * RUN_EVERY * DT_MDL, v) for k, v in enumerate(fast[::RUN_EVERY])]
+  road_hz = cams.count('road') / len(cams) / (RUN_EVERY * DT_MDL)
+  assert road_hz == pytest.approx(10.) and road_hz * CONFIRM_WINDOW_S >= 2 * CONFIRM_RECENT_HITS

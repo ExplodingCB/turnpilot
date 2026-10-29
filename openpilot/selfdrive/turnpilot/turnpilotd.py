@@ -151,7 +151,7 @@ from openpilot.selfdrive.turnpilot.lane_planner import (OPENPILOT_SIGNALS_BRANDS
 from openpilot.selfdrive.turnpilot.route_follower import KEEP, LEFT, TURN, UNCERTAIN_M, RouteFollower
 from openpilot.selfdrive.turnpilot.scene.lane_paint import lane_paint_from_msg
 from openpilot.selfdrive.turnpilot.scene.tracker import MAX_COAST_S, STALE_S, SWEEP_COAST_S, SceneTracker, default_yaw_rate
-from openpilot.selfdrive.turnpilot.junction_watch import JunctionWatch, detector_view, sweep_control
+from openpilot.selfdrive.turnpilot.junction_watch import JunctionWatch, detector_view, sweep_control, sweep_wanted
 from openpilot.selfdrive.turnpilot import visibility_table
 from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
 from openpilot.common.time_helpers import system_time_valid
@@ -336,6 +336,7 @@ class TurnPilot:
     self.go_override = GO_OVERRIDE_DEFAULT  # TurnPilotGoOverride (main())
     self.go_cert = GoCertifier()  # the go certified for plannerd's lift (go_override.py): its ids never repeat while this runs
     self.sweeping = False  # the last plan asked modeld for a stop sweep (stopSweep, stopSweepGo): the tracker coasts longer
+    self.sweep_on = False  # the held cycle is wanted (junction_watch.sweep_wanted: walking pace, with hysteresis)
     self.watch = JunctionWatch()  # step S3's evidence at the swept stop or yield (junction_watch.py): logged, never acted on
     self.tracks_now: list = []    # the tracker's tracks this frame (observe_runs), for the watch
     self.reset()
@@ -509,7 +510,7 @@ class TurnPilot:
       self.stop('turnedOff')
       plan.state = State.disabled
       self.fill_stop_abort(plan)
-      self.sweeping = False
+      self.sweeping = self.sweep_on = False
       self.watch_junction(None, 0.)
       return msg
     self._stop_abort_t = 0.
@@ -691,9 +692,11 @@ class TurnPilot:
       (NO_JUNCTION_DATA_REASON if no_junction_data else "")
     fill_map_control(plan, mapd)
     self.fill_left(plan, decision)
-    # the stop sweep at every engaged stop and yield, engaged or not, the left's own view first (junction_watch.py)
+    # the stop sweep at every engaged stop and yield, engaged or not, at walking pace only, the left's own view first
+    # (junction_watch.py); the watch logs the control's whole window whatever the speed
     sweep = sweep_control(self.map_controls.tracker.controls.values())
-    plan.detectorView = detector_view(str(plan.detectorView), sweep is not None)
+    self.sweep_on = sweep_wanted(sweep, v_ego, self.sweep_on)
+    plan.detectorView = detector_view(str(plan.detectorView), self.sweep_on)
     self.sweeping = str(plan.detectorView) in ('stopSweep', 'stopSweepGo')
     self.watch_junction(sweep, v_ego)
     if acting:

@@ -3,12 +3,14 @@
 turnpilotd asks modeld for the held cycle (turnpilotPlan.detectorView stopSweep: full wide, side left, road, side right) for
 every stop or yield control map_controls has engaged (sweep_control), from STOP_SWEEP_M before it until the car is
 SWEEP_PAST_M past it, whether openpilot is engaged or not: step S3's dwell is driven with it off and TurnPilot on, and
-modeld reads the field through fresh_plan, so a shadow drive sweeps too. The unprotected left's own view (the road camera
-from its go to its commit, CRITIQUE REQUIRED 3; roadAndWide held at its line) outranks it (detector_view): the sweep suspends
-the far crop the left reads. SG4a's decider takes the field over with its own cycles.
+modeld reads the field through fresh_plan, so a shadow drive sweeps too. It asks only with the car at walking pace
+(sweep_wanted: at or under SWEEP_V_MAX, held to SWEEP_V_OFF): at road speed the held cycle would halve the road camera's
+rate and slow scene_policy's hard-brake confirmation, so the approach keeps modeld's own choice. The unprotected left's own
+view (the road camera from its go to its commit, CRITIQUE REQUIRED 3; roadAndWide held at its line) outranks it
+(detector_view): the sweep suspends the far crop the left reads. SG4a's decider takes the field over with its own cycles.
 
-While a sweep runs, JunctionWatch keeps the held control's live visibility (visibility.py) and track evidence
-(stop_evidence.py), fed every run turnpilotd drains, and logs:
+Over the swept control's whole window, at any speed, JunctionWatch keeps its live visibility (visibility.py) and track
+evidence (stop_evidence.py), fed every run turnpilotd drains, and logs:
 
 - turnpilot.stop_visibility every VIS_LOG_S: each conflicting lane's reach, R_seen, need, binding limit, blockers and shields,
   the views' freshness and the lane-edge estimate (read by nothing).
@@ -43,6 +45,8 @@ LINE_M = 3.0            # m from the stop point the car stands at it (section 2.
 VIS_LOG_S = 1.0
 DEFAULT_SETBACK_M = 1.9  # m, the design's camera setback until step S1 measures it (the event says which)
 LEFT_VIEWS = ('road', 'roadAndWide')
+SWEEP_V_MAX = sr.STOP_GO_V_MAX  # m/s: the sweep is asked for only at or under this (modeld's SIDE_VIEW_V_MAX, section 1.3)
+SWEEP_V_OFF = 2.5               # m/s: once asked for, held until over this (the go's cap is STOP_GO_V_MAX: no flapping there)
 
 
 def sweep_control(controls):
@@ -50,6 +54,16 @@ def sweep_control(controls):
   past it, else None."""
   live = [c for c in controls if c.kind in SWEEP_KINDS and c.engaged and -SWEEP_PAST_M <= c.d <= STOP_SWEEP_M]
   return min(live, key=lambda c: abs(c.d)) if live else None
+
+
+def sweep_wanted(control, v_ego: float, sweeping: bool) -> bool:
+  """Whether turnpilotd asks modeld for the held cycle: a swept control (sweep_control's) with the car at or under
+  SWEEP_V_MAX, or, once asked (sweeping), at or under SWEEP_V_OFF. Faster, the car is on its approach at road speed, where
+  the held cycle's even steps would halve the road camera's rate (full wide and road alternating, 5 Hz each) and so slow
+  scene_policy's hard-brake confirmation (CONFIRM_RECENT_HITS in CONFIRM_WINDOW_S: SG3b skeptic, a pedestrian 18 m ahead at
+  9 m/s was reached at up to 7.4 m/s), and its odd steps idle anyway (modeld's side views run only at or under
+  SIDE_VIEW_V_MAX). Step S3 counts only cars first tracked after our car has stood at the stop point, so it loses nothing."""
+  return control is not None and v_ego <= (SWEEP_V_OFF if sweeping else SWEEP_V_MAX)
 
 
 def detector_view(left_view: str, sweep: bool) -> str:
