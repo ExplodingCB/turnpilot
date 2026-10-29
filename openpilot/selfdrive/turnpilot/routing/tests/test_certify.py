@@ -84,6 +84,16 @@ class TestOrderedChecks:
   def test_a_surveyed_validated_25_mph_all_way_certifies(self, tmp_path):
     assert check(tmp_path) == ('certifiable', 'none')
 
+  @pytest.mark.parametrize('maneuver', ['straight', 'left', 'right'])
+  def test_10_a_stamp_without_the_opposite_side_validates_no_maneuver(self, tmp_path, maneuver):
+    # junction_validate.py leaves the opposite approach out of every stamp until step S4's taped ranges bound its ground
+    # range (STAMP_SIDES): every maneuver conflicts with the opposite approach, so none certifies on such a stamp
+    st = stamp()
+    for k in ('cars', 'minFirstTrackM', 'maxDropoutS'):
+      del st[k]['opposite']
+    v = ce.assess(junction(maneuver=maneuver), maneuver, visibility(tmp_path), [survey(validations=[st])], ETA, RUN)
+    assert (v.certification, v.reason) == ('uncertifiable', 'notValidated') and 'opposite lane 1' in v.detail
+
   def test_1_no_visibility_file_is_no_table(self, tmp_path):
     assert check(tmp_path, vis=False) == ('uncertifiable', 'noTable')
     assert ce.certify(junction(), 'straight', None, [survey()], ETA, RUN) == ('uncertifiable', 'noTable')

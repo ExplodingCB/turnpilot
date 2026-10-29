@@ -9,21 +9,23 @@ control's OSM node and the approach it was held from (approachBearingDeg, within
 lighting row (each car's row at its first track; day or sunAhead, the rows a stamp is written for). A row passes when:
 
 - the camera setback was measured (step S1) in every pass, so first-track ranges were taken from a known camera position;
-- every binding side (each conflicting approach the events list: left, right, opposite) had at least VALIDATE_CARS cross
-  motor vehicles approaching it, counted only when our car had stood at its stop point SETTLE_S before their first track
-  (they were seen from the stop point) and not excluded;
+- every binding side (each conflicting approach the events list, of STAMP_SIDES: left and right; the opposite side's
+  first-track range is its ground range's, unbounded until step S4, so it is never stamped and its reach is not judged, and
+  certify() then validates no maneuver at the junction) had at least VALIDATE_CARS cross motor vehicles approaching it,
+  counted only when our car had stood at its stop point SETTLE_S before their first track (they were seen from the stop
+  point) and not excluded;
 - every such vehicle first tracked inside its lane's R_req plus latency (needM) while moving toward the junction is late
   (a car the camera missed looks exactly like one that entered the lane late) and fails the row, unless --exclude names it
   by its log time (its first track's camera time, which this tool prints) with a reason, recorded in the stamp: only after
   looking at the clip and seeing it enter the lane inside that distance (a driveway, a turn in, a parked car pulling out);
-- every motor vehicle that approached stopped at its line, and none went through it at speed (the survey may be stale: the
-  junction fails for Kellen's review);
+- every motor vehicle that approached, on any side, stopped at its line, and none went through it at speed (the survey may
+  be stale: the junction fails for Kellen's review);
 - per lane, the longest gap between consecutive detections of a counted vehicle while inside its need is at most CLEAR_S / 3
   (CRITIQUE REQUIRED 2), and every conflicting lane had a counted vehicle.
 
 A passing row's stamp goes into the matched survey entry's validations, in a copy of the survey file (--out; never the file
 itself): {lighting, date, passes, approachBearingDeg, cars {side: n}, minFirstTrackM and maxDropoutS {side: [per lane, nearest
-first]} (first-track ranges at the pessimistic distance end of section 1.2, the gaps unrounded), allStopped, verdict pass,
+first]} for STAMP_SIDES (first-track ranges at the pessimistic distance end of section 1.2, the gaps unrounded), allStopped, verdict pass,
 exclusions [{logT, reason}], tool}. routing/certify.py reads it (pick_stamp). Why each failing row fails is printed. Exit 0
 when every row with evidence passed and was stamped, 1 otherwise.
 """
@@ -39,6 +41,14 @@ from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
 EVENT = 'turnpilot.junction_evidence'
 MOTOR = ('car', 'truck', 'bus', 'motorcycle')
 SIDES = ('left', 'right', 'opposite')
+# the sides whose first-track ranges a stamp carries. The opposite approach's lanes run parallel to ours, where a bearing
+# says nothing about how far along one a car is, so stop_evidence places its cars by ground range at 0.7x, and nothing bounds
+# that error until step S4's taped ranges do: at 1.3 m camera height +0.5 deg of pitch reads 60 m as 100.6 (x0.7 = 70.4, 17%
+# long) and +0.75 deg reads 45 m as 82.4 (x0.7 = 57.7, 28% long), growing without bound toward the horizon, so no fixed band
+# is pessimistic and a late opposite car would pass the late check (SG3b skeptic). Left out of every stamp, certify() finds
+# nothing for the opposite lanes (notValidated) for every maneuver, all of which conflict with them; add 'opposite' back once
+# step S4 bounds its range
+STAMP_SIDES = ('left', 'right')
 STAMP_ROWS = ('day', 'sunAhead')
 SETTLE_S = 3.0          # s our car must have stood at its stop point before a car's first track counts toward reach
 APPROACH_TOL_DEG = 35.  # deg: passes held from approaches this close are one approach (certify's LEG_HEADING_TOL)
@@ -126,17 +136,20 @@ def judge(g: dict, row: str, excludes: list[dict]) -> tuple[dict | None, list[st
     elif c.get('approaching') is True and not c.get('stoppedAtLine'):
       why.append(f"{tag} approached and didn't stop at its line")
     settled = float(c.get('settledS', -1.)) >= SETTLE_S
-    if settled and c.get('approaching') is not False and float(c['firstRangeM']) < float(c['needM']):
+    if c['role'] in STAMP_SIDES and settled and c.get('approaching') is not False and float(c['firstRangeM']) < float(c['needM']):
       why.append(f"{tag} was late: first tracked {float(c['firstRangeM']):.1f} m down its lane, inside {float(c['needM']):.1f} m " +
                  f"(R_req plus latency); --exclude {float(c['firstT']):.2f}=REASON only after the clip shows it entered there")
-  sides = sorted({r for r, _ in lanes}, key=SIDES.index)
+  sides = sorted({r for r, _ in lanes if r in STAMP_SIDES}, key=SIDES.index)
+  for role, index in sorted((k for k in lanes if k[0] not in STAMP_SIDES), key=lambda k: (SIDES.index(k[0]), k[1])):
+    notes.append(f"{role} lane {index}: not stamped: its first-track range is the ground range's, which nothing bounds until " +
+                 "step S4's taped ranges (STAMP_SIDES), so certify() validates no maneuver here")
   count = {s: sum(1 for c in counted if c['role'] == s) for s in sides}
   for s in sides:
     if count[s] < sr.VALIDATE_CARS:
       why.append(f"{s}: {count[s]} cross motor vehicles seen from the stop point, {sr.VALIDATE_CARS} needed")
   first: dict[str, list] = {s: [] for s in sides}
   drop: dict[str, list] = {s: [] for s in sides}
-  for (role, index) in sorted(lanes, key=lambda k: (SIDES.index(k[0]), k[1])):
+  for (role, index) in sorted((k for k in lanes if k[0] in STAMP_SIDES), key=lambda k: (SIDES.index(k[0]), k[1])):
     on = [c for c in counted if c['role'] == role and int(c['index']) == index]
     if not on:
       why.append(f"{role} lane {index}: no counted vehicle")

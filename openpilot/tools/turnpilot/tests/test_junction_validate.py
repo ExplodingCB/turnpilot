@@ -2,6 +2,7 @@
 the held control's OSM node and arriving approach, judged per lighting row, and a passing stamp written into a copy of
 surveyed_junctions.json that maps/surveys.py loads and routing/certify.py picks."""
 import json
+import math
 
 import pytest
 
@@ -76,9 +77,9 @@ def test_a_validated_junction_gets_a_stamp_that_surveys_loads_and_certify_picks(
   assert code == 0
   (st,) = stamps(out)
   assert st['verdict'] == 'pass' and st['lighting'] == 'day' and st['approachBearingDeg'] == 0. and st['allStopped'] is True
-  assert st['cars'] == {'left': 10, 'right': 10, 'opposite': 10} and st['passes'] == 1
-  assert st['minFirstTrackM'] == {'left': [pytest.approx(52.1)], 'right': [pytest.approx(53.1)], 'opposite': [pytest.approx(54.1)]}
-  assert st['maxDropoutS'] == {'left': [0.3], 'right': [0.3], 'opposite': [0.3]}
+  assert st['cars'] == {'left': 10, 'right': 10} and st['passes'] == 1  # the opposite side isn't stamped this week (below)
+  assert st['minFirstTrackM'] == {'left': [pytest.approx(52.1)], 'right': [pytest.approx(53.1)]}
+  assert st['maxDropoutS'] == {'left': [0.3], 'right': [0.3]}
   # the copy reads back through the survey loader and the certifier's stamp pick; the input is untouched
   entry = survey_file.load(out).entries[0]
   assert pick_stamp(entry, 'day', 0.) == st and pick_stamp(entry, 'day', 90.) is None
@@ -193,3 +194,29 @@ def test_the_watchs_own_event_reads_back(tmp_path, capsys):
   text = capsys.readouterr().out
   assert code == 1 and stamps(out) == []
   assert 'track 7 (car, left lane 1)' in text and 'through its line at speed' in text and 'left: 1 cross motor vehicles' in text
+
+
+def test_the_opposite_approachs_first_track_range_is_never_stamped_until_step_s4_bounds_it(tmp_path, capsys):
+  # SG3b skeptic: an opposite-lane car's first-track range is its ground range at 0.7x (stop_evidence: a bearing says
+  # nothing along a lane parallel to ours), and nothing bounds that: at 1.3 m camera height +0.5 deg of pitch reads 60 m as
+  # 100.6 (x0.7 = 70.4, 17% long) and +0.75 deg reads 45 m as 82.4 (x0.7 = 57.7, 28% long), so a late opposite car passed the
+  # late check and its range went into minFirstTrackM, which certify() reads for every maneuver. Until step S4's taped
+  # ranges bound it, no stamp carries the opposite side (certify then finds nothing for it: notValidated), and it says why
+  assert jv.STAMP_SIDES == ('left', 'right')
+  height = 1.3
+
+  def read(true_m, pitch_deg):  # ground range from the angle below the horizon, the camera pitched up by pitch_deg
+    return height / math.tan(math.atan2(height, true_m) - math.radians(pitch_deg))
+  assert read(45., 0.75) * 0.7 > 45. * 1.25 and read(60., 0.5) * 0.7 > 60. * 1.15
+  cars = traffic()
+  late = next(c for c in cars if c['role'] == 'opposite')
+  late['firstRangeM'] = read(40., 0.75) * 0.7  # truly first tracked 40 m out, inside its 45.4 m need: it reads 47 m
+  code, _, out = run(tmp_path, [event(cars)])
+  st = stamps(out)[0]
+  assert code == 0 and 'opposite' not in st['minFirstTrackM'] and 'opposite' not in st['maxDropoutS'] and 'opposite' not in st['cars']
+  text = capsys.readouterr().out
+  assert 'opposite lane 1: not stamped' in text and 'step S4' in text
+  # its cars are still judged for what the survey says: one through its line at speed fails the junction
+  late['throughAtSpeed'] = True
+  code, _, out = run(tmp_path, [event(cars)])
+  assert code == 1 and stamps(out) == [] and 'through its line at speed' in capsys.readouterr().out
