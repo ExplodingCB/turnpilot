@@ -541,7 +541,7 @@ class StubJunction(StubValhalla):
       out = next((x for x in junctions.get(begin_m, []) if x['exit']), None)
       d['begin_heading'] = out['h'] if out else 0.
       if out:  # the route's edge leaving by the exit leg is that road's
-        d['road_class'], d['use'], d['way_id'] = out['class'], out['use'], out['way']
+        d['road_class'], d['use'], d['way_id'], d['traversability'] = out['class'], out['use'], out['way'], out['drive']
       if end_m in junctions:
         d['end_node']['intersecting_edges'] = [{'begin_heading': x['h'], 'road_class': x['class'], 'use': x['use'],
                                                 'driveability': x['drive'], 'cyclability': x['cyclability']}
@@ -615,6 +615,13 @@ def test_g23_a_left_at_a_four_leg_junction_lists_the_exit_leg_with_role_exit():
                                     turn_steps(100., 'left'))[0])
   ex = next(a for a in j.approaches if a.role == 'exit')
   assert (ex.valhalla_control, ex.inbound, ex.lanes_in) == ('unknown', True, 0)
+  # a one-way away from the junction (the route's exit edge traversable forward only): no car comes in by it, its
+  # control still unknown (none to match)
+  one_way = [leg(0.), leg(90.), leg(270., exit=True, drive='forward')]
+  _, j = junction_of(route_controls(StubJunction([(0., 100., {'stop': True}), (100., 400., {})], {100.: one_way}),
+                                    turn_steps(100., 'left'))[0])
+  ex = next(a for a in j.approaches if a.role == 'exit')
+  assert (ex.valhalla_control, ex.inbound, ex.outbound, ex.lanes_out) == ('unknown', False, True, 1)
 
 
 def test_an_unmatched_leg_reads_unknown_never_none():
@@ -1020,3 +1027,31 @@ def test_controls_ahead_keeps_q1_and_q2_by_edge_id():
   v.requests.clear()
   controls_ahead(v, pt(5.), 3.)  # no cache: both asked again
   assert len([r for e, r in v.requests if e == 'locate' and 'heading' not in r['locations'][0]]) == 2
+
+
+def test_a_stop_before_a_crosswalk_node_is_read_at_the_junction_it_governs(tmp_path):
+  """Indianapolis, OSM node 1710705057: Valhalla splits our approach at a crosswalk node 16 m before the junction, and the
+  sidecar's stop line lands on the edge ending there, where no other road meets. The junction is read at the node the
+  sidecar says the stop governs, further on the route (within JUNCTION_AHEAD_M), with its legs; the stop point never moves
+  forward for it (here it stays 27 m back, past the 2-lane rule's 13 m)."""
+  edges = [(0., 84., {'way_id': 50, 'crossing': []}), (84., 100., {'way_id': 50}), (100., 400., {})]
+  side = {'50:f': [entry('stop', 80., junction=900)]}
+  at = {'900': {'pos': list(pt(100.)), 'approaches': []}}
+  v = StubJunction(edges, {100.: four()[100.]}, every=2.)
+  c, j = junction_of(route_controls(v, steps(every=2.), sidecar_dir=osm_dir(tmp_path, side, at))[0])
+  assert (c.edge, round(c.route_m, 1), c.junction) == (0, 84. - OFF, False)
+  assert haversine((j.lat, j.lon), pt(100.)) < 0.5 and j.osm_node_id == 900
+  assert roles(j) == {0: ('exit', 0), 90: ('right', 90), 270: ('left', -90)}
+  assert round(j.stop_point_distance, 1) == round(100. - (84. - OFF), 1) and j.stop_point_source == 'default'
+  assert j.status == 'ok'
+  # the junction not on the route ahead: read where the stop is, where no road meets, so it is failed (no cross road to
+  # judge), logged; a stop Valhalla flags there with nothing in the sidecar is the same
+  elsewhere = {'900': {'pos': list(toward(pt(100.), 90., 40.)), 'approaches': []}}
+  with patch.object(controls_module, 'cloudlog') as log:
+    _, j = junction_of(route_controls(v, steps(every=2.), sidecar_dir=osm_dir(tmp_path / 'b', side, elsewhere))[0])
+  assert haversine((j.lat, j.lon), pt(84.)) < 0.5 and [a.role for a in j.approaches] == ['exit'] and j.status == 'failed'
+  assert any('no other road' in str(c.args[0]) for c in log.warning.call_args_list)
+  flagged = StubJunction([(0., 84., {'way_id': 50, 'crossing': [], 'stop': True}), (84., 100., {'way_id': 50}), (100., 400., {})],
+                         {100.: four()[100.]}, every=2.)
+  _, j = junction_of(route_controls(flagged, steps(every=2.), sidecar_dir=osm_dir(tmp_path / 'c'))[0])
+  assert j.status == 'failed' and haversine((j.lat, j.lon), pt(84.)) < 0.5

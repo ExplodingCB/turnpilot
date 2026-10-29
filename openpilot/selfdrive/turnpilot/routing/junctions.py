@@ -162,6 +162,7 @@ class Leg:
   cyclability: str | None = None
   exit: bool = False
   way_id: int = 0            # the exit leg's own way (the route's edge)
+  traversability: str | None = None  # the exit leg's: the route's edge's (forward: one-way away from the junction)
   probe: int = -1            # its point among probes()'
 
 
@@ -312,7 +313,7 @@ def junction_legs(edges, tpts, a: int, ahead: bool) -> tuple[list[tuple[float, f
   if out is not None:
     h = out.get('begin_heading')
     legs.append(Leg(len(nodes) - 1, None if h is None else float(h) % 360., out.get('road_class'), out.get('use'), None, None,
-                    exit=True, way_id=int(out.get('way_id') or 0)))
+                    exit=True, way_id=int(out.get('way_id') or 0), traversability=out.get('traversability')))
   elif ahead:
     h_in = heading_in(edges[j], tpts)
     last = [x for x in legs if x.node == len(nodes) - 1 and x.heading is not None and x.driveability in ('forward', 'both')]
@@ -440,7 +441,8 @@ def approach(leg: Leg, h_in: float, inb: dict | None, outb: dict | None) -> Appr
   a.road_class, a.rank, a.valhalla_class = ROAD_CLASS.get(cls or '', 'unknown'), RANK.get(cls or '', 8), cls or ''
   a.use, a.valhalla_use = (ROAD_USE.get(use, 'other') if use else 'unknown'), use or ''
   if leg.exit and leg.driveability is None:
-    a.inbound = a.outbound = True  # the route's own exit has no driveability: cars may come in by it (unknown until matched)
+    # the route's own exit: by its edge's traversability (forward: a one-way away, no car comes in); not given, both
+    a.inbound, a.outbound = leg.traversability in (None, 'both', 'backward'), leg.traversability in (None, 'both', 'forward')
   else:
     a.inbound, a.outbound = leg.driveability in ('backward', 'both'), leg.driveability in ('forward', 'both')
   a.matched = inb is not None

@@ -99,8 +99,9 @@ ATTRIBUTES = ['edge.id', 'edge.way_id', 'edge.forward', 'edge.length', 'edge.beg
               # the junctions (routing/junctions.py)
               'edge.begin_heading', 'edge.end_heading', 'edge.roundabout', 'edge.use', 'edge.lane_count', 'edge.speed_limit',
               'node.intersecting_edge.begin_heading', 'node.intersecting_edge.driveability', 'node.intersecting_edge.use',
-              'node.intersecting_edge.cyclability']
+              'node.intersecting_edge.cyclability', 'edge.traversability']
 EXCLUDE_BACK_M = 12.     # m back from the node an approach's exclusion point goes, at most half its edge (SG2, 3.3)
+JUNCTION_AHEAD_M = 60.   # m on along the route the junction the sidecar says a stop governs is looked for (its MAXD)
 CACHE_MAX = 4096         # Q1 and Q2 answers a LocateCache keeps, each
 
 
@@ -514,6 +515,20 @@ def _q1(call, edges, tpts, tcum, cache: LocateCache | None) -> list[dict | None]
   return out
 
 
+def governed_node(edges, tpts, ends, a: int, pos) -> int:
+  """The trace edge whose end node is the junction a control at the end of edge a governs: the sidecar's junction at pos
+  (lat, lon) when it is on the route ahead within JUNCTION_AHEAD_M (a node on the way there: a crosswalk, an alley), else
+  edge a's own."""
+  if pos is None or haversine(tpts[edges[a]['end_shape_index']], pos) <= jn.survey_file.SAME_NODE_M:
+    return a
+  for i in range(a + 1, len(edges)):
+    if ends[i][0] - ends[a][0] > JUNCTION_AHEAD_M:
+      break
+    if haversine(tpts[edges[i]['end_shape_index']], pos) <= jn.survey_file.SAME_NODE_M:
+      return i
+  return a
+
+
 def maneuver_at(steps, starts, stop_s: float, node_s: float) -> str:
   """The route's maneuver at a junction (N8): the first step starting from the stop point stop_s to MANEUVER_AFTER_M past
   the node node_s (m along the route's shape), else straight."""
@@ -669,18 +684,21 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
                     'instance': '', 'source': 'default', 'osm_node': 0, 'status': 'failed' if osm is not None and not osm_ok else 'ok',
                     'a': a, 'sign_m': None, 'suspected': True, 'legs': (nodes, legs, last)})
 
-  # Q2: every stop and yield's junction, in one batched verbose locate with the route's opposing roads
+  # Q2: every stop and yield's junction, in one batched verbose locate with the route's opposing roads. A control whose
+  # edge ends short of the junction the sidecar says it governs (Valhalla splits an approach at a crosswalk or an alley) is
+  # read at that junction's node, when it is on the route ahead
   jobs = []
   for f in found:
     if f['kind'] not in ('stop', 'yield'):
       continue
-    nodes, legs, last = f['legs'] or jn.junction_legs(edges, tpts, f['a'], ahead)
+    f['node_edge'] = governed_node(edges, tpts, ends, f['a'], osm.junction_pos(f['osm_node']) if osm_ok and f['osm_node'] else None)
+    nodes, legs, last = f['legs'] or jn.junction_legs(edges, tpts, f['node_edge'], ahead)
     jobs.append((f, nodes, legs, last))
   opp_legs, locs = opposing_probes(steps) if opposing is not None else ({}, [])
   n_opp, spans = len(locs), []
   for f, nodes, legs, last in jobs:
     mine = jn.probes(nodes, legs)
-    qkey = (edges[f['a']].get('id'), tuple(edges[k].get('id') for k in range(f['a'] + 1, last + 1)),
+    qkey = (edges[f['node_edge']].get('id'), tuple(edges[k].get('id') for k in range(f['node_edge'] + 1, last + 1)),
             edges[last + 1].get('id') if last + 1 < len(edges) else None)
     hit = cache.get('q2', qkey) if cache is not None else None
     spans.append((qkey, None, hit) if hit is not None else (qkey, (len(locs), len(mine)), None))
@@ -704,15 +722,21 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
       mine = answers[span_[0]:span_[0] + span_[1]]
       if cache is not None:
         cache.put('q2', qkey, mine)
-    a = f['a']
-    end_m, span, key, node = ends[a]
-    j = jn.build(edges, tpts, a, nodes, legs, last, mine)
+    a, k = f['a'], f['node_edge']
+    end_m = ends[k][0]  # the junction's node
+    begin_m = ends[a][0] - ends[a][1]  # the control's own edge's start
+    j = jn.build(edges, tpts, k, nodes, legs, last, mine)
     j.suspected, j.sidecar = f['suspected'], osm_ok
     if f['status'] == 'failed' or not context.overrides_ok:
       j.status = 'failed'
+    if len(nodes) == 1 and not ends[k][3].get('intersecting_edges'):
+      # no other road at its node and no junction found ahead for it: nothing to judge cross traffic by
+      cloudlog.warning(f"turnpilot controls: the {f['kind']} on {ends[a][2]} at {ends[a][0]:.0f} m is at a node no other road meets " +
+                       "and its junction wasn't found ahead: its junction failed")
+      j.status = 'failed'
     j.osm_node_id = jn.osm_node_at(osm if osm_ok else None, f['osm_node'], nodes[0])
     jn.classify(j, osm, not f['suspected'], context)
-    j.rail_distance = rail_distance(osm, pts, cum, end_m - span, end_m, nodes[0])
+    j.rail_distance = rail_distance(osm, pts, cum, begin_m, end_m, nodes[0])
     j.maneuver = 'unknown' if ahead else maneuver_at(steps, starts, f['s'], end_m)
     sv = jn.survey_approach(j.survey if j.surveyed else None, j.our_way, j.heading_in)
     off, j.stop_point_source = jn.stop_offset(j, end_m - f['s'], f['mapped'], sv.get('stopPointM') if sv else None)
