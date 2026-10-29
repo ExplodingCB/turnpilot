@@ -89,6 +89,24 @@ python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotEnabled=1 --se
 | `TurnPilotRouteSource` | `auto` | Left over from Mapbox routing. `mapbox` is now an error; anything else is ignored. |
 | `TurnPilotWebToken` | generated | The phone's password. `turnpilot_web` creates it on its first run. |
 
+## Let the car signal its own turns
+
+On a Tesla, TurnPilot can work the car's own turn signal through `DAS_bodyControls` (0x3E9). It is off by default, and it stays off on a car until a lamp check passes on that car and you confirm on the phone that the outside lamps flashed. Until then, and whenever the car's signal fails, every turn below 20 mph prompts "Signal Left" or "Signal Right" and the driver signals. The panda allows the message only in a debug build, the build this branch already flashes.
+
+1. On the phone page's **Car turn signal** section, set the mode to **check**, then turn the car off and on. In Park, with hands off the stalk, the check runs by itself after 3 s: it blinks each side, says each step, and takes 75 to 110 s. If Park gives no lamp, set **check** again, restart, stop in Drive with the brake held, and tap **Start check in Drive**.
+2. When it passes, the card asks whether the front, side and rear lamps flashed outside on each side. Answer it, then set the mode to **on**.
+3. At the next ignition the car checks the record against its VIN and firmware. A record from a check in Park also blinks each side once in Park before the first drive. A Tesla update that changes the firmware voids the record: run the check again.
+
+| Param | Value | What it does |
+| --- | --- | --- |
+| `TurnPilotCarSignals` | `off` | `off`: the driver signals, prompted, and no 0x3E9 is ever sent. `check`: the lamp check runs on the next ignition, and the comma writes `off` back as soon as it reads it. `on`: the car signals TurnPilot's turns and lane changes, if this car has a verified record. Any other value is `off`, logged as an error. Read once per ignition. |
+| `TurnPilotCarSignalsVerified` | written by the comma | The verified record: VIN, firmware, the request reason that lit the lamp, the measured latencies, and when you confirmed the outside lamps. Deleted if the car ever lights the wrong side. |
+| `TurnPilotCarSignalsCheck` | written by the comma | The last check's result, pass or fail, with every measurement and the step that failed. |
+| `TurnPilotCarSignalsCheckNow` | set by the phone | One-shot "Start check in Drive". Cleared at every ignition. |
+| `TurnPilotCarSignalsExterior` | set by the phone | Your answer to the outside-lamp question, for the pending check only. |
+
+In the BeamNG sim, `run_bridge.py --car-signals` writes `on` and a sim record that the comma accepts only with `SIMULATION=1`.
+
 ## Install Valhalla for offline routing
 
 The system Python on the comma is read-only, so pyvalhalla goes into `/data/turnpilot/pyvalhalla`, which survives updates. The comma needs internet once for the 35 MB wheel, from home Wi-Fi or the hotspot:
@@ -185,4 +203,4 @@ Two safety choices are open. Both are set to the cautious option in this build, 
 
 **The 20 mph minimum for nav lane changes.** DesireHelper refuses lane changes below 20 mph (`LANE_CHANGE_SPEED_MIN` in `openpilot/selfdrive/controls/lib/desire_helper.py`), and TurnPilot's lane planner adds 0.5 m/s on top (`LC_SPEED_MARGIN`) so a request does not wait below the limit. Nav lane changes inherit both. On city streets below that speed, the car does not change lanes for a turn, so a turn from the wrong lane is missed, or the driver changes lanes. Lowering the limit for nav requests only is a safety change in DesireHelper, and the model's lane-change behavior at low speed has not been looked at. The suggestion: keep 20 mph through the shadow and empty-lot rungs, count how many needed lane changes happen below it on the empty-streets rung, and decide with those notes.
 
-**The stalk signal prompt.** The Tesla port cannot send turn signals: the panda allows only three Tesla messages, and the controller has a `TODO: HUD control`. TurnPilot treats every car except Hyundai as one that can't signal (`OPENPILOT_SIGNALS_BRANDS` in `lane_planner.py`). On those cars it publishes a "signal left" or "signal right" prompt and holds the lane change request until the driver taps the stalk. Then the change goes ahead without a steering nudge, and the request drops after 8 seconds if the blindspot check or the driver doesn't clear it. This keeps signals legal, but a lane change needs a hand on the stalk. Nothing in this build displays the prompt: the phone page and the comma screen don't read `signalPrompt` yet. Until an overlay ships, Chase gets no cue, and a nav lane change only happens if he signals on his own. The suggestion: keep the prompt, and treat lane changes as driver-initiated on the first rungs. The other options are to change lanes without signaling, which is unsafe for the cars around the Tesla and illegal in most places, or to turn off nav lane changes on Tesla.
+**The stalk signal prompt.** Until the car's own turn signal is verified and on (see "Let the car signal its own turns"), TurnPilot can't signal on any car. It publishes a "signal left" or "signal right" prompt and holds the lane change request until the driver taps the stalk. Then the change goes ahead without a steering nudge, and the request drops after 8 seconds if the blindspot check or the driver doesn't clear it. This keeps signals legal, but a lane change needs a hand on the stalk. Nothing in this build displays the prompt: the phone page and the comma screen don't read `signalPrompt` yet. Until an overlay ships, Chase gets no cue, and a nav lane change only happens if he signals on his own. The suggestion: keep the prompt, and treat lane changes as driver-initiated on the first rungs. The other options are to change lanes without signaling, which is unsafe for the cars around the Tesla and illegal in most places, or to turn off nav lane changes on Tesla.
