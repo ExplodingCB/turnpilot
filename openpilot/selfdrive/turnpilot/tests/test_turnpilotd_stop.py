@@ -339,6 +339,35 @@ def test_a_turn_at_the_stop_sign_takes_its_first_pulse_at_the_deciders_go_never_
   assert not any("isn't straight" in p.reason for p in plans)
 
 
+def test_O2_a_roll_up_g5_never_lifts_hands_back_h5_never_a_silent_stand(tmp_path):
+  # TurnPilotGoOverride off: the rollUp goes are never certified, and a holding model leaves the car standing 4.3 m short
+  # of the stop point where something stopped it. It stood about 90 s saying only "Rolling up to the stop sign" until the
+  # generic carStoppedTakeControl; now H5 after ROLLUP_WAIT_S of it
+  from openpilot.selfdrive.turnpilot.stop_go import ROLLUP_WAIT_S
+  sim = StopSim(tmp_path, model='holds')
+  sim.tp.go_override = False
+  base = sim.planner
+
+  def planner(s, plan):
+    a = base(s, plan)
+    room = S_LINE - 4.3 - s.s
+    if s.v > 0.01 and room < 25.:
+      a = min(a, -s.v * s.v / (2. * max(room, 0.2)))
+    return a
+  sim.accel = planner
+  while not (sim.v < 0.02 and sim.s > S_LINE - 30.):
+    sim.step()
+    assert sim.t < 80.
+  sim.accel = base
+  t0 = len(sim.plans())
+  sim.run(ROLLUP_WAIT_S + 10.)
+  plans = sim.plans()[t0:]
+  k = next((i for i, p in enumerate(plans) if p.controlPrompt == 'stopSignTakeControl'), None)
+  assert k is not None and k * DT_MDL <= ROLLUP_WAIT_S + 6. and plans[k].reason == "Can't start: take control"
+  assert all(p.shouldStop for p in plans[k + 1:]) and S_LINE - sim.s > 3.
+  assert not any(p.controlPrompt == 'carStoppedTakeControl' for p in plans)
+
+
 def test_V19_a_car_backing_out_ahead_holds_the_go(tmp_path):
   sim = StopSim(tmp_path)
   run_to_line(sim)

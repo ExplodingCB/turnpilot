@@ -98,6 +98,7 @@ CAR_LEN_M = 4.7
 BOX_HOLD_M = 6.                 # any box overlapping 0-6 m ahead of the bumper holds the go (V13)
 ROLLUP_GOES = 4
 ROLLUP_V_MAX = 3.0              # m/s: a roll-up's cap is the map curve alone, up to this
+ROLLUP_WAIT_S = 15.             # s standing short of the line with no lead within LEAD_GO_M, its rollUp goes spent: H5 (4.6)
 GO_RETRIES = 2
 UNCOMMIT_STOP_S = 0.5
 BAND_ABORT_MARGIN_S = 1.0
@@ -340,6 +341,7 @@ class StopGo:
     self.retries = 0
     self.went = False              # a stopSign go has gone out this encounter (its turn's pulse with it)
     self.rollups = 0
+    self.short_s = 0.              # s standing short of the line, no lead (the roll-up's bound)
     self.clear_boxes = 0
     self.stall_s = 0.
     self.uncommit_s = 0.
@@ -553,13 +555,30 @@ class StopGo:
     standing = f.v_ego < STAND_V
     self.stand_s = self.stand_s + f.dt if standing else 0.
     d.detector_view = 'stopSweep' if -pos <= STOP_SWEEP_M else 'auto'
+    free = f.lead_m is None or f.lead_m > LEAD_GO_M
+    if acting and -pos > LINE_M and self._short_wait(f, d, pos, standing and free and not f.tp_holding):
+      d.stops.append(hold_here(f.v_ego, self.fault_reason))  # never latched: the decider's own hold from this frame
+      return
     # a queue's lead gone, the model holding the car short of the line (V1, O2): a rollUp go (G5), the map curve rolling it up
-    if acting and standing and self.stand_s >= STOP_DWELL_S and (f.lead_m is None or f.lead_m > LEAD_GO_M) and -pos > LINE_M and \
+    if acting and standing and self.stand_s >= STOP_DWELL_S and free and -pos > LINE_M and \
        f.go_active == 'none' and self.rollups < ROLLUP_GOES and f.enabled:
       self.rollups += 1
       self.stand_s = 0.
       d.go_cause = 'rollUp'
       cloudlog.event("turnpilot.stop_go_rollup", key=list(self.key), d=round(-pos, 2), n=self.rollups, latched=False)
+
+  def _short_wait(self, f: Frame, d: StopGoDecision, pos: float, waiting: bool) -> bool:
+    """4.6's bound on a roll-up (V1, O2): standing short of the line with nothing ahead within LEAD_GO_M is waiting on the
+    roll-up's goes, a static wait said as such; ROLLUP_WAIT_S of it, the ROLLUP_GOES goes spent (TurnPilotGoOverride off, or
+    each go blocked) and none out, is H5. A lead within LEAD_GO_M, or the car moving, starts it over. True: the fault."""
+    self.short_s = self.short_s + f.dt if waiting and f.enabled else 0.
+    if self.short_s <= 0.:
+      return False
+    d.ledger, d.reason = STATIC, "Rolling up to the stop sign"
+    if self.short_s >= ROLLUP_WAIT_S - 1e-6 and self.rollups >= ROLLUP_GOES and f.go_active == 'none':
+      self._fault('H5', f, d, f"{self.rollups} roll-up goes left the car {-pos:.1f} m short of the line")
+      return True
+    return False
 
   def _stopped(self, f, d, ctl, pos, acting, why) -> None:
     d.latch, d.detector_view, d.action, d.reason = 'wait', 'stopSweep', 'held', "Stopped at stop sign"
@@ -588,10 +607,13 @@ class StopGo:
     standing = f.v_ego < STAND_V
     if target - self.crept_m <= 0.1 + 1e-6 or (standing and abs(pos) <= LINE_M and self.crept_m > 0.5):
       # there: the full stop again, its dwell from now (the arrival is this stop)
-      self.state, self.rollup_target, self.dwell_s = 'stopped', None, 0.
+      self.state, self.rollup_target, self.dwell_s, self.short_s = 'stopped', None, 0., 0.
       d.creep = (target, ROLLUP_V_MAX)
       return
     d.creep = (target, ROLLUP_V_MAX)
+    if self._short_wait(f, d, pos, standing and (f.lead_m is None or f.lead_m > LEAD_GO_M)):
+      d.creep = None
+      return
     self.stand_s = self.stand_s + f.dt if standing else 0.
     if standing and self.stand_s >= STOP_DWELL_S and f.go_active == 'none' and self.rollups < ROLLUP_GOES and f.enabled:
       self.rollups += 1

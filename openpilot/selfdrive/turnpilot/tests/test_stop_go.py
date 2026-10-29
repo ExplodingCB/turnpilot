@@ -22,7 +22,7 @@ from openpilot.selfdrive.turnpilot.routing.tests.test_certify import ETA, juncti
 from openpilot.selfdrive.turnpilot.scene.tracker import RawFrame
 from openpilot.selfdrive.turnpilot.scene_policy import ScenePolicy, Stop
 from openpilot.selfdrive.turnpilot.stop_evidence import junction_lanes
-from openpilot.selfdrive.turnpilot.stop_go import FAULT_GRACE_S, FRONT_ZONE_MAX_S, STATIC_WAIT_S, Frame, StopGo
+from openpilot.selfdrive.turnpilot.stop_go import FAULT_GRACE_S, FRONT_ZONE_MAX_S, ROLLUP_WAIT_S, STATIC_WAIT_S, Frame, StopGo
 from openpilot.selfdrive.turnpilot.tests.synthetic import model_v2
 from openpilot.selfdrive.turnpilot.tests.test_stop_evidence import track as ev_track
 from openpilot.selfdrive.turnpilot.tests.test_visibility import raw_box, sectors
@@ -870,6 +870,34 @@ def test_O2_stopped_more_than_3_m_short_rolls_up_on_the_map_curve_and_stops_agai
   assert any(d.go_cause == 'rollUp' for d in out)
   arrived = next(k for k, d in enumerate(out) if d.state == 'observe')
   assert abs(out[arrived].position_m) <= 3.0 + 1e-6 and w.state.moved_m >= 1.5
+
+
+def test_O2_V1_a_roll_up_that_never_moves_the_car_is_bounded_and_says_so_h5(tmp_path):
+  # 4.6: every held state has a bound or a voice. With TurnPilotGoOverride off, or every go blocked (a queue's lead still
+  # inside go_blocked's 15 m), the ROLLUP_GOES rollUp goes never move a holding model's car: it had stood short of its line
+  # in 'rollUp' (or 'approach') saying only "Rolling up to the stop sign", no chime, no ledger, no fault, until the generic
+  # 90 s stand. Now ROLLUP_WAIT_S of standing short with no lead within LEAD_GO_M, its goes spent, is H5
+  for latched in (True, False):
+    w = World(tmp_path, d0=6.)  # the car never moves: no G5 lift reaches it
+    if not latched:
+      w.control.held = False
+    out = w.run(ROLLUP_WAIT_S + 8., **({} if latched else {'approach': w.control}))
+    rollups = [k for k, d in enumerate(out) if d.go_cause == 'rollUp']
+    assert len(rollups) == 4, latched
+    h5 = next((k for k, d in enumerate(out) if d.fault == 'H5'), None)
+    assert h5 is not None, (latched, out[-1].state, out[-1].reason)
+    assert ROLLUP_WAIT_S - 0.1 <= h5 * DT_MDL <= ROLLUP_WAIT_S + 1.5
+    assert all(d.reason for d in out[:h5]) and all(d.ledger == 'static' for d in out[round(1.2 / DT_MDL):h5])
+    assert out[h5].prompt == 'stopSignTakeControl' and out[h5].reason == "Can't start: take control"
+    # held: by the latch, handing back (map_controls' fault), or once it never latched by the decider's own hold
+    assert all(d.prompt == 'stopSignTakeControl' and (d.latch == 'fault' and d.creep is None if latched else
+                                                      any(s.should_stop for s in d.stops)) for d in out[h5:])
+    assert all(s.accel_cap >= -2. - 1e-9 for d in out for s in d.stops)
+  # a lead within LEAD_GO_M is a queue: waiting behind it is no fault, however long
+  w = World(tmp_path, d0=6.)
+  w.control.held = False
+  out = w.run(ROLLUP_WAIT_S + 8., approach=w.control, lead_m=6.)
+  assert not any(d.fault for d in out) and not any(d.go_cause == 'rollUp' for d in out)
 
 
 def test_V2_a_cross_car_not_slowing_is_waited_for_until_it_has_passed(tmp_path):
