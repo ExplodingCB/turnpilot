@@ -352,6 +352,7 @@ class SideViews:
     self.geometry: SideGeometry | None = None  # the maps on the device are for this calibration
     self.device: dict[str, tuple] = {}
     self.pending = None             # (future, rpy, wide euler) of a recompute under way
+    self.staged: dict[str, tuple] = {}  # its views' maps uploaded so far, one an odd step
     self.why = SideViewStatus.noCalibration  # why the maps aren't ready
     self.next = 0                   # the side the next odd step runs (SIDE_VIEWS index)
     self.last_run_t: float | None = None  # time.monotonic() of the last side run
@@ -377,8 +378,9 @@ class SideViews:
 
   def prepare(self, upload: bool = True) -> bool:
     """Whether the maps on the device are for the calibration (within RECALIB_DEG). If not, the views are invalid at once,
-    their recompute runs off the step, and the step after it finishes uploads them (upload: this step may; that step runs
-    no view). why says what they wait for."""
+    their recompute runs off the step, and once it finishes they are uploaded one view a step (upload: this step may; it
+    then runs no view; both views' maps at once took 27 ms on the chestnut, more than an odd step's room). why says what
+    they wait for."""
     cal = self.calibration()
     if cal is None or self.lens is None:
       self.why = SideViewStatus.noCalibration
@@ -393,20 +395,21 @@ class SideViews:
       self.geometry, self.device = None, {}
     self.why = SideViewStatus.mapsStale
     if self.pending is not None and calib_moved_deg(self.pending[1], self.pending[2], rpy, euler) > RECALIB_DEG:
-      self.pending = None  # for a calibration since left behind: never uploaded
+      self.pending, self.staged = None, {}  # for a calibration since left behind: never used
     if self.pending is None:
       if self.executor is None:
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='side_maps')
       self.pending = (self.executor.submit(compute_geometry, self.lens, rpy, euler, self.cam_w, self.cam_h), rpy, euler)
     future = self.pending[0]
     if upload and future.done():
-      self.pending = None
       geom = future.result()  # a failed recompute raises: the side views' failure, off for the drive
+      name = next(n for n in SIDE_VIEWS if n not in self.staged)
       t0 = time.perf_counter()
-      self.device = {name: self.upload(name, geom.maps[name]) for name in SIDE_VIEWS}
-      self.geometry = geom
+      self.staged[name] = self.upload(name, geom.maps[name])
       rpy_deg = np.round(np.degrees(geom.rpy), 2).tolist()
-      cloudlog.warning(f"turnpilot side views: maps for rpy {rpy_deg} deg on the device in {1e3 * (time.perf_counter() - t0):.1f} ms")
+      cloudlog.warning(f"turnpilot side views: {name}'s maps for rpy {rpy_deg} deg on the device in {1e3 * (time.perf_counter() - t0):.1f} ms")
+      if len(self.staged) == len(SIDE_VIEWS):
+        self.pending, self.device, self.staged, self.geometry = None, self.staged, {}, geom
     return False
 
   def estimate(self, name: str) -> float:

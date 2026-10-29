@@ -438,6 +438,7 @@ class SweepPM:
 def side_detector(rpy=CAL_RPY, side_time=0.007, det_time=0.005, executor=None, ready=True):
   from openpilot.common.transformations.camera import DEVICE_CAMERAS
   from openpilot.selfdrive.turnpilot.detector.modeld_detector import SideViews
+  from openpilot.selfdrive.turnpilot.detector.sideview import SIDE_VIEWS
   from openpilot.selfdrive.turnpilot.scene.ranging import wide_lens
   det = make_detector(det_time=det_time)
   det.model_state.frames = [np.zeros(1, np.uint8), np.zeros(1, np.uint8)]  # sector quality reads nothing here
@@ -448,7 +449,8 @@ def side_detector(rpy=CAL_RPY, side_time=0.007, det_time=0.005, executor=None, r
   side.warmup_s = side_time
   det.side = side
   if ready:
-    side.prepare(time.monotonic())  # the maps for this calibration, on the device
+    for _ in range(len(SIDE_VIEWS)):  # the maps for this calibration, on the device a view at a time
+      side.prepare(True)
     assert side.geometry is not None and set(side.device) == {'sideLeft', 'sideRight'}
   return det
 
@@ -631,8 +633,10 @@ class TestStopSweep(OpenpilotTestCase):
     sweep_steps(det, pm, 4)  # no maps yet: computing, nothing runs
     assert det.side.run.calls == [] and len(held.pending) == 1 and pm.msgs[-1].sideViewStatus == SideViewStatus.mapsStale
     held.finish()
+    sweep_steps(det, pm, 2, start=50)  # one odd step: one view's maps up (27 ms for both on the chestnut), no view run
+    assert list(det.side.staged) == ['sideLeft'] and det.side.geometry is None and det.side.run.calls == []
     sweep_steps(det, pm, 8, start=100)
-    # the step after the recompute uploads the maps (and runs no view), then the views run
+    # the steps after the recompute upload the maps a view at a time (and run no view), then the views run
     assert {c[1] for c in det.side.run.calls} == {'sideLeft', 'sideRight'} and pm.msgs[-1].sideViewStatus == SideViewStatus.running
     first = det.side.geometry
     # under RECALIB_DEG of movement: the same maps
