@@ -14,9 +14,11 @@ what a table bin bounds. A validated entry bounds the distance along the lane in
 
 The reach walk (reach_walk) steps out along a lane from our conflict point and stops at the first point that fails: past the
 frame edge less EDGE_MARGIN_DEG; zeroed (sun ahead, low sun, a sector that isn't ok); outside the footprint mask; past every
-running view's range for its bin; inside the inner band (INNER_BAND_LO_DEG to the side views' inner edge) without the full
-pass and that side's view both fresh, or past the side view's first bin; past a validated distance; past a cap (survey sight
-distance, the parking cap); or behind an occluder. It returns the reach from the conflict point, m.
+running, fresh view's coverage of its bearing (a view stale past DET_FRESH_S, or a bin of 0 m, covers nothing); inside the
+inner band (INNER_BAND_LO_DEG to the side views' inner edge) without the full pass and that side's view both fresh, or past
+the side view's first bin; past every covering view's range for its bin, or past a validated distance in place of that range
+(never in place of the coverage); past a cap (survey sight distance, the parking cap); or behind an occluder. It returns the
+reach from the conflict point, m.
 """
 import math
 from collections.abc import Callable
@@ -503,7 +505,9 @@ def sun_ahead_zero(side: str, bearing: float) -> bool:
 def reach_walk(lane: Lane, sight: Sight, rotation_deg: float, validated_m: float | None = None, cap_m: float | None = None,
                step: float = WALK_STEP_M, max_m: float = WALK_MAX_M) -> float:
   """m of lane seen from our conflict point outward (module docstring). validated_m bounds the distance along the lane
-  from its origin (a validation stamp), in place of the views' range; cap_m likewise (survey sight distance, parking)."""
+  from its origin (a validation stamp) in place of the views' range bound only: some running, fresh view must still cover
+  each point's bearing, the inner band by its rule (1.4 rules 1 and 3a hold at a validated junction too). cap_m bounds the
+  distance along the lane as well (survey sight distance, parking)."""
   d = lane.conflict_m
   while d < max_m:
     nd = d + step
@@ -518,10 +522,13 @@ def reach_walk(lane: Lane, sight: Sight, rotation_deg: float, validated_m: float
     rng = math.hypot(xm, ym)
     if sight.mask is not None and not sight.mask(side, bearing, rng):
       break
+    limit = range_limit(sight, side, bearing)
+    if limit <= 0.:
+      break  # no running, fresh view covers the bearing (the inner band by its rule), validated or not
     if validated_m is not None:
       if nd > validated_m + 1e-9:
         break
-    elif rng > range_limit(sight, side, bearing) + 1e-9:
+    elif rng > limit + 1e-9:
       break
     if cap_m is not None and nd > cap_m + 1e-9:
       break

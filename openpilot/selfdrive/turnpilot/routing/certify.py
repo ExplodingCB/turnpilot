@@ -229,7 +229,8 @@ def assess(junction: sr.Junction, maneuver: str, visibility, surveys, eta: float
     reach = float('inf')
     for row, st in stamps.items():
       if runtime.side_views:
-        sight = visibility.sight({})
+        # the stamp stands in for the tables' range bound; the views still say which bearings are covered (all fresh here)
+        sight = visibility.sight(visibility.views(row, use='allWay'))
         validated = _per_lane(st.get('minFirstTrackM'), ln.role, ln.index)
         r = sr.reach_walk(ln, sight, rot, validated_m=validated, cap_m=min(caps))
       else:

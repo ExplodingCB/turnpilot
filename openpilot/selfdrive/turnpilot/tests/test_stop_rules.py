@@ -159,6 +159,26 @@ class TestReachWalk:
     edge_d = 4.0 * math.tan(math.radians(EDGE_K03 - sr.EDGE_MARGIN_DEG - 2.5))
     assert sr.reach_walk(near_edge, s, 2.5, validated_m=200.) == pytest.approx(edge_d, abs=0.25)
 
+  @pytest.mark.parametrize('role, s_min, s_max, rel, y', [('left', 6.7, 16.75, -90., 0.), ('right', 9.7, 20.45, 90., 0.),
+                                                          ('opposite', 16.4, 21.0, 0., -3.7)])
+  def test_a_validated_entry_replaces_only_the_range_bound_not_freshness_or_the_inner_band(self, role, s_min, s_max, rel, y):
+    # 1.4 rules 1 and 3a hold at a validated junction too: a point no fresh view covers ends the walk whatever the stamp says
+    lane = sr.Lane(role, 1, 'cross', s_min, s_max, rel, y=y)
+    fresh = {'all': None, 'side stale': lambda view, side: view != 'side', 'full stale': lambda view, side: view != 'full',
+             'all stale': lambda view, side: False}
+    for name, f in fresh.items():
+      table = sr.reach_walk(lane, sight('cons', fresh=f), 3.5)
+      validated = sr.reach_walk(lane, sight('cons', fresh=f), 3.5, validated_m=48.)
+      if name == 'all':
+        assert validated == pytest.approx(48., abs=0.25), (role, name)
+      elif role == 'opposite' and name != 'all stale':
+        assert validated == pytest.approx(48., abs=0.25), (role, name)  # the road camera covers it
+      else:
+        # coverage ends where the table walk's bearing ends it (the table's range bound never binds first here)
+        assert validated == pytest.approx(table, abs=0.25) and validated < 48., (role, name, validated, table)
+    side_stale = sr.reach_walk(sr.Lane('left', 1, 'cross', 6.7, 16.75, -90.), sight('cons', fresh=fresh['side stale']), 3.5, validated_m=48.)
+    assert side_stale == pytest.approx(6.7 * math.tan(math.radians(36.5)), abs=0.25)  # 40 deg: the inner band needs the side view
+
   def test_caps_mask_and_occluders(self):
     lane = sr.Lane('left', 1, 'cross', 10.4, 15.75, -90.)
     assert sr.reach_walk(lane, sight('opt'), 2.5, cap_m=30.) == pytest.approx(30., abs=0.25)

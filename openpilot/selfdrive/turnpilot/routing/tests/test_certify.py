@@ -397,6 +397,12 @@ class TestAssess:
     assert near.reach == pytest.approx(40., abs=0.3) and near.need == pytest.approx(45.4, abs=0.05)
     assert v.rows == {'day'} and v.validated
 
+  def test_route_time_views_are_all_fresh_so_the_stamp_bounds_each_lane(self, tmp_path):
+    # the walk keeps the views' coverage under a validated entry; at route time every view counts as fresh
+    v = ce.assess(junction(), 'straight', visibility(tmp_path), [survey()], ETA, RUN)
+    assert v.certification == 'certifiable'
+    assert {(lane.role, round(lane.reach)) for lane in v.lanes} == {('left', 48), ('right', 48), ('opposite', 80)}
+
   def test_certify_control_fills_navd_junction(self, tmp_path):
     from openpilot.selfdrive.turnpilot.routing.controls import Control
     from openpilot.selfdrive.turnpilot.routing.junctions import Approach, Junction
