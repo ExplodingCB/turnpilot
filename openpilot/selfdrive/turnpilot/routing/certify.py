@@ -7,7 +7,7 @@ certify(junction, maneuver, visibility, surveys, eta, runtime) returns (certific
 ('uncertifiable', reason) at the first of these checks that fails, in order:
    1 noTable       no visibility file, or its camera fields, lens, mask, darkThreshold or veil are empty (before step S1)
    2 modeOff       TurnPilotStopSignGo (runtime.mode) off or shadow, or a value this build doesn't know
-   3 noLaunch      no launchVerified stamp (step S4a), unless the mode is trial
+   3 noLaunch      no launchVerified stamp (step S4a) whose verdict is pass, unless the mode is trial
    4 geometry      roundabout, a turn_channel approach, a rail crossing within RAIL_M or on our approach (or not known), a
                    divided cross road, a U-turn
    5 skew          a road a car uses there (stop_rules.leg_skew: inbound or outbound, the exit leg included) that isn't the
@@ -153,9 +153,10 @@ def assess(junction: sr.Junction, maneuver: str, visibility, surveys, eta: float
   # 2, 3 the mode and the launch
   if runtime.mode not in ACTING:
     return _fail('modeOff', f"TurnPilotStopSignGo is {runtime.mode}")
-  launch = runtime.launch_verified if runtime.launch_verified is not None else visibility.launch_verified is not None
+  launch = runtime.launch_verified if runtime.launch_verified is not None else visibility.launch_passed
   if not launch and runtime.mode != 'trial':
-    return _fail('noLaunch', 'no launchVerified stamp (step S4a)')
+    return _fail('noLaunch', 'no passing launchVerified stamp (step S4a)' + (f": its verdict is {visibility.launch_verified.get('verdict')}"
+                                                                           if visibility.launch_verified else ''))
   # 4 geometry
   moves = sr.conflict_movements(j, maneuver, runtime.yaw_deg)
   exit_leg = next((a for a in j.approaches if a.role == 'exit'), None)

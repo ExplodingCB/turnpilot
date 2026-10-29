@@ -101,6 +101,11 @@ class TestOrderedChecks:
     assert check(tmp_path, launchVerified=None, runtime=ce.Runtime(mode='trial', side_views=True)) == ('certifiable', 'none')
     assert check(tmp_path, runtime=ce.Runtime(mode='auto', side_views=True, launch_verified=False)) == ('uncertifiable', 'noLaunch')
 
+  def test_3_a_failing_launch_stamp_is_no_launch(self, tmp_path):
+    failed = {'date': '2026-10-30', 'goes': 10, 'takenOver': 3, 'maxTakeoverS': 4.0, 'verdict': 'fail'}
+    assert check(tmp_path, launchVerified=failed) == ('uncertifiable', 'noLaunch')
+    assert check(tmp_path, launchVerified=failed, runtime=ce.Runtime(mode='trial', side_views=True)) == ('certifiable', 'none')
+
   @pytest.mark.parametrize('changes', [{'roundabout': True}, {'divided': True}, {'rail_distance': 12.}, {'rail_distance': -2.},
                                        {'maneuver': 'uTurn'}])
   def test_4_geometry(self, tmp_path, changes):

@@ -21,7 +21,8 @@ until step S1 fills them, and then certify() returns noTable (camera_ready()):
   allowProvisionalFor  allWay | null: where a provisional table may be read (route_audit reads them anyway, as candidates)
 and these may be absent or null:
   actuatorDelayS  s, step S4a's measured longitudinal delay (stop_rules.t_abort takes the larger of it and CarParams')
-  launchVerified  {date, goes, takenOver, maxTakeoverS, verdict}, written by launch_verify.py (S4a), never by hand
+  launchVerified  {date, goes, takenOver, maxTakeoverS, verdict: pass | fail}, written by launch_verify.py (S4a), never by
+                  hand; only a passing one verifies the launch (launch_passed), a failing one is there and verifies nothing
 
 The shipped file is PV1 (1.6) as provisional tables, the camera fields empty and launchVerified absent, so certify() says
 noTable for every stop and yield and navd routes around all of them until steps S1 and S4a.
@@ -52,6 +53,7 @@ BOUNDS = ('conservative', 'optimistic')
 VIEWS = ('road', 'full', 'side')
 LIGHTINGS = ('day', 'sunAhead', 'overcast', 'night')
 LAUNCH_FIELDS = ('date', 'goes', 'takenOver', 'maxTakeoverS', 'verdict')
+LAUNCH_VERDICTS = ('pass', 'fail')
 PROVISIONAL_USES = ('allWay',)
 DEFAULT_EDGE_DEG = 85.2   # the frame edge at lens k = 0, the bracket's pessimistic end until S1 fits the lens (1.1)
 SIM_PARAM = 'TurnPilotSimLightOracle'
@@ -107,6 +109,12 @@ class Visibility:
   @property
   def launch_verified(self) -> dict | None:
     return self.raw.get('launchVerified')
+
+  @property
+  def launch_passed(self) -> bool:
+    """S4a's launchVerified stamp is there and passed (certify's noLaunch otherwise)."""
+    lv = self.launch_verified
+    return isinstance(lv, dict) and lv.get('verdict') == 'pass'
 
   @property
   def allow_provisional_for(self) -> str | None:
@@ -224,6 +232,8 @@ def validate(raw) -> list[Table]:
   lv = raw.get('launchVerified')
   if lv is not None and (not isinstance(lv, dict) or any(k not in lv for k in LAUNCH_FIELDS)):
     _bad('launchVerified', f"must be {{{', '.join(LAUNCH_FIELDS)}}} (written by launch_verify.py) or absent")
+  if lv is not None and lv['verdict'] not in LAUNCH_VERDICTS:
+    _bad('launchVerified.verdict', f"must be {' or '.join(LAUNCH_VERDICTS)}, not {lv['verdict']!r}")
   if not isinstance(raw['tables'], list):
     _bad('tables', "must be a list")
   return [_check_table(i, t) for i, t in enumerate(raw['tables'])]
@@ -302,7 +312,8 @@ def main(argv=None) -> int:
   ready, missing = v.camera_ready()
   print(f"{args.check}: schema ok, {len(v.tables)} tables ({', '.join(sorted({t.source for t in v.tables})) or 'none'})")
   print("camera measurements ready" if ready else f"camera measurements not ready (certify says noTable): {', '.join(missing)} empty")
-  print(f"launchVerified: {'present' if v.launch_verified else 'absent (certify says noLaunch outside trial)'}")
+  launch = 'pass' if v.launch_passed else 'fail' if v.launch_verified else 'absent'
+  print(f"launchVerified: {launch}{'' if v.launch_passed else ' (certify says noLaunch outside trial)'}")
   return 0
 
 

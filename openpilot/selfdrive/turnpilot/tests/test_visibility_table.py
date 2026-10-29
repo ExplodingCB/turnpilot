@@ -80,6 +80,9 @@ class TestSchema:
     (('allowProvisionalFor',), 'twoWay', 'allowProvisionalFor'),
     (('actuatorDelayS',), -1., 'actuatorDelayS'),
     (('launchVerified',), {'date': '2026-10-30', 'goes': 10}, 'launchVerified'),
+    (('launchVerified',), {'date': '2026-10-30', 'goes': 0, 'takenOver': 0, 'maxTakeoverS': 0, 'verdict': None}, 'launchVerified.verdict'),
+    (('launchVerified',), {'date': '2026-10-30', 'goes': 10, 'takenOver': 10, 'maxTakeoverS': 1.1, 'verdict': 'ok'},
+     'launchVerified.verdict'),
   ])
   def test_a_bad_value_names_its_field(self, tmp_path, path, value, name):
     raw = filled()
@@ -101,6 +104,16 @@ class TestSchema:
     assert v.setback == 1.9 and v.height == 1.3 and v.veil == 'none' and v.actuator_delay_s == 0.45
     assert v.edge_deg == {'left': 88.1, 'right': 88.1}
     assert v.launch_verified['verdict'] == 'pass'
+
+  def test_only_a_passing_launch_stamp_counts(self, tmp_path):
+    # launch_verify.py (S4a) writes a failing stamp too: it is there, and it verifies nothing
+    raw = filled()
+    assert vt.load(write(tmp_path, raw)).launch_passed
+    raw['launchVerified'].update(verdict='fail', takenOver=3)
+    v = vt.load(write(tmp_path, raw))
+    assert v.launch_verified is not None and not v.launch_passed
+    del raw['launchVerified']
+    assert not vt.load(write(tmp_path, raw)).launch_passed
 
   def test_an_empty_veil_is_not_ready(self, tmp_path):
     raw = filled()
@@ -129,7 +142,14 @@ class TestCheck:
 
   def test_check_accepts_a_filled_file(self, tmp_path, capsys):
     assert vt.main(['--check', str(write(tmp_path, filled()))]) == 0
-    assert 'ready' in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert 'ready' in out and 'launchVerified: pass\n' in out
+
+  def test_check_says_a_failing_launch_stamp(self, tmp_path, capsys):
+    raw = filled()
+    raw['launchVerified']['verdict'] = 'fail'
+    assert vt.main(['--check', str(write(tmp_path, raw))]) == 0
+    assert 'launchVerified: fail (certify says noLaunch' in capsys.readouterr().out
 
 
 class TestTables:
