@@ -31,6 +31,8 @@ A validation stamp (written by junction_validate.py, SG3b) is {lighting, date, p
 heading toward the junction of the approach it was measured from; a stamp without it validates no approach), cars: {left,
 right, opposite}, minFirstTrackM and maxDropoutS: {left, right, opposite} each a list per binding lane, nearest first (or
 one number for all), allStopped, verdict: pass}. Lanes are named by where their traffic comes from, relative to our approach.
+junction_validate.py writes no opposite side until step S4 bounds its ground range (its STAMP_SIDES), so check 10 finds
+nothing for the opposite lanes and, as every maneuver conflicts with them, no 4-way junction certifies until then.
 
 The binding curb of a lane (1.4 rule 6, nearestParkingM {left, right} along each curb of the approach, left and right as a
 car on it toward the junction sees them): the left approach's right curb (the near side, between us and its lanes) and the

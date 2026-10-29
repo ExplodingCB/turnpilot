@@ -16,7 +16,8 @@ map knows and leaves null what must be measured). The shipped file is an empty l
    "validations": [{"lighting", "date", "passes", "approachBearingDeg" (the heading toward the junction of the approach it
                     was measured from: always written, a stamp without it validates no approach), "cars": {"left", "right",
                     "opposite"}, "minFirstTrackM", "maxDropoutS", "allStopped", "verdict"}, ...] (written by
-                    junction_validate.py, never by hand)}
+                    junction_validate.py, never by hand; it writes no "opposite" side until step S4 bounds its ground
+                    range, junction_validate.STAMP_SIDES)}
 
 An example, for a made-up junction (its node id can't match anything, and none of its numbers may be copied):
 
