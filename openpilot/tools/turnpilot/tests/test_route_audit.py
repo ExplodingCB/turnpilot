@@ -59,3 +59,53 @@ def test_b3_osm_signs_near_the_route_that_no_row_covers_are_listed(tmp_path):
   text = '\n'.join(route_audit.lines(report))
   assert 'no row covers' in text and '501' in text and 'not_on_a_drivable_way' in text and '505' not in text
   assert [g['node'] for g in route_audit.as_json(report)['signs']] == [501, 506, 504]
+
+
+def test_each_junction_lists_its_legs_tiers_limits_the_line_source_and_the_survey(tmp_path):
+  """STOP_SIGNS.md SG1b: route_audit prints each stop and yield's junction: its legs with their roles, tiers, limits and
+  the limit's source, the stop point's source, and the survey it matched (or why one doesn't count)."""
+  from openpilot.selfdrive.turnpilot.routing.tests.test_route_controls import StubJunction, allway, context, four, survey
+  v = StubJunction([(0., 100., {'stop': True, 'way_id': 50}), (100., 400., {})], four({90: {'kph': 40}}))
+  report = route_audit.audit(v, steps(), None, allway(tmp_path), context([survey(stops=(True, True, True, False))]))
+  assert [(j.kind, j.osm_node, j.survey) for j in report.junctions] == [('stop', 900, 'matched, counts')]
+  legs = {round(a['bearing']): (a['role'], a['tier'], a['speed_source'], round(a['assumed_mph'])) for a in report.junctions[0].legs}
+  assert legs == {0: ('exit', 'surveyed', 'survey', 20), 90: ('right', 'surveyed', 'survey', 20), 270: ('left', 'no', 'survey', 20)}
+  text = '\n'.join(route_audit.lines(report))
+  for word in ('junction', 'node 900', 'exit', 'right', 'surveyed', 'mph', 'survey', 'line default'):
+    assert word in text, word
+  doc = json.loads(json.dumps(route_audit.as_json(report)))
+  assert doc['junctions'][0]['osm_node'] == 900 and len(doc['junctions'][0]['legs']) == 3
+  old = route_audit.audit(v, steps(), None, allway(tmp_path / 'old'), context([survey(date='2025-01-01')]))
+  assert old.junctions[0].survey.startswith("matched, doesn't count")
+
+
+def test_the_survey_template_fills_what_the_map_knows_and_leaves_the_rest_null(tmp_path):
+  """route_audit --survey-template: for each candidate all-way on the trip (every other approach mapStrong or better), a
+  surveyed_junctions.json entry with the OSM node, its position and per approach the way, the OSM bearing toward the
+  junction and the tagged limit as hints; every field Kellen measures is null, so the entry doesn't load until he fills it
+  (STOP_SIGNS.md 4.3, step S2). Filled in, it loads."""
+  from openpilot.selfdrive.turnpilot.maps import surveys
+  from openpilot.selfdrive.turnpilot.routing.tests.test_route_controls import StubJunction, allway, four
+  v = StubJunction([(0., 100., {'stop': True, 'way_id': 50}), (100., 400., {})], four({90: {'kph': 40}}))
+  report = route_audit.audit(v, steps(), None, allway(tmp_path))
+  template = route_audit.survey_template(report)
+  assert len(template) == 1
+  entry = template[0]
+  assert (entry['osmNodeId'], entry['date'], entry['source']) == (900, None, None)
+  assert [(a['wayId'], round(a['bearingDeg']), a['laneEdgeM'], a['stops']) for a in entry['approaches']] == \
+    [(50, 0, None, None), (790, 270, None, None), (970, 90, None, None), (700, 180, None, None)]
+  assert entry['approaches'][1]['hintTaggedMph'] == round(40 / 3.6 / 0.44704) and entry['approaches'][2]['hintTaggedMph'] is None
+  path = tmp_path / 'template.json'
+  path.write_text(json.dumps(template))
+  assert surveys.load(path).entries == []  # nulls: no survey yet
+  entry |= {'date': '2026-10-29', 'source': 'inPerson'}
+  for a in entry['approaches']:
+    a |= {'stops': True, 'plaque': True, 'postedMph': 20, 'laneEdgeM': 4., 'lineM': 7., 'nearestParkingM': {'left': 40., 'right': 40.},
+          'sightM': 60.}
+  path.write_text(json.dumps([entry]))
+  loaded = surveys.load(path)
+  assert loaded.errors == [] and len(loaded.entries) == 1
+  two_way = route_audit.audit(v, steps(), None, allway(tmp_path / 'two', (True, 'mid_directed', 'none'),
+                                                      {700: (True, 'mid_directed', 'none'), 790: (False, 'none', 'none'),
+                                                       970: (True, 'mid_directed', 'none')}))
+  assert route_audit.survey_template(two_way) == []  # an approach that doesn't stop: no all-way to survey

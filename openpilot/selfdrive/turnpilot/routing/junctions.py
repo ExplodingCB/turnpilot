@@ -233,6 +233,7 @@ class Junction:
   our_rank: int = 8
   our_way: int = 0
   our_forward: bool = True
+  our_limit: float = 0.        # m/s, our edge's tagged limit (0 untagged)
   nodes: list = field(default_factory=list)
 
   def to_msg(self) -> dict:
@@ -615,7 +616,7 @@ def build(edges, tpts, a: int, nodes, legs, last: int, located: list | None) -> 
   h_in = heading_in(edges[a], tpts)
   j = Junction(lat=float(nodes[0][0]), lon=float(nodes[0][1]), heading_in=h_in, divided=len(nodes) > 1, nodes=list(nodes))
   j.our_way, j.our_forward = int(edges[a].get('way_id') or 0), bool(edges[a].get('forward', True))
-  j.our_rank = RANK.get(edges[a].get('road_class') or '', 8)
+  j.our_rank, j.our_limit = RANK.get(edges[a].get('road_class') or '', 8), kph(edges[a].get('speed_limit'))
   out = edges[last + 1] if last + 1 < len(edges) else None
   j.roundabout = bool(out is not None and out.get('roundabout'))
   if located is None:

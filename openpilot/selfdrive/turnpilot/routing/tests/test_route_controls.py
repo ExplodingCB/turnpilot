@@ -528,7 +528,7 @@ def leg(h, **kw):
 class StubJunction(StubValhalla):
   """StubValhalla with junctions on its route due north: {node m: [leg(...), ...]}. trace_attributes gives each edge its
   headings (north, the begin heading of an edge leaving by an exit leg its heading) and its end node's intersecting edges
-  (every leg but the exit). locate answers a leg's probe point (radius 5, near the point LEG_PROBE_M out along it) with the
+  (every leg but the exit, whose road the route's next edge is). locate answers a leg's probe point (radius 5, near the point LEG_PROBE_M out along it) with the
   leg's inbound and outbound edges, the node's own point (radius 1) with every leg's, and an opposing-road probe (with a
   heading) with the inbound edge of the leg it points at; anything else as StubValhalla."""
 
@@ -540,6 +540,8 @@ class StubJunction(StubValhalla):
       d['end_heading'] = 0.
       out = next((x for x in junctions.get(begin_m, []) if x['exit']), None)
       d['begin_heading'] = out['h'] if out else 0.
+      if out:  # the route's edge leaving by the exit leg is that road's
+        d['road_class'], d['use'], d['way_id'] = out['class'], out['use'], out['way']
       if end_m in junctions:
         d['end_node']['intersecting_edges'] = [{'begin_heading': x['h'], 'road_class': x['class'], 'use': x['use'],
                                                 'driveability': x['drive'], 'cyclability': x['cyclability']}
@@ -619,11 +621,12 @@ def test_an_unmatched_leg_reads_unknown_never_none():
   """A leg whose inbound edge Q2 doesn't match has Valhalla control unknown: never read as no sign. A matched one with no
   sign is none, with a stop stop, and a leg cars only leave by has no inbound edge to match: unknown too (read it with
   inbound)."""
-  legs = [leg(0., match=False), leg(90., stop=True), leg(270.), leg(300., drive='forward', **{'class': 'service_other'})]
+  legs = [leg(0., exit=True), leg(90., stop=True), leg(270., match=False), leg(300., drive='forward', **{'class': 'service_other'})]
   v = StubJunction([(0., 100., {'stop': True}), (100., 400., {})], {100.: legs})
   _, j = junction_of(route_controls(v, steps())[0])
-  got = {round(a.bearing): (a.valhalla_control, a.inbound, a.outbound) for a in j.approaches}
-  assert got == {0: ('unknown', True, True), 90: ('stop', True, True), 270: ('none', True, True), 300: ('unknown', False, True)}
+  got = {round(a.bearing): (a.role, a.valhalla_control, a.inbound, a.outbound) for a in j.approaches}
+  assert len(j.approaches) == 4 and got == {0: ('exit', 'none', True, True), 90: ('right', 'stop', True, True),
+                                            270: ('left', 'unknown', True, True), 300: ('left', 'unknown', False, True)}
   assert all(c.kind != 'signal' for c in route_controls(v, steps())[0])
 
 
@@ -681,7 +684,7 @@ def test_n5_a_suspected_unmapped_stop_is_emitted_as_a_stop_control(tmp_path, our
   """Nothing mapped on our approach (no Valhalla flag, nothing in the sidecar) where every road crossing outranks ours by two
   classes or more: a suspected unmapped stop, emitted as a stop control flagged suspected at the default stop point, its
   approaches' tiers unknown (nothing mapped there). A signal or a mapped yield there is no suspect (STOP_SIGNS.md N5)."""
-  legs = [leg(90., **{'class': crossing}), leg(270., **{'class': crossing}), leg(0., **{'class': ours})]
+  legs = [leg(90., **{'class': crossing}), leg(270., **{'class': crossing}), leg(0., exit=True, **{'class': ours})]
   v = StubJunction([(0., 100., {'road_class': ours} | extra), (100., 400., {'road_class': ours})], {100.: legs})
   controls, status = route_controls(v, steps(), sidecar_dir=osm_dir(tmp_path))
   assert status == 'ok'
@@ -751,9 +754,11 @@ def allway(tmp_path, ours=None, others=None, record=None, maxspeed=None):
 
 
 def four(over=None):
-  """Legs at the stub route's node 100 m: straight on (way 700), right (790), left (970); over: {heading: leg fields}."""
+  """Legs at the stub route's node 100 m: straight on (way 700, the road the route leaves by), right (790), left (970);
+  over: {heading: leg fields}."""
   over = over or {}
-  return {100.: [leg(0., way=700, **over.get(0, {})), leg(90., way=790, **over.get(90, {})), leg(270., way=970, **over.get(270, {}))]}
+  return {100.: [leg(0., way=700, exit=True, **over.get(0, {})), leg(90., way=790, **over.get(90, {})),
+                 leg(270., way=970, **over.get(270, {}))]}
 
 
 def tiers(j):
