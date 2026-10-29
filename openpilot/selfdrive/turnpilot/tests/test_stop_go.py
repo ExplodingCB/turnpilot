@@ -760,7 +760,9 @@ def test_C1_all_way_order_ties_shields_u2_the_go_and_the_band(tmp_path):
   w.tracks = cars((1, 'left', lambda t: LINE_D - 6. * (t - 6.) if t >= 6. else LINE_D), (2, 'right', at_line(t0=4.)))
   out = w.run(16.)
   i = first_go(out)
-  assert i is not None and any(d.state in ('committed', 'inLane', 'done') for d in out[i:])
+  # the later arrival at the right line shields its lane and waits for us: we cross to the far side, no band abort
+  assert i is not None and any(d.state in ('inLane', 'done') for d in out[i:])
+  assert not [d.withdraw for d in out[i:] if d.withdraw] and not [d.fault for d in out if d.fault]
 
 
 def test_C2_a_two_way_the_route_could_not_avoid_hands_back_h3_right_after_the_full_stop(tmp_path):
@@ -998,6 +1000,53 @@ def test_V25_a_car_waiting_at_another_line_when_it_is_our_turn_shields_its_lane(
   assert i is not None and any(x.role == 'left' and x.shielded for x in out[i - 1].lanes)
   left = next(x for x in out[i - 1].lanes if x.role == 'left')
   assert left.r_seen < left.r_req  # the shield, not reach, satisfies it (it hides the lane behind it)
+
+
+def track_boxes(tracks_fn):
+  """World.boxes for scripted tracks: each one's own raw box in its view (the detection its track is made of), from where
+  the car is now."""
+  def boxes(w):
+    out = {}
+    for trk in tracks_fn(w):
+      b = dataclasses.replace(raw_box(trk.bearing_seen, conf=0.6, xy=(float(trk.x[0]), float(trk.x[1])), view=trk.view),
+                              span_deg=tuple(trk.span_seen))
+      out.setdefault(trk.view, []).append(b)
+    return out
+  return boxes
+
+
+@pytest.mark.parametrize('raw', [False, True])
+@pytest.mark.parametrize('role', ['left', 'right'])
+def test_V25_a_shield_that_stays_stopped_through_our_crossing_is_never_a_band_abort_by_its_track_or_its_box(tmp_path, role, raw):
+  # the commonest all-way scene (C1, V25): a car arrives after us and waits at its line, never moving. Once our car moves,
+  # stop_evidence restarts its trust (bearings from a moving car aren't comparable), so in the band it reads notStopping and
+  # untrusted, and its box's bearing swings as we pass it: neither is a vehicle that will reach us first, the shield known at
+  # the go not having moved since. It had been an in-band abort 4.9-5.0 m past the stop point, then H5 ('no room for a go')
+  w = Drive(tmp_path, behaviour=lambda w: 'goes', lag_s=0.3)
+  w.tracks = cars((8, role, at_line(t0=1.5, d0=10.5, v0=2.)))
+  if raw:
+    w.boxes = track_boxes(w.tracks)
+  out = w.run(25.)
+  i = first_go(out)
+  assert i is not None and any(x.role == role and x.shielded for x in out[i - 1].lanes)
+  assert not [(k, d.withdraw) for k, d in enumerate(out) if d.withdraw]
+  assert not [d.fault for d in out if d.fault]
+  assert any(d.state in ('inLane', 'done') for d in out)
+  # and one that moves once we are in the band is still the in-band abort or said (V8), its motion judged on the ground
+  w = Drive(tmp_path, behaviour=lambda w: 'goes', lag_s=0.2)
+  w.tracks = cars((8, role, at_line(t0=1.5, d0=10.5, v0=2.)))
+  if raw:
+    w.boxes = track_boxes(w.tracks)
+  out = []
+  for _ in range(round(16. / DT_MDL)):
+    d = w.step()
+    out.append(d)
+    if d.state == 'committed' and not getattr(w, 'moved', False):
+      w.moved, t0 = True, w.t_cam - 100.
+      w.tracks = cars((8, role, lambda t, t0=t0: LINE_D - 6. * (t - t0) if t >= t0 else LINE_D))
+      if raw:
+        w.boxes = track_boxes(w.tracks)
+  assert any(d.withdraw == 'bandAbort' or d.alert == 'crossTrafficAfterCommit' for d in out)
 
 
 def test_V26_the_model_stopping_in_the_band_uncommits_never_clear_box(tmp_path):

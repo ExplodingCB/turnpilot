@@ -236,6 +236,39 @@ def test_O7_the_brake_during_the_go_ends_the_lift_and_the_decider_resets(tmp_pat
   assert str(plans[-1].goCertified.cause) == 'none' and str(plans[-1].stopGo.state) in ('done', 'off')
 
 
+def shield_tracks(sim, role='left', tid=8):
+  """A car waiting at the role line (its box centre LINE_D m down its lane), as the tracker reports it from where our car is
+  now: its bearing and box from here, on its side view."""
+  import math
+  from openpilot.selfdrive.turnpilot.routing.tests.test_certify import junction
+  from openpilot.selfdrive.turnpilot.stop_evidence import junction_lanes
+  from openpilot.selfdrive.turnpilot.tests.test_stop_evidence import track as ev_track
+  from openpilot.selfdrive.turnpilot.tests.test_stop_go import LINE_D
+  ln = {x.role: x for x in junction_lanes(junction(), 'unknown', 1.9, 3.5) if x.index == 1}[role]
+  s = (ln.s_min + ln.s_max) / 2. - (sim.s - S_LINE)
+  trk = ev_track(tid, sim.t_cam, LINE_D, ln, view='sideLeft' if role == 'left' else 'sideRight', cls=2, s=s)
+  half = math.degrees(math.atan2(0.9, math.hypot(s, LINE_D)))
+  trk.span_seen = tuple(sorted((trk.bearing_seen - half, trk.bearing_seen + half)))
+  trk.hits = 5
+  return [trk]
+
+
+def test_C1_V25_a_car_waiting_at_its_line_is_crossed_past_no_band_abort_no_h5(tmp_path):
+  # closed loop: a car at the left line for the whole encounter (a later arrival waiting for us, or a shield). Moving, our
+  # car restarts its trust, and the band had read it as a car not stopping: an in-band abort at 4.88 m, standing 0.05-0.16 m
+  # short of dEdgeMin, then H5 'no room for a go'. It is known at the go and hasn't moved: we cross
+  sim = StopSim(tmp_path, model='goes')
+  run_to_line(sim)
+  sim.tracks = lambda s: shield_tracks(s, 'left')
+  sim.run(25.)
+  plans = sim.plans()
+  k = go_frame(sim)
+  assert k is not None and any(ln.role == 'left' and ln.shielded for ln in plans[k - 1].stopGo.lanes)
+  assert not [p.stopGo.withdrawn for p in plans if p.stopGo.withdrawn]
+  assert not any(p.controlPrompt == 'stopSignTakeControl' for p in plans)
+  assert any(str(p.stopGo.state) == 'done' for p in plans) and sim.s > S_LINE + 15.
+
+
 def test_V19_a_car_backing_out_ahead_holds_the_go(tmp_path):
   sim = StopSim(tmp_path)
   run_to_line(sim)

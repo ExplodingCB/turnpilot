@@ -117,6 +117,7 @@ PED_STILL_V = 0.4               # m/s: a person moving slower stands (D3's measu
 PED_RANGE_BAND = 0.3            # a person's ranging band, plus or minus this of range
 RAW_PERSON_CONF = 0.35
 MOVING_V = 0.5                  # m/s: a vehicle moving
+RAW_KNOWN_DEG = 3.              # deg a raw box may lie outside a known track's live span and still be its box (raw_known)
 HALF_LEFT_M = 1.85 + sr.LANE_W_MAX   # our half of the road plus one lane, left of our axis (RCW 46.61.235)
 HALF_RIGHT_M = 1.85 + 3.0       # ...and right of it to the curb
 BOX_LEFT_M, BOX_RIGHT_M = 1.85 + sr.LANE_W_MAX + 1., 1.85 + 1.  # the junction box: our road's width, a metre either side
@@ -859,6 +860,7 @@ class StopGo:
     rep = f.live.lanes(lanes, -at, f.vis, rot_deg=rot, edges=self.edges, lighting=row if row in ('day', 'sunAhead') else 'night',
                        low_sun_sides=low, entry=self.entry, stamp=stamp, tracks=f.tracks or (), evidence=self.ev)
     known = self.go['tracks'] if launch and self.go is not None else {}
+    still = self._still_spans(f, known) if launch else []
     for ln, seen in zip(lanes, rep.lanes, strict=True):
       r_req = max(seen.need_m - sr.V_CROSS_FACTOR * ln.limit * sr.T_LAT, 0.)
       r_seen = seen.r_seen_m
@@ -877,7 +879,7 @@ class StopGo:
                           DYNAMIC if moving else STATIC))
       if launch:
         # objects are judged from where the car is now (only reach keeps the go position's geometry, D13)
-        raw = [b for b in self._blockers(f, ln, seen.need_m, rot, pos) if not raw_known(b, known)]
+        raw = [b for b in self._blockers(f, ln, seen.need_m, rot, pos) if not raw_known(b, still)]
       else:
         raw = seen.blockers
       if raw:
@@ -918,6 +920,23 @@ class StopGo:
       if trk is not None:
         out[tid] = {'role': e.role, 'index': e.index, 'shield': e.shield, 'u2': e.u2, 'x': float(trk.x[0]), 'y': float(trk.x[1]),
                     'odo': f.odo_m, 'span': getattr(trk, 'span_seen', None), 'd_lo': e.d_lo, 'v_hi': e.v_hi, 't': self.t}
+    return out
+
+  def _still(self, f: Frame) -> dict:
+    """The tracks known at the go that haven't moved since (_known_moved): the go stands on them as it found them."""
+    known = self.go['tracks'] if self.go is not None else {}
+    return {tid: k for tid, k in known.items() if not self._known_moved(f, tid, k)}
+
+  def _still_spans(self, f: Frame, known: dict) -> list:
+    """The bearing spans, from where the car is now, of the known tracks that haven't moved: the tracker's live span of
+    each (its newest match), which a raw box of the same vehicle shares however the launch swings its bearing."""
+    by_id = {t.track_id: t for t in f.tracks or ()}
+    out = []
+    for tid, k in known.items():
+      trk = by_id.get(tid)
+      span = getattr(trk, 'span_seen', None) if trk is not None else None
+      if span is not None and not self._known_moved(f, tid, k):
+        out.append(tuple(span))
     return out
 
   def _known_moved(self, f: Frame, tid: int, k: dict) -> bool:
@@ -1201,9 +1220,13 @@ class StopGo:
     only said)."""
     lanes = {(ln.role, ln.index): ln for ln in self.junction_lanes(f)}
     v = max(f.v_ego, 0.5)
-    for e in self.ev.values():
+    # a track known at the go that hasn't moved since (a shield, a later arrival waiting at its line, a car far enough to
+    # stop) is as the go found it: once our car moves stop_evidence restarts its trust, and untrusted it would read as a car
+    # not stopping at v_c, so a car standing at its line turned the commonest all-way crossing into an in-band abort
+    still = self._still(f)
+    for tid, e in self.ev.items():
       ln = lanes.get((e.role, e.index))
-      if ln is None or e.cls not in MOTOR + CYCLISTS or (e.u2 == 'stopped' and e.v_trusted):
+      if ln is None or e.cls not in MOTOR + CYCLISTS or (e.u2 == 'stopped' and e.v_trusted) or tid in still:
         continue
       far_side = ln.s_max - self.setback + sr.LANE_W_MAX / 2.
       if pos - CAR_LEN_M > far_side:
@@ -1217,8 +1240,9 @@ class StopGo:
         if pos - CAR_LEN_M > ln.s_max - self.setback + sr.LANE_W_MAX / 2.:
           continue
         need = sr.reach_needed_allway(ln.limit) if ln.stopping else sr.reach_needed_two_way(ln.limit, self.edges.d_max)
+        spans = self._still_spans(f, still)
         blockers = [b for b in self._blockers(f, ln, need, sr.angle_bound(self.edges.nominal is not None), pos)
-                    if any(m in b for m in MOTOR)]
+                    if any(m in b for m in MOTOR) and not raw_known(b, spans)]
         if blockers:
           return f"a vehicle {side_word(ln.role)}"
     return ''
@@ -1295,12 +1319,13 @@ def side_word(role: str) -> str:
   return {'left': 'from the left', 'right': 'from the right', 'opposite': 'ahead'}.get(role, role)
 
 
-def raw_known(desc: str, known: dict) -> bool:
-  """A raw blocker (visibility.LiveVisibility.blockers' description) that is a known track's box: its bearing within a few
-  degrees of that track's span at the go. The launch's own motion moves every box's bearing, so a standing shield's box would
-  otherwise block as a new one."""
+def raw_known(desc: str, spans: list) -> bool:
+  """A raw blocker (visibility.LiveVisibility.blockers' description) that is a known, unmoved track's own box: its bearing
+  within RAW_KNOWN_DEG of that track's live span (StopGo._still_spans, from where the car is now). The launch's own motion
+  swings every box's bearing (a car 9 m down the near lane by 15 deg over 5 m of ours), so against the span at the go a
+  standing shield's box blocked as a new one, and an 8 deg allowance on it excused other boxes beside it."""
   try:
     bearing = float(desc.split(' at ', 1)[1].split(' deg', 1)[0])
   except (IndexError, ValueError):
     return False
-  return any(k.get('span') is not None and min(k['span']) - 8. <= bearing <= max(k['span']) + 8. for k in known.values())
+  return any(min(span) - RAW_KNOWN_DEG <= bearing <= max(span) + RAW_KNOWN_DEG for span in spans)
