@@ -65,6 +65,15 @@ STEP_OUT_CURB_M = 0.
 STEP_OUT_DECEL = 3.0
 STEP_OUT_REACT_S = 0.5
 STEP_OUT_MIN_V = 4.      # m/s: she never steps out in front of a car slower than this
+# ...facing the car, standing and through her step (Entry.ped_faces_car): BeamNG's walker is a low-poly block figure, and
+# side-on, facing across the road the way she walks, it never scores as a person (BeamNG build findings D3: best 0.197 from
+# 56 m to contact, contact at 8 m/s; the same walker facing the car up to 0.84). The labels say which the shot shows
+STEP_OUT_LABELS = {
+  'car': "BeamNG sim mannequin facing the car, sliding sideways into the lane (the stock walker scores as a person only " +
+         "facing the camera); a real person stepping out side-on is the detector's 15-30 m limit, not shown here",
+  'across': "detector limit: BeamNG's side-on walker never scores as a person, so nothing brakes for her; this is the " +
+            "sim figure's limit, not TurnPilot's pedestrian stop",
+}
 
 
 @dataclass(frozen=True)
@@ -80,6 +89,7 @@ class Entry:
   actor: str = ''                 # 'crosswalk', 'oncoming', 'standing', 'pacer', 'step_out'
   crosswalk_m: float = 0.         # crosswalk centre from the junction along the exit road; 0: road edge + 2.5 m (unverified)
   ped_before_m: float = 40.       # standing mannequin, this far before the junction
+  ped_faces_car: bool = False     # step_out: she faces the car, standing and through her step (STEP_OUT_LABELS)
   oncoming: int = 2               # cars
   oncoming_start_m: float = 35.   # the first one starts this far from the junction (released at the car's stop: nearer
                                   # than ~36 m at 11 m/s, 2.5 m/s^2, it can still come arrive_after_s after the go)
@@ -157,9 +167,13 @@ SCENARIOS = {
   'ped_in_path': Entry('straight', junction=(-768.9, 661.4), turn='right', from_heading_deg=0., actor='standing', end_on_stop_s=4.,
                        timeout_s=90.),
   # S10: on the same straight a walker standing at the road edge 45 m before the junction steps into the middle of the
-  # lane when the car is step_out_distance ahead of her (STEP_OUT_*): the stop needs hard braking from a confirmed track
+  # lane when the car is step_out_distance ahead of her (STEP_OUT_*): the stop needs hard braking from a confirmed track.
+  # She faces the car (ped_in_path's mannequin); ped_step_out_side is the same step side-on, the detector-limit clip
+  # (STEP_OUT_LABELS: the smoke's and the diag's runs, contact at 8 m/s with no person box)
   'ped_step_out': Entry('straight', junction=(-768.9, 661.4), turn='right', from_heading_deg=0., actor='step_out', ped_before_m=45.,
-                        end_on_stop_s=4., timeout_s=90., expect=('hardBrake',)),
+                        ped_faces_car=True, end_on_stop_s=4., timeout_s=90., expect=('hardBrake',)),
+  'ped_step_out_side': Entry('straight', junction=(-768.9, 661.4), turn='right', from_heading_deg=0., actor='step_out',
+                             ped_before_m=45., end_on_stop_s=4., timeout_s=90., expect=('hardBrake',)),
   # forced reds (the module docstring's forced light). S13: the same straight through gate1's junction (group_80_81_82_83),
   # its signal red from the start: with no accepted light source (the car this week) TurnPilot adds nothing for it, the
   # model alone meets it. S14: ped_crosswalk_right's right turn without the walker, red until 8 s after the car stands.
@@ -590,11 +604,14 @@ def _turn_plan(name: str, e: Entry, graph: RoadGraph) -> Plan:
     end = p[:2] + o_lane * right_of(travel)
     enter_s = max(radius + STEP_OUT_CURB_M - o_lane - CORRIDOR_HALF_WIDTH, 0.) / WALK_SPEED
     z = float(p[2])
+    face = wrap(travel + math.pi) if e.ped_faces_car else None  # toward the car, kept through the step (director.tick)
     actors.append(Actor(f"{PREFIX}ped", 'walker', 'step_out', [[*map(float, start), z], [*map(float, end), z]], WALK_SPEED,
-                        heading=heading_of(start, end),
+                        heading=heading_of(start, end) if face is None else face,
                         params={'decel': STEP_OUT_DECEL, 'gap_m': PED_STOP_GAP_M, 'enter_s': round(enter_s, 3),
-                                'react_s': STEP_OUT_REACT_S, 'min_v': STEP_OUT_MIN_V}))
-    notes['step_out'] = {'before_m': e.ped_before_m, 'lateral_m': round(radius + STEP_OUT_CURB_M - o_lane, 2), 'enter_s': round(enter_s, 2)}
+                                'react_s': STEP_OUT_REACT_S, 'min_v': STEP_OUT_MIN_V, **({} if face is None else {'face': face})}))
+    faces = 'across' if face is None else 'car'
+    notes['step_out'] = {'before_m': e.ped_before_m, 'lateral_m': round(radius + STEP_OUT_CURB_M - o_lane, 2), 'enter_s': round(enter_s, 2),
+                         'faces': faces, 'label': STEP_OUT_LABELS[faces]}
   elif e.actor == 'oncoming' and e.stream_headway_s:
     # a queue across the junction, each released on its own timer from the car's stand: at its headway (Entry)
     paths = oncoming_paths(graph, jn, e.oncoming, e.oncoming_start_m, QUEUE_GAP_M)

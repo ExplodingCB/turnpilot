@@ -177,7 +177,7 @@ HARD_BRAKE_PREFIXES = ('ped_', 'unprotected_left')
 # ...and in the hard stop's own shot (S10 'the braking past -2.0 m/s^2 starts only after the track confirmed', ped_step_out
 # or any run expecting hardBrake) the planner's aTarget (longitudinalPlan, whoever asked for it) below ACCEL_FLOOR before
 # TurnPilot's first hardBrake fails too, as does one with no hardBrake at all; rows with no a_target fail it as not checked
-HARD_BRAKE_SHOTS = ('ped_step_out',)
+HARD_BRAKE_SHOTS = ('ped_step_out', 'ped_step_out_side')  # S10's facing walker and its side-on detector-limit cut
 
 
 # the speed openpilot was given against the car's travel, from the run's teleport (run.Runner.odometer): off by more than
@@ -745,7 +745,7 @@ def _fails(name: str, res: dict) -> list[tuple[str, str]]:
       fails.append(('ped_stop', "did not stop for the pedestrian"))
     elif not PED_STOP_GAP[0] <= g <= PED_STOP_GAP[1]:
       fails.append(('ped_stop', f"stopped {g} m from the pedestrian, outside {PED_STOP_GAP[0]}-{PED_STOP_GAP[1]} m"))
-  elif name == 'ped_step_out':
+  elif name in HARD_BRAKE_SHOTS:
     if res['outcome'] != 'stopped':
       fails.append(('ped_stop', "did not stop for the pedestrian"))
   elif name == 'occupied_lane':
@@ -782,7 +782,7 @@ def _fails(name: str, res: dict) -> list[tuple[str, str]]:
       fails.append(('not_arrived', f"ended {res['outcome']}, not arrived"))
     if attempted == 0 or taken < attempted:
       fails.append(('maneuvers', f"took {taken} of {attempted} maneuvers"))
-  if name in ('ped_crosswalk_right', 'ped_in_path', 'ped_step_out') and res['min_gap_ped_m'] is not None and \
+  if name in ('ped_crosswalk_right', 'ped_in_path', *HARD_BRAKE_SHOTS) and res['min_gap_ped_m'] is not None and \
      res['min_gap_ped_m'] < COLLISION_GAP_M:
     fails.append(('ped_contact', f"came within {res['min_gap_ped_m']} m of the pedestrian"))
   fails += [('speed', why) for why in speed_problems(res.get('speed_check'))]

@@ -215,6 +215,7 @@ class Director(threading.Thread):
         continue
       t = now - w['t0']
       p, h = walker_pose(w['path'], t, w['actor'].speed)
+      h = w['actor'].params.get('face', h)  # a walker facing the car steps sideways (catalog: ped_step_out), else along her path
       scenario.move_pedestrian(self.bng, name, float(p[0]), float(p[1]), float(p[2]), h)
       self.poses[name] = (float(p[0]), float(p[1]), h, float(p[2]))
       w['done'] = t * w['actor'].speed > float(arc_lengths(w['path'])[-1])
