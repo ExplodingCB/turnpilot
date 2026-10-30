@@ -2195,15 +2195,15 @@ def test_G3_no_creep_where_it_is_not_predicted_to_help_or_the_creep_floor_forbid
 def test_ladder_rung_2_a_static_wait_the_routes_maneuver_cant_end_takes_another_that_certifies_and_says_so(tmp_path):
   # 7.1 rung 2 (3.5): going straight, a car double-parked 4 m past the far crosswalk (V15) leaves no room past the junction,
   # a static wait; at STATIC_WAIT_S no creep helps it (rung 1 is for reach), so the decider synthesizes another maneuver from
-  # the junction's approaches: a right (the right road outbound, its relBearing 90 deg), from a single-lane approach (the
-  # opposite leg's one lane out standing in for ours), certified like any other (its own conflict set and exit). Said once
+  # the junction's approaches: a right (the right road outbound, its relBearing 90 deg), from a single-lane approach (navd's
+  # lane guidance), certified like any other (its own conflict set and exit). Said once
   # ("Turning right instead", otherTurn), it decides as a right from then on and goes; the planned turn is published missed once
   # the encounter is done so navd reroutes at once. Before SG4c: H3 "no room past the junction"
   w = World(tmp_path)
   w.objects = lambda ww: (vehicle(95, 26., 0.),)
   out = []
   while len(out) < round((STATIC_WAIT_S + 6.) / DT_MDL) and first_go(out) is None:
-    out.append(w.step())
+    out.append(w.step(approach_lanes=1))
   k = next((k for k, d in enumerate(out) if d.alert == 'otherTurn'), None)
   assert k is not None and (k + 1) * DT_MDL >= 1.0 + STATIC_WAIT_S - 0.1, [(d.state, d.reason, d.fault) for d in out[::40]]
   d = out[k]
@@ -2234,10 +2234,47 @@ def test_ladder_rung_2_a_right_only_from_a_lane_that_can_turn_right_a_left_or_st
   # going right with the right road's exit blocked (V15's right case), from a single-lane approach: straight is taken
   w = World(tmp_path, maneuver='right')
   w.objects = lambda ww: (vehicle(95, 14., -9.),)
-  out = w.run(STATIC_WAIT_S + 5.)
+  out = w.run(STATIC_WAIT_S + 5., approach_lanes=1)
   k = next(k for k, d in enumerate(out) if d.alert == 'otherTurn')
   assert out[k].alt['maneuver'] == 'straight' and out[k].alt['side'] == 0 and out[k].reason == "Going straight instead"
   assert first_go(out) is not None
+
+
+def test_ladder_rung_2_with_our_lanes_unknown_takes_no_left_or_straight_and_a_right_only_from_the_rightmost_lane(tmp_path):
+  # skeptic SG4c B: with no navd lane guidance (approach_lanes 0: the route straight here, or a turn with no lane data)
+  # _our_lanes stood the opposite leg's lanes out in for our approach's, so a turn bay's two-lane approach opposite a one-lane
+  # far side read as single-lane. B1: route left from the bay, a lane to our right (rightmost False), the left's exit blocked:
+  # the right was taken across the through lane. B2: route straight from the right lane (rightmost True), the far exit and the
+  # right's blocked: a left was synthesized from an approach whose lane count isn't known. Unknown is unknown: no left or
+  # straight, and a right only from the rightmost lane (the model seeing no lane to our right)
+  w = World(tmp_path, maneuver='left')
+  w.step()
+  s = w.sg
+
+  def left_exit_blocked(ww):
+    pos = s.pos_ref + (ww.odo - s.odo_ref)
+    return (vehicle(95, s._x(s.edges.d_max, pos) + 2. * sr.LANE_W_MAX, sg.BOX_LEFT_M + 3.),)
+  w.objects = left_exit_blocked
+  out = w.run(STATIC_WAIT_S + 6., approach_lanes=0, rightmost=False)
+  assert [a for a in (s.junction.approaches) if sr.effective_role(a) == 'opposite' and a.lanes_out == 1]
+  assert not any(d.alert == 'otherTurn' for d in out) and any(d.fault == 'H3' for d in out)
+  w = World(tmp_path, maneuver='straight')
+  w.step()
+  s = w.sg
+
+  def far_and_right_blocked(ww):
+    pos = s.pos_ref + (ww.odo - s.odo_ref)
+    return (vehicle(95, 26., 0.), vehicle(96, s._x(s.edges.d_min, pos) + sr.LANE_W_MAX, -(sg.BOX_RIGHT_M + 3.)))
+  w.objects = far_and_right_blocked
+  out = w.run(STATIC_WAIT_S + 6., approach_lanes=0, rightmost=True)
+  assert not any(d.alert == 'otherTurn' and d.alt['maneuver'] in ('left', 'straight') for d in out)
+  # the same layout with navd's lane guidance saying ours is single-lane: the left may be taken
+  w = World(tmp_path, maneuver='straight')
+  w.step()
+  s = w.sg
+  w.objects = far_and_right_blocked
+  out = w.run(STATIC_WAIT_S + 6., approach_lanes=1, rightmost=True)
+  assert any(d.alert == 'otherTurn' and d.alt['maneuver'] == 'left' for d in out)
 
 
 def test_O12_a_long_dynamic_wait_takes_another_certifiable_maneuver_at_wait_alt_s(tmp_path):
@@ -2252,7 +2289,7 @@ def test_O12_a_long_dynamic_wait_takes_another_certifiable_maneuver_at_wait_alt_
   w = World(tmp_path)
   w.run(0.05)
   w.objects = far_walkers
-  out = w.run(sg.WAIT_ALT_S + 4.)
+  out = w.run(sg.WAIT_ALT_S + 4., approach_lanes=1)  # a single-lane approach (navd's lane guidance)
   k = next((k for k, d in enumerate(out) if d.alert == 'otherTurn'), None)
   assert k is not None, [(d.state, d.reason) for d in out[::100]]
   assert (k + 1) * DT_MDL >= sg.WAIT_ALT_S - 0.1 and out[k].alt['maneuver'] == 'right'

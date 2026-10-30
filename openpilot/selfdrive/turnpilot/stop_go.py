@@ -1428,17 +1428,16 @@ class StopGo:
   # --------------------------------------------------------------------------------------------- the other turn (rung 2)
 
   def _our_lanes(self, f: Frame) -> int:
-    """Our approach's lanes toward the junction: navd's lane guidance for a turn here (Frame.approach_lanes), else the road
-    straight across's lanes out (our road going on: junctionInfo has no leg for our own approach), else 0, not known."""
-    if f.approach_lanes > 0:
-      return int(f.approach_lanes)
-    opp = next((a for a in (self.junction.approaches if self.junction is not None else []) if sr.effective_role(a) == 'opposite'), None)
-    return int(opp.lanes_out) if opp is not None and opp.lanes_out > 0 else 0
+    """Our approach's lanes toward the junction: navd's lane guidance for a turn here (Frame.approach_lanes), else 0, not
+    known. Never the road straight across's lanes out (skeptic SG4c B: a turn bay's two-lane approach opposite a one-lane far
+    side read as single-lane, and the other turn was taken across a lane)."""
+    return int(f.approach_lanes) if f.approach_lanes > 0 else 0
 
   def _alternatives(self, f: Frame) -> list:
     """The maneuvers the ladder may synthesize instead of the route's (3.5), fewest conflicts first: a right from a lane that
     can turn right (a single-lane approach, or the rightmost lane), straight or a left only from a single-lane approach (a
-    lane's own arrows aren't known), each where a road leaves the junction that way: (maneuver, its approach)."""
+    lane's own arrows aren't known), each where a road leaves the junction that way: (maneuver, its approach). Our lane count
+    unknown (no navd lane guidance) is never single-lane: no straight or left, a right only from the rightmost lane."""
     j = self.junction
     if self.alt is not None or j is None or j.status != 'ok' or f.maneuver not in ('straight', 'left', 'right'):
       return []

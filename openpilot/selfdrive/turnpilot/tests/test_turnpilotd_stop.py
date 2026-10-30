@@ -812,7 +812,9 @@ def test_a_left_taken_instead_of_the_routes_right_gets_the_scenes_oncoming_hold(
   from openpilot.selfdrive.turnpilot import stop_go as sg_mod
   from openpilot.selfdrive.turnpilot.route_follower import LEFT
   from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M
-  sim = StopSim(tmp_path, info_kw={'maneuver': 'right'}, maneuvers=[(S_LINE + 13., 'turn', 'right'), (2000., 'turn', 'left')])
+  # a single-lane approach: navd's lane guidance (with our lane count unknown no left is synthesized: skeptic SG4c B)
+  sim = StopSim(tmp_path, info_kw={'maneuver': 'right'}, maneuvers=[(S_LINE + 13., 'turn', 'right'), (2000., 'turn', 'left')],
+                nav_lanes={0: ((('right',), True),)})
   seen = []
   orig = sim.tp.scene.update
 
@@ -867,7 +869,8 @@ def other_turn_drive(tmp_path, route, err_after_s=None):
     sim = StopSim(tmp_path)
   else:
     sim = StopSim(tmp_path, info_kw={'maneuver': route}, maneuvers=[(S_LINE + 13., 'turn', route),
-                                                                    (2000., 'turn', 'right' if route == 'left' else 'left')])
+                                                                    (2000., 'turn', 'right' if route == 'left' else 'left')],
+                  nav_lanes={0: (((route,), True),)})  # a single-lane approach, navd's lane guidance
   seen = []
   orig = sim.tp.scene.update
 
