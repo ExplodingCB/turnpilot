@@ -157,6 +157,9 @@ def test_a_veto_at_the_stop_sign_skips_the_turn_and_the_decider_then_judges_ever
   k = go_frame(sim)
   assert k is not None and k > n0, "the decider never went straight on"
   assert (k - n0) * DT_MDL >= sr.CLEAR_S - 0.1  # the union's go conditions held CLEAR_S from the veto
+  # ...and no more: the skipped turn's union never waits for navd's reroute (SG4b's off-route OFFROUTE_WAIT_S), the car
+  # going straight on whatever it says (merged with tp/integrate: 10 s more at the line, "Waiting: the reroute")
+  assert (k - n0) * DT_MDL < sr.CLEAR_S + 0.5 and not any("reroute" in p.reason for p in after)
   assert all(p.turnSignal.side == LaneChange.none for p in plans[k:])
   assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in after)
 

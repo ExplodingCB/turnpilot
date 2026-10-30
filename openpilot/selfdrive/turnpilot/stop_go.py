@@ -259,6 +259,9 @@ class Frame:
   go_taken_over: bool = False    # ...the last one ended on the model's takeover
   go_end: str = ''               # ...why it ended
   signal_veto: str = ''          # a turn signal veto turnpilotd skipped the turn for last frame on this go while withdrawable
+  # maneuver is the union because the route's turn at this control was skipped (turnpilotd: a turn signal veto, too fast, a
+  # lane it can't reach), straight on for the rest of the encounter whatever navd says: no reroute is waited for (O9)
+  skip_union: bool = False
   mode: str = MODE_DEFAULT
   mode_known: bool = True        # the build's params know TurnPilotStopSignGo, and its value is a mode
   approach_lanes: int = 0        # our approach's lanes toward the junction (navd's lane guidance for a turn here), 0 unknown
@@ -1093,8 +1096,9 @@ class StopGo:
     holds: list[Hold] = []
     j = self.junction
     # off the route (O9, 3.5): the maneuver unknown, the union of the three conflict sets; navd's reroute is waited for up to
-    # OFFROUTE_WAIT_S from the full stop (a dynamic wait, said, its static causes' clock running meanwhile), then the union decides
-    if not launch and f.maneuver == 'unknown' and self.route_wait_s < OFFROUTE_WAIT_S - 1e-6:
+    # OFFROUTE_WAIT_S from the full stop (a dynamic wait, said, its static causes' clock running meanwhile), then the union decides.
+    # Never for a skipped turn's union (skip_union): the car goes straight on whatever the reroute says, so nothing is gained
+    if not launch and f.maneuver == 'unknown' and not f.skip_union and self.route_wait_s < OFFROUTE_WAIT_S - 1e-6:
       self.route_wait_s += f.dt
       holds.append(Hold("route", "the reroute (off the route)", DYNAMIC))
     # H2's triggers, and 10: the junction, the data

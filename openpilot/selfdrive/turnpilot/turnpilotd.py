@@ -1314,6 +1314,7 @@ class TurnPilot:
       m = str(info.get('maneuver', 'straight'))
       maneuver = 'unknown' if src is not None and src.key[0] == OFF_ROUTE else m if m in ('straight', 'left', 'right') else 'unknown'
       self.sg_route_maneuver = maneuver
+      skip_union = False
       if maneuver in ('left', 'right') and ((self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id) or
                                             (sg.token is not None and sg.token is self.sg_skip_token)):
         # the route's turn here skipped (a veto of the turn signal at the stop, too fast, a lane it can't reach; last frame's
@@ -1321,7 +1322,7 @@ class TurnPilot:
         # (unknown, as off the route), never the skipped turn's alone, for the rest of this encounter (navd moving on to the
         # next maneuver as the car leaves the junction ends the skip, never the launch's union). A reroute that goes straight
         # here is judged straight
-        maneuver, self.sg_skip_token = 'unknown', sg.token
+        maneuver, self.sg_skip_token, skip_union = 'unknown', sg.token, True
       vis = self.vis_source()
       live, tracks, runs, objs, side_status = self.watch.live, tuple(self.tracks_now), tuple(self.runs_now), objects, self.side_status
       oracle = self.cross_oracle(sm)
@@ -1349,7 +1350,8 @@ class TurnPilot:
                 enabled=bool(sm['carControl'].enabled), right_blindspot=bool(cs.rightBlindspot), tp_holding=self.last_holding,
                 go_active=self.go_cert.cause, go_taken_over=self.go_cert.taken_over, go_end=self.go_cert.end,
                 mode=self.stop_sign_mode if acting else 'shadow', mode_known=self.stop_sign_known, approach_lanes=ours,
-                rightmost=model_lanes.measured and model_lanes.right_known and model_lanes.right == 0, signal_veto=self.sg_veto)
+                rightmost=model_lanes.measured and model_lanes.right_known and model_lanes.right == 0, signal_veto=self.sg_veto,
+                skip_union=skip_union)
       self.sg_veto = ''  # read once: the go it vetoed is withdrawn on it
       d = self.stop_go.update(f)
       self.sg_last, self.sg_carried = d, 0

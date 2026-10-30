@@ -2127,6 +2127,19 @@ def test_O9_off_the_route_the_decider_waits_up_to_10_s_for_navds_maneuver_then_d
   assert first_go(out) is None and (h3 - a) * DT_MDL == pytest.approx(STATIC_WAIT_S, abs=0.2)
 
 
+def test_the_union_of_a_turn_skipped_at_its_stop_sign_never_waits_for_navds_reroute(tmp_path):
+  # the route's turn at the control skipped (turnpilotd: a turn signal veto, too fast, a lane it can't reach; Frame.skip_union):
+  # the decider judges the union, straight on, for the rest of the encounter, whatever navd says, so no reroute is waited for
+  # (O9's OFFROUTE_WAIT_S is for a control off the route): the union's go conditions hold CLEAR_S from the arrival and it goes,
+  # never "Waiting: the reroute (off the route)" (merging tp/blinker 253c358 with SG4b fafc139: 10 s more at the line)
+  w = World(tmp_path, maneuver='unknown')
+  out = w.run(6., skip_union=True)
+  a = arrived_at(out)
+  i = first_go(out)
+  assert not any(h.key == 'route' for d in out for h in d.holds) and not any("reroute" in d.reason for d in out)
+  assert i is not None and (i - a) * DT_MDL == pytest.approx(sr.CLEAR_S, abs=0.2) and out[i].maneuver == 'unknown'
+
+
 def test_V15_a_vehicle_stopped_on_our_exit_leg_holds_the_go_a_static_wait_then_h3_and_goes_once_it_leaves(tmp_path):
   # no go until the exit has room for the car plus 2 m past its crosswalk: a car double-parked 4 m past the far crosswalk,
   # in our path. Standing, a static wait and the ladder (from a two-lane approach the other-turn rung has nothing to take:
