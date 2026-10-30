@@ -929,13 +929,16 @@ class MapControlPolicy:
     cv = curve(v, c.d)
     st.cap = cv if v < LATCH_SPEED else min(st.cap, cv)  # the stop curve kept, for a test that fails later
     st.yield_cap = min(st.yield_cap, math.sqrt(YIELD_SPEED ** 2 + 2. * MAP_STOP_DECEL * max(c.d - v * STOP_LAG_S, 0.)))
-    if st.mode == YIELD_ROLLING or rolling:
+    taken_rolling = st.mode == YIELD_ROLLING or rolling
+    if taken_rolling:
       cap, accel, reason = st.yield_cap, NO_ACCEL_CAP, "Yield ahead"
     else:
       need = needed(v, c.d)
       cap, accel, reason = st.cap, max(need, MAP_DECEL_MAX) if need < -MAP_STOP_DECEL else NO_ACCEL_CAP, "Yield ahead: stopping"
     st.action = 'braking' if cap < v + 0.5 or accel < NO_ACCEL_CAP else 'approaching'
-    out.stops.append(Stop(accel, cap, False, reason, c.d))
+    # on the stop curve to its line it brings the car to rest there (Stop.rest: a turn signal veto then is decided as standing
+    # at a stop, car_signals.py), as it does once yieldStop; taken rolling it is a cap, never a rest
+    out.stops.append(Stop(accel, cap, False, reason, c.d, rest=not taken_rolling))
     prompts.append('yieldAhead')
     return st.infeasible
 

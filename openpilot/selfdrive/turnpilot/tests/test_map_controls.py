@@ -363,9 +363,17 @@ def test_a_stop_sign_brings_the_car_to_rest_and_a_yield_or_the_off_route_cap_nev
   assert not dec.should_stop and dec.rest_d is not None and abs(dec.rest_d - (150. - car.s)) < 2.
   out, dec = car.run_until(held)
   assert dec.rest_d == 0.
+  # a yield taken rolling (its rolling test passing: STOP_SIGNS.md 2.7) is a cap, never a rest
   car = Car([(150., 'yield')])
-  rests = [car.step()[1].rest_d for _ in range(int(20. / DT_MDL))]
+  rests = [car.step(yields=rolling_ok)[1].rest_d for _ in range(int(20. / DT_MDL))]
   assert all(r is None for r in rests)
+  # one whose rolling test fails (this week every yield's: SG4c's C5) is a stop: a rest at its line as it brakes toward it,
+  # before it becomes yieldStop at its commit point as after, and held there (merging tp/blinker, whose yield was only a cap)
+  car = Car([(150., 'yield')])
+  out, dec = car.run_until(lambda out, dec: out.stops and dec.holding and car.v > 3. and 150. - car.s > 40.)
+  assert car.policy.tracker.controls and dec.rest_d is not None and abs(dec.rest_d - (150. - car.s)) < 2.
+  out, dec = car.run_until(held)
+  assert dec.rest_d == 0.
   car = Car([(400., 'signal')])
   car.run(2.)
   car.nav_valid, car.off_route, car.off_status = False, [], 'failed'
