@@ -190,7 +190,7 @@ class TestFindStack:
 
 
 class TestTreeJson:
-  def test_start_writes_it_pessimistic_and_finish_clears_it(self, checkout, tmp_path):
+  def test_start_writes_it_unverified_and_finish_checks_it(self, checkout, tmp_path):
     run_dir = tmp_path / 'run'
     run_dir.mkdir()
     cwd = str(checkout / 'openpilot/system/manager')
@@ -198,7 +198,7 @@ class TestTreeJson:
     doc = tree.start(str(run_dir), 'tpsim', git_commit=head, managers=[cwd], resolve=no_packages)
     on_disk = json.load(open(run_dir / 'tree.json'))
     assert on_disk['schema'] == 1 and on_disk['clean'] and on_disk['stack_dir'] == os.path.realpath(checkout)
-    assert on_disk['changed_during_run'] is True and on_disk['end_checked_at'] is None  # not known unchanged until the end check
+    assert on_disk['changed_during_run'] is None and on_disk['end_checked_at'] is None  # unverified until the end check
     assert on_disk['problems'] == [] and on_disk['stack_git_commit'] == head
     for k in ('head', 'tree', 'openpilot_tree', 'tracked_changes', 'untracked_py', 'submodules', 'written_at'):
       assert k in on_disk
@@ -217,7 +217,7 @@ class TestTreeJson:
   def test_an_unknown_stack_is_written_unclean_with_why(self, tmp_path):
     tree.finish(str(tmp_path), tree.start(str(tmp_path), 'tpsim', managers=[], resolve=no_packages), resolve=no_packages)
     on_disk = json.load(open(tmp_path / 'tree.json'))
-    assert on_disk['stack_dir'] is None and not on_disk['clean'] and on_disk['changed_during_run'] is True
+    assert on_disk['stack_dir'] is None and not on_disk['clean'] and on_disk['changed_during_run'] is None
     assert "no running openpilot manager found with OPENPILOT_PREFIX='tpsim'" in on_disk['problems'][0]
 
   def test_a_git_commit_param_not_the_checkouts_is_said(self, checkout, tmp_path):
@@ -247,5 +247,5 @@ def test_run_writes_it_at_the_start_and_checks_it_after_the_drive(monkeypatch, t
   run.main()
   (run_dir,) = (tmp_path / 'out').iterdir()
   end = json.load(open(run_dir / 'tree.json'))
-  assert seen['at_drive']['changed_during_run'] is True and seen['at_drive']['end_checked_at'] is None
+  assert seen['at_drive']['changed_during_run'] is None and seen['at_drive']['end_checked_at'] is None
   assert end['changed_during_run'] is False and end['clean'] and end['stack_dir'] == os.path.realpath(checkout)

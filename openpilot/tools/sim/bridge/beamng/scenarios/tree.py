@@ -19,8 +19,9 @@ tools/turnpilot/README.md), so the rlogs can't say whether a run's code had unco
                     venv resolves it with the checkout first on the path, the main checkout's for every worktree here
   clean             tracked_changes and untracked_py empty, and every submodule at its gitlink with no tracked changes but
                     msgq_repo's diff being exactly MSGQ_PATCH
-  changed_during_run  true until the end check (finish) finds the same tree: a run that never reached it isn't known
-                    unchanged; at_end holds the end's snapshot when it differs
+  changed_during_run  null until the end check (finish) has read the checkout again (a run that never reached it, or
+                    whose checkout couldn't be read then, is unverified), then whether anything differed; at_end holds the
+                    end's snapshot when it did
   written_at        unix s of the last write; started_at, end_checked_at the start's and the end check's
   stack_git_commit  the manager's GitCommit param (manager_init), and problems: why the stack or its tree is in doubt
 
@@ -221,7 +222,7 @@ def start(run_dir: str, prefix: str, option: str = '', git_commit=None, managers
   doc['stack_git_commit'] = git_commit
   if doc['head'] is not None and git_commit != doc['head']:
     problems.append(f"the manager's GitCommit param {git_commit!r} is not the stack checkout's HEAD {doc['head']}")
-  doc.update(changed_during_run=True, started_at=round(time.time(), 3), end_checked_at=None, problems=problems)  # noqa: TID251
+  doc.update(changed_during_run=None, started_at=round(time.time(), 3), end_checked_at=None, problems=problems)  # noqa: TID251
   write(run_dir, doc)
   for p in problems:
     print(f"tree.json: {p}", flush=True)
@@ -229,18 +230,20 @@ def start(run_dir: str, prefix: str, option: str = '', git_commit=None, managers
 
 
 def finish(run_dir: str, doc: dict, resolve=None) -> dict:
-  """The end check: the stack's checkout read again, changed_during_run from whether anything COMPARED differs."""
+  """The end check: the stack's checkout read again, changed_during_run from whether anything COMPARED differs (left
+  null, unverified, when there is no checkout to read or it can't be read)."""
   end = None
   if doc.get('stack_dir') is not None:
     try:
       end = snapshot(doc['stack_dir'], resolve)
     except (subprocess.CalledProcessError, OSError) as e:
       doc['problems'] = doc.get('problems', []) + [f"the end check could not read {doc['stack_dir']}: {e!r}"]
-  changed = end is None or any(end[k] != doc.get(k) for k in COMPARED)
+  changed = None if end is None else any(end[k] != doc.get(k) for k in COMPARED)
   doc.update(changed_during_run=changed, end_checked_at=round(time.time(), 3))  # noqa: TID251
-  if changed and end is not None:
+  if changed:
     doc['at_end'] = end
   write(run_dir, doc)
-  if changed:
-    print(f"tree.json: the stack's checkout changed during the run, or couldn't be checked ({doc.get('stack_dir')})", flush=True)
+  if changed is not False:
+    print(f"tree.json: the stack's checkout {'changed during the run' if changed else 'was not checked at the end'} " +
+          f"({doc.get('stack_dir')})", flush=True)
   return doc
