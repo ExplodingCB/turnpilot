@@ -80,6 +80,8 @@ class Entry:
   spawn: tuple = ()               # route: (x, y, z), heading_deg, destination (x, y, z)
   heading_deg: float = 0.
   dest: tuple = ()
+  expect: tuple = ()              # what the run must show (score.EXPECTS): a handback, a skip, ...; the runner's options add theirs
+  fault_at_s: float = 0.          # the runner's --gas-press-at and --drop-detections-at with no value: this long after engagement
 
 
 SCENARIOS = {
@@ -100,6 +102,12 @@ SCENARIOS = {
   **{f'unprotected_left_gap{h}': Entry('turn', junction=(-650.1, 481.7), turn='left', from_heading_deg=137., actor='oncoming',
                                        oncoming=4 if h < 10 else 3, oncoming_start_m=40., oncoming_speed=11.18,
                                        stream_headway_s=float(h), timeout_s=150. + 10. * h) for h in (4, 6, 8, 10)},
+  # ped_in_path's straight with nothing on it, to a destination 140 m past the junction, straight on: S01's detection drop
+  # (run.py --drop-detections-at) and S04's gas press (--gas-press-at). Either at fault_at_s after engagement lands the
+  # disengagement, a soft disable's DETECTOR_DEADLINE_S + SOFT_DISABLE_TIME later for the drop, 10 m or more short of the
+  # junction's stop line (tests: test_runner_options)
+  'straight_cruise': Entry('straight', junction=(-768.9, 661.4), turn='right', from_heading_deg=0., dest_after_m=140., timeout_s=60.,
+                           fault_at_s=3.),
   # gate1's approach: eastbound on the 140 m straight from the bridge's default spawn
   'ped_in_path': Entry('straight', junction=(-768.9, 661.4), turn='right', from_heading_deg=0., actor='standing', end_on_stop_s=4.,
                        timeout_s=90.),
@@ -148,6 +156,8 @@ class Plan:
   actors: list
   notes: dict
   road: dict | None = None  # road_model() around the run, for the score's oncoming-lane check
+  expect: tuple = ()        # Entry.expect
+  fault_at_s: float = 0.    # Entry.fault_at_s
 
 
 # *** road geometry ***
@@ -581,6 +591,7 @@ def build(name: str, graph: RoadGraph | None = None, data_path: str = DATA_JSON,
   else:
     plan = _turn_plan(name, e, graph)
   plan.road = road_model(graph, [plan.spawn, plan.junction, plan.dest])
+  plan.expect, plan.fault_at_s = tuple(e.expect), e.fault_at_s
   return plan
 
 

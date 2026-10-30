@@ -15,6 +15,16 @@ Start openpilot first (navd, turnpilotd and turnpilot_web need NavigationEnabled
 Bridge options (--host, --signals, ...) pass through. --record records the UI while the runs drive and renders each run's
 chase view after the bridge exits, from the pose log: a live chase camera (--capture) costs the driving cameras 6 to 9
 pairs a second, at which the model's turns fail.
+
+The demo's options (each run's result says what it did and when):
+  --end-after-handback N   N s after TurnPilot hands back (a take-control prompt, turnpilotPlan.handback, a soft disable)
+                           the sim driver brakes, as a driver taking over does: the run ends 'taken over', not on its timeout
+  --gas-press-at [S]       the sim driver presses the gas once (GAS_PRESS for GAS_PRESS_S), S s after engagement
+  --drop-detections-at [S] S s after engagement the sim's detector goes silent for DROP_S (DROP_PARAM, honoured only with
+                           SIMULATION=1: modeld_detector.DetectorHost); the run clears it at its start and end
+  --expect E               what the run must show (score.EXPECTS), in place of the scenario's own; the press implies
+                           gasDisengage and the drop handback:detectorStopped
+Without S, the scenario's fault_at_s (catalog: straight_cruise's lands the fault short of its junction).
 """
 import argparse
 import json
@@ -32,7 +42,7 @@ from pathlib import Path
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log
 from openpilot.common.hardware.hw import Paths
-from openpilot.common.params import Params
+from openpilot.common.params import Params, UnknownKeyName
 from openpilot.selfdrive.turnpilot.web.pairing import PORT
 from openpilot.selfdrive.turnpilot.web.store import ensure_token
 from openpilot.tools.sim.bridge.beamng import frame
@@ -57,6 +67,13 @@ TURN_DESIRES = (int(log.Desire.turnLeft), int(log.Desire.turnRight))
 SERVICES = ['turnpilotPlan', 'selfdriveState', 'carState', 'navInstruction', 'navRoute', 'modelV2', 'turnpilotLights']
 OUT_ROOT = os.path.expanduser("~/turnpilot-artifacts/scenarios")
 POSE_FIELDS = ["wall_s", "t_s", "x", "y", "z", "qx", "qy", "qz", "qw"]  # route_drive's, which chase_render.py reads
+GAS_PRESS, GAS_PRESS_S = 0.3, 0.5  # --gas-press-at: the driver's press (a GasTaps tap is 0.25 for 1 s)
+TAKEOVER_BRAKE = 1.0       # --end-after-handback: the driver's brake, which disengages (bridge.driver_brake)
+SOFT_DISABLE_ALERT = '/softDisable'  # selfdriveState.alertType of a soft disable: '<event>/softDisable'
+DROP_PARAM = 'TurnPilotSimDropDetectionsS'
+# the detector silent this long (--drop-detections-at): past turnpilotd's 1.5 s deadline and openpilot's 3 s soft disable,
+# so the disengagement completes and engaging again is refused while it lasts
+DROP_S = 20.
 ACTOR_FIELDS = ["wall_s", "x", "y", "z", "heading"]
 
 
@@ -89,10 +106,28 @@ class Runner:
   the bridge process, so everything live (SubMaster, the director thread and its client) starts on the first call."""
 
   def __init__(self, plan: Plan, runs: int, out_dir: str, web_url: str, token: str, host: str, port: int, signal_tap: bool = True,
-               params=None):
-    """params: Params, for TurnPilot's reset between runs (TP_RESET_S); None leaves TurnPilot be."""
+               params=None, end_after_handback: float = 0., gas_press_at: float | None = None,
+               drop_detections_at: float | None = None, expect=None):
+    """params: Params, for TurnPilot's reset between runs (TP_RESET_S) and the detection drop; None leaves TurnPilot be.
+    end_after_handback, gas_press_at, drop_detections_at: the demo's options (module docstring; a negative time: the
+    scenario's fault_at_s); expect: in place of the plan's expectations (each option adds its own)."""
     if plan.road is None:
       raise ValueError(f"scenario {plan.name} has no road model: its runs could not be checked for the oncoming lane")
+    if drop_detections_at is not None and params is None:
+      raise ValueError("--drop-detections-at writes a param: the runner needs params")
+
+    def at(t, option):
+      if t is None or t >= 0.:
+        return t
+      if plan.fault_at_s <= 0.:
+        raise ValueError(f"{option} without a time: scenario {plan.name} has no fault_at_s")
+      return plan.fault_at_s
+    self.end_after_handback = end_after_handback
+    self.gas_press_at, self.drop_at = at(gas_press_at, '--gas-press-at'), at(drop_detections_at, '--drop-detections-at')
+    implied = ('gasDisengage',) * (self.gas_press_at is not None) + ('handback:detectorStopped',) * (self.drop_at is not None)
+    self.expect = tuple(dict.fromkeys((plan.expect if expect is None else tuple(expect)) + implied))
+    self.handback = self.takeover = self.press = self.drop = None  # the demo options' (demo_options), per run
+    self.press_until = -1.
     self.plan, self.runs, self.out_dir, self.web_url, self.token = plan, runs, out_dir, web_url, token
     self.signal_tap = signal_tap
     self.params = params
@@ -182,8 +217,12 @@ class Runner:
       r = self.row(b, now)
       self.rows.append(r)
       self.triggers(b, r)
+      if not self.demo_options(b, r):
+        return False
       self.driver(b)
       end = self.end_check.update(r)
+      if end == 'disengaged' and self.takeover is not None:
+        end = 'taken over'
       if end is not None:
         self.end_run(b, end)
     return False
@@ -208,9 +247,13 @@ class Runner:
     self.end_check = score.EndCheck(plan.timeout_s, plan.end_on_stop_s)
     self.taps = GasTaps(self.signal_tap)
     self.watch = GoWatch()
+    self.handback = self.takeover = self.press = self.drop = None  # the demo options' (demo_options)
+    self.press_until = -1.
     if self.params is not None:
       self.params.put_bool('TurnPilotEnabled', False)
       self.tp_off_t = time.monotonic()
+    if self.drop_at is not None:
+      self.clear_drop()
 
   def engage(self, b):
     b.set_speed_kph, b.rolling_start_kph, b.auto_engage = self.plan.speed_kph, self.plan.speed_kph * ROLL_FRACTION, True
@@ -297,6 +340,39 @@ class Runner:
         where = '' if r['j_dist'] is None else f", {r['j_dist']:.0f} m from the junction"
         print(f"scenario: {a.name} goes at t={r['t']:.1f} s{where}", flush=True)
 
+  def demo_options(self, b, r) -> bool:
+    """The demo's options (module docstring) on this row. False: the run ended here."""
+    t = r['t']
+    if self.end_after_handback > 0. and self.takeover is None:
+      cp, hb = r.get('control_prompt', 'none'), r.get('handback', 'none')
+      what = hb if hb not in ('', 'none') else cp if cp.endswith('TakeControl') else \
+             r['alert'].split('/')[0] if SOFT_DISABLE_ALERT in r.get('alert', '') else None
+      if self.handback is None and what is not None:
+        self.handback = {'t': t, 'what': what}
+        print(f"scenario: TurnPilot handed back ({what}) at t={t:.1f} s; the driver takes over in {self.end_after_handback:.0f} s", flush=True)
+      if self.handback is not None and t - self.handback['t'] >= self.end_after_handback - 1e-6:
+        b.driver_brake = TAKEOVER_BRAKE
+        self.takeover = {'t': t, 'after': self.handback['what'], 'handback_t': self.handback['t'], 'brake': TAKEOVER_BRAKE}
+        print(f"scenario: the driver brakes at t={t:.1f} s, taking over", flush=True)
+    if self.gas_press_at is not None and self.press is None and t >= self.gas_press_at - 1e-6:
+      self.press, self.press_until = {'t': t, 'gas': GAS_PRESS, 's': GAS_PRESS_S}, time.monotonic() + GAS_PRESS_S
+      print(f"scenario: the driver presses the gas at t={t:.1f} s", flush=True)
+    if self.drop_at is not None and self.drop is None and t >= self.drop_at - 1e-6:
+      try:
+        self.params.put(DROP_PARAM, DROP_S)
+      except UnknownKeyName:
+        self.end_run(b, 'error', f"{DROP_PARAM} unknown to this build's params: rebuild the stack (scons) at the demoed tip")
+        return False
+      self.drop = {'t': t, 's': DROP_S, 'param': DROP_PARAM}
+      print(f"scenario: the sim's detector goes silent for {DROP_S:.0f} s at t={t:.1f} s ({DROP_PARAM})", flush=True)
+    return True
+
+  def clear_drop(self):
+    try:
+      self.params.remove(DROP_PARAM)
+    except UnknownKeyName:
+      pass  # a build without it: the drop itself says so
+
   def driver(self, b):
     """The driver taps the stalk when TurnPilot asks for a signal (PLAN: Tesla can't signal for openpilot), and lets go
     when it stops asking, which it does as soon as the lane change starts. And taps the gas where a driver gives the go
@@ -306,18 +382,26 @@ class Runner:
     p = str(plan.signalPrompt) if plan is not None else 'none'
     b.blinker = (p == 'left', p == 'right')
     now = time.monotonic()
-    b.driver_gas = self.taps.update(now, plan, self.sm['selfdriveState'].enabled, b.simulator_state.wheel_speed,
-                                    ground_truth_green(b.cfg, self.sm, now), plan_age_s=now - self.sm.recv_time['turnpilotPlan'])
+    gas = self.taps.update(now, plan, self.sm['selfdriveState'].enabled, b.simulator_state.wheel_speed,
+                           ground_truth_green(b.cfg, self.sm, now), plan_age_s=now - self.sm.recv_time['turnpilotPlan'])
+    b.driver_gas = max(gas, GAS_PRESS if now < self.press_until else 0.)  # --gas-press-at's, over any tap
 
   def end_run(self, b, outcome: str, detail: str = ''):
     b.auto_engage = False
-    b.driver_gas = 0.
+    b.driver_gas = b.driver_brake = 0.
+    self.press_until = -1.
+    if self.drop_at is not None:
+      self.clear_drop()
     b.car.cancel()
     b.blinker = (False, False)
     end_wall = wall()
     failed = [f"{name}: {f.exception()!r}" for name, f in getattr(self, 'jobs', []) if f.done() and f.exception() is not None]
     detail = '; '.join([detail] * bool(detail) + failed)
-    res = score.summarize(self.plan.name, self.rows, outcome, road=self.plan.road, junction_control=self.plan.notes.get('junction_control'))
+    res = score.summarize(self.plan.name, self.rows, outcome, road=self.plan.road, junction_control=self.plan.notes.get('junction_control'),
+                          expect=self.expect, stop_line_m=self.plan.notes.get('stop_line_m'))
+    # what the demo's options did, and when (t: s since engagement)
+    res.update(driver_takeover=getattr(self, 'takeover', None), gas_press=getattr(self, 'press', None),
+               detection_drop=getattr(self, 'drop', None))
     # every go the sim driver gave, with its reason (the score's gas_taps are the presses openpilot saw, from the rows)
     res['driver_taps'] = getattr(self, 'taps', GasTaps()).log
     res.update(run=self.run_idx + 1, detail=detail, t_start_wall=self.t0_wall, t_engaged_wall=self.t_engaged_wall, t_end_wall=end_wall,
@@ -335,6 +419,7 @@ class Runner:
     out = {'scenario': plan.name, 'started_wall': self.started_wall, 'spawn': plan.spawn, 'heading': plan.heading, 'dest': plan.dest,
            'junction': plan.junction, 'speed_kph': plan.speed_kph, 'notes': plan.notes, 'road': plan.road,
            'actors': [{'name': a.name, 'kind': a.kind, 'trigger': a.trigger, 'path': a.path, 'params': a.params} for a in plan.actors],
+           'expect': list(self.expect),
            'passed': sum(r['passed'] for r in self.results), 'runs': self.results}
     with open(os.path.join(self.out_dir, 'result.json'), 'w') as f:
       json.dump(out, f, indent=1)
@@ -379,6 +464,14 @@ def main():
   ap.add_argument('--cleanup', action='store_true', help='only remove leftover scenario actors from the game')
   ap.add_argument('--signal-tap', choices=('on', 'off'), default='on',
                   help="off: the driver never gives the go at a signal TurnPilot hasn't checked (the stop-at-the-line runs)")
+  ap.add_argument('--end-after-handback', type=float, default=0., metavar='N',
+                  help="N s after TurnPilot hands back the driver brakes, taking over, and the run ends (0: stand to the timeout)")
+  ap.add_argument('--gas-press-at', type=float, nargs='?', const=-1., default=None, metavar='S',
+                  help="the driver presses the gas once, S s after engagement (no S: the scenario's fault_at_s)")
+  ap.add_argument('--drop-detections-at', type=float, nargs='?', const=-1., default=None, metavar='S',
+                  help=f"the sim's detector goes silent for {DROP_S:.0f} s, S s after engagement (SIMULATION=1 only; no S: fault_at_s)")
+  ap.add_argument('--expect', action='append', default=None, metavar='E',
+                  help=f"what the run must show, in place of the scenario's own: {', '.join(score.EXPECTS)} (handback:<kind>); repeatable")
   args, rest = ap.parse_known_args()
 
   from openpilot.tools.sim.bridge.beamng.run_bridge import config_from_args, light_oracle, parse_args
@@ -411,8 +504,10 @@ def main():
   sweep_game(bargs.host, bargs.port)
   ui = start_ui_recording(os.path.join(run_dir, 'ui.mp4')) if args.record and not args.no_ui else None
   q: Queue = Queue()
+  score.parse_expect(args.expect)  # an unknown expectation is refused before the game is touched
   bridge = BeamNGBridge(cfg, scenario=Runner(plan, args.runs, run_dir, args.web.rstrip('/'), token, bargs.host, bargs.port,
-                                             signal_tap=args.signal_tap == 'on', params=params))
+                                             signal_tap=args.signal_tap == 'on', params=params, end_after_handback=args.end_after_handback,
+                                             gas_press_at=args.gas_press_at, drop_detections_at=args.drop_detections_at, expect=args.expect))
   with light_oracle(bargs):
     drive(bridge, q, ui, bargs)
   result = os.path.join(run_dir, 'result.json')

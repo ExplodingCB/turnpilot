@@ -31,6 +31,15 @@ Bridge options (`--host`, `--signals`, `--reload` and so on) pass through. Every
 - With `--record DIR`, they go to `DIR/<scenario>-<time>/`, along with `ui.mp4` (the upstream UI recorded by `openpilot/tools/turnpilot/record_ui.py` while the runs drive) and `chase_run<N>.mp4` per run, rendered by `../chase_render.py` from the run's pose log once the bridge has exited. Each video gets a `<video>.start.json` sidecar holding the wall-clock time of its first frame. Block the stack's own UI (`BLOCK=ui`) so only the recorder draws. `--no-chase` skips the render. There is no live chase camera: a third camera costs the driving cameras 6 to 9 pairs a second, at which the model's turns fail.
 - `--cleanup` only sweeps leftover scenario actors out of the game.
 
+For the demo's shots:
+
+- `--end-after-handback N`: N s after TurnPilot hands back (a take-control prompt, `turnpilotPlan.handback`, or a soft disable), the sim driver brakes as a driver taking over does, and the run ends `taken over` instead of standing to its timeout. `driver_takeover` says when, and after what.
+- `--gas-press-at [S]`: the sim driver presses the gas once (0.3 for 0.5 s), S s after engagement (`gas_press`). It implies the `gasDisengage` expectation.
+- `--drop-detections-at [S]`: S s after engagement the runner sets `TurnPilotSimDropDetectionsS` to 20 s, and the detector skips its runs that long (`detection_drop`). modeld honours it only with `SIMULATION=1`; on the car it is never read. The runner clears it at each run's start and end; a build that doesn't know the param ends the run `error` (rebuild the stack). It implies `handback:detectorStopped`.
+- `--expect E` (repeatable): what the run must show, in place of the scenario's own `expect` (below).
+
+Without S, the two take the scenario's `fault_at_s`.
+
 ## Scenarios
 
 The turn scenarios use junctions from piston's list of signalized junctions with crosswalks. Of the six he listed, (-445.3, 147.0) and (-32.5, 403.8) have no 90-degree turn in the road graph.
@@ -44,6 +53,7 @@ The turn scenarios use junctions from piston's list of signalized junctions with
 | `occupied_lane` | A data entry (below). When the car engages, an AI car is placed in the target lane just ahead of it and paces it at the set speed until 6 s into the lane change window, then drops back to 40%. | The planner reports "car in target lane", and the lane change starts with the pacer more than 15 m away |
 | `lane_change` | A data entry: a multi-lane approach to a turn that needs a lane change. | Changes lanes, takes the turn, arrives, no disengagement |
 | `route_demo` | From 20 m past the bridge's default spawn to road-graph node DR249_3, about 850 m away. | Arrives, takes every maneuver, no disengagement |
+| `straight_cruise` | `ped_in_path`'s straight with nothing on it, to 140 m past the junction straight on. The stage for `--drop-detections-at` (S01) and `--gas-press-at` (S04): at its `fault_at_s`, 3 s after engagement, the disengagement lands 10 m or more short of the junction's stop line. | Its expectation: the detector's handback, or the gas press disengaging |
 
 Each scenario is an `Entry` in `catalog.py`. The builders there turn an entry into world positions from the road-graph export, without touching the game.
 
@@ -72,7 +82,8 @@ The sim tiles (`west_coast_usa_signals`) map every signal and stop sign of the l
 
 `result.json` holds every run. Each run records:
 
-- the outcome: `arrived`, `disengaged`, `stopped`, `timeout`, `no destination`, `no route`, `no engagement` or `error`
+- the outcome: `arrived`, `disengaged`, `taken over` (the driver's brake from `--end-after-handback`), `stopped`, `timeout`, `no destination`, `no route`, `no engagement` or `error`
+- its expectations (`expect`: the scenario's `Entry.expect`, or the runner's) and whether each was met (`expected`). An expectation is what the run's shot exists to show: `handback:<kind>` (a `turnpilotPlan.handback` such as `detectorStopped`, or a take-control prompt such as `cantStartTakeControl`), `gasDisengage`, `skip` (too fast to turn, or the left skipped at route time), `turnMissed`, `hardBrake`. One not seen fails the run. One seen explains only the failures it causes: the disengagements at or after the handback, the press's own disengagement within 0.3 s, the route not finished, the left's stall. A disengagement before the handback, a turn desire after the skip, or a handback after the gas press still fails.
 - maneuvers taken out of attempted. A maneuver is attempted once the car is within 30 m of it while engaged. It is taken if navd then moves on to the next step without a reroute, the car stays on the route for 20 m of the next step (`left_route_after`), and for a turn, the car's heading turns at least 45 degrees its way (`turn_deg`; a recorded drive's rows have no heading). Going straight on past a turn moves navd on to the next step all the same, then leaves the car off the route, so it counts as not taken.
 - gas taps: each press of the gas while engaged, with the go TurnPilot asked for (`prompt`), the hold's reason, how long the car had stood (`stopped_s`) and how far it was from the junction (`j_dist`). `driver_taps` is the sim driver's own log of the taps it gave.
 - the go the junction's turn takes (`junction_go`), from its own mapped control (`junction_control`, from the plan's notes; a rescore reads them from `result.json`): `signalGo` at a signal, `stopSignGo` at a stop sign, `unprotectedTurnGo` where there is none. Only a stop and a tap within 35 m of the junction count for it.
