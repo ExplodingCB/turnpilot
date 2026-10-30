@@ -93,7 +93,7 @@ def plan_events(sm, now: float | None = None) -> list[str]:
   5. a map control's other prompt (turnpilotControlPrompt: yield ahead, an unprotected left waiting for a gap or creeping for
      a view, visual only; its go, a short chime);
   6. a map control's other alerts (turnpilotControlAlert: a stop line overrun, going on a yellow, an unprotected turn's
-     junction uncertain);
+     junction uncertain, the car stopped with nothing holding it: the stopped note's chime);
   7. a planned lane change, offered or just aborted (turnpilotLaneChangeLeft/Right/Aborted, LaneChangeEvents);
   8. the wrong lane, or a lane it can't confirm (turnpilotWrongLane);
   9. the map controls' status (turnpilotControlAlert: map stops unavailable, light source rejected).
