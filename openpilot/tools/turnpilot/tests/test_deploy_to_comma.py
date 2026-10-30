@@ -47,7 +47,7 @@ cmd="$*"
 action=$(printf '%s' "$cmd" | awk '{for (i = 1; i <= NF; i++) if ($i == "deploy_to_comma") {print $(i + 1); exit}}')
 echo "host=$host action=${action:-$cmd}" >> "$FAKE_COMMA_LOG"
 if [ "$cmd" = "sudo reboot" ]; then echo REBOOT >> "$FAKE_COMMA_LOG"; exit 0; fi
-export PATH="$FAKE_COMMA_BIN:$PATH"
+export PATH="$FAKE_COMMA_BIN:${FAKE_COMMA_PATH:-$PATH}"
 # the comma's git never reads this Mac's config: none at all by default (git-lfs installed, its filter not set up)
 export GIT_CONFIG_GLOBAL="${FAKE_COMMA_GITCONFIG:-/dev/null}" GIT_CONFIG_NOSYSTEM=1
 if [ -n "${FAKE_COMMA_CUT_BYTES:-}" ] && [ "$action" = receive ]; then
@@ -290,6 +290,18 @@ def test_clean_whatever_the_commas_git_config(source, comma, tmp_path, comma_git
     for rel in LFS_FILES:
       os.utime(tree / rel, (t, t))  # whole seconds away from the index's stat, so the next refresh hashes them again
     assert version_values(tree, config)['dirty'] is False, config
+
+
+def test_comma_without_git_lfs(source, comma):
+  """No git-lfs on the comma at all: the deploy still goes, with a warning, because every file was checked byte for byte;
+  only is_dirty() reads True."""
+  src, _, second, _ = source
+  root, env = comma
+  r = deploy(src, root, env, extra_env={'FAKE_COMMA_PATH': '/usr/bin:/bin:/usr/sbin:/sbin'})
+  assert r.returncode == 0, r.stdout
+  assert "git-lfs isn't on the comma" in r.stdout and 'dirty=no-git-lfs' in r.stdout
+  assert g(root / 'openpilot', 'rev-parse', 'HEAD', env=os.environ) == second
+  no_pointers(root / 'openpilot', REAL_PATHS)
 
 
 @pytest.mark.parametrize('param,value', [('IsOffroad', '0'), ('IsOnroad', '1')])

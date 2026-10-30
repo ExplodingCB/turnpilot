@@ -228,6 +228,12 @@ def git(*args: str, cwd: Path | str | None = None) -> str:
 # size, as an ordinary LFS checkout does. A pointer-sized index entry reads as modified to git without a content check.
 LFS_CLEAN = ["-c", "filter.lfs.process=git-lfs filter-process", "-c", "filter.lfs.clean=git-lfs clean -- %f",
              "-c", "filter.lfs.required=true"]
+# The same clean filter, written into the comma's .git/config and every .git/modules/<name>/config: the comma's check and
+# the device's own is_dirty() (`git update-index --refresh` and `git diff-index`, no -c) then hash each LFS file the way
+# its pointer was made, whatever AGNOS's git config for user comma has. Without a filter, git hashes the real bytes, and
+# every LFS file reads modified. No smudge and no process filter: checkouts (the updater's, if DisableUpdates is ever 0)
+# keep whatever smudge AGNOS's config gives them, and a process filter there still takes precedence, as git-lfs's own.
+DEVICE_LFS_FILTER = {"filter.lfs.clean": "git-lfs clean -- %f", "filter.lfs.required": "true"}
 
 # ---------------------------------------------------------------------------------------------------------------- Mac
 
@@ -312,6 +318,8 @@ def submodules(stage: Path) -> list[tuple[str, str, str]]:
 def linux_git_config(gitdir: Path) -> None:
   for key in ("core.ignorecase", "core.precomposeunicode"):  # macOS git init sets these true; the comma is Linux
     git("--git-dir", str(gitdir), "config", key, "false")
+  for key, value in DEVICE_LFS_FILTER.items():
+    git("--git-dir", str(gitdir), "config", key, value)
   if git("--git-dir", str(gitdir), "config", "core.repositoryformatversion") != "0":
     raise Failed(f"{gitdir} is not repository format 0; the comma's git may not read it")
   exts = subprocess.run(["git", "--git-dir", str(gitdir), "config", "--get-regexp", r"^extensions\."],
