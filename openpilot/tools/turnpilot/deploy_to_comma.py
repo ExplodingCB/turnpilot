@@ -532,7 +532,6 @@ class Comma:
                     f"IsOnroad={state.get('IsOnroad') or 'unset'}). Turn the car off, wait for the comma to go " +
                     "offroad, and run this again")
 
-
   def reboot(self) -> None:
     """Reboot, once the comma's side has checked again that it is offroad and has a tree to boot, and for a TurnPilot
     tree that DisableUpdates is 1 and no updater has set up its overlay over it. Raises Refused when it doesn't reboot."""
@@ -549,7 +548,7 @@ class Comma:
 
 
 def not_rebooted(comma: Comma, running_from: str) -> str:
-  return (f"NOT REBOOTED. Don't start the car until the comma has rebooted: until then the fork that was running keeps " +
+  return ("NOT REBOOTED. Don't start the car until the comma has rebooted: until then the fork that was running keeps " +
           f"running from {running_from}, and going onroad would start its onroad processes out of the tree now in " +
           f"{comma.root}/openpilot. With the car off, reboot it with: {sys.argv[0]} {comma.host} --reboot")
 
