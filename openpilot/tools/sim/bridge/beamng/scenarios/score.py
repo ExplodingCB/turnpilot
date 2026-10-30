@@ -29,6 +29,7 @@ A row is a dict:
   accel_cap          turnpilotPlan.accelCap; tp_accel: TurnPilot's accel candidate in plannerd from it and the plan's speedCap
                      (hooks.plan_accel), m/s^2 (None before the first plan); a_target: longitudinalPlan.aTarget, what plannerd
                      asked of the car whoever asked it (None without one)
+  det_age            s since the last turnpilotDetections (None before the first)
 
 A scenario's expectations (EXPECTS: catalog Entry.expect, or the runner's --expect and the options that imply one) are
 what its shot exists to show: a handback, a skip, a missed turn, the driver's gas press, hard braking. Each is required of
@@ -101,6 +102,18 @@ HELD_REACT_S = 0.5
 HELD_DECEL = 1.0
 HELD_SLACK_M = 1.0
 FULL_STOP_HANDBACKS = ('stopSignTakeControl',)
+# turnpilotPlan.handback's kinds: a fault, handed back with openpilot's soft disable, which ends the drive (the car is not
+# held: it coasts engaged through the soft disable); the disengagement after one is that soft disable's
+FAULT_HANDBACKS = ('detectorStopped', 'modelFellBack', 'noDetector')
+SOFT_DISABLE = '/softDisable'
+# S01's drop (run.py --drop-detections-at; summarize's drop): the detectorStopped handback within DROP_HANDBACK_S of the
+# detector's last detections before it (the shot's rule, from the rows' det_age), which come after the drop (but for a
+# frame or so: DROP_BEFORE_TOL_S); rows without det_age (results from before it) are held to the drop's own time, the
+# runner's write of its param, plus the detector's read of it, up to DETECTOR_PARAM_CHECK_S later (modeld_detector's
+# PARAM_CHECK_S; BeamNG smoke 2026-10-29: written at 3.04 s, handed back at 5.29 s)
+DROP_HANDBACK_S = 2.0
+DETECTOR_PARAM_CHECK_S = 1.0
+DROP_BEFORE_TOL_S = 0.25
 # the disengagement within this of the first row showing the gas is the press's: the shot's 0.2 s (carState.gasPressed to
 # disengaged, in the rlog), plus the rows' 50 ms sampling of two messages that may each land a row late
 GAS_DISENGAGE_S = 0.3
@@ -154,7 +167,8 @@ def route_id(coords) -> int:
   return hash((n, round(coords[0].latitude, 6), round(coords[n - 1].longitude, 6))) if n else 0
 
 
-LOG_SERVICES = ('selfdriveState', 'carState', 'turnpilotPlan', 'navInstruction', 'navRoute', 'modelV2', 'longitudinalPlan')
+LOG_SERVICES = ('selfdriveState', 'carState', 'turnpilotPlan', 'navInstruction', 'navRoute', 'modelV2', 'longitudinalPlan',
+                'turnpilotDetections')
 
 
 def rows_from_log(msgs) -> list[dict]:
@@ -176,9 +190,11 @@ def rows_from_log(msgs) -> list[dict]:
     t0 = t if t0 is None else t0
     cs = latest['carState'].carState
     nav = latest.get('navInstruction')
+    det = latest.get('turnpilotDetections')
     rows.append({'t': round(t - t0, 3), 'wall': None, 'x': None, 'y': None, 'heading': None, 'v': round(cs.vEgo, 2), 'route': route,
                  'dest_dist': None, 'blinker': 'left' if cs.leftBlinker else 'right' if cs.rightBlinker else '',
                  'ped_gap': None, 'car_gap': None, 'pacer_dx': None, 'j_dist': None, 'car_j_dist': None, 'onc': None,
+                 'det_age': None if det is None else round(t - det.logMonoTime * 1e-9, 3),
                  **msg_fields(latest['selfdriveState'].selfdriveState, cs, m.turnpilotPlan,
                               nav.navInstruction if nav is not None and nav.valid else None, latest['modelV2'].modelV2,
                               latest['longitudinalPlan'].longitudinalPlan if 'longitudinalPlan' in latest else None)})
@@ -723,14 +739,16 @@ def expect_facts(rows) -> dict:
   controlPrompt), control alert, skip and missed turn; the first row showing the gas once engaged; and the turn desires and
   TurnPilot prompts after them."""
   first: dict[str, dict] = {'handback': {}, 'alert': {}}
+  det_t: dict[str, float | None] = {}  # each handback's detector: its last detections at the handback's first row
   skip_t = missed_t = gas_t = None
   engaged = False
   for r in rows:
     engaged = engaged or r['enabled']
     hb, cp = r.get('handback', 'none'), r.get('control_prompt', 'none')
     for k in (hb if hb not in ('', 'none') else None, cp if cp.endswith('TakeControl') else None):
-      if k is not None:
-        first['handback'].setdefault(k, r['t'])
+      if k is not None and k not in first['handback']:
+        first['handback'][k] = r['t']
+        det_t[k] = None if r.get('det_age') is None else round(r['t'] - r['det_age'], 3)
     if r.get('control_alert', 'none') not in ('', 'none'):
       first['alert'].setdefault(r['control_alert'], r['t'])
     if skip_t is None and (r.get('too_fast') or r.get('left_state') == 'skipped'):
@@ -741,22 +759,59 @@ def expect_facts(rows) -> dict:
       gas_t = r['t']
   return {'handbacks': first['handback'], 'control_alerts': first['alert'], 'skip_t': skip_t, 'turn_missed_t': missed_t,
           'gas_t': gas_t,
+          'handback_det_t': det_t,
           'held': {k: held_after(rows, t) for k, t in first['handback'].items() if k in TAKE_CONTROL_PROMPTS},
           'stood_before': {k: stood_before(rows, t) for k, t in first['handback'].items() if k in FULL_STOP_HANDBACKS},
           'desire_after_skip_t': next((r['t'] for r in rows if skip_t is not None and r['t'] >= skip_t and r.get('desire') in TURN_DESIRES), None),
           'prompts_after_gas': sorted({k for k, t in first['handback'].items() if gas_t is not None and t >= gas_t})}
 
 
-def handback_problems(arg: str, t: float, facts: dict) -> list[str]:
-  """Why a handback of kind arg first seen at t isn't its shot's: a take-control handback the car wasn't held after
-  (held_after), the stop sign's without its full stop."""
+def drop_problems(t: float, det_t: float | None, drop: dict | None) -> list[str]:
+  """Why the detectorStopped handback at t isn't the drop's (DROP_HANDBACK_S): det_t, the detector's last detections
+  before it (None: the rows don't say); drop, the runner's (summarize)."""
+  drop_t = None if drop is None else drop.get('t')
+  if drop is not None and drop_t is None:
+    at = drop.get('at')
+    return [f"the detection drop asked for at t={at:.1f} s never came (the run ended first)" if at is not None else
+            "the detection drop never came (the run ended first)"]
   out = []
+  if det_t is not None:
+    if t - det_t > DROP_HANDBACK_S + 1e-6:
+      out.append(f"handed back {t - det_t:.1f} s after the detector's last detections (t={det_t:.1f} s), over {DROP_HANDBACK_S} s")
+    if drop_t is not None and det_t < drop_t - DROP_BEFORE_TOL_S:
+      out.append(f"the detector went silent at t={det_t:.1f} s, before the drop at t={drop_t:.1f} s")
+  elif drop_t is not None:
+    if t < drop_t:
+      out.append(f"handed back detectorStopped at t={t:.1f} s, before the drop at t={drop_t:.1f} s")
+    elif t - drop_t > DROP_HANDBACK_S + DETECTOR_PARAM_CHECK_S + 1e-6:
+      out.append(f"handed back {t - drop_t:.1f} s after the drop at t={drop_t:.1f} s, over {DROP_HANDBACK_S + DETECTOR_PARAM_CHECK_S:.1f} s " +
+                 f"({DROP_HANDBACK_S} s, and up to {DETECTOR_PARAM_CHECK_S} s for the detector to read the drop's param)")
+  else:
+    out.append(f"no detector times in the rows and no drop: the detectorStopped handback's {DROP_HANDBACK_S} s was not checked")
+  return out
+
+
+def handback_problems(arg: str, t: float, facts: dict, res: dict) -> list[str]:
+  """Why a handback of kind arg first seen at t isn't its shot's: another handback before it; a take-control handback the
+  car wasn't held after (held_after), the stop sign's without its full stop; a fault's disengagement not its soft disable;
+  the detection drop's not within DROP_HANDBACK_S of the detector going silent after the drop (drop_problems)."""
+  out = [f"handed back {k} at t={tk:.1f} s, before the expected handback {arg}"
+         for k, tk in sorted(facts['handbacks'].items(), key=lambda kv: kv[1]) if k != arg and tk < t]
   h = facts.get('held', {}).get(arg)
   if h is not None and h['went_m'] > h['allowed_m']:
     out.append(f"moved {h['went_m']:.1f} m engaged after the {arg} handback (up to {h['v_max']:.1f} m/s), past the " +
                f"{h['allowed_m']:.1f} m a stop from {h['v0']:.1f} m/s allows: not held")
   if arg in FULL_STOP_HANDBACKS and not facts.get('stood_before', {}).get(arg, True):
     out.append(f"handed back {arg} at t={t:.1f} s at {h['v0'] if h else 0.:.1f} m/s: no full stop before it")
+  if arg in FAULT_HANDBACKS:
+    after = [d for d in res['disengagements'] if d['t'] >= t]
+    if not after:
+      out.append(f"no disengagement after the {arg} handback: its soft disable never ended the drive")
+    elif SOFT_DISABLE not in after[0]['cause']:
+      who = "the driver's" if after[0]['cause'].startswith('driver ') else 'for something else'
+      out.append(f"the disengagement after the {arg} handback was {who} ({after[0]['cause']}), not its soft disable")
+  if arg == 'detectorStopped':
+    out += drop_problems(t, facts['handback_det_t'].get(arg), res.get('detection_drop'))
   return out
 
 
@@ -778,10 +833,13 @@ def expectations(name: str, res: dict, fails: list[tuple[str, str]], expect) -> 
     t, met = None, False
     if kind == 'handback':
       t = facts['handbacks'].get(arg)
-      problems = [] if t is None else handback_problems(arg, t, facts)
+      problems = [] if t is None else handback_problems(arg, t, facts, res)
       met = t is not None and not problems
       if t is None:
         extra.append(f"expected handback {arg}: none came")
+        drop = res.get('detection_drop')
+        if arg == 'detectorStopped' and drop is not None and drop.get('t') is None:
+          extra += drop_problems(0., None, drop)  # the drop itself never came
       elif problems:
         extra += problems  # seen, but not the shot: it explains nothing
       else:
@@ -875,11 +933,12 @@ def red_light(rows, stop_line_m: float | None) -> dict | None:
 
 
 def summarize(name: str, rows, outcome: str, road: dict | None = None, junction_control: str | None = None, expect=(),
-              stop_line_m: float | None = None) -> dict:
+              stop_line_m: float | None = None, drop: dict | None = None) -> dict:
   """road: catalog.road_model's roads around the run, for the oncoming-lane check (rows with positions need one);
   junction_control: the scenario junction's own mapped control (catalog.junction_control's kind: 'signal', 'stop',
   'none'; None: not known), recorded with the result (a signal there no longer protects a left: map_controls);
-  expect: the run's expectations (EXPECTS); stop_line_m: m before the junction of its own stop line (the plan's notes)."""
+  expect: the run's expectations (EXPECTS); stop_line_m: m before the junction of its own stop line (the plan's notes);
+  drop: the runner's detection drop ({t: s since engagement, ...}; {t: None, at: s} asked for and never set; None: none)."""
   ms = maneuvers(rows)
   wrong_m, wrong_spans = wrong_side(rows, road)
   res = {
@@ -911,6 +970,7 @@ def summarize(name: str, rows, outcome: str, road: dict | None = None, junction_
     'red_light': red_light(rows, stop_line_m),
     'stop_met_t': next((r['t'] for r in rows if r.get('map_kind') == 'stop' and r['enabled']), None),  # a stop sign the plan met
     'tp_accel': tp_accel(rows),
+    'detection_drop': drop,
   }
   res['failures'] = check(name, res, expect)
   res['passed'] = not res['failures']
@@ -961,7 +1021,7 @@ def main():
       expect = args.expect if args.expect is not None else run.get('expect', result.get('expect', ()))
       print(report(f"{result['scenario']} run {run['run']}", summarize(result['scenario'], run['rows'], run['outcome'], road=result.get('road'),
                                                                      junction_control=notes.get('junction_control'), expect=expect,
-                                                                     stop_line_m=notes.get('stop_line_m'))))
+                                                                     stop_line_m=notes.get('stop_line_m'), drop=run.get('detection_drop'))))
 
 
 if __name__ == "__main__":

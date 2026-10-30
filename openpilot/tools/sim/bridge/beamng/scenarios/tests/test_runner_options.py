@@ -45,6 +45,21 @@ class DriverWorld(World):
       tp.reason = 'pedestrian in crosswalk'
 
 
+class DetectorWorld(DriverWorld):
+  """DriverWorld with a detector: turnpilotDetections every step until the drop's param is written, silent after."""
+  def __init__(self, plan, clock, take_control: str = '', params=None):
+    super().__init__(plan, clock, take_control)
+    self.params, self.silent_t = params, None
+
+  def step(self, b):
+    super().step(b)
+    if self.silent_t is None and any(k == run.DROP_PARAM and v for _, k, v in self.params.writes):
+      self.silent_t = self.clock.t
+    if self.silent_t is None:
+      self.msgs['turnpilotDetections'] = messaging.new_message('turnpilotDetections', valid=True)
+      self.updated.add('turnpilotDetections')
+
+
 class FakeParams:
   def __init__(self, clock, known=True):
     self.clock, self.known, self.writes = clock, known, []
@@ -63,17 +78,17 @@ class FakeParams:
     self.writes.append((round(self.clock.t, 2), key, None))
 
 
-def drive(tmp_path, monkeypatch, name, take_control='', runs=1, params=None, **options):
+def drive(tmp_path, monkeypatch, name, take_control='', runs=1, params=None, world_cls=None, **options):
   clock = Clock()
   plan = catalog.build(name)
-  world = DriverWorld(plan, clock, take_control)
+  params = params(clock) if callable(params) else params
+  world = DriverWorld(plan, clock, take_control) if world_cls is None else world_cls(plan, clock, take_control, params)
   monkeypatch.setattr(run, 'time', SimpleNamespace(monotonic=clock.monotonic, strftime=lambda *a: 'now'))
   monkeypatch.setattr(run, 'wall', clock.wall)
   monkeypatch.setattr(run, 'Director', FakeDirector)
   monkeypatch.setattr(FakeDirector, 'clock', clock)
   monkeypatch.setattr(run, 'web_call', world.web)
   monkeypatch.setattr(run.messaging, 'SubMaster', lambda services: FakeSM(world))
-  params = params(clock) if callable(params) else params
   runner = run.Runner(plan, runs, str(tmp_path), 'http://127.0.0.1:8088', 'tok', 'host', 0, params=params, **options)
   b = bridge()
   b.world.teleport = lambda pos, rot: (b.teleports.append(pos), setattr(world, 's', 0.0), setattr(world, 'hold', None))
@@ -133,6 +148,25 @@ def test_the_detection_drop_is_set_once_and_cleared(tmp_path, monkeypatch):
   assert out['expect'] == ['handback:detectorStopped']
   assert r['outcome'] == 'arrived'  # the fake world has no detector to drop: the expectation fails it
   assert "expected handback detectorStopped: none came" in r['failures']
+  assert all(row['det_age'] is None for row in r['rows'])  # nor any detections
+
+
+def test_the_rows_carry_the_detectors_silence_from_the_drop(tmp_path, monkeypatch):
+  # the S01 shot's clock: the rows' det_age, from the runner's own turnpilotDetections, runs from the drop's write
+  out, *_ = drive(tmp_path, monkeypatch, 'straight_cruise', drop_detections_at=-1., params=FakeParams, world_cls=DetectorWorld)
+  (r,) = out['runs']
+  drop_t = r['detection_drop']['t']
+  before = [row['det_age'] for row in r['rows'] if row['t'] < drop_t - 0.1]
+  assert before and max(before) <= 0.06
+  last = r['rows'][-1]
+  assert last['t'] - last['det_age'] == pytest.approx(drop_t, abs=0.06)
+
+
+def test_a_drop_the_run_never_reached_is_said_and_fails(tmp_path, monkeypatch):
+  out, *_ = drive(tmp_path, monkeypatch, 'straight_cruise', drop_detections_at=500., params=FakeParams)
+  (r,) = out['runs']
+  assert r['detection_drop'] == {'t': None, 'at': 500.} and not r['passed']
+  assert "the detection drop asked for at t=500.0 s never came (the run ended first)" in r['failures'], r['failures']
 
 
 def test_a_build_without_the_param_ends_the_run_loudly(tmp_path, monkeypatch):

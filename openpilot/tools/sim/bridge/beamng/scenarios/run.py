@@ -72,7 +72,8 @@ WEB_RETRY_S = 1.
 ENGAGE_TIMEOUT_S = 30.
 
 TURN_DESIRES = (int(log.Desire.turnLeft), int(log.Desire.turnRight))
-SERVICES = ['turnpilotPlan', 'selfdriveState', 'carState', 'navInstruction', 'navRoute', 'modelV2', 'turnpilotLights', 'longitudinalPlan']
+SERVICES = ['turnpilotPlan', 'selfdriveState', 'carState', 'navInstruction', 'navRoute', 'modelV2', 'turnpilotLights', 'longitudinalPlan',
+            'turnpilotDetections']
 OUT_ROOT = os.path.expanduser("~/turnpilot-artifacts/scenarios")
 POSE_FIELDS = ["wall_s", "t_s", "x", "y", "z", "qx", "qy", "qz", "qw"]  # route_drive's, which chase_render.py reads
 GAS_PRESS, GAS_PRESS_S = 0.3, 0.5  # --gas-press-at: the driver's press (a GasTaps tap is 0.25 for 1 s)
@@ -318,6 +319,7 @@ class Runner:
       'blinker': 'left' if b.blinker[0] else 'right' if b.blinker[1] else '',
       'ped_gap': None, 'car_gap': None, 'pacer_dx': None, 'j_dist': junction_distance(self.plan, x, y), 'car_j_dist': None,
       'onc': None, 'forced_light': self.light_state, 'lights': self.oracle_lights(now),
+      'det_age': round(now - sm.recv_time['turnpilotDetections'], 3) if sm.seen['turnpilotDetections'] else None,
       **score.msg_fields(sm['selfdriveState'], sm['carState'], sm['turnpilotPlan'] if sm.seen['turnpilotPlan'] else None,
                          sm['navInstruction'] if sm.seen['navInstruction'] and sm.valid['navInstruction'] else None,
                          sm['modelV2'], sm['longitudinalPlan'] if sm.seen['longitudinalPlan'] else None),
@@ -477,11 +479,14 @@ class Runner:
     end_wall = wall()
     failed = [f"{name}: {f.exception()!r}" for name, f in getattr(self, 'jobs', []) if f.done() and f.exception() is not None]
     detail = '; '.join([detail] * bool(detail) + failed)
+    # the detection drop, for the score's timing of its handback; asked for and never set (the run ended first): said so
+    drop = getattr(self, 'drop', None)
+    drop = drop if drop is not None or self.drop_at is None else {'t': None, 'at': self.drop_at}
     res = score.summarize(self.plan.name, self.rows, outcome, road=self.plan.road, junction_control=self.plan.notes.get('junction_control'),
-                          expect=self.expect, stop_line_m=self.plan.notes.get('stop_line_m'))
-    # what the demo's options did, and when (t: s since engagement)
+                          expect=self.expect, stop_line_m=self.plan.notes.get('stop_line_m'), drop=drop)
+    # what the demo's options did, and when (t: s since engagement); the drop's is the score's detection_drop
     res.update(driver_takeover=getattr(self, 'takeover', None), gas_press=getattr(self, 'press', None),
-               detection_drop=getattr(self, 'drop', None), step_out=getattr(self, 'step_out', None))
+               step_out=getattr(self, 'step_out', None))
     if self.plan.lights is not None:  # the forced light: what was set when (wall, from the director), and the swap's times
       res['light_events'] = [e for e in self.director.light_log if e[0] >= self.t0_wall - 1.]
       res['forced_light'] = {'instance': self.plan.lights['instance'], 'stand_t': getattr(self, 'stand_t', None),

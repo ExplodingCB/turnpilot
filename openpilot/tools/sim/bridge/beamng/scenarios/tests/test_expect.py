@@ -9,19 +9,27 @@ from openpilot.tools.sim.bridge.beamng.scenarios import score
 from openpilot.tools.sim.bridge.beamng.scenarios.tests.test_score import drive, route
 
 SOFT = 'turnpilotDetectorStopped/softDisable'
+A = {'nav_type': 'arrive', 'nav_mod': ''}
 
 
-def detector_drop(handback=True, early_disengage=False):
-  """A straight cruise: engaged, the detector stops, TurnPilot hands back (handback detectorStopped, openpilot's soft
-  disable), and openpilot disengages."""
-  segs = [(4.0, {'nav_type': 'arrive', 'nav_mod': ''})]
+def silent_from(rows, last_det_t):
+  """The rows' det_age (turnpilotDetections' age, 20 Hz) with the detector's last detections at last_det_t."""
+  for r in rows:
+    r['det_age'] = 0.05 if r['t'] <= last_det_t + 0.05 else round(r['t'] - last_det_t, 3)
+  return rows
+
+
+def detector_drop(handback=True, early_disengage=False, cruise_s=4.0, last_det_t=2.45, driver=False):
+  """A straight cruise: engaged, the detector stops (its last detections at last_det_t), TurnPilot hands back
+  (handback detectorStopped, openpilot's soft disable) cruise_s in, and openpilot disengages (or the driver brakes)."""
+  segs = [(cruise_s, dict(A))]
   if early_disengage:
-    segs += [(0.5, {'enabled': False, 'nav_type': 'arrive', 'nav_mod': ''}), (1.0, {'nav_type': 'arrive', 'nav_mod': ''})]
+    segs += [(0.5, {'enabled': False, **A}), (1.0, dict(A))]
   if handback:
-    segs += [(3.0, {'handback': 'detectorStopped', 'state': 'unavailable', 'alert': SOFT, 'nav_type': 'arrive', 'nav_mod': ''})]
-  segs += [(1.0, {'enabled': False, 'handback': 'detectorStopped' if handback else 'none', 'state': 'unavailable',
-                  'nav_type': 'arrive', 'nav_mod': ''})]
-  return drive(segs)
+    segs += [(3.0, {'handback': 'detectorStopped', 'state': 'unavailable', 'alert': SOFT, **A})]
+  segs += [(1.0, {'enabled': False, 'handback': 'detectorStopped' if handback else 'none', 'state': 'unavailable', 'brake': driver,
+                  **A})]
+  return silent_from(drive(segs), last_det_t)
 
 
 class TestHandback:
@@ -43,8 +51,24 @@ class TestHandback:
     assert "expected handback detectorStopped: none came" in res['failures']
 
   def test_a_disengagement_before_the_handback_still_fails(self):
-    res = score.summarize('straight_cruise', detector_drop(early_disengage=True), 'disengaged', expect=('handback:detectorStopped',))
+    res = score.summarize('straight_cruise', detector_drop(early_disengage=True, last_det_t=4.0), 'disengaged', expect=('handback:detectorStopped',))
     assert not res['passed'] and any(f.startswith('1 disengagement(s) before the expected') for f in res['failures']), res['failures']
+
+  def test_another_handback_before_the_expected_one_fails(self):
+    rows = detector_drop()
+    for r in rows:
+      if 1.0 <= r['t'] < 2.0:
+        r['control_prompt'] = 'carStoppedTakeControl'
+    res = score.summarize('straight_cruise', rows, 'disengaged', expect=('handback:detectorStopped',))
+    assert "handed back carStoppedTakeControl at t=1.0 s, before the expected handback detectorStopped" in res['failures'], res['failures']
+
+  def test_the_disengagement_after_a_fault_handback_is_its_soft_disable(self):
+    res = score.summarize('straight_cruise', detector_drop(driver=True), 'disengaged', expect=('handback:detectorStopped',))
+    assert "the disengagement after the detectorStopped handback was the driver's (driver brake), not its soft disable" in \
+      res['failures'], res['failures']
+    rows = [r for r in detector_drop() if r['enabled']]  # the run ended before the soft disable did
+    res = score.summarize('straight_cruise', rows, 'timeout', expect=('handback:detectorStopped',))
+    assert "no disengagement after the detectorStopped handback: its soft disable never ended the drive" in res['failures'], res['failures']
 
   def test_a_take_control_prompt_is_a_handback_and_explains_the_stall_and_the_drivers_takeover(self):
     # S02: the go withdrawn (cantStartTakeControl), the car held; the sim driver brakes (--end-after-handback): disengaged
@@ -61,6 +85,80 @@ class TestHandback:
     explained = res['expected'][0]['explains']
     assert any('cantStartTakeControl' in x for x in explained) and any('driver brake' in x for x in explained)
     assert any('not arrived' in x for x in explained)
+
+
+class TestDetectionDrop:
+  """S01's 'handback within 2.0 s of the drop (rlog: last turnpilotDetections to turnpilotPlan.handback)' (demo skeptic
+  P1): the drop's handback within score.DROP_HANDBACK_S of the detector's last detections before it, which come after the
+  runner's drop; without the detections' age in the rows, within that and the detector's read of the param of the drop."""
+  DROP = {'t': 3.0, 's': 20.0, 'param': 'TurnPilotSimDropDetectionsS'}
+
+  def late(self):
+    """The skeptic's P1: dropped at t=3, the handback 12 s later, at t=15."""
+    return detector_drop(cruise_s=15.0, last_det_t=3.0)
+
+  def test_a_handback_12_s_after_the_drop_fails(self):
+    res = score.summarize('straight_cruise', self.late(), 'disengaged', expect=('handback:detectorStopped',), drop=self.DROP)
+    assert not res['passed']
+    assert "handed back 12.0 s after the detector's last detections (t=3.0 s), over 2.0 s" in res['failures'], res['failures']
+    assert any(f.startswith('1 disengagement(s)') for f in res['failures'])  # unmet: the soft disable isn't explained
+    # the same rows without det_age (a result from before it): held to the drop's time and the detector's read of it
+    for r in (old := self.late()):
+      del r['det_age']
+    res = score.summarize('straight_cruise', old, 'disengaged', expect=('handback:detectorStopped',), drop=self.DROP)
+    want = "handed back 12.0 s after the drop at t=3.0 s, over 3.0 s (2.0 s, and up to 1.0 s for the detector to read the drop's param)"
+    assert want in res['failures'], res['failures']
+
+  def test_the_smoke_runs_timing_passes(self):
+    # BeamNG smoke 2026-10-29 (s01_detector_drop): the param written at 3.04 s, the handback at 5.29 s, the soft disable 3 s on
+    rows = detector_drop(cruise_s=5.3, last_det_t=3.79)
+    drop = {**self.DROP, 't': 3.04}
+    res = score.summarize('straight_cruise', rows, 'disengaged', expect=('handback:detectorStopped',), drop=drop)
+    assert res['passed'], res['failures']
+    for r in rows:
+      del r['det_age']
+    res = score.summarize('straight_cruise', rows, 'disengaged', expect=('handback:detectorStopped',), drop=drop)
+    assert res['passed'], res['failures']
+
+  def test_a_detector_silent_before_the_drop_isnt_the_drops(self):
+    rows = detector_drop(cruise_s=2.5, last_det_t=1.0)
+    res = score.summarize('straight_cruise', rows, 'disengaged', expect=('handback:detectorStopped',), drop=self.DROP)
+    assert "the detector went silent at t=1.0 s, before the drop at t=3.0 s" in res['failures'], res['failures']
+    for r in rows:
+      del r['det_age']
+    res = score.summarize('straight_cruise', rows, 'disengaged', expect=('handback:detectorStopped',), drop=self.DROP)
+    assert "handed back detectorStopped at t=2.5 s, before the drop at t=3.0 s" in res['failures'], res['failures']
+
+  def test_a_drop_asked_for_that_never_came_fails(self):
+    res = score.summarize('straight_cruise', detector_drop(), 'disengaged', expect=('handback:detectorStopped',),
+                          drop={'t': None, 'at': 30.0})
+    assert "the detection drop asked for at t=30.0 s never came (the run ended first)" in res['failures'], res['failures']
+
+  def test_neither_the_detections_age_nor_the_drop_is_not_checked(self):
+    rows = detector_drop()
+    for r in rows:
+      del r['det_age']
+    res = score.summarize('straight_cruise', rows, 'disengaged', expect=('handback:detectorStopped',))
+    assert "no detector times in the rows and no drop: the detectorStopped handback's 2.0 s was not checked" in res['failures']
+
+  def test_a_recorded_drives_rows_carry_the_detections_age(self):
+    from openpilot.tools.sim.bridge.beamng.scenarios.tests.test_score import msg
+    out = []
+    for i in range(80):  # 4 s at 20 Hz, the detector silent from 1.5 s
+      t = i * 0.05
+      out += [msg('selfdriveState', t, enabled=True), msg('carState', t, vEgo=8.0), msg('modelV2', t)]
+      if t < 1.5:
+        out.append(msg('turnpilotDetections', t))
+      out.append(msg('turnpilotPlan', t + 0.01))
+    rows = score.rows_from_log(out)
+    assert rows[10]['det_age'] == pytest.approx(0.01, abs=1e-6) and rows[-1]['det_age'] == pytest.approx(3.95 + 0.01 - 1.45, abs=1e-6)
+    assert score.rows_from_log(out[:3] + [msg('turnpilotPlan', 0.01)])[0]['det_age'] is None
+
+  def test_the_param_read_is_the_detectors(self):
+    from openpilot.selfdrive.turnpilot.detector.modeld_detector import PARAM_CHECK_S
+    from openpilot.selfdrive.turnpilot.turnpilotd import DETECTOR_DEADLINE_S
+    assert score.DETECTOR_PARAM_CHECK_S == PARAM_CHECK_S
+    assert DETECTOR_DEADLINE_S < score.DROP_HANDBACK_S  # the shot's 2.0 s holds turnpilotd's deadline
 
 
 def left_go(after):
