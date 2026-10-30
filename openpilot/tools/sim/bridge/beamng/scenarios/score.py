@@ -100,7 +100,10 @@ TURN_DESIRES = (1, 2)  # log.Desire.turnLeft, turnRight
 # 'gasDisengage', 'skip' (tooFastToTurn, or the left skipped at route time), 'turnMissed', 'hardBrake' (controlAlert).
 # An unprotected left's skip is its range skip (unprotectedLeft.state skipped: turnpilotd sets it for turn_skip's
 # unprotectedRange only); tooFastToTurn alone there is another skip (tooLate, laneUnreachable or tooFast), not its shot.
-# A skip's alert comes before its junction (S05, S19): one first seen with the junction behind the car (j_ahead) isn't met
+# A skip's alert comes before its junction (S05, S19): one first seen with the junction behind the car (j_ahead) isn't met.
+# The left's range skip drives on (S05 'no hold at the line ... a reroute', after_range_skip): no TurnPilot hold within
+# NEAR_JUNCTION_M of the junction after it, and a new navRoute once the car is past the junction (navd reroutes past a
+# skipped turn only: navd.skipped_turn_passed)
 EXPECTS = ('handback', 'gasDisengage', 'skip', 'turnMissed', 'hardBrake')
 # a take-control handback holds the car while the driver is told to take control (hooks.TAKE_CONTROL_PROMPTS): from it,
 # engaged, the car goes no further than a stop from its speed then, HELD_REACT_S at that speed and HELD_DECEL after it (a
@@ -835,12 +838,47 @@ def expect_facts(rows) -> dict:
           'skip_ahead_m': ahead.get('skip'), 'range_skip_ahead_m': ahead.get('range_skip'), 'turn_missed_t': missed_t,
           'gas_t': gas_t,
           'handback_det_t': det_t, 'handback_det_age': det_age,
+          'after_range_skip': after_range_skip(rows, range_skip_t),
           'held': {k: held_after(rows, t) for k, t in first['handback'].items() if k in TAKE_CONTROL_PROMPTS},
           'stood_at': {k: stood_at(rows, t) for k, t in first['handback'].items() if k in FULL_STOP_HANDBACKS},
           'go_before': {k: go_before(rows, t) for k, t in first['handback'].items() if k in GO_TIMED},
           'stand_before': {k: stand_before(rows, t) for k, t in first['handback'].items() if k in STALL_HANDBACKS},
           'desire_after_skip_t': next((r['t'] for r in rows if skip_t is not None and r['t'] >= skip_t and r.get('desire') in TURN_DESIRES), None),
           'prompts_after_gas': sorted({k for k, t in first['handback'].items() if gas_t is not None and t >= gas_t})}
+
+
+def after_range_skip(rows, t: float | None) -> dict | None:
+  """After the left's range skip at t: the first TurnPilot hold near the junction ({t, reason, j_dist}, NEAR_JUNCTION_M),
+  when the car first had the junction behind it (passed_t; None: never, or no junction in the rows: has_j), and the first
+  row from then on with a navRoute other than the one the car came up to the junction on (rerouted_t). None without the
+  skip."""
+  if t is None:
+    return None
+  after = [r for r in rows if r['t'] >= t]
+  hold = next(({'t': r['t'], 'reason': r.get('reason', ''), 'j_dist': r.get('j_dist')} for r in after
+               if r.get('state') == 'holding' and near_junction(r)), None)
+  i = next((i for i, r in enumerate(after) if r.get('j_ahead') is not None and r['j_ahead'] <= 0.), None)
+  passed_t = None if i is None else after[i]['t']
+  base = None if i is None else after[max(i - 1, 0)].get('route')
+  rerouted_t = None if i is None else next((r['t'] for r in after[i:] if r.get('route') != base), None)
+  return {'hold': hold, 'passed_t': passed_t, 'rerouted_t': rerouted_t, 'has_j': any(r.get('j_ahead') is not None for r in after)}
+
+
+def range_skip_problems(a: dict | None) -> list[str]:
+  """Why the left's range skip met isn't its shot's (after_range_skip): a hold at the line after it, no reroute past it."""
+  if a is None:
+    return []
+  out = []
+  if (h := a['hold']) is not None:
+    where = '' if h['j_dist'] is None else f", {h['j_dist']:.0f} m from the junction,"
+    out.append(f"TurnPilot held the car at t={h['t']:.1f} s ({h['reason']}){where} after the range skip: no hold at the line")
+  if not a['has_j']:
+    out.append("no junction in the rows after the range skip: its reroute was not checked")
+  elif a['passed_t'] is None:
+    out.append("never passed the skipped junction: no reroute seen")
+  elif a['rerouted_t'] is None:
+    out.append(f"no reroute after passing the skipped junction at t={a['passed_t']:.1f} s (one navRoute to the run's end)")
+  return out
 
 
 def drop_problems(t: float, det_t: float | None, drop: dict | None, det_age: float | None = None) -> list[str]:
@@ -983,9 +1021,12 @@ def expectations(name: str, res: dict, fails: list[tuple[str, str]], expect) -> 
       t = facts['range_skip_t'] if range_skip else facts['skip_t']
       a = facts['range_skip_ahead_m' if range_skip else 'skip_ahead_m']
       late = t is not None and a is not None and a <= 0.
-      met = t is not None and not late
+      problems = range_skip_problems(facts.get('after_range_skip')) if range_skip and t is not None and not late else []
+      met = t is not None and not late and not problems
       if late:
         extra.append(f"the skip came at t={t:.1f} s with the junction {-a:.0f} m behind the car: its alert is before the junction")
+      elif problems:
+        extra += problems  # seen, but not the shot: it explains nothing
       elif not met and range_skip and facts['skip_t'] is not None:
         extra.append("expected skip: the left never skipped for range (unprotectedLeft.state skipped); tooFastToTurn at " +
                      f"t={facts['skip_t']:.1f} s is another skip (tooLate, laneUnreachable or tooFast)")

@@ -298,3 +298,62 @@ class TestDetectorSilentAtTheHandback:
            "not turnpilotDetectorStopped's"
     assert want in res['failures'], res['failures']
     assert [score.fault_event(k) for k in score.FAULT_HANDBACKS] == ['turnpilotDetectorStopped', 'turnpilotModelFellBack', 'turnpilotNoDetector']
+
+
+def range_skip(hold=False, reroute=True, past=True):
+  """S05: the left skipped for range 80 m out (left_state skipped, tooFastToTurn), straight on past the junction (or to 10 m
+  short of it), rerouted 1 s after passing it; with hold, TurnPilot holds the car to a stop 28 m out first."""
+  segs = [(4.0, {'v': 8., 'left_state': 'skipped', 'too_fast': True, 'nav_mod': 'left', 'j_dist': lambda tau: 80. - 8 * tau,
+                 'j_ahead': lambda tau: 80. - 8 * tau})]
+  j = 48.
+  if hold:
+    segs += [(5.0, {'v': lambda tau: max(8. - 1.6 * tau, 0.), 'left_state': 'skipped', 'state': 'holding', 'reason': 'Junction ahead',
+                    'nav_mod': 'left', 'j_dist': lambda tau: 48. - 8. * tau + 0.8 * tau * tau, 'j_ahead': lambda tau: 48. - 8. * tau + 0.8 * tau * tau}),
+             (5.0, {'v': 0., 'left_state': 'skipped', 'state': 'holding', 'reason': 'Junction ahead', 'nav_mod': 'left', 'j_dist': 28.,
+                    'j_ahead': 28.})]
+    j = 28.
+  end = -24. if past else 10.
+  run_s = (j - end) / 8.
+  segs += [(run_s, {'v': 8., 'left_state': 'skipped', 'nav_mod': 'left', 'j_dist': lambda tau: abs(j - 8. * tau), 'j_ahead': lambda tau: j - 8. * tau,
+                    'route': lambda tau: 2 if reroute and j - 8. * tau < -8. else 1})]
+  return drive(segs)
+
+
+class TestRangeSkipDrivesOn:
+  """S05 'the skip alert before the junction; no turn desire; no hold at the line; ... a reroute' (B5): the left's range
+  skip met explains the left's wait, go and arrival only if TurnPilot never held the car near the junction after it
+  (NEAR_JUNCTION_M) and navd rerouted once the car was past the junction (a new navRoute after the first row with the
+  junction behind it)."""
+  EXPECT = ('skip',)
+
+  def test_a_hold_at_the_line_and_no_reroute_fail(self):
+    # the skeptic's B5: the range skip 80 m out, then a hold to a stop 28 m out, then straight on, one route id throughout
+    res = score.summarize('unprotected_left_visible', range_skip(hold=True, reroute=False), 'timeout', expect=self.EXPECT)
+    assert not res['passed'] and not res['expected'][0]['met']
+    assert any(f.startswith("TurnPilot held the car at t=") and "(Junction ahead)" in f and "after the range skip: no hold at the line" in f
+               for f in res['failures']), res['failures']
+    assert any(f.startswith("no reroute after passing the skipped junction at t=") for f in res['failures']), res['failures']
+    assert any('never went' in f for f in res['failures'])  # unmet: the left's checks stand
+
+  def test_each_alone_fails(self):
+    res = score.summarize('unprotected_left_visible', range_skip(hold=True), 'timeout', expect=self.EXPECT)
+    assert any('no hold at the line' in f for f in res['failures']) and not any('no reroute' in f for f in res['failures']), res['failures']
+    res = score.summarize('unprotected_left_visible', range_skip(reroute=False), 'timeout', expect=self.EXPECT)
+    assert any('no reroute' in f for f in res['failures']) and not any('no hold' in f for f in res['failures']), res['failures']
+
+  def test_a_run_ending_short_of_the_junction_never_shows_the_reroute(self):
+    res = score.summarize('unprotected_left_visible', range_skip(past=False), 'timeout', expect=self.EXPECT)
+    assert "never passed the skipped junction: no reroute seen" in res['failures'], res['failures']
+
+  def test_straight_on_and_rerouted_passes(self):
+    res = score.summarize('unprotected_left_visible', range_skip(), 'timeout', expect=self.EXPECT)
+    assert res['passed'], res['failures']
+    assert res['expect_facts']['after_range_skip']['rerouted_t'] is not None
+
+  def test_s19s_skip_isnt_held_to_it(self):
+    # too_fast_right ends 30 m past its junction ('past junction'), before navd's reroute: not the left's range skip
+    rows = range_skip(reroute=False)
+    for r in rows:
+      r['left_state'] = 'off'
+    res = score.summarize('too_fast_right', rows, 'past junction', expect=self.EXPECT)
+    assert res['expected'][0]['met'], res['failures']
