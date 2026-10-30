@@ -6,6 +6,8 @@ faked) and from an rlog written to disk."""
 import ast
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +18,7 @@ from opendbc.car.tesla.fingerprints import FW_VERSIONS
 from opendbc.car.tesla.values import CAR
 from openpilot.cereal import messaging
 from openpilot.common.params import Params, UnknownKeyName
+from openpilot.common.prefix import OpenpilotPrefix
 from openpilot.tools.lib.logreader import save_log
 from openpilot.tools.turnpilot import car_preflight as cpf
 from openpilot.tools.turnpilot.car_preflight import GO, INFO, NO_GO, UNKNOWN, WARN
@@ -606,6 +609,26 @@ def test_sunnypilot_log(tmp_path):
 
 
 # ------------------------------------------------------------------------------------------------- the command, the rules
+
+def test_live_reads_the_sockets(tmp_path):
+  """--live's own path on real msgq sockets: this test publishes (as card and pandad would), the tool only subscribes."""
+  sent = [m for m in drive() if m.which() in ("pandaStates", "carState") and m.logMonoTime < (OFFSET_S + 2.) * 1e9]
+  values = {**GOOD_PARAMS, **git_params(TURNPILOT)}
+  out = {}
+  with OpenpilotPrefix():
+    pubs = {s: messaging.pub_sock(s) for s in ("pandaStates", "carState")}
+    reader = threading.Thread(target=lambda: out.update(f=cpf.collect_live(2., params=FakeParams(tmp_path, values))[0]))
+    reader.start()
+    time.sleep(0.5)  # the subscriber is up: msgq hands a new subscriber only what is published after it joins
+    for m in sent:
+      pubs[m.which()].send(m.as_builder().to_bytes())
+      time.sleep(0.002)
+    reader.join()
+  f = out["f"]
+  assert len(f.car_state) == sum(m.which() == "carState" for m in sent) and len(f.panda) == sum(m.which() == "pandaStates" for m in sent)
+  assert f.live and f.init["branch"] == TURNPILOT["branch"]
+
+
 
 def test_main_prints_and_exits(tmp_path, capsys):
   path = write(tmp_path, drive(refuse_after=1))
