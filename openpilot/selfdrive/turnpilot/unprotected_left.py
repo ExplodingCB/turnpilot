@@ -75,7 +75,8 @@ while held, for the exit crosswalk). Until the car can no longer stop short of t
 where the comfortable curve can (oncomingHolding, a chime) and waits again; standing where it was held, it can always
 stay. So does anything else the go was certified on no longer holding (the exit crosswalk, the view, another hold, the
 light gone red or yellow): a go never outlives them to run stale when they let go. It is committed only by its own go and
-motion, never by a reading while it stands (a scene commit before its go, with the car held, is a 'position' fault).
+motion (or the driver's release of the junction, driving it), never by a reading: a scene commit before its go, the car
+rolling up to its line or standing held, is a 'position' fault.
 Committed, nothing here ever stops the car (a pedestrian in the path still does: scene_policy). A go the car hasn't moved
 on within turnpilotd's LEFT_NO_MOVE_S is withdrawn and handed back there (the model holding the car; G5's bounded go is the
 remedy).
@@ -182,7 +183,8 @@ class LeftInput:
   scene_clear: bool = True       # the scene held nothing last frame
   junction_uncertain: bool = False
   go_withdrawn: bool = False     # turnpilotd withdrew the go (not moving): its handback
-  committed: bool = False        # the scene committed to (or was released into) this junction
+  committed: bool = False        # the scene committed to this junction (scene_policy: committed_id)
+  released: bool = False         # the driver released the scene's hold here (a gas press at the line: released_id)
   spread_m: float = 0.           # m between the furthest and the nearest of navd's readings of the junction (route follower)
   other_hold: bool = False       # another of TurnPilot's stops holds the car at or before the junction (a signal's red, a
                                  # stop sign: map_controls.stop_ahead), last frame
@@ -460,10 +462,11 @@ class UnprotectedLeft:
       out.alert = 'oncomingHolding'
 
     standing = inp.held or self.hold_here
-    # committed by its own go and motion: never by a reading before it moved (skeptic G4: a reading 6 m nearer while held at
-    # the line committed the scene, and the left stopped judging with the latch holding the car, silently, for good)
-    past = inp.committed or committed_past_line(inp.distance, inp.v_ego, True)
-    if self.state == 'committed' or (self.went and self.moved and past) or (inp.committed and not self.went and not standing):
+    # committed by its own go and motion, or by the driver driving it (their release, moving): never by a reading before its
+    # go (skeptic G4: a reading 6 m nearer while held at the line committed the scene, and the left stopped judging with the
+    # latch holding the car, silently, for good; the same while the car still rolled up to its line)
+    past = inp.committed or inp.released or committed_past_line(inp.distance, inp.v_ego, True)
+    if self.state == 'committed' or (self.went and self.moved and past) or (inp.released and not self.went and not standing):
       if self.state != 'committed':
         cloudlog.event("turnpilot.left_committed", distance=round(inp.distance, 1), v=round(inp.v_ego, 2))
       self.state, self.hold_here = 'committed', False
@@ -471,9 +474,9 @@ class UnprotectedLeft:
       return out
     if self.state == 'undecided':
       return self._undecided(out, self.why)
-    if inp.committed and not self.went and standing:
-      # the scene committed to the junction while the car stands held short of it, the left never having gone: where the
-      # car is isn't known. Out loud, never a freeze
+    if (inp.committed or inp.released) and not self.went:
+      # the scene committed to the junction before the left's own go, the car rolling up to its line or standing held short of
+      # it (or the driver's release with the car still standing): where the car is isn't known. Out loud, never a freeze
       return self._undecided(out, 'position')
 
     if self.went:

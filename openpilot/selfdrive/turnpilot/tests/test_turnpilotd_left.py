@@ -400,6 +400,34 @@ def test_a_nearer_reading_while_held_at_the_line_never_silently_freezes_the_left
 
 
 
+def test_a_nearer_reading_on_the_roll_up_to_the_line_is_said_never_a_silent_hold():
+  # skeptic G4 (residual): a reading 6-8 m nearer while the car rolled up to its line at 0.9-2.2 m/s, 1.5-3 m short of it,
+  # committed the moving car's scene; the left entered 'committed' with no go, and the latch held the car at the line for good
+  # (121 s of 150, controlPrompt none throughout) on an empty road. Now that is the 'position' fault, out loud, the car held
+  for jump in (6., 8.):
+    for at_line in (1.5, 3.):
+      sim = left_sim()
+      st = {'on': False, 'n': 0}
+
+      def nav(sim, instr, jump=jump, at_line=at_line, st=st):
+        if not st['on'] and JUNCTION - 9. - sim.s < at_line and sim.v > 0.3:
+          st['on'] = True
+        if st['on'] and st['n'] < 1 and instr.maneuverModifier == 'left':
+          st['n'] += 1
+          return nav_instruction(instr.maneuverDistance - jump, "turn", "left", remaining=instr.distanceRemaining,
+                                 junction=LEFT_25[0][3], ahead=[(1500. - sim.s - jump, "turn", "right", junction_of("right"))]), True
+        return instr, True
+      sim.nav_filter = nav
+      plans = drive(sim, 40.)
+      assert st['n'] == 1, (jump, at_line)
+      states = {str(p.unprotectedLeft.state) for p in plans}
+      first = next((i for i, p in enumerate(plans) if str(p.controlPrompt) == 'leftUndecidedTakeControl'), None)
+      assert first is not None and 'committed' not in states and 'go' not in states, (jump, at_line, sorted(states))
+      assert plans[first].unprotectedLeft.why == 'position'
+      assert any(p.reason == "Junction position unsure: take control" for p in plans[first:])
+      assert sim.s < JUNCTION - ONCOMING_ENTRY_M and all(str(p.controlPrompt) == 'leftUndecidedTakeControl' for p in plans[first:])
+
+
 class GoHeldSim(Sim):
   """The model holding the car at a standstill once TurnPilot's turn pulse (its go) has gone out: it never pulls away."""
   went = False

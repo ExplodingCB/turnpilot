@@ -965,7 +965,8 @@ class TurnPilot:
                     upcoming.opposing_speed or None, upcoming.opposing_lanes or None, self.left_range_m,
                     scene_clear=scene.junction is None and not scene.carried,
                     junction_uncertain=rf.junction_spread > UNCERTAIN_M or stray,
-                    go_withdrawn=self.go_withdrawn, committed=rf.maneuver_id in (scene.committed_id, scene.released_id),
+                    go_withdrawn=self.go_withdrawn, committed=rf.maneuver_id == scene.committed_id,
+                    released=rf.maneuver_id == scene.released_id,
                     spread_m=rf.junction_spread, other_hold=stop_d is not None and stop_d <= rf.distance + PROTECT_PAST_M,
                     light=self.map_controls.turn_light(int(turn[0]), turn[1]), far=raw_far, far_range_m=self.left_far_range_m,
                     far_live=self.far_live(route=True))  # on: a spell without room is waited through on its runs' freshness

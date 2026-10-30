@@ -438,6 +438,30 @@ def test_a_commit_while_standing_held_before_any_go_is_a_fault_never_a_freeze():
   assert d.state == 'committed'
 
 
+def test_a_scene_commit_before_any_go_is_a_fault_moving_or_standing_and_only_the_drivers_release_is_a_commit():
+  # skeptic G4 (residual): a nearer reading arriving while the car rolled up to its line at 0.9-2.2 m/s committed the moving
+  # car's scene (a2d2ebe's guard needs it standing), the left took that as its commit with no go of its own and stopped
+  # judging, and the latch held the car at the line for good, saying nothing (121 s of 150). The left is committed only by its
+  # own go and motion: a scene commit before its go is 'position', out loud, whether the car moves or stands
+  for v in (0.93, 2.22):
+    j = Junction()
+    j.held = False
+    d = j.step(v=v, distance=HOLD_D + 2., committed=True)
+    assert d.state == 'undecided' and d.why == 'position' and d.prompt == 'leftUndecidedTakeControl' and not d.go, v
+    d = j.step(v=0., distance=HOLD_D, committed=True)
+    j.held = True
+    assert j.step(committed=True).state == 'undecided'
+  # the driver releasing the junction (a gas press at the line: scene_policy's released_id) and driving on is theirs: committed,
+  # nothing said; standing with it, where the car is isn't known, as before
+  j = Junction()
+  j.held = False
+  d = j.step(v=2., distance=HOLD_D - 1., released=True)
+  assert d.state == 'committed' and d.prompt == 'none' and not d.stops
+  j = Junction()
+  j.wait(1.)
+  assert j.step(released=True).why == 'position'
+
+
 def test_never_a_go_while_anything_else_holds_the_car_or_its_light_isnt_green():
   # skeptic G4 (blocker 2), DESIGN G4 go condition 5: with a red at the junction (accepted: the map's signal stop, other_hold;
   # or any source, the camera in shadow too: light) the band empty, it never goes; the window counts only from the green
