@@ -617,6 +617,18 @@ def far_wait(j, seconds, far=(), every=2, **kw):
 V_45, V_55 = 20.1, 24.6  # m/s
 
 
+def test_route_times_reach_is_taken_where_the_car_may_stand():
+  """BUILD_FINDINGS D4: route time checked R_req at LINE_D, a best case the live check at the line rarely meets (it takes
+  where the car stands and the furthest reading). reach_at_line's setback is how much further back the car may stand: R_req
+  from LINE_D + setback, rising past the 6.2 m ramp by about 4.4 m a metre at 25 mph."""
+  from openpilot.selfdrive.turnpilot.unprotected_left import LINE_D, r_req, reach_at_line, t_req
+  assert reach_at_line(11.18, 1) == reach_at_line(11.18, 1, 0.) == r_req(11.18, t_req(LINE_D, 1), LINE_D)
+  for setback in (2., 15.):
+    assert math.isclose(reach_at_line(11.18, 1, setback), r_req(11.18, t_req(LINE_D + setback, 1), LINE_D + setback))
+  assert 4. < (reach_at_line(11.18, 1, 15.) - reach_at_line(11.18, 1, 10.)) / 5. < 4.8
+  assert reach_at_line(None, None, 15.) == reach_at_line(20.1, 2, 15.)  # unmapped: 45 mph, two lanes
+
+
 def test_45_and_55_mph_reach_needs_the_far_crop_and_its_measured_range():
   # DESIGN phase 4 G5, the owner's "support both": R_req from the line is ~231-244 m at 45 mph and ~280-296 m at 55 mph,
   # past the full pass's range; the far crop's runs judge the band out there, but only under a measured far range

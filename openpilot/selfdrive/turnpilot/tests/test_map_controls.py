@@ -81,6 +81,26 @@ class Car:
     raise AssertionError("condition never met")
 
 
+def test_the_junctions_mapped_stop_line_setback():
+  """BUILD_FINDINGS D4: route time's reach margin for an unprotected left is the junction's mapped stop line's setback where
+  the map has one (MapControlPolicy.line_setback: how far back of the hold line, HOLD_LINE_M + MAP_MARGIN_M before the
+  junction, it lies), else unprotected_left.ROUTE_REACH_MARGIN_M. Only a line mapped (not the junction less 10 m), of the
+  junction's own controls (PROTECT_BEFORE_M before to PROTECT_PAST_M past), never the cross road's yield."""
+  from openpilot.selfdrive.turnpilot.map_controls import MAP_MARGIN_M
+  hold = HOLD_LINE_M + MAP_MARGIN_M
+  car = Car([(280., 'signal', True)], v=10.)
+  car.run(1.)
+  j = 300. - car.s
+  assert math.isclose(car.policy.line_setback(j), 20. - hold, abs_tol=0.5)
+  car = Car([(295., 'signal', True)], v=10.)  # a line nearer than the hold line: none back of it
+  car.run(1.)
+  assert car.policy.line_setback(300. - car.s) == 0.
+  for controls in ([(280., 'signal', False)], [(200., 'signal', True)], [], [(280., 'yield', True, True, True, {'status': 'ok', 'crossGoverned': True})]):
+    car = Car(controls, v=10.)
+    car.run(1.)
+    assert car.policy.line_setback(300. - car.s) is None, controls
+
+
 def held(out, dec):
   return dec.should_stop and out.shown is not None and out.shown.action in ('held', 'awaitingDriver')
 

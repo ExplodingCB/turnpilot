@@ -188,8 +188,8 @@ from openpilot.selfdrive.turnpilot.scene_policy import (CURB_PED_CAP_DEFAULT, HO
                                                          STOP_DECEL, VEHICLES, ScenePolicy, far_side_turn, in_path)
 from openpilot.selfdrive.turnpilot.turn_skip import SkipState, TurnSkip, can_make_turn
 from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
-from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, LINE_D, OFF, ROAD_RANGE_M, LeftInput, UnprotectedLeft,
-                                                           left_mode_for, reach_at_line)
+from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, LINE_D, OFF, ROAD_RANGE_M, ROUTE_REACH_MARGIN_M,
+                                                           LeftInput, UnprotectedLeft, left_mode_for, reach_at_line)
 
 FAR_OFF_ALERT_S = ABORT_HOLD_S  # farViewOff is shown this long, once, when the far crop goes off for the drive
 FAR_STATUS_STALE_S = 1.         # the full pass's farStatus older than this: the far crop isn't known to read
@@ -562,6 +562,7 @@ class TurnPilot:
     self.alt_was_on = False
     self.alt_route_id: int | None = None  # the route's maneuver the ladder's other turn was taken in place of (turn_skip's)
     self.not_straight_id: int | None = None  # the left last logged as skipped for an opposing road not known straight
+    self.route_reach_m = 0.  # route time's last R_req for the unprotected left (its plan's rReq when skipped for it)
     self.last_holding = False     # the last plan's scene held the car (the decider's clearBox waits it out)
     self.params = None            # Params (main()): TurnPilotJunctionOverrides is written through it (signal_seen_override)
     self.override_failed_t = 0.   # s overrideWriteFailed has left to show
@@ -874,14 +875,18 @@ class TurnPilot:
     # (unprotected_left: farOff), the car held, never a skip and a reroute from the line
     # So is one whose opposing road isn't known straight out to that R_req (navd's maneuverOpposingStraightM: the band is straight
     # on from our approach, skeptic G4), said by its own log line
+    # R_req is taken where the car may stand: LINE_D plus the junction's mapped stop line's setback, or ROUTE_REACH_MARGIN_M
+    # without one (BUILD_FINDINGS D4); the band straight on from our approach to that reach past where it stands
     out_of_range = False
     if acting and self.auto_left == AUTO and unprotected_turn(upcoming, right_hand_traffic) and not engaged:
-      reach = reach_at_line(upcoming.opposing_speed, upcoming.opposing_lanes or None)
-      bent = reach > LINE_D + upcoming.opposing_straight_m
+      setback = self.map_controls.line_setback(rf.distance)
+      margin = ROUTE_REACH_MARGIN_M if setback is None else setback
+      reach = self.route_reach_m = reach_at_line(upcoming.opposing_speed, upcoming.opposing_lanes or None, margin)
+      bent = reach > LINE_D + margin + upcoming.opposing_straight_m
       out_of_range = reach > self.left_reach_m(route=True) or bent
       if bent and self.not_straight_id != rf.maneuver_id:
         self.not_straight_id = rf.maneuver_id
-        cloudlog.event("turnpilot.left_not_straight", error=True, r_req=round(reach, 1),
+        cloudlog.event("turnpilot.left_not_straight", error=True, r_req=round(reach, 1), margin=round(margin, 1),
                        straight_m=round(float(upcoming.opposing_straight_m), 1), distance=round(rf.distance, 1))
     self.carry_veto(upcoming, rf, v_ego)
     skip = self.skip.update(None if alt_replaced else upcoming, rf.distance, rf.maneuver_id, v_ego, desire_out, right_hand_traffic, lat_active,
@@ -1171,7 +1176,7 @@ class TurnPilot:
       ul = plan.unprotectedLeft
       ul.state, ul.rangeM = 'skipped', float(self.left_range_m)
       ul.vLimit = float(upcoming.opposing_speed or DEFAULT_OPPOSING_SPEED)
-      ul.rReq = float(reach_at_line(upcoming.opposing_speed, upcoming.opposing_lanes or None))
+      ul.rReq = float(self.route_reach_m or reach_at_line(upcoming.opposing_speed, upcoming.opposing_lanes or None, ROUTE_REACH_MARGIN_M))
       ul.farRangeM, ul.farNeeded = float(self.left_far_range_m if self.far_live(route=True) else 0.), ul.rReq > self.left_range_m
     if self.far_off_t > 0. and str(plan.controlAlert) == 'none':  # the far crop off for the drive: said once, a status line
       plan.controlAlert = 'farViewOff'

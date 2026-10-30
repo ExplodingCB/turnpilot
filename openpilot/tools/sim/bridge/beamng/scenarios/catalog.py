@@ -29,8 +29,8 @@ from openpilot.selfdrive.turnpilot.control_tracker import DROP_PAST_M
 from openpilot.selfdrive.turnpilot.lane_planner import LANE_WIDTH, lane_change_window
 from openpilot.selfdrive.turnpilot.map_controls import MAP_STOP_DECEL, PROTECT_BEFORE_M, engage_distance
 from openpilot.selfdrive.turnpilot.scene.tracker import CORRIDOR_HALF_WIDTH
-from openpilot.selfdrive.turnpilot.unprotected_left import (DEFAULT_OPPOSING_SPEED, LINE_D, PROVISIONAL_RANGE_M, r_req, reach_at_line,
-                                                             t_req)
+from openpilot.selfdrive.turnpilot.unprotected_left import (DEFAULT_OPPOSING_SPEED, LINE_D, PROVISIONAL_RANGE_M, ROUTE_REACH_MARGIN_M, r_req,
+                                                             reach_at_line, t_req)
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, PED_STOP_GAP_M
 from openpilot.tools.sim.bridge.beamng.roadgraph import RoadGraph, wrap
 from openpilot.tools.sim.bridge.beamng.scenarios.timing import WALK_SPEED, arc_lengths, oncoming_release_delay, point_at, travel_time
@@ -772,10 +772,13 @@ def _turn_plan(name: str, e: Entry, graph: RoadGraph) -> Plan:
     pos, h_occ = lane_pose(far, e.occluder_past_m, graph.lanes_toward(jn.node, jn.straight), graph.radius[jn.straight], 'left')
     actors.append(Actor(f"{PREFIX}occluder", 'car', 'setup', [list(pos)], 0., 0., h_occ, params={'past_m': e.occluder_past_m}))
     notes['occluder'] = {'past_m': e.occluder_past_m, 'lane': 'opposing inner'}
-  if e.turn == 'left' and jn.straight is not None:  # the left's R_req at its line, the opposing road's mapped limit (route time's)
+  if e.turn == 'left' and jn.straight is not None:  # the left's R_req at its line, the opposing road's mapped limit
     link = graph.links.get((jn.straight, jn.node)) or graph.links.get((jn.node, jn.straight)) or {}
     lanes_in = graph.lanes_toward(jn.node, jn.straight).count('+')
     notes['left_r_req_m'] = round(reach_at_line(link.get('speedLimit'), lanes_in), 1)
+    # route time's (BUILD_FINDINGS D4: LINE_D plus ROUTE_REACH_MARGIN_M without a mapped stop line): over the shot's
+    # TurnPilotLeftRangeM the left is skipped and rerouted before its junction
+    notes['left_r_req_route_m'] = round(reach_at_line(link.get('speedLimit'), lanes_in, ROUTE_REACH_MARGIN_M), 1)
     notes['left_reach'] = left_reach(link.get('speedLimit'), lanes_in)
   notes['ego_lane_offset_m'] = round(lane_offset(lanes, radius, ego_lane(e.turn)), 2)
   return Plan(name, spawn, heading, dest, (float(jn.center[0]), float(jn.center[1])), e.speed_kph, e.timeout_s,
@@ -783,7 +786,7 @@ def _turn_plan(name: str, e: Entry, graph: RoadGraph) -> Plan:
 
 
 def left_reach(v_limit: float | None, lanes: int | None, range_m: float = PROVISIONAL_RANGE_M) -> dict:
-  """The left's R_req at its line (route time's, reach_at_line) against the range the sim's shots set (TurnPilotLeftRangeM:
+  """The left's R_req at its line (LINE_D: reach_at_line) against the range the sim's shots set (TurnPilotLeftRangeM:
   PROVISIONAL_RANGE_M), and slack_m, how far past LINE_D the car may stand, or its junction be read further out (navd's
   readings' spread), before the live R_req at the line passes that range and the left is undecided there (BeamNG build
   findings D4-shots: about 4.4 m of R_req a metre at 25 mph). Negative: past it at the line already."""

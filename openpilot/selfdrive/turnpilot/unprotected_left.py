@@ -28,7 +28,8 @@ of straight ahead, break the clear window. It is velocity-free (one pixel of box
 v_limit is the opposing road's mapped limit (navInstruction maneuverOpposingSpeed), DEFAULT_OPPOSING_SPEED when unknown.
 A left whose R_req is past the detector's proven range (TurnPilotLeftRangeM; unset, unmeasured: none, so every left) is
 never attempted: turnpilotd skips it at route time (turn_skip: unprotectedRange, chimed, navd reroutes) and it is undecided
-here should it reach its hold.
+here should it reach its hold. Route time takes R_req where the car may stand (reach_at_line's setback: the junction's mapped
+stop line's, else ROUTE_REACH_MARGIN_M, UNCERTAIN_M of readings' spread), not at LINE_D alone (BUILD_FINDINGS D4).
 The far crop (DESIGN phase 4 G5; modeld's FarCrop, tracker.update_far) reaches further: a native-resolution window of the
 road frame, aimed (far_aim) at the band's bearings past the full pass's range. While it is on (far_live) its own proven
 range (TurnPilotLeftFarRangeM, unset: unmeasured, none) extends the reach, the full pass's measured (it covers the band only
@@ -92,6 +93,7 @@ import math
 from dataclasses import dataclass, field
 
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.turnpilot.route_follower import UNCERTAIN_M
 from openpilot.selfdrive.turnpilot.scene_policy import (CROSSWALK_X_AFTER_M, CROSSWALK_X_BEFORE_M, ONCOMING_ENTRY_M, ONCOMING_PAST_M,
                                                         ONCOMING_Y_FAR_M, ONCOMING_Y_NEAR_M, STOP_DECEL, VEHICLES, box_overlap,
                                                         committed_past_line, stop, velocity_trusted)
@@ -266,13 +268,21 @@ def r_req(v_limit: float, t: float, distance: float) -> float:
 
 
 LINE_D = 9.                # m from the hold line to the maneuver point (map_controls: HOLD_LINE_M + MAP_MARGIN_M)
+# route time checks R_req this far past LINE_D where the junction has no mapped stop line (one that has: the line's setback,
+# MapControlPolicy.line_setback): a junction readings' spread just short of the junctionUncertain alert, which the live check
+# at the line takes (d_far). BUILD_FINDINGS D4: at LINE_D alone it was a best case, and a set-back line or about 2 m of
+# spread ended the left undecided at the line (a takeover); now it is skipped and rerouted before the junction
+ROUTE_REACH_MARGIN_M = UNCERTAIN_M
 
 
-def reach_at_line(v_limit: float | None, lanes: int | None) -> float:
-  """R_req for a go from the hold line, the opposing road's mapped limit (DEFAULT_OPPOSING_SPEED when unknown): what route time
-  checks against the detector's proven range (turnpilotd: turn_skip's unprotectedRange)."""
+def reach_at_line(v_limit: float | None, lanes: int | None, setback: float = 0.) -> float:
+  """R_req for a go from the hold line, or setback m further back, the opposing road's mapped limit (DEFAULT_OPPOSING_SPEED
+  when unknown): what route time checks against the detector's proven range (turnpilotd: turn_skip's unprotectedRange), at
+  LINE_D plus its margin for a set-back stop line and the junction readings' spread (BUILD_FINDINGS D4: the live check at the
+  line takes where the car stands and the furthest reading, d_far, which LINE_D alone was a best case of)."""
   v = v_limit if v_limit is not None and v_limit > 0. else DEFAULT_OPPOSING_SPEED
-  return r_req(v, t_req(LINE_D, lanes), LINE_D)
+  d = LINE_D + max(setback, 0.)
+  return r_req(v, t_req(d, lanes), d)
 
 
 def turn_bearing(bearing_deg: float, heading_deg: float, side: int) -> float:

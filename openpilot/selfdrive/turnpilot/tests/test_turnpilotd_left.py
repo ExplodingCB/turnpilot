@@ -21,8 +21,9 @@ JUNCTION = 300.
 STRAIGHT_M = 400.  # the opposing road's straight span from our approach (maneuverOpposingStraightM): straight past every R_req here
 LEFT_25 = [(JUNCTION, "turn", "left", (0., 270., 2, 'present', V_25, 1, STRAIGHT_M)), (1500., "turn", "right", junction_of("right"))]
 LINE = JUNCTION - HOLD_LINE_M - 1.  # the map's hold line (MAP_MARGIN_M short of the scene's)
-# TurnPilotLeftRangeM as a drive that measured it would set it (the default is unmeasured, 0: no left is attempted)
-TEST_RANGE_M = 150.
+# TurnPilotLeftRangeM as a drive that measured it would set it (the default is unmeasured, 0: no left is attempted): past route
+# time's R_req for a 25 mph one-lane left, 200 m from LINE_D plus ROUTE_REACH_MARGIN_M (BUILD_FINDINGS D4; 150 m before it)
+TEST_RANGE_M = 210.
 
 
 def raw_box(x, y, conf=0.6):
@@ -249,7 +250,7 @@ def test_a_left_the_detector_cant_see_far_enough_for_is_skipped_at_route_time():
     assert 'unprotectedRange' in reasons
   # within range (TurnPilotLeftRangeM measured further): taken
   sim = Sim([(600., "turn", "left", (0., 270., 2, 'present', 20.1, 1, STRAIGHT_M)), (2000., "turn", "right", junction_of("right"))])
-  sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps, sim.raw = 'auto', 300., False, road_runs()
+  sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps, sim.raw = 'auto', 350., False, road_runs()  # past route time's 337 m
   sim.answers_prompt = True
   plans = drive(sim, 5.)
   assert not any(p.tooFastToTurn for p in plans)
@@ -727,6 +728,59 @@ def test_a_signal_whose_light_nothing_reads_is_handed_back_never_gone():
   assert not any(p.desire == Desire.turnLeft for p in plans) and sim.s < LINE + 1.
 
 
+def route_time_left(range_m, controls=()):
+  """LEFT_25 with TurnPilotLeftRangeM range_m and navd's controls, driven until held at the junction's hold line or past it:
+  its plans."""
+  sim = Sim(LEFT_25, controls=controls)
+  sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps, sim.raw = 'auto', range_m, False, road_runs()
+  sim.answers_prompt = True
+  plans = []
+  for _ in range(int(40. / DT_MDL)):
+    plans += drive(sim, DT_MDL, yaw=False)
+    if plans[-1].shouldStop or sim.s > LINE + 1.:
+      break
+  return sim, plans
+
+
+def test_route_time_takes_the_lefts_reach_where_the_car_may_stand():
+  """BUILD_FINDINGS D4 (smoke S08, diag s02_nomove_handback): route time checked R_req at LINE_D with no margin (134 m at 25
+  mph, one lane, under a 150 m range), and the live check at the line, from where the car stands and the furthest reading
+  (S08: d_far 23.6 m, 204 m), ended the left undecided there: a takeover at any left with a set-back line or about 2 m of
+  spread. With no mapped stop line route time now takes LINE_D plus ROUTE_REACH_MARGIN_M (UNCERTAIN_M, a spread just short of
+  the junctionUncertain alert): 200 m, so at 150 m the left is skipped before its junction out loud (unprotectedRange) and
+  rerouted, its plan's rReq the reach it was skipped for; with a range covering that it is attempted as before. The live
+  check at the line is unchanged."""
+  from openpilot.selfdrive.turnpilot.route_follower import UNCERTAIN_M
+  from openpilot.selfdrive.turnpilot.unprotected_left import ROUTE_REACH_MARGIN_M
+  from openpilot.selfdrive.turnpilot.unprotected_left import LINE_D, reach_at_line
+  assert ROUTE_REACH_MARGIN_M == UNCERTAIN_M
+  route_reach = reach_at_line(V_25, 1, ROUTE_REACH_MARGIN_M)
+  assert reach_at_line(V_25, 1) < 150. < route_reach < TEST_RANGE_M, (reach_at_line(V_25, 1), route_reach)
+  assert math.isclose(route_reach, r_req(V_25, t_req(LINE_D + UNCERTAIN_M, 1), LINE_D + UNCERTAIN_M))
+  sim, plans = route_time_left(150.)
+  skipped = [p for p in plans if str(p.unprotectedLeft.state) == 'skipped']
+  assert skipped and all(p.tooFastToTurn and str(p.skipReason) == 'unprotectedRange' for p in skipped)
+  assert skipped[0].maneuverDistance > 100., "skipped as soon as it is the maneuver, well before its junction"
+  assert abs(skipped[0].unprotectedLeft.rReq - route_reach) < 0.1 and skipped[0].unprotectedLeft.rangeM == 150.
+  assert not any(p.shouldStop or p.desire != Desire.none for p in plans)
+  sim, plans = route_time_left(TEST_RANGE_M)
+  assert not any(p.tooFastToTurn for p in plans)
+  assert any(p.shouldStop and p.mapControl.kind == 'unprotectedTurn' for p in plans), "attempted: held at its line"
+
+
+def test_route_time_takes_a_mapped_stop_lines_setback_in_place_of_the_margin():
+  # a mapped stop line at the junction (a signal's, its line 10 m before it: 1 m back of the hold line) is where the car may
+  # stand: route time takes R_req there, 138 m, under a 150 m range, so the left isn't skipped for range. One mapped 20 m
+  # back (11 m) takes 182 m: skipped
+  from openpilot.selfdrive.turnpilot.unprotected_left import reach_at_line
+  for line_m, skip in ((10., False), (20., True)):
+    sim, plans = route_time_left(150., controls=[(JUNCTION - line_m, 'signal', True)])
+    assert any(p.tooFastToTurn and str(p.skipReason) == 'unprotectedRange' for p in plans) == skip, line_m
+    if skip:
+      rreq = next(p.unprotectedLeft.rReq for p in plans if str(p.unprotectedLeft.state) == 'skipped')
+      assert abs(rreq - reach_at_line(V_25, 1, line_m - HOLD_LINE_M - 1.)) < 0.5, (line_m, rreq)
+
+
 def test_an_unmeasured_detector_range_attempts_no_left_blind():
   # skeptic G4 (blocker 6): TurnPilotLeftRangeM defaulted to 150 m, pixel arithmetic never measured on real comma frames
   # (CRITIQUE SEV2: even a 25 mph R_req of 134-141 m is past the uncropped detector at 6.5-8 px), so 25 mph lefts were
@@ -749,7 +803,9 @@ def test_an_unmeasured_detector_range_attempts_no_left_blind():
 # DESIGN phase 4 G5 (this run's G6): the far crop's runs, between the full pass's
 V_45 = 20.1
 LEFT_45 = [(JUNCTION, "turn", "left", (0., 270., 2, 'present', V_45, 1, STRAIGHT_M)), (1500., "turn", "right", junction_of("right"))]
-FAR_RANGE_M = 300.  # TurnPilotLeftFarRangeM as a drive that measured it would set it (the default is unmeasured, 0)
+# TurnPilotLeftFarRangeM as a drive that measured it would set it (the default is unmeasured, 0): past route time's R_req for a
+# 45 mph one-lane left, 337 m from LINE_D plus ROUTE_REACH_MARGIN_M (BUILD_FINDINGS D4; 300 m before it)
+FAR_RANGE_M = 350.
 
 
 def far_runs(cars=lambda sim: (), cover=(-15.6, 15.6)):

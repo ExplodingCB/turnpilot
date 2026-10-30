@@ -37,7 +37,9 @@ def stop_turn_sim(tmp_path, maneuver, car_signals=True, auto_left='auto', model=
   sim = StopSim(tmp_path, model=model, info_kw={'maneuver': maneuver}, driver_signals=None,
                 maneuvers=[(S_LINE + 13., 'turn', maneuver, (0., 270. if maneuver == 'left' else 90., 2, 'present', 11.2, 1, STRAIGHT_M)),
                            (2000., 'turn', OTHER[maneuver], (0., 90. if maneuver == 'left' else 270., 2, 'present', 0., 0, STRAIGHT_M))])
-  sim.tp.auto_left, sim.tp.left_range_m = auto_left, 300.
+  # a range past route time's R_req for the left after a right here (its opposing road unmapped: 45 mph, two lanes, 350 m
+  # from LINE_D plus ROUTE_REACH_MARGIN_M, BUILD_FINDINGS D4), so it isn't skipped for range once it is the maneuver
+  sim.tp.auto_left, sim.tp.left_range_m = auto_left, 360.
   sim.veto, sim.turn_done = None, False
   if car_signals:
     car_signals_on(sim)
