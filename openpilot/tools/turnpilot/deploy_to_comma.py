@@ -14,6 +14,8 @@ on the comma, verifies it, and only then swaps it in. The old /data/openpilot (s
 Exit status: 0 done, 1 failed (the output says what state the comma is in), 2 refused before changing anything.
 Standard library only, so it runs with the Mac's python3.
 """
+from __future__ import annotations  # the Mac's /usr/bin/python3 is 3.9
+
 import argparse
 import datetime
 import hashlib
