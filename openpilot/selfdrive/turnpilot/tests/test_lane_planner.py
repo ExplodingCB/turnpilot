@@ -15,7 +15,7 @@ from openpilot.selfdrive.turnpilot.lane_planner import (LANE_UNKNOWN_REASON, LAN
                                                         YellowHold, change_blocker, desired_changes, ego_lane_index, lane_change_window,
                                                         lane_mismatch,
                                                         lane_changes_needed, model_lanes, model_lanes_from_msg, nav_lane_span, stopped_in_lane,
-                                                        target_lane_blocked)
+                                                        target_lane_blocked, keep_blocker)
 from openpilot.selfdrive.turnpilot.route_follower import LEFT, NOMINAL_ANGLE_DEG, RIGHT, Maneuver, classify
 from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN, LinePaint
 from openpilot.selfdrive.turnpilot.tests.synthetic import car_state, model_v2, road, scene
@@ -51,6 +51,51 @@ def test_model_lanes_counts_room_over_lane_width():
   # no ego line on a side: no keep that way
   line_ys, probs, edges, stds = road(1, 1)
   assert not model_lanes(line_ys, [probs[0], 0.1, probs[2], probs[3]], edges, stds).keep_left_ok
+
+
+def test_a_keep_toward_the_far_side_needs_a_lane_going_our_way_there():
+  """BUILD_FINDINGS D5 (smoke S19): a keep toward the far side (left where traffic keeps right) went on the ego line alone
+  with room beyond it, and on an undivided road that room is the oncoming lane: keepLeft at 19 m/s put the car 2.5 m over
+  the centre line. Toward the far side a keep needs a lane counted beyond the ego line (its next line out painted, a
+  same-direction lane) and that ego line not read yellow, now or held (YellowHold); toward the curb side it is as before."""
+  undivided = model_lanes(*road(0, 1, shoulder=4.5))  # the left ego line seen, no line beyond it, the far edge 4.5 m out
+  assert undivided.keep_left_ok and undivided.left == 0, "the old gate: the room beyond is enough"
+  assert keep_blocker(undivided, LEFT) == 'keepFarSide'
+  assert keep_blocker(undivided, LEFT, paint=paint(left=BW)) == 'keepFarSide', "no lane counted beyond it: no keep, whatever the paint"
+  two_lanes = model_lanes(*road(1, 0))
+  assert keep_blocker(two_lanes, LEFT) == '' and keep_blocker(two_lanes, LEFT, paint=paint(left=BW)) == ''
+  assert keep_blocker(two_lanes, LEFT, paint=paint(left=BW, far_left=SY)) == '', "a lane ours, then a divided road's left edge"
+  for yellow in (SY, BY, LinePaint('unknown', 'yellow', 0.35, 0.)):
+    assert keep_blocker(two_lanes, LEFT, paint=paint(left=yellow)) == 'keepFarSide', yellow  # oncoming beyond it
+  hold = YellowHold()
+  hold.update(paint(left=SY), 15., 0.05, False)
+  held = hold.update(paint(), 15., 0.05, False)  # worn the next frame: still yellow for the hold
+  assert keep_blocker(two_lanes, LEFT, paint=held) == 'keepFarSide'
+  assert hold.apply(paint()) == held and hold.update(paint(), 15., 0.05, False) == held, "apply reads the holds without counting a frame"
+  # no line that way is said as before, first
+  line_ys, probs, edges, stds = road(1, 1)
+  assert keep_blocker(model_lanes(line_ys, [probs[0], 0.1, probs[2], probs[3]], edges, stds), LEFT) == 'keepNoLine'
+  # toward the curb side the room is the road's own: a keep right with no lane beyond goes (an exit's, a fork's)
+  curb = model_lanes(*road(1, 0, shoulder=3.))
+  assert curb.right == 0 and keep_blocker(curb, RIGHT) == '' and keep_blocker(curb, RIGHT, paint=paint(right=SY)) == ''
+  # traffic keeping left: the far side is the right
+  assert keep_blocker(model_lanes(*road(1, 0, shoulder=4.5)), RIGHT, right_hand_traffic=False) == 'keepFarSide'
+  assert keep_blocker(undivided, LEFT, right_hand_traffic=False) == ''
+
+
+def test_no_keep_left_on_s19s_two_way_road():
+  """S19's reroute slight left (tests/keep_far_side.json, every frame from the reroute to 5 m past its point): keepLeft went out
+  at 10.76 s with the left ego line read at 0.62 and no line beyond it (lanes 0, the far edge 4.3 m out); the far side's
+  rule never lets it go there, on the lanes alone (the paint read no yellow on that line after the reroute)."""
+  data = json.loads((Path(__file__).parent / 'keep_far_side.json').read_text())['s19_too_fast_right_smoke']['rows']
+  went = [r for r in data if r[3] == log.Desire.keepLeft]
+  assert went and went[0][0] == 10.76, "the fixture's keepLeft as it went out"
+  for t, _v, _d, _des, pnt, ys, probs, eys, stds in data:
+    lanes = model_lanes(ys, probs, eys, stds)
+    lp = tuple(LinePaint(k, c, conf, 0.) for k, c, conf in pnt)
+    assert not any(q.color == 'yellow' for q in lp), t
+    assert keep_blocker(lanes, LEFT, paint=lp) != '', (t, lanes)
+    assert keep_blocker(lanes, LEFT, paint=()) != '', (t, lanes)  # nor with no paint read at all
 
 
 def test_model_lanes_from_msg():

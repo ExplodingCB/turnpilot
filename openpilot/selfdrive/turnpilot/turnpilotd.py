@@ -959,8 +959,10 @@ class TurnPilot:
     self.release_go = self.release_go and not withdrawn  # handed back: a hold that comes and goes is no new go
 
     lanes = model_lanes_from_msg(model)
-    # a keep goes only where it may (lane_planner.keep_blocker: a lane line that way); one that can't go by keep_last is said
-    keep_why = {side: keep_blocker(lanes, side) for side in (LEFT, RIGHT)}
+    # a keep goes only where it may (lane_planner.keep_blocker: a lane line that way, and toward the far side a lane of ours
+    # beyond it, no yellow line read there now or held); one that can't go by keep_last is said
+    keep_paint = self.lanes.yellow.apply(paint)
+    keep_why = {side: keep_blocker(lanes, side, right_hand_traffic, keep_paint) for side in (LEFT, RIGHT)}
     # the stop-sign ladder's other turn (stop_go: 7.1 rung 2, O12) decides this junction: its synthesized turn is the desire
     # (from the decider's go, as a stop-sign turn's pulse is), never the route's maneuver here
     d_on, d_dist, d_id, d_passed, d_replaced = desire_on, rf.distance, rf.maneuver_id, rf.passed, rf.replaced

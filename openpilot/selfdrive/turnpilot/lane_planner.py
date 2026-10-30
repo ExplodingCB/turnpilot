@@ -304,14 +304,30 @@ def paint_lanes(lanes: ModelLanes, paint) -> ModelLanes:
 
 
 KEEP_NO_LINE = 'keepNoLine'  # TurnpilotPlan.skipReason: a keep the model sees no lane line for (ModelLanes.keep_*_ok)
+KEEP_FAR_SIDE = 'keepFarSide'  # ...one toward the far side with no lane of ours beyond the ego line, or that line yellow
 
 
-def keep_blocker(lanes: ModelLanes, direction: int) -> str:
-  """Why a keep desire toward direction (LEFT or RIGHT) may not go now, '' when it may: the model sees no lane line and road
-  that way (ModelLanes.keep_*_ok: a keep with no line drove the car off the road). turnpilotd starts one only when it may, and
-  says a keep that couldn't go by keep_last (BUILD_FINDINGS D2-keep)."""
+def keep_blocker(lanes: ModelLanes, direction: int, right_hand_traffic: bool = True, paint=()) -> str:
+  """Why a keep desire toward direction (LEFT or RIGHT) may not go now, '' when it may (turnpilotd starts one only when it
+  may, and says a keep that couldn't go by keep_last: BUILD_FINDINGS D2-keep):
+  - KEEP_NO_LINE: the model sees no lane line and road that way (ModelLanes.keep_*_ok: a keep with no line drove the car off
+    the road);
+  - KEEP_FAR_SIDE: toward the far side (left where traffic keeps right), no lane counted beyond the ego line once the lane
+    paint has taken out every lane beyond a yellow line (paint_lanes; paint as for it, held yellow included: YellowHold.apply).
+    The room beyond the ego line is no lane there: on an undivided road it is the oncoming lane, the far road edge beyond it
+    (BUILD_FINDINGS D5, BeamNG S19: keepLeft at 19 m/s on a two-way road, 2.5 m over the centre line). So a far-side keep
+    needs the next line out painted a lane width on (a lane going our way) and the ego line not read yellow. Paint unread
+    leaves the model's count: an undivided road whose oncoming lane has its edge line painted a lane out counts a lane there
+    unless its centre line reads yellow (the lane paint reads only the road camera). Toward the curb side the room is the
+    road's own (a shoulder, an exit's lane), as before."""
   ok = lanes.keep_left_ok if direction == LEFT else lanes.keep_right_ok if direction == RIGHT else False
-  return '' if ok else KEEP_NO_LINE
+  if not ok:
+    return KEEP_NO_LINE
+  if direction == (LEFT if right_hand_traffic else RIGHT):
+    counted = paint_lanes(lanes, paint)
+    if (counted.left if direction == LEFT else counted.right) == 0:
+      return KEEP_FAR_SIDE
+  return ''
 
 
 def broken_white_toward(paint, side) -> bool:
@@ -454,6 +470,11 @@ class YellowHold:
     self.since = [(t + dt, d + v_ego * dt) for t, d in self.since]
     if len(paint) == 4 and not frozen:
       self.since = [(0., 0.) if _yellow(p) else hold for p, hold in zip(paint, self.since, strict=True)]
+    return self.apply(paint)
+
+  def apply(self, paint) -> tuple:
+    """paint with every line held yellow read yellow, as update() returns it, without counting a frame: the holds as of the
+    last update (turnpilotd's keep gate, before the lane planner's update this frame)."""
     held = [t < YELLOW_HOLD_S or d < YELLOW_HOLD_M for t, d in self.since]
     if not any(held):
       return tuple(paint)

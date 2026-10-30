@@ -1,17 +1,19 @@
 """turnpilotd's keeps (route_follower.KEEP: a slight turn at a junction, a fork, an off ramp) in closed loop, on the synthetic
 route, model and scene of test_turnpilotd: a keep the model can't be sent is said and rerouted, never left to the model
-in silence (BUILD_FINDINGS D2-keep)."""
+in silence (BUILD_FINDINGS D2-keep), and none goes toward the oncoming side of the road (D5)."""
 from unittest import mock
 
 from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.desire_timing import keep_lead, keep_last
+from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN, LinePaint
 from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Sim
 from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP
 
 Desire = log.Desire
 KEEP_J = 300.
+BROKEN_WHITE, SOLID_YELLOW = LinePaint('broken', 'white', 0.9, 0.3), LinePaint('solid', 'yellow', 0.9, 0.95)
 # S23's first step: turn, slight right, 22 deg, 1 branch (navd on twoway_route_pair), a keep (route_follower.classify)
 SLIGHT_RIGHT = [(KEEP_J, "turn", "slight right", junction_of("slight right", branches=1, angle=22.)),
                 (1500., "turn", "right", junction_of("right"))]
@@ -108,3 +110,50 @@ def test_an_off_ramp_with_no_line_is_said_too():
   assert not any(p.desire == Desire.keepRight for _, _, p in sim.trace)
   said = [p for _, _, p in sim.trace if p.tooFastToTurn]
   assert said and str(said[0].skipReason) == 'keepNoLine' and said[0].maneuverDistance > 0.
+
+
+# S19's reroute step: turn, slight left, 14 deg (bearings 221 to 207), 1 branch, at a bend on a two-way road
+SLIGHT_LEFT = [(KEEP_J, "turn", "slight left", junction_of("slight left", branches=1, angle=14.)),
+               (1500., "turn", "right", junction_of("right"))]
+
+
+def run_keep(sim, until):
+  for _ in range(int(40. / DT_MDL)):
+    sim.step()
+    if sim.s > until:
+      break
+  return sim
+
+
+def test_no_keep_toward_the_oncoming_side_of_an_undivided_road():
+  """BUILD_FINDINGS D5 (smoke S19): the reroute's slight left on a two-way road went out as keepLeft at 19 m/s, the left ego
+  line read with room beyond it (the oncoming lane: no line beyond, the far edge about 4.5 m out), and the car crossed the
+  centre line by up to 2.5 m for 52 m. Toward the far side a keep needs a same-direction lane counted beyond the ego line:
+  none here, so no keepLeft, and the keep is said (skipReason keepFarSide) and logged as D2-keep's."""
+  sim = Sim(SLIGHT_LEFT, cruise=19., model_lanes=(0, 1))
+  sim.model_kw = {'shoulder': 4.5}
+  with mock.patch('openpilot.selfdrive.turnpilot.turnpilotd.cloudlog.event') as event:
+    run_keep(sim, KEEP_J + 20.)
+  assert not any(p.desire == Desire.keepLeft for _, _, p in sim.trace), "no keep over the centre line"
+  said = [p for _, _, p in sim.trace if p.tooFastToTurn]
+  assert said and str(said[0].skipReason) == 'keepFarSide' and said[0].maneuverDistance > 0.
+  logged = keep_events(event)
+  assert len(logged) == 1 and logged[0].kwargs['side'] == 'left' and logged[0].kwargs['reason'] == 'keepFarSide', logged
+
+
+def test_a_keep_left_with_a_lane_of_ours_beyond_goes():
+  # the control: a lane counted beyond the left ego line (its next line out painted), paint unread or white: keepLeft goes
+  for pnt in ((), (UNKNOWN, BROKEN_WHITE, UNKNOWN, UNKNOWN)):
+    sim = Sim(SLIGHT_LEFT, cruise=19., model_lanes=(1, 0), paint=pnt)
+    run_keep(sim, KEEP_J + 20.)
+    assert any(p.desire == Desire.keepLeft for _, _, p in sim.trace), pnt
+    assert not any(p.tooFastToTurn for _, _, p in sim.trace), pnt
+
+
+def test_no_keep_left_across_a_yellow_line():
+  # a lane counted beyond the left ego line, but that line read yellow: oncoming traffic beyond it (MUTCD). No keepLeft, said
+  sim = Sim(SLIGHT_LEFT, cruise=19., model_lanes=(1, 0), paint=(UNKNOWN, SOLID_YELLOW, UNKNOWN, UNKNOWN))
+  run_keep(sim, KEEP_J + 20.)
+  assert not any(p.desire == Desire.keepLeft for _, _, p in sim.trace)
+  said = [p for _, _, p in sim.trace if p.tooFastToTurn]
+  assert said and str(said[0].skipReason) == 'keepFarSide'

@@ -258,6 +258,11 @@ def test_a_keep_that_cant_be_sent_is_skipped_out_loud():
   assert custom.TurnpilotPlan.schema.fields['skipReason'].proto.ordinal.explicit == 37
   a, = alerts(EventName.turnpilotTooFastToTurn, FakeSM(plan(tooFastToTurn=True, skipReason='keepNoLine', maneuverModifier='slight right')))
   assert a.alert_text_1 == "Can't See Lanes" and a.alert_text_2 == 'Rerouting' and a.audible_alert == AudibleAlert.tpTooFastTurn
+  # BUILD_FINDINGS D5: a keep toward the far side with no lane of ours beyond the ego line, or that line read yellow
+  a, = alerts(EventName.turnpilotTooFastToTurn, FakeSM(plan(tooFastToTurn=True, skipReason='keepFarSide', maneuverModifier='slight left')))
+  assert a.alert_text_1 == "No Lane to Keep Left" and a.alert_text_2 == 'Rerouting' and a.audible_alert == AudibleAlert.tpTooFastTurn
+  a, = alerts(EventName.turnpilotTooFastToTurn, FakeSM(plan(tooFastToTurn=True, skipReason='keepFarSide', maneuverModifier='slight right')))
+  assert a.alert_text_1 == "No Lane to Keep Right"
   # any other skip's title is as before
   a, = alerts(EventName.turnpilotTooFastToTurn, FakeSM(plan(tooFastToTurn=True, skipReason='tooFast', maneuverModifier='right')))
   assert a.alert_text_1 == "Too Fast to Turn"
