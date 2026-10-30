@@ -62,7 +62,7 @@ GO_LINES = ["branch", "car", "EPS", "3-bit firmware", "DAS_settings", "longitudi
             "driver's blinker", "car signals", "calibration", "road camera", "big model", "detector", "TurnPilot faults",
             "car health", *REQUIRED_KEYS, *MAP_KEYS]
 INFO_LINES = ["fingerprint source", "turn-signal frame", "X179 add-on", "VIN", "TurnPilotShadowMode", "DisableUpdates",
-              "TurnPilotLeftFarRangeM", "TurnPilotAutoLeft", "TurnPilotGoOverride", "TurnPilotNoMoveS",
+              "TurnPilotLeftFarRangeM", "TurnPilotAutoLeft", "TurnPilotGoOverride", "TurnPilotNoMoveS", "TurnPilotCarSignalsVinless",
               "panda build", "Tesla software", "outside lamps", "mount"]
 CAN_LINES = ["3-bit firmware", "panda honours long", "turn-signal frame", "driver's blinker", "X179 add-on"]
 TURNPILOT_LINES = ["car signals", "detector", "TurnPilot faults"]
@@ -97,6 +97,8 @@ def raw_param(key, value):
     return b""  # loggerd logs a DONT_LOG key with no value (logger.cc)
   if isinstance(value, bool):
     return b"1" if value else b"0"
+  if isinstance(value, dict):
+    return json.dumps(value).encode()  # a JSON param, as Params stores it
   return str(value).encode()
 
 
@@ -535,6 +537,82 @@ def test_car_signals_on(tmp_path):
   s = statuses(lines)
   assert s["car signals"] == WARN and "VIN unreadable" in line(lines, "car signals").detail
   assert s["TurnPilotCarSignals"] == NO_GO
+
+
+DONGLE = "0123456789abcdef"
+UPDATED_EPS = b'TeM3_E014p10_0.0.0 (24),E014.20.2'  # another TESLA_MODEL_3 string: a Tesla update
+DID = "Car's VIN unreadable: can't match the record"
+
+
+def signal_record(vin="0" * 17, eps=CHASE_EPS, **kw):
+  """A verified record as promote() writes it from a check on this car (fill_car_params' carFw): with the identity a check
+  keeps under TurnPilotCarSignalsVinless."""
+  from openpilot.selfdrive.turnpilot.car_signals import fw_list
+  cp = car.CarParams.new_message()
+  fill_car_params(cp, SimpleNamespace(**{**DEFAULTS, "eps": eps, "vin": vin}))
+  r = {"onReason": 9, "gear": "P", "onSeparates": False, "vin": vin, "fw": fw_list(cp.carFw), "checkId": "c0ffee00",
+       "exteriorConfirmed": "2026-10-30T12:00:00+00:00", "when": "2026-10-30T11:58:00+00:00", "opendbc": "",
+       "dongleId": DONGLE, "carFingerprint": "TESLA_MODEL_3"}
+  r.update(kw)
+  return r
+
+
+def signals_on(record, vinless=None, **extra):
+  return {**GOOD_PARAMS, "TurnPilotCarSignals": "on", "TurnPilotCarSignalsVerified": record, "DongleId": DONGLE, **extra,
+          **({} if vinless is None else {"TurnPilotCarSignalsVinless": vinless})}
+
+
+def test_car_signals_say_which_way_the_record_matched(tmp_path):
+  """Mode on: the car signals line says whether the verified record matches and which way, by VIN or without one
+  (TurnPilotCarSignalsVinless), live and from a route, and never prints the DongleId or the VIN."""
+  vin = valid_vin()
+  cases = [
+    (signals_on(signal_record()), {}, f"does not match: {DID} (TurnPilotCarSignalsVinless off: a record matches by VIN only)"),
+    (signals_on(signal_record(), False), {}, f"does not match: {DID} (TurnPilotCarSignalsVinless off: a record matches by VIN only)"),
+    (signals_on(signal_record(), True), {}, "matches without a VIN (TurnPilotCarSignalsVinless): this comma's DongleId, " +
+                                             "TESLA_MODEL_3 by its firmware and the exact carFw list"),
+    (signals_on(signal_record(vin)), {"vin": vin}, "matches by VIN and firmware"),
+    (signals_on(signal_record(vin), True), {"vin": vin}, "matches by VIN and firmware"),
+    (signals_on(signal_record(), True), {"vin": vin}, "does not match: Recorded for another car: run the check"),
+    (signals_on(signal_record(), True, DongleId="fedcba9876543210"), {}, "does not match: Recorded on another comma: run the check"),
+    (signals_on(signal_record(), True), {"eps": UPDATED_EPS}, "does not match: Car software changed: run the check again"),
+    (signals_on(signal_record(gear="D"), True), {}, "does not match: Checked in Drive: without a VIN, check in P"),
+  ]
+  for params, kw, said in cases:
+    for lines in (run_live(tmp_path, params=params, **kw), run_route(tmp_path, params=params, **kw)):
+      s = statuses(lines)
+      detail = line(lines, "car signals").detail
+      assert s["car signals"] == WARN and detail.startswith(f"on: Saturday plans for off; the verified record {said}"), (said, detail)
+      out = cpf.render(lines)
+      assert DONGLE not in out and "fedcba9876543210" not in out and vin not in out
+
+
+def test_the_vinless_opt_in_line(tmp_path):
+  """TurnPilotCarSignalsVinless: INFO while off (the default), WARN on (an owner's opt-in that loosens which car a record
+  fits), NO-GO for a library that lacks it; the VIN and turn-signal frame lines say what a zero VIN can match."""
+  lines = run_live(tmp_path)
+  assert statuses(lines)["TurnPilotCarSignalsVinless"] == INFO
+  assert line(lines, "TurnPilotCarSignalsVinless").detail.startswith("0 (default): a car-signal record matches by VIN only")
+  assert "a car-signal record can't match" in line(lines, "VIN").detail
+  on = run_live(tmp_path, params={**GOOD_PARAMS, "TurnPilotCarSignalsVinless": True})
+  s = statuses(on)
+  assert s["TurnPilotCarSignalsVinless"] == WARN and "without a VIN" in line(on, "TurnPilotCarSignalsVinless").detail
+  assert "TurnPilotCarSignalsVinless=0" in line(on, "TurnPilotCarSignalsVinless").fix
+  assert s["VIN"] == INFO and "matches only without a VIN (TurnPilotCarSignalsVinless on)" in line(on, "VIN").detail
+  assert "VIN is unreadable" not in line(on, "turn-signal frame").detail
+  assert "only from a record made without a VIN" in line(on, "turn-signal frame").detail
+  assert cpf.exit_code(on) == 0  # a WARN: read and decided, as every WARN
+  stale = run_live(tmp_path, unknown={"TurnPilotCarSignalsVinless"})
+  assert statuses(stale)["TurnPilotCarSignalsVinless"] == NO_GO
+
+
+def test_a_check_on_a_zero_vin_says_whether_its_record_can_match(tmp_path):
+  off = run_live(tmp_path, params={**GOOD_PARAMS, "TurnPilotCarSignals": "check"})
+  assert "its record can't match this car's zero VIN (TurnPilotCarSignalsVinless off)" in line(off, "car signals").detail
+  on = run_live(tmp_path, params={**GOOD_PARAMS, "TurnPilotCarSignals": "check", "TurnPilotCarSignalsVinless": True})
+  assert "its record keeps this comma's DongleId and the firmware's fingerprint (TurnPilotCarSignalsVinless on)" in \
+    line(on, "car signals").detail
+  assert statuses(on)["car signals"] == WARN
 
 
 def test_no_ui_warning(tmp_path):
