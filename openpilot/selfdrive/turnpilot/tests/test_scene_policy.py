@@ -824,3 +824,81 @@ def test_confirmation_lapses_with_missed_runs_and_comes_back_on_a_match():
   # last matched within LOST_CLOSE_M confirmed: kept while published, missed runs or not
   frame(10, 0, x=LOST_CLOSE_M - 0.5)
   assert frame(10, 12, x=LOST_CLOSE_M - 2.).hard_brake and sp.tracks[3].confirmed
+
+
+# --- the curb-pedestrian speed cap (owner decision, 2026-10-30: BUILD_FINDINGS D3-real option 2, TurnPilotCurbPedCap) ---
+
+def curb_run(objects_at, secs=8., v0=13., path=None, curb_cap=True, sp=None):
+  """A point-mass car under a ScenePolicy (curb_cap as TurnPilotCurbPedCap) for secs from v0; objects_at(t) gives the scene's
+  objects. Returns (sp, [(t, v, decision, the planner's accel from the caps)])."""
+  sp = sp or ScenePolicy()
+  sp.curb_cap = curb_cap
+  v, rows = v0, []
+  for k in range(int(round(secs / DT_MDL))):
+    t = k * DT_MDL
+    sc = scene(objects_at(t))
+    d = sp.update(sc.objects, True, None, 1000., v, maneuver_id=0, path=path)
+    a = plan_accel(d.accel_cap, d.speed_cap, v)
+    rows.append((t, v, d, a))
+    v = max(v + min(a, (v0 - v) / 2.) * DT_MDL, 0.)
+  return sp, rows
+
+
+def steady_curb_walker(x, y, every=1, conf=0.7):
+  """A person track at (x, y) matched on every `every`-th frame from 2 hits (the tracker publishes from MIN_HITS)."""
+  return lambda t: [ped(x, y, age=2 + int(round(t / DT_MDL)) // every, conf=conf, trackId=7)]
+
+
+def test_a_steady_person_by_the_road_caps_the_speed_on_the_comfortable_curve_only():
+  """Owner decision (BUILD_FINDINGS D3-real option 2): a published person track with crosswalk-grade steadiness
+  (crosswalk_walker, CROSSWALK_STEADY_HITS within CROSSWALK_STEADY_S) within CURB_PED_EDGE_M of the path's edge
+  (PATH_HALF_WIDTH_M + 3 m of the model path) and CURB_PED_X_M ahead caps the speed at CURB_PED_SPEED, 5.6 m/s, through the
+  speed cap alone: no accel cap, and nothing from it asks for more than -CURB_PED_DECEL (1.5 m/s^2). Never a stop, never a
+  hard brake: the track's confirmation is untouched (it is kept, so a step-out finds it warm)."""
+  from openpilot.selfdrive.turnpilot.scene_policy import CURB_PED_DECEL, CURB_PED_SPEED
+  sp, rows = curb_run(steady_curb_walker(35., 3.8), secs=6.)
+  capped = [(t, v, d, a) for t, v, d, a in rows if d.speed_cap < NO_SPEED_CAP]
+  assert capped and capped[0][0] < 1.
+  assert all(d.accel_cap == NO_ACCEL_CAP and not d.should_stop and not d.hard_brake for _, _, d, _ in rows)
+  assert all(a >= -CURB_PED_DECEL - 1e-6 for _, _, _, a in rows)
+  assert all(d.speed_cap >= CURB_PED_SPEED - 1e-6 for _, _, d, _ in capped)
+  assert rows[-1][1] < CURB_PED_SPEED + 0.3 and capped[-1][2].reason == "pedestrian by the road"
+  assert not any(d.speed_cap < NO_SPEED_CAP for t, _, d, _ in rows if t < 0.1)  # not before its fifth hit
+
+
+def test_the_curb_cap_never_takes_a_flicker_a_weak_track_or_one_far_off_the_path():
+  for objects_at, why in ((lambda t: [ped(30., 3.5, age=min(2 + int(round(t / DT_MDL)), 4), conf=0.8, trackId=7)], "4 hits"),
+                          (steady_curb_walker(30., 3.5, conf=0.45), "under CROSSWALK_CONF"),
+                          (steady_curb_walker(30., 3.5, every=12), "one hit in 0.6 s"),
+                          (steady_curb_walker(30., 5.), "4.5 m or more off the path"),
+                          (steady_curb_walker(45., 3.5), "past CURB_PED_X_M"),
+                          (lambda t: [car(25., 3.5, age=40)], "not a person")):
+    _, rows = curb_run(objects_at, secs=5.)
+    assert all(d.speed_cap == NO_SPEED_CAP for _, _, d, _ in rows), why
+  # off with TurnPilotCurbPedCap off
+  _, rows = curb_run(steady_curb_walker(35., 3.8), secs=5., curb_cap=False)
+  assert all(d.speed_cap == NO_SPEED_CAP for _, _, d, _ in rows)
+
+
+def test_the_curb_cap_follows_the_model_path_and_lets_go_a_second_after_the_last_track():
+  import numpy as np
+  # the path bends right, 2 m right at 35 m: a person 3.5 m left of the straight line ahead is 5.5 m off the path, one 3.5 m
+  # right of it 1.5 m off it (inside the cap's band; not in_path, the tracker's own flag unset, so no stop)
+  path = (np.array([0., 50.]), np.array([0., -2.0 * 50. / 35.]))
+  _, rows = curb_run(steady_curb_walker(35., 3.5), secs=4., path=path)
+  assert all(d.speed_cap == NO_SPEED_CAP for _, _, d, _ in rows)
+  _, rows = curb_run(steady_curb_walker(35., -3.5), secs=4., path=path)
+  assert any(d.speed_cap < NO_SPEED_CAP for _, _, d, _ in rows)
+  # published for 3 s, then gone: the cap holds CURB_PED_HOLD_S more, then lets go
+  from openpilot.selfdrive.turnpilot.scene_policy import CURB_PED_HOLD_S
+  walker = steady_curb_walker(35., 3.8)
+  _, rows = curb_run(lambda t: walker(t) if t < 3. else [], secs=6.)
+  held = [t for t, _, d, _ in rows if d.speed_cap < NO_SPEED_CAP and t >= 3.]
+  assert held and abs(max(held) - (3. + CURB_PED_HOLD_S)) < 2 * DT_MDL, max(held)
+
+
+def test_the_curb_cap_is_logged_once_per_track():
+  with mock.patch('openpilot.selfdrive.turnpilot.scene_policy.cloudlog') as log:
+    curb_run(steady_curb_walker(35., 3.8), secs=4.)
+  calls = [c for c in log.event.call_args_list if c.args[0] == 'turnpilot.curb_ped_cap']
+  assert len(calls) == 1 and {'x', 'y', 'conf', 'hits', 'track_id'} <= set(calls[0].kwargs), calls

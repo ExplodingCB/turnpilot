@@ -58,10 +58,23 @@ don't want to kill Chase but we do want a good demo"; BUILD_FINDINGS N2): a conf
 zone (junction_stops) is in the turn's path though in_path's corridor straight ahead doesn't hold them, so the crosswalk
 hold may harden on that walker's confirmation alone (may_harden=confirmed_track), as BeamNG S03's hold did for a confirmed
 walker 2.7 m to the turn side (in_path false). Everything else about it stands: confirmed, ranged, published, steady.
+
+A person by the road (owner decision, 2026-10-30: BUILD_FINDINGS D3-real option 2, TurnPilotCurbPedCap, on by default): a
+published person track with a crosswalk hold's steadiness (TrackEvidence.walker: CROSSWALK_HITS at CROSSWALK_CONF and
+CROSSWALK_STEADY_HITS within CROSSWALK_STEADY_S) within CURB_PED_EDGE_M of the path's edge (under PATH_HALF_WIDTH_M plus that
+from the model's path, update()'s path) and CURB_PED_X_M ahead caps the speed at CURB_PED_SPEED: a side-on person 15-30 m out
+is scored reliably only inside about 15 m (DETECTOR_DIAG), so the car comes past her slowly enough for a late detection to
+stop it. Through the speed cap alone, eased so nothing from it asks for more than -CURB_PED_DECEL: no accel cap, never a stop,
+never the hard tier. It holds while such a track is published and lets go CURB_PED_HOLD_S after the last; logged once a track
+(turnpilot.curb_ped_cap). The track is kept as any other, so her confirmation is warm if she steps out; nothing about
+confirmation, the tracker or what stops the car changes. Replayed over 16.4 min of public comma four footage through the real
+tracker it took no false track (the nearest, a roadside object, came 2.38 m off the path with 4 hits) and one real person.
 """
 import math
 from collections import deque
 from dataclasses import dataclass, field
+
+import numpy as np
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
@@ -152,6 +165,15 @@ ONCOMING_ENTRY_M = 4.       # m (of the car's position) before the maneuver poin
 # as coming at ONCOMING_ASSUMED_SPEED, whatever its vx says
 VEL_TRUST_HITS = 25
 ONCOMING_ASSUMED_SPEED = 15.  # m/s, 54 km/h: within 75 m of the junction an untrusted track holds
+
+# the curb-pedestrian speed cap (module docstring): TurnPilotCurbPedCap (turnpilotd main()), ScenePolicy.curb_cap
+CURB_PED_CAP_DEFAULT = True
+CURB_PED_SPEED = 5.6        # m/s, 20 km/h
+CURB_PED_EDGE_M = 3.        # within this of the path's edge (PATH_HALF_WIDTH_M from the model's path)
+CURB_PED_X_M = 40.          # ...this close ahead
+CURB_PED_DECEL = STOP_DECEL  # m/s^2: nothing from the cap asks for more
+CURB_PED_HOLD_S = 1.        # the cap lets go this long after the last such track
+CURB_PED_REASON = "pedestrian by the road"
 
 
 @dataclass
@@ -414,6 +436,9 @@ class ScenePolicy:
     self.fault_junction: Stop | None = None  # ...kept through a fault, which lost the route it was for
     self.fault_open = False  # a fault lost the route with the car committed to (or released into) its junction
     self.hard = False  # the last frame braked harder than SPEED_CAP_ACCEL_MIN (hard_brake())
+    self.curb_cap = CURB_PED_CAP_DEFAULT  # TurnPilotCurbPedCap: the curb-pedestrian speed cap (module docstring)
+    self.curb_t = math.inf  # s since a track last earned it
+    self.curb_logged: set[int] = set()  # tracks it was logged for
 
   def fault(self, maneuver_id: int | None = None) -> None:
     """turnpilotd faulted and dropped the route (maneuver_id: its maneuver): the junction hold in force stays where it
@@ -438,10 +463,11 @@ class ScenePolicy:
 
   def update(self, objects, available: bool, maneuver, distance: float, v_ego: float, right_hand_traffic: bool = True,
              maneuver_id: int | None = None, gas_pressed: bool = False, dt: float = DT_MDL, extra_stops=(),
-             heading_deg: float = 0.) -> SceneDecision:
+             heading_deg: float = 0., path=None) -> SceneDecision:
     """As scene_policy(), plus maneuver_id (RouteFollower.maneuver_id), once per frame dt apart. gas_pressed: the driver
     taking over (turnpilotd: carState.gasPressed with openpilot disengaged), never a go. extra_stops: the map's stop signs
-    and signals (map_controls.py), composed with the scene's like any other stop. heading_deg: as scene_policy()'s."""
+    and signals (map_controls.py), composed with the scene's like any other stop. heading_deg: as scene_policy()'s. path:
+    the model's path ahead (scene.tracker.predicted_path: x, y left), None straight ahead, for the curb cap."""
     far_side = far_side_turn(maneuver, right_hand_traffic)
     self.t += dt
     if available:
@@ -483,10 +509,41 @@ class ScenePolicy:
       junction = []
     self.junction = junction[0] if junction else None
     stops = peds + junction + self._fault_hold(available, maneuver, distance, v_ego, gas_pressed, dt) + list(extra_stops)
+    stops += self.curb_ped(objects if available else [], v_ego, path, dt)
     decision = decide(stops, v_ego)
     decision.accel_cap = self.ramp(decision.accel_cap, dt)
     self.hard_brake(decision, stops, v_ego)
     return decision
+
+  def curb_ped(self, objects, v_ego: float, path, dt: float) -> list[Stop]:
+    """The curb-pedestrian speed cap (module docstring): a speed cap of CURB_PED_SPEED eased to ask no more than
+    -CURB_PED_DECEL of the planner (SPEED_CAP_TAU), while a published walker-grade person track is within CURB_PED_EDGE_M
+    of the path's edge and CURB_PED_X_M ahead, and CURB_PED_HOLD_S after the last; none with curb_cap off."""
+    if not self.curb_cap:
+      self.curb_t = math.inf
+      return []
+    near = None
+    for obj in objects:
+      ev = self.tracks.get(obj.trackId)
+      if str(obj.cls) != "pedestrian" or ev is None or not ev.walker or not 0. < obj.x <= CURB_PED_X_M or \
+         is_rider(obj, objects, lambda o: self.tracks[o.trackId].confirmed if o.trackId in self.tracks else False):
+        continue
+      path_y = float(np.interp(obj.x, path[0], path[1])) if path is not None and len(path[0]) else 0.
+      if abs(obj.y - path_y) < PATH_HALF_WIDTH_M + CURB_PED_EDGE_M and (near is None or obj.x < near.x):
+        near = obj
+    self.curb_logged &= set(self.tracks)
+    if near is not None:
+      self.curb_t = 0.
+      if near.trackId not in self.curb_logged:
+        self.curb_logged.add(near.trackId)
+        cloudlog.event("turnpilot.curb_ped_cap", track_id=int(near.trackId), x=round(float(near.x), 2), y=round(float(near.y), 2),
+                       conf=round(float(near.conf), 3), hits=int(near.age), v_ego=round(v_ego, 2), camera=str(near.camera))
+    else:
+      self.curb_t += dt
+    if self.curb_t > CURB_PED_HOLD_S + 1e-6:
+      return []
+    cap = max(CURB_PED_SPEED, v_ego - CURB_PED_DECEL * SPEED_CAP_TAU)
+    return [Stop(NO_ACCEL_CAP, cap, False, CURB_PED_REASON, confirmed=False)]
 
   def hard_brake(self, decision: SceneDecision, stops: list[Stop], v_ego: float) -> None:
     """decision.hard_brake while its accel cap asks for more than SPEED_CAP_ACCEL_MIN, with the evidence of the stop that

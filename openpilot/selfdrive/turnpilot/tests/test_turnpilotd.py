@@ -2345,6 +2345,41 @@ def test_wrong_side_on_the_beamng_rlogs_and_the_demo_route():
     assert not yellow_on_the_right(lp, line_ys, probs, edge_ys, stds)[0], name
 
 
+def test_a_steady_person_by_the_road_slows_the_car_to_20_kph_never_harder_than_the_curve():
+  """Owner decision (2026-10-30, BUILD_FINDINGS D3-real option 2; TurnPilotCurbPedCap, on by default): a person standing
+  2.5 m off the path's edge, tracked steadily, slows the car at 36 km/h on the speed cap to 5.6 m/s as it passes her, from
+  CURB_PED_X_M out, the plan never asking the planner for more than -1.5 m/s^2 and never an accel cap (from much faster than
+  12 m/s the 40 m at 1.5 m/s^2 don't reach 5.6 m/s: the cap's bound, by design); once she is behind the car the cap lets go
+  a second later. With the param off nothing slows the car."""
+  from openpilot.selfdrive.turnpilot.scene_policy import CURB_PED_DECEL, CURB_PED_HOLD_S, CURB_PED_SPEED
+  for on in (True, False):
+    sim = Sim([(2000., 'turn', 'left', T_LEFT)], cruise=10.)
+    sim.tp.curb_ped_cap = on
+    sim.v, frame = 10., [0]
+
+    def walker(sim, frame=frame):
+      frame[0] += 1
+      x = 60. - sim.s
+      return ({'cls': 'pedestrian', 'x': x, 'y': 4., 'vx': 0., 'vy': 0., 'inPath': False, 'age': 2 + frame[0], 'conf': 0.7},) if x > -2. else ()
+    plans, past = [], None
+    while sim.s < 90.:
+      plans.append(sim.step(objects=walker(sim), engaged=True))
+      if past is None and sim.s > 62.:
+        past = sim.t
+      assert sim.t < 60.
+    accels = [plan_accel(p.accelCap, p.speedCap, v) for (_, v, p) in sim.trace]
+    if on:
+      at_her = min(v for s_, v, _ in sim.trace if 55. < s_ < 60.)
+      assert at_her < CURB_PED_SPEED + 0.3, at_her
+      assert all(p.accelCap == NO_ACCEL_CAP and not p.shouldStop for p in plans) and min(accels) >= -CURB_PED_DECEL - 1e-6
+      assert any(p.reason == "pedestrian by the road" for p in plans)
+      capped_after = [t for t, (_, _, p) in zip([k * DT_MDL for k in range(len(sim.trace))], sim.trace, strict=True)
+                      if p.speedCap < 20. and t > past]
+      assert not capped_after or max(capped_after) < past + CURB_PED_HOLD_S + 0.5
+    else:
+      assert min(v for _, v, _ in sim.trace) > 9.5
+
+
 def test_a_hard_brake_is_raised_only_for_a_confirmed_pedestrian():
   # one detector frame of a pedestrian 10 m ahead at 10 m/s: braked for on the curve, no hard brake raised; a confirmed
   # one 10 m ahead: braked hard, and the plan says so (controlAlert hardBrake)

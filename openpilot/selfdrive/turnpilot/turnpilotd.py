@@ -177,14 +177,15 @@ from openpilot.selfdrive.turnpilot.route_follower import (KEEP, LEFT, RIGHT, SAM
                                                            same_junction)
 from openpilot.selfdrive.turnpilot.route_notice import RouteNotices
 from openpilot.selfdrive.turnpilot.scene.lane_paint import lane_paint_from_msg
-from openpilot.selfdrive.turnpilot.scene.tracker import MAX_COAST_S, STALE_S, SWEEP_COAST_S, RawFrame, SceneTracker, default_yaw_rate
+from openpilot.selfdrive.turnpilot.scene.tracker import (MAX_COAST_S, STALE_S, SWEEP_COAST_S, RawFrame, SceneTracker, default_yaw_rate,
+                                                          predicted_path)
 from openpilot.selfdrive.turnpilot.visibility import OracleLive
 from openpilot.selfdrive.turnpilot.junction_watch import JunctionWatch, detector_view, junction_from_info, sweep_control, sweep_wanted
 from openpilot.selfdrive.turnpilot import visibility_table
 from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
 from openpilot.common.time_helpers import system_time_valid
-from openpilot.selfdrive.turnpilot.scene_policy import (HOLD_LINE_M, NO_ACCEL_CAP, ONCOMING_ENTRY_M, PATH_HALF_WIDTH_M, STOP_DECEL, VEHICLES,
-                                                         ScenePolicy, far_side_turn, in_path)
+from openpilot.selfdrive.turnpilot.scene_policy import (CURB_PED_CAP_DEFAULT, HOLD_LINE_M, NO_ACCEL_CAP, ONCOMING_ENTRY_M, PATH_HALF_WIDTH_M,
+                                                         STOP_DECEL, VEHICLES, ScenePolicy, far_side_turn, in_path)
 from openpilot.selfdrive.turnpilot.turn_skip import SkipState, TurnSkip, can_make_turn
 from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
 from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, LINE_D, OFF, ROAD_RANGE_M, LeftInput, UnprotectedLeft,
@@ -533,6 +534,7 @@ class TurnPilot:
     self.unverified_why = ''  # why mode on found no verified record for this car (main())
     self._rf_ticked = self._yaw_ticked = False  # update() dead-reckoned the route, and counted the yaw, this frame
     self.go_override = GO_OVERRIDE_DEFAULT  # TurnPilotGoOverride (main())
+    self.curb_ped_cap = CURB_PED_CAP_DEFAULT  # TurnPilotCurbPedCap (main()): the scene's curb-pedestrian speed cap (scene_policy.py)
     self.go_cert = GoCertifier()  # the go certified for plannerd's lift (go_override.py): its ids never repeat while this runs
     self.go_own_cap: float | None = None  # m/s: a creep go's own creep cap, which isn't a hold that blocks it (go_blocked)
     self.sweeping = False  # the last plan asked modeld for a stop sweep (stopSweep, stopSweepGo): the tracker coasts longer
@@ -925,8 +927,10 @@ class TurnPilot:
       cap_on, cap_d = scene_m, scene_d
     self.alt_was_on = alt_on
     left_stops = self.left_now.stops if self.left_now is not None else []
+    self.scene.curb_cap = self.curb_ped_cap
     decision = self.scene_now = self.scene.update(objects, available, scene_m, scene_d, v_ego, right_hand_traffic, scene_id,
-                                                 took_over, extra_stops=mapd.stops + left_stops + sg.stops, heading_deg=scene_yaw)
+                                                 took_over, extra_stops=mapd.stops + left_stops + sg.stops, heading_deg=scene_yaw,
+                                                 path=predicted_path(model))
     self.last_holding = decision.holding
     # a TurnPilot stop in force brings the car to rest at or short of the junction (shouldStop at its end: a walker's
     # hold, a red, a stop sign), braking toward it on the speed cap's curve (shouldStop false until about standstill) or
@@ -2316,6 +2320,22 @@ def go_override_for(params) -> bool:
   return bool(value)
 
 
+def curb_ped_cap_for(params) -> bool:
+  """TurnPilotCurbPedCap: the scene's curb-pedestrian speed cap (scene_policy.py; owner decision, BUILD_FINDINGS D3-real
+  option 2); CURB_PED_CAP_DEFAULT (on) if unset or unknown to this build's params (said)."""
+  try:
+    value = params.get("TurnPilotCurbPedCap")
+  except UnknownKeyName:
+    log_error(f"turnpilotd: TurnPilotCurbPedCap unknown to this build's params, {'on' if CURB_PED_CAP_DEFAULT else 'off'}; run scons")
+    return CURB_PED_CAP_DEFAULT
+  if value is None:
+    return CURB_PED_CAP_DEFAULT
+  if isinstance(value, (bytes, str)):
+    value = value.decode() if isinstance(value, bytes) else value
+    return value.strip() == '1'
+  return bool(value)
+
+
 def camera_signs_read(params) -> bool:
   """TurnPilotCameraStopSigns isn't off: modeld decodes the class-11 boxes of every forward run (detector/modeld_detector.py
   camera_stop_signs_mode: off reads none; shadow, the default, or anything else, or a build that doesn't know the key, reads
@@ -2491,6 +2511,7 @@ def main():
       tp.left_range_m = left_range_for(params)
       tp.left_far_range_m = left_far_range_for(params)
       tp.go_override = go_override_for(params)
+      tp.curb_ped_cap = curb_ped_cap_for(params)
       tp.stop_sign_mode, tp.stop_sign_known = stop_sign_mode_for(params)
       tp.camera_signs = camera_signs_read(params)
       tp.params = params

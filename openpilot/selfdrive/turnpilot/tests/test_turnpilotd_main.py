@@ -305,6 +305,20 @@ def test_main_reads_the_go_override(value, on):
   assert made[0].go_override is on
 
 
+@pytest.mark.parametrize("value,on", [(None, True), (True, True), (False, False), ('0', False), (b'1', True)])
+def test_main_reads_the_curb_pedestrian_cap(value, on):
+  """TurnPilotCurbPedCap (scene_policy.py: the curb-pedestrian speed cap; owner decision, BUILD_FINDINGS D3-real option 2),
+  read once a second: unset is on, and the scene policy takes it every frame."""
+  made, real = [], turnpilotd.TurnPilot
+  def make():
+    made.append(real())
+    return made[-1]
+  with mock.patch.object(turnpilotd, 'TurnPilot', side_effect=make):
+    run_main(frames=3, TurnPilotCurbPedCap=value)
+  assert made[0].curb_ped_cap is on
+  assert turnpilotd.curb_ped_cap_for(FakeParams()) is True
+
+
 def test_a_sweep_coasts_the_trackers_tracks_longer_and_the_watch_sees_every_run():
   # STOP_SIGNS.md section 9: MAX_COAST_S 0.65 s while a stop sweep runs (the last plan asked for one), 0.5 s otherwise; and
   # the junction watch gets the tracker's runs and tracks every frame
