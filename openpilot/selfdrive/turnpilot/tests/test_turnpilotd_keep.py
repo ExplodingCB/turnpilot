@@ -142,12 +142,26 @@ def test_no_keep_toward_the_oncoming_side_of_an_undivided_road():
 
 
 def test_a_keep_left_with_a_lane_of_ours_beyond_goes():
-  # the control: a lane counted beyond the left ego line (its next line out painted), paint unread or white: keepLeft goes
-  for pnt in ((), (UNKNOWN, BROKEN_WHITE, UNKNOWN, UNKNOWN)):
+  # the control: a lane counted beyond the left ego line (its next line out painted), that line read broken white: keepLeft goes
+  sim = Sim(SLIGHT_LEFT, cruise=19., model_lanes=(1, 0), paint=(UNKNOWN, BROKEN_WHITE, UNKNOWN, UNKNOWN))
+  run_keep(sim, KEEP_J + 20.)
+  assert any(p.desire == Desire.keepLeft for _, _, p in sim.trace)
+  assert not any(p.tooFastToTurn for _, _, p in sim.trace)
+
+
+def test_no_keep_left_on_the_lane_count_alone_with_the_paint_unread():
+  """Skeptic SIMFIX D5 (8c0f4e7): with the lane paint unread a far-side keep went on the model's lane count alone, and an
+  undivided two-way road whose oncoming lane has its outer edge line painted counts a lane to the left (road(1, 0)): an
+  uncapped keepLeft over the centre line whenever the paint is unread (night, worn paint, frames the reader skips). S19's keep
+  was 14 deg, under KEEP_CORNER_MIN_DEG, so no corner cap either, and the wrong-side handback needs WRONG_SIDE_S of yellow
+  reads, after the crossing. A far-side keep needs the ego line read broken white: unread or unknown it is said
+  (skipReason keepFarSide, 'Rerouting') and never sent."""
+  for pnt in ((), (UNKNOWN,) * 4):
     sim = Sim(SLIGHT_LEFT, cruise=19., model_lanes=(1, 0), paint=pnt)
     run_keep(sim, KEEP_J + 20.)
-    assert any(p.desire == Desire.keepLeft for _, _, p in sim.trace), pnt
-    assert not any(p.tooFastToTurn for _, _, p in sim.trace), pnt
+    assert not any(p.desire == Desire.keepLeft for _, _, p in sim.trace), f"keepLeft on the lane count alone, paint {pnt}"
+    said = [p for _, _, p in sim.trace if p.tooFastToTurn]
+    assert said and str(said[0].skipReason) == 'keepFarSide' and said[0].maneuverDistance > 0., pnt
 
 
 def test_no_keep_left_across_a_yellow_line():

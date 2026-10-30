@@ -63,7 +63,7 @@ def test_a_keep_toward_the_far_side_needs_a_lane_going_our_way_there():
   assert keep_blocker(undivided, LEFT) == 'keepFarSide'
   assert keep_blocker(undivided, LEFT, paint=paint(left=BW)) == 'keepFarSide', "no lane counted beyond it: no keep, whatever the paint"
   two_lanes = model_lanes(*road(1, 0))
-  assert keep_blocker(two_lanes, LEFT) == '' and keep_blocker(two_lanes, LEFT, paint=paint(left=BW)) == ''
+  assert keep_blocker(two_lanes, LEFT, paint=paint(left=BW)) == ''
   assert keep_blocker(two_lanes, LEFT, paint=paint(left=BW, far_left=SY)) == '', "a lane ours, then a divided road's left edge"
   for yellow in (SY, BY, LinePaint('unknown', 'yellow', 0.35, 0.)):
     assert keep_blocker(two_lanes, LEFT, paint=paint(left=yellow)) == 'keepFarSide', yellow  # oncoming beyond it
@@ -72,6 +72,12 @@ def test_a_keep_toward_the_far_side_needs_a_lane_going_our_way_there():
   held = hold.update(paint(), 15., 0.05, False)  # worn the next frame: still yellow for the hold
   assert keep_blocker(two_lanes, LEFT, paint=held) == 'keepFarSide'
   assert hold.apply(paint()) == held and hold.update(paint(), 15., 0.05, False) == held, "apply reads the holds without counting a frame"
+  # the model's count alone is no lane of ours (skeptic SIMFIX D5): an undivided road whose oncoming lane has its outer edge
+  # line painted counts a lane to the left, so the paint unread, the ego line's colour unknown or anything but broken white
+  # there is no keep, said
+  for unread in ((), paint(), (UNKNOWN,) * 4, paint(left=SW), paint(left=LinePaint('broken', 'unknown', 0.9, 0.3)),
+                 paint(left=LinePaint('broken', 'white', 0.2, 0.3))):
+    assert keep_blocker(two_lanes, LEFT, paint=unread) == 'keepFarSide', unread
   # no line that way is said as before, first
   line_ys, probs, edges, stds = road(1, 1)
   assert keep_blocker(model_lanes(line_ys, [probs[0], 0.1, probs[2], probs[3]], edges, stds), LEFT) == 'keepNoLine'

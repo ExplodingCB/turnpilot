@@ -304,7 +304,7 @@ def paint_lanes(lanes: ModelLanes, paint) -> ModelLanes:
 
 
 KEEP_NO_LINE = 'keepNoLine'  # TurnpilotPlan.skipReason: a keep the model sees no lane line for (ModelLanes.keep_*_ok)
-KEEP_FAR_SIDE = 'keepFarSide'  # ...one toward the far side with no lane of ours beyond the ego line, or that line yellow
+KEEP_FAR_SIDE = 'keepFarSide'  # ...one toward the far side with no lane of ours beyond the ego line read broken white
 
 
 def keep_blocker(lanes: ModelLanes, direction: int, right_hand_traffic: bool = True, paint=()) -> str:
@@ -316,16 +316,19 @@ def keep_blocker(lanes: ModelLanes, direction: int, right_hand_traffic: bool = T
     paint has taken out every lane beyond a yellow line (paint_lanes; paint as for it, held yellow included: YellowHold.apply).
     The room beyond the ego line is no lane there: on an undivided road it is the oncoming lane, the far road edge beyond it
     (BUILD_FINDINGS D5, BeamNG S19: keepLeft at 19 m/s on a two-way road, 2.5 m over the centre line). So a far-side keep
-    needs the next line out painted a lane width on (a lane going our way) and the ego line not read yellow. Paint unread
-    leaves the model's count: an undivided road whose oncoming lane has its edge line painted a lane out counts a lane there
-    unless its centre line reads yellow (the lane paint reads only the road camera). Toward the curb side the room is the
-    road's own (a shoulder, an exit's lane), as before."""
+    needs the next line out painted a lane width on (a lane going our way) and positive evidence of it: the ego line read
+    broken white this frame (broken_white_toward, never held yellow). The model's count alone is no lane of ours: an
+    undivided road whose oncoming lane has its edge line painted a lane out counts a lane there, so with the paint unread
+    (night, worn paint, a frame the reader skips; it reads only the road camera) or the ego line's colour unknown the keep
+    is refused, said and rerouted (skeptic SIMFIX D5: an uncapped keepLeft over the centre line at highway-to-town speed;
+    the wrong-side handback comes only after WRONG_SIDE_S of reads, past the crossing). More skips at night: the safe
+    side. Toward the curb side the room is the road's own (a shoulder, an exit's lane), as before."""
   ok = lanes.keep_left_ok if direction == LEFT else lanes.keep_right_ok if direction == RIGHT else False
   if not ok:
     return KEEP_NO_LINE
   if direction == (LEFT if right_hand_traffic else RIGHT):
     counted = paint_lanes(lanes, paint)
-    if (counted.left if direction == LEFT else counted.right) == 0:
+    if (counted.left if direction == LEFT else counted.right) == 0 or not broken_white_toward(paint, direction):
       return KEEP_FAR_SIDE
   return ''
 
