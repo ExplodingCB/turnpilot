@@ -586,6 +586,7 @@ def left_at_a_signal(controls, lights, model_fn=holding, seconds=40.):
   red). Returns (sim, plans, the car's s at the stand)."""
   sim = Sim(LEFT_25, controls=controls)
   sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps = 'auto', TEST_RANGE_M, False
+  sim.answers_prompt = True  # the driver signals the left when prompted: it goes only with a lamp lit (LEFT_GO_NEEDS_SIGNAL, tp/blinker)
   sim.tp.oracle_ok = False
   sim.lights = lights
   sim.raw = road_runs()
@@ -631,6 +632,7 @@ def test_the_lefts_lift_stays_on_an_accepted_green_or_where_no_signal_is():
     if not unsignalized:
       sim = Sim(LEFT_25, controls=[(JUNCTION - 8.5, 'signal')])
       sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps = 'auto', TEST_RANGE_M, False
+      sim.answers_prompt = True  # the driver signals the left when prompted: it goes only with a lamp lit (LEFT_GO_NEEDS_SIGNAL, tp/blinker)
       sim.tp.oracle_ok, sim.lights = True, oracle_lights('green', JUNCTION - 8.5)
       sim.raw = road_runs()
     while not (sim.trace and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):

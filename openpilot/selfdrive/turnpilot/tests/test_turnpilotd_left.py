@@ -385,6 +385,7 @@ def test_a_creep_for_a_view_the_car_makes_then_undecided_keeps_the_car_held_and_
   # gone after 104 frames, the car 164 m past the junction at 13 m/s). Held short of the oncoming lanes, said throughout
   sim = Sim(LEFT_25)
   sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps = 'auto', TEST_RANGE_M, False
+  sim.answers_prompt = True  # the driver signals the left when prompted: it goes only with a lamp lit (LEFT_GO_NEEDS_SIGNAL, tp/blinker)
 
   def objects(sim):
     return ({'cls': 'car', 'x': JUNCTION + 6. - sim.s, 'y': 3.6, 'vx': 0., 'vy': 0., 'age': 40, 'trackId': 7,
@@ -612,6 +613,7 @@ def test_a_red_at_a_junction_with_no_mapped_signal_never_gets_a_go():
   # oncoming road stopped at its own red) had leftGo at 31.8 s and the car committed through the red. Now it waits at its line
   sim = Sim(LEFT_25)
   sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps = 'auto', TEST_RANGE_M, False
+  sim.answers_prompt = True  # the driver signals the left when prompted: it goes only with a lamp lit (LEFT_GO_NEEDS_SIGNAL, tp/blinker)
   sim.tp.oracle_ok = True
 
   def lights(sim):
