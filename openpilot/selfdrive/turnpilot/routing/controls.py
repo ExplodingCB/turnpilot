@@ -389,7 +389,7 @@ UNLIMITED_KPH = 255         # Valhalla's speed_limit for no limit (kUnlimitedSpe
 # OPPOSING_STRAIGHT_AWAY_M to the side away from the turn (where the band's near edge loses the first oncoming lane) and no more
 # than OPPOSING_STRAIGHT_TOWARD_M toward it: the straight span is out to the last of those in a row (0 the first not)
 OPPOSING_STRAIGHT_STEP_M = 25.
-OPPOSING_STRAIGHT_MAX_M = 250.
+OPPOSING_STRAIGHT_MAX_M = 400.  # turnpilotd's LEFT_RANGE_MAX_M: a 55 mph left's R_req from its line is 271-287 m past the junction
 OPPOSING_STRAIGHT_RADIUS_M = 15.
 OPPOSING_STRAIGHT_AWAY_M = 2.
 OPPOSING_STRAIGHT_TOWARD_M = 10.

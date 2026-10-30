@@ -280,6 +280,10 @@ class TestOpposingRoad(unittest.TestCase):
         return out
       return call
     self.assertEqual(opposing_roads(road(), steps)[0][2], OPPOSING_STRAIGHT_MAX_M)
+    # the probes reach far enough that a straight road never skips a 55 mph left (owner: support 45-55 mph oncoming), lanes
+    # unknown taken as two
+    from openpilot.selfdrive.turnpilot.unprotected_left import LINE_D, reach_at_line
+    self.assertLessEqual(reach_at_line(24.6, None) - LINE_D, OPPOSING_STRAIGHT_MAX_M)
     # 400 m away from the turn: 0.8 m off at 25 m, 3.1 m at 50 m (past OPPOSING_STRAIGHT_AWAY_M): straight to 25 m
     self.assertEqual(opposing_roads(road(400., toward=-1.), steps)[0][2], OPPOSING_STRAIGHT_STEP_M)
     # toward the turn the band reaches further: 7 m off at 75 m, 12.5 m at 100 m
