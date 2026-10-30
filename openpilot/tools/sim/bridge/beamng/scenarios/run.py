@@ -40,7 +40,7 @@ from openpilot.tools.sim.bridge.beamng.driver import GasTaps, ground_truth_green
 from openpilot.tools.sim.bridge.beamng.pose import beamng_quat
 from openpilot.tools.sim.bridge.beamng.scenario import heading_quat
 from openpilot.tools.sim.bridge.beamng.scenarios import score
-from openpilot.tools.sim.bridge.beamng.scenarios.catalog import DATA_JSON, ROLL_FRACTION, SCENARIOS, Plan, build, junction_distance
+from openpilot.tools.sim.bridge.beamng.scenarios.catalog import CAR_HALF_M, DATA_JSON, ROLL_FRACTION, SCENARIOS, Plan, build, junction_distance
 from openpilot.tools.sim.bridge.beamng.scenarios.director import Director, sweep
 from openpilot.tools.sim.bridge.beamng.scenarios.timing import GO_NEAR_M, STOOD_V, GoWatch
 
@@ -60,14 +60,17 @@ POSE_FIELDS = ["wall_s", "t_s", "x", "y", "z", "qx", "qy", "qz", "qw"]  # route_
 ACTOR_FIELDS = ["wall_s", "x", "y", "z", "heading"]
 
 
-def cross_due(params: dict, held_t: float | None, went: bool, t: float, key: str = 'release') -> bool:
+def cross_due(params: dict, held_t: float | None, went: bool, t: float, key: str = 'release', j_dist: float | None = None) -> bool:
   """A stop-sign scenario's cross car's leg (catalog.Entry.cross) is due: params[key] (its 'arrive' or its 'release') s after
-  the car's stand at the junction (held_t), on the car's go there ('go'), or never (None)."""
+  the car's stand at the junction (held_t), on the car's go there ('go'), once the car is within m of the junction
+  (('near', m), j_dist: the car's), or never (None)."""
   when = params.get(key)
   if when is None:
     return False
   if when == 'go':
     return went
+  if isinstance(when, (list, tuple)) and len(when) == 2 and when[0] == 'near':
+    return j_dist is not None and j_dist <= float(when[1])
   return held_t is not None and t - held_t >= float(when)
 
 
@@ -261,7 +264,8 @@ class Runner:
       if a.trigger == 'cross' and a.params.get('side') != 'lead':  # a stop sign's cross car, for its PET (score.stop_sign)
         hc = pose[2]
         ahead = (self.plan.junction[0] - pose[0]) * math.cos(hc) + (self.plan.junction[1] - pose[1]) * math.sin(hc)
-        r['cross'] = (r['cross'] or []) + [[round(junction_distance(self.plan, pose[0], pose[1]), 2), round(ahead, 2)]]
+        r['cross'] = (r['cross'] or []) + [[round(junction_distance(self.plan, pose[0], pose[1]), 2), round(ahead, 2),
+                                            round(a.params['line_m'] + CAR_HALF_M, 2)]]  # and where it stands at its line
       if a.trigger == 'pace':
         r['pacer_dx'] = round((pose[0] - x) * math.cos(h) + (pose[1] - y) * math.sin(h), 2)
     r['j_ahead'] = None
@@ -305,13 +309,13 @@ class Runner:
         continue
       go = False
       if a.trigger == 'cross' and a.params['start'] != 'line' and a.name not in self.arrived:
-        if cross_due(a.params, self.stood_t, w.went, r['t'], 'arrive'):
+        if cross_due(a.params, self.stood_t, w.went, r['t'], 'arrive', r['j_dist']):
           self.arrived.add(a.name)
           self.jobs.append((a.name, d.submit(d.arrive, a.name)))
           print(f"scenario: {a.name} drives up to its line at t={r['t']:.1f} s", flush=True)
         continue
       if a.trigger == 'cross':
-        go, job = cross_due(a.params, self.stood_t, w.went, r['t']), (d.cross_on, a.name)
+        go, job = cross_due(a.params, self.stood_t, w.went, r['t'], j_dist=r['j_dist']), (d.cross_on, a.name)
       elif a.trigger == 'walk':
         go, job = w.went, (d.walk, a.name)
       elif a.trigger == 'oncoming':

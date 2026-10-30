@@ -2,6 +2,7 @@
 instances (catalog.py), their cross cars' triggers (run.py), their score (score.py: goes, withdrawn goes, retries, handbacks
 with their reason, the minimum post-encroachment time, any TurnPilot accel below -2.0) and the sim's cross-traffic oracle
 (light_oracle.cross_traffic). Logic checks only, never range evidence."""
+import json
 import math
 
 import numpy as np
@@ -24,6 +25,7 @@ def test_the_six_scenarios_are_on_the_sims_mapped_stops(plans):
     assert p.notes['junction_control'] == 'stop', name  # the car's own approach stops
     assert p.notes['stop_scenario'] == name and p.junction is not None
     near = [c for c in stops if math.hypot(c.x - p.junction[0], c.y - p.junction[1]) < 40.]
+    json.dumps([a.params for a in p.actors])  # run.save writes them with the result
     if name == 'stop_two_way':
       assert p.notes['all_way'] is False
     else:
@@ -52,10 +54,11 @@ def test_each_scenarios_cross_cars_start_and_go_as_section_8_2_says(plans):
   # 4: a cross car that arrived after us standing at its line goes on our go (out of turn), across
   a, = cross(plans['stop_allway_out_of_turn'])
   assert a.params['release'] == 'go' and a.params['through'] and a.params['side'] == 'left'
-  # 5: a cross car arrives after us at the left line and waits there (its path ends at its line)
+  # 5: a cross car arrives after us at the left line and waits there (its path ends at its line), sent up to it as the car
+  # nears its own line so it stands there before the car's go (else the go never meets the shield)
   a, = cross(plans['stop_allway_shield'])
   assert a.params['side'] == 'left' and not a.params['through'] and a.params['start'] > 15.
-  assert to_line(a, plans['stop_allway_shield']) < 20.
+  assert to_line(a, plans['stop_allway_shield']) < 20. and list(a.params['arrive']) == ['near', pytest.approx(30.)]
 
 
 def test_the_cross_trigger_releases_on_its_delay_after_the_stand_or_on_our_go():
@@ -64,6 +67,9 @@ def test_the_cross_trigger_releases_on_its_delay_after_the_stand_or_on_our_go():
   assert not cross_due({'release': 3.}, held_t=8., went=False, t=10.) and cross_due({'release': 3.}, held_t=7., went=False, t=10.)
   assert not cross_due({'release': 'go'}, held_t=1., went=False, t=10.) and cross_due({'release': 'go'}, held_t=1., went=True, t=10.)
   assert not cross_due({'release': None}, held_t=1., went=True, t=100.)
+  # ('near', m): once the car is within m of the junction, before any stand
+  assert not cross_due({'arrive': ('near', 30.)}, held_t=None, went=False, t=1., key='arrive', j_dist=31.)
+  assert cross_due({'arrive': ['near', 30.]}, held_t=None, went=False, t=1., key='arrive', j_dist=29.)
 
 
 def row(t, **kw):
@@ -88,6 +94,18 @@ def test_the_stop_sign_score_counts_goes_withdrawals_retries_handbacks_pet_and_h
   assert score.stop_sign(rows)['min_pet_s'] == pytest.approx(2., abs=0.11)
   rows = [row(k * 0.05, accel_cap=-2.5 if k == 3 else 10.) for k in range(10)]
   assert score.stop_sign(rows)['below_2'] == 1
+
+
+def test_the_shield_is_untested_unless_its_car_stood_at_its_line_before_the_go():
+  # the shield car's rows carry its at-line distance (run.py: line_m + CAR_HALF_M): at 12.3 m from 2 s on, our go at 4 s
+  at = [row(k * 0.1, cross=[[12.3 if k * 0.1 >= 2. else 30., 1., 12.3]], go_cause='stopSign' if 4. <= k * 0.1 < 4.3 else 'none')
+        for k in range(80)]
+  res = score.stop_sign(at)
+  assert res['present_t'] == pytest.approx(2.) and res['first_go_t'] == pytest.approx(4.)
+  good = dict(res, handbacks=[], below_2=0, min_pet_s=None)
+  assert score.check_stop('stop_allway_shield', good) == []
+  late = [dict(r, cross=[[12.3 if r['t'] >= 6. else 30., 1., 12.3]]) for r in at]  # it came after the go: untested
+  assert score.check_stop('stop_allway_shield', dict(score.stop_sign(late), handbacks=[], below_2=0))
 
 
 def test_check_fails_any_go_at_the_two_way_any_hard_accel_and_a_pet_under_2_s():

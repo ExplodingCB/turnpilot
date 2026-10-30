@@ -82,7 +82,8 @@ class Entry:
   dest: tuple = ()
   # the stop-sign logic gate (STOP_SIGNS.md v3 8.2, SG4c): cross cars, each (side: left, right or lead (ours, in our lane,
   # ahead of the car), start: 'line' (standing at its stop line from the start) or m back from it, arrive: s after the car's
-  # stand at its line a car starting back drives up to its line and stops there (None: it stands), release: s after that
+  # stand at its line, or ('near', m) once the car is within m of the junction, a car starting back drives up to its line
+  # and stops there (None: it stands), release: s after that
   # stand, 'go' (the car's go: out of turn when it arrived after the car) or None (never) it goes on from its line, through:
   # across the junction and away); from_stop_arm: the car's approach is the junction's arm with a stop line (a two-way)
   cross: tuple = ()
@@ -119,7 +120,9 @@ SCENARIOS = {
   # braking); cross_first: a car standing at the left line before ours arrives goes 3 s after our stand (we go after it,
   # PET 2 s or more); queue: a lead standing at our line goes 3 s after we stand behind it (a roll-up, then our own stop and
   # go); out_of_turn: a car up to the left line after our stand goes across on our go (a withdrawn go, then ours); shield: a
-  # car up to the left line after us stands there (its lane shielded: a go, no handback); two_way: only our approach
+  # car 16 m back sent up to the left line as the car comes within 30 m of the junction (about 5 s each: it stands there
+  # after our stand, before our go) waits there (its lane shielded: a go, no handback; untested if it wasn't there by the
+  # go); two_way: only our approach
   # stops (a handback, no go)
   'stop_allway_empty': Entry('straight', junction=(-768.8, 769.2), turn='right', timeout_s=90.),
   'stop_allway_cross_first': Entry('straight', junction=(-768.8, 769.2), turn='right', timeout_s=90.,
@@ -127,7 +130,8 @@ SCENARIOS = {
   'stop_allway_queue': Entry('straight', junction=(-768.8, 769.2), turn='right', timeout_s=90., cross=(('lead', 'line', None, 3., True),)),
   'stop_allway_out_of_turn': Entry('straight', junction=(-768.8, 769.2), turn='right', timeout_s=90.,
                                    cross=(('left', 10., 0., 'go', True),)),
-  'stop_allway_shield': Entry('straight', junction=(-768.8, 769.2), turn='right', timeout_s=90., cross=(('left', 25., 0.5, None, False),)),
+  'stop_allway_shield': Entry('straight', junction=(-768.8, 769.2), turn='right', timeout_s=90.,
+                              cross=(('left', 16., ('near', 30.), None, False),)),
   'stop_two_way': Entry('turn', junction=(-768.2, 872.9), turn='right', approach_m=77., timeout_s=60., from_stop_arm=True, end_on_stop_s=6.),
   # downtown: 20 m on from the bridge's default spawn (clear of the junction behind it), eastbound, to road-graph node
   # DR249_3 about 850 m east-southeast
@@ -523,7 +527,7 @@ def cross_actors(graph: RoadGraph, jn: Junction, e: Entry) -> list:
     if (start == 'line') != (arrive is None):
       raise ValueError(f"cross car {k}: a car standing at its line has no arrive, one starting back needs one")
     come, across, line = cross_path(graph, jn, side, start, through, stops)
-    params = {'side': side, 'start': start, 'arrive': arrive, 'release': release, 'through': bool(through), 'line_m': round(line, 1)}
+    params = {'side': side, 'start': start, 'arrive': arrive, 'release': release, 'through': bool(through), 'line_m': round(float(line), 1)}
     if start == 'line':
       path = across if across is not None else come
     else:

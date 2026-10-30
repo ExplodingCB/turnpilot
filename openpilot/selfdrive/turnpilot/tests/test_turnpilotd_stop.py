@@ -636,13 +636,17 @@ def oracle_msg(cars=(), range_m=60.):
   return msg.as_reader().turnpilotLights
 
 
-def test_the_sim_cross_traffic_oracle_feeds_the_decider_ground_truth_under_the_gate_and_is_refused_out_loud_off_it(tmp_path):
+@pytest.mark.parametrize('cert', [None, 'uncertifiable'])
+def test_the_sim_cross_traffic_oracle_feeds_the_decider_ground_truth_under_the_gate_and_is_refused_out_loud_off_it(tmp_path, cert):
   # STOP_SIGNS.md 8.2 (SG4c): in the sim the decider takes ground-truth cross traffic and the oracle's range as each lane's reach
   # (labelled synthetic: binding 'oracle'), only under the light oracle's gate; a car standing at the left line before our
   # arrival is an earlier arrival: we wait for it to go (3 s after our stop, pulling away through our path) and go after it.
-  # Off the gate the message is refused and said (lightSourceRejected), the cameras' reach stands
+  # Off the gate the message is refused and said (lightSourceRejected), the cameras' reach stands. navd with TurnPilotAvoidStops
+  # off (the logic gate's runs) certifies from the shipped survey, which has no sim junction: 'uncertifiable', never
+  # 'unavoidable' (avoid.run marks that only while avoiding), and that is no handback where the decider's own certification
+  # (the sim's survey under set_sim) passes
   from openpilot.selfdrive.turnpilot.tests.test_stop_go import LINE_D
-  sim = StopSim(tmp_path)
+  sim = StopSim(tmp_path, info_kw={'certification': cert} if cert else None)
   sim.tp.oracle_ok = True
   st = {'stop': None}
 

@@ -78,6 +78,7 @@ LEFT_STALLS = ('stalledTakeControl', 'cantStartTakeControl')
 STOP_GO_CAUSE = 'stopSign'
 HARD_ACCEL = -2.0
 STOP_HANDBACK = 'stopSignTakeControl'
+AT_LINE_SLACK_M = 1.5  # a cross car this close to where it stands at its line is at it
 
 
 def msg_fields(ss, cs, tp, nav, model) -> dict:
@@ -510,8 +511,11 @@ def stop_sign(rows) -> dict:
   cars = [zone_spans(rows, lambda r, k=k: r['cross'][k][0] if r.get('cross') and len(r['cross']) > k else None) for k in range(n)]
   pets = [span_gap(e, c) for e in ego for spans in cars for c in spans]
   caps = [r['accel_cap'] for r in rows if r.get('accel_cap') is not None]
+  # a cross car standing at its line (run.py's third element: where its centre stands there; AT_LINE_SLACK_M of it)
+  present_t = next((r['t'] for r in rows if any(len(c) > 2 and c[0] <= c[2] + AT_LINE_SLACK_M for c in (r.get('cross') or []))), None)
+  first_go_t = next((r['t'] for r in rows if r.get('go_cause') == STOP_GO_CAUSE), None)
   return {'goes': goes, 'go_causes': causes, 'withdrawn': withdrawn, 'retries': retries, 'handbacks': handbacks,
-          'min_pet_s': round(min(pets), 2) if pets else None,
+          'min_pet_s': round(min(pets), 2) if pets else None, 'present_t': present_t, 'first_go_t': first_go_t,
           'min_accel_cap': min(caps) if caps else None, 'below_2': len(rising(rows, lambda r: r.get('accel_cap', 10.) < HARD_ACCEL)),
           'gas': len(rising(rows, lambda r: bool(r.get('gas')))),
           'states': sorted({r['sg_state'] for r in rows if r.get('sg_state')}),
@@ -538,6 +542,9 @@ def check_stop(name: str, res: dict) -> list[str]:
     fails.append("the car and the cross car never both passed the conflict zone: the turn-taking went untested")
   elif res['min_pet_s'] is not None and res['min_pet_s'] < PET_MIN_S:
     fails.append(f"post-encroachment time {res['min_pet_s']} s with a cross car, under {PET_MIN_S} s")
+  if name == 'stop_allway_shield' and res['goes'] and 'first_go_t' in res and (res['present_t'] is None or res['first_go_t'] < res['present_t']):
+    fails.append(f"the shield car wasn't standing at its line by the go (t={res['first_go_t']}, at its line {res.get('present_t')}): " +
+                 "the shield went untested")
   if name == 'stop_allway_out_of_turn' and not res['withdrawn']:
     fails.append("never withdrew its go for the car going out of turn")
   return fails
