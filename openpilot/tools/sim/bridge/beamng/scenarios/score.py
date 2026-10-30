@@ -104,6 +104,14 @@ TURN_DESIRES = (1, 2)  # log.Desire.turnLeft, turnRight
 # The left's range skip drives on (S05 'no hold at the line ... a reroute', after_range_skip): no TurnPilot hold within
 # NEAR_JUNCTION_M of the junction after it, and a new navRoute once the car is past the junction (navd reroutes past a
 # skipped turn only: navd.skipped_turn_passed)
+# A missed turn is said at the pass (S18 'the alert within 3 s of passing the junction', missed_turn): turnMissed first
+# comes with the junction behind the car (the first row with j_ahead at or under 0) and within TURN_MISSED_S of it;
+# turnpilotd says it only for a turn its car has turned under MISSED_TURN_DEG (its own), so the car's heading has turned
+# under that (and HEADING_TOL_DEG, the game's heading against turnpilotd's yaw) from its go (the last stand before the
+# pass) when it comes, and never TURN_TAKEN_DEG through its alert: a turn taken is never a miss (1c69d2e's false miss)
+TURN_MISSED_S = 3.
+MISSED_TURN_DEG = 15.
+HEADING_TOL_DEG = 3.
 EXPECTS = ('handback', 'gasDisengage', 'skip', 'turnMissed', 'hardBrake')
 # a take-control handback holds the car while the driver is told to take control (hooks.TAKE_CONTROL_PROMPTS): from it,
 # engaged, the car goes no further than a stop from its speed then, HELD_REACT_S at that speed and HELD_DECEL after it (a
@@ -838,7 +846,7 @@ def expect_facts(rows) -> dict:
           'skip_ahead_m': ahead.get('skip'), 'range_skip_ahead_m': ahead.get('range_skip'), 'turn_missed_t': missed_t,
           'gas_t': gas_t,
           'handback_det_t': det_t, 'handback_det_age': det_age,
-          'after_range_skip': after_range_skip(rows, range_skip_t),
+          'after_range_skip': after_range_skip(rows, range_skip_t), 'missed': missed_turn(rows, missed_t),
           'held': {k: held_after(rows, t) for k, t in first['handback'].items() if k in TAKE_CONTROL_PROMPTS},
           'stood_at': {k: stood_at(rows, t) for k, t in first['handback'].items() if k in FULL_STOP_HANDBACKS},
           'go_before': {k: go_before(rows, t) for k, t in first['handback'].items() if k in GO_TIMED},
@@ -862,6 +870,60 @@ def after_range_skip(rows, t: float | None) -> dict | None:
   base = None if i is None else after[max(i - 1, 0)].get('route')
   rerouted_t = None if i is None else next((r['t'] for r in after[i:] if r.get('route') != base), None)
   return {'hold': hold, 'passed_t': passed_t, 'rerouted_t': rerouted_t, 'has_j': any(r.get('j_ahead') is not None for r in after)}
+
+
+def _heading_turn(rows, a: int, b: int) -> float | None:
+  """The most the car's heading turned either way from row a over rows a..b, in degrees; None without headings."""
+  hs = [r['heading'] for r in rows[a:b + 1] if r.get('heading') is not None]
+  if not hs or rows[a].get('heading') is None:
+    return None
+  return round(float(np.degrees(np.abs(np.unwrap(np.array(hs)) - hs[0]).max())), 1)
+
+
+def missed_turn(rows, t: float | None) -> dict | None:
+  """The first turnMissed, at t (TURN_MISSED_S): the junction's distance ahead then (ahead_m), when the car first had the
+  junction behind it (passed_t; has_j: the rows have the junction), its go (from_t: the last stand before the pass or the
+  miss, else its first row within NEAR_JUNCTION_M before the junction), and how far its heading had turned from there when
+  the miss came (turned_at_deg) and through its alert (turned_through_deg; None without headings). None without one."""
+  if t is None:
+    return None
+  i_m = next(i for i, r in enumerate(rows) if r['t'] >= t)
+  end = i_m
+  while end + 1 < len(rows) and rows[end + 1].get('turn_missed'):
+    end += 1
+  i_p = next((i for i, r in enumerate(rows) if r.get('j_ahead') is not None and r['j_ahead'] <= 0.), None)
+  ref = i_m if i_p is None else min(i_p, i_m)
+  i0 = next((i for i in range(ref, -1, -1) if rows[i]['v'] < STOPPED_V), None)
+  if i0 is None:
+    i0 = next((i for i, r in enumerate(rows) if r.get('j_dist') is not None and r['j_dist'] <= NEAR_JUNCTION_M and
+               (r.get('j_ahead') or 0.) > 0.), 0)
+  return {'t': t, 'ahead_m': rows[i_m].get('j_ahead'), 'passed_t': None if i_p is None else rows[i_p]['t'],
+          'has_j': any(r.get('j_ahead') is not None for r in rows), 'from_t': rows[i0]['t'],
+          'turned_at_deg': _heading_turn(rows, i0, i_m), 'turned_through_deg': _heading_turn(rows, i0, end)}
+
+
+def missed_problems(m: dict | None) -> list[str]:
+  """Why the turnMissed seen isn't its shot's (missed_turn): before the pass or too long after it, or with the turn taken."""
+  if m is None:
+    return []
+  out = []
+  if not m['has_j']:
+    out.append("no junction in the rows: turnMissed's timing at the pass was not checked")
+  elif m['passed_t'] is None or m['t'] < m['passed_t']:
+    ahead = f"with the junction {m['ahead_m']:.0f} m ahead" if m['ahead_m'] is not None else "with the junction ahead"
+    out.append(f"turnMissed at t={m['t']:.1f} s {ahead}: before the car passed it")
+  elif m['t'] - m['passed_t'] > TURN_MISSED_S + ROW_TOL_S:
+    out.append(f"turnMissed {m['t'] - m['passed_t']:.1f} s after the car passed the junction (t={m['passed_t']:.1f} s), over {TURN_MISSED_S} s")
+  if m['turned_at_deg'] is None:
+    out.append("no headings in the rows: whether the car turned before turnMissed was not checked")
+  else:
+    if m['turned_at_deg'] >= MISSED_TURN_DEG + HEADING_TOL_DEG:
+      out.append(f"the car had turned {m['turned_at_deg']:.0f} deg from its go at t={m['from_t']:.1f} s when turnMissed came: a miss " +
+                 f"is under turnpilotd's {MISSED_TURN_DEG:.0f} deg")
+    if m['turned_through_deg'] >= TURN_TAKEN_DEG:
+      out.append(f"the car turned {m['turned_through_deg']:.0f} deg from its go at t={m['from_t']:.1f} s through the turnMissed " +
+                 "alert: the turn was taken, not missed")
+  return out
 
 
 def range_skip_problems(a: dict | None) -> list[str]:
@@ -1038,9 +1100,12 @@ def expectations(name: str, res: dict, fails: list[tuple[str, str]], expect) -> 
           extra.append(f"a turn desire after the skip, at t={facts['desire_after_skip_t']:.1f} s")
     elif kind == 'turnMissed':
       t = facts['turn_missed_t']
-      met = t is not None
-      if not met:
+      problems = missed_problems(facts.get('missed'))
+      met = t is not None and not problems
+      if t is None:
         extra.append("expected turnMissed: none came (no turnMissed)")
+      elif problems:
+        extra += problems  # seen, but not the shot: it explains nothing
       else:
         explain(e, ('turn_missed', 'not_arrived', 'maneuvers'))
     elif kind == 'hardBrake':

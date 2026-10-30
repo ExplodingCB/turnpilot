@@ -1,6 +1,8 @@
 """A scenario's expectations (Entry.expect, or the runner's): the handback, skip, missed turn, gas press or hard braking a
 shot exists to show is required of the run, and only the generic failure it causes is explained by it, so result.json's
 verdict means what the shot shows."""
+import math
+
 import pytest
 
 import openpilot.cereal.messaging as messaging
@@ -338,12 +340,16 @@ class TestSkip:
 
 class TestTurnMissed:
   def test_the_missed_turn_is_required_and_explains_the_maneuver(self):
-    # S18: stood at the forced red 3 m short of its line (12 m before the junction), then green, pulled away straight on
+    # S18: stood at the forced red 3 m short of its line (12 m before the junction), then green, pulled away straight on,
+    # heading as it came (45 deg); turnMissed at turnpilotd's pass, 15 m past the junction, held 3 s, and the reroute
     rows = drive([(3.0, {'v': 0., 'state': 'holding', 'reason': 'Red light (sim oracle)', 'j_dist': 15., 'j_ahead': 15.,
                          'forced_light': 'red'}),
-                  (3.0, {'turn_missed': True, 'nav_dist': lambda tau: 20. - 8. * tau, 'forced_light': 'green',
-                         'j_ahead': lambda tau: 15. - 8. * tau, 'j_dist': lambda tau: abs(15. - 8. * tau)}),
-                  (3.0, {'route': 2, 'nav_dist': 150., 'nav_remaining': 400., 'forced_light': 'green'})])
+                  (3.75, {'nav_dist': lambda tau: 20. - 8. * tau, 'forced_light': 'green',
+                          'j_ahead': lambda tau: 15. - 8. * tau, 'j_dist': lambda tau: abs(15. - 8. * tau)}),
+                  (3.0, {'turn_missed': True, 'route': 2, 'nav_dist': 150., 'nav_remaining': 400., 'forced_light': 'green',
+                         'j_ahead': lambda tau: -15. - 8. * tau, 'j_dist': lambda tau: 15. + 8. * tau})])
+    for r in rows:
+      r['heading'] = math.radians(45.)
     plain = score.summarize('red_right_g62', rows, 'timeout', stop_line_m=12.)
     assert not plain['passed']
     res = score.summarize('red_right_g62', rows, 'timeout', expect=('turnMissed',), stop_line_m=12.)

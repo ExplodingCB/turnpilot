@@ -1,5 +1,7 @@
 """The shots' pass rules the expectations hold a run to (the demo skeptic's recheck at afadad3, B1 to B9): each test is a run
 that broke its shot's rule and passed, and the run that keeps it."""
+import math
+
 from openpilot.tools.sim.bridge.beamng.scenarios import score
 from openpilot.tools.sim.bridge.beamng.scenarios.tests.test_score import drive
 
@@ -357,3 +359,73 @@ class TestRangeSkipDrivesOn:
       r['left_state'] = 'off'
     res = score.summarize('too_fast_right', rows, 'past junction', expect=self.EXPECT)
     assert res['expected'][0]['met'], res['failures']
+
+
+def red_pull_away(missed_from, missed_s=3.0, turn_deg=0.):
+  """S18 (red_right_g62): up to the forced red, standing 17.1 m short of the junction, the green, the pull-away straight on
+  (or turning turn_deg its way, right, from a second before the junction over 3 s), heading 45 deg as the approach;
+  turnMissed held missed_s from missed_from(rows, passed_t). Returns the rows and when the junction was passed."""
+  def ahead(tau):
+    return 17.1 - (0.75 * tau * tau if tau < 5.33 else 21.3 + 8. * (tau - 5.33))
+  rows = drive([(6.0, {'v': lambda tau: max(8. - 1.4 * tau, 0.), 'forced_light': 'red',
+                       'j_dist': lambda tau: 40. - 8. * tau + 0.7 * tau * tau, 'j_ahead': lambda tau: 40. - 8. * tau + 0.7 * tau * tau}),
+                (8.0, {'v': 0., 'forced_light': 'red', 'state': 'holding', 'reason': 'Red light (sim oracle)', 'j_dist': 17.1, 'j_ahead': 17.1}),
+                (25.0, {'v': lambda tau: min(1.5 * tau, 8.), 'forced_light': 'green', 'j_dist': lambda tau: abs(ahead(tau)), 'j_ahead': ahead})])
+  passed_t = next(r['t'] for r in rows if r['j_ahead'] <= 0.)
+  t0 = missed_from(rows, passed_t)
+  for r in rows:
+    r['heading'] = math.radians(45. - turn_deg * min(max((r['t'] - (passed_t - 1.)) / 3., 0.), 1.))
+    r['turn_missed'] = t0 <= r['t'] < t0 + missed_s
+  return rows, passed_t
+
+
+class TestTurnMissedAtThePass:
+  """S18 'the alert within 3 s of passing the junction' (B2a, B2d): turnMissed first comes after the car has the junction
+  behind it (the first row with j_ahead at or under 0) and within TURN_MISSED_S of it, the car having turned under
+  turnpilotd's MISSED_TURN_DEG (and HEADING_TOL_DEG) from its go when it came, and never TURN_TAKEN_DEG through its alert."""
+  EXPECT = ('turnMissed',)
+
+  def score(self, rows):
+    return score.summarize('red_right_g62', rows, 'timeout', expect=self.EXPECT, stop_line_m=12.)
+
+  def test_the_miss_is_turnpilots(self):
+    from openpilot.selfdrive.turnpilot.turnpilotd import MISSED_HOLD_S, MISSED_TURN_DEG
+    assert score.MISSED_TURN_DEG == MISSED_TURN_DEG and score.TURN_MISSED_S == MISSED_HOLD_S == 3.
+
+  def test_turn_missed_before_the_junction_fails(self):
+    # the skeptic's B2a: turnMissed 16 m before the junction, on the pull-away
+    rows, p = red_pull_away(lambda rows, p: next(r['t'] for r in rows if r['t'] > 14. and r['j_ahead'] <= 16.))
+    res = self.score(rows)
+    assert not res['passed'] and not res['expected'][0]['met']
+    assert any(f.startswith("turnMissed at t=") and "with the junction 16 m ahead: before the car passed it" in f for f in res['failures']), \
+      res['failures']
+
+  def test_turn_missed_15_s_after_the_junction_fails(self):
+    rows, p = red_pull_away(lambda rows, p: p + 15.)
+    res = self.score(rows)
+    assert f"turnMissed 15.0 s after the car passed the junction (t={p:.1f} s), over 3.0 s" in res['failures'], res['failures']
+
+  def test_a_turn_taken_with_a_turn_missed_fails(self):
+    # the skeptic's B2d: the car turns 90 deg right through the junction, and a turnMissed comes at the pass all the same
+    rows, p = red_pull_away(lambda rows, p: p, turn_deg=90.)
+    res = self.score(rows)
+    assert not res['passed']
+    assert any(f.startswith("the car had turned 30 deg from its go at t=") and "when turnMissed came" in f for f in res['failures']), \
+      res['failures']
+    assert any(f.startswith("the car turned 90 deg from its go at t=") and "through the turnMissed alert: the turn was taken" in f
+               for f in res['failures']), res['failures']
+
+  def test_straight_on_and_said_at_the_pass_passes(self):
+    for after in (0., 1.5, 3.0):
+      rows, p = red_pull_away(lambda rows, p, a=after: p + a, turn_deg=5.)
+      res = self.score(rows)
+      assert res['passed'], (after, res['failures'])
+
+  def test_rows_without_the_junction_or_headings_arent_checked(self):
+    rows, p = red_pull_away(lambda rows, p: p + 1.)
+    for r in rows:
+      r['heading'] = None
+    assert any("no headings in the rows" in f and 'not checked' in f for f in self.score(rows)['failures'])
+    for r in rows:
+      r['j_ahead'] = None
+    assert any("no junction in the rows" in f and 'not checked' in f for f in self.score(rows)['failures'])
