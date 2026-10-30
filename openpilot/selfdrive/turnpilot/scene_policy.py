@@ -53,6 +53,11 @@ its motion is the tracker's, not range noise. A track the tracker published for 
 few never does: its stop brakes on the comfortable curve (no accel cap, a speed cap no lower than STOP_DECEL takes).
 Every hard brake is logged at its start with the track's evidence (turnpilot.hard_brake) and is raised to the driver
 (SceneDecision.hard_brake: turnpilotd's controlAlert hardBrake).
+In the path, for this rule, includes the crosswalk the turn is about to cross (Kellen's reading, delegated 2026-10-30: "we
+don't want to kill Chase but we do want a good demo"; BUILD_FINDINGS N2): a confirmed walker in the turn side's crosswalk
+zone (junction_stops) is in the turn's path though in_path's corridor straight ahead doesn't hold them, so the crosswalk
+hold may harden on that walker's confirmation alone (may_harden=confirmed_track), as BeamNG S03's hold did for a confirmed
+walker 2.7 m to the turn side (in_path false). Everything else about it stands: confirmed, ranged, published, steady.
 """
 import math
 from collections import deque
