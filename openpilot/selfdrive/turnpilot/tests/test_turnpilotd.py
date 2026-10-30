@@ -9,7 +9,7 @@ from opendbc.car.structs import car
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import custom, log
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, CLEAR_DESIRE, lane_change_events, plan_accel
+from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, CLEAR_DESIRE, SPEED_CAP_ACCEL_MIN, TAKE_CONTROL_PROMPTS, lane_change_events, plan_accel
 from openpilot.selfdrive.turnpilot.lane_planner import LANE_UNKNOWN_REASON, LC_WARN_S, lane_change_window
 from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN, LinePaint
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, NO_ACCEL_CAP, ONCOMING_TTA_S, PED_STOP_GAP_M
@@ -19,8 +19,8 @@ from openpilot.selfdrive.turnpilot.turn_skip import MIN_FIRST_PULSE_M
 from openpilot.selfdrive.turnpilot.route_follower import Maneuver, classify
 from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP, POST_GO_PROFILES, V_TURN_MIN
 from openpilot.selfdrive.turnpilot.turnpilotd import (CAR_UNKNOWN_REASON, DETECTOR_DEADLINE_S, DETECTOR_START_DEADLINE_S, NO_LONG_REASON,
-                                                       GAS_DISENGAGE_REASON, LEFT_NO_MOVE_S, NEAR_CONTROL_STAND_S, NO_MOVE_REASON, NO_MOVE_S,
-                                                       SIGNAL_STOPPED_REASON, STALL_PROMPT_S, STALLED_REASON,
+                                                       GAS_DISENGAGE_REASON, GO_LINE_M, LEFT_NO_MOVE_S, NEAR_CONTROL_STAND_S, NO_MOVE_REASON, NO_MOVE_S,
+                                                       SIGNAL_STOPPED_REASON, STALL_MIN_DEG, STALL_PROMPT_S, STALLED_REASON,
                                                        STOPPED_HANDBACK_S, STOPPED_LEAD_M, STOPPED_NOTE, STOPPED_NOTE_S, STOPPED_REASON,
                                                        TURN_MISSED_REASON, WAITING_REASON, TurnPilot, long_control_for)
 from openpilot.selfdrive.turnpilot.handback import Handback
@@ -2440,6 +2440,28 @@ def test_a_go_past_the_hold_line_under_20_deg_in_is_handed_back_as_a_stall_never
   go_from_the_hold(sim)
   assert sim.distance() >= HOLD_LINE_M
   assert stand(sim, NO_MOVE_S + 0.2)[-1].controlPrompt == 'cantStartTakeControl'
+
+
+def test_a_go_from_the_line_that_creeps_into_the_junction_and_stands_there_is_handed_back_as_a_stall():
+  """Skeptic G3 (residual): a go from the hold line; the model pulls away past 0.3 m/s (the no-move clock is done with) and
+  creeps to 5 m before the maneuver point, past GO_LINE_M in the cross street's lanes, 5.5 deg turned, and stands. The stall
+  handback keyed on where the go was (go_in_junction) and on STALL_MIN_DEG, never on where the car is now, so nothing loud
+  came for 89.95 s (a status note at 5 s, carStoppedTakeControl at 90 s: the signal close behind it). Standing in the
+  junction (not go_at_line) is the stall's from 0 deg: stalledTakeControl after STALL_PROMPT_S, no hold, never -2.0"""
+  sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
+  go_from_the_hold(sim)
+  n = 0
+  while sim.distance() > 5.:
+    sim.v = 0.5
+    sim.step(engaged=True, yaw_rate=0.01)
+    n += 1
+    assert n < 2000
+  assert sim.distance() < GO_LINE_M and sim.tp.desires.turned_deg < STALL_MIN_DEG and not sim.tp.go_in_junction
+  plans = stand(sim, STALL_PROMPT_S + 0.5)
+  loud = next(i for i, p in enumerate(plans) if p.controlPrompt in TAKE_CONTROL_PROMPTS)
+  assert plans[loud].controlPrompt == 'stalledTakeControl' and loud * DT_MDL <= STALL_PROMPT_S + 0.2
+  assert not any(p.shouldStop for p in plans)
+  assert all(plan_accel(p.accelCap, p.speedCap, v) >= SPEED_CAP_ACCEL_MIN - 1e-6 for _, v, p in sim.trace)
 
 
 def test_a_go_at_the_hold_line_already_into_the_turn_is_still_withdrawn():

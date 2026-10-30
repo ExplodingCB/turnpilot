@@ -1430,10 +1430,12 @@ class TurnPilot:
   def stalled_in_turn(self, sm, cs, v_ego: float, acting: bool, decision, mapd) -> bool:
     """The car has stood STALL_PROMPT_S in the turn a hold let go of, with nothing holding it (module docstring): hand
     back. The stop line it left is close behind it, so stopped_unheld would wait NEAR_CONTROL_STAND_S. From STALL_MIN_DEG
-    into the turn, or from its start if the go came in the junction (go_in_junction: never withdrawn, never silent)."""
+    into the turn, or from its start if the go came in the junction (go_in_junction: never withdrawn, never silent) or the
+    car stands in it now (not go_at_line: a go from the line it crept on from into the cross street's lanes, skeptic G3,
+    89.95 s silent at 5.5 deg)."""
     d, rf = self.desires, self.follower
     in_turn = self.go_id is not None and self.go_id == d.maneuver_id == rf.maneuver_id and \
-      (self.go_in_junction or STALL_MIN_DEG <= d.turned_deg) and d.turned_deg <= STALL_MAX_DEG
+      (self.go_in_junction or not self.go_at_line(rf.distance) or STALL_MIN_DEG <= d.turned_deg) and d.turned_deg <= STALL_MAX_DEG
     stalled = acting and in_turn and sm['carControl'].enabled and v_ego < STANDSTILL_SPEED and not decision.should_stop and \
       not self.go_withdrawn and \
       not decision.holding and not close_lead(sm['modelV2']) and not cs.gasPressed and not cs.brakePressed and \
