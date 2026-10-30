@@ -640,12 +640,13 @@ def _fails(name: str, res: dict) -> list[tuple[str, str]]:
         fails.append(('left_wait', "never waited for oncoming traffic"))
       if not lr['gos']:
         fails.append(('left_go', "never went at the unprotected left"))
-      if lr['false_goes']:
-        x = lr['false_goes'][0]
-        fails.append(('left_false_go', f"{len(lr['false_goes'])} false go(es): at t={x['t']:.1f} s an oncoming car {x['tta_s']} s from " +
-                      f"the junction (tReq {x['t_req']} s)"))
-      if lr['pet_s'] is not None and lr['pet_s'] < PET_MIN_S:
-        fails.append(('left_pet', f"post-encroachment time {lr['pet_s']} s with an oncoming car, under {PET_MIN_S} s"))
+    # every go's safety, whatever the left ended in: a go withdrawn before an undecided handback is still a go
+    if lr['false_goes']:
+      x = lr['false_goes'][0]
+      fails.append(('left_false_go', f"{len(lr['false_goes'])} false go(es): at t={x['t']:.1f} s an oncoming car {x['tta_s']} s from " +
+                    f"the junction (tReq {x['t_req']} s)"))
+    if lr['pet_s'] is not None and lr['pet_s'] < PET_MIN_S:
+      fails.append(('left_pet', f"post-encroachment time {lr['pet_s']} s with an oncoming car, under {PET_MIN_S} s"))
     if lr['stalls']:
       fails.append(('stall', f"stalled or never moved on its go ({', '.join(lr['stalls'])})"))
     if lr['turn_missed']:

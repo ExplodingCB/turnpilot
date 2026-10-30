@@ -102,3 +102,34 @@ def test_a_go_with_the_view_blocked_and_a_creep_too_far_fail():
   res = score.summarize('unprotected_left_occluded', left_rows(creep_to=ul.CREEP_MAX_M + 2.), 'timeout')
   assert any('crept' in f for f in res['failures']), res['failures']
   assert score.summarize('unprotected_left_occluded', left_rows(), 'timeout')['left']['creep_m'] == pytest.approx(3.5, abs=0.1)
+
+
+def withdrawn_go_rows(into_zone=False):
+  """left_rows' blocked creep and undecided handback, but with the view clear from 8 to 11 s and a go at 10 s, the stream
+  car 22 m from the junction at 11 m/s (1.3 s from the conflict zone, under tReq), withdrawn 1 s on: 2 m on, or into the
+  conflict zone as the car passes through it (into_zone)."""
+  rows = left_rows()
+  for r in rows:
+    t = r['t']
+    if 8. <= t < 11.:
+      r['left_blocked'] = False
+    if 10. <= t:
+      gone = min(t - 10., 1.) * (7. if into_zone else 2.)
+      r['j_dist'] = r['j_ahead'] = round(14.5 - gone, 2)
+    if 10. <= t < 11.:
+      r.update(left_state='go', v=7. if into_zone else 2., control_prompt='leftGo')
+  return rows
+
+
+def test_a_false_go_or_a_close_pass_fails_even_when_it_ends_undecided():
+  # demo skeptic (score._fails): with undecided_t set the false-go and PET checks never ran, and the occluded rule takes
+  # the blocked undecided as the fault it is, so a withdrawn go into an oncoming car passed
+  res = score.summarize('unprotected_left_occluded', withdrawn_go_rows(), 'timeout')
+  lr = res['left']
+  assert lr['undecided_t'] == pytest.approx(25.) and lr['blocked_at_undecided'] and not lr['go_blocked']
+  assert any(f.startswith("1 false go(es): at t=10.0 s an oncoming car 1.27 s from the junction") for f in res['failures']), res['failures']
+  res = score.summarize('unprotected_left_occluded', withdrawn_go_rows(into_zone=True), 'timeout')
+  assert any(f.startswith("post-encroachment time 0.0 s with an oncoming car") for f in res['failures']), res['failures']
+  assert not res['passed']
+  # the blocked undecided alone still passes (test_undecided_with_the_view_blocked_passes_the_occluded_left_only)
+  assert score.summarize('unprotected_left_occluded', left_rows(), 'timeout')['passed']
