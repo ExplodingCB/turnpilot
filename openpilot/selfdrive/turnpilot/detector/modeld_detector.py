@@ -53,12 +53,19 @@ detections, so nothing stops, caps or releases on one.
 Nothing here runs unless TurnPilotEnabled is set and the compiled pkl for this device and camera size exists
 (compile_detector.py builds it; the pkls are not in git).
 
+SIM ONLY, the demo's stale-detection fault (DetectorHost.sim_drop): with SIMULATION=1, TurnPilotSimDropDetectionsS set to
+S > 0 (the scenario runner's --drop-detections-at; CLEAR_ON_MANAGER_START) skips every detector step for S s from the
+check that first reads it, so turnpilotd's deadline hands back as it would for a detector gone silent. A value still set
+after its drop is no new drop; only a new value is. Without SIMULATION=1 the param is never read, so nothing on the car
+can trigger it, and with it unset nothing changes.
+
 Once it's on it stays on for the drive, and nothing here turns it off quietly: without fresh detections turnpilotd hands
 control back to the driver (a soft disable), so every gap is loud. A slow spell only skips frames until a forced run,
 inside turnpilotd's deadline, measures the time again, a failed run is retried with a backoff and logged, a mid-drive
 TurnPilotEnabled starts it, and a fallback to the small driving model switches to that model's detector, where one
 exists.
 """
+import os
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -122,6 +129,7 @@ SIDE_OVERRUNS = 3          # of the last TIME_WINDOW side runs pushing the step 
 SIDE_STATUS_S = 0.5        # sideViewStatus noRoom: the gate open this long with no side run
 SWEEP_SIGNAL_M = 60.       # during a sweep the light reader reads colour only with a signal mapped within this
 STOP_SIGNS_DEFAULT = 'shadow'  # TurnPilotCameraStopSigns: off, or shadow (logged, never acted on)
+SIM_DROP_PARAM = 'TurnPilotSimDropDetectionsS'  # SIM ONLY (module docstring): s of no detector, read only with SIMULATION=1
 LanePaintStatus = custom.TurnpilotDetections.LanePaintStatus
 LightStatus = custom.TurnpilotDetections.LightStatus
 FarStatus = custom.TurnpilotDetections.FarStatus
@@ -181,6 +189,18 @@ def camera_stop_signs_mode(params) -> str:
     return STOP_SIGNS_DEFAULT
   value = value.decode() if isinstance(value, bytes) else value
   return 'off' if value == 'off' else STOP_SIGNS_DEFAULT
+
+
+def sim_drop_seconds(params) -> float:
+  """TurnPilotSimDropDetectionsS as seconds, 0 when unset or unreadable; UnknownKeyName from a build without it. Called
+  only with SIMULATION=1 (DetectorHost)."""
+  value = params.get(SIM_DROP_PARAM)
+  if isinstance(value, bytes):
+    value = value.decode()
+  try:
+    return max(float(value), 0.) if value not in (None, '') else 0.
+  except (TypeError, ValueError):
+    return 0.
 
 
 def plan_inputs(plan) -> tuple[str, float, bool]:
@@ -914,9 +934,15 @@ class DetectorHost:
   once. That needs a pkl compiled on the small model's device, and models/ has only the chestnut's, so today a fallback
   leaves the detector off (logged), which turnpilotd sees as an unavailable scene."""
 
-  def __init__(self, params, cam_w: int, cam_h: int, main_wide_camera: bool, use_extra_client: bool, models: list, load_fn=None):
-    """models: the driving models modeld may run (the active one first); None and repeats are skipped."""
+  def __init__(self, params, cam_w: int, cam_h: int, main_wide_camera: bool, use_extra_client: bool, models: list, load_fn=None,
+               environ=None):
+    """models: the driving models modeld may run (the active one first); None and repeats are skipped. environ: the
+    process environment (os.environ), read once here for SIMULATION."""
     self.params = params
+    self.sim = (os.environ if environ is None else environ).get('SIMULATION') == '1'  # the sim drop's gate (module docstring)
+    self.drop_until = 0.  # SIM ONLY: no detector step before this (time.monotonic())
+    self.drop_seen = 0.   # SIM ONLY: the drop param's value at the last check
+    self.drop_unknown = False  # SIM ONLY: the build's params don't know it (said once)
     self.args = (cam_w, cam_h, main_wide_camera, use_extra_client)
     self.models = [m for i, m in enumerate(models) if m is not None and all(m is not n for n in models[:i])]
     self.load_fn = load_fn or load
@@ -936,7 +962,25 @@ class DetectorHost:
       self.light_mode = camera_lights_mode(self.params)
       self.far_on = far_crop_on(self.params)
       self.signs_mode = camera_stop_signs_mode(self.params)
+      if self.sim:
+        self.sim_drop(now)
     return self.enabled
+
+  def sim_drop(self, now: float) -> None:
+    """SIM ONLY (module docstring): a new TurnPilotSimDropDetectionsS value S > 0 starts S s of no detector from now."""
+    try:
+      value = sim_drop_seconds(self.params)
+    except UnknownKeyName:
+      if not self.drop_unknown:
+        cloudlog.error(f"turnpilot: {SIM_DROP_PARAM} unknown to this build's params, no sim detection drop; run scons")
+      self.drop_unknown, value = True, 0.
+    if value > 0. and value != self.drop_seen:
+      self.drop_until = now + value
+      cloudlog.warning(f"turnpilot detector: SIMULATION, {SIM_DROP_PARAM} {value:.1f}: no detector runs for {value:.1f} s")
+    self.drop_seen = value
+
+  def dropping(self, now: float) -> bool:
+    return self.sim and now < self.drop_until
 
   def load(self) -> None:
     self.detectors = [(m, self.load_fn(m, *self.args)) for m in self.models]
@@ -946,7 +990,7 @@ class DetectorHost:
     """Called once per model frame after modelV2 is sent, with the model that made it. view, far_bearing, signal_near:
     plan_inputs of turnpilotPlan; v_ego: carState.vEgo."""
     try:
-      if not self.check_enabled(time.monotonic()):
+      if not self.check_enabled(time.monotonic()) or self.dropping(time.monotonic()):
         return
       if self.detectors is None:
         if engaged:

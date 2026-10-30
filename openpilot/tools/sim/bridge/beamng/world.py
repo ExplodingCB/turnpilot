@@ -17,8 +17,8 @@ from beamngpy import BeamNGpy, Scenario, Vehicle
 from beamngpy.sensors import AdvancedIMU, Electrics
 
 from openpilot.tools.sim.bridge.beamng import frame, scenario
-from openpilot.tools.sim.bridge.beamng.cameras import MOUNT, CameraRig
-from openpilot.tools.sim.bridge.beamng.pose import Pose, after_last_jump
+from openpilot.tools.sim.bridge.beamng.cameras import MOUNT, MOUNT_ABOVE_ROAD_M, CameraRig
+from openpilot.tools.sim.bridge.beamng.pose import Pose, after_last_jump, car_speed
 from openpilot.tools.sim.bridge.beamng.tesla import GEAR_D, GEAR_N, GEAR_P, GEAR_R, GameLights
 from openpilot.tools.sim.lib.common import SimulatorState, World, vec3
 
@@ -54,6 +54,9 @@ class BeamNGConfig:
   # verified record written before the car's first CAN (bridge.car_signals_at_start). On by default in the sim, so the game's
   # indicator lights and the autonomous left goes on a signalled left; run_bridge.py --no-car-signals writes it off
   car_signals: bool = True
+  # where openpilot's wheel speeds come from (pose.car_speed): 'ground', the car's travel (the IMU pose); 'wheels',
+  # electrics.wheelspeed, which over-reads 10-20% while the car speeds up or brakes (BeamNG build findings D4-speed)
+  speed_source: str = 'ground'
 
 
 def load_scenario(bng, cfg: BeamNGConfig, log=print) -> tuple[Vehicle, float]:
@@ -94,7 +97,8 @@ def load_scenario(bng, cfg: BeamNGConfig, log=print) -> tuple[Vehicle, float]:
 class BeamNGState(SimulatorState):
   def __init__(self):
     super().__init__()
-    self.wheel_speed = 0.0
+    self.wheel_speed = 0.0  # m/s, what openpilot's wheel speeds say (BeamNGConfig.speed_source)
+    self.wheel_speed_electrics = 0.0  # m/s, electrics.wheelspeed (negative in reverse), logged beside it
     self.gear = GEAR_D
     self.user_torque_nm = 0.0
     self.position = vec3(0, 0, 0)
@@ -208,7 +212,7 @@ class BeamNGWorld(World):
           history.clear()
           latest = latest[k - len(seam):]
         history.extend(latest)
-        self.pose = Pose(history, latest)
+        self.pose = Pose(history, latest, ground_h=MOUNT_ABOVE_ROAD_M)
       time.sleep(max(0.0, 0.02 - (time.monotonic() - t0)))
 
   # *** World ***
@@ -236,7 +240,8 @@ class BeamNGWorld(World):
     state.a_long = pose.a_long
     state.gear = GEARS.get(str(el.get('gear', 'D')), GEAR_D)
     speed = float(el.get('wheelspeed', 0.0))
-    state.wheel_speed = -speed if state.gear == GEAR_R else speed
+    state.wheel_speed_electrics = -speed if state.gear == GEAR_R else speed
+    state.wheel_speed = car_speed(speed, pose.v_fwd, state.gear == GEAR_R, self.cfg.speed_source)
     state.steering_angle = -float(el.get('steering_input', 0.0)) * self.cfg.steer_lock_deg * TESLA_STEER_RATIO
     state.valid = True
 

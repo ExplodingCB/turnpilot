@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # openpilot as a comma four in a Tesla Model 3, fed by the BeamNG bridge (run_bridge.py). Like tools/sim/launch_openpilot.sh,
-# but a Model 3 with alpha longitudinal instead of a Civic, and loggerd left on so every run leaves an rlog.
+# but a Model 3 with alpha longitudinal instead of a Civic, and loggerd and logmessaged left on so every run leaves an rlog
+# with cloudlog's records in it.
 # OPENPILOT_ROOT picks the (built) checkout to run; extra processes to block go in BLOCK, e.g. BLOCK=turnpilotd for gate1.py.
 
 export PASSIVE="0"
@@ -10,7 +11,13 @@ export SKIP_FW_QUERY="1"
 export FINGERPRINT="TESLA_MODEL_3"
 
 # the bridge is camerad; encoderd writes lossless video on PC, too heavy for the Mac
-export BLOCK="${BLOCK},camerad,encoderd,micd,logmessaged,manage_athenad"
+export BLOCK="${BLOCK},camerad,encoderd,micd,manage_athenad"
+# logmessaged runs with loggerd: it publishes cloudlog's records as logMessage, which loggerd writes to the rlog, so a run's
+# rlog says why TurnPilot did what it did (turnpilot.go_not_certified, ...). Upstream's sim blocks it with loggerd, having
+# no rlog to carry them; a BLOCK that leaves loggerd out here leaves logmessaged out with it, for the same reason
+if [[ ",${BLOCK}," == *",loggerd,"* ]]; then
+  export BLOCK="${BLOCK},logmessaged"
+fi
 if [[ "$CI" ]]; then
   export BLOCK="${BLOCK},ui"
 fi

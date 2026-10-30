@@ -13,6 +13,7 @@ from multiprocessing import Queue
 
 from openpilot.tools.sim.bridge.common import control_cmd_gen
 from openpilot.tools.sim.bridge.beamng.bridge import BeamNGBridge
+from openpilot.tools.sim.bridge.beamng.pose import SPEED_SOURCES
 from openpilot.tools.sim.bridge.beamng.world import BeamNGConfig
 
 
@@ -51,6 +52,9 @@ def parse_args(add_args=None):
                  help="the car signals TurnPilot's turns itself (default on): writes TurnPilotCarSignals on and a sim verified " +
                       "record (SIM ONLY: card takes a sim record only with SIMULATION=1); --no-car-signals writes it off, the " +
                       "driver prompted")
+  p.add_argument('--speed-source', choices=SPEED_SOURCES, default=d.speed_source,
+                 help="openpilot's wheel speeds from the car's travel (ground, the IMU pose) or electrics.wheelspeed (wheels, " +
+                      "which over-reads 10-20%% while the car speeds up or brakes)")
   return p.parse_args(add_args)
 
 
@@ -68,6 +72,9 @@ def light_oracle(args):
   try:
     yield oracle
   finally:
+    if oracle is not None and oracle.poll() is not None:  # it ended during the drive: light_oracle.EXIT_NOT_READY, a crash
+      print(f"warning: the light oracle exited ({oracle.returncode}) during the drive: every light unknown since; its log says why",
+            flush=True)
     if oracle is not None:
       oracle.terminate()
       try:
@@ -81,7 +88,7 @@ def config_from_args(args) -> BeamNGConfig:
   return BeamNGConfig(host=args.host, port=args.port, level=args.level, model=args.model, spawn_pos=args.spawn, spawn_rot=args.rot,
                       reload=args.reload, camera_update=args.camera_update, camera_poll=args.camera_poll, lean=not args.no_lean,
                       green=not args.signals, capture=args.capture, capture_fps=args.capture_fps,
-                      restore=args.restore_on_exit, car_signals=args.car_signals)
+                      restore=args.restore_on_exit, car_signals=args.car_signals, speed_source=args.speed_source)
 
 
 def main():

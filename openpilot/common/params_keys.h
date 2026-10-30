@@ -102,6 +102,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"TurnPilotMapCoverageStatus", {CLEAR_ON_MANAGER_START, JSON}},
     {"TurnPilotMapStatus", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, JSON}},
     {"TurnPilotSimLightOracle", {CLEAR_ON_MANAGER_START, BOOL}},
+    {"TurnPilotSimDropDetectionsS", {CLEAR_ON_MANAGER_START, FLOAT}},
     {"TurnPilotYellowDecel", {PERSISTENT, FLOAT, "2.0"}},
     {"TurnPilotCameraLights", {PERSISTENT, STRING, "shadow"}},
     {"TurnPilotPostGoProfile", {PERSISTENT, STRING, "graduated"}},

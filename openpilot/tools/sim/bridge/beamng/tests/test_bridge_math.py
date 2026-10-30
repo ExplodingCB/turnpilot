@@ -5,7 +5,8 @@ import numpy as np
 # no beamngpy here: these run without the game's client library installed
 from openpilot.tools.sim.bridge.beamng import frame
 from openpilot.tools.sim.bridge.beamng.control import AccelController
-from openpilot.tools.sim.bridge.beamng.pose import Pose, after_last_jump, beamng_quat
+from openpilot.tools.sim.bridge.beamng.pose import (STANDSTILL_MPS, WHEELS_STOPPED_MPS, Pose, after_last_jump, beamng_quat,
+                                                    car_speed)
 from openpilot.tools.sim.bridge.beamng.scenario import heading_quat
 
 
@@ -43,6 +44,48 @@ class TestPose:
     assert after_last_jump(rs) == 6
     rs[8:] = [imu_reading(i * 0.01, (-300.0, 0.0, 0.0), 0.0) for i in range(8, 10)]
     assert after_last_jump(rs) == 8
+
+
+class TestGroundSpeed:
+  """The car's speed for openpilot (BeamNG build findings D4-speed): electrics.wheelspeed over-read by 10-20% while the car
+  sped up or braked (smoke S08 14% on its braking approach, diag S02 19.5% on the rolling start), so turnpilotd's route
+  follower, dead-reckoning navd's readings on vEgo, put the junction 6-13 m too near. The pose's ground velocity is what the
+  car really does: the forward speed of the road-level point under the IMU, which the body's pitch doesn't swing."""
+  def test_forward_speed_on_a_straight_and_in_a_turn(self):
+    hist = [imu_reading(i * 0.01, (0.0, 10.0 * i * 0.01, 0.0), math.pi / 2) for i in range(10)]
+    assert abs(Pose(hist, hist[-2:], ground_h=1.34).v_fwd - 10.0) < 1e-6
+    v, r = 8.0, 0.3  # a left turn: along the arc
+    hist = [imu_reading(i * 0.01, (v / r * math.sin(r * i * 0.01), v / r * (1 - math.cos(r * i * 0.01)), 0.0), r * i * 0.01)
+            for i in range(10)]
+    assert abs(Pose(hist, hist[-2:], ground_h=1.34).v_fwd - v) < 0.01
+
+  def test_backwards_is_negative(self):
+    hist = [imu_reading(i * 0.01, (-2.0 * i * 0.01, 0.0, 0.0), 0.0) for i in range(10)]
+    assert abs(Pose(hist, hist[-2:]).v_fwd + 2.0) < 1e-6
+
+  def test_a_pitching_body_at_a_standstill_reads_no_speed(self):
+    # stopped, the body rocking nose-down at 0.15 rad/s about a point on the road: the windshield mount, 1.34 m up, swings
+    # forward at about 0.2 m/s, the road under it doesn't move
+    h, q = 1.34, 0.15
+    hist = []
+    for i in range(10):
+      t = i * 0.01
+      th = q * t  # pitch, nose down
+      fwd, up = [math.cos(th), 0.0, -math.sin(th)], [math.sin(th), 0.0, math.cos(th)]
+      hist.append({'time': t, 'pos': [h * math.sin(th), 0.0, h * math.cos(th)], 'dirX': fwd, 'dirY': up, 'dirZ': [0.0, -1.0, 0.0],
+                   'accSmooth': [0.0, 0.0, 0.0]})
+    p = Pose(hist, hist[-2:], ground_h=h)
+    assert float(np.dot(p.vel, p.fwd)) > 0.15  # the mount itself
+    assert abs(p.v_fwd) < 1e-3
+
+  def test_car_speed_from_the_ground_and_the_wheels(self):
+    assert car_speed(9.3, 8.1) == 8.1  # the wheels over-reading: the ground
+    assert car_speed(0.0, 0.004) == 0.0  # standing: no jitter, ESP_vehicleStandstillSts holds
+    assert car_speed(WHEELS_STOPPED_MPS / 2, STANDSTILL_MPS * 2) == STANDSTILL_MPS * 2  # sliding: what the car does
+    assert car_speed(0.5, 0.4) == 0.4  # creeping
+    assert car_speed(2.0, -1.8, reverse=True) == -1.8 and car_speed(2.0, 1.8, reverse=True) == -1.8  # reverse: negative, as before
+    assert car_speed(9.3, 8.1, source='wheels') == 9.3 and car_speed(9.3, 8.1, reverse=True, source='wheels') == -9.3
+    assert car_speed(9.3, None) == 9.3  # no pose yet: the wheels
 
 
 class TestFrame:

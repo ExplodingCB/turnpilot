@@ -5,6 +5,25 @@ import numpy as np
 
 GRAVITY = 9.81
 TELEPORT_JUMP = 2.0  # m between 100 Hz IMU readings
+# the car's speed for openpilot (car_speed): the pose's, standing when the wheels have stopped and the road under the IMU
+# moves slower than STANDSTILL_MPS (a settling body's jitter is no speed: ESP_vehicleStandstillSts holds)
+WHEELS_STOPPED_MPS = 0.1
+STANDSTILL_MPS = 0.3
+SPEED_SOURCES = ('ground', 'wheels')
+
+
+def car_speed(wheelspeed: float, v_fwd: float | None, reverse: bool = False, source: str = 'ground') -> float:
+  """The car's speed for openpilot's wheel speeds, m/s, negative in reverse. source 'ground': the pose's forward speed of
+  the road under the IMU (Pose.v_fwd), the wheels' only before the first pose; 'wheels': electrics.wheelspeed, which over-read
+  by 10-20% while the car sped up or braked (BeamNG smoke S08's braking approach, diag S02's rolling start), so turnpilotd's
+  route follower, dead-reckoning navd's readings on vEgo, put the junction 6-13 m too near (build findings D4-speed)."""
+  if source == 'wheels' or v_fwd is None:
+    speed = float(wheelspeed)
+  elif abs(wheelspeed) < WHEELS_STOPPED_MPS and abs(v_fwd) < STANDSTILL_MPS:
+    speed = 0.
+  else:
+    speed = abs(float(v_fwd))
+  return -abs(speed) if reverse else speed
 
 
 def after_last_jump(readings: list, jump: float = TELEPORT_JUMP) -> int:
@@ -42,7 +61,9 @@ class Pose:
   not the documented sensor frame, while the axes in dirX/dirY/dirZ are exact."""
   WINDOW = 0.05  # s of readings to difference for velocity and angular rate
 
-  def __init__(self, history, latest):
+  def __init__(self, history, latest, ground_h: float = 0.):
+    """ground_h: m from the sensor down its up axis to the road, for v_fwd, the forward speed of the road under it: the
+    sensor's own swings with the body's pitch (1.34 m up at the windshield, about 0.2 m/s rocking on a stop)."""
     r1 = history[-1]
     r0 = next((r for r in reversed(history) if r1['time'] - r['time'] >= self.WINDOW), history[0])
     self.t_sim = r1['time']
@@ -52,13 +73,15 @@ class Pose:
     dt = r1['time'] - r0['time']
     if dt > 0:
       self.vel = (self.pos - np.array(r0['pos'])) / dt
+      ground0 = np.array(r0['pos']) - ground_h * np.array(r0['dirY'])
+      self.v_fwd = float((self.pos - ground_h * up - ground0) @ fwd) / dt
       # world angular velocity from the orientation change: dR/dt = [w]x R
       R0 = np.array([r0['dirX'], r0['dirY'], r0['dirZ']]).T
       R1 = np.array([fwd, up, right]).T
       Wm = (R1 @ R0.T - np.eye(3)) / dt
       omega = np.array([Wm[2, 1] - Wm[1, 2], Wm[0, 2] - Wm[2, 0], Wm[1, 0] - Wm[0, 1]]) / 2
     else:
-      self.vel, omega = np.zeros(3), np.zeros(3)
+      self.vel, omega, self.v_fwd = np.zeros(3), np.zeros(3), 0.
     acc = np.mean([r['accSmooth'] for r in latest], axis=0)  # kinematic, in sensor axes (is_using_gravity=False)
     # the car's acceleration from its forward speed across the history (logged as a_long): accSmooth bounces with the
     # suspension (single readings of +-3 m/s^2 at a steady speed)

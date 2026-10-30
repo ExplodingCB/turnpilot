@@ -79,6 +79,13 @@ class GoWatch:
       self.went = True
 
 
+def step_out_distance(v: float, p: dict) -> float:
+  """m ahead of the car a stepping-out walker (catalog: ped_step_out) sets off at, the car at v m/s: so that once she is
+  in its corridor (enter_s after her first step) and react_s more has gone, stopping PED_STOP_GAP_M short of her (gap_m)
+  needs decel m/s^2. p: the walker's params (decel, gap_m, enter_s, react_s)."""
+  return v ** 2 / (2. * p['decel']) + p['gap_m'] + v * (p['enter_s'] + p['react_s'])
+
+
 def profile_times(s_nodes, v: float, accel: float, s_change: float = math.inf, v_change: float = 0.0,
                   dt: float = PROFILE_DT) -> list[float]:
   """Seconds from a standing start to reach each arc length in s_nodes (increasing): speed up at `accel` to v, and from

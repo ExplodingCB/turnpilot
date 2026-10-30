@@ -10,7 +10,11 @@ wall time and camera sensors render nothing while it is paused, so a replay can'
 frame by frame. Teleporting needs only the log, so it also covers drives recorded before this existed.
 
 The poses come from the drive's IMU pose log, cleaned and moved onto the game's clock by chase_track.py. Scenario
-actors logged with the run (`actor_poses`) are put back too: the mannequin as a prop, cars as etk800s.
+actors logged with the run (`actor_poses`) are put back too: the mannequin as a prop, cars as etk800s. So are the
+lights and the ego's indicator the run logged (chase_track.Replay): a forced light's states from its light_events, the
+light oracle's readings of the others, carState's blinkers. A light nothing logged shows what the render's world shows
+(every light green and held, as the bridge without --signals): the sidecar says which were replayed, and whether the
+run's own lights were running (signals_running), so a lamp the log can't vouch for is captioned as not the run's.
 
 Run it with the game free: after the drive, with the bridge stopped (it teleports the ego the bridge drives).
 
@@ -30,7 +34,8 @@ from beamngpy.sensors import Camera
 from openpilot.tools.sim.bridge.beamng import scenario
 from openpilot.tools.sim.bridge.beamng.cameras import bng_recv, bng_send, fingerprint
 from openpilot.tools.sim.bridge.beamng.capture import CH, CHASE_DIR, CHASE_POS, CW
-from openpilot.tools.sim.bridge.beamng.chase_track import POSE_LAG_S, actor_at, ego_at, ego_track, teleport_pos
+from openpilot.tools.sim.bridge.beamng.chase_track import POSE_LAG_S, Replay, actor_at, ego_at, ego_track, lamp_timeline, light_timeline, teleport_pos
+from openpilot.tools.sim.bridge.beamng.scenarios.director import LIGHT_STATES
 from openpilot.tools.sim.bridge.beamng.world import BeamNGConfig, load_scenario
 
 FPS = 20
@@ -133,10 +138,21 @@ class Renderer:
     self.poller.disconnect()
 
 
-def write_sidecar(video: str, start: float, frames: int, lag: float, source: str):
+def write_sidecar(video: str, start: float, frames: int, lag: float, source: str, replayed: dict | None = None):
   with open(f"{video}.start.json", 'w') as f:
     json.dump({'start': start, 'end': start + (frames - 1) / FPS, 'frames': frames, 'fps': FPS, 'source': source,
-               'pose_lag_s': lag}, f)
+               'pose_lag_s': lag, **(replayed or {})}, f)
+
+
+def replayed_note(doc: dict, replay: Replay) -> dict:
+  """What the sidecar says of the lights and indicator: which instances were replayed from the log, whether the run's
+  own lights ran (--signals), and so whether any other lamp in view is the run's."""
+  running = doc.get('signals_running')
+  note = ("every light was green and held in the run, as here" if running is False else
+          "the run's lights were running: only the replayed ones are the run's, any other lamp in view is not" if running else
+          "the log doesn't say whether the run's lights were running: only the replayed ones are the run's")
+  return {'lights_replayed': replay.instances(), 'indicator_replayed': bool(replay.lamps), 'signals_running': running,
+          'lights_note': note}
 
 
 def main(argv=None):
@@ -151,7 +167,7 @@ def main(argv=None):
   ap.add_argument('--port', type=int, default=BeamNGConfig.port)
   args = ap.parse_args(argv)
 
-  _, r = load_run(args.log, args.run)
+  doc, r = load_run(args.log, args.run)
   segs, t0, t1 = ego_track(r['poses'], args.lag)
   t0 += args.from_s
   if args.seconds > 0:
@@ -166,12 +182,18 @@ def main(argv=None):
     raise RuntimeError("chase_render needs ffmpeg on PATH")
   os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
   bng = BeamNGpy(args.host, args.port).open(launch=False)
-  renderer, proc, frames, misses = None, None, 0, 0
+  renderer, proc, frames, misses, replay = None, None, 0, 0, None
   try:
     ego, _ = load_scenario(bng, BeamNGConfig(host=args.host, port=args.port))
     ego.connect(bng)
     ego.control(throttle=0.0, brake=1.0, steering=0.0)
     renderer = Renderer(bng, ego, args.host, args.port)
+    replay = Replay(light_timeline(r), lamp_timeline(r.get('rows', [])),
+                    set_light=lambda inst, st: bng.traffic_signals.set_instance_strict_state(inst, LIGHT_STATES[st]),
+                    set_lamp=lambda side: ego.set_lights(left_signal=side == 'left', right_signal=side == 'right'))
+    if replay.lights:
+      scenario.hold_signals(bng)  # a sequence would overwrite the replayed states
+    print(f"replaying {len(replay.lights)} light(s) {replay.instances()} and {'the' if replay.lamps else 'no'} indicator", flush=True)
     proc = subprocess.Popen([ffmpeg, "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{CW}x{CH}",
                              "-r", str(FPS), "-i", "pipe:0", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                              "-pix_fmt", "yuv420p", args.out], stdin=subprocess.PIPE)
@@ -180,6 +202,7 @@ def main(argv=None):
       renderer.place_ego(ego_at(segs, float(t)))
       for name, a in actors.items():
         renderer.place_actor(name, a['kind'], actor_at(a['rows'], float(t)))
+      replay.apply(float(t))
       img = renderer.fresh_frame()
       if img is None:
         misses += 1
@@ -197,11 +220,17 @@ def main(argv=None):
     if proc is not None:
       proc.stdin.close()
       proc.wait(timeout=60)
+    if replay is not None:
+      try:
+        replay.close(green=True)  # load_scenario left every light green and held: so again
+      except Exception as e:
+        print(f"warning: putting the replayed lights back failed: {e!r}", flush=True)
     if renderer is not None:
       renderer.close()
     bng.disconnect()
   if frames:
-    write_sidecar(args.out, float(grid[len(grid) - frames]), frames, args.lag, f"chase re-render of {os.path.basename(args.log)} run {args.run}")
+    write_sidecar(args.out, float(grid[len(grid) - frames]), frames, args.lag, f"chase re-render of {os.path.basename(args.log)} run {args.run}",
+                  replayed_note(doc, replay) if replay is not None else None)
   print(f"{args.out}: {frames} frames ({frames / FPS:.1f} s) from wall time {grid[0]:.2f}, {misses} repeated after no answer", flush=True)
 
 

@@ -5,7 +5,13 @@ runs on the Mac and talks to the game over BeamNGpy 1.36 at `192.168.137.1:25252
 ETK 800 (the stock sedan closest to a Model 3: 4.67 m long and 1.39 m tall, against 4.69 m and 1.44 m) and publishes:
 
 - `can` and `pandaStates` for a Model 3 on 3-bit DAS firmware, including `DI_autonomyHealth` (0x054) on bus 0, so card
-  fingerprints `TESLA_MODEL_3` with `dashcamOnly` false and alpha longitudinal
+  fingerprints `TESLA_MODEL_3` with `dashcamOnly` false and alpha longitudinal. Its wheel speeds (vEgo) are the car's
+  ground speed: the forward speed of the road under the IMU, from the pose (`pose.car_speed`, `--speed-source ground`),
+  zero once the wheels have stopped. `electrics.wheelspeed` (`--speed-source wheels`, before 2026-10-30) over-read by
+  10-20% while the car sped up or braked (the rolling start, a braking approach), so turnpilotd's route follower,
+  dead-reckoning navd's readings on vEgo, put a junction 6-13 m too near (BeamNG build findings D4-speed). The scenario
+  runner logs the wheels' speed beside it (rows' `v_wheel`) and fails a run whose speed and travel differ by over 3%
+  (`score.speed_problems`)
 - road and wide frames on VisionIPC at 1344x760 with `narrowRoadCameraState` and `wideRoadCameraState` (`sensor` os04c10)
 - `accelerometer` and `gyroscope` at 100 Hz, `gpsLocationExternal` at 10 Hz (with a fix, in `frame.py`'s projection),
   and upstream's fake driver monitoring and peripheral state
@@ -44,8 +50,10 @@ Use the repo venv, from the repo root. `OPENPILOT_PREFIX` keeps msgq, params and
    OPENPILOT_PREFIX=tpsim openpilot/tools/sim/bridge/beamng/launch_openpilot.sh
    ```
 
-   It is upstream's sim launch with `FINGERPRINT=TESLA_MODEL_3`, alpha longitudinal on, and loggerd kept, so every run
-   leaves an rlog in `~/.commatpsim/media/0/realdata`. Add more processes to block with `BLOCK=...`.
+   It is upstream's sim launch with `FINGERPRINT=TESLA_MODEL_3`, alpha longitudinal on, and loggerd and logmessaged kept, so
+   every run leaves an rlog in `~/.commatpsim/media/0/realdata` with cloudlog's records in it as `logMessage` (TurnPilot's
+   reasons, such as `turnpilot.go_not_certified`). Add more processes to block with `BLOCK=...`; blocking loggerd blocks
+   logmessaged with it.
 
 2. In a second terminal, start the bridge:
 
@@ -280,6 +288,15 @@ python -m openpilot.tools.sim.bridge.beamng.run_bridge --signals --light-oracle
 the drive, stopping it at the end. `--signals` without `--light-oracle` leaves the lights running with nothing reading
 them: every signal is held for the driver's go, and the sim driver taps only on a ground-truth green, so it never does.
 
+The oracle starts with the bridge, before the level has loaded, and the game has no signals until then: it reads their
+directions again every 2 s for up to `light_oracle.STARTUP_TIMEOUT_S` (180 s), then exits non-zero having published
+nothing (the run's log and the bridge's warning say so). The scenario runner waits up to `run.ORACLE_WAIT_S` (30 s) from
+each run's teleport for its first lights before the destination goes out, and ends the run 'error' without them, or once
+they are `run.ORACLE_STALE_S` (3 s) old mid-run, and the invocation with it: a run asked for with the oracle never
+drives with every light unknown. `route_drive.py` has no such check. The oracle lists a light from 15 m past its stop
+line (`PAST_M`; a negative distance) to 200 m before it, nearest first either side: a car standing just past the line
+keeps its light, as a camera sees the far-side head.
+
 turnpilotd takes the oracle only with `SIMULATION=1` and `TurnPilotSimLightOracle` (which the launch sets, and which
 clears on every manager start); otherwise it rejects it out loud and holds. The scenario runner and `route_drive.py` tap
 the gas where a driver gives the go (`driver.GasTaps`, each tap logged with its reason and how long the car had stood):
@@ -306,6 +323,15 @@ measurement; on the car it is set only from a measured recall range). And the ju
 gate checks the left's logic (waiting through the streams, going after them, never a false go, PET, no stall), never its
 reach; nothing in the stack checks a junction's sightline, so the demo junction is chosen by eye for a straight, flat
 approach of R_req or more.
+
+That 150 m leaves little room. The live check at the line computes R_req from where the car stands and the furthest of
+navd's readings, about 4.4 m more R_req for every metre past the 9 m line at 25 mph, so a left's plan says how far past it
+the car may stand, or its junction be read, before the left is undecided there (`notes.left_reach.slack_m`): 3.7 m at
+(-650.1, 481.7), one lane across, and 2.0 m at S08's wpTown_5, two lanes across. The round-2 smoke's S08 and the diag's S02
+went undecided at R_req 204 and 172.9 m because TurnPilot's junction ran 13 m and 6.5 m short of navd's on the wheels'
+over-read speed (now the ground speed, above); an undecided left's result says where the car stood, navd's junction and
+TurnPilot's (`left.undecided_at`). tp/integrate's planned route-time margin (BeamNG build findings D4) would make lefts with
+so little slack range skips: re-check these shots once it lands.
 
 The junction is signalized and mapped, so the left goes only on a read green (`unprotected_left.SIGNAL_NEEDS_GREEN`: it
 doesn't check the cross traffic). Run it with the light oracle (`TURNPILOT_LIGHT_ORACLE=1` on the launch, `--light-oracle`
@@ -425,6 +451,15 @@ python -m openpilot.tools.turnpilot.demo_video --chase demo_chase.mp4 --ui demo_
 
 `record_route.sh` and `record_scenario.sh` do it all on a fresh stack (`restart_stack.sh`): the drive with the UI
 recorded by `record_ui.py`, the stats, the render and the composed video.
+
+The render also replays the lights and the indicator the run logged (`chase_track.Replay`): a forced light's states from
+its `light_events`, exactly when the director set them; any other light the light oracle read, from the rows' `lights`,
+0.3 s earlier than the row that first shows each change (the oracle's latency); and the ego's indicator from carState's
+blinkers in the rows (`lamp`), else the stalk the runner held. A light the log says nothing of stays as the render's
+world has it, every light green and held. The sidecar lists the replayed lights (`lights_replayed`,
+`indicator_replayed`) and says whether the run's own lights were running (`signals_running`, `lights_note`): with
+`--signals`, a lamp in view that wasn't replayed isn't the run's, so caption it. Not yet checked in the game: that a
+strict state set between frames shows in the next chase frame, and `set_lights` on the teleported ego.
 
 Measured on 2026-10-27:
 

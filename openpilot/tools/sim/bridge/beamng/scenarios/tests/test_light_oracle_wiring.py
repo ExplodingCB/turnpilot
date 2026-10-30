@@ -12,8 +12,11 @@ from openpilot.tools.sim.bridge.beamng.scenarios import run
 
 
 class FakeProc:
-  def __init__(self, hangs=False):
-    self.terminated, self.killed, self.hangs = False, False, hangs
+  def __init__(self, hangs=False, returncode=None):
+    self.terminated, self.killed, self.hangs, self.returncode = False, False, hangs, returncode
+
+  def poll(self):
+    return self.returncode
 
   def terminate(self):
     self.terminated = True
@@ -53,7 +56,8 @@ def oracle(monkeypatch):
 def run_main(monkeypatch, tmp_path, flags):
   monkeypatch.setattr(sys, 'argv', ['run.py', 'ped_in_path', '--out', str(tmp_path), *flags])
   monkeypatch.setattr(run, 'build', lambda *a, **k: SimpleNamespace(spawn=(0., 0., 0.), heading=0., notes={}))
-  monkeypatch.setattr(run, 'Params', lambda: SimpleNamespace(get_bool=lambda k: True))
+  monkeypatch.setattr(run, 'Params', lambda: SimpleNamespace(get_bool=lambda k: True, get=lambda k: None))
+  monkeypatch.setattr(run.tree, 'running_managers', lambda prefix: [])  # tree.json: no stack found, said in it
   monkeypatch.setattr(run, 'ensure_token', lambda params: 'tok')
   monkeypatch.setattr(run, 'sweep_game', lambda host, port: None)
   monkeypatch.setattr(run, 'Runner', lambda *a, **k: None)
@@ -94,3 +98,15 @@ def test_an_oracle_that_wont_stop_is_killed_and_the_run_still_ends(monkeypatch):
   with run_bridge.light_oracle(SimpleNamespace(light_oracle=True)):
     pass
   assert proc.terminated and proc.killed
+
+
+def test_an_oracle_that_exited_during_the_drive_is_said(monkeypatch, capsys):
+  from openpilot.tools.sim.bridge.beamng import light_oracle as lo
+  proc = FakeProc(returncode=lo.EXIT_NOT_READY)
+  monkeypatch.setattr(run_bridge, 'start_light_oracle', lambda args: proc)
+  with run_bridge.light_oracle(SimpleNamespace(light_oracle=True)):
+    pass
+  assert f"light oracle exited ({lo.EXIT_NOT_READY})" in capsys.readouterr().out and proc.terminated
+  with run_bridge.light_oracle(SimpleNamespace(light_oracle=True)) as p:  # still running at the end: nothing said
+    p.returncode = None
+  assert 'exited' not in capsys.readouterr().out

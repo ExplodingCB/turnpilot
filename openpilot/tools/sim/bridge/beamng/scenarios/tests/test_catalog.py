@@ -125,6 +125,8 @@ def test_every_scenario_carries_a_road_model_and_starts_on_its_own_side(graph):
     past = score.oncoming_offsets([{'x': plan.spawn[0], 'y': plan.spawn[1], 'heading': plan.heading}], plan.road)[0]
     if past is None and plan.notes.get('data_entry') == 'autojunction_1311_left':
       continue  # a divided road, two lanes our way: no oncoming lane beside it
+    if past is None and name == 'twoway_route_pair':
+      continue  # a one-way street to its stop (test_twoway): no oncoming lane beside it
     assert past is not None and past < -0.5, f"{name}: the spawn is {past} m left of the road's divider"
 
 

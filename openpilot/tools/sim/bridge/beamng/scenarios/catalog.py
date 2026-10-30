@@ -12,6 +12,11 @@ wcusa_map_node_signals.json (mapsignals.py). Every spawn is clear of them: more 
 engage distance before each one on its approach (spawn_clear_m), or past it, so the car never runs over a line before
 openpilot is engaged to stop for it (the smoke's "Stop Line Passed"). A turn scenario's spawn moves to the nearest
 clear spot, a data entry that isn't clear is refused.
+
+A forced light (Entry.light, the demo's S13, S14, S18): the junction's own signal on the approach (its stop line's
+instance) is forced to that state from the run's setup and held, its opposing approach with it and the cross approaches
+the other way (their mapped headings: within PHASE_DEG of ours, or of its reverse, is our phase); green_after_s after the
+car stands at the junction the phases swap (run.py). With --signals alone the phase at the car's arrival is chance.
 """
 import json
 import math
@@ -23,7 +28,10 @@ import numpy as np
 from openpilot.selfdrive.turnpilot.control_tracker import DROP_PAST_M
 from openpilot.selfdrive.turnpilot.lane_planner import LANE_WIDTH, lane_change_window
 from openpilot.selfdrive.turnpilot.map_controls import MAP_STOP_DECEL, PROTECT_BEFORE_M, engage_distance
-from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M
+from openpilot.selfdrive.turnpilot.scene.tracker import CORRIDOR_HALF_WIDTH
+from openpilot.selfdrive.turnpilot.unprotected_left import (DEFAULT_OPPOSING_SPEED, LINE_D, PROVISIONAL_RANGE_M, r_req, reach_at_line,
+                                                             t_req)
+from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, PED_STOP_GAP_M
 from openpilot.tools.sim.bridge.beamng.roadgraph import RoadGraph, wrap
 from openpilot.tools.sim.bridge.beamng.scenarios.timing import WALK_SPEED, arc_lengths, oncoming_release_delay, point_at, travel_time
 
@@ -48,6 +56,25 @@ LINE_LATERAL_M = 8.      # a control's stop line within this of the approach's c
 LINE_ALIGNED_DEG = 40.   # ...if it controls traffic within this of the approach's direction
 LINE_ASSOC_M = 40.       # a stop line this close to the junction nearest it is that junction's...
 INTO_DEG = 60.           # ...if it controls traffic heading into it, within this of the bearing to it
+PHASE_DEG = 45.          # a signal of the junction's group whose traffic heads within this of ours, or of its reverse: our phase
+# ped_step_out (S10): she stands STEP_OUT_CURB_M off the road edge on the car's side (0: on it, 0.5 m outside the car's
+# corridor in a 4 m lane) and steps into the middle of its lane when the car is timing.step_out_distance away: the stop
+# then needs STEP_OUT_DECEL once she is inside the corridor, STEP_OUT_REACT_S later (a detector run, the pipeline and the
+# actuator's lag), and less (2.4 m/s^2 at 30 km/h) if the policy takes her as entering at her first step; both are past
+# the comfortable -2.0 floor that only a confirmed track may brake harder than, and short of the Tesla's -3.48
+STEP_OUT_CURB_M = 0.
+STEP_OUT_DECEL = 3.0
+STEP_OUT_REACT_S = 0.5
+STEP_OUT_MIN_V = 4.      # m/s: she never steps out in front of a car slower than this
+# ...facing the car, standing and through her step (Entry.ped_faces_car): BeamNG's walker is a low-poly block figure, and
+# side-on, facing across the road the way she walks, it never scores as a person (BeamNG build findings D3: best 0.197 from
+# 56 m to contact, contact at 8 m/s; the same walker facing the car up to 0.84). The labels say which the shot shows
+STEP_OUT_LABELS = {
+  'car': "BeamNG sim mannequin facing the car, sliding sideways into the lane (the stock walker scores as a person only " +
+         "facing the camera); a real person stepping out side-on is the detector's 15-30 m limit, not shown here",
+  'across': "detector limit: BeamNG's side-on walker never scores as a person, so nothing brakes for her; this is the " +
+            "sim figure's limit, not TurnPilot's pedestrian stop",
+}
 
 
 @dataclass(frozen=True)
@@ -60,9 +87,10 @@ class Entry:
   dest_after_m: float = 60.       # destination this far past it
   speed_kph: float = 30.
   timeout_s: float = 150.
-  actor: str = ''                 # 'crosswalk', 'oncoming', 'standing', 'pacer'
+  actor: str = ''                 # 'crosswalk', 'oncoming', 'standing', 'pacer', 'step_out'
   crosswalk_m: float = 0.         # crosswalk centre from the junction along the exit road; 0: road edge + 2.5 m (unverified)
   ped_before_m: float = 40.       # standing mannequin, this far before the junction
+  ped_faces_car: bool = False     # step_out: she faces the car, standing and through her step (STEP_OUT_LABELS)
   oncoming: int = 2               # cars
   oncoming_start_m: float = 35.   # the first one starts this far from the junction (released at the car's stop: nearer
                                   # than ~36 m at 11 m/s, 2.5 m/s^2, it can still come arrive_after_s after the go)
@@ -75,8 +103,12 @@ class Entry:
   # the first reaches the junction stream_first_s after the stand and each one after it stream_headway_s later; 0: none
   stream_headway_s: float = 0.
   stream_first_s: float = 6.
+  # an occluder (S08): a car on its parking brake in the opposing inner lane this far past the maneuver point, facing it,
+  # where a car waiting to turn its left stands, never released (trigger 'setup'); 0: none
+  occluder_past_m: float = 0.
   pace_block_s: float = 6.        # the pacer keeps the target lane occupied this long into the lane change window
   end_on_stop_s: float = 0.       # end the run once the car has stood this long after moving
+  end_past_m: float = 0.          # end the run once the car is this far past the junction (0: never; score.EndCheck)
   spawn: tuple = ()               # route: (x, y, z), heading_deg, destination (x, y, z)
   heading_deg: float = 0.
   dest: tuple = ()
@@ -88,6 +120,10 @@ class Entry:
   # across the junction and away); from_stop_arm: the car's approach is the junction's arm with a stop line (a two-way)
   cross: tuple = ()
   from_stop_arm: bool = False
+  expect: tuple = ()              # what the run must show (score.EXPECTS): a handback, a skip, ...; the runner's options add theirs
+  light: str = ''                 # 'red': the junction's own signal forced red from setup and held (module docstring)
+  green_after_s: float = 0.       # ...then green this long after the car stands at the junction (0: red for the whole run)
+  fault_at_s: float = 0.          # the runner's --gas-press-at and --drop-detections-at with no value: this long after engagement
 
 
 SCENARIOS = {
@@ -108,9 +144,55 @@ SCENARIOS = {
   **{f'unprotected_left_gap{h}': Entry('turn', junction=(-650.1, 481.7), turn='left', from_heading_deg=137., actor='oncoming',
                                        oncoming=4 if h < 10 else 3, oncoming_start_m=40., oncoming_speed=11.18,
                                        stream_headway_s=float(h), timeout_s=150. + 10. * h) for h in (4, 6, 8, 10)},
+  # ped_in_path's straight with nothing on it, to a destination 140 m past the junction, straight on: S01's detection drop
+  # (run.py --drop-detections-at) and S04's gas press (--gas-press-at). Either at fault_at_s after engagement lands the
+  # disengagement, a soft disable's DETECTOR_DEADLINE_S + SOFT_DISABLE_TIME later for the drop, 10 m or more short of the
+  # junction's stop line (tests: test_runner_options)
+  'straight_cruise': Entry('straight', junction=(-768.9, 661.4), turn='right', from_heading_deg=0., dest_after_m=140., timeout_s=60.,
+                           fault_at_s=3.),
+  # S08: the left at wpTown_5 (-600.7, 220.9), two lanes each way at the mapped 25 mph (R_req 141 m), from its longest
+  # approach: a car standing 10 m past the junction in the opposing inner lane, where one waiting to turn its left would,
+  # hides part of the oncoming lanes from the hold line and after the full creep (unprotected_left.view_blocked); a stream
+  # at 10 s headways in the outer lane beside it, then an empty road. It creeps, then goes on a clear band or hands back
+  'unprotected_left_occluded': Entry('turn', junction=(-600.7, 220.9), turn='left', actor='oncoming', oncoming=3, oncoming_start_m=40.,
+                                     oncoming_speed=11.18, stream_headway_s=10., occluder_past_m=10., timeout_s=250.),
+  # S19: the right at DR475_2 (-153.7, 148.7), no control of its own, at the end of the map's one straight of 240 m or more
+  # with no mapped control on it (357 m, south-west-bound, through two uncontrolled junctions 135-210 m out, where no spawn
+  # may stand), at 80 km/h from 230 m out: the rolling start engages about 54 m out at 64 km/h, already past where the turn
+  # can be made braking at -2.0 (turn_skip.can_make_turn), so it is skipped, never braked hard for, and rerouted. At 65 km/h
+  # from the nearest clear spawn (215 m) it would engage 92 m out, where the turn is still feasible and its cap slows the car.
+  # The run ends 30 m past the junction it skipped: the reroute's own turns are no part of the shot (BeamNG smoke 2026-10-29:
+  # run on to its timeout, a desire for the reroute's next turn and the model wide on it failed a run whose skip was clean)
+  'too_fast_right': Entry('turn', junction=(-153.7, 148.7), turn='right', from_heading_deg=-135., approach_m=230., speed_kph=80.,
+                          timeout_s=60., expect=('skip',), end_past_m=30.),
+  # S20: route_demo's route has no right on green (its right is uncontrolled) and no left without an oncoming road (its left
+  # has one straight across), so: ped_crosswalk_right's right at its signal with nothing on it, and a left from the stem of
+  # the T at DR295_16 (-586.7, 631.3), no control, no road straight across, two-way all round
+  'right_green': Entry('turn', junction=(-768.6, 555.2), turn='right', timeout_s=120.),
+  # left_t_junction spawns 65 m up the stem, on its last straight: further out the stem is an S-bend, which the rolling
+  # start (it never steers) ran straight off (BeamNG smoke 2026-10-29: 140 m out, into the roadside 12 m on, no engagement)
+  'left_t_junction': Entry('turn', junction=(-586.7, 631.3), turn='left', from_heading_deg=45., approach_m=65., timeout_s=120.),
   # gate1's approach: eastbound on the 140 m straight from the bridge's default spawn
   'ped_in_path': Entry('straight', junction=(-768.9, 661.4), turn='right', from_heading_deg=0., actor='standing', end_on_stop_s=4.,
                        timeout_s=90.),
+  # S10: on the same straight a walker standing at the road edge 45 m before the junction steps into the middle of the
+  # lane when the car is step_out_distance ahead of her (STEP_OUT_*): the stop needs hard braking from a confirmed track.
+  # She faces the car (ped_in_path's mannequin); ped_step_out_side is the same step side-on, the detector-limit clip
+  # (STEP_OUT_LABELS: the smoke's and the diag's runs, contact at 8 m/s with no person box)
+  'ped_step_out': Entry('straight', junction=(-768.9, 661.4), turn='right', from_heading_deg=0., actor='step_out', ped_before_m=45.,
+                        ped_faces_car=True, end_on_stop_s=4., timeout_s=90., expect=('hardBrake',)),
+  'ped_step_out_side': Entry('straight', junction=(-768.9, 661.4), turn='right', from_heading_deg=0., actor='step_out',
+                             ped_before_m=45., end_on_stop_s=4., timeout_s=90., expect=('hardBrake',)),
+  # forced reds (the module docstring's forced light). S13: the same straight through gate1's junction (group_80_81_82_83),
+  # its signal red from the start: with no accepted light source (the car this week) TurnPilot adds nothing for it, the
+  # model alone meets it. S14: ped_crosswalk_right's right turn without the walker, red until 8 s after the car stands.
+  # S18: the right at (-650.1, 481.7) from the south-west (G0's 62R: every pull-away at a 20 m hold went straight), its
+  # miss expected (likely, not certain)
+  'red_straight': Entry('straight', junction=(-768.9, 661.4), turn='right', from_heading_deg=0., light='red', green_after_s=8.,
+                        timeout_s=90.),
+  'red_right': Entry('turn', junction=(-768.6, 555.2), turn='right', light='red', green_after_s=8., timeout_s=120.),
+  'red_right_g62': Entry('turn', junction=(-650.1, 481.7), turn='right', from_heading_deg=45., light='red', green_after_s=8.,
+                         timeout_s=120., expect=('turnMissed',)),
   'occupied_lane': Entry('data', actor='pacer', speed_kph=45., timeout_s=150.),
   'lane_change': Entry('data', speed_kph=45., timeout_s=150.),
   # the stop-sign logic gate (STOP_SIGNS.md 8.2), on the sim's mapped stops: DR439_5, a four-way all-way three blocks north
@@ -136,6 +218,28 @@ SCENARIOS = {
   # downtown: 20 m on from the bridge's default spawn (clear of the junction behind it), eastbound, to road-graph node
   # DR249_3 about 850 m east-southeast
   'route_demo': Entry('route', spawn=(-888.82, 659.66, 111.4), heading_deg=0., dest=(-84.9, 377.0, 101.5), speed_kph=40., timeout_s=600.),
+  # S23: in the right lane 90 m up DR677_5 from the stop sign at DR225_1 (-651.2, 774.2), whose other way in (DR409_3)
+  # doesn't stop, to 120 m straight across it. Run with TurnPilotAvoidStops at its default (the route goes around it,
+  # ROUTE_NOTES) and off (the car stops at the sign and hands back: --expect handback:stopSignTakeControl)
+  'twoway_route_pair': Entry('route', spawn=(-564.58, 779.66, 75.0), heading_deg=-180., dest=(-770.2, 769.21, 87.66), speed_kph=30.,
+                             timeout_s=150.),
+}
+
+# what a route entry's plan notes carry: for twoway_route_pair, its stop and route_audit's reading of the trip on the
+# stop-sign sim tiles (build_sim_tiles.sh at this branch's code, the stop-sign map branch merged, 2026-10-29), routed from
+# the spawn's heading as navd sends the car's bearing, certified as navd would (mode auto, side views on); twoway_pair.py
+# finds it again. The fastest route (208 m, 14 s, straight on) meets the stop 68 m in, uncertifiable (a stop whose junction
+# isn't a surveyed all-way never certifies); navd's avoidance loop goes around it in one reroute, clean, 4.8 s longer
+# (348 m), with no stop, yield or signal on it, a keep (slight right) 54 m in and its one junction turn 230 m in, a left at
+# DR560_1 with no road straight across. Neither route has an unprotected left or a junction turn inside 100 m of the start
+ROUTE_NOTES = {
+  'twoway_route_pair': {'twoway_stop': {
+    'node': 'DR225_1', 'xy': (-651.2, 774.2), 'approach': 'DR677_5', 'instance': 'stop 41', 'spawn_before_m': 90.,
+    'kinds': {'DR677_5': 'stop', 'DR409_3': 'none'},
+    'route_audit': {'fastest': {'m': 208, 's': 14, 'stops': [['stop', 68, 'uncertifiable']], 'turns': []},
+                    'avoided': {'m': 348, 'stops': [], 'signals_m': [],
+                                'turns': [[54, 'slight right', 'DR677_1'], [230, 'left', 'DR560_1']]},
+                    'avoidance': {'status': 'clean', 'avoided': 1, 'added_s': 4.8}}}},
 }
 
 
@@ -176,6 +280,10 @@ class Plan:
   actors: list
   notes: dict
   road: dict | None = None  # road_model() around the run, for the score's oncoming-lane check
+  expect: tuple = ()        # Entry.expect
+  fault_at_s: float = 0.    # Entry.fault_at_s
+  lights: dict | None = None  # the forced light (junction_lights), or None
+  end_past_m: float = 0.    # Entry.end_past_m
 
 
 # *** road geometry ***
@@ -304,14 +412,37 @@ def spawn_conflicts(s_spawn: float, along, speed_kph: float) -> list[tuple[float
   return [(s - s_spawn, c) for s, c in along if -SPAWN_PAST_M < s - s_spawn < clear]
 
 
-def junction_control(along, total: float) -> tuple[str, float] | None:
-  """(kind, m before the junction) of the junction's own control on its approach: a line within PROTECT_BEFORE_M before
-  it (map_controls.protected's reach), or None."""
+def own_control(along, total: float) -> tuple[float, MappedControl] | None:
+  """(m before the junction, control) of the junction's own control on its approach: a line within PROTECT_BEFORE_M
+  before it (map_controls.protected's reach), the nearest, or None."""
   own = [(total - s, c) for s, c in along if -2. < total - s <= PROTECT_BEFORE_M]
-  if not own:
-    return None
-  d, c = min(own, key=lambda dc: dc[0])
-  return c.kind, round(float(d), 1)
+  return min(own, key=lambda dc: dc[0]) if own else None
+
+
+def junction_control(along, total: float) -> tuple[str, float] | None:
+  """(kind, m before the junction) of the junction's own control on its approach (own_control), or None."""
+  own = own_control(along, total)
+  return None if own is None else (own[1].kind, round(float(own[0]), 1))
+
+
+def junction_lights(controls, own: MappedControl, state: str, green_after_s: float, signals: list[dict] | None = None) -> dict:
+  """The forced light of a junction whose own signal is `own` (module docstring): its instance, the rest of its phase
+  ('with', from the level's signal groups, scenario.SIGNALS_JSON, by mapped heading) and the cross phase, and the states
+  they are forced to at setup."""
+  from openpilot.tools.sim.bridge.beamng.scenario import load_signals
+  group = next((g for g in (load_signals() if signals is None else signals) if own.instance in g['instances']), None)
+  if group is None:
+    raise ValueError(f"{own.instance} is in no signal group of the level")
+  heading = {c.instance: c.heading for c in reversed(controls)}  # the first link each controls
+  same, cross = [], []
+  for inst in group['instances']:
+    if inst == own.instance or inst not in heading:
+      continue
+    d = abs(math.degrees(wrap(heading[inst] - own.heading)))
+    (same if min(d, 180. - d) <= PHASE_DEG else cross).append(inst)
+  other = 'green' if state == 'red' else 'red'
+  return {'instance': own.instance, 'group': group['group'], 'with': same, 'cross': cross, 'state': state,
+          'green_after_s': green_after_s, 'states_at_setup': {own.instance: state, **dict.fromkeys(same, state), **dict.fromkeys(cross, other)}}
 
 
 def window_controls(along, total: float, v: float) -> list[tuple[float, str]]:
@@ -564,6 +695,13 @@ def _turn_plan(name: str, e: Entry, graph: RoadGraph) -> Plan:
                        'controls_from_spawn': [(round(float(sc - (total - s)), 1), str(c)) for sc, c in along]}
   own = junction_control(along, total)
   notes['junction_control'], notes['stop_line_m'] = own if own is not None else ('none', None)
+  own_c = own_control(along, total)
+  notes['junction_instance'] = None if own_c is None else own_c[1].instance
+  lights = None
+  if e.light:
+    if own_c is None or own_c[1].kind != 'signal':
+      raise ValueError(f"{name}: a forced light at {jn.node}, whose approach has no signal of its own ({notes['junction_control']})")
+    lights = junction_lights(mapped_controls(graph), own_c[1], e.light, e.green_after_s)
   if e.kind == 'straight':
     if jn.straight is None:
       dest = None
@@ -585,6 +723,22 @@ def _turn_plan(name: str, e: Entry, graph: RoadGraph) -> Plan:
   elif e.actor == 'standing':
     p, _ = lane_pose(jn.approach, e.ped_before_m, lanes, radius, ego_lane(e.turn))
     actors.append(Actor(f"{PREFIX}ped", 'walker', 'setup', [list(p)], 0., heading=wrap(heading + math.pi)))
+  elif e.actor == 'step_out':
+    p, h_out = point_at(jn.approach, e.ped_before_m)  # the centreline there; h_out points away from the junction
+    travel = wrap(h_out + math.pi)
+    o_lane = lane_offset(lanes, radius, ego_lane(e.turn))
+    start = p[:2] + (radius + STEP_OUT_CURB_M) * right_of(travel)
+    end = p[:2] + o_lane * right_of(travel)
+    enter_s = max(radius + STEP_OUT_CURB_M - o_lane - CORRIDOR_HALF_WIDTH, 0.) / WALK_SPEED
+    z = float(p[2])
+    face = wrap(travel + math.pi) if e.ped_faces_car else None  # toward the car, kept through the step (director.tick)
+    actors.append(Actor(f"{PREFIX}ped", 'walker', 'step_out', [[*map(float, start), z], [*map(float, end), z]], WALK_SPEED,
+                        heading=heading_of(start, end) if face is None else face,
+                        params={'decel': STEP_OUT_DECEL, 'gap_m': PED_STOP_GAP_M, 'enter_s': round(enter_s, 3),
+                                'react_s': STEP_OUT_REACT_S, 'min_v': STEP_OUT_MIN_V, **({} if face is None else {'face': face})}))
+    faces = 'across' if face is None else 'car'
+    notes['step_out'] = {'before_m': e.ped_before_m, 'lateral_m': round(radius + STEP_OUT_CURB_M - o_lane, 2), 'enter_s': round(enter_s, 2),
+                         'faces': faces, 'label': STEP_OUT_LABELS[faces]}
   elif e.actor == 'oncoming' and e.stream_headway_s:
     # a queue across the junction, each released on its own timer from the car's stand: at its headway (Entry)
     paths = oncoming_paths(graph, jn, e.oncoming, e.oncoming_start_m, QUEUE_GAP_M)
@@ -611,8 +765,40 @@ def _turn_plan(name: str, e: Entry, graph: RoadGraph) -> Plan:
     stops = [c for c in mapped_controls(graph) if c.kind == 'stop']
     notes['stop_scenario'], notes['all_way'] = name, all_way(graph, jn.node, stops)
     actors += cross_actors(graph, jn, e)
+  if e.occluder_past_m > 0.:
+    if jn.straight is None:
+      raise ValueError(f"{name}: no arm straight across {jn.node} for an occluder")
+    far = walk_straight(graph, jn.node, jn.straight, e.occluder_past_m + 10.)
+    pos, h_occ = lane_pose(far, e.occluder_past_m, graph.lanes_toward(jn.node, jn.straight), graph.radius[jn.straight], 'left')
+    actors.append(Actor(f"{PREFIX}occluder", 'car', 'setup', [list(pos)], 0., 0., h_occ, params={'past_m': e.occluder_past_m}))
+    notes['occluder'] = {'past_m': e.occluder_past_m, 'lane': 'opposing inner'}
+  if e.turn == 'left' and jn.straight is not None:  # the left's R_req at its line, the opposing road's mapped limit (route time's)
+    link = graph.links.get((jn.straight, jn.node)) or graph.links.get((jn.node, jn.straight)) or {}
+    lanes_in = graph.lanes_toward(jn.node, jn.straight).count('+')
+    notes['left_r_req_m'] = round(reach_at_line(link.get('speedLimit'), lanes_in), 1)
+    notes['left_reach'] = left_reach(link.get('speedLimit'), lanes_in)
+  notes['ego_lane_offset_m'] = round(lane_offset(lanes, radius, ego_lane(e.turn)), 2)
   return Plan(name, spawn, heading, dest, (float(jn.center[0]), float(jn.center[1])), e.speed_kph, e.timeout_s,
-              e.end_on_stop_s, actors, notes)
+              e.end_on_stop_s, actors, notes, lights=lights)
+
+
+def left_reach(v_limit: float | None, lanes: int | None, range_m: float = PROVISIONAL_RANGE_M) -> dict:
+  """The left's R_req at its line (route time's, reach_at_line) against the range the sim's shots set (TurnPilotLeftRangeM:
+  PROVISIONAL_RANGE_M), and slack_m, how far past LINE_D the car may stand, or its junction be read further out (navd's
+  readings' spread), before the live R_req at the line passes that range and the left is undecided there (BeamNG build
+  findings D4-shots: about 4.4 m of R_req a metre at 25 mph). Negative: past it at the line already."""
+  v = v_limit if v_limit is not None and v_limit > 0. else DEFAULT_OPPOSING_SPEED
+  at_line = r_req(v, t_req(LINE_D, lanes), LINE_D)
+  lo, hi = 0., 100.
+  if at_line > range_m:
+    slack = -1.
+  else:
+    for _ in range(50):  # R_req rises with the distance: the slack where it reaches the range
+      mid = (lo + hi) / 2.
+      d = LINE_D + mid
+      lo, hi = (mid, hi) if r_req(v, t_req(d, lanes), d) < range_m else (lo, mid)
+    slack = lo
+  return {'r_req_at_line_m': round(at_line, 1), 'range_m': range_m, 'slack_m': round(slack, 2), 'v_limit': round(v, 3), 'lanes': lanes}
 
 
 def load_data(path: str = DATA_JSON, entry: str = '') -> dict:
@@ -705,12 +891,14 @@ def build(name: str, graph: RoadGraph | None = None, data_path: str = DATA_JSON,
   e = SCENARIOS[name]
   graph = RoadGraph() if graph is None else graph
   if e.kind == 'route':
-    plan = Plan(name, e.spawn, math.radians(e.heading_deg), e.dest, None, e.speed_kph, e.timeout_s, e.end_on_stop_s, [], {})
+    plan = Plan(name, e.spawn, math.radians(e.heading_deg), e.dest, None, e.speed_kph, e.timeout_s, e.end_on_stop_s, [],
+                json.loads(json.dumps(ROUTE_NOTES.get(name, {}))))
   elif e.kind == 'data':
     plan = _data_plan(name, e, graph, load_data(data_path, entry))
   else:
     plan = _turn_plan(name, e, graph)
   plan.road = road_model(graph, [plan.spawn, plan.junction, plan.dest])
+  plan.expect, plan.fault_at_s, plan.end_past_m = tuple(e.expect), e.fault_at_s, e.end_past_m
   return plan
 
 
