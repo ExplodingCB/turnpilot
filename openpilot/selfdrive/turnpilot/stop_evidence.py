@@ -43,7 +43,7 @@ the lane whoever looks. Nothing here acts: SG4a's decider reads it, and turnpilo
 """
 import math
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -322,8 +322,13 @@ class StopEvidence:
     for tid, h in self.hist.items():
       hit = self.cache.get(tid)
       if hit is not None and hit[0] == h[-1].t:
-        if hit[1] is not None:
-          out[tid] = hit[1]
+        e = hit[1]
+        if e is not None:
+          # the shield's seen-on-every-cycle reads the newest match of any track, which goes on without this one's: re-checked
+          # on every evaluate(), never kept from the cached match (skeptic SG3b q8: kept DROP_S, not CYCLE_GAP_S)
+          if e.shield and self.newest_t is not None and self.newest_t - h[-1].t > CYCLE_GAP_S + 1e-9:
+            e = replace(e, shield=False)
+          out[tid] = e
         continue
       e = self._evidence(tid, h)
       self.cache[tid] = (h[-1].t, e)

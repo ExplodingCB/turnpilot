@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from openpilot.selfdrive.turnpilot import stop_rules as sr
-from openpilot.selfdrive.turnpilot.stop_evidence import SIDE_PIXEL_RAD, StopEvidence, junction_lanes
+from openpilot.selfdrive.turnpilot.stop_evidence import CYCLE_GAP_S, SIDE_PIXEL_RAD, StopEvidence, junction_lanes
 
 MPH = sr.MPH
 CAR, BICYCLE = 2, 1
@@ -194,6 +194,23 @@ def test_stopped_at_its_line_and_the_shield():
   # missed runs of its view (a hit every 0.6 s): not seen on every cycle, no shield
   ev = evidence()
   assert not drive(ev, 4, ln, lambda t: 11.3, 4.2, hz=1. / 0.6).shield
+
+
+def test_a_shield_lost_from_its_view_is_dropped_after_a_cycle_gap_while_other_tracks_go_on():
+  # skeptic SG3b q8: evaluate()'s cache (f1edc72) reused a track's evidence while its last match's camera time was unchanged,
+  # but its seen_every reads the newest match of any track, which other tracks keep moving: a car that qualified as a shield
+  # and then went unmatched (occluded, missed) stayed shield=True for DROP_S 2.0 s, where 2.3 allows CYCLE_GAP_S. The shield is
+  # re-checked on every evaluate() against the newest match
+  lns = junction_lanes(junction(), 'straight', 1.9, lane_edge_m=4.0)
+  left, right = (next(x for x in lns if x.role == r) for r in ('left', 'right'))
+  ev = StopEvidence()
+  ev.set_junction(lns, sr.angle_bound(True), lines={'left': 9., 'right': 9., 'opposite': 9.})
+  assert drive(ev, 1, left, braking(23.8, 8., 2.5), 6.0).shield
+  for k in range(1, 11):
+    t = 6.0 + 0.1 * k
+    ev.observe([track(2, t, 40. - 1.5 * k, right, view='sideRight')], d_stop=0.)
+    e = ev.evaluate().get(1)
+    assert e is not None and e.shield == (t - 6.0 <= CYCLE_GAP_S + 1e-9), (round(t, 2), e.shield)
 
 
 def test_history_is_on_camera_time_and_restarts_when_our_car_moves():
