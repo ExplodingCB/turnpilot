@@ -1797,6 +1797,58 @@ def test_V9_an_earlier_arrival_that_never_moves_beside_a_standing_cause_is_a_sta
   assert all(s.accel_cap >= -2. - 1e-9 for d in out for s in d.stops) and max(d.position_m for d in out) <= 0.05
 
 
+def test_V9_a_creep_cut_short_by_a_third_car_arriving_is_taken_again_once_nothing_moves_then_the_go(tmp_path):
+  # an ordinary three-car all-way: the waver at the left line; 0.3 s into our signalling creep a third car comes in on the
+  # right (30 m out at 6 m/s) and stops at its line, a later arrival waiting for us. Its motion ends our creep (something
+  # moving in the junction) and we yield, but the earlier arrival never moved: the creep is given back, and DEADLOCK_S after
+  # the third car stands we creep again, then the turn passes to us and we go. Before, the cut-short creep used up the
+  # encounter's one creep: 60 s of "an earlier arrival's turn", no go and no handback
+  w = Drive(tmp_path, behaviour=lambda w: 'goes')
+  w.tracks = cars((1, 'left', at_line(t0=-10.)))
+  watch(w)
+  out = w.run(4.4)
+  k = next(k for k, d in enumerate(out) if d.go_cause == 'creep')
+  t3 = w.t_cam - 100. - (len(out) - 1 - k) * DT_MDL + 0.3
+  w.tracks = cars((1, 'left', at_line(t0=-10.)), (2, 'right', at_line(t0=t3, d0=30., v0=6.)))
+  more = w.run(20.)
+  assert [d.withdraw for d in more if d.withdraw][:1] == ['deadlockYield']
+  ts = creep_times(w, more)
+  assert len(ts) == 1 and ts[0] >= t3 + (30. - LINE_D) / 6. + sg.DEADLOCK_S - 0.1, ts
+  i = first_go(more)
+  assert i is not None and not any(d.fault for d in out + more) and 2 in w.sg.later and w.sg.order_waived
+  assert any(d.state in ('inLane', 'done') for d in more[i:])
+  assert all(s.accel_cap >= -2. - 1e-9 for d in out + more for s in d.stops)
+
+
+def test_V9_creeps_each_cut_short_by_something_moving_are_bounded_then_a_static_wait_and_h3(tmp_path):
+  # the give-back has a bound: a car crossing the box 0.3 s into every creep, gone 1.2 s later, the waver at the left line
+  # never moving. DEADLOCK_CREEP_TRIES creeps, each yielded, then with nothing moving the turn is a static cause: its
+  # STATIC_WAIT_S, then H3 with its reason; no go, the car short of the closest edge, nothing below -2.0
+  w = Drive(tmp_path, behaviour=lambda w: 'goes')
+  w.tracks = cars((1, 'left', at_line(t0=-10.)))
+  starts = []
+
+  def objects(ww):
+    t = ww.t_cam - 100.
+    return tuple(vehicle(90 + n, 15., -2. + 3. * (t - t0 - 0.3), vy=3.) for n, t0 in enumerate(starts) if 0.3 <= t - t0 <= 1.5)
+  w.objects = objects
+  watch(w)
+  out = []
+  for _ in range(round(45. / DT_MDL)):
+    out.append(w.step())
+    if out[-1].go_cause == 'creep':
+      starts.append(w.t_cam - 100.)
+  assert len(starts) == sg.DEADLOCK_CREEP_TRIES, starts
+  assert all(b - a >= 1.5 + sg.DEADLOCK_S - 0.1 for a, b in zip(starts, starts[1:], strict=False)), starts
+  assert [d.withdraw for d in out if d.withdraw] == ['deadlockYield'] * sg.DEADLOCK_CREEP_TRIES
+  k = next(k for k, d in enumerate(out) if d.fault)
+  assert out[k].fault == 'H3' and out[k].reason == "Stop sign: an earlier arrival isn't taking its turn: take control"
+  t_h3 = w.t_cam - 100. - (len(out) - 1 - k) * DT_MDL
+  assert t_h3 - starts[-1] == pytest.approx(1.5 + sg.DEADLOCK_S + STATIC_WAIT_S, abs=0.3), t_h3 - starts[-1]
+  assert first_go(out) is None and max(d.position_m for d in out) < w.sg.edges.d_min - sr.M_EDGE
+  assert all(s.accel_cap >= -2. - 1e-9 for d in out for s in d.stops)
+
+
 def test_V13_a_box_overlapping_0_6_m_ahead_of_the_bumper_holds_the_go(tmp_path):
   # a truck turning into our road swings over our line: its box 4 m ahead of our bumper, in our path
   w = World(tmp_path)

@@ -32,7 +32,9 @@ decider computes would_go only (logged once a stop). Acting:
   junction moving gets one signalling creep of DEADLOCK_CREEP_M on the latch's creep path (DEADLOCK_CREEP_V, a G5 go with
   cause creep, never closer than GO_ROOM_M to the closest plausible edge, never while creep_blocked: V12, V13), then the
   order is waived and every other go condition still holds for CLEAR_S; it moving before our commit stops us short and we
-  yield (during the creep the latch holds again; during the launch the re-check's capped abort). With nothing moving
+  yield (during the creep the latch holds again; during the launch the re-check's capped abort); a creep something else cut
+  short (anything moving in the junction, the corner no longer clear: the earlier arrival didn't move) is given back and
+  taken again DEADLOCK_S after nothing moves, up to DEADLOCK_CREEP_TRIES creeps an encounter. With nothing moving
   DEADLOCK_S and no creep able to run (another go condition holding the go, or the encounter's creeps spent), the turn is a
   static cause (4.6: only traffic taking turns waits with no bound): STATIC_WAIT_S, then H3. Off the route (O9) the
   maneuver is unknown, the union of the conflict sets: navd's reroute is waited for up to OFFROUTE_WAIT_S from the full stop
@@ -113,6 +115,7 @@ DEADLOCK_S = 3.0                # s an earlier arrival may hold its turn, nothin
 DEADLOCK_CREEP_M = 0.5          # m of the one signalling creep (4.5 step 5; map_controls' creep path at CREEP_SPEED)
 DEADLOCK_CREEP_V = min(0.4, CREEP_SPEED)  # m/s, its cap: the creep path's limit or under, slow enough to end 0.5 m on (8.1)
 DEADLOCK_CYCLES = 1             # creeps an encounter takes before the order is waived (the turn passes to us after one)
+DEADLOCK_CREEP_TRIES = 3        # creeps an encounter may start: one something else cut short is given back, up to this many
 DEADLOCK_CREEP_MAX_S = GO_WINDOW_S + 1.  # s the creep may take (G5's window, a second to stop): then it is over, moved or not
 CREEP_LANE_HOLDS = ('reach', 'raw', 'u2', 'tracked', 'wrongWay', 'stale', 'hide')  # a creep in hand isn't ended by these
 CORNER_M = 15.                  # m down a cross lane a long vehicle coming toward our path is at the corner (no creep, V13)...
@@ -369,6 +372,7 @@ class StopGo:
     self.route_wait_s = 0.          # s waited off the route for navd's maneuver (OFFROUTE_WAIT_S)
     self.creep: dict | None = None  # the deadlock's signalling creep in hand: its target, start, the earlier arrivals then
     self.creeps = 0                 # creeps taken this encounter (DEADLOCK_CYCLES)
+    self.creep_tries = 0            # creeps started this encounter, given back or not (DEADLOCK_CREEP_TRIES)
     self.order_waived = False       # the deadlock passed the turn to us: go condition 5 waived, and only it
     self.creep_end = None           # (why, creep): the creep just ended (its G5 go withdrawn)
     self.clear_s = 0.
@@ -1296,6 +1300,7 @@ class StopGo:
     if f.control is None or room < need - 1e-6:
       why = 'no latch to creep from' if f.control is None else f"no room to creep: {room:.2f} m to the closest edge, {need:.2f} needed"
       return self._waive(waiting, why)
+    self.creep_tries += 1
     moved = float(getattr(f.control.state, 'moved_m', 0.))
     # the latch holds again within CREEP_AT_M of its target, and the car runs on through the actuator delay and its stop: the
     # target is that much short, so the car comes to rest about DEADLOCK_CREEP_M on (8.1's bounded move)
@@ -1317,7 +1322,14 @@ class StopGo:
     blocked = self.creep_blocked(f, pos, c['known'])
     if stirred or moving or blocked:
       why = f"track {stirred[0]} moved" if stirred else blocked or 'something moved in the junction'
-      cloudlog.event("turnpilot.stop_go_deadlock_yield", key=list(self.key), why=why, pos=round(pos, 2))
+      # the earlier arrival didn't move (something else did, or the corner stopped being clear): the creep is given back,
+      # taken again once nothing moves DEADLOCK_S, up to DEADLOCK_CREEP_TRIES; spent, or the earlier arrival stirring and
+      # standing again (a standoff), the turn is a static cause with its bound once nothing moves (_turn_holds)
+      again = not stirred and self.creep_tries < DEADLOCK_CREEP_TRIES
+      if again:
+        self.creeps -= 1
+      cloudlog.event("turnpilot.stop_go_deadlock_yield", key=list(self.key), why=why, pos=round(pos, 2), again=again,
+                     tries=self.creep_tries)
       self.creep, self.turn_wait_s = None, 0.
       c['yield'] = why
       self.creep_end = ('deadlockYield', c)
