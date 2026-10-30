@@ -13,6 +13,7 @@ from multiprocessing import Queue
 
 from openpilot.tools.sim.bridge.common import control_cmd_gen
 from openpilot.tools.sim.bridge.beamng.bridge import BeamNGBridge
+from openpilot.tools.sim.bridge.beamng.pose import SPEED_SOURCES
 from openpilot.tools.sim.bridge.beamng.world import BeamNGConfig
 
 
@@ -47,6 +48,9 @@ def parse_args(add_args=None):
                  help="publish the game's light states ahead as turnpilotLights (light_oracle.py; SIM ONLY: turnpilotd takes them " +
                       "only with TURNPILOT_LIGHT_ORACLE=1 in launch_openpilot.sh)")
   p.add_argument('--light-latency', type=float, default=0.3, help='with --light-oracle, publish the lights this late, s')
+  p.add_argument('--speed-source', choices=SPEED_SOURCES, default=d.speed_source,
+                 help="openpilot's wheel speeds from the car's travel (ground, the IMU pose) or electrics.wheelspeed (wheels, " +
+                      "which over-reads 10-20%% while the car speeds up or brakes)")
   return p.parse_args(add_args)
 
 
@@ -80,7 +84,7 @@ def config_from_args(args) -> BeamNGConfig:
   return BeamNGConfig(host=args.host, port=args.port, level=args.level, model=args.model, spawn_pos=args.spawn, spawn_rot=args.rot,
                       reload=args.reload, camera_update=args.camera_update, camera_poll=args.camera_poll, lean=not args.no_lean,
                       green=not args.signals, capture=args.capture, capture_fps=args.capture_fps,
-                      restore=args.restore_on_exit)
+                      restore=args.restore_on_exit, speed_source=args.speed_source)
 
 
 def main():

@@ -5,7 +5,13 @@ runs on the Mac and talks to the game over BeamNGpy 1.36 at `192.168.137.1:25252
 ETK 800 (the stock sedan closest to a Model 3: 4.67 m long and 1.39 m tall, against 4.69 m and 1.44 m) and publishes:
 
 - `can` and `pandaStates` for a Model 3 on 3-bit DAS firmware, including `DI_autonomyHealth` (0x054) on bus 0, so card
-  fingerprints `TESLA_MODEL_3` with `dashcamOnly` false and alpha longitudinal
+  fingerprints `TESLA_MODEL_3` with `dashcamOnly` false and alpha longitudinal. Its wheel speeds (vEgo) are the car's
+  ground speed: the forward speed of the road under the IMU, from the pose (`pose.car_speed`, `--speed-source ground`),
+  zero once the wheels have stopped. `electrics.wheelspeed` (`--speed-source wheels`, before 2026-10-30) over-read by
+  10-20% while the car sped up or braked (the rolling start, a braking approach), so turnpilotd's route follower,
+  dead-reckoning navd's readings on vEgo, put a junction 6-13 m too near (BeamNG build findings D4-speed). The scenario
+  runner logs the wheels' speed beside it (rows' `v_wheel`) and fails a run whose speed and travel differ by over 3%
+  (`score.speed_problems`)
 - road and wide frames on VisionIPC at 1344x760 with `narrowRoadCameraState` and `wideRoadCameraState` (`sensor` os04c10)
 - `accelerometer` and `gyroscope` at 100 Hz, `gpsLocationExternal` at 10 Hz (with a fix, in `frame.py`'s projection),
   and upstream's fake driver monitoring and peripheral state

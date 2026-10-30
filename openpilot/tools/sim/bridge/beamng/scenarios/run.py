@@ -96,6 +96,10 @@ LIGHTS_FRESH_S = 1.  # a row's lights: the light oracle's turnpilotLights this f
 # the oracle never drives with every light unknown (BeamNG ctl_ped_in_path 2026-10-30, the oracle dead before the level loaded)
 ORACLE_WAIT_S = 30.
 ORACLE_STALE_S = 3.
+# the speed check (score.speed_problems): the speed openpilot was given, and electrics.wheelspeed beside it, integrated over
+# the pose log's travel from each run's teleport (the rolling start before engagement is where the wheels over-read most:
+# BeamNG diag S02, 19.5%); a pose step longer than this in one 20 Hz row is the teleport, not travel
+ODO_JUMP_M = 2.
 ACTOR_FIELDS = ["wall_s", "x", "y", "z", "heading"]
 
 
@@ -205,6 +209,7 @@ class Runner:
     plan = self.plan
     if self.phase not in ('next', 'done') and b.rk_frame % 5 == 0:  # 20 Hz, from the teleport to the end of the run
       self.log_pose(b)
+      self.odometer(b, now)
     if not self.director.is_alive() and self.phase not in ('next', 'done'):
       self.end_run(b, 'error', "the scenario director stopped (is the game reachable?)")
       self.finish(b)
@@ -331,6 +336,8 @@ class Runner:
     self.handback = self.takeover = self.press = self.drop = None  # the demo options' (demo_options)
     self.press_until = -1.
     self.step_out = None  # ped_step_out's walker: when she set off, the car's speed and distance, the stop it then needed
+    self.odo = {'v_m': 0., 'wheel_m': None, 'travel_m': 0.}  # the speed check's integrals (odometer), from the teleport
+    self.odo_last = None
     if self.params is not None:
       self.params.put_bool('TurnPilotEnabled', False)
       self.tp_off_t = time.monotonic()
@@ -347,7 +354,8 @@ class Runner:
     h = math.radians(90.0 - s.bearing)  # compass to CCW from east
     r = {
       't': round(now - self.t_engaged, 3), 'wall': round(wall(), 3), 'x': round(x, 2), 'y': round(y, 2), 'heading': round(h, 3),
-      'v': round(s.wheel_speed, 2), 'route': self.route_id,
+      'v': round(s.wheel_speed, 2), 'v_wheel': None if (vw := getattr(s, 'wheel_speed_electrics', None)) is None else round(vw, 2),
+      'route': self.route_id,
       'dest_dist': None if self.plan.dest is None else round(math.hypot(self.plan.dest[0] - x, self.plan.dest[1] - y), 1),
       'blinker': 'left' if b.blinker[0] else 'right' if b.blinker[1] else '',
       'ped_gap': None, 'car_gap': None, 'pacer_dx': None, 'j_dist': junction_distance(self.plan, x, y), 'car_j_dist': None,
@@ -403,6 +411,33 @@ class Runner:
         rows[-1][0] = new[0]
       else:
         rows.append(new)
+
+  def odometer(self, b, now: float):
+    """The speed check's integrals (module constants): the speed openpilot was given and the wheels' over the pose's
+    horizontal travel, a pose step over ODO_JUMP_M (the teleport) left out."""
+    pose, s = b.world.pose, b.simulator_state
+    if pose is None:
+      return
+    xy, v, vw = (float(pose.pos[0]), float(pose.pos[1])), abs(float(s.wheel_speed)), getattr(s, 'wheel_speed_electrics', None)
+    last, self.odo_last = self.odo_last, (now, xy, v, vw)
+    if last is None:
+      return
+    step, dt = math.hypot(xy[0] - last[1][0], xy[1] - last[1][1]), now - last[0]
+    if step > ODO_JUMP_M or dt <= 0.:
+      return
+    o = self.odo
+    o['travel_m'] += step
+    o['v_m'] += dt * (v + last[2]) / 2.
+    if vw is not None and last[3] is not None:
+      o['wheel_m'] = (o['wheel_m'] or 0.) + dt * (abs(vw) + abs(last[3])) / 2.
+
+  def speed_check(self) -> dict:
+    """The run's speed check, for score.speed_problems: m the given speed and the wheels' integrate to, m of travel."""
+    o = getattr(self, 'odo', None) or {'v_m': 0., 'wheel_m': None, 'travel_m': 0.}
+    travel = o['travel_m']
+    return {'v_m': round(o['v_m'], 1), 'wheel_m': None if o['wheel_m'] is None else round(o['wheel_m'], 1), 'travel_m': round(travel, 1),
+            'ratio': round(o['v_m'] / travel, 3) if travel > 0. else None,
+            'wheel_ratio': round(o['wheel_m'] / travel, 3) if travel > 0. and o['wheel_m'] is not None else None, 'from': 'teleport'}
 
   def triggers(self, b, r):
     """Set the actors going on the car at its junction (timing.GoWatch): the walker steps out on the car's go there, the
@@ -516,7 +551,7 @@ class Runner:
     drop = getattr(self, 'drop', None)
     drop = drop if drop is not None or self.drop_at is None else {'t': None, 'at': self.drop_at}
     res = score.summarize(self.plan.name, self.rows, outcome, road=self.plan.road, junction_control=self.plan.notes.get('junction_control'),
-                          expect=self.expect, stop_line_m=self.plan.notes.get('stop_line_m'), drop=drop)
+                          expect=self.expect, stop_line_m=self.plan.notes.get('stop_line_m'), drop=drop, speed=self.speed_check())
     # what the demo's options did, and when (t: s since engagement); the drop's is the score's detection_drop
     res.update(driver_takeover=getattr(self, 'takeover', None), gas_press=getattr(self, 'press', None),
                step_out=getattr(self, 'step_out', None))

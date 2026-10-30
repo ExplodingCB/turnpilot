@@ -3,7 +3,9 @@
 
 A row is a dict:
   t, wall            s since engagement (run.py; a recorded drive's: since its first turnpilotPlan), and wall-clock time
-  x, y, heading, v   the ego's camera mount in BeamNG world meters, heading rad CCW from east, wheel speed m/s
+  x, y, heading, v   the ego's camera mount in BeamNG world meters, heading rad CCW from east, and the speed openpilot's
+                     wheel speeds were given, m/s (the bridge's speed source: the car's ground speed by default, world.py)
+  v_wheel            electrics.wheelspeed, m/s, logged beside it (None in rows from before it was)
   enabled            selfdriveState.enabled; alert, alert_text: its alertType and alertText1
   steer, gas, brake  carState steeringPressed, gasPressed, brakePressed
   state, reason      turnpilotPlan.state and .reason; lc, prompt: its laneChange and signalPrompt
@@ -176,6 +178,22 @@ HARD_BRAKE_PREFIXES = ('ped_', 'unprotected_left')
 # or any run expecting hardBrake) the planner's aTarget (longitudinalPlan, whoever asked for it) below ACCEL_FLOOR before
 # TurnPilot's first hardBrake fails too, as does one with no hardBrake at all; rows with no a_target fail it as not checked
 HARD_BRAKE_SHOTS = ('ped_step_out',)
+
+
+# the speed openpilot was given against the car's travel, from the run's teleport (run.Runner.odometer): off by more than
+# SPEED_TOL fails the run, as harness (BeamNG build findings D4-speed: the wheels' 14% over-read on S08's approach put the
+# route follower's junction 13 m too near, and the left undecided at the line); under SPEED_CHECK_MIN_M of travel, not said
+SPEED_TOL = 0.03
+SPEED_CHECK_MIN_M = 20.
+
+
+def speed_problems(sc: dict | None) -> list[str]:
+  """Why a run's speed check (run.Runner.speed_check) fails it; empty when it passes or can't say."""
+  if not sc or sc.get('ratio') is None or (sc.get('travel_m') or 0.) < SPEED_CHECK_MIN_M or abs(sc['ratio'] - 1.) <= SPEED_TOL:
+    return []
+  wheels = '' if sc.get('wheel_ratio') is None else f"; the wheels read {sc['wheel_ratio'] - 1.:+.0%}"
+  return [f"the sim's speed integrates to {sc['v_m']} m against {sc['travel_m']} m of travel from the teleport " +
+          f"({sc['ratio'] - 1.:+.0%}, over {SPEED_TOL:.0%}{wheels}): TurnPilot dead-reckoned on a wrong vEgo (harness, not TurnPilot)"]
 
 
 def msg_fields(ss, cs, tp, nav, model, lp=None) -> dict:
@@ -767,6 +785,7 @@ def _fails(name: str, res: dict) -> list[tuple[str, str]]:
   if name in ('ped_crosswalk_right', 'ped_in_path', 'ped_step_out') and res['min_gap_ped_m'] is not None and \
      res['min_gap_ped_m'] < COLLISION_GAP_M:
     fails.append(('ped_contact', f"came within {res['min_gap_ped_m']} m of the pedestrian"))
+  fails += [('speed', why) for why in speed_problems(res.get('speed_check'))]
   return fails
 
 
@@ -1181,12 +1200,13 @@ def red_light(rows, stop_line_m: float | None) -> dict | None:
 
 
 def summarize(name: str, rows, outcome: str, road: dict | None = None, junction_control: str | None = None, expect=(),
-              stop_line_m: float | None = None, drop: dict | None = None) -> dict:
+              stop_line_m: float | None = None, drop: dict | None = None, speed: dict | None = None) -> dict:
   """road: catalog.road_model's roads around the run, for the oncoming-lane check (rows with positions need one);
   junction_control: the scenario junction's own mapped control (catalog.junction_control's kind: 'signal', 'stop',
   'none'; None: not known), recorded with the result (a signal there no longer protects a left: map_controls);
   expect: the run's expectations (EXPECTS); stop_line_m: m before the junction of its own stop line (the plan's notes);
-  drop: the runner's detection drop ({t: s since engagement, ...}; {t: None, at: s} asked for and never set; None: none)."""
+  drop: the runner's detection drop ({t: s since engagement, ...}; {t: None, at: s} asked for and never set; None: none);
+  speed: the runner's speed check (run.Runner.speed_check; None: not made, as for a recorded drive)."""
   ms = maneuvers(rows)
   wrong_m, wrong_spans = wrong_side(rows, road)
   res = {
@@ -1219,6 +1239,7 @@ def summarize(name: str, rows, outcome: str, road: dict | None = None, junction_
     'stop_met_t': next((r['t'] for r in rows if r.get('map_kind') == 'stop' and r['enabled']), None),  # a stop sign the plan met
     'tp_accel': tp_accel(rows),
     'detection_drop': drop,
+    'speed_check': speed,
   }
   res['failures'] = check(name, res, expect)
   res['passed'] = not res['failures']
@@ -1269,7 +1290,8 @@ def main():
       expect = args.expect if args.expect is not None else run.get('expect', result.get('expect', ()))
       print(report(f"{result['scenario']} run {run['run']}", summarize(result['scenario'], run['rows'], run['outcome'], road=result.get('road'),
                                                                      junction_control=notes.get('junction_control'), expect=expect,
-                                                                     stop_line_m=notes.get('stop_line_m'), drop=run.get('detection_drop'))))
+                                                                     stop_line_m=notes.get('stop_line_m'), drop=run.get('detection_drop'),
+                                                                     speed=run.get('speed_check'))))
 
 
 if __name__ == "__main__":

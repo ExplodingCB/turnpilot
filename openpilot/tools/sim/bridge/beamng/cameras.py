@@ -30,6 +30,7 @@ W, H = 1344, 760  # what a comma four's camerad outputs from the os04c10
 ROAD_FOV_Y = 36.82  # deg, common/transformations/camera.py _os_config: 2 atan(380 / 1141.5)
 WIDE_FOV_Y = 83.57  # deg, 2 atan(380 / 425.25); a pinhole stand-in for the fisheye, which is what modeld's warp assumes
 MOUNT = (0.0, -0.55, 1.3)  # etk800 vehicle frame (-y forward): top center of the windshield, 1.34 m above the road
+MOUNT_ABOVE_ROAD_M = 1.34  # ...the IMU's too (world.py): the road under it is pose.Pose's ground_h below
 PERIOD = 0.05  # s, the comma four's 20 Hz
 MIN_GAP = 0.04  # s; after a late pair the next slot moves out so pairs never come in bursts
 REPUBLISH_AFTER = 0.15  # s; at a standstill BeamNG can render identical frames, and modeld must not starve
