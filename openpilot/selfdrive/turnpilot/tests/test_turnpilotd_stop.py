@@ -740,3 +740,116 @@ def test_the_sim_cross_traffic_oracle_is_refused_out_loud_without_a_sim_car(tmp_
   sim.run(3.)
   assert any(ln.binding == 'oracle' for p in sim.plans()[-40:] for ln in p.stopGo.lanes)
   assert not any(str(p.controlAlert) == 'lightSourceRejected' for p in sim.plans())
+
+
+def test_the_ladders_other_turn_is_the_scenes_maneuver_and_the_turn_caps_never_the_routes(tmp_path):
+  # 7.1 rung 2: the route turns left here, a car stands on the left's exit leg (no room past the junction), and at the static
+  # bound the decider takes a right. From then on the turn the car makes is the right: scene_policy's junction holds and the
+  # turn's speed cap are the right's, from its junction distance. turnpilotd had fed them the route's left all along, so an
+  # oncoming car (confirmed, trusted, 2 s out) held the right's launch at the left's hold line ("waiting for oncoming", a stop
+  # a confirmed track may harden past -2.0) for a car that is no conflict to a right
+  from openpilot.selfdrive.turnpilot import stop_go as sg_mod
+  from openpilot.selfdrive.turnpilot.route_follower import RIGHT
+  from openpilot.selfdrive.turnpilot.turn_speed import turn_speed_cap
+  sim = StopSim(tmp_path, info_kw={'maneuver': 'left'}, maneuvers=[(S_LINE + 13., 'turn', 'left'), (2000., 'turn', 'right')])
+  seen = []
+  orig = sim.tp.scene.update
+
+  def update(objects, available, maneuver, distance, v_ego, rht=True, maneuver_id=None, *a, **kw):
+    d = orig(objects, available, maneuver, distance, v_ego, rht, maneuver_id, *a, **kw)
+    junction = sim.tp.scene.junction
+    seen.append((maneuver, distance, maneuver_id, v_ego, junction.reason if junction is not None else ''))
+    return d
+  sim.tp.scene.update = update
+  st = {'go': None, 'k': 0}
+
+  def objects(s):
+    sg = s.tp.stop_go
+    out = []
+    if sg.token is not None and s.v < 0.5 and abs(S_LINE - s.s) < 6.:
+      pos = sg.pos_ref + (s.tp.odo_m - sg.odo_ref)
+      x0 = sg._x(sg.edges.d_max, pos) + sr.LANE_W_MAX
+      out.append({'trackId': 40, 'cls': 'car', 'x': x0 + sr.LANE_W_MAX, 'y': sg_mod.BOX_LEFT_M + 3., 'vx': 0., 'vy': 0., 'inPath': False,
+                  'age': 200, 'camera': 'wide', 'view': 'full', 'tSeen': s.t_cam})
+    if st['go'] is not None:
+      st['k'] += 1
+      out.append({'trackId': 41, 'cls': 'car', 'x': 30., 'y': 3.2, 'vx': -8., 'vy': 0., 'inPath': False, 'age': 40 + st['k'],
+                  'camera': 'wide', 'view': 'full', 'tSeen': s.t_cam})
+    return tuple(out)
+  run_to_line(sim)
+  start = len(sim.trace)
+  turned = 0.
+  while sim.t < 90. and not any(p.turnMissed for p in sim.plans()[start:]):
+    if st['go'] is None and str(sim.tp.stop_go.state) == 'going':
+      st['go'] = len(sim.trace)
+    moving = sim.v > 0.5 and str(sim.trace[-1][2].stopGo.state) in ('committed', 'inLane')
+    yaw = -0.6 if moving and turned < 80. else 0.
+    turned += abs(yaw) * DT_MDL * 57.3
+    sim.step(objects=objects(sim), yaw_rate=yaw)
+  plans = sim.plans()
+  alt = next((k for k, p in enumerate(plans) if k >= start and str(p.controlAlert) == 'otherTurn'), None)
+  assert alt is not None and str(plans[alt].stopGo.maneuver) == 'right', [(str(p.stopGo.state), p.reason) for p in plans[start::40]]
+  go = next(k for k, p in enumerate(plans) if str(p.goCertified.cause) == 'stopSign')
+  assert go > alt and st['go'] is not None
+  # the scene's maneuver from the other turn on: the right, its junction from the decider's toNode, its own id
+  assert len(seen) == len(plans)
+  done = next(k for k, p in enumerate(plans) if k > go and str(p.stopGo.state) in ('done', 'off'))
+  assert all(x[0] is not None and x[0].side == RIGHT and abs(x[1]) < 20. and x[2] != sim.tp.follower.maneuver_id for x in seen[alt + 1:done])
+  # the scene never held the right's launch for the oncoming car (its junction hold, a right's: the crosswalk), nothing
+  # below -2.0, and the plan's cap no higher than the right's turn cap
+  assert not any(x[4] for x in seen[alt + 1:done]), sorted({x[4] for x in seen[alt + 1:done]})
+  assert all(p.accelCap >= -2. - 1e-9 for p in plans)
+  assert all(p.speedCap <= turn_speed_cap(m, d, v) + 1e-6 for p, (m, d, _, v, _) in zip(plans[alt + 1:done], seen[alt + 1:done], strict=True))
+  assert any(p.desire == Desire.turnRight for p in plans[go:go + 3]) and Desire.turnLeft not in [p.desire for p in plans]
+
+
+def test_a_left_taken_instead_of_the_routes_right_gets_the_scenes_oncoming_hold(tmp_path):
+  # the route turns right here; its exit leg and the road straight across both have a car standing on them, so at the static
+  # bound the decider takes a left (a single-lane approach). The scene's far-side oncoming hold is then the left's: a car
+  # coming the other way during the left's launch holds it short of the oncoming lanes (it had had none, the scene's maneuver
+  # the route's right, a curb-side turn)
+  from openpilot.selfdrive.turnpilot import stop_go as sg_mod
+  from openpilot.selfdrive.turnpilot.route_follower import LEFT
+  from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M
+  sim = StopSim(tmp_path, info_kw={'maneuver': 'right'}, maneuvers=[(S_LINE + 13., 'turn', 'right'), (2000., 'turn', 'left')])
+  seen = []
+  orig = sim.tp.scene.update
+
+  def update(objects, available, maneuver, distance, v_ego, rht=True, maneuver_id=None, *a, **kw):
+    d = orig(objects, available, maneuver, distance, v_ego, rht, maneuver_id, *a, **kw)
+    junction = sim.tp.scene.junction
+    seen.append((maneuver, distance, junction.reason if junction is not None else ''))
+    return d
+  sim.tp.scene.update = update
+  st = {'go': None, 'k': 0}
+
+  def objects(s):
+    sg = s.tp.stop_go
+    out = []
+    if sg.token is not None and s.v < 0.5 and abs(S_LINE - s.s) < 6. and st['go'] is None:
+      pos = sg.pos_ref + (s.tp.odo_m - sg.odo_ref)
+      x0 = sg._x(sg.edges.d_min, pos)
+      out.append({'trackId': 40, 'cls': 'car', 'x': x0 + sr.LANE_W_MAX, 'y': -(sg_mod.BOX_RIGHT_M + 3.), 'vx': 0., 'vy': 0.,
+                  'inPath': False, 'age': 200, 'camera': 'wide', 'view': 'full', 'tSeen': s.t_cam})
+      out.append({'trackId': 42, 'cls': 'car', 'x': sg._x(sg._far_edge(), pos) + 3., 'y': 0., 'vx': 0., 'vy': 0., 'inPath': True,
+                  'age': 200, 'camera': 'wide', 'view': 'full', 'tSeen': s.t_cam})
+    if st['go'] is not None:
+      st['k'] += 1
+      out.append({'trackId': 41, 'cls': 'car', 'x': 30., 'y': 3.2, 'vx': -8., 'vy': 0., 'inPath': False, 'age': 40 + st['k'],
+                  'camera': 'wide', 'view': 'full', 'tSeen': s.t_cam})
+    return tuple(out)
+  run_to_line(sim)
+  start = len(sim.trace)
+  while sim.t < 60. and (st['go'] is None or len(sim.trace) - st['go'] < round(7. / DT_MDL)):
+    if st['go'] is None and str(sim.tp.stop_go.state) == 'going':
+      st['go'] = len(sim.trace)
+    sim.step(objects=objects(sim))
+  plans = sim.plans()
+  alt = next((k for k, p in enumerate(plans) if k >= start and str(p.controlAlert) == 'otherTurn'), None)
+  assert alt is not None and str(plans[alt].stopGo.maneuver) == 'left', [(str(p.stopGo.state), p.reason) for p in plans[start::40]]
+  assert st['go'] is not None
+  assert all(x[0] is not None and x[0].side == LEFT for x in seen[alt + 1:])
+  assert any(x[2] == 'waiting for oncoming' for x in seen[st['go']:]), sorted({x[2] for x in seen[st['go']:]})
+  # held short of the oncoming lanes (the node is 13 m past the stop point), on the speed cap: nothing below -2.0 here
+  assert sim.v < 0.3 and sim.s - S_LINE < 13. - ONCOMING_ENTRY_M
+  assert all(p.accelCap >= -2. - 1e-9 for p in plans)

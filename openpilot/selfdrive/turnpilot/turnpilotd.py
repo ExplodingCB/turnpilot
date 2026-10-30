@@ -232,6 +232,9 @@ MISSED_HOLD_S = 3.     # turnMissed is held this long, for the alert and for nav
 # the stop-sign ladder's other turn (stop_go.py: 7.1 rung 2, O12) is a maneuver of its own for DesireTiming, never a route's id, so
 # navd's reroute after it (turnMissed) never clears its pulse as a replaced maneuver's
 ALT_MANEUVER_ID = -7
+# ...and for the scene's junction holds (scene_policy: its committed and released ids) each other turn is a maneuver of its own,
+# ALT_SCENE_ID less one per encounter: the last one's commitment never opens the next one's junction
+ALT_SCENE_ID = -1000
 # the sim's cross-traffic oracle (cross_oracle): its road users' track ids, and their classes as the tracker's (COCO) indexes
 ORACLE_ID = 1_000_000
 CROSS_ORACLE_REFUSED_REASON = "Sim cross traffic refused: not a sim car"  # the light oracle's gate without a sim car (cross_oracle)
@@ -392,6 +395,8 @@ class TurnPilot:
     self.yaw20: list = []         # (odometer, deg) of the car's heading change, the last YAW20_M
     self.sg_now: StopGoDecision | None = None  # this frame's decision, once update() has made it
     self.sg_turned = 0.           # deg the car has turned since the decider's go
+    self.alt_scene_id = ALT_SCENE_ID  # the scene's maneuver id for the ladder's other turn in hand (a new one per encounter)
+    self.alt_was_on = False
     self.last_holding = False     # the last plan's scene held the car (the decider's clearBox waits it out)
     self.params = None            # Params (main()): TurnPilotJunctionOverrides is written through it (signal_seen_override)
     self.override_failed_t = 0.   # s overrideWriteFailed has left to show
@@ -671,11 +676,25 @@ class TurnPilot:
     cap_on = act_on if act_on is not None else (maneuver if rf.maneuver_id == self.turn_cap_id else None)
     if cap_on is None and rf.maneuver_id == self.skip_cap_id:
       cap_on = upcoming  # the skipped turn's pulse may have been taken before it was cleared: never sped up into it
+    cap_d = rf.distance
 
     # the scene's holds only ever brake, so they keep the real maneuver through a handback
+    scene_m, scene_d, scene_id, scene_yaw = maneuver, rf.distance, rf.maneuver_id, self.approach_yaw_deg
+    # the stop-sign ladder's other turn (stop_go: 7.1 rung 2, O12), from when it is taken until its encounter is over, is the
+    # turn the car makes here: the scene's junction holds (a right's crosswalk, a left's oncoming hold, its road frame turned by
+    # the car's yaw since the decider's go, its pulse) and the turn's speed cap are its, never the route's maneuver here (a route
+    # left's oncoming hold through a right's launch; no oncoming hold for a left taken instead of a right). None going straight
+    alt_on = sg.alt is not None and sg.state != 'off'
+    if alt_on:
+      if not self.alt_was_on:
+        self.alt_scene_id -= 1
+      scene_m, scene_d, scene_id = alt_maneuver(sg.alt), float(sg.alt['toNode']) - sg.position_m, self.alt_scene_id
+      scene_yaw = self.sg_turned * scene_m.side if scene_m is not None else 0.
+      cap_on, cap_d = scene_m, scene_d
+    self.alt_was_on = alt_on
     left_stops = self.left_now.stops if self.left_now is not None else []
-    decision = self.scene_now = self.scene.update(objects, available, maneuver, rf.distance, v_ego, right_hand_traffic, rf.maneuver_id,
-                                                 took_over, extra_stops=mapd.stops + left_stops + sg.stops, heading_deg=self.approach_yaw_deg)
+    decision = self.scene_now = self.scene.update(objects, available, scene_m, scene_d, v_ego, right_hand_traffic, scene_id,
+                                                 took_over, extra_stops=mapd.stops + left_stops + sg.stops, heading_deg=scene_yaw)
     self.last_holding = decision.holding
     # a hold let go with the car standing (the walker cleared, a stop's go): the model won't pull away on its own, and the
     # turn's pulse is long forgotten, so it goes again in this very plan, the one that lets the car go: held, the desire
@@ -760,7 +779,7 @@ class TurnPilot:
     # once the step is dead-reckoned past, until navd moves on to the turn
     ahead_on = acting and rf.valid and rf.maneuver_id != self.dropped_id
     ahead_cap = turn_speed_cap(rf.ahead, rf.ahead_distance, v_ego, right_hand_traffic) if ahead_on else NO_SPEED_CAP
-    plan.speedCap = min(decision.speed_cap, turn_speed_cap(cap_on, rf.distance, v_ego, right_hand_traffic), ahead_cap,
+    plan.speedCap = min(decision.speed_cap, turn_speed_cap(cap_on, cap_d, v_ego, right_hand_traffic), ahead_cap,
                         NO_SPEED_CAP if self.hold_v is None else self.hold_v)
     plan.shouldStop = decision.should_stop
     if self.post_go is not None and self.post_go.over:
