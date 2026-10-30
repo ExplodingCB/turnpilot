@@ -7,7 +7,8 @@ compared, so a third pass matches what's left by ground position; and a constant
 position, with the car's own motion taken out in the predict step, so velocities are over the ground, not relative.
 Every run's boxes also come out as they are (raw, raw_new: RawFrame), tracked or not, with their bearing and ground range
 uncapped, for the unprotected left's gap rule: a distant car that never scores NEW_TRACK_CONF never becomes a track, so
-track absence certifies nothing (CRITIQUE REQUIRED 2).
+track absence certifies nothing (CRITIQUE REQUIRED 2). A run before calibration (calStatus not calibrated) is no run at all:
+nothing it carried can be ranged or borne, so it never reads as an empty, clear one (skeptic G4).
 
 The far crop's runs (DESIGN phase 4 G5: turnpilotFarDetections, update_far) come out the same way (raw_far, raw_far_new),
 view far: their boxes are in the road camera's full-frame pixels, so they range and bear with the road lens, and the run
@@ -138,6 +139,11 @@ class RawFrame:
                            # elevation deg, conf) of each box's centre, map_controls' class-11 evidence of a mapped stop (C11)
 
 
+def is_calibrated(calibration) -> bool:
+  """extrinsicsCalibration with calStatus calibrated and its rpyCalib (modeld's light reader requires the same)."""
+  return calibration is not None and len(calibration.rpyCalib) == 3 and str(calibration.calStatus) == 'calibrated'
+
+
 def view_key(camera: str, view: str) -> str:
   """raw_by_view's key for a run: the full pass on the road camera is 'road', on the wide camera 'full'; a far crop or a
   side view is its view."""
@@ -262,6 +268,7 @@ class SceneTracker:
     self.new_runs: list[tuple] = []             # ...and each run, in order: (view key, camera time, RawFrame, a side view's
                                                 # sectors [(inner, outer, quality)]), for the stop-sign evidence
     self.coast_s = MAX_COAST_S                  # SWEEP_COAST_S while a stop sweep runs (turnpilotd)
+    self.uncalibrated = False                   # runs are coming before calibration (update(): no runs), logged once a spell
 
   def measure(self, det, camera: str, calibration) -> Measurement:
     box = np.array([det.x0, det.y0, det.x1, det.y1], dtype=np.float64)
@@ -392,6 +399,19 @@ class SceneTracker:
     view = str(detections.view) if detections is not None else 'full'
     key = (str(detections.camera), view, detections.frameId, detections.timestampEof) if detections is not None else None
     self.raw_new = False
+    if key is not None and key != self.last_key and detections.timestampEof > 0 and not is_calibrated(calibration):
+      # before calibration (extrinsicsCalibration not seen, or not calStatus calibrated) a run is no run: it can't be ranged or
+      # borne, so its boxes would all drop and it would read clear (skeptic G4). No raw frame, no view, no receipt: the scene
+      # goes stale, never "nothing there"
+      self.last_key = key
+      if not self.uncalibrated:
+        self.uncalibrated = True
+        cloudlog.event("turnpilot.tracker_uncalibrated", error=True,
+                       status=str(calibration.calStatus) if calibration is not None else 'none')
+      key = None
+    elif key is not None and key != self.last_key and self.uncalibrated:
+      self.uncalibrated = False
+      cloudlog.event("turnpilot.tracker_calibrated")
     if key is not None and key != self.last_key and detections.timestampEof > 0:
       self.last_key, self.last_recv = key, now
       t = detections.timestampEof * 1e-9

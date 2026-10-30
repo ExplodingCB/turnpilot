@@ -428,6 +428,28 @@ def test_a_nearer_reading_on_the_roll_up_to_the_line_is_said_never_a_silent_hold
       assert sim.s < JUNCTION - ONCOMING_ENTRY_M and all(str(p.controlPrompt) == 'leftUndecidedTakeControl' for p in plans[first:])
 
 
+def test_runs_before_calibration_never_let_the_left_go_with_a_car_in_the_band():
+  # skeptic G4 (residual): uncalibrated runs read as empty road runs, and the left went at 3.5 s with a car 60 m up the
+  # oncoming lane at 0.8. Now they are no runs: the left never certifies, and its stale fault says so
+  from openpilot.cereal import messaging as msgs
+  from openpilot.selfdrive.turnpilot.detector.decoder import CAR
+  from openpilot.selfdrive.turnpilot.scene.tests.test_tracker import CAMS, car_state, detections
+  from openpilot.selfdrive.turnpilot.scene.tracker import SceneTracker
+  from openpilot.selfdrive.turnpilot.unprotected_left import AUTO, LeftInput, UnprotectedLeft
+  trk = SceneTracker(CAMS, 'mici')
+  empty = msgs.new_message('extrinsicsCalibration').as_reader().extrinsicsCalibration
+  left, decisions = UnprotectedLeft(), []
+  for i in range(int(10. / DT_MDL)):
+    t = 1. + i * DT_MDL
+    raw = None
+    if i % 2 == 0:
+      trk.update_runs([detections(trk, 'road', t, [(CAR, 60., 3.6, 0.8)], frame_id=i)], empty, car_state(), now=t)
+      raw = trk.raw if trk.raw_new else None
+    decisions.append(left.update(LeftInput(AUTO, 1, 1, 9., 0., True, raw, [], 0., V_25, 1, TEST_RANGE_M), DT_MDL))
+  assert not any(d.go for d in decisions)
+  assert decisions[-1].state == 'undecided' and decisions[-1].why == 'stale'
+
+
 class GoHeldSim(Sim):
   """The model holding the car at a standstill once TurnPilot's turn pulse (its go) has gone out: it never pulls away."""
   went = False

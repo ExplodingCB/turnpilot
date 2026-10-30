@@ -43,6 +43,7 @@ def calibration(demo=False):
   cal = msg.extrinsicsCalibration
   rpy, wide, height = DEMO_CALIBRATION if demo else (RPY, WIDE_EULER, HEIGHT)
   cal.rpyCalib, cal.wideFromDeviceEuler, cal.height = rpy, wide, [height]
+  cal.calStatus = 'calibrated'
   return msg.as_reader().extrinsicsCalibration
 
 
@@ -606,3 +607,26 @@ def test_a_track_counts_the_forward_runs_of_its_camera_it_missed():
   assert missed() == [3]
   trk.update(detections(trk, 'road', 1.5, [(PERSON, 12., 0.2, 0.8)], frame_id=7), cal, car_state(), now=1.5)
   assert missed() == [0]
+
+
+def test_a_run_before_calibration_is_no_run_never_a_clear_one():
+  # skeptic G4 (residual): with no calibration yet (extrinsicsCalibration not seen: rpyCalib empty) raw_frame dropped every box
+  # but update() still returned a fresh RawFrame([], 'road') with raw_new, and nothing read calStatus: the unprotected left
+  # took an empty road run as a clear band and went with a car 60 m up the oncoming lane. A run is a run only once calStatus
+  # is calibrated (as modeld's light reader requires): before that, no raw frame, no view, no receipt, so the scene goes stale
+  # (unavailable, never "nothing there") and the left's stale fault comes
+  d = lambda trk, t, f: detections(trk, 'road', t, [(CAR, 60., 3.6, 0.8)], frame_id=f)  # noqa: E731
+  empty = messaging.new_message('extrinsicsCalibration').as_reader().extrinsicsCalibration
+  msg = messaging.new_message('extrinsicsCalibration')
+  msg.extrinsicsCalibration.rpyCalib, msg.extrinsicsCalibration.height = RPY, [HEIGHT]
+  for status in ('uncalibrated', 'recalibrating', 'invalid'):
+    msg.extrinsicsCalibration.calStatus = status
+    for cal in (empty, msg.as_reader().extrinsicsCalibration):
+      trk = SceneTracker(CAMS, 'mici')
+      for i in range(12):
+        trk.update_runs([d(trk, 1. + 0.1 * i, i)], cal, car_state(), now=1. + 0.1 * i)
+        assert not trk.raw_new and trk.raw is None and not trk.new_views and not trk.new_runs and not trk.tracks, status
+      assert not trk.available, status
+  trk = SceneTracker(CAMS, 'mici')
+  trk.update_runs([d(trk, 1., 0)], calibration(), car_state(), now=1.)
+  assert trk.raw_new and len(trk.raw.boxes) == 1 and trk.available
