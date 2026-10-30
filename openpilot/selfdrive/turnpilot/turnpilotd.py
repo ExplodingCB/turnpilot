@@ -397,7 +397,8 @@ class TurnPilot:
       self.left = UnprotectedLeft()  # the autonomous unprotected left (unprotected_left.py); kept through a fault, as its latch
       self.stop_go = StopGo()  # the stop-sign decider: kept through a fault, as the latch it decides for
       self.stop_go.on_signal_seen = self.signal_seen_override
-      self.sg_route_maneuver: str | None = None  # the route's maneuver at its control, last frame (stop_go_update)
+      self.sg_skip_token = None  # the decider's encounter in which the route's turn at its control was skipped (stop_go_update)
+      self.sg_route_maneuver: str | None = None  # the route's maneuver at its control, last frame (before a skip's union)
     self.go_cert.withdraw('reset')  # a disabled plan carries no go
     self.decider_turn_id: int | None = None  # the route's turn whose stop sign the decider acted for last frame (update())
     self.stopped_s = 0.            # standing engaged with nothing holding the car (carStoppedTakeControl)
@@ -1090,6 +1091,14 @@ class TurnPilot:
       m = str(info.get('maneuver', 'straight'))
       maneuver = 'unknown' if src is not None and src.key[0] == OFF_ROUTE else m if m in ('straight', 'left', 'right') else 'unknown'
       self.sg_route_maneuver = maneuver
+      if maneuver in ('left', 'right') and ((self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id) or
+                                            (sg.token is not None and sg.token is self.sg_skip_token)):
+        # the route's turn here skipped (a veto of the turn signal at the stop, too fast, a lane it can't reach; last frame's
+        # skip): no turn desire goes out and the hold's go is straight on, so the decider judges every maneuver's conflicts
+        # (unknown, as off the route), never the skipped turn's alone, for the rest of this encounter (navd moving on to the
+        # next maneuver as the car leaves the junction ends the skip, never the launch's union). A reroute that goes straight
+        # here is judged straight
+        maneuver, self.sg_skip_token = 'unknown', sg.token
       vis = self.vis_source()
       lead = model.leadsV3[0] if len(model.leadsV3) else None
       lead_m = float(lead.x[0]) if lead is not None and lead.prob > STOPPED_LEAD_PROB and len(lead.x) else None

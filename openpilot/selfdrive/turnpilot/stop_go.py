@@ -259,9 +259,10 @@ class Hold:
 
 def capped_abort(v: float, d_remaining: float, reason: str) -> Stop:
   """The capped stop d_remaining m ahead (map_controls._approach's way): an accel cap of max(needed, -2.0) and a speed cap of 0,
-  never a hard stop, shouldStop once slow."""
+  never a hard stop, shouldStop once slow. A stop that brings the car to rest (Stop.rest): a turn signal veto while it brakes
+  is decided as standing at it (turnpilotd's stopping, car_signals.py)."""
   need = -v * v / (2. * max(d_remaining, 0.5))
-  return Stop(max(need, -sr.A_ABORT), 0., v < STOP_SPEED, reason, max(d_remaining, 0.), confirmed=False)
+  return Stop(max(need, -sr.A_ABORT), 0., v < STOP_SPEED, reason, max(d_remaining, 0.), confirmed=False, rest=True)
 
 
 def hold_here(v: float, reason: str) -> Stop:
@@ -329,6 +330,7 @@ class StopGo:
     self.rank = 0
     self.turn_wait_s = 0.
     self.clear_s = 0.
+    self.clear_for = ''            # the maneuver clear_s counts for: a new one (a reroute, a skipped turn) counts from 0
     self.static_s = 0.
     self.dynamic_s = 0.
     self.next_chime = WAIT_INFO_S
@@ -682,6 +684,10 @@ class StopGo:
         # a withdrawn go come to rest with no room for another (2.6): H5, never a wait from where no go can start
         self._fault('H5', f, d, f"no room for another go: {room:.2f} m to the closest edge, {need:.2f} needed")
         return
+    if f.maneuver != self.clear_for:
+      # another path to judge (navd's reroute while held, or turnpilotd's skip of the turn here: the union, 'unknown'): its
+      # go conditions hold CLEAR_S from now, never on the time the old path's lanes were clear
+      self.clear_s, self.clear_for = 0., f.maneuver
     holds = self.go_holds(f, pos, launch=False)
     d.holds = holds
     self.clear_s = self.clear_s + f.dt if not holds else 0.
