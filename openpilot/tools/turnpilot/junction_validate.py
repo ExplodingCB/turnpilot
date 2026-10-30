@@ -19,7 +19,7 @@ lighting row (each car's row at its first track; day or sunAhead, the rows a sta
   by its log time (its first track's camera time, which this tool prints) with a reason, recorded in the stamp: only after
   looking at the clip and seeing it enter the lane inside that distance (a driveway, a turn in, a parked car pulling out);
 - every motor vehicle that approached, on any side, stopped at its line, and none went through it at speed (the survey may
-  be stale: the junction fails for Kellen's review);
+  be stale: the junction fails for Kellen's review), an excluded one too: --exclude excuses a late first track only;
 - per lane, the longest gap between consecutive detections of a counted vehicle while inside its need is at most CLEAR_S / 3
   (CRITIQUE REQUIRED 2), and every conflicting lane had a counted vehicle.
 
@@ -129,12 +129,17 @@ def judge(g: dict, row: str, excludes: list[dict]) -> tuple[dict | None, list[st
     return hit is not None
   live = [c for c in cars if not excluded(c)]
   counted = [c for c in live if c.get('approaching') is True and float(c.get('settledS', -1.)) >= SETTLE_S]
-  for c in live:
+  # every car, an excluded one too, is checked for running or not stopping at its line (skeptic SG3b q6a: --exclude, meant for a
+  # late first track seen entering inside R_req, made a stale-survey runner a pass with a driveway excuse); --exclude excuses
+  # the late check alone (and keeps the car out of the counts and first-track ranges)
+  for c in cars:
     tag = f"track {c['trackId']} ({c['cls']}, {c['role']} lane {c['index']}) at log time {float(c['firstT']):.2f}"
     if c.get('throughAtSpeed'):
       why.append(f"{tag} went through its line at speed (vMax {float(c.get('vMax', 0.)):.1f} m/s): the survey may be stale")
     elif c.get('approaching') is True and not c.get('stoppedAtLine'):
       why.append(f"{tag} approached and didn't stop at its line")
+    if c not in live:
+      continue
     settled = float(c.get('settledS', -1.)) >= SETTLE_S
     if c['role'] in STAMP_SIDES and settled and c.get('approaching') is not False and float(c['firstRangeM']) < float(c['needM']):
       why.append(f"{tag} was late: first tracked {float(c['firstRangeM']):.1f} m down its lane, inside {float(c['needM']):.1f} m " +

@@ -134,6 +134,21 @@ def test_a_late_first_track_fails_unless_excluded_by_hand_with_a_reason(tmp_path
   assert code == 0
 
 
+def test_an_exclusion_excuses_only_the_late_first_track_never_a_car_through_its_line_or_one_that_didnt_stop(tmp_path, capsys):
+  # skeptic SG3b q6a (row C9): judge dropped an excluded car from 'live', so its through-at-speed and didn't-stop checks went
+  # with its late check: a late car that also ran its line at speed failed the junction, but with --exclude 5000=driveway the
+  # same logs passed and got a stamp. --exclude excuses its late first track only
+  for kw in ({'through': True, 'stopped': False}, {'stopped': False}):
+    cars = traffic(n=11)
+    late = cars[7]
+    late.update(firstRangeM=30., throughAtSpeed=kw.get('through', False), stoppedAtLine=kw['stopped'])
+    code, _, out = run(tmp_path, [event(cars)], '--exclude', f"{late['firstT']:.2f}=pulled out of a driveway")
+    text = capsys.readouterr().out
+    assert code == 1 and stamps(out) == [], kw
+    assert ('went through its line at speed' if kw.get('through') else "approached and didn't stop") in text, kw
+    assert 'was late' not in text, kw
+
+
 def test_too_few_cars_on_a_binding_side_fails(tmp_path, capsys):
   cars = [c for c in traffic() if not (c['role'] == 'right' and c['trackId'] > 15)]
   code, _, out = run(tmp_path, [event(cars)])
