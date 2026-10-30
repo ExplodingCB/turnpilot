@@ -170,6 +170,10 @@ RED_NEAR_M = 30.      # a stand within this before the stop line is at the red
 ACCEL_FLOOR = SPEED_CAP_ACCEL_MIN
 ACCEL_TOL = 0.01
 HARD_BRAKE_PREFIXES = ('ped_', 'unprotected_left')
+# ...and in the hard stop's own shot (S10 'the braking past -2.0 m/s^2 starts only after the track confirmed', ped_step_out
+# or any run expecting hardBrake) the planner's aTarget (longitudinalPlan, whoever asked for it) below ACCEL_FLOOR before
+# TurnPilot's first hardBrake fails too, as does one with no hardBrake at all; rows with no a_target fail it as not checked
+HARD_BRAKE_SHOTS = ('ped_step_out',)
 
 
 def msg_fields(ss, cs, tp, nav, model, lp=None) -> dict:
@@ -599,13 +603,18 @@ def unprotected_left(rows) -> dict:
 
 def tp_accel(rows) -> dict:
   """TurnPilot's accel request while engaged (rows' tp_accel): its minimum, and the first row below ACCEL_FLOOR without a
-  confirmed track's hard stop (unannounced) and with one (hard), each {t, accel, alert}; the planner's minimum aTarget."""
-  out: dict = {'min': None, 'unannounced': None, 'hard': None, 'a_target_min': None}
+  confirmed track's hard stop (unannounced) and with one (hard), each {t, accel, alert}; the planner's minimum aTarget, its
+  first below ACCEL_FLOOR before TurnPilot's first hardBrake (a_target_early: {t, accel}), and that hardBrake's t."""
+  out: dict = {'min': None, 'unannounced': None, 'hard': None, 'a_target_min': None, 'a_target_early': None, 'hard_brake_t': None}
   for r in rows:
     if not r.get('enabled'):
       continue
+    if out['hard_brake_t'] is None and r.get('control_alert') == 'hardBrake':
+      out['hard_brake_t'] = r['t']
     if r.get('a_target') is not None:
       out['a_target_min'] = r['a_target'] if out['a_target_min'] is None else min(out['a_target_min'], r['a_target'])
+      if out['hard_brake_t'] is None and out['a_target_early'] is None and r['a_target'] < ACCEL_FLOOR - ACCEL_TOL:
+        out['a_target_early'] = {'t': r['t'], 'accel': r['a_target']}
     a = r.get('tp_accel')
     if a is None:
       continue
@@ -661,6 +670,14 @@ def _fails(name: str, res: dict) -> list[tuple[str, str]]:
     tc = take_control_expected(res.get('expect'))
     why = f"a run expecting a take-control handback (handback:{tc[0]}) shows no hard stop" if tc else f"{name} has nothing to brake for"
     fails.append(('accel', f"TurnPilot braked hard ({x['accel']} m/s^2, hardBrake) at t={x['t']:.1f} s: {why} past {ACCEL_FLOOR} m/s^2"))
+  if name in HARD_BRAKE_SHOTS or 'hardBrake' in {str(e).partition(':')[0] for e in res.get('expect') or ()}:
+    if acc.get('a_target_min') is None:
+      fails.append(('accel', f"no planner aTarget in the rows: whether the braking past {ACCEL_FLOOR} m/s^2 started only after the " +
+                    "track confirmed was not checked"))
+    elif (x := acc.get('a_target_early')) is not None:
+      when = f"before TurnPilot's confirmed hard stop (hardBrake at t={acc['hard_brake_t']:.1f} s)" if acc.get('hard_brake_t') is not None \
+        else "with no confirmed hard stop of TurnPilot's (no hardBrake)"
+      fails.append(('accel', f"the planner asked for {x['accel']} m/s^2 at t={x['t']:.1f} s, below {ACCEL_FLOOR} m/s^2 {when}"))
   taken, attempted = res['maneuvers_taken'], res['maneuvers_attempted']
   hs = res['holds']
   if name == 'ped_crosswalk_right':

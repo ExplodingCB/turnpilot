@@ -429,3 +429,44 @@ class TestTurnMissedAtThePass:
     for r in rows:
       r['j_ahead'] = None
     assert any("no junction in the rows" in f and 'not checked' in f for f in self.score(rows)['failures'])
+
+
+def step_out_stop(a_before=0., hard=True):
+  """S10 (ped_step_out): at 8.3 m/s toward the walker, the planner's aTarget at a_before for the second before TurnPilot's
+  confirmed hard stop (hardBrake, -3.2 m/s^2) and then the stop, standing 4 s; hard=False: never a hardBrake."""
+  return drive([(3.0, {'v': 8.3, 'tp_accel': 0., 'a_target': 0., 'ped_gap': lambda tau: 30. - 8.3 * tau}),
+                (1.0, {'v': lambda tau: 8.3 + a_before * tau, 'tp_accel': 0., 'a_target': a_before, 'ped_gap': 6.}),
+                (1.0, {'v': lambda tau: max(8.3 + a_before - 3.2 * tau, 0.), 'tp_accel': -3.2 if hard else 0., 'a_target': -3.2,
+                       'control_alert': 'hardBrake' if hard else 'none', 'ped_gap': 4.}),
+                (4.0, {'v': 0., 'tp_accel': 0., 'a_target': 0., 'ped_gap': 4.})])
+
+
+class TestHardBrakingStartsConfirmed:
+  """S10 'the braking past -2.0 m/s^2 starts only after the track confirmed (rlog turnpilotScene and longitudinalPlan)'
+  (B7): in ped_step_out and any run expecting hardBrake, the planner's aTarget (longitudinalPlan, the rows' a_target) below
+  score.ACCEL_FLOOR before the first hardBrake row (TurnPilot's confirmed track's hard stop) fails, as does one with no
+  hardBrake at all; rows with no aTarget say it wasn't checked."""
+
+  def test_the_planner_braking_hard_before_the_confirmed_stop_fails(self):
+    # the skeptic's B7: the planner at -3.0 for 1 s before TurnPilot's hardBrake, TurnPilot's own request at 0
+    res = score.summarize('ped_step_out', step_out_stop(-3.0), 'stopped', expect=('hardBrake',))
+    assert not res['passed']
+    want = "the planner asked for -3.0 m/s^2 at t=3.0 s, below -2.0 m/s^2 before TurnPilot's confirmed hard stop (hardBrake at t=4.0 s)"
+    assert want in res['failures'], res['failures']
+
+  def test_hard_braking_from_the_confirmed_stop_passes(self):
+    res = score.summarize('ped_step_out', step_out_stop(-1.5), 'stopped', expect=('hardBrake',))
+    assert res['passed'], res['failures']
+
+  def test_hard_braking_without_a_confirmed_stop_fails(self):
+    res = score.summarize('ped_step_out', step_out_stop(hard=False), 'stopped', expect=('hardBrake',))
+    assert "the planner asked for -3.2 m/s^2 at t=4.0 s, below -2.0 m/s^2 with no confirmed hard stop of TurnPilot's (no hardBrake)" in \
+      res['failures'], res['failures']
+
+  def test_rows_without_the_planners_accel_arent_checked(self):
+    rows = step_out_stop()
+    for r in rows:
+      del r['a_target']
+    res = score.summarize('ped_step_out', rows, 'stopped', expect=('hardBrake',))
+    want = "no planner aTarget in the rows: whether the braking past -2.0 m/s^2 started only after the track confirmed was not checked"
+    assert want in res['failures'], res['failures']

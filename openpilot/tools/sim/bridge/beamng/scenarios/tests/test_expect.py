@@ -362,10 +362,11 @@ class TestTurnMissed:
 
 class TestHardBrake:
   def stop(self, gap=4.0, alert=True):
-    return drive([(2.0, {'ped_gap': lambda tau: 25. - 8. * tau}),
+    """At 8 m/s toward the walker, then TurnPilot's confirmed hard stop at 5.5 m/s^2 (the planner's aTarget with it)."""
+    return drive([(2.0, {'ped_gap': lambda tau: 25. - 8. * tau, 'a_target': 0.}),
                   (1.5, {'control_alert': 'hardBrake' if alert else 'none', 'v': lambda tau: max(8. - 5.5 * tau, 0.),
-                         'ped_gap': lambda tau: max(9. - 6. * tau, gap)}),
-                  (4.0, {'v': 0., 'ped_gap': gap})])
+                         'ped_gap': lambda tau: max(9. - 6. * tau, gap), 'a_target': -5.5 if alert else -1.5}),
+                  (4.0, {'v': 0., 'ped_gap': gap, 'a_target': 0.})])
 
   def test_hard_braking_for_the_walker_without_contact(self):
     res = score.summarize('ped_step_out', self.stop(), 'stopped', expect=('hardBrake',))
