@@ -56,7 +56,7 @@ from openpilot.tools.sim.bridge.beamng.scenario import heading_quat
 from openpilot.tools.sim.bridge.beamng.scenarios import score
 from openpilot.tools.sim.bridge.beamng.scenarios.catalog import DATA_JSON, ROLL_FRACTION, SCENARIOS, Plan, build, junction_distance
 from openpilot.tools.sim.bridge.beamng.scenarios.director import Director, sweep
-from openpilot.tools.sim.bridge.beamng.scenarios.timing import GO_NEAR_M, STOOD_V, GoWatch
+from openpilot.tools.sim.bridge.beamng.scenarios.timing import GO_NEAR_M, STOOD_V, GoWatch, step_out_distance
 
 SETTLE_S = 4.         # after the teleport: the car is back in D and the GPS has caught up
 CLEAR_TIMEOUT_S = 5.  # wait this long for navd to drop the old route
@@ -261,6 +261,7 @@ class Runner:
     self.watch = GoWatch()
     self.handback = self.takeover = self.press = self.drop = None  # the demo options' (demo_options)
     self.press_until = -1.
+    self.step_out = None  # ped_step_out's walker: when she set off, the car's speed and distance, the stop it then needed
     if self.params is not None:
       self.params.put_bool('TurnPilotEnabled', False)
       self.tp_off_t = time.monotonic()
@@ -348,6 +349,14 @@ class Runner:
       go = False
       if a.trigger == 'walk':
         go, job = w.went, (d.walk, a.name)
+      elif a.trigger == 'step_out':  # ped_step_out: once the car is step_out_distance from her, along its heading
+        p0, h = a.path[0], r['heading']
+        ahead = (p0[0] - r['x']) * math.cos(h) + (p0[1] - r['y']) * math.sin(h)
+        go, job = r['v'] >= a.params['min_v'] and ahead <= step_out_distance(r['v'], a.params), (d.walk, a.name)
+        if go:
+          react = r['v'] * (a.params['enter_s'] + a.params['react_s'])
+          self.step_out = {'t': r['t'], 'v': r['v'], 'ahead_m': round(ahead, 2),
+                           'needs_decel': round(r['v'] ** 2 / (2. * max(ahead - react - a.params['gap_m'], 0.1)), 2)}
       elif a.trigger == 'oncoming':
         # a gap stream's car only on its own timer (catalog: timed); the others at the car's go too
         go = (w.went and not a.params.get('timed')) or (w.held_t is not None and r['t'] - w.held_t >= a.params['release_after_stop_s'])
@@ -437,7 +446,7 @@ class Runner:
                           expect=self.expect, stop_line_m=self.plan.notes.get('stop_line_m'))
     # what the demo's options did, and when (t: s since engagement)
     res.update(driver_takeover=getattr(self, 'takeover', None), gas_press=getattr(self, 'press', None),
-               detection_drop=getattr(self, 'drop', None))
+               detection_drop=getattr(self, 'drop', None), step_out=getattr(self, 'step_out', None))
     if self.plan.lights is not None:  # the forced light: what was set when (wall, from the director), and the swap's times
       res['light_events'] = [e for e in self.director.light_log if e[0] >= self.t0_wall - 1.]
       res['forced_light'] = {'instance': self.plan.lights['instance'], 'stand_t': getattr(self, 'stand_t', None),

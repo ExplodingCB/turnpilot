@@ -28,7 +28,8 @@ import numpy as np
 from openpilot.selfdrive.turnpilot.control_tracker import DROP_PAST_M
 from openpilot.selfdrive.turnpilot.lane_planner import LANE_WIDTH, lane_change_window
 from openpilot.selfdrive.turnpilot.map_controls import MAP_STOP_DECEL, PROTECT_BEFORE_M, engage_distance
-from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M
+from openpilot.selfdrive.turnpilot.scene.tracker import CORRIDOR_HALF_WIDTH
+from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, PED_STOP_GAP_M
 from openpilot.tools.sim.bridge.beamng.roadgraph import RoadGraph, wrap
 from openpilot.tools.sim.bridge.beamng.scenarios.timing import WALK_SPEED, arc_lengths, oncoming_release_delay, point_at, travel_time
 
@@ -54,6 +55,15 @@ LINE_ALIGNED_DEG = 40.   # ...if it controls traffic within this of the approach
 LINE_ASSOC_M = 40.       # a stop line this close to the junction nearest it is that junction's...
 INTO_DEG = 60.           # ...if it controls traffic heading into it, within this of the bearing to it
 PHASE_DEG = 45.          # a signal of the junction's group whose traffic heads within this of ours, or of its reverse: our phase
+# ped_step_out (S10): she stands STEP_OUT_CURB_M off the road edge on the car's side (0: on it, 0.5 m outside the car's
+# corridor in a 4 m lane) and steps into the middle of its lane when the car is timing.step_out_distance away: the stop
+# then needs STEP_OUT_DECEL once she is inside the corridor, STEP_OUT_REACT_S later (a detector run, the pipeline and the
+# actuator's lag), and less (2.4 m/s^2 at 30 km/h) if the policy takes her as entering at her first step; both are past
+# the comfortable -2.0 floor that only a confirmed track may brake harder than, and short of the Tesla's -3.48
+STEP_OUT_CURB_M = 0.
+STEP_OUT_DECEL = 3.0
+STEP_OUT_REACT_S = 0.5
+STEP_OUT_MIN_V = 4.      # m/s: she never steps out in front of a car slower than this
 
 
 @dataclass(frozen=True)
@@ -66,7 +76,7 @@ class Entry:
   dest_after_m: float = 60.       # destination this far past it
   speed_kph: float = 30.
   timeout_s: float = 150.
-  actor: str = ''                 # 'crosswalk', 'oncoming', 'standing', 'pacer'
+  actor: str = ''                 # 'crosswalk', 'oncoming', 'standing', 'pacer', 'step_out'
   crosswalk_m: float = 0.         # crosswalk centre from the junction along the exit road; 0: road edge + 2.5 m (unverified)
   ped_before_m: float = 40.       # standing mannequin, this far before the junction
   oncoming: int = 2               # cars
@@ -119,6 +129,10 @@ SCENARIOS = {
   # gate1's approach: eastbound on the 140 m straight from the bridge's default spawn
   'ped_in_path': Entry('straight', junction=(-768.9, 661.4), turn='right', from_heading_deg=0., actor='standing', end_on_stop_s=4.,
                        timeout_s=90.),
+  # S10: on the same straight a walker standing at the road edge 45 m before the junction steps into the middle of the
+  # lane when the car is step_out_distance ahead of her (STEP_OUT_*): the stop needs hard braking from a confirmed track
+  'ped_step_out': Entry('straight', junction=(-768.9, 661.4), turn='right', from_heading_deg=0., actor='step_out', ped_before_m=45.,
+                        end_on_stop_s=4., timeout_s=90., expect=('hardBrake',)),
   # forced reds (the module docstring's forced light). S13: the same straight through gate1's junction (group_80_81_82_83),
   # its signal red from the start: with no accepted light source (the car this week) TurnPilot adds nothing for it, the
   # model alone meets it. S14: ped_crosswalk_right's right turn without the walker, red until 8 s after the car stands.
@@ -518,6 +532,19 @@ def _turn_plan(name: str, e: Entry, graph: RoadGraph) -> Plan:
   elif e.actor == 'standing':
     p, _ = lane_pose(jn.approach, e.ped_before_m, lanes, radius, ego_lane(e.turn))
     actors.append(Actor(f"{PREFIX}ped", 'walker', 'setup', [list(p)], 0., heading=wrap(heading + math.pi)))
+  elif e.actor == 'step_out':
+    p, h_out = point_at(jn.approach, e.ped_before_m)  # the centreline there; h_out points away from the junction
+    travel = wrap(h_out + math.pi)
+    o_lane = lane_offset(lanes, radius, ego_lane(e.turn))
+    start = p[:2] + (radius + STEP_OUT_CURB_M) * right_of(travel)
+    end = p[:2] + o_lane * right_of(travel)
+    enter_s = max(radius + STEP_OUT_CURB_M - o_lane - CORRIDOR_HALF_WIDTH, 0.) / WALK_SPEED
+    z = float(p[2])
+    actors.append(Actor(f"{PREFIX}ped", 'walker', 'step_out', [[*map(float, start), z], [*map(float, end), z]], WALK_SPEED,
+                        heading=heading_of(start, end),
+                        params={'decel': STEP_OUT_DECEL, 'gap_m': PED_STOP_GAP_M, 'enter_s': round(enter_s, 3),
+                                'react_s': STEP_OUT_REACT_S, 'min_v': STEP_OUT_MIN_V}))
+    notes['step_out'] = {'before_m': e.ped_before_m, 'lateral_m': round(radius + STEP_OUT_CURB_M - o_lane, 2), 'enter_s': round(enter_s, 2)}
   elif e.actor == 'oncoming' and e.stream_headway_s:
     # a queue across the junction, each released on its own timer from the car's stand: at its headway (Entry)
     paths = oncoming_paths(graph, jn, e.oncoming, e.oncoming_start_m, QUEUE_GAP_M)
