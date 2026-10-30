@@ -157,6 +157,22 @@ def test_V2_a_roller_at_an_all_way_is_never_stopping_and_one_through_at_speed_is
   assert not drive(ev, 3, ln, braking(35., 8., 0.), 4.0, cls=BICYCLE).through_at_speed
 
 
+def test_V3_a_car_that_stops_hard_with_its_front_at_its_line_is_never_through_at_speed():
+  # SG4b's downgrade reads through at speed: the speed fit spans SPEED_SPAN_S, so a car coming in at 8 m/s and stopping hard
+  # with its front on its line (the limit: at once) still read 8 m/s the moment its front touched the line, and was through,
+  # a car that stopped. Through is past the line region (SHIELD_PAST_M past its line), where a stopped car never is
+  ln = lane('left')
+  line = 9.  # evidence()'s lines
+  for front_end in (line, line - sr.SHIELD_PAST_M + 0.2):
+    ev = evidence()
+    e = drive(ev, 4, ln, lambda t, fe=front_end: max(35. - 8. * t, fe + 2.3), 6.0)
+    assert not e.through_at_speed, front_end
+  # one that goes on through: through, its crossing speed and the least it read in the 20 m before kept as evidence
+  ev = evidence()
+  e = drive(ev, 5, ln, braking(35., 8., 0.), 4.0)
+  assert e.through_at_speed and e.through_v == pytest.approx(8., abs=0.5) and e.through_min_v >= 5.
+
+
 def test_stopped_at_its_line_and_the_shield():
   ln = lane('left')
   ev = evidence()

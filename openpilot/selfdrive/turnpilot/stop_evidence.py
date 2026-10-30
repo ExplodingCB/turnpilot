@@ -28,7 +28,8 @@ control's stop point). From it, per track, for SG4a's and SG4b's decider and for
   before its stop point to 2 m past it), the shield (stop_rules.shield_ok: a motor vehicle so for SHIELD_STOP_S, seen on
   every cycle of its view, not moved SHIELD_MOVE_M, on a stopping approach with no mapped bike lane and no shoulder of
   SHOULDER_PASS_M to pass it in: stop_rules.shield_lane_ok), and through at speed (a motor vehicle whose
-  front passed its line at DOWNGRADE_V or more without dropping under it in the DOWNGRADE_WINDOW_M before: SG4b's downgrade,
+  front passed its line region (SHIELD_PAST_M past its line) at DOWNGRADE_V or more without dropping under it from
+  DOWNGRADE_WINDOW_M before its line on: SG4b's downgrade,
   and a validation failure).
 
 The opposite approach's lanes run parallel to ours, where a bearing says nothing about how far along one a car is (its
@@ -140,6 +141,8 @@ class TrackEvidence:
   shield: bool
   through_at_speed: bool
   lane: sr.Lane | None = None
+  through_v: float = 0.      # m/s, through at speed: its speed crossing its line (nominal offset)...
+  through_min_v: float = 0.  # ...and the least it read in the DOWNGRADE_WINDOW_M before it (the downgrade's evidence)
 
 
 @dataclass
@@ -149,6 +152,8 @@ class _State:
   speeds: list = field(default_factory=list)  # (front m down the lane, nominal speed) per match, for through at speed
   through: bool = False
   crossed: bool = False
+  through_v: float = 0.
+  through_min_v: float = 0.
 
 
 def class_name(cls) -> str:
@@ -383,7 +388,7 @@ class StopEvidence:
                          fit.a_trusted, fit.tau_dot, fit.expansion_agrees, d_nom, v_nom,
                          d_nom / v_nom if v_nom > 0.1 else float('inf'), fit.d_lo / fit.v_hi if fit.v_hi > 0.1 else float('inf'),
                          tta_foot, ttc, sr.u2_state(fit, at_line=at_line), front_from_line, at_line and stopped, stopped_s, shield,
-                         through, ln)
+                         through, ln, st.through_v, st.through_min_v)
 
   def _through(self, st: _State, ln: sr.Lane, here, s_nom: float, line: float, cls: str, cross: bool = True) -> bool:
     """Through its line at speed (module docstring), measured at the lane's nominal offset; latched."""
@@ -396,14 +401,19 @@ class StopEvidence:
         ds = [s_nom * math.tan(math.radians(min(abs(s.bearing), 89.5))) - ln.conflict_m for s in span]
       else:
         ds = [s.x - (s_nom + s.d_stop) - ln.conflict_m for s in span]
-      d, slope = _linfit([s.t for s in span], ds)
-      st.speeds.append((d - CAR_HALF_LEN_M if cross else d, -slope))
+      _, slope = _linfit([s.t for s in span], ds)
+      # where it is: its latest match, not the fit's end, which runs on past a car braking onto its line
+      st.speeds.append((ds[-1] - CAR_HALF_LEN_M if cross else ds[-1], -slope))
     if not st.speeds or st.crossed:
       return st.through
     front, _ = st.speeds[-1]
-    if front < line:
+    if front < line - sr.SHIELD_PAST_M:
+      # through: its front past the line region, where a car that stopped at its line never is (the speed fit spans
+      # SPEED_SPAN_S, so one braking hard onto its line still read its approach speed as its front reached the line)
       st.crossed = True
-      before = [v for f, v in st.speeds if line <= f <= line + DOWNGRADE_WINDOW_M]
+      before = [v for f, v in st.speeds if line - sr.SHIELD_PAST_M <= f <= line + DOWNGRADE_WINDOW_M]
       trusted = here[-1].t - here[0].t >= sr.VEL_TRUST_S - 1e-9 and len(here) >= sr.VEL_TRUST_SAMPLES
       st.through = trusted and bool(before) and min(before) >= DOWNGRADE_V and st.speeds[-1][1] >= DOWNGRADE_V
+      if st.through:
+        st.through_v, st.through_min_v = st.speeds[-1][1], min(before)
     return st.through

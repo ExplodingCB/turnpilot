@@ -902,12 +902,17 @@ def test_O2_V1_a_roll_up_that_never_moves_the_car_is_bounded_and_says_so_h5(tmp_
 
 
 def test_V2_a_cross_car_not_slowing_is_waited_for_until_it_has_passed(tmp_path):
+  # a rolling stop (from 11 m/s, slowing at 3 m/s^2 to 4 m/s and on through its line, under DOWNGRADE_V): U2 holds the go
+  # until it has passed. One through its line at speed is V3's: its approach no for the encounter (SG4b)
+  def roll(t, t0=0.5, tb=7. / 3.):
+    tt = t - t0
+    return None if tt < 0. else 45. - (11. * min(tt, tb) - 1.5 * min(tt, tb) ** 2) - 4. * max(tt - tb, 0.)
   w = World(tmp_path)
-  w.tracks = cars((5, 'left', rolling(0.5, d0=45., v0=11.)))
-  out = w.run(4.)
+  w.tracks = cars((5, 'left', roll))
+  out = w.run(8.)
   assert first_go(out) is None and any(h.key == 'u2:5' for d in out for h in d.holds)
-  out = w.run(5.)
-  assert first_go(out) is not None  # through and gone: our turn
+  out = w.run(12.)
+  assert first_go(out) is not None and not w.sg.downgraded  # through and gone: our turn
 
 
 def test_V4_a_vehicle_in_the_box_moving_is_a_dynamic_wait_standing_a_static_one_then_h3(tmp_path):
@@ -996,7 +1001,9 @@ def test_V8_a_new_conflict_in_the_band_aborts_short_of_the_midpoint_and_in_a_lan
 
 def test_V17_a_large_vehicle_gone_from_a_conflicting_lane_leaves_that_side_unseen_hide_s(tmp_path):
   w = World(tmp_path)
-  w.tracks = cars((11, 'left', lambda t: 30. - 10. * t if t < 4.2 else None, 7))  # a truck through the left lane, gone at 4.2 s
+  # a truck that stopped at the left line pulls away through our path at 3 m/s^2 (under DOWNGRADE_V past its line region: a
+  # truck through at speed is V3's), gone at 4.2 s
+  w.tracks = cars((11, 'left', lambda t: LINE_D - 1.5 * max(t - 0.5, 0.) ** 2 if t < 4.2 else None, 7))
   out = w.run(4.2)
   out = w.run(6.)
   hide = [k for k, d in enumerate(out) if any(h.key == 'hide:left' for h in d.holds)]
@@ -1569,3 +1576,84 @@ def test_V22_a_wrong_way_car_appearing_during_the_launch_withdraws_the_go_never_
   assert wd and wd[0].startswith('wrongWay')
   assert all(s.accel_cap >= -2. - 1e-9 for d in out for s in d.stops)
 
+
+def downgrades(w):
+  """StopGo.on_downgrade's calls (turnpilotd writes TurnPilotJunctionOverrides from it): (junction, approach, evidence)."""
+  seen = []
+  w.sg.on_downgrade = lambda j, a, ev: seen.append((j, a, ev))
+  return seen
+
+
+def test_V3_C9_one_car_through_its_line_at_speed_makes_its_approach_no_for_the_encounter_and_writes_the_override(tmp_path):
+  # 4.4, decision D11: a car (a motor vehicle, its speed trusted) through the left line at 8 m/s, never under 5 m/s in the 20 m
+  # before it: the left approach doesn't stop, whatever the survey said, for the rest of this encounter at once, and is
+  # written to TurnPilotJunctionOverrides as no with its evidence (on_downgrade). Before, once the car was through and gone,
+  # the junction went on its all-way rule: across an approach a car had just run
+  w = World(tmp_path)
+  seen = downgrades(w)
+  w.tracks = cars((31, 'left', rolling(1.2, d0=45., v0=8.)))
+  out = w.run(8.)
+  assert len(seen) == 1
+  j, a, ev = seen[0]
+  assert j.osm_node_id == w.j.osm_node_id and sr.effective_role(a) == 'left' and a.way_id == 11
+  assert ev['kind'] == 'no' and ev['trackId'] == 31 and ev['cls'] == 'car' and ev['role'] == 'left'
+  assert 5. <= ev['speedMs'] <= 11. and ev['minSpeedMs'] >= 5. and ev['cameraTimeS'] > 100.
+  out += w.run(STATIC_WAIT_S + 2.)
+  assert first_go(out) is None
+  k = next(i for i, d in enumerate(out) if any(h.key == 'downgrade' for h in d.holds))
+  assert all(any(h.key == 'downgrade' and h.kind == 'static' for h in d.holds) for d in out[k:] if d.state == 'observe')
+  h3 = next(d for d in out if d.fault == 'H3')
+  assert h3.reason == "Stop sign: cross traffic doesn't stop: take control" and len(seen) == 1  # written once
+  assert all(s.accel_cap >= -2. - 1e-9 for d in out for s in d.stops)
+
+
+def test_V3_a_downgrade_before_commit_withdraws_the_go_short_and_once_committed_never_stops_the_car(tmp_path):
+  # the go stood on its approaches stopping: an approach downgraded before our commit withdraws it with the capped abort (the
+  # safe direction, never below -2.0); once committed only the in-band rule may stop the car, and a downgrade adds nothing.
+  # (Through at speed is read only while our car stands, its bearings comparable: here the downgrade is set directly)
+  for stage in ('going', 'committed'):
+    w = Drive(tmp_path, behaviour=lambda w: 'goes')
+    out = []
+    for _ in range(round(14. / DT_MDL)):
+      d = w.step()
+      out.append(d)
+      if d.state == stage and not w.sg.downgraded and (stage == 'committed' or w.v > 0.3):
+        a = next(x for x in w.sg.junction.approaches if sr.effective_role(x) == 'left')
+        w.sg.downgraded[id(a)] = {'kind': 'no'}
+        k = len(out)
+    rest = out[k:]
+    assert all(s.accel_cap >= -2. - 1e-9 for d in out for s in d.stops)
+    if stage == 'going':
+      assert rest[0].withdraw == 'downgrade' and rest[0].stops and rest[0].stops[0].speed_cap == 0.
+      assert w.sg.edges.d_min >= max(d.position_m for d in out) and not any(d.state == 'committed' for d in rest)
+    else:
+      assert not any(d.withdraw for d in rest) and all(not d.stops for d in rest) and any(d.state in ('inLane', 'done') for d in rest)
+
+
+def test_P8_P14_a_cyclist_rolling_through_at_5_5_m_s_downgrades_nothing_and_is_tested_as_not_stopping(tmp_path):
+  # a bicycle on a stopping approach is never stopping and never a shield (2.3: Washington's stop-as-yield, any roller): the
+  # non-stopping tracked test holds the go while it comes, and through its line at 5.5 m/s it downgrades nothing
+  w = World(tmp_path)
+  seen = downgrades(w)
+  w.tracks = cars((33, 'left', rolling(1.2, d0=40., v0=5.5), 1))
+  out = w.run(7.)
+  assert any(h.key == 'tracked:33' for d in out for h in d.holds) and not any(h.key == 'u2:33' for d in out for h in d.holds)
+  out += w.run(6.)
+  assert not seen and first_go(out) is not None and not any(h.key == 'downgrade' for d in out for h in d.holds)
+  # stopped at its line it holds an arrival rank, and is never its lane's shield
+  w = World(tmp_path)
+  w.tracks = cars((34, 'left', at_line(t0=1.5, d0=10.5, v0=2.), 1))
+  out = w.run(8.)
+  assert not any(x.shielded for d in out for x in d.lanes) and first_go(out) is None
+
+
+def test_upgrade_a_car_that_stops_at_its_line_and_proceeds_is_logged_as_a_stop_event_only(tmp_path, monkeypatch):
+  # 4.4: logs only, never a tier (courtesy stops and stops for people we can't see would count)
+  events = []
+  monkeypatch.setattr(sg.cloudlog, 'event', lambda name, **kw: events.append((name, kw)))
+  w = World(tmp_path)
+  w.tracks = cars((35, 'left', lambda t: (max(30. - 6. * t, LINE_D) if t < 5.5 else LINE_D - 4. * (t - 5.5))))
+  w.run(10.)
+  stops = [kw for name, kw in events if name == 'turnpilot.stop_go_stop_event']
+  assert len(stops) == 1 and stops[0]['track'] == 35 and stops[0]['role'] == 'left'
+  assert all(a.tier == 'surveyed' for a in w.sg.junction.approaches if sr.effective_role(a) in ('left', 'right'))

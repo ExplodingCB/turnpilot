@@ -58,6 +58,12 @@ stop_rules.wrong_way_lanes) is watched: a track there not yet trusted, or coming
 going the wrong way, or a cyclist, on a contraflow bike lane or not); during the launch any new track there, or a known one
 the tracker's ground motion brings nearer, withdraws it, and in the band it is the in-band rule's threat.
 
+Evidence on site (4.4, decision D11): a motor vehicle through a stopping approach's line at DOWNGRADE_V or more (its speed
+trusted, never under it in the DOWNGRADE_WINDOW_M before; never a bicycle) makes that approach no for the rest of the
+encounter at once (go_holds: "cross traffic doesn't stop", a static wait, then H3; before commit a go out is withdrawn for it,
+never once committed), and on_downgrade (turnpilotd) writes it to TurnPilotJunctionOverrides with its evidence; a vehicle that
+stops at its line and goes on is a stop event, logged only.
+
 Phantom clears are what the go conditions are about: no detections in a lane says nothing (visibility.py's positive walk), an
 untrusted track is never stopping, a raw box blocks before it is a track, a stale view resets CLEAR_S, the shield needs a
 vehicle seen stopped on every cycle at a surveyed stopping approach, and the junction must certify by routing/certify.assess
@@ -76,7 +82,7 @@ from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
 from openpilot.selfdrive.turnpilot.routing import certify as ce
 from openpilot.selfdrive.turnpilot.routing.junctions import survey_approach
 from openpilot.selfdrive.turnpilot.scene_policy import PATH_HALF_WIDTH_M, STOP_SPEED, Stop, stop
-from openpilot.selfdrive.turnpilot.stop_evidence import APPROACH_V, StopEvidence, class_name, junction_lanes
+from openpilot.selfdrive.turnpilot.stop_evidence import APPROACH_V, DOWNGRADE_V, DOWNGRADE_WINDOW_M, StopEvidence, class_name, junction_lanes
 from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP
 
 MODES = ce.MODES                # off, shadow, trial, auto (TurnPilotStopSignGo)
@@ -132,6 +138,9 @@ PED_RANGE_BAND = 0.3            # a person's ranging band, plus or minus this of
 RAW_PERSON_CONF = 0.35
 MOVING_V = 0.5                  # m/s: a vehicle moving
 RAW_KNOWN_DEG = 3.              # deg a raw box may lie outside a known track's live span and still be its box (raw_known)
+UPGRADE_V = 0.5                 # m/s or less, within UPGRADE_BEFORE_M before its stop point to UPGRADE_PAST_M past it, then on:
+UPGRADE_BEFORE_M, UPGRADE_PAST_M = 8., 3.  # a stop event on that approach, logged only (4.4's upgrade, never a tier)
+UPGRADE_LEAD_M = 10.            # m: with another vehicle that close ahead of it in its lane it stopped for that one, not its sign
 HALF_LEFT_M = 1.85 + sr.LANE_W_MAX   # our half of the road plus one lane, left of our axis (RCW 46.61.235)
 HALF_RIGHT_M = 1.85 + 3.0       # ...and right of it to the curb
 BOX_LEFT_M, BOX_RIGHT_M = 1.85 + sr.LANE_W_MAX + 1., 1.85 + 1.  # the junction box: our road's width, a metre either side
@@ -356,6 +365,8 @@ class StopGo:
     self.large_seen: dict[int, str] = {}
     self.lights = deque(maxlen=SIGNAL_HEAD_OF)
     self.signal_seen = False
+    self.downgraded: dict[int, dict] = {}  # id(approach): the evidence that it doesn't stop (4.4: no for this encounter)
+    self.stop_events: dict[int, dict] = {}  # trackId: its stop at its line seen, logged (4.4's upgrade: a log only)
     self.retries = 0
     self.went = False              # a stopSign go has gone out this encounter (its turn's pulse with it)
     self.rollups = 0
@@ -534,6 +545,7 @@ class StopGo:
         self.stopped_since.setdefault(tid, self.t - e.stopped_s)
       else:
         self.stopped_since.pop(tid, None)
+    self._on_site(f, pos)
     for k in self.view_age:
       self.view_age[k] += f.dt
     for key, _t, raw, _sectors in f.runs or ():
@@ -572,6 +584,58 @@ class StopGo:
 
   def on_signal_seen(self, j) -> None:
     """A signal head at the junction (2.4 item 9, C20): turnpilotd's hook writes TurnPilotJunctionOverrides (signalSeen)."""
+
+  def on_downgrade(self, j, approach, evidence: dict) -> None:
+    """An approach downgraded on site (4.4, decision D11): turnpilotd's hook writes TurnPilotJunctionOverrides (no) with
+    the evidence, so navd avoids it from the next lookup on until Kellen clears it (route_audit --clear)."""
+
+  def _on_site(self, f: Frame, pos: float) -> None:
+    """4.4's evidence on site, every frame from the tracks' evidence. Downgrade: a motor vehicle (never a bicycle: those are
+    non-stopping already) on a stopping approach, its speed trusted, through its line at DOWNGRADE_V or more without dropping
+    under it in the DOWNGRADE_WINDOW_M before (stop_evidence's through at speed, at the lane's nominal offset: at a surveyed
+    junction the surveyed one). That approach is no for the rest of this encounter at once (go_holds: cross traffic doesn't
+    stop), the safe direction for a runner as for a wrong survey, and on_downgrade writes it. The heading clause (a change under
+    DOWNGRADE_HEADING_DEG 20 deg) isn't applied: the bearing ray assumes the lane line and ground-plane heading at the side is
+    30 deg or more off with the ranging's 1.5-2.5x error, so a turning car through at speed downgrades too, the safe
+    direction, its evidence saying 'heading unmeasured'. Upgrade (_stop_event): a log only."""
+    j = self.junction
+    for tid, e in self.ev.items():
+      ln = e.lane
+      if ln is None or ln.movement == sr.WRONG_WAY or ln.approach is None:
+        continue
+      a = ln.approach
+      if e.through_at_speed and e.cls in MOTOR and ln.stopping and id(a) not in self.downgraded:
+        ev = {'kind': 'no', 'trackId': int(tid), 'cls': e.cls, 'role': sr.effective_role(a), 'wayId': int(a.way_id),
+              'bearing': round(float(a.bearing), 1), 'speedMs': round(float(e.through_v), 2), 'minSpeedMs': round(float(e.through_min_v), 2),
+              'thresholdMs': DOWNGRADE_V, 'windowM': DOWNGRADE_WINDOW_M, 'heading': 'unmeasured', 'cameraTimeS': round(float(e.t), 3),
+              'view': e.view, 'osmNodeId': int(j.osm_node_id) if j is not None else 0, 'log': 'turnpilot.stop_go_downgrade'}
+        self.downgraded[id(a)] = ev
+        self._cert_key = None
+        cloudlog.event("turnpilot.stop_go_downgrade", error=True, key=list(self.key), state=self.state, pos=round(pos, 2), **ev)
+        self.on_downgrade(j, a, ev)
+      self._stop_event(f, tid, e, pos)
+
+  def _stop_event(self, f: Frame, tid: int, e, pos: float) -> None:
+    """4.4's upgrade, logged only: a vehicle that reaches UPGRADE_V or less within UPGRADE_BEFORE_M before to UPGRADE_PAST_M
+    past its stop point, no vehicle within UPGRADE_LEAD_M ahead of it in its lane and no person in front of it (the junction
+    and the crosswalks on its side), and then goes on, is a stop event on its approach for route_audit to show. It never
+    changes a tier: while the car waits, courtesy stops and stops for people it can't see would count."""
+    st = self.stop_events.setdefault(tid, {'stopped': False, 'logged': False})
+    if st['logged'] or e.cls not in MOTOR:
+      return
+    if e.v_trusted and e.v_nom <= UPGRADE_V and -UPGRADE_BEFORE_M <= e.front_from_line_m <= UPGRADE_PAST_M:
+      lead = any(o is not e and (o.role, o.index) == (e.role, e.index) and 0. < o.front_from_line_m - e.front_from_line_m <= UPGRADE_LEAD_M
+                 for o in self.ev.values())
+      x0, x1 = self._x(self.edges.d_min, pos) - CROSSWALK_M - 1., self._x(self._far_edge(), pos) + CROSSWALK_M + 1.
+      side = 1. if e.role == 'left' else -1. if e.role == 'right' else 0.
+      person = any(class_name(o.cls) == PERSON and x0 <= float(o.x) <= x1 and (side == 0. or float(o.y) * side >= 0.)
+                   for o in f.objects or ())
+      if not lead and not person:
+        st['stopped'] = True
+    elif st['stopped'] and ((e.v_trusted and e.v_nom > MOVING_V) or e.front_from_line_m > UPGRADE_PAST_M):
+      st['logged'] = True
+      cloudlog.event("turnpilot.stop_go_stop_event", key=list(self.key), track=int(tid), cls=e.cls, role=e.role,
+                     wayId=int(e.lane.approach.way_id) if e.lane is not None and e.lane.approach is not None else 0, cameraTimeS=round(float(e.t), 3))
 
   def _head_seen(self, raw, pos: float) -> bool:
     """A class-9 head in the junction's region on this forward run: above the horizon, its bearing within SIGNAL_SPAN_M of
@@ -876,6 +940,12 @@ class StopGo:
       return [Hold('position', f"its distance read {f.position_spread:.1f} m apart", FAULT)]
     if self.line_fault:
       return [Hold('position', self.line_fault, FAULT)]
+    # an approach downgraded on site this encounter (4.4): not stopping, so no maneuver here certifies (the union rule
+    # leaves none that conflicts with no approach); before commit a go out is withdrawn for it, never once committed
+    if self.downgraded:
+      conflicting = {id(m.approach) for m in sr.conflict_movements(j, f.maneuver, f.approach_yaw_deg)}
+      if conflicting & set(self.downgraded):
+        return [Hold('downgrade', "cross traffic doesn't stop", STATIC)]
     verdict = self.certified(f)
     if verdict.certification != 'certifiable' and verdict.reason != 'reach':
       return [Hold('cert:' + verdict.reason, f"can't certify ({verdict.reason}: {verdict.detail})" if verdict.detail else
