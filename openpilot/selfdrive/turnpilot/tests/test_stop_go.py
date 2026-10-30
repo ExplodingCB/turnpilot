@@ -1877,3 +1877,51 @@ def test_O9_off_the_route_the_decider_waits_up_to_10_s_for_navds_maneuver_then_d
   a = arrived_at(out)
   h3 = next(k for k, d in enumerate(out) if d.fault == 'H3')
   assert first_go(out) is None and (h3 - a) * DT_MDL == pytest.approx(STATIC_WAIT_S, abs=0.2)
+
+
+def test_V15_a_vehicle_stopped_on_our_exit_leg_holds_the_go_a_static_wait_then_h3_and_goes_once_it_leaves(tmp_path):
+  # no go until the exit has room for the car plus 2 m past its crosswalk: a car double-parked 4 m past the far crosswalk,
+  # in our path. Standing, a static wait and the ladder; gone, the go
+  for maneuver, xy in (('straight', (26., 0.)), ('right', (14., -9.))):
+    w = World(tmp_path, maneuver=maneuver)
+    w.objects = lambda ww, xy=xy: (vehicle(95, *xy),)
+    out = w.run(STATIC_WAIT_S + 3.)
+    assert first_go(out) is None and any(h.key == 'exit:95' and h.kind == 'static' for h in out[round(2. / DT_MDL)].holds), maneuver
+    h3 = next(d for d in out if d.fault == 'H3')
+    assert h3.reason == "Stop sign: no room past the junction: take control"
+    w = World(tmp_path, maneuver=maneuver)
+    w.objects = lambda ww, xy=xy: (vehicle(95, *xy),) if ww.t_cam - 100. < 4. else ()
+    out = w.run(8.)
+    i = first_go(out)
+    assert i is not None and (i + 1) * DT_MDL >= 4. + sr.CLEAR_S - 0.1, maneuver
+
+
+def test_V16_a_car_double_parked_in_the_near_lane_caps_it_is_no_shield_and_is_a_static_wait_then_h3(tmp_path):
+  # standing 20 m down the left lane, 8.7 m back from its line: not at its line, so no shield and no rank; it caps its lane
+  # where its bearing meets it (1.4 rule 4), so the lane is short of reach: a static wait, then the ladder
+  w = World(tmp_path)
+  w.tracks = cars((96, 'left', lambda t: 20.))
+  out = w.run(STATIC_WAIT_S + 3.)
+  assert first_go(out) is None and all(d.rank == 0 for d in out)
+  left = [x for x in out[round(3. / DT_MDL)].lanes if x.role == 'left']
+  assert left and not left[0].shielded and left[0].r_seen < left[0].r_req and left[0].binding == 'occluder'
+  assert any(h.key.startswith('reach:left') and h.kind == 'static' for h in out[round(3. / DT_MDL)].holds)
+  h3 = next(d for d in out if d.fault == 'H3')
+  assert "can't see far enough from the left" in h3.reason
+
+
+def test_G14_a_stop_point_close_to_the_cross_road_creep_and_the_go_measured_from_the_closest_plausible_edge(tmp_path):
+  # the pessimistic end (1.2): at a surveyed stop point the rule's closest (5.8 m outside the lane edge), dEdgeMin is 3.3 m
+  # ahead; latched 0.6 m past it, 2.7 m of room: a go fits (GO_ROOM_M about 2.3 m with CarParams' 0.15 s), the deadlock's
+  # 0.5 m creep doesn't (it would leave 2.2 m), so the turn passes with no creep; a withdrawn go stops short of dEdgeMin
+  j = junction(stop_point_distance=LANE_EDGE + 5.8, stop_point_source='survey')
+  w = Drive(tmp_path, j=j, d0=-0.6, behaviour=lambda w: 'holds')
+  w.tracks = cars((1, 'left', at_line(t0=-10.)))
+  watch(w)
+  out = w.run(12.)
+  assert w.sg.edges.d_min == pytest.approx(3.3)
+  assert not any(d.go_cause == 'creep' for d in out) and w.sg.order_waived
+  i = first_go(out)
+  assert i is not None and out[i].position_m == pytest.approx(0.6, abs=0.05)
+  assert max(d.position_m for d in out) <= w.sg.edges.d_min - sr.M_EDGE + 0.05
+  assert all(s.accel_cap >= -2. - 1e-9 for d in out for s in d.stops)

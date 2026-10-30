@@ -434,3 +434,35 @@ def test_rule_5_a_non_stopping_lane_without_a_surveyed_sight_distance_has_no_rea
     assert x.why in ('cap', 'range') and 0. < x.reach_m <= 20. + 1e-6
   # a stopping lane is untouched: without an entry it is the tables' walk (rule 3)
   assert lane_of(report(live()), 'left').why == 'range' and lane_of(report(live()), 'left').reach_m > 0.
+
+
+def test_V11_a_near_lane_car_turning_into_our_road_caps_the_lane_behind_it_until_it_has_left_the_lane_band():
+  # a car slowing in the near lane to turn into our road, a follower behind it: while it comes down the lane (moving or
+  # slowing) its box caps the lane where its bearing meets the lane at sLaneMin (rule 4), so the stretch it hides is never
+  # counted seen; once it has turned out of the lane and gone past us, the lane is walked in full again (and the follower, a
+  # new track, is U2's: untrusted, never stopping)
+  ln = next(x for x in lanes() if x.role == 'left')
+  free = lane_of(report(live()), 'left').reach_m
+  for d, vy in ((25., -8.), (15., -6.), (10., -3.)):
+    car = trk(1, d, ln, vy=vy)
+    x = lane_of(report(live(), tracks=[car]), 'left')
+    lo = min(abs(b) for b in car.span_seen)
+    assert x.why == 'occluder' and x.reach_m == pytest.approx(ln.s_min * math.tan(math.radians(lo - ROT)), abs=sr.WALK_STEP_M)
+    assert x.reach_m < free
+  # turned into our road and coming toward us in its oncoming lane 8 m ahead, its box may still lie nearer than the lane at
+  # its bearing (ranging trusted under 40 deg at OCCLUDER_NEAR_FRAC): the lane's first metres capped, never more counted seen
+  turned = SimpleNamespace(**vars(trk(1, 2., ln, vx=-3.)))
+  turned.bearing_seen, turned.span_seen, turned.x = 20.6, (17.6, 23.6), np.array([8., 3.0, -3., 0.])
+  assert lane_of(report(live(), tracks=[turned]), 'left').reach_m < free
+  # gone past us: the lane walked in full again
+  assert lane_of(report(live(), tracks=[]), 'left').reach_m == pytest.approx(free, abs=sr.WALK_STEP_M)
+
+
+def test_V16_a_car_double_parked_in_the_near_lane_caps_it_and_isnt_its_shield():
+  # standing 20 m down the left lane, not at its line: an occluder capping the lane at its bearing, never a shield candidate
+  ln = next(x for x in lanes() if x.role == 'left')
+  car = trk(1, 20., ln)
+  x = lane_of(report(live(), tracks=[car]), 'left')
+  lo = min(abs(b) for b in car.span_seen)
+  assert x.why == 'occluder' and x.reach_m == pytest.approx(ln.s_min * math.tan(math.radians(lo - ROT)), abs=sr.WALK_STEP_M)
+  assert not x.shields
