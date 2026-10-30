@@ -44,8 +44,10 @@ Use the repo venv, from the repo root. `OPENPILOT_PREFIX` keeps msgq, params and
    OPENPILOT_PREFIX=tpsim openpilot/tools/sim/bridge/beamng/launch_openpilot.sh
    ```
 
-   It is upstream's sim launch with `FINGERPRINT=TESLA_MODEL_3`, alpha longitudinal on, and loggerd kept, so every run
-   leaves an rlog in `~/.commatpsim/media/0/realdata`. Add more processes to block with `BLOCK=...`.
+   It is upstream's sim launch with `FINGERPRINT=TESLA_MODEL_3`, alpha longitudinal on, and loggerd and logmessaged kept, so
+   every run leaves an rlog in `~/.commatpsim/media/0/realdata` with cloudlog's records in it as `logMessage` (TurnPilot's
+   reasons, such as `turnpilot.go_not_certified`). Add more processes to block with `BLOCK=...`; blocking loggerd blocks
+   logmessaged with it.
 
 2. In a second terminal, start the bridge:
 
