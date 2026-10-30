@@ -185,6 +185,8 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
                                     # take control; never released by the timeout
     turnAbandonedTakeControl @18;   # the model steering away from the route's turn in the junction, under half of it turned
                                     # (turnpilotd.py: turn_abandoned): take control; no hold, the turn's caps stay
+    wrongSideTakeControl @19;       # right-hand traffic, moving: the first painted line to the car's right read yellow
+                                    # (turnpilotd.py: wrong_side): left of the centre line, take control; no hold, no steering
   }
   enum ControlAlert {
     none @0;

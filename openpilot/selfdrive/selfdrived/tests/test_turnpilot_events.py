@@ -301,6 +301,18 @@ def test_a_turn_abandoned_in_the_junction_is_a_loud_handback():
   assert a.audible_alert == AudibleAlert.tpHandback and a.visual_alert == VisualAlert.steerRequired
 
 
+def test_the_wrong_side_of_the_road_is_a_loud_handback():
+  # BUILD_FINDINGS D5-lane: a yellow line read on the car's right, take control with the handback's chime, the reason line
+  # as its title; appended after turnAbandonedTakeControl @18
+  from openpilot.cereal import custom
+  from openpilot.selfdrive.turnpilot.hooks import CONTROL_PROMPT_TEXT, TAKE_CONTROL_PROMPTS
+  assert custom.TurnpilotPlan.ControlPrompt.schema.enumerants['wrongSideTakeControl'] == 19
+  assert 'wrongSideTakeControl' in TAKE_CONTROL_PROMPTS
+  a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt='wrongSideTakeControl', reason="Wrong side of the road: take control")))
+  assert a.alert_text_1 == "Wrong side of the road: take control" and a.alert_text_2 == CONTROL_PROMPT_TEXT['wrongSideTakeControl']
+  assert a.audible_alert == AudibleAlert.tpHandback and a.visual_alert == VisualAlert.steerRequired
+
+
 def test_the_stop_sign_wait_is_silent_its_go_chimes_and_its_faults_hand_back():
   # SG4a: waiting for cross traffic is ordinary (visual only), with an info chime at WAIT_INFO_S (stopGo.chime); the go is a
   # short chime as the left's; a fault is stopSignTakeControl with its reason line; the alerts after commit and while the

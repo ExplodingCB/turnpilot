@@ -327,7 +327,8 @@ CONTROL_PROMPT_TITLE = {'yieldAhead': "Yield Ahead", 'stopSignTakeControl': "Sto
                         'creepingForView': "Creeping for a View", 'leftGo': "Turning",
                         'leftUndecidedTakeControl': "Unprotected Turn: Take Control", 'waitingForCross': "Waiting for Cross Traffic",
                         'stopGo': "Going", 'signalUnseenTakeControl': "Signal Not Seen: Take Control",
-                        'turnAbandonedTakeControl': "Turn Abandoned: Take Control"}
+                        'turnAbandonedTakeControl': "Turn Abandoned: Take Control",
+                        'wrongSideTakeControl': "Wrong Side: Take Control"}
 CONTROL_ALERT_TITLE = {'cannotStopComfortably': "Take Control", 'stopOverrun': "Stop Line Passed",
                        'proceedingOnYellow': "Proceeding on Yellow",
                        'mapControlsUnavailable': "Map Stops Unavailable", 'lightSourceRejected': "Light Source Rejected",

@@ -22,6 +22,7 @@ from openpilot.selfdrive.turnpilot.turnpilotd import (CAR_UNKNOWN_REASON, DETECT
                                                        GAS_DISENGAGE_REASON, GO_LINE_M, LEFT_NO_MOVE_S, NEAR_CONTROL_STAND_S, NO_MOVE_REASON, NO_MOVE_S,
                                                        LEAD_STAND_MAX_S, NO_MOVE_MAX_S, SIGNAL_STOPPED_REASON, STALL_MIN_DEG, STALL_PROMPT_S,
                                                        STALLED_REASON, TURN_ABANDON_CURV, TURN_ABANDON_S, TURN_ABANDONED_REASON,
+                                                       WRONG_SIDE_MIN_SPEED, WRONG_SIDE_REASON, WRONG_SIDE_S, yellow_on_the_right,
                                                        STOPPED_HANDBACK_S, STOPPED_LEAD_M, STOPPED_NOTE, STOPPED_NOTE_S, STOPPED_REASON,
                                                        TURN_MISSED_REASON, WAITING_REASON, TurnPilot, long_control_for)
 from openpilot.selfdrive.turnpilot.handback import Handback
@@ -2240,6 +2241,108 @@ def test_a_turn_taken_or_a_brief_correction_never_reads_abandoned():
   while 300. - sim.s > HOLD_LINE_M + 1.:
     plans.append(sim.step(engaged=True))
   assert sim.tp.desires.started and all(p.controlPrompt == 'none' for p in plans)
+
+
+YELLOW, WHITE = LinePaint('solid', 'yellow', 1., 0.9), LinePaint('broken', 'white', 1., 0.4)
+UNPAINTED = LinePaint('none', 'unknown', 1., 0.)
+
+
+def wrong_side_sim(paint, model_lanes=(0, 1), cruise=10.):
+  """A straight road with the route's turn far ahead, the lane paint fixed (paint), the model seeing model_lanes."""
+  sim = Sim([(2000., 'turn', 'left', T_LEFT)], cruise=cruise, model_lanes=model_lanes, paint=paint)
+  sim.v = cruise
+  return sim
+
+
+def test_a_yellow_line_on_the_cars_right_hands_back_out_loud():
+  """BUILD_FINDINGS D5-lane (BeamNG S18, S19): the model kept to the oncoming lane after wide turns and on a straight street,
+  82-216 m left of a yellow line, and nothing in TurnPilot noticed. Under US markings a yellow line on the car's right means
+  it is left of the centre line: the first painted line to its right read yellow for WRONG_SIDE_S, engaged and moving in
+  right-hand traffic, hands back loudly (wrongSideTakeControl), logged, until the driver takes over; no steering, no hold,
+  no cap."""
+  sim = wrong_side_sim((UNKNOWN, WHITE, YELLOW, UNKNOWN))
+  plans = [sim.step(engaged=True) for _ in range(int((WRONG_SIDE_S - 0.1) / DT_MDL))]
+  assert all(p.controlPrompt == 'none' for p in plans)
+  p = [sim.step(engaged=True) for _ in range(3)][-1]
+  assert p.controlPrompt == 'wrongSideTakeControl' and p.reason == WRONG_SIDE_REASON == "Wrong side of the road: take control"
+  assert not p.shouldStop and p.accelCap == NO_ACCEL_CAP and p.speedCap > 20.  # nothing slows the car for it
+  sim.paint = (UNKNOWN, YELLOW, WHITE, UNKNOWN)  # back on its side: said until the driver takes over
+  assert all(p.controlPrompt == 'wrongSideTakeControl' for p in [sim.step(engaged=True) for _ in range(40)])
+  assert sim.step(engaged=False, gas=True).controlPrompt == 'none'
+  assert all(p.controlPrompt == 'none' for p in [sim.step(engaged=True) for _ in range(40)])
+  # the ego right line unpainted, the next one out yellow (S18 at 84 s: the double yellow a lane over)
+  sim = wrong_side_sim((UNKNOWN, YELLOW, UNPAINTED, YELLOW), model_lanes=(0, 2))
+  assert [sim.step(engaged=True) for _ in range(int((WRONG_SIDE_S + 0.2) / DT_MDL))][-1].controlPrompt == 'wrongSideTakeControl'
+  # reads the reader doesn't make (the wide camera's frames) neither count nor reset; a read of white resets
+  sim = wrong_side_sim((UNKNOWN, WHITE, YELLOW, UNKNOWN))
+  plans = []
+  for k in range(int(2. * WRONG_SIDE_S / DT_MDL)):
+    sim.paint = (UNKNOWN, WHITE, YELLOW, UNKNOWN) if k % 2 else (UNKNOWN,) * 4
+    plans.append(sim.step(engaged=True))
+  assert plans[-1].controlPrompt == 'wrongSideTakeControl' and all(p.controlPrompt == 'none' for p in plans[:int(1.8 * WRONG_SIDE_S / DT_MDL)])
+  sim = wrong_side_sim((UNKNOWN, WHITE, YELLOW, UNKNOWN))
+  for k in range(int(3. / DT_MDL)):
+    sim.paint = (UNKNOWN, WHITE, WHITE, UNKNOWN) if k % 15 == 14 else (UNKNOWN, WHITE, YELLOW, UNKNOWN)
+    assert sim.step(engaged=True).controlPrompt == 'none', k
+
+
+def test_a_yellow_line_that_is_no_centre_line_never_reads_wrong_side():
+  for paint, lanes, why in (((UNKNOWN, YELLOW, WHITE, UNKNOWN), (0, 1), "yellow on the left: the car's own side"),
+                            ((UNKNOWN, YELLOW, YELLOW, UNKNOWN), (0, 1), "yellow both sides: a two-way left-turn lane"),
+                            ((UNKNOWN, WHITE, YELLOW, UNKNOWN), (0, 0), "yellow at the right road edge: a painted kerb"),
+                            ((UNKNOWN, WHITE, LinePaint('solid', 'yellow', 0.3, 0.9), UNKNOWN), (0, 1), "a weak read"),
+                            ((UNKNOWN, WHITE, WHITE, YELLOW), (0, 2), "the next line out, past a painted ego line")):
+    sim = wrong_side_sim(paint, model_lanes=lanes)
+    assert all(p.controlPrompt == 'none' for p in [sim.step(engaged=True) for _ in range(int(3. / DT_MDL))]), why
+  # slow, disengaged, or keeping left: nothing
+  sim = wrong_side_sim((UNKNOWN, WHITE, YELLOW, UNKNOWN), cruise=WRONG_SIDE_MIN_SPEED - 0.5)
+  assert all(p.controlPrompt == 'none' for p in [sim.step(engaged=True) for _ in range(int(3. / DT_MDL))])
+  sim = wrong_side_sim((UNKNOWN, WHITE, YELLOW, UNKNOWN))
+  assert all(p.controlPrompt == 'none' for p in [sim.step(engaged=False) for _ in range(int(3. / DT_MDL))])
+  tp = TurnPilot()  # left-hand traffic: no yellow centre lines to read
+  fake = {'carControl': SimpleNamespace(enabled=True), 'modelV2': model_v2(0, 1)}
+  assert not any(tp.wrong_side(fake, SimpleNamespace(gasPressed=False), 10., True, (UNKNOWN, WHITE, YELLOW, UNKNOWN), False) for _ in range(60))
+
+
+def wrong_side_rows(rows):
+  """wrong_side over a fixture's rows (10 Hz), each fed twice (turnpilotd's 20 Hz): the times it hands back, the latch
+  released after each (the driver taking over) to see where it would fire again on its own."""
+  tp, fired = TurnPilot(), []
+  for t, v, enabled, paint, line_ys, probs, edge_ys, stds in rows:
+    msg = messaging.new_message('modelV2')
+    m = msg.modelV2
+    m.init('laneLines', 4)
+    for line, y in zip(m.laneLines, line_ys, strict=True):
+      line.y = [float(y)] * 33
+    m.laneLineProbs = probs
+    m.init('roadEdges', 2)
+    for edge, y in zip(m.roadEdges, edge_ys, strict=True):
+      edge.y = [float(y)] * 33
+    m.roadEdgeStds = stds
+    sm = {'carControl': SimpleNamespace(enabled=enabled), 'modelV2': msg.as_reader().modelV2}
+    lp = tuple(LinePaint(k, c, conf, 0.) for k, c, conf in paint) if paint else (UNKNOWN,) * 4
+    for _ in range(2):
+      if tp.wrong_side(sm, SimpleNamespace(gasPressed=False), v, True, lp, True):
+        fired.append(t)
+        tp.wrong_side_on = False
+  return fired
+
+
+def test_wrong_side_on_the_beamng_rlogs_and_the_demo_route():
+  """The rule on real reads (tests/wrong_side_paint.json): S18 (diag s18_red_right_g62_frames) went left of a double yellow
+  at 58.1 s; the reader first read the road camera at 62.1 s, the right line solid yellow from 62.4 s, and the handback is
+  at 63.4 s. S19's smoke run read a broken yellow 2.2 m to the car's right from 38.25 s (the right road edge 9-10 m out):
+  40.2 s. Openpilot's demo route, every frame read yellow on any line but the far left and a sample of the rest: never."""
+  import json
+  import os
+  data = json.load(open(os.path.join(os.path.dirname(__file__), 'wrong_side_paint.json')))
+  fired = wrong_side_rows(data['s18_red_right_g62_frames']['rows'])
+  assert fired and 63. <= fired[0] <= 63.8 and all(t < 64.6 for t in fired), fired
+  fired = wrong_side_rows(data['s19_too_fast_right_smoke']['rows'])
+  assert fired and 39.8 <= fired[0] <= 40.5, fired
+  for name, _v, paint, line_ys, probs, edge_ys, stds in data["demo_route"]["rows"]:
+    lp = tuple(LinePaint(k, c, conf, 0.) for k, c, conf in paint)
+    assert not yellow_on_the_right(lp, line_ys, probs, edge_ys, stds)[0], name
 
 
 def test_a_hard_brake_is_raised_only_for_a_confirmed_pedestrian():

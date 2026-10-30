@@ -63,6 +63,10 @@ stalledTakeControl, STALLED_REASON), never held there, and TurnPilot never goes 
 line, under half of it turned, the model steering away from it (modelV2.action.desiredCurvature, TURN_ABANDON_S) is a turn
 abandoned (BUILD_FINDINGS N1): handed back loudly (turnAbandonedTakeControl) until the driver takes over, nothing steered
 or held, the turn's caps kept.
+Right-hand traffic, engaged and moving, a yellow line read on the car's right (the lane paint: under US markings the car is
+left of the centre line; BUILD_FINDINGS D5-lane, the model keeping to the oncoming lane after wide turns) for WRONG_SIDE_S
+of reads is the wrong side of the road: handed back loudly (wrongSideTakeControl) until the driver takes over, nothing
+steered or held.
 From the go such a turn is driven under its post-go profile (turn_speed.py: PostGo; DESIGN phase 4 section 3): accel and
 speed capped by the heading it has turned, DesireTiming.turned_deg at the go and the car's yaw after, until 60 deg or
 POST_GO_MAX_M on, and dropped at the pass of a turn missed straight on. TurnPilotPostGoProfile names the profile
@@ -167,7 +171,8 @@ from openpilot.selfdrive.turnpilot.control_tracker import OFF_ROUTE
 from openpilot.selfdrive.turnpilot.stop_go import MODE_DEFAULT, STOP_SWEEP_M, Frame, StopGo, StopGoDecision, mode_for, side_views_live
 from openpilot.selfdrive.turnpilot.car_signals import (TurnSignalIntent, TurnSignalOut, driver_signals_for, read_mode,
                                                         record_matches)
-from openpilot.selfdrive.turnpilot.lane_planner import LanePlanner, Phase, lane_change_window, lane_mismatch, model_lanes_from_msg
+from openpilot.selfdrive.turnpilot.lane_planner import (SAMPLE_IDX, LanePlanner, Phase, lane_change_window, lane_mismatch,
+                                                        model_lanes_from_msg)
 from openpilot.selfdrive.turnpilot.route_follower import (KEEP, LEFT, RIGHT, SAME_TURN_M, TURN, UNCERTAIN_M, Maneuver, RouteFollower,
                                                            same_junction)
 from openpilot.selfdrive.turnpilot.route_notice import RouteNotices
@@ -284,6 +289,25 @@ TURN_ABANDON_FRACTION = 0.5
 TURN_ABANDON_CURV = 0.005
 TURN_ABANDON_S = 0.5
 TURN_ABANDONED_REASON = "Turn abandoned: take control"
+# the car left of the centre line (BUILD_FINDINGS D5-lane: BeamNG S18, S19, the model kept to the oncoming lane for 82-216 m
+# after a wide turn and on a straight street, and nothing in TurnPilot noticed). Under US markings (MUTCD) a yellow line on
+# the car's right means it is left of the centre line (or of a divided road's left edge): right-hand traffic, engaged,
+# moving WRONG_SIDE_MIN_SPEED or more, the first painted line to the car's right (the ego line; the next one out where the
+# ego line reads unpainted) read yellow by the lane paint reader at WRONG_SIDE_CONF or more for WRONG_SIDE_S of reads
+# (frames it doesn't read, the wide camera's, neither count nor reset; a read of anything else resets) is handed back
+# (wrongSideTakeControl, WRONG_SIDE_REASON) until the driver takes over: no steering, no hold. Not a two-way left-turn lane
+# (the car's own lines both yellow), nor a yellow-painted kerb (the right road edge, seen: its std under
+# WRONG_SIDE_EDGE_STD_MAX, at least WRONG_SIDE_BEYOND_M beyond the yellow line, the oncoming lane: none past a kerb;
+# BeamNG's streets read std 1.3-1.4 there, past lane_planner's EDGE_STD_MAX, with the edge 3.7 m beyond). The finding's
+# geometry fallback (the left road edge close to the left line with a lane to the right, paint unknown) is no rule here: on
+# openpilot's demo route it read so for 62 frames of the highway's left lane (segment 13), the car on its own side
+WRONG_SIDE_S = 1.
+WRONG_SIDE_MIN_SPEED = 2.
+WRONG_SIDE_CONF = 0.5
+WRONG_SIDE_BEYOND_M = 1.
+WRONG_SIDE_EDGE_STD_MAX = 2.  # an edge the model sees at all (the demo route's right edge 0.7-0.8; none there reads 20-60)
+WRONG_SIDE_GAP_S = 1.  # no read this long and the count starts over
+WRONG_SIDE_REASON = "Wrong side of the road: take control"
 LEAD_CORROBORATE_M = 3.
 LEAD_BEARING_TOL_DEG = 3.
 LEAD_SEEN_HOLD_S = 1.
@@ -377,6 +401,33 @@ def close_lead(model) -> bool:
   """modelV2 has a lead within STOPPED_LEAD_M: what holds a standing car (one further on doesn't)."""
   return len(model.leadsV3) > 0 and model.leadsV3[0].prob > STOPPED_LEAD_PROB and len(model.leadsV3[0].x) > 0 and \
     model.leadsV3[0].x[0] < STOPPED_LEAD_M
+
+
+def yellow_on_the_right(paint, line_ys, line_probs, edge_ys, edge_stds) -> tuple[bool, bool]:
+  """(the first painted line to the car's right reads yellow: the car left of the centre line, the line's paint read at all)
+  from the lane paint of modelV2's four lines and the lines' and road edges' y (positive right), probs and stds at one
+  distance ahead (WRONG_SIDE_*). The ego right line, or the next one out where the ego line reads unpainted (kind none).
+  Not with the car's left line yellow too (a two-way left-turn lane), nor without a road edge seen WRONG_SIDE_BEYOND_M
+  beyond it (a yellow kerb has no road past it). Unknown paint, or fewer than four lines, is no read."""
+  if len(paint) != 4 or len(line_ys) != 4 or len(edge_ys) != 2:
+    return False, False
+  i = 3 if paint[2].kind == 'none' else 2
+  p = paint[i]
+  if p.color == 'unknown':
+    return False, False
+  yellow = p.color == 'yellow' and p.confidence >= WRONG_SIDE_CONF and not (i == 2 and paint[1].color == 'yellow') and \
+    edge_stds[1] < WRONG_SIDE_EDGE_STD_MAX and edge_ys[1] - line_ys[i] >= WRONG_SIDE_BEYOND_M
+  return yellow, True
+
+
+def model_lines_at(model):
+  """modelV2's (line ys, line probs, edge ys, edge stds) at SAMPLE_IDX (lane_planner's), empty when it hasn't them all."""
+  lines, edges = model.laneLines, model.roadEdges
+  if len(lines) < 4 or len(edges) < 2 or len(model.laneLineProbs) < 4 or len(model.roadEdgeStds) < 2 or \
+     any(len(e.y) <= SAMPLE_IDX for e in list(lines) + list(edges)):
+    return (), (), (), ()
+  return ([float(ln.y[SAMPLE_IDX]) for ln in lines], [float(p) for p in model.laneLineProbs], [float(e.y[SAMPLE_IDX]) for e in edges],
+          [float(s) for s in model.roadEdgeStds])
 
 
 def lead_corroboration(model, objects, raw) -> str:
@@ -547,6 +598,9 @@ class TurnPilot:
     self.stall_stand_s = 0.        # ...standing there, a corroborated lead or not (LEAD_STAND_MAX_S)
     self.stall_said = False        # ...handed back for it (its log once)
     self.abandon_s = 0.            # the model steering away from the route's turn in the junction (turn_abandoned)
+    self.wrong_s = 0.              # s of reads of a yellow line on the car's right (wrong_side)
+    self.wrong_unread_s = 0.       # ...since the last read of that line
+    self.wrong_side_on = False     # ...handed back for it, until the driver takes over
     self.abandoned_id: int | None = None  # ...the maneuver handed back for it, until the driver takes over
     self.lead_seen_s = float('inf')  # since the live scene last corroborated modelV2's close lead (watch_lead)
     self.lead_why = ''             # ...what did
@@ -1126,10 +1180,13 @@ class TurnPilot:
     stalled = self.stalled_in_turn(sm, cs, v_ego, acting, decision, mapd)
     stopped = self.stopped_unheld(sm, cs, v_ego, acting, decision, mapd)
     abandoned = self.turn_abandoned(sm, cs, v_ego, acting)
+    wrong_side = self.wrong_side(sm, cs, v_ego, acting, paint, right_hand_traffic)
     if withdrawn:
       plan.controlPrompt, plan.reason = 'cantStartTakeControl', NO_MOVE_REASON
     elif abandoned:
       plan.controlPrompt, plan.reason = 'turnAbandonedTakeControl', TURN_ABANDONED_REASON
+    elif wrong_side:
+      plan.controlPrompt, plan.reason = 'wrongSideTakeControl', WRONG_SIDE_REASON
     elif stalled:
       plan.controlPrompt, plan.reason = 'stalledTakeControl', STALLED_REASON
     elif stopped == STOPPED_NOTE:
@@ -1875,6 +1932,34 @@ class TurnPilot:
     cloudlog.event("turnpilot.turn_abandoned", error=True, turned_deg=round(d.turned_deg, 1), angle_deg=round(float(m.angle_deg), 1),
                    curvature=round(float(sm['modelV2'].action.desiredCurvature), 4), v=round(v_ego, 2), distance=round(rf.distance, 1),
                    steer_deg=round(float(cs.steeringAngleDeg), 1))
+    return True
+
+  def wrong_side(self, sm, cs, v_ego: float, acting: bool, paint, right_hand_traffic: bool) -> bool:
+    """The car left of the centre line by the lane paint (yellow_on_the_right, WRONG_SIDE_*): handed back from WRONG_SIDE_S of
+    reads on, held until the driver takes over (openpilot disengaged). Nothing here steers or holds."""
+    enabled = sm['carControl'].enabled
+    if self.wrong_side_on:
+      self.wrong_side_on = enabled
+      return self.wrong_side_on
+    if not (acting and enabled and right_hand_traffic and v_ego >= WRONG_SIDE_MIN_SPEED and not cs.gasPressed):
+      self.wrong_s = self.wrong_unread_s = 0.
+      return False
+    model = sm['modelV2']
+    geom = model_lines_at(model)
+    yellow, read = yellow_on_the_right(paint, *geom)
+    if read:
+      self.wrong_unread_s = 0.
+      self.wrong_s = self.wrong_s + DT_MDL if yellow else 0.
+    else:
+      self.wrong_unread_s += DT_MDL
+      if self.wrong_unread_s > WRONG_SIDE_GAP_S:
+        self.wrong_s = 0.
+    if self.wrong_s < WRONG_SIDE_S - 1e-6:
+      return False
+    self.wrong_side_on, self.wrong_s = True, 0.
+    i = 3 if paint[2].kind == 'none' else 2
+    cloudlog.event("turnpilot.wrong_side", error=True, v=round(v_ego, 2), line=i, paint=[[str(q.kind), str(q.color), round(q.confidence, 2)] for q in paint],
+                   line_y=round(geom[0][i], 2), edge_y=round(geom[2][1], 2), edge_std=round(geom[3][1], 2))
     return True
 
   def watch_lead(self, model, objects, raw) -> None:
