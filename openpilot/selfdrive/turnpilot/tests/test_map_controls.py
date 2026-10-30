@@ -1579,3 +1579,32 @@ def test_the_drivers_crossing_past_the_lefts_own_hold_is_said_until_the_car_is_t
   assert inside and all(out.prompt == 'unprotectedTurnTakeControl' and out.driven for out, _ in inside)
   assert not any(dec.should_stop or dec.speed_cap < car.v - 1. for _, dec in inside)
   assert all(out.prompt == 'none' and not out.driven for s, out, _, _ in rows if s > line + DRIVEN_THROUGH_M + 0.5)
+
+
+@pytest.mark.parametrize("nudge,theirs", [(1.5, True), (1.0, True), (0.4, False)])
+def test_a_nudge_on_from_the_lefts_full_creep_is_never_held_in_the_oncoming_lanes(nudge, theirs):
+  """The invariant, never a TurnPilot hold standing the car in the oncoming lanes on a re-engage (found fixing SIMFIX round
+  2, at e93750b): the latch's reach, LATCH_PAST_M past both its stop point and the creep it asked, lies 3 m from the
+  junction after the left's full creep (CREEP_MAX_M on, to ONCOMING_ENTRY_M + CREEP_SHORT_M out), 1 m inside the lanes: a
+  1-1.5 m gas nudge on from there and a re-engage held the car standing 3.5-4 m from the centre. At an unprotected turn the
+  car moved on past the latch's ask is the driver's too once a hold could no longer stand it short of the lanes (from its
+  speed at REENGAGE_DECEL; the junction HOLD_LINE_M + MAP_MARGIN_M past the stop point as latched), said until through.
+  Short of that, held there (c)."""
+  from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M
+  junction = 250.
+  car = left_car(at=junction)
+  held_left(car, left_cmd(reason="Waiting for a gap"))
+  creep = left_cmd(creep_m=4., reason="Creeping for a view")
+  run_left(car, 12., creep)
+  assert abs(junction - car.s - 5.) < 0.35 and car.v < 0.05
+  s0 = car.s
+  while car.s < s0 + nudge:
+    car.step(gas=True, accel=0.4 if car.v < 0.6 else 0., left=creep)
+  rows = [car.step(left=creep) for _ in range(int(5. / DT_MDL))]  # re-engaged rolling, the left still asking its creep
+  in_lanes = [round(junction - r[1], 2) for r in car.rows[-len(rows):] if r[2] < 0.05 and junction - r[1] < ONCOMING_ENTRY_M]
+  assert not in_lanes, f"held standing {in_lanes[0]} m from the junction, in the oncoming lanes"
+  if theirs:
+    assert car.policy.held is None and car.policy.driven is not None and not any(dec.should_stop for _, dec, _ in rows)
+    assert all(out.prompt == 'unprotectedTurnTakeControl' for out, _, _ in rows)
+  else:
+    assert car.policy.held is not None and car.policy.driven is None and car.v < 0.05 and junction - car.s > ONCOMING_ENTRY_M

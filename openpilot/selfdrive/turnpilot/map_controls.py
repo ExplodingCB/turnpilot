@@ -22,7 +22,9 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   overrun. At a stop or an unprotected turn, the car past its stop point and past the furthest TurnPilot asked of the
   latch (a creep, a roll-up) by the latch's reach (LATCH_PAST_M), the driver's gas having moved it, at any speed, is the
   driver's too (driverWent handed back, else drivenOff): a peek-creep past the line is never held again in the crossing
-  lanes on a re-engage. Short of either nothing is let go (owner decision (a), 2026-10-30): a gas nudge inside a roll-up or
+  lanes on a re-engage. At an unprotected turn so is the car on past both by less, once a hold could no longer stand it
+  short of the oncoming lanes (from its speed at REENGAGE_DECEL, to ONCOMING_ENTRY_M before the junction as latched): after
+  the left's full creep the reach lies inside them. Short of either nothing is let go (owner decision (a), 2026-10-30): a gas nudge inside a roll-up or
   a creep is TurnPilot's metres, a handback with no driver input lets nothing go (the car is held, the handback said), and
   a re-engage short of the line goes back to the full check. The autonomous left's own hold after a withdrawn go
   (unprotected_left: hold_here, the latch already let go by the go) has the same rule there, its crossing said here
@@ -128,7 +130,7 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.turnpilot.control_tracker import JUMP_M, ControlTracker, TrackedControl
 from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, SPEED_CAP_ACCEL_MIN, TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.route_follower import LEFT, TURN
-from openpilot.selfdrive.turnpilot.scene_policy import HARD_STOP_MIN_M, HOLD_LINE_M, NO_ACCEL_CAP, STOP_LAG_S, Stop
+from openpilot.selfdrive.turnpilot.scene_policy import HARD_STOP_MIN_M, HOLD_LINE_M, NO_ACCEL_CAP, ONCOMING_ENTRY_M, STOP_LAG_S, Stop
 from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP
 
 MAP_STOP_DECEL = 1.5          # m/s^2, the braking curve to a map stop point
@@ -941,7 +943,13 @@ class MapControlPolicy:
     # a re-engage stopped the car in the crossing lanes; a gas nudge then a roll on past is theirs too, never a hold in the
     # lanes). Only the driver's gas counts, never a prompt being up (TurnPilot's own creep is no driver's), and never at a
     # signal: its stop is the light's, which a crawl under the gas doesn't change (residual-check-1, d)
-    drivers = stop_like and st.gas_moved_m > 0. and past > LATCH_PAST_M
+    # at an unprotected turn, short of the reach too once a hold could no longer stand the car short of the oncoming lanes
+    # (ONCOMING_ENTRY_M before its junction, HOLD_LINE_M + MAP_MARGIN_M past the stop point as latched; a hold taken up by a
+    # re-engage carries a rolling car on v^2/(2 REENGAGE_DECEL)): the left's full creep stands the car CREEP_SHORT_M short of
+    # them, where the reach (LATCH_PAST_M past it) is 1 m inside them (the invariant: never a TurnPilot hold there)
+    lanes = c.kind == UNPROTECTED and past > 0. and \
+      st.moved_m + v * v / (2. * REENGAGE_DECEL) > c.d + HOLD_LINE_M + MAP_MARGIN_M - ONCOMING_ENTRY_M
+    drivers = stop_like and st.gas_moved_m > 0. and (past > LATCH_PAST_M or lanes)
     if cause is None and drivers:
       # handed back: theirs, said already (driverWent); else lifting must not stop the car in the junction (drivenOff)
       cause = 'driverWent' if prompt is not None else 'drivenOff'
