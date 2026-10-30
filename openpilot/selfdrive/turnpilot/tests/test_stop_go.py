@@ -1312,7 +1312,7 @@ def test_P3_a_person_who_walks_up_to_the_curb_waits_ped_curb_s_from_when_they_st
   t_go = (i + 1) * DT_MDL
   # standing is under PED_STILL_M in PED_STILL_S, so it reads standing up to PED_STILL_S after they stop
   assert t_stop + sg.PED_CURB_S - 1e-6 <= t_go <= t_stop + sg.PED_STILL_S + sg.PED_CURB_S + sr.CLEAR_S + 0.3, (t_stop, t_go)
-  standing = [d for d in out[round((t_stop + sg.PED_STILL_S) / DT_MDL):round((t_stop + sg.PED_CURB_S - 0.2) / DT_MDL)]]
+  standing = out[round((t_stop + sg.PED_STILL_S) / DT_MDL):round((t_stop + sg.PED_CURB_S - 0.2) / DT_MDL)]
   assert standing and all(any(h.key == 'curb:90' for h in d.holds) for d in standing)
 
 
