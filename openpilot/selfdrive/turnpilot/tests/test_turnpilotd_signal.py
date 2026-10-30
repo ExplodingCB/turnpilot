@@ -1058,8 +1058,11 @@ def nearer_reading_at_the_left_line(driver, nearer_m):
   assert jumped['n'] == 1
   assert sim.tp.follower.distance < d_line - nearer_m + 0.5, (d_line, sim.tp.follower.distance)
   p = sim.trace[-1][2]
-  assert str(p.unprotectedLeft.state) == 'waitGap' and p.turnSignal.side == LaneChange.left and p.shouldStop, \
-    (str(p.unprotectedLeft.state), p.turnSignal.side, p.shouldStop)
+  # a reading that puts the junction behind the car standing at its line (10 m) is the left's position fault (skeptic
+  # m-behaviour3 P2): handed back, held, still signalling; nearer readings that leave it ahead, the left still waits for its gap
+  waiting = ('undecided', 'position') if nearer_m > d_line else ('waitGap', '')
+  assert (str(p.unprotectedLeft.state), p.unprotectedLeft.why if waiting[1] else '') == waiting and \
+    p.turnSignal.side == LaneChange.left and p.shouldStop, (str(p.unprotectedLeft.state), p.unprotectedLeft.why, p.turnSignal.side, p.shouldStop)
   state['driver'] = driver
   return sim, state, drive(sim, 1.)
 
