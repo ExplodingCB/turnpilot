@@ -29,6 +29,7 @@ from openpilot.selfdrive.turnpilot.control_tracker import DROP_PAST_M
 from openpilot.selfdrive.turnpilot.lane_planner import LANE_WIDTH, lane_change_window
 from openpilot.selfdrive.turnpilot.map_controls import MAP_STOP_DECEL, PROTECT_BEFORE_M, engage_distance
 from openpilot.selfdrive.turnpilot.scene.tracker import CORRIDOR_HALF_WIDTH
+from openpilot.selfdrive.turnpilot.unprotected_left import reach_at_line
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, PED_STOP_GAP_M
 from openpilot.tools.sim.bridge.beamng.roadgraph import RoadGraph, wrap
 from openpilot.tools.sim.bridge.beamng.scenarios.timing import WALK_SPEED, arc_lengths, oncoming_release_delay, point_at, travel_time
@@ -91,6 +92,9 @@ class Entry:
   # the first reaches the junction stream_first_s after the stand and each one after it stream_headway_s later; 0: none
   stream_headway_s: float = 0.
   stream_first_s: float = 6.
+  # an occluder (S08): a car on its parking brake in the opposing inner lane this far past the maneuver point, facing it,
+  # where a car waiting to turn its left stands, never released (trigger 'setup'); 0: none
+  occluder_past_m: float = 0.
   pace_block_s: float = 6.        # the pacer keeps the target lane occupied this long into the lane change window
   end_on_stop_s: float = 0.       # end the run once the car has stood this long after moving
   spawn: tuple = ()               # route: (x, y, z), heading_deg, destination (x, y, z)
@@ -126,6 +130,12 @@ SCENARIOS = {
   # junction's stop line (tests: test_runner_options)
   'straight_cruise': Entry('straight', junction=(-768.9, 661.4), turn='right', from_heading_deg=0., dest_after_m=140., timeout_s=60.,
                            fault_at_s=3.),
+  # S08: the left at wpTown_5 (-600.7, 220.9), two lanes each way at the mapped 25 mph (R_req 141 m), from its longest
+  # approach: a car standing 10 m past the junction in the opposing inner lane, where one waiting to turn its left would,
+  # hides part of the oncoming lanes from the hold line and after the full creep (unprotected_left.view_blocked); a stream
+  # at 10 s headways in the outer lane beside it, then an empty road. It creeps, then goes on a clear band or hands back
+  'unprotected_left_occluded': Entry('turn', junction=(-600.7, 220.9), turn='left', actor='oncoming', oncoming=3, oncoming_start_m=40.,
+                                     oncoming_speed=11.18, stream_headway_s=10., occluder_past_m=10., timeout_s=250.),
   # gate1's approach: eastbound on the 140 m straight from the bridge's default spawn
   'ped_in_path': Entry('straight', junction=(-768.9, 661.4), turn='right', from_heading_deg=0., actor='standing', end_on_stop_s=4.,
                        timeout_s=90.),
@@ -585,6 +595,18 @@ def _turn_plan(name: str, e: Entry, graph: RoadGraph) -> Plan:
       h = heading_of(path[0], path[1])
       actors.append(Actor(f"{PREFIX}car{k}", 'car', 'oncoming', path.tolist(), e.oncoming_speed, e.oncoming_accel, h,
                           params={'start_m': e.oncoming_start_m, 'arrive_after_s': e.arrive_after_s, 'release_after_stop_s': round(delay, 2)}))
+  if e.occluder_past_m > 0.:
+    if jn.straight is None:
+      raise ValueError(f"{name}: no arm straight across {jn.node} for an occluder")
+    far = walk_straight(graph, jn.node, jn.straight, e.occluder_past_m + 10.)
+    pos, h_occ = lane_pose(far, e.occluder_past_m, graph.lanes_toward(jn.node, jn.straight), graph.radius[jn.straight], 'left')
+    actors.append(Actor(f"{PREFIX}occluder", 'car', 'setup', [list(pos)], 0., 0., h_occ, params={'past_m': e.occluder_past_m}))
+    notes['occluder'] = {'past_m': e.occluder_past_m, 'lane': 'opposing inner'}
+  if e.turn == 'left' and jn.straight is not None:  # the left's R_req at its line, the opposing road's mapped limit (route time's)
+    link = graph.links.get((jn.straight, jn.node)) or graph.links.get((jn.node, jn.straight)) or {}
+    lanes_in = graph.lanes_toward(jn.node, jn.straight).count('+')
+    notes['left_r_req_m'] = round(reach_at_line(link.get('speedLimit'), lanes_in), 1)
+  notes['ego_lane_offset_m'] = round(lane_offset(lanes, radius, ego_lane(e.turn)), 2)
   return Plan(name, spawn, heading, dest, (float(jn.center[0]), float(jn.center[1])), e.speed_kph, e.timeout_s,
               e.end_on_stop_s, actors, notes, lights=lights)
 

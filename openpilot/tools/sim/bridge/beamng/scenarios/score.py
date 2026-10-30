@@ -42,6 +42,7 @@ import numpy as np
 
 from openpilot.selfdrive.turnpilot.lane_planner import LC_BLOCK_X_M
 from openpilot.selfdrive.turnpilot.route_follower import KEEP, TURN, classify
+from openpilot.selfdrive.turnpilot.unprotected_left import CREEP_MAX_M
 
 STOPPED_V = 0.3        # m/s: standing
 RESUMED_V = 2.0        # m/s: moving again after a hold
@@ -79,6 +80,11 @@ PET_MIN_S = 2.
 CONFLICT_M = 8.        # the conflict zone: within this of the junction's point
 APPROACH_SPEED_S = 0.5  # an oncoming car's speed at a go: from its distance this long before
 LEFT_STALLS = ('stalledTakeControl', 'cantStartTakeControl')
+# the occluded left (S08): undecided with the view blocked is its fault handback, a pass even with a gap offered it couldn't
+# see; a go with the view blocked fails; its creep past where it first stood at its line is unprotected_left.CREEP_MAX_M,
+# plus this for the rows' camera positions
+OCCLUDED = 'unprotected_left_occluded'
+CREEP_SLACK_M = 1.
 TURN_DESIRES = (1, 2)  # log.Desire.turnLeft, turnRight
 # expectations (module docstring): 'handback:<kind>' (a turnpilotPlan.handback, or a take-control controlPrompt),
 # 'gasDisengage', 'skip' (tooFastToTurn, or the left skipped at route time), 'turnMissed', 'hardBrake' (controlAlert)
@@ -103,6 +109,7 @@ def msg_fields(ss, cs, tp, nav, model) -> dict:
     'left_state': 'off' if tp is None else str(tp.unprotectedLeft.state),
     'left_treq': 0. if tp is None else round(float(tp.unprotectedLeft.tReq), 2),
     'left_rreq': 0. if tp is None else round(float(tp.unprotectedLeft.rReq), 1),
+    'left_blocked': False if tp is None else bool(tp.unprotectedLeft.viewBlocked),
     'turn_missed': False if tp is None else bool(tp.turnMissed),
     'handback': 'none' if tp is None else str(tp.handback), 'control_alert': 'none' if tp is None else str(tp.controlAlert),
     'too_fast': False if tp is None else bool(tp.tooFastToTurn),
@@ -485,6 +492,13 @@ def unprotected_left(rows) -> dict:
   go_t = [rows[i]['t'] for i in gos]
   missed = [(a, b) for a, b in offered if any(a <= t <= b - t_req for t in waiting) and not any(a <= t <= b - t_req for t in go_t)]
   undecided_t = next((r['t'] for r in rows if r.get('left_state') == 'undecided'), None)
+  # the view (unprotectedLeft.viewBlocked): at the undecided, at each go, and how far the car crept past where it first stood
+  blocked_at_undecided = any(r.get('left_blocked') for r in rows if undecided_t is not None and undecided_t - 0.5 <= r['t'] <= undecided_t)
+  go_blocked = [rows[i]['t'] for i in gos if rows[i].get('left_blocked') or rows[i - 1].get('left_blocked')]
+  first_go = rows[gos[0]]['t'] if gos else None
+  line = [r for r in rows if r.get('left_state') in ('waitGap', 'creep', 'undecided') and r.get('j_ahead') is not None and
+          (first_go is None or r['t'] < first_go)]
+  creep_m = round(line[0]['j_ahead'] - min(r['j_ahead'] for r in line), 2) if line else None
   # undecided passes only where no gap of tReq was offered with the car at its line, before or after it: a stream that ends
   # in an empty road offers one. No tReq known at all is no pass either
   return {'pet_s': round(min(pets), 2) if pets else None, 'gos': go_t, 'false_goes': false_goes,
@@ -492,7 +506,8 @@ def unprotected_left(rows) -> dict:
           'undecided_t': undecided_t,
           'gap_before_undecided': undecided_t is not None and (t_req <= 0. or any(t_line is not None and b > t_line for a, b in offered)),
           'stalls': sorted({r['control_prompt'] for r in rows if r.get('control_prompt') in LEFT_STALLS}),
-          'turn_missed': any(r.get('turn_missed') for r in rows)}
+          'turn_missed': any(r.get('turn_missed') for r in rows),
+          'blocked_at_undecided': blocked_at_undecided, 'go_blocked': go_blocked, 'creep_m': creep_m}
 
 
 def _disengage_text(ds: list[dict], before: str = '') -> str:
@@ -526,7 +541,12 @@ def _fails(name: str, res: dict) -> list[tuple[str, str]]:
       fails.append(('stall', "did not move on after the crosswalk cleared"))
   elif name.startswith('unprotected_left'):  # and its variants at other approaches, gap streams and the occluded view
     lr = res['left']
-    if lr['undecided_t'] is not None and lr['gap_before_undecided']:
+    if name == OCCLUDED:
+      if lr.get('go_blocked'):
+        fails.append(('left_go_blocked', f"went with the view blocked at t={lr['go_blocked'][0]:.1f} s"))
+      if lr.get('creep_m') is not None and lr['creep_m'] > CREEP_MAX_M + CREEP_SLACK_M:
+        fails.append(('left_creep', f"crept {lr['creep_m']} m past where it first stood at its line, over {CREEP_MAX_M} m"))
+    if lr['undecided_t'] is not None and lr['gap_before_undecided'] and not (name == OCCLUDED and lr.get('blocked_at_undecided')):
       gap = f"a gap of {max(lr['gaps_offered_s'])} s" if lr['gaps_offered_s'] else "no tReq known"
       fails.append(('left_undecided', f"undecided at t={lr['undecided_t']:.1f} s with {gap} (tReq {lr['t_req']} s) offered at its line"))
     elif lr['undecided_t'] is None:
@@ -582,7 +602,8 @@ def _fails(name: str, res: dict) -> list[tuple[str, str]]:
         fails.append(('red', "never stood at the forced red"))
       if red['past_line_on_red_t'] is not None:
         fails.append(('red', f"past the stop line on the forced red at t={red['past_line_on_red_t']:.1f} s"))
-  undecided_ok = name.startswith('unprotected_left') and res['left']['undecided_t'] is not None and not res['left']['gap_before_undecided']
+  undecided_ok = name.startswith('unprotected_left') and res['left']['undecided_t'] is not None and \
+    (not res['left']['gap_before_undecided'] or (name == OCCLUDED and res['left'].get('blocked_at_undecided')))
   arrives = ('ped_crosswalk_right', 'lane_change', 'route_demo', 'right_green', 'left_t_junction', 'twoway_route_pair') + RED_STOP_SCENARIOS
   if (name in arrives or name.startswith('unprotected_left')) and not undecided_ok:
     if res['outcome'] != 'arrived':

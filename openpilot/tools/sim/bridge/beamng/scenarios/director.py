@@ -29,7 +29,7 @@ PACER_AHEAD_M = 2.     # the pacer settles this far ahead of the car's camera
 Z_ABOVE = 3.           # ground ray casts start this far above the road graph's height
 
 
-KNOWN = [f"{PREFIX}{n}" for n in ('ped', 'pacer', *(f'car{k}' for k in range(6)))]  # every name the catalog gives out
+KNOWN = [f"{PREFIX}{n}" for n in ('ped', 'pacer', 'occluder', *(f'car{k}' for k in range(6)))]  # every name the catalog gives out
 LIGHT_STATES = {'green': GREEN, 'yellow': YELLOW, 'red': RED}
 
 
