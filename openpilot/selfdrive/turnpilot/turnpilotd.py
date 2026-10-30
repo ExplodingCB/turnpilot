@@ -193,6 +193,9 @@ ERROR_LOG_PERIOD_S = 10.  # s between logged exceptions from one place, so one t
 PLAN_INPUT_GRACE_FRAMES = 10
 MISMATCH_CONFIRM_FRAMES = 20  # a lane mismatch this many frames in a row (1 s) is flagged: the model's lane count flickers
 NO_JUNCTION_DATA_REASON = "no junction data: nominal turn angle"
+# hazards hold the car's signal off while it signals a maneuver (car_signals.py; DESIGN phase4/blinker 7.7): the reason line
+# says so while it lasts, under the scene's, a missed turn's, the lane planner's and the map's reasons
+HAZARDS_REASON = "Hazards on: car not signalling"
 JUNCTION_UNCERTAIN_REASON = "junction position uncertain: stopping early"
 # no fresh detections for this long (the scene goes unavailable STALE_S after the last) and the detector has stopped:
 # past modeld's forced runs (every 0.8 s) and its first retry (1 s), short of its second (2 s)
@@ -846,10 +849,9 @@ class TurnPilot:
     signal_skip = self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id and \
       self.skip.reason in ('driverSignal', 'hazards', 'signalLost', 'sideUncertain')
     plan.turnSignal.skip = self.skip.reason if signal_skip else 'none'
-    if ts.side != LaneChange.none and str(port.block) == 'hazard' and not plan.reason:
-      plan.reason = "Hazards on: car not signalling"
+    hazards_hold = ts.side != LaneChange.none and str(port.block) == 'hazard'
     plan.reason = decision.reason or (TURN_MISSED_REASON if plan.turnMissed else "") or lane_reason or mapd.reason or \
-      (NO_JUNCTION_DATA_REASON if no_junction_data else "")
+      (HAZARDS_REASON if hazards_hold else "") or (NO_JUNCTION_DATA_REASON if no_junction_data else "")
     fill_map_control(plan, mapd)
     self.fill_left(plan, decision)
     self.fill_stop_go(plan, sg, decision)

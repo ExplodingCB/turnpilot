@@ -764,3 +764,22 @@ def test_a_veto_at_rest_in_the_junction_the_scene_committed_to_finishes_the_turn
   assert str(plans[0].turnSignal.notice) == 'changedMidTurn', str(plans[0].turnSignal.notice)
   assert not any(p.tooFastToTurn or p.desire == CLEAR_DESIRE for p in plans), "skipped inside the junction"
 
+
+# ---------------------------------------------------------------- hazards holding the port off: said on the reason line (7.7)
+
+def test_hazards_holding_the_port_off_say_so_on_the_reason_line():
+  """DESIGN 7.7: hazards hold the port off (it claims nothing while they're on), so a turn the car finishes with them on
+  (they came on after it started: "Finishing the turn") is not signalled by the car, and the plan's reason line says so
+  while it lasts. A reason of higher rank (the scene's, a missed turn, the lane planner's, the map's) still outranks it."""
+  sim = signal_sim()
+  plans = drive_to(sim, 30.)
+  assert sim.tp.desires.started and sim.v > 2. and plans[-1].turnSignal.side == LaneChange.right
+  assert plans[-1].reason != "Hazards on: car not signalling"
+  sim.port_state = {'status': 'ready', 'block': 'hazard', 'hazard': True, 'leftLamp': True, 'rightLamp': True}
+  hazards = [sim.step(engaged=True) for _ in range(int(1. / DT_MDL))]
+  assert str(hazards[0].turnSignal.notice) == 'changedMidTurn'
+  assert all(p.turnSignal.side == LaneChange.right for p in hazards)
+  assert all(p.reason == "Hazards on: car not signalling" for p in hazards), sorted({p.reason for p in hazards})
+  sim.port_state = {'status': 'ready'}
+  off = [sim.step(engaged=True) for _ in range(3)]
+  assert all(p.reason != "Hazards on: car not signalling" for p in off)
