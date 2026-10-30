@@ -20,7 +20,7 @@ from opendbc.car.car_helpers import get_car, interfaces
 from opendbc.car.interfaces import CarInterfaceBase, RadarInterfaceBase
 from openpilot.selfdrive.pandad import can_capnp_to_list, can_list_to_can_capnp
 from openpilot.selfdrive.car.cruise import VCruiseHelper
-from openpilot.selfdrive.turnpilot.car_signals import check_record, resolver as car_signals_resolver
+from openpilot.selfdrive.turnpilot.car_signals import check_record, identity_for, resolver as car_signals_resolver
 
 REPLAY = "REPLAY" in os.environ
 SIMULATION = "SIMULATION" in os.environ
@@ -273,7 +273,9 @@ class Car:
           cloudlog.warning("card: car signal check started in Drive from the phone")
         result = port.check.result
         if result is not None and result is not self.signal_check_written:
-          self.params.put("TurnPilotCarSignalsCheck", check_record(result, self.CP.carVin, self.CP.carFw, SIMULATION))
+          # with TurnPilotCarSignalsVinless on, also what a record without a VIN matches on (car_signals.identity_for)
+          identity = identity_for(self.params, self.CP.carVin, self.CP.carFw)
+          self.params.put("TurnPilotCarSignalsCheck", check_record(result, self.CP.carVin, self.CP.carFw, SIMULATION, identity))
           self.signal_check_written = result
       if port.fault == 'wrongSide' and not self.signal_record_deleted:
         self.params.remove("TurnPilotCarSignalsVerified")

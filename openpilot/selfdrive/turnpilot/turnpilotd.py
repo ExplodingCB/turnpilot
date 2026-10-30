@@ -169,8 +169,8 @@ from openpilot.selfdrive.turnpilot.map_controls import (CAMERA_STALE_S, KEEP_TUR
 from openpilot.selfdrive.turnpilot import stop_rules as sr
 from openpilot.selfdrive.turnpilot.control_tracker import OFF_ROUTE
 from openpilot.selfdrive.turnpilot.stop_go import MODE_DEFAULT, STOP_SWEEP_M, Frame, StopGo, StopGoDecision, mode_for, side_views_live
-from openpilot.selfdrive.turnpilot.car_signals import (TurnSignalIntent, TurnSignalOut, driver_signals_for, read_mode,
-                                                        record_matches)
+from openpilot.selfdrive.turnpilot.car_signals import (TurnSignalIntent, TurnSignalOut, driver_signals_for, identity_for,
+                                                        read_mode, record_matches)
 from openpilot.selfdrive.turnpilot.lane_planner import (SAMPLE_IDX, LanePlanner, Phase, keep_blocker, lane_change_window,
                                                         lane_mismatch, model_lanes_from_msg)
 from openpilot.selfdrive.turnpilot.route_follower import (KEEP, LEFT, RIGHT, SAME_TURN_M, TURN, UNCERTAIN_M, Maneuver, RouteFollower,
@@ -2415,14 +2415,15 @@ def car_params(params):
 
 
 def unverified_why_for(params, cp) -> str:
-  """With TurnPilotCarSignals on, why no verified record matched this car (car_signals.record_matches), '' when one did."""
+  """With TurnPilotCarSignals on, why no verified record matched this car (car_signals.record_matches), '' when one did:
+  with TurnPilotCarSignalsVinless on, on the identity card's resolver formed from the same VIN and firmware."""
   if cp is None:
     return "waiting for the car's parameters"
   try:
     record = params.get("TurnPilotCarSignalsVerified")
   except UnknownKeyName:
     return "this build's params lack the car signal keys: run scons"
-  return record_matches(record, cp.carVin, cp.carFw, "SIMULATION" in os.environ)[1]
+  return record_matches(record, cp.carVin, cp.carFw, "SIMULATION" in os.environ, identity_for(params, cp.carVin, cp.carFw))[1]
 
 
 def long_control_for(params) -> bool | None:
