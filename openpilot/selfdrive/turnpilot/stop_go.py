@@ -202,6 +202,7 @@ STOP_SIGN_REASON = "Stop sign: take control to proceed"  # map_controls' handbac
 # junctionInfo.certification of a stop the route couldn't avoid (routing/avoid.py): announced, then handed back at the full stop
 UNAVOIDABLE = 'unavoidable'
 ROUTE_KNOWN_REASON = "this stop needs you"
+ALT_VETOED_REASON = "turn cancelled"  # H3's detail: a turn signal veto of the other turn (Frame.signal_veto with self.alt)
 VIEW_CREEP_REASON = "Creeping for view"
 STALLED_REASON = "Stalled in junction"
 ALT_REASON = {'right': "Turning right instead", 'left': "Turning left instead", 'straight': "Going straight instead"}
@@ -520,6 +521,14 @@ class StopGo:
     if cur is not None and cur.state is self.token:
       self.key, self.control = cur.key, cur
     self.t += f.dt
+    if self.alt is not None and f.signal_veto and not self.alt.get('vetoed') and self.state not in ('committed', 'inLane', 'done', 'ladder'):
+      # a turn signal veto of the other turn before it starts (turnpilotd, with its lamp armed: the driver's lamp the other way,
+      # hazards, our lamp put out): never taken. A go out for it is withdrawn (_going: signalVeto, its capped abort) and the car,
+      # standing, is handed back (_observe: H3), held: the route's maneuver here is not retried, nor another turn taken in its
+      # place (DESIGN phase4/blinker 6.6 for the turn the ladder made, which tp/blinker's vetoes predate)
+      self.alt['vetoed'] = f.signal_veto
+      cloudlog.event("turnpilot.stop_go_other_turn_vetoed", error=True, key=list(self.key), maneuver=self.alt['maneuver'],
+                     veto=f.signal_veto, state=self.state)
     if self.alt is not None:
       f = replace(f, maneuver=self.alt['maneuver'])  # the other turn decides from here on (7.1 rung 2)
     d = StopGoDecision(maneuver=f.maneuver, edges=self.edges)
@@ -871,6 +880,9 @@ class StopGo:
         # a withdrawn go come to rest with no room for another (2.6): H5, never a wait from where no go can start
         self._fault('H5', f, d, f"no room for another go: {room:.2f} m to the closest edge, {need:.2f} needed")
         return
+    if self.alt is not None and self.alt.get('vetoed'):
+      self._fault('H3', f, d, ALT_VETOED_REASON)  # the other turn overruled, the car standing: handed back, held
+      return
     if f.maneuver != self.clear_for:
       # another path to judge (navd's reroute while held, or turnpilotd's skip of the turn here: the union, 'unknown'): its
       # go conditions hold CLEAR_S from now, never on the time the old path's lanes were clear

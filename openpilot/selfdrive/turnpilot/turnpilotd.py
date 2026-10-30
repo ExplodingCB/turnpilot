@@ -794,6 +794,7 @@ class TurnPilot:
     if alt_on:
       if not self.alt_was_on:
         self.alt_scene_id -= 1
+        self.turn_signal.forget(ALT_MANEUVER_ID)  # another encounter's other turn: armed afresh, whatever the last one's end
       scene_m, scene_d, scene_id = alt_maneuver(sg.alt), float(sg.alt['toNode']) - sg.position_m, self.alt_scene_id
       scene_yaw = self.sg_turned * scene_m.side if scene_m is not None else 0.
       cap_on, cap_d = scene_m, scene_d
@@ -834,6 +835,8 @@ class TurnPilot:
     d_on, d_dist, d_id, d_passed, d_replaced = desire_on, rf.distance, rf.maneuver_id, rf.passed, rf.replaced
     if sg.acting and sg.alt is not None and sg.state != 'off':
       d_on, d_dist, d_id, d_passed, d_replaced = alt_maneuver(sg.alt), max(sg.alt['toNode'] - sg.position_m, 0.), ALT_MANEUVER_ID, False, False
+      if sg.alt.get('vetoed'):
+        d_on = None  # the driver overruled it (stop_go: handed back, held): no desire for it, ever
     if sg.turn_missed:
       self.missed_t = MISSED_HOLD_S  # the other turn taken: the route's planned turn is missed, navd reroutes at once (3.5)
     desire = self.desires.update(d_on, d_dist, d_id, d_passed, v_ego, cs.steeringAngleDeg,
@@ -948,25 +951,41 @@ class TurnPilot:
     # short of dEdgeMin with VETO_MARGIN_M to spare, the go's own frame included): a veto skips the turn as at the line, and
     # the decider withdraws the go on it next frame (sg_veto), never "Finishing the turn" across a stop-sign left's oncoming
     # lanes with the other lamp, hazards or no lamp lit (M2: B10's rule, the decider's go being the turn's there)
-    sg_withdrawable = sg.acting and sg.state == 'going' and sg.withdrawable and self.decider_turn_id == rf.maneuver_id
+    # the stop-sign ladder's other turn in hand (stop_go: 7.1 rung 2, O12) is the turn the car signals, or asks the driver to,
+    # from the frame it is taken, armed at once (DESIGN phase4/blinker 8, item 2): its side under DesireTiming's id for it, none
+    # going straight or once vetoed; the route's turn it replaced at this junction is never signalled again (the merge with
+    # tp/integrate left the intent on the route's turn: the car turned right instead of the route's left with its left lamp lit)
+    alt_sig = d_id == ALT_MANEUVER_ID
+    sig_on = d_on if alt_sig else None if rf.maneuver_id == self.alt_route_id else desire_on
+    sg_withdrawable = sg.acting and sg.state == 'going' and sg.withdrawable and (self.decider_turn_id == rf.maneuver_id or alt_sig)
     short_of_turn = stopping or at_rest or sg_withdrawable  # one boolean for the intent's started and the skip gate below
     ts = self.turn_signal.update(status=signal_status, port=port, gates_ok=acting and not shadow, engaged=sm['carControl'].enabled,
                                  lane_side=self.lanes.signal_side, lane_pending=self.lanes.phase != Phase.IDLE or
                                  (lc.want != 0 and lc.wait in LANE_PENDING_WAITS),
-                                 maneuver=desire_on, maneuver_id=rf.maneuver_id, distance=rf.distance, desires=self.desires,
-                                 missed=plan.turnMissed, v_ego=v_ego, dt=DT_MDL, limit_ms=sm['navInstruction'].speedLimit,
+                                 maneuver=sig_on, maneuver_id=d_id, distance=d_dist, desires=self.desires,
+                                 missed=plan.turnMissed and not alt_sig, v_ego=v_ego, dt=DT_MDL, limit_ms=sm['navInstruction'].speedLimit,
                                  left_lamp=cs.leftBlinker or port.leftLamp, right_lamp=cs.rightBlinker or port.rightLamp,
                                  at_left_line=at_left_line, standing=decision.should_stop or at_left_line,
                                  stopping=short_of_turn, go_now=self.release_go,
-                                 skipped=self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id,
-                                 passed=rf.valid and rf.upcoming is None)
+                                 skipped=self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id and not alt_sig,
+                                 passed=rf.valid and rf.upcoming is None and not alt_sig)
     self.signal_out = ts
     ts.fill(plan.turnSignal)
     # a turn whose desire is out is skipped only while a stop brings the car to rest short of the junction, or it stands at
     # rest short of it, under TURN_STARTED_DEG into it (the intent's own rule, on the same short_of_turn): a right turn
     # pulses 40 m out, so every hold short of it, and every queue standing there, finds its desire out
     stop_veto = short_of_turn and not at_left_line and self.desires.turned_deg < TURN_STARTED_DEG
-    if ts.skip != 'none' and act_on is not None and not self.skip.skipped:
+    if ts.skip != 'none' and alt_sig:
+      # the other turn overruled before it starts (standing, or on its go while the decider can still withdraw it): the
+      # decider reads the veto next frame (sg_veto) and never takes it, withdrawing a go out for it and handing back with the
+      # car held (stop_go: H3, "turn cancelled"); its request ends now, never handed over, and a pulse of its go comes out of
+      # the model's queue. Never a skip of the route's maneuver, which may be a turn further on
+      self.sg_veto = ts.skip
+      self.turn_signal.end(ALT_MANEUVER_ID)
+      if self.desires.maneuver_id == ALT_MANEUVER_ID and self.desires.started:
+        self.desires.cancel()
+      cloudlog.event("turnpilot.turn_signal_alt_veto", error=True, veto=ts.skip, maneuver=str(sg.alt['maneuver']), state=sg.state)
+    elif ts.skip != 'none' and act_on is not None and not self.skip.skipped:
       if not committed or stop_veto:
         # the driver overruled the car's signal: skipped out loud, navd reroutes. A desire out from the approach comes
         # out of the model's queue now (CLEAR_DESIRE) and the turn's cap stays until it is passed, as for a dropped turn

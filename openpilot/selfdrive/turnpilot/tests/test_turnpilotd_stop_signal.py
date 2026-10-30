@@ -13,7 +13,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot import stop_rules as sr
 from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Desire
-from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_stop import S_LINE, StopSim, go_frame, run_to_line
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_stop import S_LINE, StopSim, go_frame, other_turn_drive, run_to_line
 
 LaneChange = custom.TurnpilotPlan.LaneChange
 Status = custom.TurnpilotPlan.TurnSignal.Status
@@ -40,18 +40,24 @@ def stop_turn_sim(tmp_path, maneuver, car_signals=True, auto_left='auto', model=
   sim.tp.auto_left, sim.tp.left_range_m = auto_left, 300.
   sim.veto, sim.turn_done = None, False
   if car_signals:
-    sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
-
-    def port(s):
-      if s.veto is not None:
-        return dict(s.veto)
-      side = s.tp.signal_out.side
-      return {'status': 'lit' if side != LaneChange.none else 'ready', 'left': side == LaneChange.left,
-              'right': side == LaneChange.right, 'leftLamp': side == LaneChange.left, 'rightLamp': side == LaneChange.right}
-    sim.car_signal = port
+    car_signals_on(sim)
   else:
     sim.tp.car_signal_mode = 'off'
   return sim
+
+
+def car_signals_on(sim):
+  """A verified Tesla whose lamp lights on the plan's side at once; sim.veto, when set, is the port's carSignal instead."""
+  sim.veto = getattr(sim, 'veto', None)
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+
+  def port(s):
+    if s.veto is not None:
+      return dict(s.veto)
+    side = s.tp.signal_out.side
+    return {'status': 'lit' if side != LaneChange.none else 'ready', 'left': side == LaneChange.left,
+            'right': side == LaneChange.right, 'leftLamp': side == LaneChange.left, 'rightLamp': side == LaneChange.right}
+  sim.car_signal = port
 
 
 def turn_step(sim, maneuver):
@@ -270,3 +276,69 @@ def test_a_veto_while_a_withdrawn_go_brings_the_car_to_rest_skips_the_turn(tmp_p
   assert any(p.desire != Desire.none for p in plans[n0:]) and plans[-1].desire == Desire.none  # cleared from the model's queue
   run(sim, maneuver, 20.)
   assert not any(p.desire in (Desire.turnLeft, Desire.turnRight) for p in sim.plans()[n0 + round(1. / DT_MDL):])
+
+
+# test_turnpilotd_stop.other_turn_drive's other turn for each route maneuver (route left: the right; right: the left; straight:
+# the right), and the route's own turn's side
+ALT = {'left': 'right', 'right': 'left', 'straight': 'right'}
+SIDE = {'left': LaneChange.left, 'right': LaneChange.right, 'straight': LaneChange.none}
+
+
+@pytest.mark.parametrize('route', ['left', 'right', 'straight'])
+def test_the_ladders_other_turn_is_the_turn_the_car_signals_never_the_routes_it_replaced(tmp_path, route):
+  # SG4c's other turn (STOP_SIGNS.md 7.1 rung 2, O12) came after tp/blinker merged e639725, and the merge left the turn signal
+  # on the route's turn: the car turned right instead of the route's left with its left lamp lit through the go and the
+  # turn. From the frame it is taken (otherTurn) the other turn is the one the car signals, armed at once (DESIGN
+  # phase4/blinker 8, item 2), lit through the go and the commit until it is done; the route's turn it replaced at this
+  # junction is never lit again, through the planned turn's miss
+  plans, go, commit, _, _ = other_turn_drive(tmp_path, route, setup=car_signals_on)
+  alt = next(k for k, p in enumerate(plans) if str(p.controlAlert) == 'otherTurn')
+  want = SIDE[ALT[route]]
+  done = next(k for k in range(go, len(plans)) if plans[k].turnSignal.side != want)
+  assert done > commit, (alt, go, commit, done)
+  assert all(p.turnSignal.side == want and p.turnSignal.status == Status.ready for p in plans[alt + 1:done])
+  if route != 'straight':
+    assert not any(p.turnSignal.side == SIDE[route] for p in plans[alt + 1:])
+  assert not any(p.turnSignal.prompt != LaneChange.none for p in plans)
+
+
+@pytest.mark.parametrize('route', ['left', 'right'])
+def test_with_the_car_not_signalling_the_other_turn_is_the_one_the_driver_is_asked_to_signal(tmp_path, route):
+  # mode off: "Signal Left" for the route's left until the other turn is taken, then "Signal Right" for the right it takes,
+  # never the route's turn again (the driver not answering, so the prompt holds on every frame standing at the line)
+  plans, go, _, _, _ = other_turn_drive(tmp_path, route, setup=lambda s: setattr(s.tp, 'car_signal_mode', 'off'))
+  alt = next(k for k, p in enumerate(plans) if str(p.controlAlert) == 'otherTurn')
+  assert any(p.turnSignal.prompt == SIDE[route] for p in plans[:alt])
+  assert all(p.turnSignal.prompt == SIDE[ALT[route]] for p in plans[alt + 1:go])
+  assert not any(p.turnSignal.prompt == SIDE[route] for p in plans[alt + 1:])
+
+
+@pytest.mark.parametrize('when', ['taken', 'going'])
+@pytest.mark.parametrize('veto', sorted(VETOES))
+@pytest.mark.parametrize('route', ['left', 'straight'])
+def test_a_veto_of_the_other_turn_before_it_starts_hands_back_held_and_the_car_never_takes_it(tmp_path, route, veto, when):
+  # the driver's lamp the other way, hazards or our lamp put out once the other turn is taken (standing at the line, or on its
+  # go while the decider can still withdraw it): the decider never takes it, withdraws a go out for it (signalVeto) and,
+  # standing, hands back with the car held (H3, "turn cancelled"), the request for its lamp ended then and there, never
+  # handed over; never a skip of the route's maneuver (route straight: a turn 1000 m on), nor the turn the driver overruled
+  st = {'n0': None}
+
+  def each(s):
+    sg = s.tp.stop_go
+    if st['n0'] is None and sg.alt is not None and (when == 'taken' or (sg.state == 'going' and s.tp.sg_now.withdrawable)):
+      st['n0'] = len(s.trace)
+      s.veto = VETOES[veto](ALT[route])
+    return st['n0'] is not None and len(s.trace) - st['n0'] >= round(12. / DT_MDL)
+  plans, _, _, _, _ = other_turn_drive(tmp_path, route, setup=car_signals_on, each=each)
+  n0 = st['n0']
+  assert n0 is not None, "the other turn was never taken"
+  after = plans[n0:]
+  assert not any(p.desire in (Desire.turnLeft, Desire.turnRight) for p in after[1:]), "a turn's pulse past the veto's frame"
+  assert all(p.turnSignal.side == LaneChange.none and p.turnSignal.handedOver == LaneChange.none for p in after[1:])
+  assert not any(p.tooFastToTurn for p in after), "a route maneuver skipped for the other turn's veto"
+  held = [k for k, p in enumerate(after) if str(p.controlPrompt) == 'stopSignTakeControl']
+  assert held and held[0] * DT_MDL < 6. and "turn cancelled" in after[held[0]].reason
+  assert all(p.shouldStop for p in after[held[0] + 20:]), "the handback holds the car"
+  assert all(p.accelCap >= -2. - 1e-9 for p in after)
+  if when == 'going':
+    assert any(str(p.stopGo.withdrawn) == 'signalVeto' for p in after[:3]), sorted({str(p.stopGo.withdrawn) for p in after})

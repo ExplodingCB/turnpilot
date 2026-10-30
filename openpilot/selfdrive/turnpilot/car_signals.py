@@ -472,6 +472,12 @@ class TurnSignalIntent:
     if self.armed_id == maneuver_id:
       self.armed_id, self.arm_side = None, LaneChange.none
 
+  def forget(self, maneuver_id) -> None:
+    """A new maneuver under an id an earlier one used (turnpilotd's ALT_MANEUVER_ID, the stop-sign ladder's other turn at each
+    encounter): that one's end no longer keeps this one from arming."""
+    if self.ended_id == maneuver_id:
+      self.ended_id = None
+
   def _notice(self, notice: str) -> None:
     self.notice, self.notice_t = notice, NOTICE_S
 

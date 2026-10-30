@@ -860,17 +860,20 @@ def test_a_left_taken_instead_of_the_routes_right_gets_the_scenes_oncoming_hold(
 
 # --- skeptic SG4c (residual): the other turn's launch and a bad decider frame never touch the route's turn ---
 
-def other_turn_drive(tmp_path, route, err_after_s=None):
+def other_turn_drive(tmp_path, route, err_after_s=None, setup=None, each=None):
   """The route's turn at the stop sign (route left: the left's exit blocked, the right taken; route right: its exit and straight
   across blocked, the left taken; straight: the exit blocked, the right taken), driven through the other turn until the turn
-  is missed. err_after_s: one decider frame raises this long after its commit (None: none). Returns (plans, the go's frame,
-  the commit's frame, the bad frame, (junction hold reason, shouldStop) of the scene each frame)."""
+  is missed. err_after_s: one decider frame raises this long after its commit (None: none). setup(sim): once, before the
+  drive (the car's own turn signal, test_turnpilotd_stop_signal); each(sim): every frame from the line, True ends the drive.
+  Returns (plans, the go's frame, the commit's frame, the bad frame, (junction hold reason, shouldStop) of the scene each frame)."""
   if route == 'straight':
     sim = StopSim(tmp_path)
   else:
     sim = StopSim(tmp_path, info_kw={'maneuver': route}, maneuvers=[(S_LINE + 13., 'turn', route),
                                                                     (2000., 'turn', 'right' if route == 'left' else 'left')],
                   nav_lanes={0: (((route,), True),)})  # a single-lane approach, navd's lane guidance
+  if setup is not None:
+    setup(sim)
   seen = []
   orig = sim.tp.scene.update
 
@@ -912,6 +915,8 @@ def other_turn_drive(tmp_path, route, err_after_s=None):
   turned = 0.
   sign = 0.6 if route == 'right' else -0.6
   while sim.t < 90. and not any(p.turnMissed for p in sim.plans()[start:]):
+    if each is not None and each(sim):
+      break
     if st['go'] is None and str(sim.tp.stop_go.state) == 'going':
       st['go'] = len(sim.trace)
     if st['commit'] is None and str(sim.tp.stop_go.state) in ('committed', 'inLane'):
