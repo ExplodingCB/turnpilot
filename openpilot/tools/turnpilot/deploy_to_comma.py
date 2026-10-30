@@ -376,6 +376,8 @@ def build_stage(repo: Path, commit: str | None, stage: Path) -> dict:
     lfs_bytes += nbytes
   info(f"{len(lfs_paths)} LFS files, {gb(lfs_bytes)}")
   verify_stage(stage, sha, subs)
+  for gitdir in [stage / ".git"] + [stage / ".git" / "modules" / n for n, _, _ in subs]:
+    shutil.rmtree(gitdir / "lfs", ignore_errors=True)  # any object the check's clean filter stored would ship twice
   facts = manifest(stage)
   facts.update(sha=sha, subs=subs, lfs_bytes=lfs_bytes, lfs_files=len(lfs_paths))
   info(f"{facts['nfiles']} files, {gb(facts['bytes'])}, manifest sha256 {facts['digest'][:16]}")
