@@ -218,6 +218,22 @@ class TestHeldAfterHandback:
     assert any("after the stalledTakeControl handback" in f and "not held" in f for f in res['failures']), res['failures']
     assert not any("into the car's stand" in f for f in res['failures'])  # handed back on time: only the pull-away fails it
 
+  def test_a_handback_given_moving_is_never_failed_for_not_holding_the_car(self):
+    # BUILD_FINDINGS N1 and D5-lane: the turn abandoned in the junction and the wrong side of the road hand back with the car
+    # moving and never hold it (turnpilotd: no steering, no hold), so the car going on engaged until the driver takes it is
+    # their shot, not a handback "not held"; another take-control handback rolling on that far still fails
+    for prompt in ('turnAbandonedTakeControl', 'wrongSideTakeControl'):
+      rows = drive([(4.0, {'v': 8., 'nav_dist': lambda tau: 60. - 8. * tau}),
+                    (8.0, {'v': 8., 'nav_dist': lambda tau: 28. - 8. * tau, 'control_prompt': prompt}),
+                    (0.5, {'v': 6., 'enabled': False, 'steer': True})])
+      res = score.summarize('lane_change', rows, 'taken over', expect=(f'handback:{prompt}',))
+      assert not any('not held' in f for f in res['failures']), (prompt, res['failures'])
+    rows = drive([(4.0, {'v': 8., 'nav_dist': lambda tau: 60. - 8. * tau}),
+                  (8.0, {'v': 8., 'nav_dist': lambda tau: 28. - 8. * tau, 'control_prompt': 'carStoppedTakeControl'}),
+                  (0.5, {'v': 6., 'enabled': False, 'steer': True})])
+    res = score.summarize('lane_change', rows, 'taken over', expect=('handback:carStoppedTakeControl',))
+    assert any('not held' in f for f in res['failures']), res['failures']
+
   def test_driving_on_through_the_stop_after_its_handback_fails(self):
     # the skeptic's P2 (S23, avoidance off): the full stop, stopSignTakeControl, then on through the stop sign engaged, arrived
     segs = route([(90., 'turn', 'straight'), (120., 'arrive', '')], v=8.)

@@ -142,6 +142,9 @@ EXPECTS = ('handback', 'gasDisengage', 'skip', 'turnMissed', 'hardBrake')
 HELD_REACT_S = 0.5
 HELD_DECEL = STOP_DECEL
 HELD_SLACK_M = 1.0
+# take-control handbacks turnpilotd gives with the car moving and never holds it after (no steering, no hold): the turn abandoned
+# in the junction (BUILD_FINDINGS N1) and the wrong side of the road (D5-lane). Never failed for the car going on engaged
+MOVING_HANDBACKS = ('turnAbandonedTakeControl', 'wrongSideTakeControl')
 FULL_STOP_HANDBACKS = ('stopSignTakeControl',)
 SHORT_OF_LANES = ('cantStartTakeControl',)
 # ...and comes soon after the left's go (S02 'handback within 3.5 s of the go, 1.5 s with the lift off'): LIFT_HANDBACK_S
@@ -1175,7 +1178,7 @@ def handback_problems(name: str, arg: str, t: float, facts: dict, res: dict) -> 
     if st is not None and not STALL_PROMPT_S - ROW_TOL_S <= st['stood_s'] <= STALL_PROMPT_S + STALL_LATE_S:
       out.append(f"handed back {arg} {st['stood_s']:.1f} s into the car's stand with nothing holding it (from t={st['from_t']:.1f} s), " +
                  f"not {STALL_PROMPT_S} s")
-  if h is not None and h['went_m'] > h['allowed_m']:
+  if h is not None and h['went_m'] > h['allowed_m'] and arg not in MOVING_HANDBACKS:
     out.append(f"moved {h['went_m']:.1f} m engaged after the {arg} handback (up to {h['v_max']:.1f} m/s), past the " +
                f"{h['allowed_m']:.1f} m a stop from {h['v0']:.1f} m/s allows: not held")
   if arg in FULL_STOP_HANDBACKS and not facts.get('stood_at', {}).get(arg, False):
