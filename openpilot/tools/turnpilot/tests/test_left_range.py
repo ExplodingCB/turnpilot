@@ -296,6 +296,15 @@ def test_the_far_crop_off_sets_no_far_range():
   assert "TurnPilotLeftFarRangeM=" not in text(result)
 
 
+def test_far_runs_missing_from_the_logs_are_not_called_a_far_crop_off():
+  """The full pass's farStatus reads but no turnpilotFarDetections were logged (the BeamNG runs' rlogs on this Mac): no far
+  range, and the reason says the far runs are missing, not that the far crop was off."""
+  msgs, _ = drive(stream(60))
+  result = run([m for m in msgs if m.which() != 'turnpilotFarDetections'])
+  assert result.road.range_m is not None and result.far.range_m is None
+  assert "far crop off" not in result.far.why and "not logged" in result.far.why
+
+
 def test_a_far_crop_that_adds_no_reach_sets_no_far_range():
   msgs, _ = drive(stream(60, far_from=150.))
   result = run(msgs)
