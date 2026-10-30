@@ -39,6 +39,7 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.error
 import urllib.request
 from multiprocessing import Queue
 from pathlib import Path
@@ -65,6 +66,9 @@ CLEAR_TIMEOUT_S = 5.  # wait this long for navd to drop the old route
 # (gaps are dead-reckoned through) and its latch and left on it (BeamNG unprotected_left_gap6: a hold 13 m early)
 TP_RESET_S = 2.5
 ROUTE_TIMEOUT_S = 30.
+# turnpilot_web refusing the connection (a fresh stack whose web server isn't listening yet: BeamNG smoke 2026-10-29, a run
+# ended 'no destination' 5 s in): the destination call again this often, for ROUTE_TIMEOUT_S from its first try
+WEB_RETRY_S = 1.
 ENGAGE_TIMEOUT_S = 30.
 
 TURN_DESIRES = (int(log.Desire.turnLeft), int(log.Desire.turnRight))
@@ -91,6 +95,12 @@ def web_call(url: str, token: str, method: str, body: dict | None = None) -> dic
   req = urllib.request.Request(url, data=data, method=method, headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'})
   with urllib.request.urlopen(req, timeout=5) as r:
     return json.loads(r.read() or b'{}')
+
+
+def refused(e: BaseException | None) -> bool:
+  """A web call's exception is turnpilot_web not listening (yet)."""
+  return isinstance(e, ConnectionRefusedError) or \
+    (isinstance(e, urllib.error.URLError) and isinstance(getattr(e, 'reason', None), ConnectionRefusedError))
 
 
 def rlog_segments(since: float) -> list[str]:
@@ -202,17 +212,22 @@ class Runner:
         elif plan.dest is None:
           self.engage(b)
         else:
-          self.web = self.director.submit(web_call, f"{self.web_url}/api/destination", self.token, 'DELETE')
+          self.web_send(now, 'DELETE')
           self.nav_cleared, self.phase, self.t_phase = False, 'clear', now
     elif self.phase == 'clear':
       # navd drops the old route within its 1 Hz tick; posting before it does could leave navd on the old one
-      if self.web.done() and (self.nav_cleared or now - self.t_phase > CLEAR_TIMEOUT_S):
+      if self.web_retry(now):
+        self.t_phase = now
+      elif self.web.done() and refused(self.web.exception()):  # still refused after ROUTE_TIMEOUT_S: no POST will get through
+        self.end_run(b, 'no destination', f"turnpilot_web at {self.web_url}: {self.web.exception()!r}")
+      elif self.web.done() and (self.nav_cleared or now - self.t_phase > CLEAR_TIMEOUT_S):
         lat, lon, _ = frame.to_latlon(*plan.dest)
-        self.web = self.director.submit(web_call, f"{self.web_url}/api/destination", self.token, 'POST',
-                                        {'latitude': lat, 'longitude': lon, 'name': f"scenario {plan.name}"})
+        self.web_send(now, 'POST', {'latitude': lat, 'longitude': lon, 'name': f"scenario {plan.name}"})
         self.route_pts, self.phase, self.t_phase = None, 'route', now
     elif self.phase == 'route':
-      if self.web.done() and self.web.exception() is not None:
+      if self.web_retry(now):
+        self.t_phase = now
+      elif self.web.done() and self.web.exception() is not None:
         self.end_run(b, 'no destination', f"turnpilot_web at {self.web_url}: {self.web.exception()!r}")
       elif self.web.done() and self.route_pts and self.sm.valid['navInstruction'] and self.sm['navInstruction'].distanceRemaining > 0:
         self.engage(b)
@@ -236,6 +251,23 @@ class Runner:
       if end is not None:
         self.end_run(b, end)
     return False
+
+  def web_send(self, now: float, method: str, body: dict | None = None):
+    """The destination call to turnpilot_web, on the director's thread; web_retry repeats it while it is refused."""
+    self.web_req, self.web_t, self.web_first_t = (method, body), now, now
+    self.web = self.director.submit(web_call, f"{self.web_url}/api/destination", self.token, method, *([body] if body is not None else []))
+
+  def web_retry(self, now: float) -> bool:
+    """True while the last destination call was refused (refused: turnpilot_web not up yet) and is being retried,
+    WEB_RETRY_S apart for ROUTE_TIMEOUT_S from its first try; it is sent again here when due. After that the refusal stands
+    and the phase ends the run as before."""
+    if not self.web.done() or not refused(self.web.exception()) or now - self.web_first_t > ROUTE_TIMEOUT_S:
+      return False
+    if now - self.web_t >= WEB_RETRY_S - 1e-6:
+      method, body = self.web_req
+      self.web_t = now
+      self.web = self.director.submit(web_call, f"{self.web_url}/api/destination", self.token, method, *([body] if body is not None else []))
+    return True
 
   def start_run(self, b):
     self.run_idx += 1
