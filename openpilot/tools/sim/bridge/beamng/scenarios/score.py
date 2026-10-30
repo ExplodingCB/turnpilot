@@ -10,6 +10,7 @@ A row is a dict:
   control_prompt     turnpilotPlan.controlPrompt ('none', 'waitingForGap', 'leftGo', 'stalledTakeControl', ...)
   left_state         turnpilotPlan.unprotectedLeft.state ('off', 'waitGap', 'go', 'undecided', ...); left_treq, left_rreq its
                      tReq and rReq; turn_missed turnpilotPlan.turnMissed
+  go_cert            turnpilotPlan.goCertified.cause: the go plannerd's bounded lift is certified for ('none', 'unprotectedLeft', ...)
   onc                [[m to the junction, m it is ahead of the car along its own heading], ...] of each oncoming scenario car
                      (None before they recorded it)
   lc_wait, lc_want   turnpilotPlan.laneChangeWait (why a change the route wants isn't offered) and laneChangeWant
@@ -110,6 +111,14 @@ HELD_REACT_S = 0.5
 HELD_DECEL = STOP_DECEL
 HELD_SLACK_M = 1.0
 SHORT_OF_LANES = ('cantStartTakeControl',)
+# ...and comes soon after the left's go (S02 'handback within 3.5 s of the go, 1.5 s with the lift off'): LIFT_HANDBACK_S
+# from it with plannerd's lift certified for it (go_override.GO_WINDOW_S, 3 s, then withdrawn), NO_LIFT_HANDBACK_S without
+# (turnpilotd's LEFT_NO_MOVE_S, 1 s, standing); rows from before go_cert are held to the former, the most either allows
+GO_TIMED = ('cantStartTakeControl',)
+LIFT_HANDBACK_S = 3.5
+NO_LIFT_HANDBACK_S = 1.5
+# a row or two: the plan's message and the car's each land in the 50 ms rows up to a row late
+ROW_TOL_S = 0.1
 FULL_STOP_HANDBACKS = ('stopSignTakeControl',)
 # turnpilotPlan.handback's kinds: a fault, handed back with openpilot's soft disable, which ends the drive (the car is not
 # held: it coasts engaged through the soft disable); the disengagement after one is that soft disable's
@@ -156,6 +165,7 @@ def msg_fields(ss, cs, tp, nav, model, lp=None) -> dict:
     'turn_missed': False if tp is None else bool(tp.turnMissed),
     'handback': 'none' if tp is None else str(tp.handback), 'control_alert': 'none' if tp is None else str(tp.controlAlert),
     'too_fast': False if tp is None else bool(tp.tooFastToTurn),
+    'go_cert': 'none' if tp is None else str(tp.goCertified.cause),
     'accel_cap': None if tp is None else round(float(tp.accelCap), 2),
     'tp_accel': None if tp is None else round(float(plan_accel(tp.accelCap, tp.speedCap, cs.vEgo)), 2),
     'a_target': None if lp is None else round(float(lp.aTarget), 2),
@@ -750,6 +760,20 @@ def held_after(rows, t: float) -> dict:
           'zone_m': None if j0 is None else round(j0 - CONFLICT_M, 2)}
 
 
+def go_before(rows, t: float) -> dict | None:
+  """The left's last go (left_state into go) at or before t: when, the s from it to t, whether plannerd's lift was certified
+  for it (a row from it to t with go_cert unprotectedLeft; None: rows from before go_cert) and the bound the handback is
+  held to (GO_TIMED). None without a go."""
+  i_t = next((i for i, r in enumerate(rows) if r['t'] >= t), len(rows) - 1)
+  go_i = next((i for i in range(i_t, -1, -1) if rows[i].get('left_state') == 'go' and (i == 0 or rows[i - 1].get('left_state') != 'go')), None)
+  if go_i is None:
+    return None
+  span = rows[go_i:i_t + 1]
+  lift = any(r.get('go_cert') == 'unprotectedLeft' for r in span) if any('go_cert' in r for r in span) else None
+  return {'go_t': rows[go_i]['t'], 'after_s': round(t - rows[go_i]['t'], 2), 'lift': lift,
+          'bound_s': NO_LIFT_HANDBACK_S if lift is False else LIFT_HANDBACK_S}
+
+
 def stood_before(rows, t: float) -> bool:
   """The last the car did before the row at t was stand (under STOPPED_V), not drive (over RESUMED_V): a full stop."""
   for r in reversed([r for r in rows if r['t'] <= t]):
@@ -792,6 +816,7 @@ def expect_facts(rows) -> dict:
           'handback_det_t': det_t,
           'held': {k: held_after(rows, t) for k, t in first['handback'].items() if k in TAKE_CONTROL_PROMPTS},
           'stood_before': {k: stood_before(rows, t) for k, t in first['handback'].items() if k in FULL_STOP_HANDBACKS},
+          'go_before': {k: go_before(rows, t) for k, t in first['handback'].items() if k in GO_TIMED},
           'desire_after_skip_t': next((r['t'] for r in rows if skip_t is not None and r['t'] >= skip_t and r.get('desire') in TURN_DESIRES), None),
           'prompts_after_gas': sorted({k for k, t in first['handback'].items() if gas_t is not None and t >= gas_t})}
 
@@ -842,6 +867,13 @@ def handback_problems(name: str, arg: str, t: float, facts: dict, res: dict) -> 
       if h['went_m'] > h['zone_m']:
         out.append(f"moved {h['went_m']:.1f} m engaged after the {arg} handback, past the {h['zone_m']:.1f} m to the junction's " +
                    f"{CONFLICT_M:.0f} m conflict zone")
+  if arg in GO_TIMED:
+    g = facts.get('go_before', {}).get(arg)
+    if g is None:
+      out.append(f"no go of the left (left_state go) before the {arg} handback")
+    elif g['after_s'] > g['bound_s'] + ROW_TOL_S:
+      lift = {True: "with plannerd's lift", False: "without the lift: no goCertified", None: "the lift not in the rows"}[g['lift']]
+      out.append(f"handed back {arg} {g['after_s']:.1f} s after the left's go at t={g['go_t']:.1f} s, over {g['bound_s']} s ({lift})")
   if h is not None and h['went_m'] > h['allowed_m']:
     out.append(f"moved {h['went_m']:.1f} m engaged after the {arg} handback (up to {h['v_max']:.1f} m/s), past the " +
                f"{h['allowed_m']:.1f} m a stop from {h['v0']:.1f} m/s allows: not held")

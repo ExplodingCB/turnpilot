@@ -117,3 +117,62 @@ class TestWithdrawnGoShortOfTheOncomingLanes:
                   (0.5, {'v': 0., 'enabled': False, 'brake': True, 'j_dist': 3., 'j_ahead': 3.})])
     res = score.summarize('unprotected_left_visible', rows, 'taken over', expect=('handback:stalledTakeControl',))
     assert not any('conflict zone' in f for f in res['failures']), res['failures']
+
+
+class TestWithdrawnGoTimed:
+  """S02 'handback within 3.5 s of the go (1.5 s with the lift off)' (B2b): the cantStartTakeControl handback comes within
+  score.LIFT_HANDBACK_S of the left's go (left_state into go) when plannerd's lift was certified for it (the rows' go_cert,
+  turnpilotPlan.goCertified.cause unprotectedLeft), within NO_LIFT_HANDBACK_S when it wasn't, and within the former in rows
+  from before go_cert."""
+  EXPECT = ('handback:cantStartTakeControl',)
+
+  def test_the_bounds_hold_turnpilots_timers(self):
+    from openpilot.selfdrive.turnpilot.go_override import GO_WINDOW_S
+    from openpilot.selfdrive.turnpilot.turnpilotd import LEFT_NO_MOVE_S
+    assert (score.LIFT_HANDBACK_S, score.NO_LIFT_HANDBACK_S) == (3.5, 1.5)
+    assert GO_WINDOW_S < score.LIFT_HANDBACK_S and LEFT_NO_MOVE_S < score.NO_LIFT_HANDBACK_S
+
+  def test_a_handback_12_s_after_the_go_fails(self):
+    # the skeptic's B2b: the go, the car standing 12 s, then cantStartTakeControl, held, the driver's brake
+    rows = drive([(3.0, {'v': 0., 'state': 'holding', 'left_state': 'waitGap', 'left_treq': 6.0, 'j_dist': 17., 'j_ahead': 17.,
+                         'reason': 'Waiting for a gap', 'control_prompt': 'waitingForGap'}),
+                  (12.0, {'v': 0., 'left_state': 'go', 'control_prompt': 'leftGo', 'j_dist': 17., 'j_ahead': 17.}),
+                  (3.0, {'v': 0., 'j_dist': 17., 'j_ahead': 17., **HB}),
+                  (0.5, {'v': 0., 'enabled': False, 'brake': True, 'j_dist': 17., 'j_ahead': 17.})])
+    res = score.summarize('unprotected_left_visible', rows, 'taken over', expect=self.EXPECT)
+    assert not res['passed'] and not res['expected'][0]['met']
+    assert "handed back cantStartTakeControl 12.0 s after the left's go at t=3.0 s, over 3.5 s (the lift not in the rows)" in \
+      res['failures'], res['failures']
+    assert any('never went' in f or 'stalled' in f for f in res['failures'])  # unmet: nothing explained
+
+  def test_the_lifts_go_withdrawn_at_its_window_passes(self):
+    rows, _ = withdrawn_go(3.0, 1.5, 14., go_s=3.0, extra={'go_cert': 'unprotectedLeft'})
+    res = score.summarize('unprotected_left_visible', rows, 'taken over', expect=self.EXPECT)
+    assert res['passed'], res['failures']
+    assert res['expect_facts']['go_before']['cantStartTakeControl'] == {'go_t': 3.0, 'after_s': 3.0, 'lift': True, 'bound_s': 3.5}
+
+  def test_without_the_lift_the_handback_comes_within_1_5_s(self):
+    rows, _ = withdrawn_go(0.2, 1.5, 14., go_s=2.5, extra={'go_cert': 'none'})
+    res = score.summarize('unprotected_left_visible', rows, 'taken over', expect=self.EXPECT)
+    assert "handed back cantStartTakeControl 2.5 s after the left's go at t=3.0 s, over 1.5 s (without the lift: no goCertified)" in \
+      res['failures'], res['failures']
+    rows, _ = withdrawn_go(0.2, 1.5, 14., go_s=1.2, extra={'go_cert': 'none'})
+    res = score.summarize('unprotected_left_visible', rows, 'taken over', expect=self.EXPECT)
+    assert res['passed'], res['failures']
+
+  def test_a_handback_with_no_go_before_it_fails(self):
+    rows, _ = withdrawn_go(0.2, 1.5, 14., go_s=1.0)
+    for r in rows:
+      if r.get('left_state') == 'go':
+        r['left_state'] = 'waitGap'
+    res = score.summarize('unprotected_left_visible', rows, 'taken over', expect=self.EXPECT)
+    assert "no go of the left (left_state go) before the cantStartTakeControl handback" in res['failures'], res['failures']
+
+  def test_rows_carry_the_certified_gos_cause(self):
+    import openpilot.cereal.messaging as messaging
+    from openpilot.cereal import custom
+    tp = messaging.new_message('turnpilotPlan')
+    tp.turnpilotPlan.goCertified.cause = custom.TurnpilotPlan.GoCertified.Cause.unprotectedLeft
+    ss, cs, model = (messaging.new_message(s) for s in ('selfdriveState', 'carState', 'modelV2'))
+    assert score.msg_fields(ss.selfdriveState, cs.carState, tp.as_reader().turnpilotPlan, None, model.modelV2)['go_cert'] == 'unprotectedLeft'
+    assert score.msg_fields(ss.selfdriveState, cs.carState, None, None, model.modelV2)['go_cert'] == 'none'
