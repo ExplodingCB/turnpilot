@@ -858,8 +858,9 @@ def test_runs_on_the_device_python():
 
 
 def test_constants_follow_their_sources():
-  from openpilot.selfdrive.turnpilot import turnpilotd
+  from openpilot.selfdrive.turnpilot import car_signals, turnpilotd
   assert cpf.DETECTOR_DEADLINE_S == turnpilotd.DETECTOR_DEADLINE_S
+  assert cpf.VINLESS == car_signals.VINLESS_KEY
   # the detector's bands come from its real rate: the model's 20 Hz over RUN_EVERY (10 Hz), never the 20 Hz of a stop sweep
   assert cpf.MODEL_HZ == ModelConstants.MODEL_RUN_FREQ and cpf.DETECTOR_RUN_EVERY == RUN_EVERY
   nominal = ModelConstants.MODEL_RUN_FREQ / RUN_EVERY

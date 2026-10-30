@@ -48,6 +48,8 @@ The exit status is 0 when no line is NO-GO or UNKNOWN, 1 on any NO-GO, and 2 on 
 
 Before the panda enters tesla safety it is in elm327 mode, the harness relay connects the Autopilot computer straight to party CAN, and openpilot's first 0x2B9 come back refused. Every CAN line counts only frames after the tesla time, and so does `carState.canValid`. Refusals before it print as one INFO line.
 
+With `TurnPilotCarSignals` on, the car signals line says whether the verified record matches this car, and which way. "Matches by VIN and firmware" is the match as it always was. "Matches without a VIN" needs the owner's opt-in, `TurnPilotCarSignalsVinless` 1, and a VIN that reads as zeros or fails its check digit: the record then fits on the comma's DongleId, the platform the firmware fingerprints exactly and the exact `carFw` list, all as the lamp check recorded them, from a check in Park. Anything else prints "does not match" with the reason the car would say ("Car Signals Not Verified"). The tool reads `DongleId` and never prints it. `TurnPilotCarSignalsVinless` has its own line: INFO while 0 (the default), WARN at 1.
+
 A param that is unset on the device, or absent from a route's `initData.params`, takes this build's default, and the line says `(default)`. A key this build's params library doesn't know is NO-GO: libparams was built before the key.
 
 ## Sunnypilot logs
