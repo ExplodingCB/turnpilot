@@ -18,12 +18,14 @@ or more; a turn the maneuver ended (done, skipped, passed, missed) never does.
 
 With the car signalling, the driver overrules it before the turn starts, or while a TurnPilot stop brings the car to
 rest short of the junction, braking toward it or standing at it, or with the car at rest short of it whatever stopped it
-(a lead in the queue: turnpilotd's at_rest), under TURN_STARTED_DEG into the turn (their lamp on the other side, hazards,
-or our lamp put out): the turn is skipped out loud and navd reroutes, except at the unprotected left's hold line and in
+(a lead in the queue: turnpilotd's at_rest), or while the stop-sign decider's go can still be withdrawn (going, short of
+its commit point: the decider withdraws it on the veto a frame later), under TURN_STARTED_DEG into the turn (their lamp on
+the other side, hazards, or our lamp put out): the turn is skipped out loud and navd reroutes (and stays skipped at its
+junction across a reroute: turnpilotd's carry_veto), except at the unprotected left's hold line and in
 its go while the car can still stop short of the oncoming lanes, where the left hands back (a skip there would let go of
 the car in a left-turn position; the go is withdrawn) and the request for the left ends there: never signalled again,
 prompted or handed over for that maneuver. Once the turn has started (moving into it with its desire out and no stop in
-force, or TurnPilot's go from a standstill out into it) it finishes, said ("Turn Signal Changed"), and a
+force, or TurnPilot's go from a standstill out into it and not spent) it finishes, said ("Turn Signal Changed"), and a
 stop that then has the car never skips it: one veto, one decision per maneuver. A wrongSide fault with the other side's
 lamp lit (ours on the wrong side, or the driver's) is a veto too: the car never turns with the other side lit.
 """
@@ -323,7 +325,8 @@ class TurnSignalIntent:
     them (ours and the driver's); at_left_line: the unprotected left stands at its hold line; standing: the car stands
     held at a line; stopping: a TurnPilot stop in force brings the car to rest at or short of the junction (shouldStop
     at its end: a hold, a red, a stop sign), braking toward it or standing at it, or the car stands at rest short of it,
-    whatever stopped it, with no go of TurnPilot's out into the turn (turnpilotd's short_of_turn); go_now: TurnPilot's go from a line this
+    whatever stopped it, with no go of TurnPilot's out into the turn, or the stop-sign decider's go can still be withdrawn
+    (turnpilotd's short_of_turn); go_now: TurnPilot's go from a line this
     frame; skipped: TurnSkip has skipped this maneuver (too fast, lane unreachable, side uncertain, a veto); passed: the
     route follower counts it passed and navd hasn't moved on."""
     out = TurnSignalOut(status=status)

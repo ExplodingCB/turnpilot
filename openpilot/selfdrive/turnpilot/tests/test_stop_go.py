@@ -462,6 +462,41 @@ def test_property_closed_loop_a_go_withdrawn_on_its_last_frames_before_commit_st
   assert len(ends) >= 12 and min(e[2] for e in ends) < 1.0, ends  # withdrawn at the boundary, some close to the edge
 
 
+def test_property_closed_loop_a_turn_signal_veto_read_while_withdrawable_withdraws_the_go_short_of_d_edge_min(tmp_path):
+  """A turn signal veto of the go (DESIGN phase4/blinker 6.6, M2): turnpilotd skips the turn on a frame whose decision is
+  'going' and withdrawable, and the decider reads it next frame (Frame.signal_veto). Replayed from every such frame of a
+  launch as hard as the model's, for true lags 0.2-0.6 s known to T_ABORT: the go is withdrawn on it (signalVeto), never
+  committed, and the capped abort ends standing short of dEdgeMin, never below -2.0. withdrawable ends VETO_MARGIN_M before
+  the commit point, so a veto from the last going frames finishes the turn instead (never a withdrawal the abort can't make)."""
+  vis = visibility(tmp_path)
+  ends = []
+  for lag in (0.2, 0.3, 0.4, 0.5, 0.6):
+    def run(veto_after=None, lag=lag):
+      w = Drive(tmp_path, lag_s=lag, behaviour=lambda w: 'goes', vis=vis)
+      for i in range(round(12. / DT_MDL)):
+        w.step(signal_veto='driverSignal' if veto_after is not None and i == veto_after + 1 else '')
+        if veto_after is not None and i > veto_after + 1 and w.v < 0.05:
+          break  # at rest from the veto's abort (the decider's next go, CLEAR_S on, is another launch)
+      return w
+    first = run()
+    going = [i for i, x in enumerate(first.trace) if x.state == 'going']
+    commit = next(i for i, x in enumerate(first.trace) if x.state == 'committed')
+    vetoable = [i for i in going if first.trace[i].withdrawable]
+    assert vetoable and vetoable[-1] < commit - 1, (lag, vetoable[-1:], commit)  # the margin: false before the commit point
+    for k in vetoable[::8] + vetoable[-1:]:
+      w = run(k)
+      states = [x.state for x in w.trace]
+      # observing again, or, come to rest with no room left for another go, H5 (said, held: never a go from there)
+      assert w.trace[k + 1].withdraw == 'signalVeto' and set(states[k + 1:]) <= {'observe', 'ladder'}, (lag, k, states[k:k + 3])
+      assert 'ladder' not in states or w.trace[-1].fault == 'H5'
+      pos = w.sg.pos_ref + (w.odo - w.sg.odo_ref)
+      ends.append((lag, k, round(w.sg.edges.d_min - pos, 2), 'ladder' in states))
+      assert w.v < 0.05 and pos <= w.sg.edges.d_min - sr.M_EDGE + 1e-6, (lag, k, pos, w.sg.edges)
+      assert all(c[3] >= -2. - 1e-9 for c in w.cmds)
+  assert len(ends) >= 10, ends
+  assert not all(e[3] for e in ends), ends  # the early ones come to rest with room for another go
+
+
 def test_property_every_held_state_has_a_reason_and_a_bound_or_a_dynamic_cause(tmp_path):
   """8.1 / 4.6: across random scenes every frame the decider holds the car (stopped, rolling up, observing, a fault's handback)
   says why, and its wait is dynamic (no bound: something moves), or static and ends in the ladder within STATIC_WAIT_S, or a

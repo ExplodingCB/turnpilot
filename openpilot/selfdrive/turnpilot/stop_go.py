@@ -102,6 +102,11 @@ ROLLUP_V_MAX = 3.0              # m/s: a roll-up's cap is the map curve alone, u
 ROLLUP_WAIT_S = 15.             # s standing short of the line with no lead within LEAD_GO_M, its rollUp goes spent: H5 (4.6)
 GO_RETRIES = 2
 UNCOMMIT_STOP_S = 0.5
+# m to spare short of dEdgeMin for a turn signal veto of the go (DESIGN phase4/blinker 6.6): turnpilotd reads this frame's
+# withdrawable and skips the turn on it, and the decider reads the veto a frame later (Frame.signal_veto), the car v*dt on and
+# its abort grown by (a T + (v + a T) a / A_ABORT) dt: 0.23 m at STOP_GO_V_MAX under a 1.5 m/s^2 launch, so four times that for
+# a launch past it or a step in the position. Inside the margin the go is the turn's: a veto finishes it, said
+VETO_MARGIN_M = 1.0
 BAND_ABORT_MARGIN_S = 1.0
 STALL_BOX_S, CLEAR_BOX_GOES = 2.0, 2
 STATIC_WAIT_S, WAIT_INFO_S, CAL_WAIT_S = 15., 60., 30.
@@ -192,6 +197,7 @@ class Frame:
   go_active: str = 'none'        # G5's go in hand (GoCertifier.cause)
   go_taken_over: bool = False    # ...the last one ended on the model's takeover
   go_end: str = ''               # ...why it ended
+  signal_veto: str = ''          # a turn signal veto turnpilotd skipped the turn for last frame on this go while withdrawable
   mode: str = MODE_DEFAULT
   mode_known: bool = True        # the build's params know TurnPilotStopSignGo, and its value is a mode
   dt: float = DT_MDL
@@ -216,6 +222,7 @@ class StopGoDecision:
   creep: tuple | None = None      # (m past where the latch held, m/s cap): the latch's stop point moved on (a roll-up)
   go_cause: str = 'none'          # G5's go to start this frame (stopSign, rollUp, clearBox), 'none'
   withdraw: str = ''              # G5's go out withdrawn this frame, why ('' none)
+  withdrawable: bool = False      # going: a veto read next frame still withdraws the go short of dEdgeMin (VETO_MARGIN_M)
   detector_view: str = 'auto'     # auto, stopSweep (turnpilotd's speed gate on it), stopSweepGo
   latch: str = 'none'             # map_controls' latch: none, shadow (its 1 s handback), wait (held, no handback), fault
   action: str = 'none'            # MapControlStatus.Action name for the control in hand
@@ -720,6 +727,7 @@ class StopGo:
     d.prompt, d.reason, d.action, d.ledger = 'stopGo', "Going", 'going', 'none'
     d.stops = []
     d.speed_cap = sr.STOP_GO_V_MAX
+    d.withdrawable = True  # standing where it was held, GO_ROOM_M or more short of dEdgeMin
     cloudlog.event("turnpilot.stop_go_go", key=list(self.key), pos=round(pos, 2), room=round(room, 2), retries=self.retries,
                    rank=self.rank, lanes=[(x.role, x.index, round(x.r_seen, 1), round(x.r_req, 1), x.shielded) for x in self.last_lanes])
 
@@ -734,12 +742,20 @@ class StopGo:
       self.takeover_s = d.go_t
     taken_over = self.takeover_s >= 0.
     a_now = max(f.a_ego, 0.)
+    if f.signal_veto:
+      # the driver overruled the turn's signal while this go could still be withdrawn (last frame's withdrawable, turnpilotd
+      # skipped the turn on it and cleared its desire): one more thing the go was made on that no longer holds. Withdrawn
+      # ahead of the commit check, its capped abort short of dEdgeMin, and observe again on every path (turnpilotd's union,
+      # unknown) for the next go, straight on (DESIGN 6.6; B10's rule for the autonomous left, unprotected_left._after_go)
+      self._withdraw(f, d, pos, 'signalVeto', "turn cancelled")
+      return
     if sr.committed(pos, f.v_ego, f.t_abort, self.edges, a_now):
       self.state, self.uncommit_s = 'committed', 0.
       d.detector_view, d.action, d.speed_cap, d.prompt, d.committed = 'stopSweepGo', 'committed', NO_SPEED_CAP, 'none', True
       cloudlog.event("turnpilot.stop_go_committed", key=list(self.key), pos=round(pos, 2), v=round(f.v_ego, 2), taken_over=taken_over,
                      go_t=round(d.go_t, 2))
       return
+    d.withdrawable = sr.abort_distance(f.v_ego, f.t_abort, a_now) + sr.M_EDGE + VETO_MARGIN_M < self.edges.d_min - pos
     holds = self.go_holds(f, pos, launch=True)
     d.holds = holds
     # a person heading for the near crosswalk (the arrival clause, P16): it lies between the stop point and dEdgeMin, so the

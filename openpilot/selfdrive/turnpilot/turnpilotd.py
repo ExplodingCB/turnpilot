@@ -414,6 +414,7 @@ class TurnPilot:
       self.stop_go = StopGo()  # the stop-sign decider: kept through a fault, as the latch it decides for
       self.stop_go.on_signal_seen = self.signal_seen_override
       self.sg_skip_token = None  # the decider's encounter in which the route's turn at its control was skipped (stop_go_update)
+      self.sg_veto = ''          # a signal veto that skipped the turn while the decider's go could be withdrawn: Frame.signal_veto
       self.sg_route_maneuver: str | None = None  # the route's maneuver at its control, last frame (before a skip's union)
     self.go_cert.withdraw('reset')  # a disabled plan carries no go
     self.decider_turn_id: int | None = None  # the route's turn whose stop sign the decider acted for last frame (update())
@@ -841,7 +842,12 @@ class TurnPilot:
     went = self.go_id == rf.maneuver_id and not self.go_withdrawn and not self.go_spent
     at_rest = v_ego < STANDSTILL_SPEED and rf.distance > -PROTECT_PAST_M and self.desires.turned_deg < TURN_STARTED_DEG and \
       not went and rf.maneuver_id not in (self.scene.committed_id, self.scene.released_id)
-    short_of_turn = stopping or at_rest  # one boolean for the intent's started and the skip gate below
+    # the stop-sign decider's go for this turn while it can still be withdrawn (going, not committed: its capped abort stops
+    # short of dEdgeMin with VETO_MARGIN_M to spare, the go's own frame included): a veto skips the turn as at the line, and
+    # the decider withdraws the go on it next frame (sg_veto), never "Finishing the turn" across a stop-sign left's oncoming
+    # lanes with the other lamp, hazards or no lamp lit (M2: B10's rule, the decider's go being the turn's there)
+    sg_withdrawable = sg.acting and sg.state == 'going' and sg.withdrawable and self.decider_turn_id == rf.maneuver_id
+    short_of_turn = stopping or at_rest or sg_withdrawable  # one boolean for the intent's started and the skip gate below
     ts = self.turn_signal.update(status=signal_status, port=port, gates_ok=acting and not shadow, engaged=sm['carControl'].enabled,
                                  lane_side=self.lanes.signal_side, lane_pending=self.lanes.phase != Phase.IDLE or
                                  (lc.want != 0 and lc.wait in LANE_PENDING_WAITS),
@@ -866,6 +872,8 @@ class TurnPilot:
         self.skip.skip(act_on, rf.distance, rf.maneuver_id, v_ego, ts.skip)
         plan.tooFastToTurn = True
         self.vetoed = VetoedTurn(act_on, self.odo_m + rf.distance, ts.skip, rf.maneuver_id, committed)
+        if sg_withdrawable:
+          self.sg_veto = ts.skip  # the decider withdraws its go on it next frame (stop_go._going)
         if committed:
           self.desires.cancel()
           self.skip_cap_id = rf.maneuver_id
@@ -1180,7 +1188,8 @@ class TurnPilot:
                 model_v2=model, lead_m=lead_m, t_abort=sr.t_abort(self.cp_delay, vis.actuator_delay_s if vis is not None else None),
                 enabled=bool(sm['carControl'].enabled), right_blindspot=bool(cs.rightBlindspot), tp_holding=self.last_holding,
                 go_active=self.go_cert.cause, go_taken_over=self.go_cert.taken_over, go_end=self.go_cert.end,
-                mode=self.stop_sign_mode if acting else 'shadow', mode_known=self.stop_sign_known)
+                mode=self.stop_sign_mode if acting else 'shadow', mode_known=self.stop_sign_known, signal_veto=self.sg_veto)
+      self.sg_veto = ''  # read once: the go it vetoed is withdrawn on it
       return self.stop_go.update(f)
     except Exception:
       log_error("turnpilotd.stop_go_failed")
