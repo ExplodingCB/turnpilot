@@ -303,6 +303,15 @@ gate checks the left's logic (waiting through the streams, going after them, nev
 reach; nothing in the stack checks a junction's sightline, so the demo junction is chosen by eye for a straight, flat
 approach of R_req or more.
 
+That 150 m leaves little room. The live check at the line computes R_req from where the car stands and the furthest of
+navd's readings, about 4.4 m more R_req for every metre past the 9 m line at 25 mph, so a left's plan says how far past it
+the car may stand, or its junction be read, before the left is undecided there (`notes.left_reach.slack_m`): 3.7 m at
+(-650.1, 481.7), one lane across, and 2.0 m at S08's wpTown_5, two lanes across. The round-2 smoke's S08 and the diag's S02
+went undecided at R_req 204 and 172.9 m because TurnPilot's junction ran 13 m and 6.5 m short of navd's on the wheels'
+over-read speed (now the ground speed, above); an undecided left's result says where the car stood, navd's junction and
+TurnPilot's (`left.undecided_at`). tp/integrate's planned route-time margin (BeamNG build findings D4) would make lefts with
+so little slack range skips: re-check these shots once it lands.
+
 The junction is signalized and mapped, so the left goes only on a read green (`unprotected_left.SIGNAL_NEEDS_GREEN`: it
 doesn't check the cross traffic). Run it with the light oracle (`TURNPILOT_LIGHT_ORACLE=1` on the launch, `--light-oracle`
 on the bridge; without `--signals` the game's lights are held green, so it reads green), or the left waits at its line and

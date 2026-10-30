@@ -11,7 +11,9 @@ A row is a dict:
   state, reason      turnpilotPlan.state and .reason; lc, prompt: its laneChange and signalPrompt
   control_prompt     turnpilotPlan.controlPrompt ('none', 'waitingForGap', 'leftGo', 'stalledTakeControl', ...)
   left_state         turnpilotPlan.unprotectedLeft.state ('off', 'waitGap', 'go', 'undecided', ...); left_treq, left_rreq its
-                     tReq and rReq; turn_missed turnpilotPlan.turnMissed
+                     tReq and rReq, left_why its why (an undecided's fault); turn_missed turnpilotPlan.turnMissed
+  tp_dist            turnpilotPlan.maneuverDistance: m to TurnPilot's own junction (its route follower's, the nearest of navd's
+                     readings dead-reckoned), against navd's nav_dist and the game's j_dist (None without a plan)
   go_cert            turnpilotPlan.goCertified.cause: the go plannerd's bounded lift is certified for ('none', 'unprotectedLeft', ...)
   onc                [[m to the junction, m it is ahead of the car along its own heading], ...] of each oncoming scenario car
                      (None before they recorded it)
@@ -209,6 +211,8 @@ def msg_fields(ss, cs, tp, nav, model, lp=None) -> dict:
     'left_treq': 0. if tp is None else round(float(tp.unprotectedLeft.tReq), 2),
     'left_rreq': 0. if tp is None else round(float(tp.unprotectedLeft.rReq), 1),
     'left_blocked': False if tp is None else bool(tp.unprotectedLeft.viewBlocked),
+    'left_why': '' if tp is None else str(tp.unprotectedLeft.why),
+    'tp_dist': None if tp is None else round(float(tp.maneuverDistance), 1),
     'turn_missed': False if tp is None else bool(tp.turnMissed),
     'handback': 'none' if tp is None else str(tp.handback), 'control_alert': 'none' if tp is None else str(tp.controlAlert),
     'too_fast': False if tp is None else bool(tp.tooFastToTurn),
@@ -603,6 +607,11 @@ def unprotected_left(rows) -> dict:
   go_t = [rows[i]['t'] for i in gos]
   missed = [(a, b) for a, b in offered if any(a <= t <= b - t_req for t in waiting) and not any(a <= t <= b - t_req for t in go_t)]
   undecided_t = next((r['t'] for r in rows if r.get('left_state') == 'undecided'), None)
+  # where the car stood when it went undecided: its R_req there and why, the game's distance to the junction, navd's and
+  # TurnPilot's (S08: 21.8 m out, navd 22.3, TurnPilot 8.8 on an over-read vEgo, R_req 204 m)
+  u = next((r for r in rows if r.get('left_state') == 'undecided'), None)
+  undecided_at = None if u is None else {'why': u.get('left_why'), 'r_req': u.get('left_rreq'), 'j_dist': u.get('j_dist'),
+                                         'nav_dist': u.get('nav_dist'), 'tp_dist': u.get('tp_dist')}
   # the view (unprotectedLeft.viewBlocked): at the undecided, at each go, and how far the car crept past where it first stood
   blocked_at_undecided = any(r.get('left_blocked') for r in rows if undecided_t is not None and undecided_t - 0.5 <= r['t'] <= undecided_t)
   go_blocked = [rows[i]['t'] for i in gos if rows[i].get('left_blocked') or rows[i - 1].get('left_blocked')]
@@ -614,7 +623,7 @@ def unprotected_left(rows) -> dict:
   # in an empty road offers one. No tReq known at all is no pass either
   return {'pet_s': round(min(pets), 2) if pets else None, 'gos': go_t, 'false_goes': false_goes,
           'gaps_offered_s': [round(b - a, 1) for a, b in offered], 'missed_gaps': len(missed), 't_req': t_req,
-          'undecided_t': undecided_t,
+          'undecided_t': undecided_t, 'undecided_at': undecided_at,
           'gap_before_undecided': undecided_t is not None and (t_req <= 0. or any(t_line is not None and b > t_line for a, b in offered)),
           'stalls': sorted({r['control_prompt'] for r in rows if r.get('control_prompt') in LEFT_STALLS}),
           'turn_missed': any(r.get('turn_missed') for r in rows),
@@ -715,7 +724,8 @@ def _fails(name: str, res: dict) -> list[tuple[str, str]]:
         fails.append(('left_creep', f"crept {lr['creep_m']} m past where it first stood at its line, over {CREEP_MAX_M} m"))
     if lr['undecided_t'] is not None and lr['gap_before_undecided'] and not (name == OCCLUDED and lr.get('blocked_at_undecided')):
       gap = f"a gap of {max(lr['gaps_offered_s'])} s" if lr['gaps_offered_s'] else "no tReq known"
-      fails.append(('left_undecided', f"undecided at t={lr['undecided_t']:.1f} s with {gap} (tReq {lr['t_req']} s) offered at its line"))
+      fails.append(('left_undecided', f"undecided at t={lr['undecided_t']:.1f} s with {gap} (tReq {lr['t_req']} s) offered at its line" +
+                    undecided_where(lr.get('undecided_at'))))
     elif lr['undecided_t'] is None:
       # waiting is required wherever an oncoming car was presented; the wait is the left's own at its line
       h = _hold_with(hs, 'gap') + _hold_with(hs, 'oncoming') + _hold_with(hs, 'Oncoming')
@@ -787,6 +797,17 @@ def _fails(name: str, res: dict) -> list[tuple[str, str]]:
     fails.append(('ped_contact', f"came within {res['min_gap_ped_m']} m of the pedestrian"))
   fails += [('speed', why) for why in speed_problems(res.get('speed_check'))]
   return fails
+
+
+def undecided_where(at: dict | None) -> str:
+  """Where an undecided left stood, for its failure: R_req there, the game's, navd's and TurnPilot's distance to the junction
+  (a TurnPilot junction short of navd's puts the car further out than its line, R_req with it: S08, S02)."""
+  if not at or at.get('r_req') is None:
+    return ''
+  why = f" ({at['why']})" if at.get('why') else ''
+  where = '' if at.get('j_dist') is None else f", {at['j_dist']:.1f} m from the junction"
+  reads = '' if at.get('tp_dist') is None else f" (navd {at.get('nav_dist')} m, TurnPilot {at['tp_dist']} m)"
+  return f": R_req {at['r_req']} m{why}{where}{reads}"
 
 
 def parse_expect(expect) -> list[tuple[str, str]]:
@@ -1258,7 +1279,7 @@ def report(label: str, res: dict) -> str:
   lr = res.get('left')
   if lr is not None and (lr['gos'] or lr['undecided_t'] is not None or lr['pet_s'] is not None):
     line += f", left: PET {lr['pet_s']} s, false goes {len(lr['false_goes'])}, missed gaps {lr['missed_gaps']} of " + \
-            f"{len(lr['gaps_offered_s'])} offered, gos {lr['gos']}, undecided {lr['undecided_t']}"
+            f"{len(lr['gaps_offered_s'])} offered, gos {lr['gos']}, undecided {lr['undecided_t']}{undecided_where(lr.get('undecided_at'))}"
   red = res.get('red_light')
   if red is not None:
     line += f", forced red: stood {red['stood_at_red']}, {red['v_at_line']} m/s at the line, green at {red['green_t']}"
