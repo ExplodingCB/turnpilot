@@ -639,6 +639,24 @@ def test_main_prints_and_exits(tmp_path, capsys):
   assert cpf.main(["--route", str(tmp_path)]) == 1  # a directory: its rlogs
 
 
+def test_route_directory(tmp_path):
+  """A device segment directory holds rlog.zst, qlog.zst and, while it records, rlog.lock: the rlog alone is read."""
+  segment = tmp_path / "route--0"
+  segment.mkdir()
+  msgs = drive()
+  write(segment, msgs, "rlog.zst")
+  write(segment, [m for i, m in enumerate(msgs) if m.which() != "can" or i % 100 == 0], "qlog.zst")
+  (segment / "rlog.lock").write_bytes(b"")
+  assert cpf.route_files([str(tmp_path)]) == [segment / "rlog.zst"]
+  f, _ = cpf.collect_route(cpf.route_files([str(tmp_path)]))
+  assert len(f.can_t) == sum(m.which() == "can" for m in msgs) and not f.qlog
+  qlogs = tmp_path / "route--1"
+  qlogs.mkdir()
+  write(qlogs, msgs, "qlog.zst")  # no rlog there: its qlog
+  assert cpf.route_files([str(tmp_path)]) == [segment / "rlog.zst", qlogs / "qlog.zst"]
+  assert cpf.route_files([str(segment / "qlog.zst")]) == [segment / "qlog.zst"]  # a file named is read as given
+
+
 def test_never_prints_a_position(tmp_path, capsys):
   for name in ("rlog.zst", "qlog.zst"):
     cpf.main(["--route", str(write(tmp_path, drive(), name))])

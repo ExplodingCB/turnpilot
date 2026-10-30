@@ -741,7 +741,8 @@ def check_big_model(f: Facts) -> Line:
   if f.chestnut:
     bits.append("supplyFault" if faults else "no supply fault")
     bits.append("pcie " + "/".join(f"0x{v:02x}" for v in sorted({r.pcie for r in f.chestnut})))
-    bits.append(f"GPU max {max(r.temp for r in f.chestnut):.0f} C, {max(r.gpu for r in f.chestnut)}%")
+    temp, gpu = max(r.temp for r in f.chestnut), max(r.gpu for r in f.chestnut)
+    bits.append(f"GPU max {temp:.0f} C, {gpu}%" if temp or gpu else "the GPU reported no temperature or load")
   bits.append(f"modelExecutionTime median {statistics.median(r.execution_time for r in rows) * 1000:.0f} ms, " +
               f"frameDropPerc max {max(r.frame_drop for r in rows):.0f}%")
   if not judged and named:
@@ -957,14 +958,23 @@ def header(f: Facts) -> str:
 
 # ------------------------------------------------------------------------------------------------------------ reading
 
+LOG_NAME = re.compile(r"(?:^|[^A-Za-z])(rlog|qlog)(?:\.zst|\.bz2)?$")  # rlog.zst, seg0_rlog.zst, <route>--0--rlog.zst; never rlog.lock
+
+
 def route_files(args: list[str]) -> list[Path]:
+  """Files as given; a directory's logs in segment order, its rlogs where it has any, else its qlogs (a segment directory
+  holds both, and reading both would count every message twice)."""
   def natural(p: Path):
     return [int(s) if s.isdigit() else s for s in re.split(r"(\d+)", str(p))]
   out = []
   for a in args:
     p = Path(a)
     if p.is_dir():
-      out += sorted((q for q in p.rglob("*") if q.is_file() and ("rlog" in q.name or "qlog" in q.name)), key=natural)
+      by_dir = defaultdict(lambda: defaultdict(list))
+      for q in p.rglob("*"):
+        if q.is_file() and (m := LOG_NAME.search(q.name)):
+          by_dir[q.parent][m.group(1)].append(q)
+      out += sorted((q for kinds in by_dir.values() for q in kinds.get("rlog") or kinds.get("qlog") or []), key=natural)
     elif p.is_file():
       out.append(p)
     else:
