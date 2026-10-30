@@ -410,3 +410,35 @@ def test_the_routes_stop_sign_notices_are_appended_and_said_engaged_or_not():
     assert a.alert_text_1 == title and a.alert_text_2 == 'the text', kind
     assert a.audible_alert == (AudibleAlert.prompt if chime else AudibleAlert.none), kind
     assert plan_events(sm) == ['turnpilotRouteNotice'], kind
+
+
+def test_the_stopped_note_is_heard_once_with_the_info_chime_never_as_a_handback():
+  # PERF_BACKLOG PF-14: the model standing the car with nothing of TurnPilot's holding it was said on the status line only
+  # (STOPPED_NOTE, at STOPPED_NOTE_S), up to 60-90 s before the handback. turnpilotd now raises ControlAlert carStoppedNote
+  # @24 (after stopAheadNeedsYou @23) for ABORT_HOLD_S at the note: junctionUncertain's line (the info chime, prompt, held 3 s),
+  # above a lane change and the wrong lane, below the handback, which keeps its own repeating chime
+  from openpilot.cereal import custom
+  from openpilot.selfdrive.turnpilot.control_text import STOPPED_NOTE
+  from openpilot.selfdrive.turnpilot.hooks import (ABORT_HOLD_S, CONTROL_ALERT_EVENTS, CONTROL_ALERT_FIRST, CONTROL_ALERT_TEXT,
+                                                   CONTROL_STATUS_ALERTS, TAKE_CONTROL_PROMPTS, plan_events)
+  assert custom.TurnpilotPlan.ControlAlert.schema.enumerants['carStoppedNote'] == 24
+  assert 'carStoppedNote' in CONTROL_ALERT_EVENTS and 'carStoppedNote' not in CONTROL_ALERT_FIRST + CONTROL_STATUS_ALERTS + TAKE_CONTROL_PROMPTS
+  a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='carStoppedNote', reason=STOPPED_NOTE)))
+  ref, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='junctionUncertain')))
+  assert a.alert_text_1 == 'Car Stopped' and a.alert_text_2 == CONTROL_ALERT_TEXT['carStoppedNote'] == 'Nothing ahead is holding the car'
+  assert a.audible_alert == AudibleAlert.prompt and a.visual_alert == VisualAlert.none
+  assert (a.alert_status, a.alert_size, a.priority, a.duration) == (ref.alert_status, ref.alert_size, ref.priority, ref.duration)
+  assert plan_events(FakeSM(plan(controlAlert='carStoppedNote'))) == ['turnpilotControlAlert']
+  assert plan_events(FakeSM(plan(controlAlert='carStoppedNote', laneMismatch='wrongLaneForTurn'))) == ['turnpilotControlAlert']
+  assert plan_events(FakeSM(plan(controlAlert='carStoppedNote', controlPrompt='carStoppedTakeControl'))) == ['turnpilotControlPrompt']
+  # in selfdrived's slot, 100 frames a second: silent before the note, its chime on air through the window and the line up
+  # 3 s from it, then silent again for the rest of the stand
+  slot = AlertSlot()
+  sounds = [slot.step(plan(reason=STOPPED_NOTE)).audible_alert for _ in range(100)]
+  window = [slot.step(plan(controlAlert='carStoppedNote', reason=STOPPED_NOTE)) for _ in range(int(ABORT_HOLD_S * 100))]
+  assert all(w.alert_type == 'turnpilotControlAlert/warning' and w.alert_text_1 == 'Car Stopped' for w in window)
+  after = [slot.step(plan(reason=STOPPED_NOTE)) for _ in range(300)]
+  sounds += [w.audible_alert for w in window + after]
+  assert all(w.alert_text_1 == 'Car Stopped' for w in after[:90]) and all(w.alert_text_1 == '' for w in after[110:])
+  rises = [i for i in range(1, len(sounds)) if sounds[i] != sounds[i - 1]]
+  assert [sounds[i] for i in rises] == [AudibleAlert.prompt, AudibleAlert.none]  # one chime, never tpHandback
