@@ -137,7 +137,7 @@ class TestTurnMissed:
     assert res['red_light']['stood_at_red'] and res['red_light']['green_t'] == pytest.approx(3.0)
     res = score.summarize('red_right_g62', drive([(3.0, {'forced_light': 'green', 'j_ahead': 30.})]), 'arrived', expect=('turnMissed',),
                           stop_line_m=12.)
-    assert "expected turnMissed: the turn was taken (no turnMissed)" in res['failures']
+    assert "expected turnMissed: none came (no turnMissed)" in res['failures']
 
 
 class TestHardBrake:

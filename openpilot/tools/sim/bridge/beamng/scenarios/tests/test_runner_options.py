@@ -166,5 +166,5 @@ def test_straight_cruise_faults_land_short_of_the_junctions_line():
 
 def test_the_plans_expect_and_the_options_reach_the_result(tmp_path, monkeypatch):
   out, runner, *_ = drive(tmp_path, monkeypatch, 'lane_change', expect=('turnMissed',))
-  assert out['expect'] == ['turnMissed'] and "expected turnMissed: the turn was taken (no turnMissed)" in out['runs'][0]['failures']
+  assert out['expect'] == ['turnMissed'] and "expected turnMissed: none came (no turnMissed)" in out['runs'][0]['failures']
   assert custom.TurnpilotPlan.Handback.detectorStopped  # the kind the drop's expectation names exists

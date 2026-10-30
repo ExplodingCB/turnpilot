@@ -718,7 +718,7 @@ def expectations(name: str, res: dict, fails: list[tuple[str, str]], expect) -> 
       t = facts['turn_missed_t']
       met = t is not None
       if not met:
-        extra.append("expected turnMissed: the turn was taken (no turnMissed)")
+        extra.append("expected turnMissed: none came (no turnMissed)")
       else:
         explain(e, ('turn_missed', 'not_arrived', 'maneuvers'))
     elif kind == 'hardBrake':
