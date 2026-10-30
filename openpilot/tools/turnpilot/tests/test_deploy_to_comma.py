@@ -1,5 +1,6 @@
 """deploy_to_comma.py against a fake comma: a temp dir stands in for /data (a sunnypilot git checkout in openpilot/, a
-params dir, a route in media/), and an ssh shim on PATH runs the comma's side of every command on this Mac. The source
+params dir, a route in media/), and an ssh shim on PATH runs the comma's side of every command on this Mac, with no git
+config (so no git-lfs filter) unless a test gives the comma one. The source
 is a small fixture repo shaped like this fork: LFS pointers at the device's model and font paths with their objects in
 .git/lfs, plain-blob TurnPilot detector weights, one submodule whose gitlink is not its checked-out HEAD, and Mac build
 outputs lying in both working trees.
@@ -47,6 +48,8 @@ action=$(printf '%s' "$cmd" | awk '{for (i = 1; i <= NF; i++) if ($i == "deploy_
 echo "host=$host action=${action:-$cmd}" >> "$FAKE_COMMA_LOG"
 if [ "$cmd" = "sudo reboot" ]; then echo REBOOT >> "$FAKE_COMMA_LOG"; exit 0; fi
 export PATH="$FAKE_COMMA_BIN:$PATH"
+# the comma's git never reads this Mac's config: none at all by default (git-lfs installed, its filter not set up)
+export GIT_CONFIG_GLOBAL="${FAKE_COMMA_GITCONFIG:-/dev/null}" GIT_CONFIG_NOSYSTEM=1
 if [ -n "${FAKE_COMMA_CUT_BYTES:-}" ] && [ "$action" = receive ]; then
   head -c "$FAKE_COMMA_CUT_BYTES" | bash -c "$cmd"
   exit 255
@@ -193,14 +196,14 @@ def tree_of(root: Path, name: str) -> dict:
   return {k.split('/', 1)[1]: v for k, v in snapshot(root).items() if k.startswith(name + '/')}
 
 
-def version_values(tree: Path) -> dict:
+def version_values(tree: Path, gitconfig: str = os.devnull) -> dict:
   """openpilot's own version functions, run the way the device runs them (is_dirty calls get_origin/get_branch with no
-  cwd, so cwd is the deployed tree)."""
+  cwd, so cwd is the deployed tree), with the comma's git config (none by default), never this Mac's."""
   code = ('import json; from openpilot.common import git, version\n' +
           't = "."\n' +
           'print(json.dumps({"commit": git.get_commit(t), "short_branch": git.get_short_branch(t), "branch": git.get_branch(t),' +
           ' "origin": git.get_origin(t), "dirty": version.is_dirty(t)}))')
-  env = {**os.environ, 'PYTHONPATH': str(REPO_ROOT)}
+  env = {**os.environ, 'PYTHONPATH': str(REPO_ROOT), 'GIT_CONFIG_GLOBAL': gitconfig, 'GIT_CONFIG_NOSYSTEM': '1'}
   r = subprocess.run([sys.executable, '-P', '-c', code], cwd=tree, env=env, capture_output=True, text=True, check=True)
   return json.loads(r.stdout.strip().splitlines()[-1])
 
@@ -212,13 +215,13 @@ def no_pointers(tree: Path, rels):
     assert len(data) > 1000, rel
 
 
-def check_deployed(tree: Path, commit: str, gitlink: str):
+def check_deployed(tree: Path, commit: str, gitlink: str, gitconfig: str = os.devnull):
   assert g(tree, 'rev-parse', 'HEAD', env=os.environ) == commit
   assert g(tree / 'panda', 'rev-parse', 'HEAD', env=os.environ) == gitlink
   status = g(tree, 'submodule', 'status', env=os.environ)
   assert status.startswith(' ' + gitlink), status
-  assert version_values(tree) == {'commit': commit, 'short_branch': 'turnpilot', 'branch': 'origin/turnpilot',
-                                  'origin': dtc.ORIGIN_URL, 'dirty': False}
+  assert version_values(tree, gitconfig) == {'commit': commit, 'short_branch': 'turnpilot', 'branch': 'origin/turnpilot',
+                                             'origin': dtc.ORIGIN_URL, 'dirty': False}
   assert g(tree / 'panda', 'remote', 'get-url', 'origin', env=os.environ) == 'https://github.com/commaai/panda.git'
   no_pointers(tree, REAL_PATHS)
   assert not (tree / 'build').exists() and not (tree / 'panda' / 'board' / 'obj').exists()
@@ -263,6 +266,30 @@ def test_deploy_over_earlier_turnpilot_deploy(source, comma):
   assert g(root / 'openpilot.prev-20261031-090000', 'rev-parse', 'HEAD', env=os.environ) == first
   assert g(root / 'openpilot.prev-20261031-080000', 'log', '-1', '--format=%s', env=os.environ) == 'sunnypilot'
   assert 'REBOOT' in Path(env['FAKE_COMMA_LOG']).read_text()
+
+
+# what `git lfs install` writes to a user's global config
+LFS_INSTALLED = ('[filter "lfs"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n' +
+                 '\tprocess = git-lfs filter-process\n\trequired = true\n')
+
+
+@pytest.mark.parametrize('comma_gitconfig', ['', LFS_INSTALLED], ids=['no-lfs-filter', 'lfs-installed'])
+def test_clean_whatever_the_commas_git_config(source, comma, tmp_path, comma_gitconfig):
+  """Whether AGNOS sets up git-lfs's filter for user comma is unverified. With no filter in its config, or with git lfs
+  install's, the comma's check passes and the device's own is_dirty() reads False, also once git has to hash every LFS
+  file again (their stat changed), as after a copy or a touch."""
+  src, _, second, panda1 = source
+  root, env = comma
+  cfg = tmp_path / 'comma_gitconfig'
+  cfg.write_text(comma_gitconfig)
+  r = deploy(src, root, env, extra_env={'FAKE_COMMA_GITCONFIG': str(cfg)})
+  assert r.returncode == 0, r.stdout
+  tree = root / 'openpilot'
+  check_deployed(tree, second, panda1, str(cfg))
+  for t, config in ((1e9, os.devnull), (1.1e9, str(cfg))):
+    for rel in LFS_FILES:
+      os.utime(tree / rel, (t, t))  # whole seconds away from the index's stat, so the next refresh hashes them again
+    assert version_values(tree, config)['dirty'] is False, config
 
 
 @pytest.mark.parametrize('param,value', [('IsOffroad', '0'), ('IsOnroad', '1')])
@@ -379,7 +406,8 @@ def test_real_commit(comma):
     assert not (tree / rel).read_bytes()[:len(dtc.LFS_HEADER)] == dtc.LFS_HEADER, rel
   code = ('import json; from openpilot.common.version import get_build_metadata as b; m = b(".");' +
           'print(json.dumps([m.channel, m.openpilot.version, m.openpilot.git_commit, m.openpilot.is_dirty]))')
-  out = subprocess.run([sys.executable, '-c', code], cwd=tree, env={**os.environ, 'PYTHONPATH': str(REPO_ROOT)},
-                       capture_output=True, text=True, check=True).stdout.strip().splitlines()[-1]
+  out = subprocess.run([sys.executable, '-c', code], cwd=tree, capture_output=True, text=True, check=True,
+                       env={**os.environ, 'PYTHONPATH': str(REPO_ROOT), 'GIT_CONFIG_GLOBAL': os.devnull,
+                            'GIT_CONFIG_NOSYSTEM': '1'}).stdout.strip().splitlines()[-1]
   channel, _, commit, dirty = json.loads(out)
   assert (channel, commit, dirty) == ('turnpilot', head, False)
