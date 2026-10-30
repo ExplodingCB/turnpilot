@@ -47,8 +47,8 @@ STANDING = 0.3              # m/s
 class GasTaps:
   """The sim driver's gas taps, where a driver would give one, each logged with its reason and how long the car had
   stood ('stopped_s'):
-  - stopSignGo: TurnPilot holds the car at a stop sign past its dwell and asks for the driver's go: once the car has
-    stood STOPPED_TAP_S (counted from the stop, not the prompt: a dwell longer than that gets its tap with the prompt);
+  - never at a stop sign (STOP_SIGNS.md v3 SG4c): the stop-sign decider goes by itself (stopGo) or hands back
+    (stopSignTakeControl); the retired stopSignGo prompt is no tap either;
   - unprotectedTurnGo: held at an unprotected turn's hold line for the driver's go: once the car has stood
     STOPPED_TAP_S, as a driver who has looked across (this driver doesn't look: the detector's oncoming hold after the
     go is what it exercises);
@@ -88,7 +88,7 @@ class GasTaps:
     reason = None
     if standing and plan is not None:
       prompt = str(plan.controlPrompt)
-      if prompt in ('stopSignGo', 'unprotectedTurnGo'):
+      if prompt == 'unprotectedTurnGo':  # never stopSignGo: a stop sign's go is the decider's own (SG4c)
         reason = prompt
       elif prompt == 'signalGo':
         reason = 'signalGo' if self.signal_tap and green is True else None

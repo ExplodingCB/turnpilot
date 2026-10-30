@@ -58,13 +58,13 @@ def run_taps(taps, plan, seconds, v=0., engaged=True, green=None, t0=0., plan_ag
   return out
 
 
-def test_stop_sign_go_is_tapped_once_the_car_has_stood_2_s():
-  from openpilot.tools.sim.bridge.beamng.driver import TAP_GAS, GasTaps
-  taps = GasTaps()
-  out = run_taps(taps, plan_msg('stopSignGo', 'holding', True), 4.)
-  first = out.index(TAP_GAS)
-  assert abs(first * 0.05 - 2.0) < 0.06 and taps.log[0]['reason'] == 'stopSignGo'
-  assert taps.log[0]['stopped_s'] >= 2.0 - 1e-6
+def test_a_stop_sign_is_never_tapped_the_decider_goes_by_itself_or_hands_back():
+  # STOP_SIGNS.md v3 SG4c: no gas go anywhere; at a stop sign the decider goes by itself (stopGo) or hands back
+  # (stopSignTakeControl), and the retired stopSignGo prompt (never sent since G1) is no tap either
+  from openpilot.tools.sim.bridge.beamng.driver import GasTaps
+  for prompt in ('stopSignGo', 'waitingForCross', 'stopGo', 'stopSignTakeControl'):
+    taps = GasTaps()
+    assert max(run_taps(taps, plan_msg(prompt, 'holding', True), 6.)) == 0. and not taps.log, prompt
 
 
 def test_unprotected_turn_go_is_tapped_once_the_car_has_stood_2_s():
@@ -83,17 +83,17 @@ def test_the_2_s_count_from_when_the_car_stopped_not_from_the_prompt():
   out += run_taps(taps, plan_msg('unprotectedTurnGo', 'holding', True), 4., t0=1.)
   first = out.index(TAP_GAS)
   assert abs(first * 0.05 - 3.0) < 0.06
-  # the car stands 1 s in the stop sign's dwell before the prompt: the tap comes 2 s after the stop, 1 s after the prompt
+  # the car stands 1 s in a hold before the prompt: the tap comes 2 s after the stop, 1 s after the prompt
   taps = GasTaps()
   out = run_taps(taps, plan_msg('none', 'holding', True), 1.)
-  out += run_taps(taps, plan_msg('stopSignGo', 'holding', True), 4., t0=1.)
+  out += run_taps(taps, plan_msg('unprotectedTurnGo', 'holding', True), 4., t0=1.)
   first = out.index(TAP_GAS)
   assert abs(first * 0.05 - 2.0) < 0.06 and taps.log[0]['stopped_s'] == pytest.approx(2.0, abs=0.06)
   # a creep in the hold restarts the count
   taps = GasTaps()
-  out = run_taps(taps, plan_msg('stopSignGo', 'holding', True), 1.5)
-  out += run_taps(taps, plan_msg('stopSignGo', 'holding', True), 0.1, v=1., t0=1.5)
-  out += run_taps(taps, plan_msg('stopSignGo', 'holding', True), 4., t0=1.6)
+  out = run_taps(taps, plan_msg('unprotectedTurnGo', 'holding', True), 1.5)
+  out += run_taps(taps, plan_msg('unprotectedTurnGo', 'holding', True), 0.1, v=1., t0=1.5)
+  out += run_taps(taps, plan_msg('unprotectedTurnGo', 'holding', True), 4., t0=1.6)
   first = out.index(TAP_GAS)
   assert abs(first * 0.05 - 3.6) < 0.06
 
@@ -130,7 +130,7 @@ def test_standing_with_nothing_held_is_never_tapped_unless_asked_and_a_hold_neve
 def test_taps_are_short_and_spaced():
   from openpilot.tools.sim.bridge.beamng.driver import TAP_S, GasTaps
   taps = GasTaps()
-  out = run_taps(taps, plan_msg('stopSignGo', 'holding', True), 10.)
+  out = run_taps(taps, plan_msg('unprotectedTurnGo', 'holding', True), 10.)
   pressed = sum(1 for g in out if g > 0.) * 0.05
   assert len(taps.log) >= 2 and abs(pressed - len(taps.log) * TAP_S) < 0.11
 
@@ -151,13 +151,13 @@ def test_never_a_tap_while_turnpilot_hands_back_is_out_or_its_plan_is_stale():
 def test_a_tap_under_way_stops_when_turnpilot_hands_back():
   from openpilot.tools.sim.bridge.beamng.driver import STOPPED_TAP_S, TAP_GAP_S, TAP_GAS, TAP_S, GasTaps
   taps = GasTaps()
-  out = run_taps(taps, plan_msg('stopSignGo', 'holding', True), STOPPED_TAP_S + 0.1)
+  out = run_taps(taps, plan_msg('unprotectedTurnGo', 'holding', True), STOPPED_TAP_S + 0.1)
   assert out[-1] == TAP_GAS
-  out = run_taps(taps, plan_msg('stopSignGo', 'unavailable', True, handback='detectorStopped'), 2., t0=STOPPED_TAP_S + 0.1)
+  out = run_taps(taps, plan_msg('unprotectedTurnGo', 'unavailable', True, handback='detectorStopped'), 2., t0=STOPPED_TAP_S + 0.1)
   assert max(out) == 0.
   # back again: the 2 s standing starts over from the handback's end, no tap the instant it clears
   t_back = STOPPED_TAP_S + 2.1
-  out = run_taps(taps, plan_msg('stopSignGo', 'holding', True), 6., t0=t_back)
+  out = run_taps(taps, plan_msg('unprotectedTurnGo', 'holding', True), 6., t0=t_back)
   first = out.index(TAP_GAS)
   assert t_back + STOPPED_TAP_S > STOPPED_TAP_S + TAP_S + TAP_GAP_S  # past the usual spacing after the cut tap
   assert abs(first * 0.05 - STOPPED_TAP_S) < 0.06

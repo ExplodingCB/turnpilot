@@ -298,7 +298,8 @@ def test_a_plan_without_a_road_model_is_refused():
 
 
 def test_driver_taps_the_gas_where_turnpilot_asks_for_a_go(monkeypatch):
-  # held at a stop sign past its dwell, TurnPilot prompts for the driver's go: the scenario driver gives it, logged
+  # held at an unprotected turn's line with its go prompt (G1's, kept for the left's announce mode), the scenario driver gives
+  # it, logged; a stop sign is never tapped (SG4c: the decider goes by itself or hands back; test_driver has that)
   from openpilot.tools.sim.bridge.beamng.driver import TAP_GAS, GasTaps
   clock = Clock()
   runner = run.Runner(catalog.build('ped_crosswalk_right'), 1, '/tmp', 'http://127.0.0.1:8088', 'tok', 'host', 0)
@@ -308,7 +309,7 @@ def test_driver_taps_the_gas_where_turnpilot_asks_for_a_go(monkeypatch):
   ss = messaging.new_message('selfdriveState')
   ss.selfdriveState.enabled = True
   tp = messaging.new_message('turnpilotPlan')
-  tp.turnpilotPlan.controlPrompt, tp.turnpilotPlan.state, tp.turnpilotPlan.shouldStop = 'stopSignGo', 'holding', True
+  tp.turnpilotPlan.controlPrompt, tp.turnpilotPlan.state, tp.turnpilotPlan.shouldStop = 'unprotectedTurnGo', 'holding', True
   msgs['selfdriveState'], msgs['turnpilotPlan'] = ss, tp
   runner.sm = type('SM', (), {'seen': {'turnpilotPlan': True, 'turnpilotLights': False}, 'recv_time': {'turnpilotPlan': clock.t},
                               '__getitem__': lambda self, s: getattr(msgs[s].as_reader(), s)})()
@@ -326,7 +327,7 @@ def test_driver_taps_the_gas_where_turnpilot_asks_for_a_go(monkeypatch):
     runner.driver(b)
     gas.append(b.driver_gas)
     clock.t += 0.05
-  assert TAP_GAS in gas and runner.taps.log[0]['reason'] == 'stopSignGo'
+  assert TAP_GAS in gas and runner.taps.log[0]['reason'] == 'unprotectedTurnGo'
 
 
 def row_runner(monkeypatch, name):
