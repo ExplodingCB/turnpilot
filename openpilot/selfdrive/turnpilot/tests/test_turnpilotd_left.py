@@ -561,6 +561,7 @@ def far_sim(cars=lambda sim: (), status='read', far_range=FAR_RANGE_M):
   sim = Sim(LEFT_45)
   sim.tp.auto_left, sim.tp.left_range_m, sim.tp.left_far_range_m = 'auto', TEST_RANGE_M, far_range
   sim.go_taps = False
+  sim.answers_prompt = True  # the driver signals the left when prompted: it goes only with a lamp lit (car_signals.py)
   sim.raw, sim.raw_far = road_runs(cars), far_runs(cars)
   sim.far_status = status if callable(status) else (lambda sim: status)
   return sim
