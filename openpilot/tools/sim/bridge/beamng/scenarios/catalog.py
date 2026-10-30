@@ -170,24 +170,28 @@ SCENARIOS = {
   # downtown: 20 m on from the bridge's default spawn (clear of the junction behind it), eastbound, to road-graph node
   # DR249_3 about 850 m east-southeast
   'route_demo': Entry('route', spawn=(-888.82, 659.66, 111.4), heading_deg=0., dest=(-84.9, 377.0, 101.5), speed_kph=40., timeout_s=600.),
-  # S23: in the right lane 200 m up DR558_7 from the two-way stop at DR687_1 (we stop, the cross road doesn't), to 120 m
-  # straight across it. Run with TurnPilotAvoidStops at its default (the route goes around it, ROUTE_NOTES) and off (the
-  # car stops at the sign and hands back: --expect handback:stopSignTakeControl)
-  'twoway_route_pair': Entry('route', spawn=(-666.41, 34.61, 103.14), heading_deg=-135., dest=(-894.27, 95.08, 139.63), speed_kph=30.,
+  # S23: in the right lane 90 m up DR677_5 from the stop sign at DR225_1 (-651.2, 774.2), whose other way in (DR409_3)
+  # doesn't stop, to 120 m straight across it. Run with TurnPilotAvoidStops at its default (the route goes around it,
+  # ROUTE_NOTES) and off (the car stops at the sign and hands back: --expect handback:stopSignTakeControl)
+  'twoway_route_pair': Entry('route', spawn=(-564.58, 779.66, 75.0), heading_deg=-180., dest=(-770.2, 769.21, 87.66), speed_kph=30.,
                              timeout_s=150.),
 }
 
-# what a route entry's plan notes carry: for twoway_route_pair, its two-way stop and route_audit's reading of the trip on the
-# stop-sign sim tiles (build_sim_tiles.sh at the stop-sign map branch's code, 2026-10-29; certified as navd would, mode auto,
-# side views on): the fastest route meets the stop 183 m in, uncertifiable (a two-way stop never certifies: no counting
-# survey, the cross road doesn't stop); navd's avoidance loop routes around it in one reroute, clean, 19 s longer, the kept
-# route with no stop or yield on it (one signal 106 m in). Both routes start clear of every mapped control
+# what a route entry's plan notes carry: for twoway_route_pair, its stop and route_audit's reading of the trip on the
+# stop-sign sim tiles (build_sim_tiles.sh at this branch's code, the stop-sign map branch merged, 2026-10-29), routed from
+# the spawn's heading as navd sends the car's bearing, certified as navd would (mode auto, side views on); twoway_pair.py
+# finds it again. The fastest route (208 m, 14 s, straight on) meets the stop 68 m in, uncertifiable (a stop whose junction
+# isn't a surveyed all-way never certifies); navd's avoidance loop goes around it in one reroute, clean, 4.8 s longer
+# (348 m), with no stop, yield or signal on it, a keep (slight right) 54 m in and its one junction turn 230 m in, a left at
+# DR560_1 with no road straight across. Neither route has an unprotected left or a junction turn inside 100 m of the start
 ROUTE_NOTES = {
   'twoway_route_pair': {'twoway_stop': {
-    'node': 'DR687_1', 'xy': (-809.6, 10.1), 'approach': 'DR558_7', 'instance': 'stop 31', 'spawn_before_m': 200.,
-    'route_audit': {'fastest': {'m': 320, 's': 29, 'stops': [['stop', 183, 'uncertifiable']]},
-                    'avoided': {'m': 386, 'stops': [], 'signals_m': [106]},
-                    'avoidance': {'status': 'clean', 'avoided': 1, 'added_s': 19.0}}}},
+    'node': 'DR225_1', 'xy': (-651.2, 774.2), 'approach': 'DR677_5', 'instance': 'stop 41', 'spawn_before_m': 90.,
+    'kinds': {'DR677_5': 'stop', 'DR409_3': 'none'},
+    'route_audit': {'fastest': {'m': 208, 's': 14, 'stops': [['stop', 68, 'uncertifiable']], 'turns': []},
+                    'avoided': {'m': 348, 'stops': [], 'signals_m': [],
+                                'turns': [[54, 'slight right', 'DR677_1'], [230, 'left', 'DR560_1']]},
+                    'avoidance': {'status': 'clean', 'avoided': 1, 'added_s': 4.8}}}},
 }
 
 
