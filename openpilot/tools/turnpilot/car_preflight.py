@@ -304,7 +304,7 @@ def mode_timeline(f: Facts) -> str:
       last = r.model
   if len(out) == 1:
     return f"{out[0][0]} throughout"
-  return ", ".join(f"{m} from {secs(f, t):.2f} s" for m, t in out)
+  return ", ".join(f"{m} from {max(0., secs(f, t)):.2f} s" for m, t in out)  # a message logged a hair before the first reads 0
 
 
 def can_window(f: Facts) -> tuple[int | None, str]:
