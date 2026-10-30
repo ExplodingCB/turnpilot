@@ -323,6 +323,8 @@ CONTROL_ALERT_TITLE = {'cannotStopComfortably': "Take Control", 'stopOverrun': "
                        'hardBrake': "Braking Hard", 'oncomingHolding': "Oncoming: Holding", 'farViewOff': "Far View Off",
                        'sideCamerasOff': "Side Cameras Off", 'crossTrafficAfterCommit': "Cross Traffic", 'cameraPaused': "Camera Paused",
                        'stalledInJunction': "Stalled in Junction", 'overrideWriteFailed': "Junction Not Saved"}
+# the stop-sign ladder's other turn (stop_go.py: 7.1 rung 2, O12), named by the turn it took (turnpilotPlan.stopGo.maneuver)
+OTHER_TURN_TITLE = {'right': "Turning Right Instead", 'left': "Turning Left Instead", 'straight': "Going Straight Instead"}
 TURNPILOT_CONTROL_ALERT_S = 3.  # an overrun, a yellow or a red go is held up this long
 
 
@@ -365,6 +367,9 @@ def turnpilot_control_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.S
   if kind in CONTROL_STATUS_ALERTS:
     return Alert(CONTROL_ALERT_TITLE[kind], plan.reason or CONTROL_ALERT_TEXT[kind], AlertStatus.normal, AlertSize.mid,
                  Priority.LOWER, VisualAlert.none, AudibleAlert.prompt, .2)
+  if kind == 'otherTurn':
+    return Alert(OTHER_TURN_TITLE.get(str(plan.stopGo.maneuver), "Taking Another Turn"), CONTROL_ALERT_TEXT[kind], AlertStatus.userPrompt,
+                 AlertSize.mid, Priority.LOW, VisualAlert.none, AudibleAlert.prompt, TURNPILOT_CONTROL_ALERT_S)
   return Alert(CONTROL_ALERT_TITLE.get(kind, "TurnPilot"), CONTROL_ALERT_TEXT.get(kind, ''), AlertStatus.userPrompt, AlertSize.mid,
                Priority.LOW, VisualAlert.none, AudibleAlert.prompt, TURNPILOT_CONTROL_ALERT_S)
 

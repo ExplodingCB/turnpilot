@@ -2069,11 +2069,12 @@ def test_O9_off_the_route_the_decider_waits_up_to_10_s_for_navds_maneuver_then_d
 
 def test_V15_a_vehicle_stopped_on_our_exit_leg_holds_the_go_a_static_wait_then_h3_and_goes_once_it_leaves(tmp_path):
   # no go until the exit has room for the car plus 2 m past its crosswalk: a car double-parked 4 m past the far crosswalk,
-  # in our path. Standing, a static wait and the ladder; gone, the go
+  # in our path. Standing, a static wait and the ladder (from a two-lane approach the other-turn rung has nothing to take:
+  # test_ladder_rung_2_* has the single-lane case); gone, the go
   for maneuver, xy in (('straight', (26., 0.)), ('right', (14., -9.))):
     w = World(tmp_path, maneuver=maneuver)
     w.objects = lambda ww, xy=xy: (vehicle(95, *xy),)
-    out = w.run(STATIC_WAIT_S + 3.)
+    out = w.run(STATIC_WAIT_S + 3., approach_lanes=2)
     assert first_go(out) is None and any(h.key == 'exit:95' and h.kind == 'static' for h in out[round(2. / DT_MDL)].holds), maneuver
     h3 = next(d for d in out if d.fault == 'H3')
     assert h3.reason == "Stop sign: no room past the junction: take control"
@@ -2162,3 +2163,80 @@ def test_G3_no_creep_where_it_is_not_predicted_to_help_or_the_creep_floor_forbid
     assert not any(d.go_cause == 'creep' or d.creep is not None for d in out), kw
     h3 = next((d for d in out if d.fault == 'H3'), None)
     assert h3 is not None and "can't see far enough from the right" in h3.reason, [(d.state, d.reason) for d in out[::40]]
+
+
+# ------------------------------------------------------------------------------------- the ladder's other turn (rung 2), O12
+
+def test_ladder_rung_2_a_static_wait_the_routes_maneuver_cant_end_takes_another_that_certifies_and_says_so(tmp_path):
+  # 7.1 rung 2 (3.5): going straight, a car double-parked 4 m past the far crosswalk (V15) leaves no room past the junction,
+  # a static wait; at STATIC_WAIT_S no creep helps it (rung 1 is for reach), so the decider synthesizes another maneuver from
+  # the junction's approaches: a right (the right road outbound, its relBearing 90 deg), from a single-lane approach (the
+  # opposite leg's one lane out standing in for ours), certified like any other (its own conflict set and exit). Said once
+  # ("Turning right instead", otherTurn), it decides as a right from then on and goes; the planned turn is published missed once
+  # the encounter is done so navd reroutes at once. Before SG4c: H3 "no room past the junction"
+  w = World(tmp_path)
+  w.objects = lambda ww: (vehicle(95, 26., 0.),)
+  out = []
+  while len(out) < round((STATIC_WAIT_S + 6.) / DT_MDL) and first_go(out) is None:
+    out.append(w.step())
+  k = next((k for k, d in enumerate(out) if d.alert == 'otherTurn'), None)
+  assert k is not None and (k + 1) * DT_MDL >= 1.0 + STATIC_WAIT_S - 0.1, [(d.state, d.reason, d.fault) for d in out[::40]]
+  d = out[k]
+  assert d.alt is not None and d.alt['maneuver'] == 'right' and d.alt['side'] == 1 and d.alt['angle'] == pytest.approx(90.)
+  assert d.reason == "Turning right instead" and d.maneuver == 'right'
+  assert all(dd.fault == '' for dd in out) and all(dd.maneuver == 'right' for dd in out[k:])
+  i = first_go(out)
+  assert i is not None and i > k and (i - k) * DT_MDL >= sr.CLEAR_S - 0.1
+  assert all(s.accel_cap >= -2. - 1e-9 for dd in out for s in dd.stops)
+  # the encounter done (the car across, 60 deg turned), the planned turn is published missed, once
+  w.v = 2.
+  done = w.run(14., turned_deg=70., go_taken_over=True)
+  assert sum(dd.turn_missed for dd in done) == 1 and any(dd.state == 'done' for dd in done)
+
+
+def test_ladder_rung_2_a_right_only_from_a_lane_that_can_turn_right_a_left_or_straight_only_from_a_single_lane_approach(tmp_path):
+  # our approach has two lanes (navd's lane guidance), the car not in the rightmost: going straight blocked as above, no other
+  # maneuver may be taken (H3, its reason); in the rightmost (the model sees no lane to our right) the right is taken
+  w = World(tmp_path)
+  w.objects = lambda ww: (vehicle(95, 26., 0.),)
+  out = w.run(STATIC_WAIT_S + 3., approach_lanes=2, rightmost=False)
+  assert not any(d.alert == 'otherTurn' for d in out) and next(d for d in out if d.fault == 'H3').reason == \
+    "Stop sign: no room past the junction: take control"
+  w = World(tmp_path)
+  w.objects = lambda ww: (vehicle(95, 26., 0.),)
+  out = w.run(STATIC_WAIT_S + 4., approach_lanes=2, rightmost=True)
+  assert any(d.alert == 'otherTurn' and d.alt['maneuver'] == 'right' for d in out) and all(d.fault == '' for d in out)
+  # going right with the right road's exit blocked (V15's right case), from a single-lane approach: straight is taken
+  w = World(tmp_path, maneuver='right')
+  w.objects = lambda ww: (vehicle(95, 14., -9.),)
+  out = w.run(STATIC_WAIT_S + 5.)
+  k = next(k for k, d in enumerate(out) if d.alert == 'otherTurn')
+  assert out[k].alt['maneuver'] == 'straight' and out[k].alt['side'] == 0 and out[k].reason == "Going straight instead"
+  assert first_go(out) is not None
+
+
+def test_O12_a_long_dynamic_wait_takes_another_certifiable_maneuver_at_wait_alt_s(tmp_path):
+  # row O12: going straight, people crossing the far crosswalk one after another (a dynamic wait, straight's alone: a right's
+  # set has no far crosswalk); at WAIT_ALT_S 45 s from the arrival the right, whose every go condition holds now, is taken and
+  # said, and the go follows its CLEAR_S. Where nothing else certifies (our approach two lanes, the car not in the rightmost)
+  # the wait goes on with the info chime at 60 s, no handback
+  def far_walkers(w):
+    x_far = (w.sg._x(w.sg._far_edge(), w.sg.pos_ref) + 1.5) / 0.7
+    t = w.t_cam - 100.
+    return (person(51, x_far, 4.5 - 1.2 * (t % 8.), vy=-1.2),)
+  w = World(tmp_path)
+  w.run(0.05)
+  w.objects = far_walkers
+  out = w.run(sg.WAIT_ALT_S + 4.)
+  k = next((k for k, d in enumerate(out) if d.alert == 'otherTurn'), None)
+  assert k is not None, [(d.state, d.reason) for d in out[::100]]
+  assert (k + 1) * DT_MDL >= sg.WAIT_ALT_S - 0.1 and out[k].alt['maneuver'] == 'right'
+  assert all(d.ledger in ('dynamic', 'none') for d in out[round(2. / DT_MDL):k])
+  i = first_go(out)
+  assert i is not None and i > k and all(d.fault == '' for d in out)
+  w = World(tmp_path)
+  w.run(0.05)
+  w.objects = far_walkers
+  out = w.run(sg.WAIT_INFO_S + 2., approach_lanes=2, rightmost=False)
+  assert first_go(out) is None and not any(d.alert == 'otherTurn' for d in out) and all(d.fault == '' for d in out)
+  assert any(d.chime and d.reason == "Waiting for cross traffic" for d in out[round(59. / DT_MDL):])

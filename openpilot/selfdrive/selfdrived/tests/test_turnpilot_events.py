@@ -312,3 +312,21 @@ def test_a_failed_junction_override_write_is_appended_and_said_with_a_chime():
   assert a.alert_text_1 == 'Junction Not Saved' and a.alert_text_2 == CONTROL_ALERT_TEXT['overrideWriteFailed']
   assert a.audible_alert == AudibleAlert.prompt and 'overrideWriteFailed' in CONTROL_ALERT_FIRST
   assert plan_events(FakeSM(plan(controlAlert='overrideWriteFailed'))) == ['turnpilotControlAlert']
+
+
+def test_the_stop_sign_ladders_other_turn_is_appended_and_said_with_a_chime_naming_the_turn():
+  # STOP_SIGNS.md v3 SG4c, 7.1 rung 2 and O12: ControlAlert otherTurn @17 after overrideWriteFailed @16, StopGoStatus.alternate
+  # @23 after fault @22; said with a chime, its title the turn the decider took (stopGo.maneuver), never a handback
+  from openpilot.cereal import custom
+  from openpilot.selfdrive.turnpilot.hooks import CONTROL_ALERT_FIRST, CONTROL_ALERT_TEXT, TAKE_CONTROL_PROMPTS, plan_events
+  tp = custom.TurnpilotPlan
+  assert tp.ControlAlert.schema.enumerants['otherTurn'] == 17
+  assert tp.StopGoStatus.schema.fields['alternate'].proto.ordinal.explicit == 23
+  for maneuver, title in (('right', 'Turning Right Instead'), ('left', 'Turning Left Instead'), ('straight', 'Going Straight Instead')):
+    msg = messaging.new_message('turnpilotPlan')
+    msg.turnpilotPlan.controlAlert = 'otherTurn'
+    msg.turnpilotPlan.stopGo.maneuver, msg.turnpilotPlan.stopGo.alternate = maneuver, True
+    a, = alerts(EventName.turnpilotControlAlert, FakeSM(msg.as_reader().turnpilotPlan))
+    assert a.alert_text_1 == title and a.alert_text_2 == CONTROL_ALERT_TEXT['otherTurn'] and a.audible_alert == AudibleAlert.prompt
+  assert 'otherTurn' in CONTROL_ALERT_FIRST and 'otherTurn' not in TAKE_CONTROL_PROMPTS
+  assert plan_events(FakeSM(plan(controlAlert='otherTurn'))) == ['turnpilotControlAlert']

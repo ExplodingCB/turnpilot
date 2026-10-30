@@ -570,3 +570,31 @@ def test_C11_the_camera_stop_signs_param_off_reads_none_anything_else_reads_them
   assert camera_signs_read(FakeParams()) and camera_signs_read(FakeParams(TurnPilotCameraStopSigns=b'shadow'))
   assert not camera_signs_read(FakeParams(TurnPilotCameraStopSigns=b'off'))
 
+
+def test_the_ladders_other_turn_pulses_its_own_turn_at_the_go_never_the_routes_and_publishes_the_planned_turn_missed(tmp_path):
+  # 7.1 rung 2, 3.5: going straight, a car stopped on the exit leg (no room past the junction: a static wait); at its bound
+  # the decider takes a right (single-lane approach), said (otherTurn, stopGo.alternate, stopGo.maneuver right). turnpilotd
+  # feeds DesireTiming the synthesized right (its own maneuver id) from the go: turnRight goes out at the go and never a turn
+  # for the route; once the encounter is done the route's planned turn is published missed (turnMissed) for navd to reroute
+  sim = StopSim(tmp_path)
+  def stopped(s):  # on the exit leg 26 m ahead while we stand at the line (out of the scene once we move)
+    return ({'cls': 'car', 'x': 26., 'y': 0., 'vx': 0., 'vy': 0., 'inPath': True, 'camera': 'wide', 'view': 'full',
+             'tSeen': s.t_cam},) if s.v < 0.5 and abs(S_LINE - s.s) < 6. else ()
+  run_to_line(sim)
+  start = len(sim.trace)
+  turned = 0.
+  while sim.t < 80. and not any(p.turnMissed for p in sim.plans()[start:]):
+    moving = sim.v > 0.5 and str(sim.trace[-1][2].stopGo.state) in ('committed', 'inLane')
+    yaw = -0.6 if moving and turned < 80. else 0.
+    turned += abs(yaw) * DT_MDL * 57.3
+    sim.step(objects=stopped(sim), yaw_rate=yaw)
+  plans = sim.plans()[start:]
+  alt = next((k for k, p in enumerate(plans) if str(p.controlAlert) == 'otherTurn'), None)
+  assert alt is not None, [(str(p.stopGo.state), p.reason) for p in plans[::40]]
+  assert plans[alt].stopGo.alternate and str(plans[alt].stopGo.maneuver) == 'right'
+  go = next(k for k, p in enumerate(plans) if str(p.goCertified.cause) == 'stopSign')
+  assert go > alt
+  desires = [p.desire for p in plans]
+  assert Desire.turnLeft not in desires and Desire.turnRight in desires[go:go + 3] and Desire.turnRight not in desires[:go]
+  assert any(p.turnMissed for p in plans[go:]) and not any(p.turnMissed for p in plans[:go])
+  assert all(p.accelCap >= -2. - 1e-9 for p in plans)

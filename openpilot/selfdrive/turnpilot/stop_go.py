@@ -26,8 +26,14 @@ decider computes would_go only (logged once a stop). Acting:
 - observe: section 2.4's go conditions every frame (go_holds: each one held a Hold with its reason and kind, the wait ledger of
   4.6). All of them for CLEAR_S is the go: map_controls' latch let go (release, cause 'clear', no span release past it), G5's
   go (go_cause stopSign) and the stopGo chime. Waiting is silent (waitingForCross, its reason) with an info chime at
-  WAIT_INFO_S and every WAIT_INFO_S after while dynamic; a static wait has STATIC_WAIT_S, then the ladder, which in this group
-  is H3 (its creep and other-turn rungs are SG4c's); a control the route couldn't avoid (junctionInfo.certification
+  WAIT_INFO_S and every WAIT_INFO_S after while dynamic; a static wait has STATIC_WAIT_S, then the ladder (7.1): rung 1, the
+  creep for a view (2.5, G3: VIEW_CREEP_M steps on the latch's creep path where the walk predicted from there gains the
+  binding lane and the creep floor allows it, measured CLEAR_S after each), rung 2, another maneuver synthesized from the
+  junction's approaches that certifies here (3.5: a right from a lane that can turn right, straight or a left only from a
+  single-lane approach; said, otherTurn, and the route's planned turn published missed once done), rung 3, H3 with the
+  reason. A dynamic wait past WAIT_ALT_S takes another maneuver whose every go condition holds now (O12). A person standing
+  at a crosswalk's curb holds the go PED_CURB_S, then the car goes at STOP_GO_V_MAX until past that crosswalk (D3, P3, P15).
+  A control the route couldn't avoid (junctionInfo.certification
   unavoidable: announced at route start and 300 m before) is H3 "this stop needs you" right after the full stop whatever the
   line reads, and one the route found uncertifiable (avoidance off) is H3 there once the line can't certify it either (7.1).
   The deadlock (4.5 step 5, V9, V10): an earlier arrival that holds its turn DEADLOCK_S with nothing in the
@@ -143,6 +149,7 @@ UNCOMMIT_STOP_S = 0.5
 BAND_ABORT_MARGIN_S = 1.0
 STALL_BOX_S, CLEAR_BOX_GOES = 2.0, 2
 STATIC_WAIT_S, WAIT_INFO_S, CAL_WAIT_S = 15., 60., 30.
+WAIT_ALT_S = 45.                # s of a wait (from the arrival) after which another maneuver whose go holds now is taken (O12)
 OFFROUTE_WAIT_S = 10.           # s off the route a stopped car waits for navd's reroute to give it a maneuver (3.5, O9)
 INFO_CHIME_S = 2.0              # s the info chime's flag (stopGo.chime) is up
 ALERT_S = 2.0                   # s an alert of the decider's is held (hooks.ABORT_HOLD_S)
@@ -191,6 +198,10 @@ STOP_SIGN_REASON = "Stop sign: take control to proceed"  # map_controls' handbac
 UNAVOIDABLE = 'unavoidable'
 ROUTE_KNOWN_REASON = "this stop needs you"
 VIEW_CREEP_REASON = "Creeping for view"
+ALT_REASON = {'right': "Turning right instead", 'left': "Turning left instead", 'straight': "Going straight instead"}
+# go conditions the same for every maneuver at the junction (the other-turn rung reads them from this frame's own evaluation)
+SHARED_HOLDS = ('signal', 'yaw', 'camera', 'stale', 'calibration', 'box', 'near', 'nearRaw', 'hide', 'lead', 'front', 'turn',
+                'deadlockCreep')
 REASONS = {
   'H1': "Cross-traffic camera unavailable: take control",
   'H2': "Stop sign position uncertain: take control",
@@ -243,6 +254,8 @@ class Frame:
   go_end: str = ''               # ...why it ended
   mode: str = MODE_DEFAULT
   mode_known: bool = True        # the build's params know TurnPilotStopSignGo, and its value is a mode
+  approach_lanes: int = 0        # our approach's lanes toward the junction (navd's lane guidance for a turn here), 0 unknown
+  rightmost: bool = False        # the car is in the rightmost lane (the model sees no lane to its right)
   dt: float = DT_MDL
 
 
@@ -294,6 +307,8 @@ class StopGoDecision:
   maneuver: str = 'straight'
   holds: list = field(default_factory=list)  # this frame's Holds (the ledger's inputs)
   acting: bool = False            # the mode acts (auto with its data, trial): not as shadow
+  alt: dict | None = None         # the ladder's other turn in hand (rung 2, O12): maneuver, side (+1 right), angle, relBearing, toNode
+  turn_missed: bool = False       # this frame: the encounter done on the other turn, the route's planned turn missed (navd reroutes)
   log: dict = field(default_factory=dict)
 
 
@@ -347,6 +362,7 @@ class StopGo:
     self._said: set = set()
     self._cert_key = None
     self._cert = None
+    self._certs: dict = {}         # the other turns' verdicts, keyed as certified() keys its own
     self.reset()
 
   # ---------------------------------------------------------------------------------------------------------- encounter
@@ -389,6 +405,8 @@ class StopGo:
     self.creep_end = None           # (why, creep): the creep just ended (its G5 go withdrawn)
     self.view_creep: dict | None = None  # the ladder's creep for a view (rung 1): phase creep, measure or over, its target...
     self.view_steps = 0             # creeps for a view taken this encounter
+    self.alt: dict | None = None    # the other turn taken (7.1 rung 2, O12): the decider's maneuver from then on
+    self._shared: list = []         # this frame's holds that are the same for every maneuver (SHARED_HOLDS)
     self.clear_s = 0.
     self.static_s = 0.
     self.dynamic_s = 0.
@@ -487,6 +505,8 @@ class StopGo:
     if cur is not None and cur.state is self.token:
       self.key, self.control = cur.key, cur
     self.t += f.dt
+    if self.alt is not None:
+      f = replace(f, maneuver=self.alt['maneuver'])  # the other turn decides from here on (7.1 rung 2)
     d = StopGoDecision(maneuver=f.maneuver, edges=self.edges)
     mode, why = self._mode(f)
     d.mode = mode
@@ -976,6 +996,10 @@ class StopGo:
       self.state, self.go = 'done', None
       d.detector_view = 'auto'
       cloudlog.event("turnpilot.stop_go_done", key=list(self.key), pos=round(pos, 2), turned=round(f.turned_deg, 1))
+      if self.alt is not None and not self.alt.get('missed'):
+        # the other turn taken: the route's planned turn is missed, and navd reroutes at once (turnMissed, 3.5)
+        self.alt['missed'] = d.turn_missed = True
+        cloudlog.event("turnpilot.stop_go_turn_missed", key=list(self.key), alt=self.alt['maneuver'], planned=self.alt['from'])
       return
     threat = self._threat(f, pos)
     if threat:
@@ -1017,11 +1041,19 @@ class StopGo:
       return []
     return junction_lanes(j, f.maneuver, self.setback, self.lane_edge, f.approach_yaw_deg)
 
-  def certified(self, f: Frame):
+  def certified(self, f: Frame, probe: bool = False):
     """routing/certify.assess at the line (the same function navd runs at route time; its mode and launch checks are _mode's):
     the static checks, cached while their inputs stand still."""
     key = (f.maneuver, round(f.approach_yaw_deg), round(max(abs(f.yaw20_deg), sr.ROUTE_YAW_DEG), 1), f.side_status in SIDE_LIVE,
-           None if f.wall_t is None else int(f.wall_t // 60.), id(f.vis), id(f.surveys), id(self.junction))
+           None if f.wall_t is None else int(f.wall_t // 60.), id(f.vis), id(f.surveys), id(self.junction), len(self.downgraded))
+    if probe:
+      if key not in self._certs:
+        if len(self._certs) > 8:
+          self._certs.clear()
+        rt = ce.Runtime(mode='trial', side_views=f.side_status in SIDE_LIVE, window=(0., 0.), yaw_deg=f.approach_yaw_deg,
+                        yaw_offset_deg=max(abs(f.yaw20_deg), sr.ROUTE_YAW_DEG))
+        self._certs[key] = ce.assess(self.junction, f.maneuver, f.vis, f.surveys, f.wall_t, rt)
+      return self._certs[key]
     if key != self._cert_key:
       rt = ce.Runtime(mode='trial', side_views=f.side_status in SIDE_LIVE, window=(0., 0.), yaw_deg=f.approach_yaw_deg,
                       yaw_offset_deg=max(abs(f.yaw20_deg), sr.ROUTE_YAW_DEG))
@@ -1082,6 +1114,7 @@ class StopGo:
     if not launch:
       lanes_only = all(h.key.split(':')[0] in CREEP_LANE_HOLDS for h in box + rest)
       turn = self._turn_holds(f, pos, any(h.kind == DYNAMIC for h in box + rest), not holds and not box and not rest, lanes_only)
+      self._shared = [h for h in holds + box + rest + turn if h.key.split(':')[0] in SHARED_HOLDS]
       if any(h.kind == STATIC for h in turn):
         return holds + box + rest + turn  # a standing cause beside it is the wait's reason, and H3's
       holds += turn
@@ -1115,14 +1148,16 @@ class StopGo:
     from openpilot.selfdrive.turnpilot.junction_watch import lighting_at
     return lighting_at(self.junction, f.wall_t, f.vis.veil if f.vis is not None else None)
 
-  def _lane_holds(self, f: Frame, pos: float, launch: bool) -> list[Hold]:
+  def _lane_holds(self, f: Frame, pos: float, launch: bool, record: bool = True) -> list[Hold]:
     """2.4 item 4: each conflicting lane's R_seen at least its R_req (or a qualified shield), its tracks passing U2 (a stopping
     approach's) or the tracked test (another's, and a cyclist on any), and no raw box blocking it. During the launch reach is
     walked on the go position's geometry and held to the smaller of its go-time and live value (D13), shields and the tracks
     known at the go are judged by their ground motion, and any other track or raw box in a lane withdraws the go."""
     holds: list[Hold] = []
     lanes = self.junction_lanes(f)
-    self.last_lanes = []
+    seen_lanes: list = []
+    if record:
+      self.last_lanes = seen_lanes
     if not lanes:
       return [Hold('noLanes', "no conflicting approach to judge by", STATIC)]
     if f.live is None or f.vis is None:
@@ -1143,7 +1178,7 @@ class StopGo:
       else:
         shielded = bool(seen.shields)
       idx = next((i for i, a in enumerate(self.junction.approaches) if a is ln.approach), 0)
-      self.last_lanes.append(LaneStatus(ln.role, ln.index, idx, r_seen, r_req, seen.why, shielded))
+      seen_lanes.append(LaneStatus(ln.role, ln.index, idx, r_seen, r_req, seen.why, shielded))
       if r_seen + 1e-9 < r_req and not shielded:
         moving = any((e.role, e.index) == (ln.role, ln.index) and e.v_nom > MOVING_V for e in self.ev.values())
         holds.append(Hold(f'reach:{ln.role}{ln.index}', f"can't see far enough {side_word(ln.role)} ({seen.why})",
@@ -1384,6 +1419,78 @@ class StopGo:
     cloudlog.event("turnpilot.stop_go_order_waived", key=list(self.key), waiting=sorted(waiting), why=why, t=round(self.t, 2))
     return []
 
+  # --------------------------------------------------------------------------------------------- the other turn (rung 2)
+
+  def _our_lanes(self, f: Frame) -> int:
+    """Our approach's lanes toward the junction: navd's lane guidance for a turn here (Frame.approach_lanes), else the road
+    straight across's lanes out (our road going on: junctionInfo has no leg for our own approach), else 0, not known."""
+    if f.approach_lanes > 0:
+      return int(f.approach_lanes)
+    opp = next((a for a in (self.junction.approaches if self.junction is not None else []) if sr.effective_role(a) == 'opposite'), None)
+    return int(opp.lanes_out) if opp is not None and opp.lanes_out > 0 else 0
+
+  def _alternatives(self, f: Frame) -> list:
+    """The maneuvers the ladder may synthesize instead of the route's (3.5), fewest conflicts first: a right from a lane that
+    can turn right (a single-lane approach, or the rightmost lane), straight or a left only from a single-lane approach (a
+    lane's own arrows aren't known), each where a road leaves the junction that way: (maneuver, its approach)."""
+    j = self.junction
+    if self.alt is not None or j is None or j.status != 'ok' or f.maneuver not in ('straight', 'left', 'right'):
+      return []
+    lanes = self._our_lanes(f)
+    out = []
+    for m, role in (('right', 'right'), ('straight', 'opposite'), ('left', 'left')):
+      a = next((a for a in j.approaches if sr.effective_role(a) == role and a.outbound), None)
+      if m == f.maneuver or a is None:
+        continue
+      if (m == 'right' and not (lanes == 1 or f.rightmost)) or (m != 'right' and lanes != 1):
+        continue
+      out.append((m, a))
+    return out
+
+  def _alt_holds(self, f: Frame, pos: float, m: str) -> list[Hold]:
+    """Maneuver m's go conditions now, certified like any other (routing/certify.assess for its maneuver, its conflict set,
+    its zones, exit and a right's guards), with this frame's holds that are the same for every maneuver (SHARED_HOLDS); no
+    clock of the decider's moves for it."""
+    fm = replace(f, maneuver=m)
+    j = self.junction
+    if self.downgraded:
+      conflicting = {id(mv.approach) for mv in sr.conflict_movements(j, m, 0.)}
+      if conflicting & set(self.downgraded):
+        return [Hold('downgrade', "cross traffic doesn't stop", STATIC)]
+    verdict = self.certified(fm, probe=True)
+    if verdict.certification != 'certifiable' and verdict.reason != 'reach':
+      return [Hold('cert:' + verdict.reason, f"can't certify ({verdict.reason})", STATIC)]
+    holds = list(self._shared) + self._lane_holds(fm, pos, False, record=False) + self._people_holds(fm, pos, probe=True)
+    holds += self._exit_holds(fm, pos)
+    if m == 'right':
+      if f.right_blindspot:
+        holds.append(Hold('blindspot', "something in the right blind spot", DYNAMIC))
+      if self.bike_t is not None and self.t - self.bike_t <= BIKE_PASS_MEMORY_S:
+        holds.append(Hold('bikePassed', "a cyclist passed on the right", DYNAMIC))
+    return holds
+
+  def _other_turn(self, f: Frame, d: StopGoDecision, pos: float, empty: bool) -> bool:
+    """7.1 rung 2 (empty False: at a static wait's bound, a maneuver with no static or fault cause, its dynamic ones waited
+    for) and O12 (empty True: a wait past WAIT_ALT_S, a maneuver whose every go condition holds now): the first of
+    _alternatives that qualifies is taken, said once (otherTurn, "Turning right instead"), and decides from then on; its side
+    and angle from its approach's relBearing for turnpilotd's synthesized turn (desire from the go), the route's planned turn
+    published missed once the encounter is done. True: taken."""
+    for m, a in self._alternatives(f):
+      holds = self._alt_holds(f, pos, m)
+      if (empty and holds) or any(h.kind in (STATIC, FAULT) for h in holds):
+        continue
+      rel = float(a.rel_bearing)
+      self.alt = {'maneuver': m, 'side': 1 if m == 'right' else -1 if m == 'left' else 0, 'angle': abs(rel) if m != 'straight' else 0.,
+                  'relBearing': rel, 'from': f.maneuver, 'why': 'wait' if empty else 'static', 'toNode': float(self.junction.stop_point_distance)}
+      self.clear_s = self.static_s = 0.
+      self.view_creep = None
+      cloudlog.event("turnpilot.stop_go_other_turn", key=list(self.key), maneuver=m, planned=f.maneuver, why=self.alt['why'],
+                     rel=round(rel, 1), waited_s=round(self.dynamic_s, 1), holds=[h.key for h in holds])
+      self._show_alert('otherTurn')
+      d.reason, d.maneuver, d.ledger = ALT_REASON[m], m, DYNAMIC if holds else 'none'
+      return True
+    return False
+
   def _x(self, d_along: float, pos: float) -> float:
     """Camera x (m ahead of the camera) of the point d_along m past the stop point, the bumper pos m past it."""
     return self.setback + d_along - pos
@@ -1431,7 +1538,7 @@ class StopGo:
         holds.append(Hold(f'hide:{role}', f"a large vehicle just passed {side_word(role)}", DYNAMIC))
     return holds
 
-  def _people_holds(self, f: Frame, pos: float, launch: bool = False) -> list[Hold]:
+  def _people_holds(self, f: Frame, pos: float, launch: bool = False, probe: bool = False) -> list[Hold]:
     """2.4 item 7, the conservative zones (P1, P2, P10): any person track or raw person box in the near or far crosswalk band
     (our half of the road plus one lane, its ranging band of plus or minus PED_RANGE_BAND included) or in the box blocks the
     go; moving, a dynamic wait, standing, a static one. A person standing at a crosswalk's curb (D3, P3, P15: _curbs) is the
@@ -1489,7 +1596,8 @@ class StopGo:
     if exit_on:
       walks.append((ex0, ex1, ey0, ey1, self.edges.d_min + EXIT_TURN_M + CROSSWALK_M, 'exit'))
     holds += self._arrival_holds(f, pos, walks)
-    holds += self._front_zone(f)
+    if not probe:
+      holds += self._front_zone(f)  # the same for every maneuver: the other turn's probe reads this frame's (SHARED_HOLDS)
     return holds
 
   def _crosswalks(self, f: Frame, pos: float) -> list:
@@ -1789,6 +1897,8 @@ class StopGo:
       # something moving: waiting is right, with no bound; a static cause starts its clock again once nothing moves
       d.ledger = DYNAMIC
       self.static_s = 0.
+      if acting and self.alt is None and self.dynamic_s >= WAIT_ALT_S - 1e-6 and self._other_turn(f, d, pos, empty=True):
+        return  # O12: a long wait for a gap, another maneuver whose go conditions hold now taken
       if self.chime_t > 0.:
         self.chime_t = max(self.chime_t - f.dt, 0.)
         d.chime, d.reason = True, "Waiting for cross traffic"
@@ -1812,6 +1922,8 @@ class StopGo:
     if vc is None and self._view_creep_start(f, d, holds, pos):
       return
     self.view_creep = {'phase': 'over'}
+    if self._other_turn(f, d, pos, empty=False):
+      return
     self._fault('H3', f, d, top.reason)
 
   # ------------------------------------------------------------------------------------------------- the creep for a view
@@ -2026,6 +2138,7 @@ class StopGo:
       if self.curb_until is not None and d.position_m <= self.curb_until:
         d.speed_cap = min(d.speed_cap, sr.STOP_GO_V_MAX)
     d.state, d.acting = self.state, acting
+    d.alt = dict(self.alt) if self.alt is not None else None
     self.latched = f.control is not None
     d.clear_s, d.rank, d.retries, d.crept_m = self.clear_s, self.rank, self.retries, self.crept_m
     d.side_live = f.side_status in SIDE_LIVE

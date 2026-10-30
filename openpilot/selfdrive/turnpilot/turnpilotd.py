@@ -151,7 +151,7 @@ from openpilot.selfdrive.turnpilot.control_tracker import OFF_ROUTE
 from openpilot.selfdrive.turnpilot.stop_go import MODE_DEFAULT, STOP_SWEEP_M, Frame, StopGo, StopGoDecision, mode_for, side_views_live
 from openpilot.selfdrive.turnpilot.lane_planner import (OPENPILOT_SIGNALS_BRANDS, LanePlanner, lane_change_window, lane_mismatch,
                                                          model_lanes_from_msg)
-from openpilot.selfdrive.turnpilot.route_follower import KEEP, LEFT, TURN, UNCERTAIN_M, RouteFollower
+from openpilot.selfdrive.turnpilot.route_follower import KEEP, LEFT, RIGHT, TURN, UNCERTAIN_M, Maneuver, RouteFollower
 from openpilot.selfdrive.turnpilot.scene.lane_paint import lane_paint_from_msg
 from openpilot.selfdrive.turnpilot.scene.tracker import MAX_COAST_S, STALE_S, SWEEP_COAST_S, SceneTracker, default_yaw_rate
 from openpilot.selfdrive.turnpilot.junction_watch import JunctionWatch, detector_view, junction_from_info, sweep_control, sweep_wanted
@@ -223,6 +223,10 @@ SIGNAL_STOPPED_REASON = "Stopped at the signal: take control"
 # a turn released from a standstill (a hold's go: BeamNG 2026-10-28, taken about half the time) is checked, never trusted:
 MISSED_TURN_DEG = 15.  # past its junction (the follower's pass) turned less than this, it was missed: said and rerouted
 MISSED_HOLD_S = 3.     # turnMissed is held this long, for the alert and for navd (1 Hz) to see it
+# the stop-sign ladder's other turn (stop_go.py: 7.1 rung 2, O12) is a maneuver of its own for DesireTiming, never a route's id, so
+# navd's reroute after it (turnMissed) never clears its pulse as a replaced maneuver's
+ALT_MANEUVER_ID = -7
+ALT_LANES_M = 30.      # navd's lane guidance is our approach's when its maneuver is this close to the held stop's junction
 TURN_MISSED_REASON = "Turn missed — rerouting"
 STALL_PROMPT_S = 3.    # standing this long after the go, STALL_MIN_DEG to STALL_MAX_DEG into the turn, nothing holding it:
 STALL_MIN_DEG = 20.    # handed back (the stop line it left is within STOPPED_CONTROL_M, so the empty-road handback
@@ -313,6 +317,15 @@ class ErrorLog:
 
 
 log_error = ErrorLog()
+
+
+def alt_maneuver(alt: dict) -> Maneuver | None:
+  """The stop-sign ladder's other turn as a route maneuver for DesireTiming (stop_go: 7.1 rung 2, 3.5): a turn to its side,
+  its angle from its approach's relBearing; None going straight (no desire)."""
+  if alt['maneuver'] == 'straight':
+    return None
+  side = RIGHT if alt['maneuver'] == 'right' else LEFT
+  return Maneuver(TURN, side, 'turn', alt['maneuver'], float(alt['angle']), geometry=True, bearing_side=side)
 
 
 class TurnPilot:
@@ -612,10 +625,10 @@ class TurnPilot:
     # the autonomous left holds its turn's pulse until its go from the line (unprotected_left.py: approach), so its first pulse
     # is that go, never too late (turn_skip.py: pulse_at_go); so does a turn at a stop sign the decider acts for (2.4 item 3:
     # no turn desire before its go, a pulse curls the car 39-49 deg and throws away a side's reach)
-    sg_turn = sg.acting and sg.state in STOP_GO_HOLDS_PULSE and sg.maneuver in ('left', 'right')
+    sg_turn = sg.acting and sg.state in STOP_GO_HOLDS_PULSE and (sg.maneuver in ('left', 'right') or sg.alt is not None)
     hold_pulse = (self.left_now is not None and self.left_now.state in LEFT_HOLDS_PULSE) or sg_turn
     # ...and its first pulse is the decider's go, from the go on too (the go frame is 'going'): never skipped tooLate there
-    sg_go_turn = sg.acting and sg.state not in ('off', 'done') and sg.maneuver in ('left', 'right')
+    sg_go_turn = sg.acting and sg.state not in ('off', 'done') and (sg.maneuver in ('left', 'right') or sg.alt is not None)
     pulse_at_go = (self.left_now is not None and self.left_now.state != 'off') or sg_go_turn
 
     # too fast to make the turn: skipped, so nothing below acts on it (no desire, no cap, no turn holds or lane changes)
@@ -667,9 +680,16 @@ class TurnPilot:
     self.release_go = self.release_go and not withdrawn  # handed back: a hold that comes and goes is no new go
 
     lanes = model_lanes_from_msg(model)
-    desire = self.desires.update(desire_on, rf.distance, rf.maneuver_id, rf.passed, v_ego, cs.steeringAngleDeg,
+    # the stop-sign ladder's other turn (stop_go: 7.1 rung 2, O12) decides this junction: its synthesized turn is the desire
+    # (from the decider's go, as a stop-sign turn's pulse is), never the route's maneuver here
+    d_on, d_dist, d_id, d_passed, d_replaced = desire_on, rf.distance, rf.maneuver_id, rf.passed, rf.replaced
+    if sg.acting and sg.alt is not None and sg.state != 'off':
+      d_on, d_dist, d_id, d_passed, d_replaced = alt_maneuver(sg.alt), max(sg.alt['toNode'] - sg.position_m, 0.), ALT_MANEUVER_ID, False, False
+    if sg.turn_missed:
+      self.missed_t = MISSED_HOLD_S  # the other turn taken: the route's planned turn is missed, navd reroutes at once (3.5)
+    desire = self.desires.update(d_on, d_dist, d_id, d_passed, v_ego, cs.steeringAngleDeg,
                                  lanes.keep_left_ok, lanes.keep_right_ok, DT_MDL, default_yaw_rate(cs, model),
-                                 lat_active=lat_active, replaced=rf.replaced,
+                                 lat_active=lat_active, replaced=d_replaced,
                                  may_start=skip.feasible_now and not held and not hold_pulse, go=self.release_go,
                                  holding=decision.should_stop or withdrawn)
     self._yaw_ticked = True
@@ -1000,16 +1020,22 @@ class TurnPilot:
       lead = model.leadsV3[0] if len(model.leadsV3) else None
       lead_m = float(lead.x[0]) if lead is not None and lead.prob > STOPPED_LEAD_PROB and len(lead.x) else None
       d = self.desires
+      alt_id = ALT_MANEUVER_ID if sg.alt is not None else rf.maneuver_id
+      model_lanes = model_lanes_from_msg(model)
+      up = rf.upcoming
+      to_node = (float(src.d) + float(info.get('stopPointDistance', 0.) or 0.)) if src is not None else None
+      ours = len(up.lanes) if up is not None and up.lanes and to_node is not None and abs(rf.distance - to_node) <= ALT_LANES_M else 0
       f = Frame(control=ctl, approach=ahead, junction=junction, route_cert=str(info.get('certification', 'unchecked')), maneuver=maneuver,
                 objects=objects, tracks=tuple(self.tracks_now), runs=tuple(self.runs_now), live=self.watch.live, vis=vis,
                 surveys=self.survey_source(), wall_t=self.wall_clock(), side_status=self.side_status, lenses=dict(self.lenses),
                 position_spread=src.fix_spread if src is not None else 0., v_ego=v_ego, a_ego=float(cs.aEgo), odo_m=self.odo_m,
                 yaw20_deg=sum(y for _, y in self.yaw20), approach_yaw_deg=self.approach_yaw_deg, turned_deg=self.sg_turned,
-                steer_deg=float(cs.steeringAngleDeg), desire_out=d.maneuver_id == rf.maneuver_id and d.started and d.side != 0 and not d.done,
+                steer_deg=float(cs.steeringAngleDeg), desire_out=d.maneuver_id == alt_id and d.started and d.side != 0 and not d.done,
                 model_v2=model, lead_m=lead_m, t_abort=sr.t_abort(self.cp_delay, vis.actuator_delay_s if vis is not None else None),
                 enabled=bool(sm['carControl'].enabled), right_blindspot=bool(cs.rightBlindspot), tp_holding=self.last_holding,
                 go_active=self.go_cert.cause, go_taken_over=self.go_cert.taken_over, go_end=self.go_cert.end,
-                mode=self.stop_sign_mode if acting else 'shadow', mode_known=self.stop_sign_known)
+                mode=self.stop_sign_mode if acting else 'shadow', mode_known=self.stop_sign_known, approach_lanes=ours,
+                rightmost=model_lanes.measured and model_lanes.right_known and model_lanes.right == 0)
       return self.stop_go.update(f)
     except Exception:
       log_error("turnpilotd.stop_go_failed")
@@ -1091,6 +1117,7 @@ class TurnPilot:
     g.committed, g.inLane, g.creptM = sg.committed, sg.in_lane, float(sg.crept_m)
     g.clearS, g.goT, g.takeoverS, g.withdrawn = float(sg.clear_s), float(sg.go_t), float(sg.takeover_s), sg.withdrawn
     g.positionM, g.chime, g.fault = float(sg.position_m), sg.chime, sg.fault
+    g.alternate = sg.alt is not None
     if sg.state == 'off':
       return
     if str(plan.controlPrompt) == 'none' and sg.prompt != 'none':

@@ -206,6 +206,9 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     stalledInJunction @15;      # standing past the in-lane point: a clearBox go (up to CLEAR_BOX_GOES), then H5
     overrideWriteFailed @16;    # a TurnPilotJunctionOverrides entry (a signal head seen at a stop-sign junction) couldn't be
                                 # written: navd may route through that junction again; logged with the entry (STOP_SIGNS.md O16)
+    # STOP_SIGNS.md v3 SG4c
+    otherTurn @17;              # the stop-sign ladder's other turn (7.1 rung 2, O12): the route's maneuver can't be taken here,
+                                # another that certifies is ("Turning right instead", stopGo.maneuver), and navd reroutes after it
   }
   mapControl @24 :MapControlStatus;
   controlPrompt @25 :ControlPrompt;
@@ -361,6 +364,10 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     positionM @20 :Float32;   # m the car's bumper is past the stop point (negative: short of it)
     chime @21 :Bool;          # the dynamic wait's info chime is due (with waitingForCross)
     fault @22 :Text;          # the fault in hand (H1-H8), '' none
+    # STOP_SIGNS.md v3 SG4c: the ladder's other turn (7.1 rung 2, O12): maneuver is a turn the decider synthesized from the
+    # junction's approaches in place of the route's, not the route's own; the route's planned turn is published missed once
+    # the encounter is done (turnpilotPlan.turnMissed), and navd reroutes
+    alternate @23 :Bool;
   }
   stopGo @34 :StopGoStatus;
 }
