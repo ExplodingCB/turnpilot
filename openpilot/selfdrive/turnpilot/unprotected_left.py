@@ -71,7 +71,10 @@ while held, for the exit crosswalk). Until the car can no longer stop short of t
 (STANDSTILL_SPEED: CRITIQUE REQUIRED 4) with the latency gone: a car in the band then withdraws the go, the car stops
 where the comfortable curve can (oncomingHolding, a chime) and waits again; standing where it was held, it can always
 stay. So does anything else the go was certified on no longer holding (the exit crosswalk, the view, another hold, the
-light gone red or yellow): a go never outlives them to run stale when they let go. It is committed only by its own go and
+light gone red or yellow): a go never outlives them to run stale when they let go. A person overruling the car's left (the
+driver's lamp the other way, hazards, our lamp put out: car_signals.py, DESIGN phase4/blinker 6.6) withdraws it the same
+while it can (withdrawable: a frame on, VETO_MARGIN_M to spare), and hands back (undecided, driverSignal), the car held
+where the comfortable curve stops it, short of the oncoming lanes. It is committed only by its own go and
 motion, never by a reading while it stands (a scene commit before its go, with the car held, is a 'position' fault).
 Committed, nothing here ever stops the car (a pedestrian in the path still does: scene_policy). A go the car hasn't moved
 on within turnpilotd's LEFT_NO_MOVE_S is withdrawn and handed back there (the model holding the car; G5's bounded go is the
@@ -161,6 +164,10 @@ NO_SIGNAL_REASON = "Unprotected left: waiting for the turn signal"
 LIGHT_UNKNOWN_S = 8.       # s at its line at a signal with no read of its light: can't tell red from green, a fault
 LIGHT_RED_MAX_S = 150.     # s at its line under a red: longer than a cycle (a red read that never ends), a fault
 GO_PROMPT_S = 1.5          # leftGo is shown this long
+# m to spare short of the oncoming lanes for a veto of the go (DESIGN phase4/blinker 6.6): the intent reads this frame's
+# decision (withdrawable) and the veto reaches the left a frame later (signal_veto), when the car has gone on up to v*dt and
+# its stop grown by v*a*dt/STOP_DECEL: 0.35 m at 3 m/s and 2 m/s^2, the left's go being slower than that while it can stop
+VETO_MARGIN_M = 0.5
 ALERT_S = 2.               # oncomingHolding
 VIEW_FROM_M = 60.          # the road camera from this far out (the window starts on the approach)
 
@@ -192,7 +199,8 @@ class LeftInput:
   light: str = 'none'            # its junction's signal's light (map_controls.turn_light): none (no signal), red, yellow, green,
                                  # unknown
   signal_lit: bool = True        # the turn's side lit (ours or the driver's), the other side dark (car_signals.py)
-  signal_veto: str = ''          # 'driverSignal': the driver overruled the car's signal at the line (hands back, car held)
+  signal_veto: str = ''          # 'driverSignal': the driver overruled the car's signal at the line, or in a go still
+                                 # withdrawable (hands back, car held)
   far: RawFrame | None = None    # a far crop run that arrived this frame (tracker.update_far: view far), None if none did
   far_range_m: float = 0.        # the far crop's proven range (TurnPilotLeftFarRangeM): 0 unmeasured
   far_live: bool = False         # the far crop on (the full pass's latest farStatus read, noRoom or noCalibration): its runs'
@@ -222,6 +230,7 @@ class LeftDecision:
   far_blockers: int = 0           # the far run's boxes in the band this frame
   far_bearing: float = 0.         # where the far crop is to look (far_aim): deg left of the calibrated axis
   far_range_m: float = 0.         # the far crop's proven range while it reads, else 0
+  withdrawable: bool = False      # go: a veto read next frame still withdraws it short of the oncoming lanes (VETO_MARGIN_M)
 
 
 def t_clear(path_m: float) -> float:
@@ -477,7 +486,7 @@ class UnprotectedLeft:
       out.state, out.alert = 'committed', 'none'
       return out
     if self.state == 'undecided':
-      return self._undecided(out, self.why)
+      return self._undecided(out, self.why, inp.v_ego)
     if inp.committed and not self.went and standing:
       # the scene committed to the junction while the car stands held short of it, the left never having gone: where the
       # car is isn't known. Out loud, never a freeze
@@ -602,16 +611,32 @@ class UnprotectedLeft:
     out.state, out.view = 'go', 'road'
     if self.go_t < GO_PROMPT_S:
       out.prompt, out.reason = 'leftGo', "Turning"
-    if inp.go_withdrawn:  # turnpilotd's: not moving, held and handed back there
+    stop_m = inp.v_ego ** 2 / (2. * STOP_DECEL)
+    if inp.go_withdrawn and not inp.signal_veto:  # turnpilotd's: not moving, held and handed back there
+      out.withdrawable = True
       return out
     first_motion = not self.moved and inp.v_ego >= 0.3
     self.moved = self.moved or first_motion
+    # can't stop short of the oncoming lanes: on (committed_past_line commits it next). Not yet moved, it stands where it was
+    # held: it can always stay (a reading nearer than the line never makes it go on)
+    can_stop = not self.moved or stop_m < inp.distance - ONCOMING_ENTRY_M
+    out.withdrawable = inp.go_withdrawn or not self.moved or stop_m + VETO_MARGIN_M < inp.distance - ONCOMING_ENTRY_M
+    if inp.signal_veto:
+      # the driver overruled the car's left while this go could still be withdrawn (last frame's withdrawable, the request for
+      # the left ended there: car_signals.py): withdrawn and handed back, held where the comfortable curve stops the car
+      if can_stop or inp.go_withdrawn:
+        cloudlog.event("turnpilot.left_go_withdrawn", error=True, why='driverSignal', veto=inp.signal_veto,
+                       first_motion=first_motion, distance=round(inp.distance, 1), v=round(inp.v_ego, 2), r_req=round(out.r_req, 1))
+        self.went, self.moved, self.hold_here, self.clear_s = False, False, True, 0.
+        self.hold_reason, self.latch_d = UNDECIDED_REASON['driverSignal'], inp.distance
+        return self._undecided(out, 'driverSignal', inp.v_ego)
+      # past VETO_MARGIN_M's frame: never a stop in the oncoming lanes, the turn finishes (its request already ended)
+      cloudlog.event("turnpilot.left_veto_past_return", error=True, veto=inp.signal_veto, distance=round(inp.distance, 1),
+                     v=round(inp.v_ego, 2), stop_m=round(stop_m, 2))
     if not why:
       return out
-    stop_m = inp.v_ego ** 2 / (2. * STOP_DECEL)
-    if self.moved and stop_m >= inp.distance - ONCOMING_ENTRY_M:
-      return out  # can't stop short of the oncoming lanes: on (committed_past_line commits it next). Not yet moved, it stands
-                  # where it was held: it can always stay (a reading nearer than the line never makes it go on)
+    if not can_stop:
+      return out
     reason = WITHDRAWN_REASON[why]
     cloudlog.event("turnpilot.left_go_withdrawn", error=True, why=why, first_motion=first_motion, distance=round(inp.distance, 1),
                    v=round(inp.v_ego, 2), blockers=blockers, r_req=round(out.r_req, 1))
@@ -625,14 +650,16 @@ class UnprotectedLeft:
     out.stops = [stop(inp.v_ego, stop_m, reason, confirmed=False)]
     return out
 
-  def _undecided(self, out: LeftDecision, why: str) -> LeftDecision:
+  def _undecided(self, out: LeftDecision, why: str, v_ego: float = 0.) -> LeftDecision:
+    """The fault's handback, the car held. After a withdrawn go (hold_here) its own hold where the comfortable curve stops
+    the car from v_ego (a car still rolling is never told shouldStop), as waitGap's after a withdrawal."""
     if self.state != 'undecided':
       cloudlog.event("turnpilot.left_undecided", error=True, why=why, r_req=round(out.r_req, 1), clear_s=round(out.clear_s, 1))
     self.state, self.why = 'undecided', why
     out.state, out.why, out.view = 'undecided', why, 'roadAndWide'
     out.prompt, out.reason = 'leftUndecidedTakeControl', UNDECIDED_REASON.get(why, "Can't judge oncoming traffic: take control")
     if self.hold_here:
-      out.stops = [stop(0., 0., self.hold_reason, confirmed=False)]
+      out.stops = [stop(v_ego, 0., self.hold_reason, confirmed=False)]
     return out
 
 

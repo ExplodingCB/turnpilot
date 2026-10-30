@@ -542,3 +542,79 @@ def test_a_veto_at_g1s_line_never_relights_the_left():
     f"the car signals left on {sum(p.turnSignal.side == LaneChange.left for p in later)} of {len(later)} plans after the veto"
   assert all(p.shouldStop and p.controlPrompt == 'unprotectedTurnTakeControl' for p in vetoed + later)
   assert not any(p.tooFastToTurn or p.turnSignal.prompt != LaneChange.none for p in vetoed + later)
+
+
+# ---------------------------------------------------------------- a veto during the autonomous left's go, while it can still stop (B10)
+
+def veto_after_go(driver, delay_frames):
+  """TurnPilotAutoLeft auto, the car signalling, an empty road: the left goes from its line (state 'go'), and delay_frames
+  later, the car still able to stop short of the oncoming lanes (_after_go's own test, with a metre to spare), the driver
+  overrules the car's left: their right lamp, hazards, or our lamp put out. Returns (sim, the 6 s of plans from the veto)."""
+  from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M, STOP_DECEL
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import JUNCTION, drive, left_sim
+  sim = left_sim()
+  sim.answers_prompt = False
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  state = {'driver': 'none'}
+  sim.car_signal = overruling_port(state, LaneChange.left)
+  while not (sim.trace and str(sim.trace[-1][2].unprotectedLeft.state) == 'go'):
+    drive(sim, DT_MDL)
+    assert sim.t < 90.
+  drive(sim, delay_frames * DT_MDL)
+  assert str(sim.trace[-1][2].unprotectedLeft.state) == 'go'
+  stop_m = sim.v ** 2 / (2. * STOP_DECEL)
+  assert stop_m < JUNCTION - sim.s - ONCOMING_ENTRY_M - 1., "the go still withdrawable (_after_go): it can stop short of oncoming"
+  state['driver'] = driver
+  return sim, drive(sim, 6.)
+
+
+@pytest.mark.parametrize("delay_frames", [0, 5, 15])
+@pytest.mark.parametrize("driver", ['right', 'hazards', 'lost'])
+def test_a_veto_at_the_lefts_go_before_it_cannot_stop_withdraws_it(driver, delay_frames):
+  """DESIGN 6.6, 6.7: the left's go is withdrawn for anything it was certified on that breaks while the car can still stop
+  short of the oncoming lanes; a person overruling the car's left is one more. Withdrawn and handed back through the left's
+  undecided (driverSignal), the car held short of the oncoming lanes, the request for the left ended on the veto's frame (as
+  at its line, B8): never "Finishing the turn" across the oncoming lanes with the driver's right lamp or hazards flashing, or
+  with no lamp at all."""
+  from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import JUNCTION
+  sim, plans = veto_after_go(driver, delay_frames)
+  states = [str(p.unprotectedLeft.state) for p in plans]
+  assert not any(str(p.turnSignal.notice) == 'changedMidTurn' for p in plans), \
+    f"'Finishing the turn' for the driver's {driver} at the left's go, the car able to stop short of the oncoming lanes"
+  assert 'committed' not in states, f"the left crossed the oncoming lanes after the driver's {driver}"
+  assert max(s for s, _, _ in sim.trace[-len(plans):]) < JUNCTION - ONCOMING_ENTRY_M, "into the oncoming lanes"
+  assert states[1] == 'undecided' and str(plans[1].unprotectedLeft.why) == 'driverSignal', (states[:3], str(plans[1].unprotectedLeft.why))
+  assert any(str(p.controlPrompt) == 'leftUndecidedTakeControl' for p in plans), sorted({str(p.controlPrompt) for p in plans})
+  assert all(p.turnSignal.side == LaneChange.none for p in plans), "the request for the left outlived the veto"
+  assert not any(p.tooFastToTurn or p.turnSignal.prompt != LaneChange.none for p in plans)
+  assert sim.v < 0.05 and plans[-1].shouldStop, "never held where the go was withdrawn"
+  assert not any(p.shouldStop for p, (_, v, _) in zip(plans, sim.trace[-len(plans):], strict=True) if v > 0.5), \
+    "shouldStop on a car still rolling: the held stop is the comfortable curve"
+
+
+def test_selfdrived_never_says_finishing_for_a_veto_at_the_lefts_go():
+  sim, plans = veto_after_go('hazards', 0)
+  shown = shown_alerts(plans)
+  assert not any(s[2] == "Finishing the turn" for s in shown), sorted({(s[1], s[2]) for s in shown})
+
+
+def test_a_veto_at_the_lefts_go_past_its_point_of_no_return_finishes_it_out_loud():
+  """Past the point where the car can stop short of the oncoming lanes the left goes on (committed_past_line commits it):
+  a veto there is "Turn Signal Changed" / "Finishing the turn", never a withdrawal in the oncoming lanes."""
+  from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M, STOP_DECEL
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import JUNCTION, drive, left_sim
+  sim = left_sim()
+  sim.answers_prompt = False
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  state = {'driver': 'none'}
+  sim.car_signal = overruling_port(state, LaneChange.left)
+  while not (sim.trace and str(sim.trace[-1][2].unprotectedLeft.state) == 'go' and sim.v > 0.3 and
+             sim.v ** 2 / (2. * STOP_DECEL) >= JUNCTION - sim.s - ONCOMING_ENTRY_M):
+    drive(sim, DT_MDL)
+    assert sim.t < 90.
+  state['driver'] = 'right'
+  plans = drive(sim, 6.)
+  assert any(str(p.turnSignal.notice) == 'changedMidTurn' for p in plans)
+  assert not any(str(p.unprotectedLeft.state) == 'undecided' for p in plans)
+  assert sim.tp.desires.done or any(p.desire == Desire.turnLeft for p in plans) or sim.tp.desires.started

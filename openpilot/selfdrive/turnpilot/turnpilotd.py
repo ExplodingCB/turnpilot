@@ -796,9 +796,12 @@ class TurnPilot:
     # the turn signal (car_signals.py): the side, the prompt, the driver overruling the car, the lamp's lead
     left_d = self.left_now
     # the unprotected left at its hold line: the autonomous left's wait there, or the line's latch holding the car (G1's
-    # handback, TurnPilotAutoLeft off): a veto there is the left's handback, never a skip that lets go of the latch
+    # handback, TurnPilotAutoLeft off): a veto there is the left's handback, never a skip that lets go of the latch. So is
+    # its go while the car can still stop short of the oncoming lanes (withdrawable, a frame on: the left reads the veto
+    # next frame and withdraws the go, DESIGN 6.6, 6.7); past that, the turn finishes and says so
     tc = self.map_controls.turn
-    at_left_line = (left_d is not None and left_d.state in ('waitGap', 'creep', 'undecided', 'announce')) or \
+    at_left_line = (left_d is not None and (left_d.state in ('waitGap', 'creep', 'undecided', 'announce') or
+                                            (left_d.state == 'go' and left_d.withdrawable))) or \
       (tc is not None and tc.held and self.map_controls.turn_engaged(rf.maneuver_id))
     ts = self.turn_signal.update(status=signal_status, port=port, gates_ok=acting and not shadow, engaged=sm['carControl'].enabled,
                                  lane_side=self.lanes.signal_side, lane_pending=self.lanes.phase != Phase.IDLE or
