@@ -825,3 +825,77 @@ def test_moving_traffic_and_other_holds_never_make_a_far_car_a_fault():
   j = Junction()
   d = far_blocked_wait(j, CLEAR_WINDOW_S + 1., 280., 5.4)
   assert d.go
+
+
+def roll(j, seconds, v, enabled=True, boxes=lambda: [raw(100., 3.6)]):
+  """The car at v m/s (a number, or a function of the step) for seconds, its junction coming nearer by it; enabled: openpilot
+  engaged (False: the driver's pedals). A car stays in the band: no fresh go meanwhile."""
+  out = []
+  for k in range(round(seconds / DT_MDL)):
+    vk = v(k) if callable(v) else v
+    out.append(j.step(boxes(), v=vk, distance=j.distance - vk * DT_MDL, enabled=enabled))
+  return out
+
+
+def withdrawn(j, v):
+  """The go certified, then withdrawn at its first motion at v by a car in the band: the left's own hold (hold_here)."""
+  go(j)
+  d = j.step([raw(110., 3.6)], v=v, distance=j.distance - v * DT_MDL)
+  assert d.state == 'waitGap' and d.stops and j.left.hold_here and not d.crossed
+  return d
+
+
+def test_the_lefts_own_hold_is_let_go_only_past_it_by_the_drivers_own_metres():
+  """Skeptic SIMFIX round 2: the left's own hold after a withdrawn go (hold_here) had no release rule: whatever the driver did,
+  a re-engage stood the car where its comfortable curve stopped it, in the oncoming lanes too. Owner decision (a), as the
+  latch's: let go as the driver's only past where TurnPilot stops it by the driver's own movement (disengaged), beyond
+  LATCH_PAST_M; however far TurnPilot's own stop carries the car (engaged) is TurnPilot's, never the driver's; short of it
+  the hold stands (c). Let go, it is said once (crossed: map_controls raises the crossing, Driven), and the left neither holds
+  nor goes again: undecided ('driven'), its prompt the crossing's."""
+  from openpilot.selfdrive.turnpilot.map_controls import CROSSED_CAUSES, LATCH_PAST_M
+  j = Junction()
+  withdrawn(j, 1.)
+  # TurnPilot's stop from 1 m/s carries the car 1 m (its curve asked 0.33): TurnPilot's own metres
+  ds = roll(j, 1.5, lambda k: max(1. - 0.67 * k * DT_MDL, 0.)) + roll(j, 2., 0.)
+  assert all(d.stops and not d.crossed for d in ds) and j.left.hold_here and ds[-1].state == 'waitGap'
+  stood = j.distance
+  # the driver moves it on 1.5 m (disengaged) and stops: under the reach, still the left's, held on a re-engage
+  ds = roll(j, 1.5 / 0.6, 0.6, enabled=False) + roll(j, 1., 0., enabled=False) + roll(j, 2., 0.)
+  assert not any(d.crossed for d in ds) and j.left.hold_here and ds[-1].stops and ds[-1].state == 'waitGap'
+  # on: past it by more than the reach by the driver's own metres, theirs: said once, never held again, never a go
+  ds = roll(j, 1.5, 0.6, enabled=False)
+  crossed = [k for k, d in enumerate(ds) if d.crossed]
+  assert len(crossed) == 1 and ds[crossed[0]].crossed in CROSSED_CAUSES and not j.left.hold_here
+  moved = stood - (j.distance + 0.6 * DT_MDL * (len(ds) - 1 - crossed[0]))
+  assert LATCH_PAST_M < moved < LATCH_PAST_M + 0.1, moved
+  ds += roll(j, 3., 1.) + roll(j, 3., 1., boxes=list)
+  after = ds[crossed[0] + 1:]
+  assert not any(d.stops or d.crossed or d.go for d in after)
+  assert all(d.state == 'undecided' and d.why == 'driven' and d.prompt == 'none' for d in after)
+
+
+def test_the_lefts_own_hold_short_of_the_oncoming_lanes_lets_go_before_a_hold_could_stand_the_car_in_them():
+  """The invariant: never a TurnPilot hold that stands the car in the oncoming lanes on a re-engage. A go from a creep
+  (ONCOMING_ENTRY_M + CREEP_SHORT_M out) withdrawn at first motion holds the car 1.5 m short of the lanes, under LATCH_PAST_M:
+  a driver's nudge on is theirs once the hold could no longer stop the car short of them (REENGAGE_DECEL from its speed),
+  never held inside. Standing, a reading that jumps nearer is no movement of the driver's (position-free): the position
+  fault, held, never let go."""
+  from openpilot.selfdrive.turnpilot.map_controls import LATCH_PAST_M, REENGAGE_DECEL
+  j = Junction()
+  j.distance = ONCOMING_ENTRY_M + CREEP_SHORT_M + 0.6
+  withdrawn(j, 0.5)
+  roll(j, 1., lambda k: max(0.5 - k * DT_MDL, 0.))
+  roll(j, 1., 0.)
+  stood = j.distance
+  ds = roll(j, 2., 0.8, enabled=False)
+  crossed = [k for k, d in enumerate(ds) if d.crossed]
+  assert len(crossed) == 1 and not j.left.hold_here
+  at = stood - 0.8 * DT_MDL * (crossed[0] + 1)
+  # let go short of the lanes, where a hold could no longer stand the car short of them, well inside LATCH_PAST_M
+  assert stood - at < LATCH_PAST_M - 0.5 and ONCOMING_ENTRY_M < at < ONCOMING_ENTRY_M + 0.8 ** 2 / (2. * REENGAGE_DECEL) + 0.1, (stood, at)
+  # standing on the hold, a reading 4 m nearer: the position fault, held, never the driver's
+  j = Junction()
+  withdrawn(j, 0.5)
+  roll(j, 1., lambda k: max(0.5 - k * DT_MDL, 0.))
+  ds = [j.step([raw(100., 3.6)], v=0., distance=j.distance - 4.) for _ in range(40)]
+  assert all(d.stops and not d.crossed for d in ds) and ds[-1].state == 'undecided' and ds[-1].why == 'position'

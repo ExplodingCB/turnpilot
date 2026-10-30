@@ -24,7 +24,9 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   driver's too (driverWent handed back, else drivenOff): a peek-creep past the line is never held again in the crossing
   lanes on a re-engage. Short of either nothing is let go (owner decision (a), 2026-10-30): a gas nudge inside a roll-up or
   a creep is TurnPilot's metres, a handback with no driver input lets nothing go (the car is held, the handback said), and
-  a re-engage short of the line goes back to the full check. A stop's or an unprotected turn's line crossed with no go
+  a re-engage short of the line goes back to the full check. The autonomous left's own hold after a withdrawn go
+  (unprotected_left: hold_here, the latch already let go by the go) has the same rule there, its crossing said here
+  (update()'s left, LeftCommand.crossed: Driven). A stop's or an unprotected turn's line crossed with no go
   (let go so, or overrun) is never silent (owner decision (b)): its take-control (DRIVEN_PROMPT) stays up, engaged or not,
   until the car is DRIVEN_THROUGH_M past the stop point (Driven), and turnpilotd misses an unprotected turn so driven
   straight past its junction (turnMissed). A signal's stop is the light's: a crawl under the gas releases nothing. The latch is never
@@ -138,6 +140,7 @@ LATCH_SPEED = 0.3             # m/s: slower than this...
 LATCH_NEAR_M = 5.             # ...this close to the stop point...
 LATCH_PAST_M = 2.             # ...or this far past it, the latch holds the car
 HOLD_ACCEL = -0.5             # m/s^2, the held car's accel cap
+REENGAGE_DECEL = -HOLD_ACCEL  # m/s^2: a hold taken up by a re-engage stops a rolling car from v within v^2/(2 x this)
 STOP_SIGN_HANDBACK_S = 1.0    # s stopped at a stop sign before it hands back (DESIGN phase 4: a 1 s full stop)
 GREEN_STEADY_S = 0.5          # s of green before it counts (the sim oracle; a camera would need 1.0)
 # a held signal with no accepted light read this long hands back (signalUnseenTakeControl), held: BeamNG S14 (BUILD_FINDINGS
@@ -234,12 +237,14 @@ class LeftCommand:
   """What the unprotected left (unprotected_left.py, through turnpilotd) asks of its hold line's latch. mode:
   TurnPilotAutoLeft's (off: handed back at once, as G1; announce: handed back, the reason its verdict; auto: held for its
   go, no handback); go: release it now (cause gap); creep_m: its stop point this far past where it latched;
-  take_control: a fault (undecided), handed back held (leftUndecidedTakeControl); reason: what to say."""
+  take_control: a fault (undecided), handed back held (leftUndecidedTakeControl); reason: what to say; crossed: the frame
+  the driver took the car past the left's own hold after its go (CROSSED_CAUSES), its crossing said (Driven)."""
   mode: str = 'off'
   go: bool = False
   creep_m: float = 0.
   take_control: bool = False
   reason: str = ''
+  crossed: str = ''
 
 
 def yield_last_stop_m(v_ego: float) -> float:
@@ -775,6 +780,11 @@ class MapControlPolicy:
       self._off_cap = None
       cloudlog.event("turnpilot.off_route_stops_known", route=self.tracker.route, status=self.tracker.off_status)
 
+    # the driver took the car past the autonomous left's own hold after its go let the latch go (unprotected_left: hold_here):
+    # the left's crossing, as one of the latch's (owner decision (b)), m past its line as read now
+    tc = self.turn
+    if self.left.crossed and tc is not None and not tc.held and (self.driven is None or self.driven.key != tc.key):
+      self._crossed(tc, -tc.d, self.left.crossed, v)
     # a line crossed with no go: its take-control up until the car is through (DRIVEN_THROUGH_M), engaged or not, ahead of
     # anything but another take-control (a held control's own handback)
     dr = self.driven

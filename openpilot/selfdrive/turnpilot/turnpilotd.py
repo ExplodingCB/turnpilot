@@ -1450,6 +1450,9 @@ class TurnPilot:
     # DESIGN G4 go condition 5: never a go while another of TurnPilot's stops holds the car at or before the junction (a
     # signal's red, a stop sign), nor at a signal whose light isn't read green (unprotected_left.py: SIGNAL_NEEDS_GREEN)
     stop_d = self.map_controls.stop_ahead()
+    # its line crossed with no go (map_controls.Driven: the latch let go as the driver's, last frame's): the left is done,
+    # never a go nor a pulse of a left nobody checked (owner decision (b))
+    driven = self.map_controls.driven
     inp = LeftInput(mode, rf.maneuver_id, upcoming.side, rf.distance, v_ego, held or stray, raw, objects, self.approach_yaw_deg,
                     upcoming.opposing_speed or None, upcoming.opposing_lanes or None, self.left_range_m,
                     scene_clear=scene.junction is None and not scene.carried,
@@ -1461,9 +1464,9 @@ class TurnPilot:
                     far_live=self.far_live(route=True),  # on: a spell without room is waited through on its runs' freshness
                     straight_m=float(upcoming.opposing_straight_m),
                     signal_lit=self.signal_out.signal_lit, signal_veto=self.signal_out.left_veto,
-                    enabled=enabled)
+                    enabled=enabled, driven=driven is not None and driven.maneuver_id == rf.maneuver_id)
     d = self.left_now = self.left.update(inp, DT_MDL)
-    return LeftCommand(mode, d.go, d.creep_m, d.state == 'undecided', d.reason)
+    return LeftCommand(mode, d.go, d.creep_m, d.state == 'undecided', d.reason, crossed=d.crossed)
 
   def observe_runs(self, tracker) -> None:
     """This tick's detector runs and tracks, for the junction watch (main(), after the tracker)."""

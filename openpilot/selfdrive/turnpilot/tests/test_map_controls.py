@@ -1151,9 +1151,9 @@ def test_a_yield_is_passed_only_by_passing_it():
 
 # --- the autonomous unprotected left (unprotected_left.py, DESIGN phase 4 G4): the hold line's latch takes its commands ---
 
-def left_cmd(mode='auto', go=False, creep_m=0., take_control=False, reason=''):
+def left_cmd(mode='auto', go=False, creep_m=0., take_control=False, reason='', **kw):
   from openpilot.selfdrive.turnpilot.map_controls import LeftCommand
-  return LeftCommand(mode, go, creep_m, take_control, reason)
+  return LeftCommand(mode, go, creep_m, take_control, reason, **kw)
 
 
 def run_left(car, seconds, cmd, **kw):
@@ -1553,3 +1553,29 @@ def test_C11_a_mapped_stop_the_camera_never_saw_still_stops_gently_and_is_logged
     car = Car([(150., 'stop')])
     car.run_until(lambda out, dec: held(out, dec), signs=None)
     assert not [1 for name, _ in events if name in ('turnpilot.map_stop_unseen',)]
+
+
+def test_the_drivers_crossing_past_the_lefts_own_hold_is_said_until_the_car_is_through():
+  """Skeptic SIMFIX round 2 (owner decision (b)): after its go let the latch go (cause gap), the left's own hold
+  (unprotected_left: hold_here) let go as the driver's says so (LeftCommand.crossed, once): the left's crossing is the
+  latch's (Driven), its take-control and reason up, engaged or not, until the car is DRIVEN_THROUGH_M past the line, then
+  nothing; never a hold or a cap for it."""
+  car = left_car()
+  held_left(car, left_cmd(reason="Waiting for a gap"))
+  line = 250. - HOLD_LINE_M - 1.
+  car.policy_step(left_cmd(go=True))
+  assert car.policy.held is None and car.policy.turn.state.cause == 'gap' and car.policy.driven is None
+  run_left(car, 1., left_cmd(reason="Turning"))  # gone
+  out, dec, _ = run_left(car, 2., left_cmd(take_control=True, reason="Oncoming, holding"))  # its own hold (unprotected_left's)
+  assert out.prompt == 'none' and car.policy.driven is None
+  out, dec, _ = car.policy_step(left_cmd(take_control=True, crossed='drivenOff'))  # the driver's: said once
+  dr = car.policy.driven
+  assert dr is not None and dr.kind == UNPROTECTED and dr.maneuver_id == 7 and dr.cause == 'drivenOff'
+  assert out.prompt == 'unprotectedTurnTakeControl' and out.driven == "Unprotected left not checked: take control"
+  rows = []
+  while car.s < line + DRIVEN_THROUGH_M + 5.:
+    rows.append((car.s,) + car.policy_step(left_cmd(take_control=True)))
+  inside = [(out, dec) for s, out, dec, _ in rows if s < line + DRIVEN_THROUGH_M - 0.5]
+  assert inside and all(out.prompt == 'unprotectedTurnTakeControl' and out.driven for out, _ in inside)
+  assert not any(dec.should_stop or dec.speed_cap < car.v - 1. for _, dec in inside)
+  assert all(out.prompt == 'none' and not out.driven for s, out, _, _ in rows if s > line + DRIVEN_THROUGH_M + 0.5)
