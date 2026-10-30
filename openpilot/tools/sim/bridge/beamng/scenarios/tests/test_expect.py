@@ -312,6 +312,22 @@ class TestSkip:
     # elsewhere tooFastToTurn is the skip (S19)
     assert score.summarize('too_fast_right', rows, 'timeout', expect=('skip',))['expected'][0]['met']
 
+  def test_the_skip_comes_before_the_junction(self):
+    # the skeptic's P5 (S19, 'the alert before the junction'): tooFastToTurn only once the junction is 5 m behind the car
+    rows = drive([(6.0, {'v': 17., 'j_dist': lambda tau: 100. - 17 * tau, 'j_ahead': lambda tau: 100. - 17 * tau}),
+                  (2.0, {'v': 17., 'too_fast': True, 'j_dist': 5., 'j_ahead': -5.})])
+    res = score.summarize('too_fast_right', rows, 'past junction', expect=('skip',))
+    assert not res['passed'] and not res['expected'][0]['met']
+    assert "the skip came at t=6.0 s with the junction 5 m behind the car: its alert is before the junction" in res['failures'], \
+      res['failures']
+    # the left's range skip likewise (S05)
+    late = [dict(r, left_state='skipped' if r['t'] >= 6.0 else 'approach') for r in rows]
+    res = score.summarize('unprotected_left_visible', late, 'timeout', expect=('skip',))
+    assert any(f.startswith("the skip came at t=6.0 s with the junction 5 m behind") for f in res['failures']), res['failures']
+    # skipped 54 m out (the smoke run's), the shot
+    early = [dict(r, too_fast=r['t'] >= 2.7) for r in rows]
+    assert score.summarize('too_fast_right', early, 'past junction', expect=('skip',))['expected'][0]['met']
+
   def test_an_expected_skip_that_never_comes_fails(self):
     rows = drive([(4.0, {'nav_mod': 'left'})])
     res = score.summarize('too_fast_right', rows, 'timeout', expect=('skip',))

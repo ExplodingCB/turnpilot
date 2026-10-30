@@ -94,7 +94,8 @@ TURN_DESIRES = (1, 2)  # log.Desire.turnLeft, turnRight
 # expectations (module docstring): 'handback:<kind>' (a turnpilotPlan.handback, or a take-control controlPrompt),
 # 'gasDisengage', 'skip' (tooFastToTurn, or the left skipped at route time), 'turnMissed', 'hardBrake' (controlAlert).
 # An unprotected left's skip is its range skip (unprotectedLeft.state skipped: turnpilotd sets it for turn_skip's
-# unprotectedRange only); tooFastToTurn alone there is another skip (tooLate, laneUnreachable or tooFast), not its shot
+# unprotectedRange only); tooFastToTurn alone there is another skip (tooLate, laneUnreachable or tooFast), not its shot.
+# A skip's alert comes before its junction (S05, S19): one first seen with the junction behind the car (j_ahead) isn't met
 EXPECTS = ('handback', 'gasDisengage', 'skip', 'turnMissed', 'hardBrake')
 # a take-control handback holds the car while the driver is told to take control (hooks.TAKE_CONTROL_PROMPTS): from it,
 # engaged, the car goes no further than a stop from its speed then, HELD_REACT_S at that speed and HELD_DECEL after it (a
@@ -743,6 +744,7 @@ def expect_facts(rows) -> dict:
   first: dict[str, dict] = {'handback': {}, 'alert': {}}
   det_t: dict[str, float | None] = {}  # each handback's detector: its last detections at the handback's first row
   skip_t = range_skip_t = missed_t = gas_t = None
+  ahead: dict[str, float | None] = {}  # j_ahead at the first skip row of each kind
   engaged = False
   for r in rows:
     engaged = engaged or r['enabled']
@@ -754,15 +756,15 @@ def expect_facts(rows) -> dict:
     if r.get('control_alert', 'none') not in ('', 'none'):
       first['alert'].setdefault(r['control_alert'], r['t'])
     if skip_t is None and (r.get('too_fast') or r.get('left_state') == 'skipped'):
-      skip_t = r['t']
+      skip_t, ahead['skip'] = r['t'], r.get('j_ahead')
     if range_skip_t is None and r.get('left_state') == 'skipped':
-      range_skip_t = r['t']
+      range_skip_t, ahead['range_skip'] = r['t'], r.get('j_ahead')
     if missed_t is None and r.get('turn_missed'):
       missed_t = r['t']
     if gas_t is None and engaged and r.get('gas'):
       gas_t = r['t']
   return {'handbacks': first['handback'], 'control_alerts': first['alert'], 'skip_t': skip_t, 'range_skip_t': range_skip_t,
-          'turn_missed_t': missed_t,
+          'skip_ahead_m': ahead.get('skip'), 'range_skip_ahead_m': ahead.get('range_skip'), 'turn_missed_t': missed_t,
           'gas_t': gas_t,
           'handback_det_t': det_t,
           'held': {k: held_after(rows, t) for k, t in first['handback'].items() if k in TAKE_CONTROL_PROMPTS},
@@ -871,8 +873,12 @@ def expectations(name: str, res: dict, fails: list[tuple[str, str]], expect) -> 
     elif kind == 'skip':
       range_skip = name.startswith('unprotected_left')  # its range skip (EXPECTS)
       t = facts['range_skip_t'] if range_skip else facts['skip_t']
-      met = t is not None
-      if not met and range_skip and facts['skip_t'] is not None:
+      a = facts['range_skip_ahead_m' if range_skip else 'skip_ahead_m']
+      late = t is not None and a is not None and a <= 0.
+      met = t is not None and not late
+      if late:
+        extra.append(f"the skip came at t={t:.1f} s with the junction {-a:.0f} m behind the car: its alert is before the junction")
+      elif not met and range_skip and facts['skip_t'] is not None:
         extra.append("expected skip: the left never skipped for range (unprotectedLeft.state skipped); tooFastToTurn at " +
                      f"t={facts['skip_t']:.1f} s is another skip (tooLate, laneUnreachable or tooFast)")
       elif not met:
