@@ -422,6 +422,8 @@ class TurnPilot:
       self.skip_cap_id: int | None = None  # a dropped turn skipped on taking it up: its cap stays until it is passed
       self.veto_hold_id: int | None = None  # a turn vetoed standing at a hold: the hold keeps it until it lets go
       self.go_id: int | None = None  # the turn a hold let go of at standstill: checked for a miss and a stall
+      self.go_rolled = False         # ...the car has rolled since that go (STANDSTILL_SPEED or more)
+      self.go_spent = False          # ...and then come to rest again short of the hold line: no longer under way (went)
       self.post_go: PostGo | None = None  # ...and driven under its post-go profile (start_post_go)
       self.no_move_limit = NO_MOVE_S       # ...withdrawn if the car hasn't moved this long after it (no_move)
       self.go_wait_s: float | None = None  # s stood since TurnPilot's go, nothing else holding the car; None: moved, or no go
@@ -725,7 +727,7 @@ class TurnPilot:
     d = self.desires
     turn_go = self.release_go and d.maneuver_id == rf.maneuver_id and d.started and d.side != 0 and not d.done and upcoming is not None
     if turn_go:
-      self.go_id, self.stall_s = rf.maneuver_id, 0.
+      self.go_id, self.stall_s, self.go_rolled, self.go_spent = rf.maneuver_id, 0., False, False
       self.go_in_junction = not self.go_at_line(rf.distance)
       if sm['carControl'].enabled and not took_over:  # TurnPilot's go; the driver driving off a hold is the driver's
         self.start_post_go(upcoming, rf.distance, d.turned_deg, right_hand_traffic)
@@ -811,8 +813,17 @@ class TurnPilot:
     # out loud (DESIGN 6.6's standing clause, B9). Never once TurnPilot's own go from a standstill is out into the turn (a
     # hold's go, the stop-sign decider's, the left's: go_id, this frame's included, and not withdrawn since; the left's go
     # while it can still stop is at_left_line's) nor once the scene committed or was released into the junction: the turn
-    # is under way there and a skip would send the car straight on a go made for the turn (6.6: finished, and said)
-    went = self.go_id == rf.maneuver_id and not self.go_withdrawn
+    # is under way there and a skip would send the car straight on a go made for the turn (6.6: finished, and said). A go
+    # the car has rolled on from and come to rest again short of the hold line (GO_LINE_M out or more, go_at_line's own
+    # test: a mid-block walker's hold let go, then a lead in the queue) is spent: the car stands short of the junction as
+    # in B9, and the next go is a new one (M1). Rolled into the junction and stopped there, the go's launch is under way
+    if self.go_id == rf.maneuver_id and not self.go_spent:
+      if v_ego >= STANDSTILL_SPEED:
+        self.go_rolled = True
+      elif self.go_rolled and rf.distance >= GO_LINE_M:
+        self.go_spent = True
+        cloudlog.event("turnpilot.go_spent", distance=round(rf.distance, 1), turned_deg=round(self.desires.turned_deg, 1))
+    went = self.go_id == rf.maneuver_id and not self.go_withdrawn and not self.go_spent
     at_rest = v_ego < STANDSTILL_SPEED and rf.distance > -PROTECT_PAST_M and self.desires.turned_deg < TURN_STARTED_DEG and \
       not went and rf.maneuver_id not in (self.scene.committed_id, self.scene.released_id)
     short_of_turn = stopping or at_rest  # one boolean for the intent's started and the skip gate below

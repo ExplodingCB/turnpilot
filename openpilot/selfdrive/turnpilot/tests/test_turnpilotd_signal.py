@@ -765,6 +765,137 @@ def test_a_veto_at_rest_in_the_junction_the_scene_committed_to_finishes_the_turn
   assert not any(p.tooFastToTurn or p.desire == CLEAR_DESIRE for p in plans), "skipped inside the junction"
 
 
+WALKER_MID_BLOCK = 300. - 26.  # a walker in the path 26 m short of the junction: the car stops about 31 m short of it
+
+
+def mid_block_go_then_lead(driver):
+  """A right turn at 300 m, the car signalling it, its desire out since 40 m. A walker in the path holds the car about 31 m
+  short of the junction (a mid-block crosswalk); it leaves, the hold's go sets go_id and the car drives on at 5 m/s. A lead
+  then stops the car in the queue about 18 m short, turned 0 deg, no TurnPilot stop in force: B9's scene, with an earlier
+  go of TurnPilot's for the turn behind it. 2 s standing, driver ('left', 'hazards', or 'lost': our lamp put out)
+  overrules the car for 3 s; then the lead moves on. Returns (sim, where the walker held the car, the plans of the veto,
+  the plans after)."""
+  sim = Sim([(300., "turn", "right"), (1500., "turn", "left")], driver_signals=None)
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  state = {'driver': 'none'}
+  sim.car_signal = overruling_port(state)
+  walker = {'on': False}
+
+  def objects(s):
+    return ({'cls': 'pedestrian', 'x': WALKER_MID_BLOCK - s.s, 'y': 0., 'age': 5 + int(s.t * 10.)},) if walker['on'] else ()
+
+  def step():
+    return sim.step(objects(sim), engaged=True, blinker=state['driver'] == 'left')
+  while sim.distance() > 70.:
+    step()
+  sim.cruise = 5.
+  while sim.distance() > 52.:
+    step()
+  walker['on'] = True
+  while not (sim.v < 0.05 and sim.trace[-1][2].shouldStop):
+    step()
+    assert sim.t < 90.
+  for _ in range(int(2. / DT_MDL)):
+    step()
+  stood_at = sim.distance()
+  assert sim.tp.desires.started, f"the right turn's desire is out ({stood_at:.1f} m short)"
+  walker['on'] = False
+  while sim.v < 0.5:
+    step()
+    assert sim.t < 120.
+  assert sim.tp.go_id == sim.tp.follower.maneuver_id, "the walker hold's go set go_id for the turn"
+  while sim.distance() > 24.:
+    step()
+  sim.cruise, sim.model_kw = 0., {'lead_prob': 0.9, 'lead_x': 6.}
+  while sim.v > 0.01:
+    step()
+    assert sim.t < 150.
+  stood = [step() for _ in range(int(2. / DT_MDL))]
+  assert sim.tp.desires.started and sim.tp.desires.turned_deg < 1. and sim.distance() > 10., \
+    (sim.tp.desires.turned_deg, sim.distance())
+  assert not stood[-1].shouldStop and stood[-1].turnSignal.side == LaneChange.right and not stood[-1].tooFastToTurn
+  state['driver'] = driver
+  vetoed = [step() for _ in range(int(3. / DT_MDL))]
+  sim.cruise, sim.model_kw = 13., {}
+  after = [step() for _ in range(int(8. / DT_MDL))]
+  return sim, stood_at, vetoed, after
+
+
+@pytest.mark.parametrize("driver,skip", [('left', 'driverSignal'), ('hazards', 'hazards'), ('lost', 'signalLost')])
+def test_a_veto_at_rest_behind_a_lead_after_an_earlier_holds_go_skips_the_turn(driver, skip):
+  """An earlier go of TurnPilot's for the turn, made well short of the junction (a mid-block walker's hold let go about
+  31 m out), is spent once the car has rolled on from it and come to rest again short of the hold line: at rest behind a
+  lead 18 m short, turned 0 deg, the car hasn't started the turn (B9's standing clause), so a veto skips it out loud,
+  never "Finishing the turn" with the car taking the vetoed turn when the lead moves on (verification of tp/blinker, M1)."""
+  sim, stood_at, vetoed, after = mid_block_go_then_lead(driver)
+  notices = sorted({str(p.turnSignal.notice) for p in vetoed + after})
+  assert not any(str(p.turnSignal.notice) == 'changedMidTurn' for p in vetoed + after), \
+    f"at rest behind a lead, turned 0 deg, a hold's go spent {stood_at:.0f} m short: 'Finishing the turn' ({notices})"
+  assert vetoed[0].tooFastToTurn and str(vetoed[0].turnSignal.skip) == skip, \
+    (vetoed[0].tooFastToTurn, str(vetoed[0].turnSignal.skip))
+  assert any(p.desire == CLEAR_DESIRE for p in vetoed[:3]), "the approach's pulse is cleared from the model's queue"
+
+
+@pytest.mark.parametrize("driver", ['left', 'hazards', 'lost'])
+def test_the_car_never_takes_the_vetoed_turn_after_an_earlier_holds_go(driver):
+  sim, _, vetoed, after = mid_block_go_then_lead(driver)
+  turning = [i for i, p in enumerate(after) if p.desire == Desire.turnRight or str(p.state) == 'turning']
+  assert not turning, f"the car takes the turn the driver's {driver} overruled, {turning[0] * DT_MDL:.2f} s after the lead moved on"
+  assert all(p.turnSignal.prompt == LaneChange.none for p in vetoed + after), "asked to signal the overruled turn"
+  assert all(p.turnSignal.side == LaneChange.none for p in vetoed[1:] + after), "the request outlived the veto"
+  assert not any(p.turnMissed for p in vetoed + after), "the vetoed turn, driven straight past, said as missed"
+
+
+def test_selfdrived_never_says_finishing_after_an_earlier_holds_go():
+  _, _, vetoed, after = mid_block_go_then_lead('left')
+  shown = shown_alerts(vetoed + after)
+  assert not any(s[2] == "Finishing the turn" for s in shown), sorted({(s[1], s[2]) for s in shown})
+  assert any(s[1].startswith("Turn Cancelled") for s in shown), sorted({(s[1], s[2]) for s in shown})
+
+
+def test_a_veto_at_rest_in_the_junction_a_holds_go_rolled_into_finishes_the_turn():
+  """A hold's go at the junction (the walker in the turn's crosswalk gone, the car let go at the hold line) that rolls the
+  car past the line into the junction, slower than COMMIT_SPEED (the scene not committed), and a lead then stopping it
+  there under TURN_STARTED_DEG into the turn: the go's launch is under way inside the junction, so a veto finishes the turn
+  and says so, never a skip that sends the car straight on from inside the junction it pulled into for the turn. Only a
+  rest again short of the hold line (GO_LINE_M out or more) spends the go."""
+  from openpilot.selfdrive.turnpilot.turnpilotd import GO_LINE_M
+  sim = Sim([(300., "turn", "right"), (1500., "turn", "left")], driver_signals=None)
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  state = {'driver': 'none'}
+  sim.car_signal = overruling_port(state)
+  walker = {'on': True}
+
+  def objects(s):
+    return ({'cls': 'pedestrian', 'x': 300. - s.s + 3., 'y': -5., 'age': 5 + int(s.t * 10.)},) if walker['on'] else ()
+
+  def step():
+    return sim.step(objects(sim), engaged=True, blinker=state['driver'] == 'left')
+  while not (sim.v < 0.05 and sim.s > 250.):
+    step()
+    assert sim.t < 60.
+  for _ in range(int(2. / DT_MDL)):
+    step()
+  assert sim.distance() >= GO_LINE_M, "held at the hold line"
+  sim.cruise = 1.5
+  walker['on'] = False
+  while sim.distance() > GO_LINE_M - 2.:
+    step()
+    assert sim.t < 90.
+  assert sim.tp.go_id == sim.tp.follower.maneuver_id
+  sim.cruise, sim.model_kw = 0., {'lead_prob': 0.9, 'lead_x': 2.}
+  while sim.v > 0.01:
+    step()
+    assert sim.t < 100.
+  [step() for _ in range(int(1. / DT_MDL))]
+  assert sim.tp.follower.maneuver_id not in (sim.tp.scene.committed_id, sim.tp.scene.released_id), "the scene committed"
+  assert sim.distance() < GO_LINE_M and sim.tp.desires.turned_deg < TURN_STARTED_DEG and sim.tp.desires.started
+  state['driver'] = 'left'
+  plans = [step() for _ in range(int(2. / DT_MDL))]
+  assert str(plans[0].turnSignal.notice) == 'changedMidTurn', str(plans[0].turnSignal.notice)
+  assert not any(p.tooFastToTurn or p.desire == CLEAR_DESIRE for p in plans), "skipped inside the junction"
+
+
 # ---------------------------------------------------------------- hazards holding the port off: said on the reason line (7.7)
 
 def test_hazards_holding_the_port_off_say_so_on_the_reason_line():
