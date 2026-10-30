@@ -9,6 +9,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.car_signals import ARM_LAG_S, LEAD_LONG_M
 from openpilot.selfdrive.turnpilot.desire_timing import TURN_STARTED_DEG
 from openpilot.selfdrive.turnpilot.hooks import CLEAR_DESIRE
+from openpilot.selfdrive.turnpilot.route_follower import KEEP
 from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of, nav_instruction
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Sim
 
@@ -901,14 +902,17 @@ def test_a_veto_at_rest_in_the_junction_a_holds_go_rolled_into_finishes_the_turn
 REROUTE_J, REROUTE_NEXT = 300., 1500.
 
 
-def veto_then_reroute(driver, rerouted_at=REROUTE_J):
-  """A right turn at 300 m, the car signalling it; driver ('lost': our lamp put out, the port failed for the drive, or
-  'left': the driver's lamp the other way, off again a second later) overrules it about 95 m short: skipped out loud. navd
-  then reroutes before the junction (an off-route drift, the stop-avoidance re-run, an ETA drift on a certified control):
-  one invalid update, then routeCount 1 with a right at rerouted_at (the same junction, same bearings, by default), the
-  next left after it. Returns (sim, the maneuver id at the veto, the plans after the veto's second)."""
-  sim = Sim([(REROUTE_J, "turn", "right", junction_of("right")), (REROUTE_NEXT, "turn", "left", junction_of("left"))],
-            driver_signals=None)
+def veto_then_reroute(driver, rerouted_at=REROUTE_J, mtype="turn", modifier="right", angle=None, model_lanes=(0, 0)):
+  """A right turn at 300 m (or mtype modifier, its junction's angle), the car signalling it; driver ('lost': our lamp put
+  out, the port failed for the drive, or 'left': the driver's lamp the other way, off again a second later) overrules it
+  about 95 m short: skipped out loud. navd then reroutes before the junction (an off-route drift, the stop-avoidance
+  re-run, an ETA drift on a certified control): one invalid update, then routeCount 1 with the same maneuver at
+  rerouted_at (the same junction, same bearings, by default), the next left after it. model_lanes: the model's lanes
+  (a keep is pulsed only toward a lane it sees). Returns (sim, the maneuver id at the veto, the plans after the veto's
+  second)."""
+  jn = junction_of(modifier, angle=angle)
+  sim = Sim([(REROUTE_J, mtype, modifier, jn), (REROUTE_NEXT, "turn", "left", junction_of("left"))], driver_signals=None,
+            model_lanes=model_lanes)
   sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
   state = {'driver': 'none'}
   sim.car_signal = overruling_port(state)
@@ -929,9 +933,9 @@ def veto_then_reroute(driver, rerouted_at=REROUTE_J):
   def reroute(s, instr):
     k[0] += 1
     if k[0] == 1:
-      return nav_instruction(REROUTE_J - s.s, "turn", "right", remaining=REROUTE_NEXT - s.s, junction=junction_of("right")), False
+      return nav_instruction(REROUTE_J - s.s, mtype, modifier, remaining=REROUTE_NEXT - s.s, junction=jn), False
     if s.s < rerouted_at + 10.:
-      return nav_instruction(rerouted_at - s.s, "turn", "right", remaining=REROUTE_NEXT - s.s, junction=junction_of("right"),
+      return nav_instruction(rerouted_at - s.s, mtype, modifier, remaining=REROUTE_NEXT - s.s, junction=jn,
                              route_count=1, ahead=[(REROUTE_NEXT - s.s, "turn", "left", junction_of("left"))]), True
     return nav_instruction(REROUTE_NEXT - s.s, "turn", "left", remaining=REROUTE_NEXT - s.s, junction=junction_of("left"),
                            route_count=1), True
@@ -961,6 +965,29 @@ def test_a_reroute_onto_the_same_junction_never_revives_a_vetoed_turn(driver, sk
   assert rerouted and all(p.tooFastToTurn and str(p.turnSignal.skip) == skip for p in rerouted), \
     "the new route's turn at the vetoed junction is skipped out loud, for the veto's reason"
   assert not any(str(p.state) == 'turning' for p in after)
+
+
+@pytest.mark.parametrize("mtype,modifier,angle", [("turn", "slight right", 40.), ("fork", "slight right", 25.)])
+@pytest.mark.parametrize("driver,skip", [('lost', 'signalLost'), ('left', 'driverSignal')])
+def test_a_reroute_onto_the_same_fork_never_revives_a_vetoed_keep(driver, skip, mtype, modifier, angle):
+  """A keep is signalled and overruled as a turn is (car_signals: TURN and KEEP), and route_follower.classify makes every
+  'slight' modifier a keep: a city 'turn slight right' at a Y junction, a fork, an off ramp. So the veto's skip carries
+  across navd's reroute onto the same fork under a new id as a turn's does: skipped for the veto's reason out loud, never
+  prompted, signalled or pulsed keepRight (verification of tp/blinker, K1: carry_veto took up only turns, and the keep came
+  back for 58-72 frames of keepRight pulses and up to 181 frames with our side set)."""
+  sim, old_id, after = veto_then_reroute(driver, mtype=mtype, modifier=modifier, angle=angle, model_lanes=(0, 1))
+  assert sim.tp.vetoed is not None and sim.tp.vetoed.maneuver.kind == KEEP, "a slight right is a keep (route_follower.classify)"
+  new_id = sim.tp.follower.maneuver_id
+  assert new_id != old_id, "navd's reroute is a new maneuver"
+  pulses = [p for p in after if p.desire == Desire.keepRight]
+  sides = [p for p in after if p.turnSignal.side != LaneChange.none]
+  prompts = [p for p in after if p.turnSignal.prompt != LaneChange.none]
+  taken = f"{len(pulses)} keepRight frames, {len(sides)} frames our side set, {len(prompts)} prompting"
+  assert not pulses and not sides and not prompts, \
+    f"maneuver id {old_id} -> {new_id}: the {mtype} {modifier} the driver overruled ({skip}) taken up again: {taken}"
+  rerouted = [p for p in after if p.routeValid and p.maneuverDistance > 0. and str(p.maneuverModifier) == modifier]
+  assert rerouted and all(p.tooFastToTurn and str(p.turnSignal.skip) == skip for p in rerouted), \
+    "the new route's keep at the vetoed fork is skipped out loud, for the veto's reason"
 
 
 def test_a_reroute_onto_the_next_junction_the_same_way_takes_that_turn():

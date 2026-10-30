@@ -324,9 +324,9 @@ log_error = ErrorLog()
 
 @dataclass
 class VetoedTurn:
-  """A turn the driver overruled (a signal veto's skip): its maneuver (type, modifier, bearings), where its junction is on
-  turnpilotd's odometer (odo_m plus the follower's distance at the veto), the veto's reason, the id it is skipped under now,
-  and whether its desire was out (its cap kept to its pass, skip_cap_id). TurnPilot.carry_veto."""
+  """A turn or keep the driver overruled (a signal veto's skip): its maneuver (type, modifier, bearings), where its
+  junction is on turnpilotd's odometer (odo_m plus the follower's distance at the veto), the veto's reason, the id it is
+  skipped under now, and whether its desire was out (its cap kept to its pass, skip_cap_id). TurnPilot.carry_veto."""
   maneuver: object
   junction_odo: float
   reason: str
@@ -970,16 +970,18 @@ class TurnPilot:
     gives it: navd's reroute before the junction (an off-route drift, the stop-avoidance re-run, an ETA drift) that turns the
     same way there again is a new maneuver id (route_follower: a new route, the turn not committed after the veto's cancel),
     and taken up fresh it would be prompted, signalled and taken, with our lamp put out by nothing that could veto it again.
-    The same junction: same_junction (type, modifier, bearings when both have them) and within SAME_TURN_M of where the veto
-    put it on the odometer; skipped for the veto's reason, out loud (tooFastToTurn, navd's skip), its cap kept if the vetoed
-    turn's was. Forgotten once the car is SAME_TURN_M past it. Before this frame's TurnSkip.update, which then keeps it."""
+    A keep is one too: the intent signals and vetoes a TURN or a KEEP (car_signals: signals_turn), and every 'slight'
+    modifier is a keep (a city Y junction's slight right, a fork, an off ramp). The same junction: same_junction (type,
+    modifier, bearings when both have them) and within SAME_TURN_M of where the veto put it on the odometer; skipped for the
+    veto's reason, out loud (tooFastToTurn, navd's skip), its cap kept if the vetoed turn's was. Forgotten once the car is
+    SAME_TURN_M past it. Before this frame's TurnSkip.update, which then keeps it."""
     v = self.vetoed
     if v is None:
       return
     if self.odo_m > v.junction_odo + SAME_TURN_M:
       self.vetoed = None
       return
-    if upcoming is None or upcoming.kind != TURN or rf.maneuver_id == v.maneuver_id or \
+    if upcoming is None or upcoming.kind not in (TURN, KEEP) or rf.maneuver_id == v.maneuver_id or \
        (self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id):
       return
     if not same_junction(upcoming, v.maneuver) or abs(self.odo_m + rf.distance - v.junction_odo) > SAME_TURN_M:
