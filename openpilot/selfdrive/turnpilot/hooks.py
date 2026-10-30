@@ -164,7 +164,7 @@ CONTROL_ALERT_TEXT = {
   'crossTrafficAfterCommit': 'Cross traffic: carrying on through the junction',
   'cameraPaused': 'Cross-traffic camera paused: holding',
   'stalledInJunction': 'Stalled in the junction: going again',
-  'overrideWriteFailed': 'Signal seen at a stop sign not saved: the route may use it again',
+  'overrideWriteFailed': 'Stop sign junction not saved: the route may use it again',
 }
 
 

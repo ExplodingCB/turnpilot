@@ -387,6 +387,7 @@ class TurnPilot:
       self.left = UnprotectedLeft()  # the autonomous unprotected left (unprotected_left.py); kept through a fault, as its latch
       self.stop_go = StopGo()  # the stop-sign decider: kept through a fault, as the latch it decides for
       self.stop_go.on_signal_seen = self.signal_seen_override
+      self.stop_go.on_downgrade = self.downgrade_override
     self.go_cert.withdraw('reset')  # a disabled plan carries no go
     self.stopped_s = 0.            # standing engaged with nothing holding the car (carStoppedTakeControl)
     self.stall_s = 0.              # standing in the turn after its go, nothing holding the car (stalledTakeControl)
@@ -768,7 +769,7 @@ class TurnPilot:
       plan.controlAlert = 'sideCamerasOff'                            # its time running only while it is shown
       self.side_off_t = max(self.side_off_t - DT_MDL, 0.)
     if self.override_failed_t > 0. and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS:
-      plan.controlAlert = 'overrideWriteFailed'  # a signal seen at a stop sign not saved for navd: said with a chime (O16)
+      plan.controlAlert = 'overrideWriteFailed'  # a signal seen or a downgrade at a stop sign not saved for navd: chimed (O16)
     self.override_failed_t = max(self.override_failed_t - DT_MDL, 0.)
     if decision.hard_brake:  # a confirmed track's hard stop outranks the map's alerts (scene_policy.py)
       plan.controlAlert = 'hardBrake'
@@ -1018,17 +1019,39 @@ class TurnPilot:
     every listed approach's way are written (only the real ones ever match navd's keys). Not written (no params, a param this
     build doesn't know, a value that doesn't read, the write failing): logged and said (overrideWriteFailed), never silently
     lost (row O16)."""
-    from openpilot.selfdrive.turnpilot.routing.junctions import approach_key, write_override
+    from openpilot.selfdrive.turnpilot.routing.junctions import approach_key
     ways = sorted({int(a.way_id) for a in (j.approaches if j is not None else []) if a.way_id})
     node = int(j.osm_node_id) if j is not None else 0
     evidence = {'source': 'stopGo signal head', 'wallTime': self.wall_clock(), 'ways': ways}
     entries = [{'approach': approach_key(node, w, fwd), 'kind': 'signalSeen', 'evidence': evidence} for w in ways for fwd in (True, False)]
-    ok, why = write_override(self.params, entries) if node and entries else (False, "the junction's node or ways unknown")
+    self.write_overrides('signalSeen', node, entries if node else [], "the junction's node or ways unknown")
+
+  def downgrade_override(self, j, approach, evidence: dict) -> None:
+    """An approach downgraded on site (stop_go: 4.4, decision D11, row V3: a motor vehicle through its line at speed):
+    TurnPilotJunctionOverrides names it no with the decider's evidence, so navd's certifier (check 8, any approach
+    overridden) routes around the junction from the next lookup on, until Kellen has looked at the evidence and cleared it
+    (route_audit --list-overrides, --clear). The bus carries the approach's way but not its direction, so both directions of
+    that way at this node are written, each naming both (written): only the real one matches navd's key, and the certifier
+    fails a junction on any overridden approach either way. Not written: logged and said (overrideWriteFailed), never
+    silently lost (row O16); the decider's own downgrade for this encounter doesn't wait on it."""
+    from openpilot.selfdrive.turnpilot.routing.junctions import approach_key
+    node = int(j.osm_node_id) if j is not None else 0
+    way = int(getattr(approach, 'way_id', 0) or 0)
+    keys = [approach_key(node, way, fwd) for fwd in (True, False)] if node and way else []
+    ev = dict(evidence, source='stopGo downgrade', wallTime=self.wall_clock(), written=keys)
+    self.write_overrides('no', node, [{'approach': k, 'kind': 'no', 'evidence': ev} for k in keys],
+                         "the junction's node or the approach's way unknown")
+
+  def write_overrides(self, kind: str, node: int, entries: list, missing: str) -> None:
+    """Add entries to TurnPilotJunctionOverrides (routing/junctions.write_override); a write that fails, or nothing to name
+    (missing says why), is logged and said (overrideWriteFailed, with a chime), never silently lost."""
+    from openpilot.selfdrive.turnpilot.routing.junctions import write_override
+    ok, why = write_override(self.params, entries) if entries else (False, missing)
     if ok:
-      cloudlog.event("turnpilot.override_written", kind='signalSeen', osmNodeId=node, approaches=[e['approach'] for e in entries])
+      cloudlog.event("turnpilot.override_written", kind=kind, osmNodeId=node, approaches=[e['approach'] for e in entries])
       return
-    log_error(f"turnpilotd: signal seen at junction {node} not saved to TurnPilotJunctionOverrides: {why}")
-    cloudlog.event("turnpilot.override_write_failed", error=True, kind='signalSeen', osmNodeId=node, why=why,
+    log_error(f"turnpilotd: {kind} at junction {node} not saved to TurnPilotJunctionOverrides: {why}")
+    cloudlog.event("turnpilot.override_write_failed", error=True, kind=kind, osmNodeId=node, why=why,
                    approaches=[e['approach'] for e in entries])
     self.override_failed_t = OVERRIDE_FAILED_ALERT_S
 

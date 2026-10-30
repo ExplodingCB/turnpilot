@@ -414,6 +414,55 @@ def test_C20_a_signal_head_at_the_junction_writes_signal_seen_for_navd_and_a_fai
       assert 'TurnPilotJunctionOverrides' not in sim.tp.params and 'overrideWriteFailed' in alerts
 
 
+def lane_tracks(sim, role, tid, d, cls=2):
+  """A car d m down the role lane (its box centre), as the tracker reports it from where our car is now (shield_tracks')."""
+  import math
+  from openpilot.selfdrive.turnpilot.routing.tests.test_certify import junction
+  from openpilot.selfdrive.turnpilot.stop_evidence import junction_lanes
+  from openpilot.selfdrive.turnpilot.tests.test_stop_evidence import track as ev_track
+  ln = {x.role: x for x in junction_lanes(junction(), 'unknown', 1.9, 3.5) if x.index == 1}[role]
+  s = (ln.s_min + ln.s_max) / 2. - (sim.s - S_LINE)
+  trk = ev_track(tid, sim.t_cam, max(d, 0.3), ln, view='sideLeft' if role == 'left' else 'sideRight', cls=cls, s=s)
+  half = math.degrees(math.atan2(0.9, math.hypot(s, d)))
+  trk.span_seen = tuple(sorted((trk.bearing_seen - half, trk.bearing_seen + half)))
+  trk.hits = 5
+  return [trk]
+
+
+def test_V3_a_car_through_its_line_at_speed_writes_its_approach_no_with_its_evidence_and_a_failed_write_is_said(tmp_path):
+  # 4.4, decision D11: the left approach no for the encounter at once (H3 "cross traffic doesn't stop" after the ledger) and
+  # in TurnPilotJunctionOverrides as no with its evidence, so navd avoids it until Kellen clears it (route_audit --clear).
+  # Not written, it is logged and said (overrideWriteFailed), never silently lost
+  import json
+  from openpilot.common.params import UnknownKeyName
+  from openpilot.selfdrive.turnpilot.routing.junctions import read_overrides
+  for fail in (None, UnknownKeyName('TurnPilotJunctionOverrides')):
+    sim = StopSim(tmp_path)
+    sim.tp.params = OverridesParam(fail)
+    run_to_line(sim)
+    t0 = sim.t_cam + 1.
+
+    def tracks(s, t0=t0):
+      d = 45. - 8. * (s.t_cam - t0)
+      return lane_tracks(s, 'left', 41, d) if s.t_cam >= t0 and d > -12. else []
+    sim.tracks = tracks
+    sim.run(24.)
+    plans = sim.plans()
+    assert go_frame(sim) is None
+    assert any(p.controlPrompt == 'stopSignTakeControl' and p.reason == "Stop sign: cross traffic doesn't stop: take control" for p in plans)
+    alerts = [str(p.controlAlert) for p in plans]
+    if fail is None:
+      got, ok, _ = read_overrides(sim.tp.params)
+      assert ok and set(got) == {f"{NODE}:11:f", f"{NODE}:11:b"} and all(v['kind'] == 'no' for v in got.values())
+      ev = got[f"{NODE}:11:f"]['evidence']
+      assert ev['source'] == 'stopGo downgrade' and ev['trackId'] == 41 and ev['cls'] == 'car' and ev['role'] == 'left'
+      assert 5. <= ev['speedMs'] <= 11. and ev['minSpeedMs'] >= 5. and ev['osmNodeId'] == NODE and ev['wallTime'] > ETA
+      assert ev['written'] == [f"{NODE}:11:f", f"{NODE}:11:b"]
+      assert len(json.loads(sim.tp.params['TurnPilotJunctionOverrides'])) == 2 and 'overrideWriteFailed' not in alerts
+    else:
+      assert 'TurnPilotJunctionOverrides' not in sim.tp.params and 'overrideWriteFailed' in alerts
+
+
 def test_V19_a_car_backing_out_ahead_holds_the_go(tmp_path):
   sim = StopSim(tmp_path)
   run_to_line(sim)
