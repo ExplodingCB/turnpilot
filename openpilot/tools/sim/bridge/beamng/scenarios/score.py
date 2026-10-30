@@ -580,8 +580,17 @@ def tp_accel(rows) -> dict:
   return out
 
 
+def take_control_expected(expect) -> list[str]:
+  """The take-control handbacks (hooks.TAKE_CONTROL_PROMPTS) among a run's expectations."""
+  return [arg for kind, _, arg in (str(e).partition(':') for e in expect or ()) if kind == 'handback' and arg in TAKE_CONTROL_PROMPTS]
+
+
 def hard_brake_ok(name: str, expect) -> bool:
-  """A confirmed track's hard stop is the scenario's to show (ACCEL_FLOOR's comment)."""
+  """A confirmed track's hard stop is the scenario's to show (ACCEL_FLOOR's comment). Never in a run expecting a
+  take-control handback: its shot is the car held while the driver is asked to take over (S03's 'no TurnPilot accel below
+  -2.0 m/s^2', in ped_crosswalk_right), not a hard stop."""
+  if take_control_expected(expect):
+    return False
   kinds = {str(e).partition(':')[0] for e in expect or ()}
   return 'hardBrake' in kinds or (name.startswith(HARD_BRAKE_PREFIXES) and 'skip' not in kinds)
 
@@ -612,8 +621,9 @@ def _fails(name: str, res: dict) -> list[tuple[str, str]]:
     fails.append(('accel', f"TurnPilot asked for {x['accel']} m/s^2 at t={x['t']:.1f} s, below {ACCEL_FLOOR} m/s^2 without a " +
                   "confirmed track's hard stop (no hardBrake)"))
   if (x := acc.get('hard')) is not None and not hard_brake_ok(name, res.get('expect')):
-    fails.append(('accel', f"TurnPilot braked hard ({x['accel']} m/s^2, hardBrake) at t={x['t']:.1f} s: {name} has nothing to " +
-                  f"brake past {ACCEL_FLOOR} m/s^2 for"))
+    tc = take_control_expected(res.get('expect'))
+    why = f"a run expecting a take-control handback (handback:{tc[0]}) shows no hard stop" if tc else f"{name} has nothing to brake for"
+    fails.append(('accel', f"TurnPilot braked hard ({x['accel']} m/s^2, hardBrake) at t={x['t']:.1f} s: {why} past {ACCEL_FLOOR} m/s^2"))
   taken, attempted = res['maneuvers_taken'], res['maneuvers_attempted']
   hs = res['holds']
   if name == 'ped_crosswalk_right':
