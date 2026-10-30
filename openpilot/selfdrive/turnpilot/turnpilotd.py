@@ -319,6 +319,11 @@ STOP_GO_CARRY_STATES = ('going', 'committed', 'inLane')
 # next step at the earliest (NAVD_ADVANCE_M past a nearest reading UNCERTAIN_M short of the 9.3 m the car stands from the
 # junction, the most spread without junctionUncertain): the record is gone before the next left is taken up
 LINE_VETO_MOVED_M = 2.
+# ...and it is for the left at that line only: carried to navd's new id for a left whose junction its readings put within this
+# of the recorded one (UNCERTAIN_M of spread without junctionUncertain, and a margin for the reroute's own reading: K2's
+# reroute at 0 m, N1's nearer reading at 10 m), never to the next left on along the road (skeptic m-behaviour3 P1: a left 25
+# m past the vetoed one, same bearings, was taken for it within SAME_TURN_M, its request ended with nothing said)
+LINE_VETO_SAME_M = UNCERTAIN_M + 5.
 STOP_GO_HOLDS_PULSE = ('approach', 'stopped', 'rollUp', 'observe')  # the decider's states a turn's pulse waits for its go in
 
 
@@ -500,6 +505,7 @@ class TurnPilot:
       self.skip_cap_id: int | None = None  # a dropped turn skipped on taking it up: its cap stays until it is passed
       self.veto_hold_id: int | None = None  # a turn vetoed standing at a hold: the hold keeps it until it lets go
       self.vetoed: VetoedTurn | None = None  # the turn the driver overruled, by its junction: skipped across a reroute
+      self.line_deferred_id: int | None = None  # the maneuver last logged as waiting on a line veto's record (line_veto_defers)
       self.go_id: int | None = None  # the turn a hold let go of at standstill: checked for a miss and a stall
       self.go_rolled = False         # ...the car has rolled since that go (STANDSTILL_SPEED or more)
       self.go_spent = False          # ...and then come to rest again short of the hold line: no longer under way (went)
@@ -957,6 +963,8 @@ class TurnPilot:
     # tp/integrate left the intent on the route's turn: the car turned right instead of the route's left with its left lamp lit)
     alt_sig = d_id == ALT_MANEUVER_ID
     sig_on = d_on if alt_sig else None if rf.maneuver_id == self.alt_route_id else desire_on
+    if not alt_sig and self.line_veto_defers(rf):
+      sig_on = None  # another turn ahead of the left the driver overruled at its line, the car still there: not signalled yet
     sg_withdrawable = sg.acting and sg.state == 'going' and sg.withdrawable and (self.decider_turn_id == rf.maneuver_id or alt_sig)
     short_of_turn = stopping or at_rest or sg_withdrawable  # one boolean for the intent's started and the skip gate below
     ts = self.turn_signal.update(status=signal_status, port=port, gates_ok=acting and not shadow, engaged=sm['carControl'].enabled,
@@ -1122,7 +1130,8 @@ class TurnPilot:
     with the car in a left-turn position, 6.6's exception), and it ended the request for the left. Carried, that request
     stays ended under the new id (TurnSignalIntent.end: never armed, signalled, prompted or handed over), before this frame's
     intent update, so the car never relights the left the driver overruled, never prompts 'Signal Left' for it with our
-    lamp put out, and a takeover never asks for it. It is for the left at the line the car stands at, so it is forgotten
+    lamp put out, and a takeover never asks for it. It is for the left at the line the car stands at: carried only to a left
+    within LINE_VETO_SAME_M of where the veto put it (the readings' spread, never the next left on), and forgotten
     once the car is past that junction (the driver took over and drove it): a left of a new id after it, which without
     junction data same_junction can't tell from it, would otherwise lose its lamp and prompt with nothing said. Past it
     takes both: beyond where the veto put the junction, and LINE_VETO_MOVED_M on from where the veto found the car. The
@@ -1139,7 +1148,8 @@ class TurnPilot:
     if upcoming is None or upcoming.kind not in (TURN, KEEP) or rf.maneuver_id == v.maneuver_id or \
        (self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id):
       return
-    if not same_junction(upcoming, v.maneuver) or abs(self.odo_m + rf.distance - v.junction_odo) > SAME_TURN_M:
+    window = LINE_VETO_SAME_M if v.line else SAME_TURN_M
+    if not same_junction(upcoming, v.maneuver) or abs(self.odo_m + rf.distance - v.junction_odo) > window:
       return
     cloudlog.event("turnpilot.veto_carried", error=True, why=v.reason, handback=v.line, vetoed_id=v.maneuver_id,
                    maneuver_id=rf.maneuver_id, distance=round(rf.distance, 1), off_m=round(self.odo_m + rf.distance - v.junction_odo, 1))
@@ -1151,6 +1161,22 @@ class TurnPilot:
     if v.capped:
       self.skip_cap_id = rf.maneuver_id
     v.maneuver_id = rf.maneuver_id
+
+  def line_veto_defers(self, rf) -> bool:
+    """A veto's record at the unprotected left's line (VetoedTurn.line) is live, the car still short of that junction where
+    the veto found it, and the route's maneuver now is another turn (navd's reroute to a left further on: never the vetoed
+    one, which carry_veto keeps ended): its request waits, never armed, signalled or prompted, until the record is forgotten
+    (carry_veto: the car past the vetoed junction). Lit at the vetoed left's line, our lamp would say the car turns there,
+    where the driver just overruled it; ended instead, as carry_veto's line branch did within SAME_TURN_M (skeptic
+    m-behaviour3 P1), the later left would never be signalled at all. Logged once per maneuver."""
+    v = self.vetoed
+    if v is None or not v.line or rf.maneuver_id == v.maneuver_id or rf.upcoming is None or rf.upcoming.kind not in (TURN, KEEP):
+      return False
+    if self.line_deferred_id != rf.maneuver_id:
+      self.line_deferred_id = rf.maneuver_id
+      cloudlog.event("turnpilot.veto_line_defers", vetoed_id=v.maneuver_id, maneuver_id=rf.maneuver_id, distance=round(rf.distance, 1),
+                     off_m=round(self.odo_m + rf.distance - v.junction_odo, 1))
+    return True
 
   def check_missed(self, rf, v_ego: float, acting: bool) -> None:
     """The turn a hold let go of at standstill is passed (the follower's pass, this update) having turned under

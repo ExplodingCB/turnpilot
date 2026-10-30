@@ -1182,6 +1182,82 @@ def test_a_line_veto_stays_while_the_car_stands_where_it_was_vetoed():
   assert tp.turn_signal.ended_id != 9 and tp.vetoed is None
 
 
+def test_a_line_veto_ends_the_same_left_within_its_readings_spread_never_the_next_left_on():
+  """A line veto's record is for the left at the line the car stands at: carried to navd's new id for that left wherever its
+  readings put it within UNCERTAIN_M of spread and a margin (LINE_VETO_SAME_M: K2's reroute at 0 m, N1's nearer reading at
+  10 m, the spread's whole 15 m), never to another left past it on the same road (skeptic m-behaviour3 P1: the next left 25
+  m on, same bearings or none, was taken for the vetoed one within SAME_TURN_M, its request ended with nothing said, and the
+  car reached it with no lamp, no 'Signal Left' and no handover)."""
+  from types import SimpleNamespace
+  from openpilot.selfdrive.turnpilot.route_follower import LEFT, TURN, UNCERTAIN_M, Maneuver
+  from openpilot.selfdrive.turnpilot.turnpilotd import LINE_VETO_SAME_M, TurnPilot, VetoedTurn
+  vetoed_left = Maneuver(TURN, LEFT, "turn", "left", 90., geometry=True, bearings=(0., 270.))
+  assert UNCERTAIN_M < LINE_VETO_SAME_M < 25.
+  for off, carried in ((0., True), (10., True), (UNCERTAIN_M, True), (-UNCERTAIN_M, True), (25., False), (40., False)):
+    for nxt in (vetoed_left, Maneuver(TURN, LEFT, "turn", "left", 90.)):  # same bearings, or no junction data
+      tp = TurnPilot()
+      tp.odo_m = 90.7  # standing at the left's line, 9.3 m short of its junction
+      tp.vetoed = VetoedTurn(vetoed_left, 100., 'driverSignal', 1, False, line=True, veto_odo=90.7)
+      tp.carry_veto(nxt, SimpleNamespace(maneuver_id=3, distance=9.3 + off), 0.)
+      assert (tp.turn_signal.ended_id == 3) == carried, (off, nxt.bearings)
+      assert tp.vetoed is not None, "standing at the line, the record stays"
+
+
+NEXT_LEFT_M = 25.
+NEXT_LEFT_JUNCTIONS = {'nodata': None, 'samebearings_present': (0., 270., 2, 'present', 11.18, 1),
+                       'samebearings_none': (0., 270., 2, 'none')}
+
+
+@pytest.mark.parametrize("take_over", [False, True])
+@pytest.mark.parametrize("kind", list(NEXT_LEFT_JUNCTIONS))
+def test_a_different_left_after_a_line_veto_keeps_its_signal(kind, take_over):
+  """Skeptic m-behaviour3 P1, closed loop: the driver's right lamp vetoes the autonomous left at its line (the left hands
+  back, the car held), and a second later navd reroutes to a route whose first step is another left NEXT_LEFT_M past the
+  vetoed junction (its junction data none, or the same bearings). Standing at the vetoed left's line, the car never lights
+  its left lamp nor prompts 'Signal Left' (that would say it turns where the driver overruled it). Once the driver has
+  taken over, driven through the vetoed junction and engaged again, the next left is the car's own: our lamp lit for it or
+  the driver prompted to signal it, or skipped out loud (tooFastToTurn: the sim's unmeasured left range); never ended with
+  nothing said (it was: carry_veto's line branch took it for the vetoed left within SAME_TURN_M)."""
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import JUNCTION, drive
+  from openpilot.selfdrive.turnpilot.turnpilotd import LINE_VETO_MOVED_M
+  junction, at, nxt = NEXT_LEFT_JUNCTIONS[kind], JUNCTION + NEXT_LEFT_M, 1500.
+  k = [0]
+
+  def nav(s, instr):
+    k[0] += 1
+    if k[0] == 1:
+      return nav_instruction(at - s.s, "turn", "left", remaining=nxt - s.s, junction=junction), False
+    if s.s < at + 10.:
+      return nav_instruction(at - s.s, "turn", "left", remaining=nxt - s.s, junction=junction, route_count=1,
+                             ahead=[(nxt - s.s, "turn", "right", junction_of("right"))]), True
+    return nav_instruction(nxt - s.s, "turn", "right", remaining=nxt - s.s, junction=junction_of("right"), route_count=1), True
+
+  sim, state, vetoed = auto_left_at_its_line('right', veto_s=1.)
+  assert any(str(p.controlPrompt) == 'leftUndecidedTakeControl' for p in vetoed)
+  state['driver'] = 'none'
+  drive(sim, 1.)
+  assert sim.tp.vetoed is not None and sim.tp.vetoed.line
+  if take_over:
+    sim.go_taps = True
+    sim.take_over_on = ('unprotectedTurnTakeControl', 'leftUndecidedTakeControl')
+  sim.nav_filter = nav
+  i0 = len(sim.trace)
+  drive(sim, 45.)
+  after = sim.trace[i0:]
+  at_line = [p for s, _, p in after if s < JUNCTION + LINE_VETO_MOVED_M - 9.3]
+  lit = [p for p in at_line if p.turnSignal.side == LaneChange.left or p.turnSignal.prompt == LaneChange.left]
+  assert at_line and not lit, f"{kind}: at the vetoed left's line, our left lamp or 'Signal Left' on {len(lit)} of {len(at_line)} frames"
+  if not take_over:
+    assert all(p.shouldStop for _, _, p in after), "held at the vetoed line"
+    return
+  near = [p for s, v, p in after if JUNCTION + LINE_VETO_MOVED_M < s < at and v > 0.5 and
+          p.state != custom.TurnpilotPlan.State.unavailable]
+  assert near, "the driver took over and drove on toward the next left"
+  said = [p for p in near if p.turnSignal.side == LaneChange.left or p.turnSignal.prompt == LaneChange.left or p.tooFastToTurn]
+  ids = f"ended id {sim.tp.turn_signal.ended_id}, maneuver id {sim.tp.follower.maneuver_id}"
+  assert said, f"{kind}: the left {NEXT_LEFT_M} m past the vetoed one approached with no lamp, no prompt and no skip ({ids})"
+
+
 @pytest.mark.parametrize("driver", ['right', 'lost'])
 def test_a_reroute_after_a_veto_at_g1s_line_never_relights_the_left(driver):
   """TurnPilotAutoLeft off (G1): the latch holds the car at the left's line, handed back (unprotectedTurnTakeControl), and a
