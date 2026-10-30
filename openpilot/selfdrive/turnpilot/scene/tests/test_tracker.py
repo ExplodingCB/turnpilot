@@ -557,3 +557,23 @@ def test_a_forward_runs_traffic_light_boxes_come_with_their_bearing_and_elevatio
   # a run with none carries none
   trk.update(detections(trk, 'road', 1.1, [(CAR, 20., 0., 0.6)], frame_id=1), cal, car_state(), now=1.1)
   assert trk.raw.lights == ()
+
+
+def test_a_forward_runs_stop_sign_boxes_come_with_their_bearing_elevation_and_conf():
+  # row C11 (SG4b): map_controls logs a mapped stop with the camera's class-11 evidence (shadow, never acting), from
+  # RawFrame.signs: a sign 20 m ahead, 3 m right, its centre 2.1 m above the road, as turnpilotDetections.signs carries it
+  trk = SceneTracker(CAMS, 'mici')
+  cal = calibration()
+  lens = trk.lenses['road']
+  rot = calib_from_view(RPY, None).T
+  u, v = lens.project(rot @ np.array([20., 3., HEIGHT - 2.1]))
+  msg = messaging.new_message('turnpilotDetections')
+  fill_detections(msg.turnpilotDetections, np.zeros((0, 6), np.float32), 0, int(1e9), 'road', 0.005)
+  s, = msg.turnpilotDetections.init('signs', 1)
+  s.box.cls, s.box.conf, s.box.x0, s.box.y0, s.box.x1, s.box.y1 = 11, 0.8, float(u) - 6., float(v) - 6., float(u) + 6., float(v) + 6.
+  trk.update(msg.as_reader().turnpilotDetections, cal, car_state(), now=1.0)
+  (bearing, elevation, conf), = trk.raw.signs
+  assert abs(bearing - np.degrees(np.arctan2(-3., 20.))) < 0.1 and abs(elevation - np.degrees(np.arctan2(2.1 - HEIGHT, 20.))) < 0.1
+  assert abs(conf - 0.8) < 1e-6
+  trk.update(detections(trk, 'road', 1.1, [(CAR, 20., 0., 0.6)], frame_id=1), cal, car_state(), now=1.1)
+  assert trk.raw.signs == ()

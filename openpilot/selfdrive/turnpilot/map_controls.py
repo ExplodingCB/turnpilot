@@ -62,6 +62,10 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   camera green or unknown never enters, so a camera red can hold a stop the oracle's green would have released, never
   the reverse; and a stop the camera added is released only by an accepted green once the camera's red has gone (on the
   car, where no other source is accepted, that is never: the stand handback ends it, which is why add-only stays off).
+- A mapped stop the camera never saw (row C11; STOP_SIGNS.md v3 SG4b) is stopped for anyway, the gentle error, and the
+  decider certifies it as mapped; at its hold its approach's class-11 shadow evidence is logged (update()'s signs: the
+  forward runs counted from SIGN_LOOK_M, their stop-sign boxes, the best conf; turnpilot.map_stop_signs), and SIGN_UNSEEN_RUNS
+  or more with none is said as unseen (turnpilot.map_stop_unseen) for the replay gate. Nothing here acts on a sign.
 - A yield caps the speed to YIELD_SPEED at its line, never stops the car, and goes once passed. One whose
   road outranks every crossing one (crossSuspect: likely mapped for the cross road) is dropped and logged. Such a stop
   sign still stops, and says the approach is unverified.
@@ -152,6 +156,11 @@ STOP_SIGN_REASON = "Stop sign: take control to proceed"
 CREEP_SPEED = 0.7             # m/s
 CREEP_ACCEL = 0.5             # m/s^2
 CREEP_AT_M = 0.1              # crept to within this of its target: held there again
+# A mapped stop the camera never saw (row C11; STOP_SIGNS.md v3 SG4b): stopped for anyway, logged at its hold with the
+# class-11 shadow evidence of its approach (TurnPilotCameraStopSigns shadow: nothing acts on a sign this week)
+SIGN_LOOK_M = 40.             # m before its stop point its forward runs are counted
+SIGN_SEEN_HITS = 2            # stop-sign boxes in them that say the camera saw a sign
+SIGN_UNSEEN_RUNS = 10         # forward runs with none, and the stop is logged as unseen (the replay gate's)
 
 
 @dataclass
@@ -306,6 +315,9 @@ class ControlState:
   moved_m: float = 0.
   done: str = ''                # 'released', 'passed', 'overrun', 'dropped'
   action: str = 'none'
+  sign_runs: int = 0            # a stop sign's approach, from SIGN_LOOK_M: forward runs counted (the camera's signs read)...
+  sign_hits: int = 0            # ...the stop-sign boxes in them...
+  sign_conf: float = 0.         # ...and the best conf (row C11's evidence)
 
 
 def description(c: TrackedControl, turn_name: str = 'left') -> str:
@@ -495,13 +507,14 @@ class MapControlPolicy:
 
   def update(self, nav, updated: bool, valid: bool, v_ego: float, gas_pressed: bool, lights: Lights = NO_LIGHTS,
              dt: float = DT_MDL, turn=None, left: LeftCommand | None = None, release: tuple | None = None,
-             creep: tuple | None = None, stop: StopCommand | None = None) -> MapDecision:
+             creep: tuple | None = None, stop: StopCommand | None = None, signs: tuple | None = None) -> MapDecision:
     """nav: the latest navInstruction, updated: it arrived this frame, valid: its valid flag; carState's vEgo and
     gasPressed; lights: light_input()'s; turn: (maneuver id, m to its junction, 'left' or 'right') of the route's
     unprotected_turn() the car is taking, or None; left: the unprotected left's command for its latch (None: off); release:
     (control key, cause) to let the latch go this frame (the stop-sign decider's 'clear'); creep: (m past where it latched,
     m/s cap) for a held stop sign's stop point (the decider's roll-up); stop: the decider's StopCommand for a held stop sign
-    (None: shadow, as before)."""
+    (None: shadow, as before); signs: (this tick's forward runs, their stop-sign boxes [(bearing, elevation, conf)]) for row
+    C11's evidence, None with the camera's signs not read."""
     self.left = left if left is not None else LeftCommand()
     self.stop_cmd = stop if stop is not None else StopCommand()
     self._creep = creep
@@ -534,6 +547,18 @@ class MapControlPolicy:
       self._camera_off_t = ABORT_HOLD_S  # its own hold, never _transient: it must not overwrite a live one-shot alert
       cloudlog.event("turnpilot.camera_lights_off", error=True)
     live_signals = [c for c in controls if c.kind == 'signal' and not (c.state is not None and c.state.done)]
+    self._signs = signs
+    if signs is not None:
+      # each forward run counted for the nearest stop sign ahead within SIGN_LOOK_M not yet held (row C11)
+      ahead = [c for c in controls if c.kind == 'stop' and not c.held and not (c.state is not None and c.state.done) and
+               -LATCH_PAST_M < c.d <= SIGN_LOOK_M]
+      if ahead:
+        st = min(ahead, key=lambda c: c.d)
+        st.state = st.state or ControlState()
+        runs, boxes = signs
+        st.state.sign_runs += int(runs)
+        st.state.sign_hits += len(boxes)
+        st.state.sign_conf = max([st.state.sign_conf] + [float(b[2]) for b in boxes])
     for c in controls:
       st = c.state = c.state or ControlState(mode=SIGNAL_GO if c.kind == 'signal' else 'stop')
       if st.done:
@@ -798,11 +823,26 @@ class MapControlPolicy:
       self.held, c.held = c.key, True
       st.dwell_t, st.moved_m, st.infeasible = 0., 0., False
       cloudlog.event("turnpilot.map_stop_held", kind=c.kind, key=list(c.key), d=round(c.d, 1), light=st.light)
+      if c.kind == 'stop' and getattr(self, '_signs', None) is not None:
+        self._sign_evidence(c)
       self._held(c, controls, v, gas_pressed, 0., out, prompts)
       return False
     st.action = 'infeasible' if st.infeasible else 'braking' if (st.cap < v + 0.5 or accel < NO_ACCEL_CAP) else 'approaching'
     out.stops.append(Stop(accel, st.cap, False, reason, c.d))
     return st.infeasible
+
+  def _sign_evidence(self, c) -> None:
+    """Row C11 at a stop sign's hold: its approach's class-11 shadow evidence logged (the forward runs counted from
+    SIGN_LOOK_M, the stop-sign boxes in them, the best conf), and with SIGN_UNSEEN_RUNS or more and no box, said as a mapped
+    stop the camera didn't see (a sign missing, turned or hidden, or the map's own error) for the replay gate. The stop
+    stands either way (the gentle error) and the decider certifies it as mapped: nothing here acts on a sign."""
+    st = c.state
+    seen = st.sign_hits >= SIGN_SEEN_HITS
+    cloudlog.event("turnpilot.map_stop_signs", key=list(c.key), runs=st.sign_runs, hits=st.sign_hits, conf=round(st.sign_conf, 2),
+                   seen=seen, lineMapped=bool(c.line_mapped), crossSuspect=bool(c.cross_suspect))
+    if not seen and st.sign_runs >= SIGN_UNSEEN_RUNS:
+      cloudlog.event("turnpilot.map_stop_unseen", key=list(c.key), runs=st.sign_runs, hits=st.sign_hits, conf=round(st.sign_conf, 2),
+                     junction=bool(c.junction), osmNodeId=int((getattr(c, 'junction_info', None) or {}).get('osmNodeId', 0) or 0))
 
   def _signal_go(self, c) -> None:
     """A signal back to nothing to stop for (a steady green): its curve gone, re-seeded if it stops the car again."""

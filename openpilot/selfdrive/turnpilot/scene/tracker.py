@@ -134,6 +134,8 @@ class RawFrame:
   cover_deg: tuple | None = None  # a far run's (right, left) bearings at the horizon; None if the horizon isn't inside it
   lights: tuple = ()       # a forward run's traffic-light boxes (lightBoxes, COCO 9): (bearing deg left, elevation deg above
                            # the horizon, conf) of each box's centre, for the stop-sign decider's signal-head check (2.4 item 9)
+  signs: tuple = ()        # a forward run's stop-sign boxes (signs, COCO 11; TurnPilotCameraStopSigns shadow): (bearing deg left,
+                           # elevation deg, conf) of each box's centre, map_controls' class-11 evidence of a mapped stop (C11)
 
 
 def view_key(camera: str, view: str) -> str:
@@ -493,7 +495,8 @@ class SceneTracker:
 
   def raw_frame(self, detections, camera: str, calibration, t: float, view: str = 'full', crop=None) -> RawFrame:
     """Every road user's box in this run, ranged where its bottom is below the horizon (RawBox), tracked or not. A far run
-    (view far) also says what it covers (far_cover of crop); a forward run (view full) its traffic-light boxes (lights)."""
+    (view far) also says what it covers (far_cover of crop); a forward run (view full) its traffic-light boxes (lights) and its
+    stop-sign boxes (signs)."""
     boxes = []
     calibrated = calibration is not None and len(calibration.rpyCalib) == 3
     lens, (w, h) = self.lenses[camera], self.sizes[camera]
@@ -514,12 +517,16 @@ class SceneTracker:
                           float(np.hypot(*near)) if near is not None else None,
                           (float(d.x0 / w), float(d.y0 / h), float(d.x1 / w), float(d.y1 / h)), view))
     cover = self.far_cover(crop, rot) if view == 'far' and crop is not None and len(crop) == 4 and rot is not None else None
-    lights = []
+    lights, signs = [], []
     if view == 'full' and rot is not None:
       for d in getattr(detections, 'lightBoxes', None) or ():
         u, v = (d.x0 + d.x1) / 2, (d.y0 + d.y1) / 2
         lights.append((bearing_deg(lens, rot, u, v), elevation_deg(lens, rot, u, v), float(d.conf)))
-    return RawFrame(boxes, camera, t, view, cover, tuple(lights))
+      for s in getattr(detections, 'signs', None) or ():
+        d = s.box
+        u, v = (d.x0 + d.x1) / 2, (d.y0 + d.y1) / 2
+        signs.append((bearing_deg(lens, rot, u, v), elevation_deg(lens, rot, u, v), float(d.conf)))
+    return RawFrame(boxes, camera, t, view, cover, tuple(lights), tuple(signs))
 
   def update_in_path(self, model_v2) -> None:
     path_x, path_y = predicted_path(model_v2)

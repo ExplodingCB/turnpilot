@@ -1052,3 +1052,28 @@ def test_G20_a_stop_just_past_a_crest_on_a_downhill_engages_from_the_map_and_lan
   assert held(out, dec) and -2. < 200. - car.s < 5. and all(r[3] >= MAP_DECEL_MAX - 1e-6 for r in car.rows)
   assert not any(r[5].alert == 'stopOverrun' for r in car.rows)
 
+
+def test_C11_a_mapped_stop_the_camera_never_saw_still_stops_gently_and_is_logged_with_the_class_11_evidence(monkeypatch):
+  # the gentle error: a stop mapped where there is none (or the camera misses it) still stops the car on the -1.5 curve and
+  # holds it (certification at the line proceeds as mapped); at the hold the class-11 shadow evidence of its approach is logged
+  # (forward runs, stop-sign boxes, the best conf), and with none seen in them, said as unseen for the replay gate. Never a
+  # brake, never a release: nothing here acts on a sign
+  import openpilot.selfdrive.turnpilot.map_controls as mcm
+  events = []
+  monkeypatch.setattr(mcm.cloudlog, 'event', lambda name, **kw: events.append((name, kw)))
+  for seen in (False, True):
+    events.clear()
+    car = Car([(150., 'stop')])
+    def signs(c, seen=seen):
+      return (1, [(-12., 2., 0.7)] if seen and 150. - c.s < 40. else [])
+    out, dec = car.run_until(lambda out, dec: held(out, dec), signs=signs)
+    assert all(r[3] >= MAP_DECEL_MAX - 1e-6 for r in car.rows) and dec.should_stop
+    ev = [kw for name, kw in events if name == 'turnpilot.map_stop_signs']
+    assert len(ev) == 1 and ev[0]['runs'] > 50 and (ev[0]['hits'] > 0) == seen and ev[0]['seen'] == seen
+    unseen = [kw for name, kw in events if name == 'turnpilot.map_stop_unseen']
+    assert bool(unseen) == (not seen)
+    # the same stop with the camera's signs not read (off, or no detector): nothing claimed either way
+    events.clear()
+    car = Car([(150., 'stop')])
+    car.run_until(lambda out, dec: held(out, dec), signs=None)
+    assert not [1 for name, _ in events if name in ('turnpilot.map_stop_unseen',)]

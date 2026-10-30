@@ -532,3 +532,26 @@ def test_every_plan_carries_navds_runtime_inputs_steady_through_a_stop_and_a_han
   sim.tp.stop_sign_known = False  # a value this build doesn't know: shadow, on every plan
   sim.long_control = True
   assert str(sim.step().stopGo.mode) == 'shadow'
+
+
+def test_C11_turnpilotd_hands_the_forward_runs_stop_sign_boxes_to_map_controls_unless_the_camera_reads_none(tmp_path, monkeypatch):
+  # each tick's forward runs and their class-11 boxes (RawFrame.signs) reach map_controls (row C11's evidence at the hold);
+  # with TurnPilotCameraStopSigns off modeld reads none, so nothing is counted and no stop is called unseen
+  import openpilot.selfdrive.turnpilot.map_controls as mcm
+  for read in (True, False):
+    events = []
+    monkeypatch.setattr(mcm.cloudlog, 'event', lambda name, events=events, **kw: events.append((name, kw)))
+    sim = StopSim(tmp_path, mode='shadow')
+    sim.tp.camera_signs = read
+    run_to_line(sim)
+    ev = [kw for name, kw in events if name == 'turnpilot.map_stop_signs']
+    if read:
+      assert len(ev) == 1 and ev[0]['runs'] >= 10 and ev[0]['hits'] == 0 and any(name == 'turnpilot.map_stop_unseen' for name, _ in events)
+    else:
+      assert not ev and not any(name == 'turnpilot.map_stop_unseen' for name, _ in events)
+
+
+def test_C11_the_camera_stop_signs_param_off_reads_none_anything_else_reads_them():
+  from openpilot.selfdrive.turnpilot.turnpilotd import camera_signs_read
+  assert camera_signs_read(FakeParams()) and camera_signs_read(FakeParams(TurnPilotCameraStopSigns=b'shadow'))
+  assert not camera_signs_read(FakeParams(TurnPilotCameraStopSigns=b'off'))

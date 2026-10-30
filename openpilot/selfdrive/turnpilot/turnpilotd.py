@@ -351,6 +351,7 @@ class TurnPilot:
     self.watch = JunctionWatch()  # step S3's evidence at the swept stop or yield (junction_watch.py): logged, never acted on
     self.tracks_now: list = []    # the tracker's tracks this frame (observe_runs), for the watch
     self.runs_now: list = []      # ...and its runs (the stop-sign decider's signal-head check)
+    self.camera_signs = True      # TurnPilotCameraStopSigns isn't off (main()): modeld reads class-11 boxes (map_controls, C11)
     self.lenses: dict = {}        # consumer: the wide lens it reports (the tracker's lens_spec, the side views' message lens)
     # the stop-sign decider (stop_go.py, STOP_SIGNS.md v3 SG4a): TurnPilotStopSignGo (main()), and its inputs' sources
     self.stop_sign_mode, self.stop_sign_known = MODE_DEFAULT, True
@@ -1321,8 +1322,14 @@ class TurnPilot:
     self.map_controls.yellow_decel = self.yellow_decel
     if stop is None and self.sg_now is not None:
       stop = StopCommand(self.sg_now.latch if self.sg_now.latch != 'none' else 'wait', self.sg_now.reason, self.sg_now.action)
+    # this tick's forward runs and their class-11 boxes (row C11's evidence), None with the camera's stop signs not read
+    signs = None
+    if self.camera_signs:
+      forward = [raw for key, _t, raw, _s in self.runs_now if key in ('road', 'full') and raw is not None]
+      signs = (len(forward), [s for raw in forward for s in getattr(raw, 'signs', ())])
     self.map_now = self.map_controls.update(sm['navInstruction'], sm.updated['navInstruction'], sm.valid['navInstruction'], v_ego,
-                                            gas_pressed, lights, DT_MDL, turn=turn, left=left, release=release, creep=creep, stop=stop)
+                                            gas_pressed, lights, DT_MDL, turn=turn, left=left, release=release, creep=creep, stop=stop,
+                                            signs=signs)
     return self.map_now
 
   def camera_lights(self, sm, data):
@@ -1612,6 +1619,18 @@ def go_override_for(params) -> bool:
   return bool(value)
 
 
+def camera_signs_read(params) -> bool:
+  """TurnPilotCameraStopSigns isn't off: modeld decodes the class-11 boxes of every forward run (detector/modeld_detector.py
+  camera_stop_signs_mode: off reads none; shadow, the default, or anything else, or a build that doesn't know the key, reads
+  them), so map_controls can say a mapped stop the camera didn't see (row C11). Off, nothing is claimed either way."""
+  try:
+    value = params.get("TurnPilotCameraStopSigns")
+  except UnknownKeyName:
+    return True
+  value = value.decode() if isinstance(value, bytes) else value
+  return value != 'off'
+
+
 def stop_sign_mode_for(params) -> tuple[str, bool]:
   """TurnPilotStopSignGo (off, shadow, trial, auto; stop_go.MODE_DEFAULT unset) and whether this build knows it: a value it
   doesn't know, or a build whose params predate the key, acts as shadow, said out loud (STOP_SIGNS.md row O16, H6)."""
@@ -1766,6 +1785,7 @@ def main():
       tp.left_far_range_m = left_far_range_for(params)
       tp.go_override = go_override_for(params)
       tp.stop_sign_mode, tp.stop_sign_known = stop_sign_mode_for(params)
+      tp.camera_signs = camera_signs_read(params)
       tp.params = params
       cp = car_params(params)
       tp.cp_delay = float(cp.longitudinalActuatorDelay) if cp is not None else tp.cp_delay
