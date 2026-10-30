@@ -249,3 +249,18 @@ def test_run_writes_it_at_the_start_and_checks_it_after_the_drive(monkeypatch, t
   end = json.load(open(run_dir / 'tree.json'))
   assert seen['at_drive']['changed_during_run'] is None and seen['at_drive']['end_checked_at'] is None
   assert end['changed_during_run'] is False and end['clean'] and end['stack_dir'] == os.path.realpath(checkout)
+
+
+def test_a_refused_expectation_writes_nothing(monkeypatch, tmp_path):
+  # an argument error is no run: no run dir, so no tree.json without a result file (a page refuses such a dir as a run
+  # killed in its first run)
+  from openpilot.tools.sim.bridge.beamng.scenarios import run
+  monkeypatch.setattr(run.tree, 'manager_dirs', lambda prefix: [])
+  monkeypatch.setattr(sys, 'argv', ['run.py', 'ped_in_path', '--out', str(tmp_path / 'out'), '--expect', 'handbak:detectorStopped'])
+  monkeypatch.setattr(run, 'build', lambda *a, **k: SimpleNamespace(spawn=(0., 0., 0.), heading=0., notes={}))
+  monkeypatch.setattr(run, 'Params', lambda: SimpleNamespace(get_bool=lambda k: True, get=lambda k: None))
+  monkeypatch.setattr(run, 'ensure_token', lambda params: 'tok')
+  monkeypatch.setattr(run, 'sweep_game', lambda host, port: pytest.fail("the game was touched"))
+  with pytest.raises(ValueError, match="unknown expectation"):
+    run.main()
+  assert not (tmp_path / 'out').exists() or not any((tmp_path / 'out').iterdir())

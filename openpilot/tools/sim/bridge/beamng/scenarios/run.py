@@ -579,6 +579,7 @@ def main():
   if args.name is None:
     ap.error("name a scenario")
 
+  score.parse_expect(args.expect)  # an unknown expectation is refused before anything is written or the game is touched
   plan = build(args.name, data_path=args.data, entry=args.entry)
   moved = plan.notes.get('approach_m')
   if moved is not None and moved != SCENARIOS[args.name].approach_m:
@@ -603,7 +604,6 @@ def main():
     sweep_game(bargs.host, bargs.port)
     ui = start_ui_recording(os.path.join(run_dir, 'ui.mp4')) if args.record and not args.no_ui else None
     q: Queue = Queue()
-    score.parse_expect(args.expect)  # an unknown expectation is refused before the game is touched
     bridge = BeamNGBridge(cfg, scenario=Runner(plan, args.runs, run_dir, args.web.rstrip('/'), token, bargs.host, bargs.port,
                                                signal_tap=args.signal_tap == 'on', params=params, end_after_handback=args.end_after_handback,
                                                gas_press_at=args.gas_press_at, drop_detections_at=args.drop_detections_at, expect=args.expect))
