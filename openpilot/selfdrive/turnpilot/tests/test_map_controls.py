@@ -966,3 +966,89 @@ def test_a_held_stop_signs_stop_point_moves_on_by_the_deciders_creep_on_the_map_
   car.lead_stop = None
   vs = [car.step(stop=StopCommand('wait'), creep=(3.0, CREEP_SPEED))[0] and car.v for _ in range(int(6. / DT_MDL))]
   assert max(vs) <= CREEP_SPEED + 1e-6
+
+
+# --- the stop-sign decider's map rows (STOP_SIGNS.md v3 SG4b) ---
+
+def released_through(car, release_key, seconds=25., **kw):
+  """The decider's 'clear' for release_key once, then the car on, the model driving (cruise), the decider waiting at whatever
+  holds it next."""
+  car.step(stop=StopCommand('wait'), release=(release_key, 'clear'), **kw)
+  return car.run_until(lambda out, dec: held(out, dec) and car.policy.held_control().key != release_key, max_s=seconds,
+                       stop=StopCommand('wait'))
+
+
+@pytest.mark.parametrize('gap', [15., 20., 30.])
+def test_G11_G18_a_clear_releases_its_own_line_only_and_the_next_line_stops_and_holds_the_car_on_its_own(gap):
+  # G11 (a divided road's two lines) and G18 (a frontage pair, 15-30 m apart): each node's own control, decision and latch;
+  # the decider's 'clear' at the first never span-releases the second (RELEASE_SPAN_M 30 m), which stops the car at its own
+  # line on the map curve and holds it there, its own key held, under the decider's wait
+  car = Car([(150., 'stop'), (150. + gap, 'stop')], v=8.)
+  first = stand_at(car, 150.)
+  car.run(1.5, stop=StopCommand('wait'))
+  car.cruise = 4.
+  out, dec = released_through(car, first.key)
+  second = car.policy.held_control()
+  assert second is not None and second.key != first.key and abs(150. + gap - car.s) < 5. and dec.should_stop
+  assert all(r[3] >= MAP_DECEL_MAX - 1e-6 for r in car.rows)
+  # held there under the decider's wait, no 1 s handback
+  out, dec, _ = car.run(3., stop=StopCommand('wait'))
+  assert held(out, dec) and out.prompt == 'none'
+
+
+def test_G13_a_stop_line_far_back_is_where_the_car_stops_and_decides_no_second_pull_up():
+  # the OSM stop node's or the survey's line is the control's stop point (navd's d): a line set back 20 m from the junction
+  # node stops the car there, latched, and it stays there while the decider waits (no creep it didn't ask for)
+  car = Car([(150., 'stop', True)])
+  c = stand_at(car, 150.)
+  s_held = car.s
+  assert c.line_mapped and abs(150. - s_held) < 3.
+  out, dec, _ = car.run(10., stop=StopCommand('wait', "Waiting: a car from the left", 'waitingCross'))
+  assert dec.should_stop and out.shown.action == 'waitingCross' and car.s - s_held < 0.05 and out.shown.line_mapped
+
+
+@pytest.mark.parametrize('past', [1.5, 3.0])
+def test_G14_the_latch_holds_the_car_only_within_its_reach_past_the_line_and_beyond_it_is_an_overrun(past):
+  # the pessimistic end: the decider measures commit, creep and the band from the closest plausible edge, from where the
+  # latch holds it, and the latch holds only up to LATCH_PAST_M past the stop point: a car (its model, not TurnPilot) braking
+  # late from 2 m/s to stand 1.5 m past the line is held there; 3 m past, it is an overrun, said, never a hold in the junction
+  from openpilot.selfdrive.turnpilot.map_controls import LATCH_PAST_M
+  car = Car([(30., 'stop')], v=2., cruise=2.)
+
+  def accel(c):
+    return 0. if c.s < 30. else -2. ** 2 / (2. * past) if c.v > 0. else 0.
+  for _ in range(int(20. / DT_MDL)):
+    car.step(accel=accel(car))
+  held_rows = [r for r in car.rows if r[4].should_stop and r[5].shown is not None and r[5].shown.action == 'held']
+  if past <= LATCH_PAST_M:
+    assert held_rows and abs(car.s - 30. - past) < 0.3 and car.policy.held_control() is not None
+  else:
+    assert not held_rows and any(r[5].alert == 'stopOverrun' for r in car.rows) and car.policy.held_control() is None
+
+
+@pytest.mark.parametrize('grade', [0., 0.2])
+def test_G20_a_stop_just_past_a_crest_on_a_downhill_engages_from_the_map_and_lands_in_the_latch_window(grade):
+  # the map distance is known before the crest (the stop engages at engage_distance, whatever the camera sees over it), and
+  # the -1.5 curve is an accel target: the car's longitudinal control holds it against the hill (openpilot's long control
+  # closes on aEgo), here with grade m/s^2 of the hill left over in its lag; it stops within the latch's window and is held,
+  # nothing commanded below MAP_DECEL_MAX and no overrun
+  car = Car([(200., 'stop')], v=11.)
+  orig = car.step
+
+  def step(*a, **kw):
+    out, dec, cmd = orig(*a, **kw)
+    if not dec.should_stop and car.v > 0.:
+      car.v += grade * DT_MDL
+    return out, dec, cmd
+  car.step = step
+  engaged = None
+  for _ in range(int(40. / DT_MDL)):
+    out, dec, _ = car.step()
+    if engaged is None and out.stops:
+      engaged = 200. - car.s
+    if held(out, dec):
+      break
+  assert engaged is not None and engaged > 40.  # well before a crest 20 m short of the line
+  assert held(out, dec) and -2. < 200. - car.s < 5. and all(r[3] >= MAP_DECEL_MAX - 1e-6 for r in car.rows)
+  assert not any(r[5].alert == 'stopOverrun' for r in car.rows)
+
