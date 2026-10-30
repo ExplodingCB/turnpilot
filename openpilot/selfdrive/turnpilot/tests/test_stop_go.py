@@ -1476,3 +1476,33 @@ def test_ledger_a_static_cause_that_flickers_still_meets_its_bound(tmp_path):
   out = w.run(25.)
   h3 = next((k for k, d in enumerate(out) if d.fault == 'H3'), None)
   assert first_go(out) is None and h3 is not None and h3 * DT_MDL <= 1.0 + STATIC_WAIT_S * 1.6
+
+
+# ------------------------------------------------------------------------------------- SG4b: the social cases' sg rows
+
+def one_way(contraflow=False, maneuver='straight', **kw):
+  """test_certify's junction with a one-way cross road whose traffic comes from the right and leaves to the left: the left leg
+  only outbound (cars leave by it), the right only inbound; contraflow: a contraflow bike lane on the left leg (cyclability
+  both, junctionInfo bikeLane), cyclists coming in from the left."""
+  j = junction(maneuver=maneuver, **kw)
+  for a in j.approaches:
+    if sr.effective_role(a) == 'left':
+      a.inbound, a.lanes_in, a.bike_lane = False, 0, contraflow
+    elif sr.effective_role(a) == 'right':
+      a.outbound, a.lanes_out = False, 0
+  return j
+
+
+def test_G9_a_one_way_cross_road_from_the_right_has_its_lane_where_the_road_is_never_a_lane_further_out():
+  # its traffic is in the cross road's only lane, the near one: placed a lane further out (lane_offsets index 2) it read 3 m
+  # more s, so every bearing-only reach (frame edge, table, occluder) and a track's distance came out long, the wrong end
+  from openpilot.selfdrive.turnpilot.routing.certify import cross_lanes
+  j = one_way()
+  edges = sr.edge_band(j.stop_point_distance, cross_lanes(j), LANE_EDGE)
+  lanes = {(ln.role, ln.index): ln for ln in junction_lanes(j, 'straight', 1.9, LANE_EDGE)}
+  assert ('left', 1) not in lanes  # only its legal approach conflicts for cars
+  near = sr.lane_offsets(edges, 1.9, 1)
+  assert (lanes[('right', 1)].s_min, lanes[('right', 1)].s_max) == pytest.approx(near)
+  # the opposite approach's lanes start past the one-way's single lane, not past two
+  two = {(ln.role, ln.index): ln for ln in junction_lanes(junction(), 'straight', 1.9, LANE_EDGE)}
+  assert lanes[('opposite', 1)].s_min == pytest.approx(two[('opposite', 1)].s_min - sr.LANE_STEP_MIN_M)

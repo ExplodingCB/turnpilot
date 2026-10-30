@@ -418,7 +418,11 @@ def conflict_lanes(j: Junction, maneuver: str, edges: Edges, setback: float, yaw
   moves = conflict_movements(j, maneuver, yaw_deg)
   left = next((a for a in j.approaches if effective_role(a) == 'left' and a.inbound), None)
   right_any = next((a for a in j.approaches if effective_role(a) == 'right'), None)
-  n_near = max(left.lanes_in, 1) if left is not None else max(right_any.lanes_out, 1) if right_any is not None else 1
+  # the near lanes carry traffic from the left: with none coming in from the left they are the right road's outbound lanes,
+  # and a right road no car leaves by (a one-way from the right, G9) has none: its own lanes are the cross road's nearest
+  # (counting a near lane that isn't there put them a lane further out, every bearing-only reach long by 3 m of s)
+  n_near = max(left.lanes_in, 1) if left is not None else \
+    (max(right_any.lanes_out, 1) if right_any.outbound else 0) if right_any is not None else 1
   n_cross = n_near + (max(right_any.lanes_in, 1) if right_any is not None and right_any.inbound else 0)
   out = []
   for m in moves:
