@@ -4,7 +4,8 @@ from unittest import mock
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_ACCEL_MIN as MAP_DECEL_MAX, plan_accel
 from openpilot.selfdrive.turnpilot.route_follower import NOMINAL_ANGLE_DEG, Maneuver, classify
-from openpilot.selfdrive.turnpilot.scene_policy import (ACCEL_CAP_JERK, COMMIT_SPEED, CONFIRM_HITS, CROSSWALK_LEAVING_FRAMES, GAS_RELEASE_M, HOLD_LINE_M,
+from openpilot.selfdrive.turnpilot.scene_policy import (ACCEL_CAP_JERK, COMMIT_SPEED, CONFIRM_HITS, CROSSWALK_LEAVING_FRAMES, GAS_RELEASE_M, HARD_MISSED_RUNS,
+                                                        HOLD_LINE_M, LOST_CLOSE_M,
                                                         NO_ACCEL_CAP, NO_SPEED_CAP, ONCOMING_ASSUMED_SPEED, ONCOMING_ENTRY_M, ONCOMING_TTA_S,
                                                         PED_STOP_GAP_M, STOP_DECEL, VEL_TRUST_HITS, ScenePolicy, Stop, scene_policy)
 from openpilot.selfdrive.turnpilot.tests.synthetic import scene
@@ -295,7 +296,8 @@ def test_cyclist_riding_away_is_followed():
   assert moving.reason == "following pedestrian" and not moving.should_stop
   assert moving.accel_cap > standing.accel_cap and moving.speed_cap > standing.speed_cap
   sp = ScenePolicy()
-  v, s, ds = drive(sp, int(30. / DT_MDL), 25., 0., lambda s, t: (ped(60. + 6. * t - s, 0.2, vx=6., in_path=True),))
+  # matched on every detector run (10 Hz): confirmation is re-earned every frame from recent hits (update_evidence)
+  v, s, ds = drive(sp, int(30. / DT_MDL), 25., 0., lambda s, t: (ped(60. + 6. * t - s, 0.2, vx=6., in_path=True, age=10 + int(t / 0.1)),))
   gap = 60. + 6. * 30. - s
   assert not any(d.should_stop for d in ds) and abs(v - 6.) < 0.5 and PED_STOP_GAP_M < gap < PED_STOP_GAP_M + 6. * 3.
 
@@ -719,3 +721,93 @@ def test_a_standing_car_a_latch_holds_is_never_committed_by_a_reading():
   sp = ScenePolicy()
   sp.update([], True, LEFT_TURN, ONCOMING_ENTRY_M - 0.2, 0., maneuver_id=4)
   assert sp.committed_id == 4
+
+
+def _burst_run(hits, x0=14., v0=10., conf=0.7, lost_at=None, misses=(), secs=6.):
+  """A stationary in-path person x0 m ahead on the road camera at 10 Hz through the real SceneTracker and ScenePolicy, the car
+  taking the plan's brake (the car's own floor -3.5): detected on the first `hits` detector runs (all of them with None), or
+  while it is further than lost_at m, skipping the runs in misses. Returns ([(s since the last detection, plan accel, v,
+  hard_brake, m to the person)] of every frame, hard_brake events)."""
+  from openpilot.cereal import messaging
+  from openpilot.common.transformations.camera import DEVICE_CAMERAS
+  from openpilot.selfdrive.turnpilot.detector.decoder import PERSON
+  from openpilot.selfdrive.turnpilot.scene.tests.test_tracker import calibration, car_state, detections
+  from openpilot.selfdrive.turnpilot.scene.tracker import SceneTracker
+  tr, sp, cal = SceneTracker(DEVICE_CAMERAS[('mici', 'os04c10')], 'mici'), ScenePolicy(), calibration()
+  v, s, t, run, last, rows = v0, 0., 0., 0, None, []
+  with mock.patch('openpilot.selfdrive.turnpilot.scene_policy.cloudlog') as log:
+    for k in range(int(secs / DT_MDL)):
+      t += DT_MDL
+      s += v * DT_MDL
+      x = x0 - s
+      if k % 2 == 0:
+        run += 1
+        seen = (hits is None or run <= hits) and (lost_at is None or x > lost_at) and run not in misses and x > 0.5
+        if seen:
+          last = t
+        tr.update(detections(tr, 'road', t, [(PERSON, x, 0.2, conf)] if seen else [], frame_id=run), cal, car_state(v), now=t)
+      msg = messaging.new_message('turnpilotScene')
+      tr.available = True
+      tr.fill_scene(msg.turnpilotScene)
+      sc = msg.as_reader().turnpilotScene
+      d = sp.update(sc.objects, sc.available, None, 1000., v)
+      a = plan_accel(d.accel_cap, d.speed_cap, v)
+      rows.append((t - last if last is not None else -1., a, v, d.hard_brake, x))
+      v = max(v + max(min(a, 0.), -3.5) * DT_MDL, 0.)
+  return rows, [c.kwargs for c in log.event.call_args_list if c.args[0] == "turnpilot.hard_brake"]
+
+
+def test_a_phantom_burst_the_tracker_coasts_on_never_brakes_hard_once_unseen():
+  # skeptic G1 (residual): a stationary in-path 'person' at 0.7 on 5-8 detector runs from 14 m, then never seen, car at 10 m/s.
+  # The tracker keeps a close one published CLOSE_HOLD_S and ScenePolicy kept its confirmation while published, so every frame
+  # below -2.0 came after the last detection, for up to 1.65 s (worst -5.5 to -8.25). Now the hard tier needs the detector
+  # still matching it (HARD_MISSED_RUNS): below -2.0 only within that many missed runs of its last detection, the stop
+  # itself still on the curve
+  window = (HARD_MISSED_RUNS + 1) * 2 * DT_MDL + 1e-6
+  for hits in (5, 6, 8):
+    rows, events = _burst_run(hits)
+    hard = [r for r in rows if r[1] < MAP_DECEL_MAX - 1e-6]
+    assert all(0. <= r[0] <= window for r in hard), (hits, hard[-1:])
+    assert all(r[1] >= MAP_DECEL_MAX - 1e-6 and not r[3] for r in rows if r[0] > window), hits
+    assert len(events) <= 1, hits
+  # under CONFIRM_HITS it never brakes hard at all
+  rows, events = _burst_run(4)
+  assert min(r[1] for r in rows) >= MAP_DECEL_MAX - 1e-6 and not events
+
+
+def test_a_person_seen_on_every_run_keeps_the_hard_stop_through_a_short_dropout():
+  # a real person in the path, seen on every run but two in a row (HARD_MISSED_RUNS): the hard stop holds through the dropout
+  rows, events = _burst_run(None, x0=20., v0=10., misses=(9, 10))
+  hard_t = [k for k, r in enumerate(rows) if r[3]]
+  assert hard_t and len(events) == 1
+  assert all(rows[k][3] for k in range(hard_t[0], hard_t[-1] + 1))  # never lapsed between its first and last frame
+  assert min(r[1] for r in rows) < MAP_DECEL_MAX - 1.
+
+
+def test_a_person_lost_at_the_stop_point_keeps_the_hard_stop_while_the_tracker_holds_them():
+  # a real person seen on every run until they drop out of view within LOST_CLOSE_M (they fill the frame or leave it: the
+  # BeamNG mannequin at 5.3 m), the car still moving: the hard tier stays while the tracker keeps them (CLOSE_HOLD_S)
+  rows, events = _burst_run(None, x0=16., v0=12., lost_at=5.)
+  lost = [r for r in rows if r[0] > (HARD_MISSED_RUNS + 1) * 2 * DT_MDL + 1e-6 and r[2] > 0.5 and r[4] > 0.5]
+  assert lost and all(r[1] < MAP_DECEL_MAX - 1e-6 and r[3] for r in lost)
+  assert len(events) == 1
+
+
+def test_confirmation_lapses_with_missed_runs_and_comes_back_on_a_match():
+  sp, v = ScenePolicy(), 10.
+
+  def frame(age, missed, x=10.):
+    sc = scene([ped(x, 0.1, in_path=True, age=age, conf=0.9, trackId=3, missedRuns=missed)])
+    return sp.update(sc.objects, True, None, 1000., v)
+  for k in range(4):
+    frame(2 + 2 * k, 0)
+  assert sp.tracks[3].confirmed
+  frame(8, HARD_MISSED_RUNS)
+  assert sp.tracks[3].confirmed
+  d = frame(8, HARD_MISSED_RUNS + 1)
+  assert not sp.tracks[3].confirmed and not d.hard_brake and d.accel_cap == NO_ACCEL_CAP
+  frame(9, 0)
+  assert sp.tracks[3].confirmed
+  # last matched within LOST_CLOSE_M confirmed: kept while published, missed runs or not
+  frame(10, 0, x=LOST_CLOSE_M - 0.5)
+  assert frame(10, 12, x=LOST_CLOSE_M - 2.).hard_brake and sp.tracks[3].confirmed

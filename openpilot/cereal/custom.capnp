@@ -540,6 +540,9 @@ struct TurnpilotScene @0xf35cc4560bbf6ec2 {
     # STOP_SIGNS.md 1.3: the camera time of its last match (TurnpilotDetections.timestampEof, s), the stop-sign evidence's
     # clock (never turnpilotd's). view above is the pass of that match: sideLeft or sideRight for a side view's
     tSeen @13 :Float64;
+    # skeptic G1 (residual): forward runs of its camera since its last match (0 matched on the latest), so a hard stop rests on
+    # a detection the detector still makes, not on a coast (scene_policy: HARD_MISSED_RUNS); a stalled detector counts none
+    missedRuns @14 :UInt8;
   }
   available @0 :Bool;          # false when detections are stale; never read as "nothing there"
   objects @1 :List(TrackedObject);

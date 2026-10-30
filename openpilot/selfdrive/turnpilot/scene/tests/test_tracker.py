@@ -577,3 +577,32 @@ def test_a_forward_runs_stop_sign_boxes_come_with_their_bearing_elevation_and_co
   assert abs(conf - 0.8) < 1e-6
   trk.update(detections(trk, 'road', 1.1, [(CAR, 20., 0., 0.6)], frame_id=1), cal, car_state(), now=1.1)
   assert trk.raw.signs == ()
+
+
+def test_a_track_counts_the_forward_runs_of_its_camera_it_missed():
+  # skeptic G1 (residual): scene_policy's hard tier needs the detector still matching a track (TrackedObject.missedRuns), not a
+  # coast. A miss is a forward run of its camera, or of the wide camera (it sees what the road camera does), that didn't match
+  # it: a match resets the count, a side view's run isn't one, and a stalled detector (no runs) counts none
+  trk = SceneTracker(CAMS, 'mici')
+  cal = calibration()
+  for i in range(3):
+    trk.update(detections(trk, 'road', 1. + 0.1 * i, [(PERSON, 12., 0.2, 0.8)], frame_id=i), cal, car_state(), now=1. + 0.1 * i)
+
+  def missed():
+    msg = messaging.new_message('turnpilotScene')
+    trk.fill_scene(msg.turnpilotScene)
+    return [o.missedRuns for o in msg.as_reader().turnpilotScene.objects]
+  assert missed() == [0]
+  trk.update(detections(trk, 'road', 1.3, [], frame_id=3), cal, car_state(), now=1.3)
+  trk.update(detections(trk, 'road', 1.35, [], frame_id=4), cal, car_state(), now=1.35)
+  assert missed() == [2]
+  side = messaging.new_message('turnpilotDetections')
+  fill_detections(side.turnpilotDetections, np.zeros((0, 6), dtype=np.float32), 5, int(1.38e9), 'wide', 0.005)
+  side.turnpilotDetections.view = 'sideLeft'
+  trk.update(side.as_reader().turnpilotDetections, cal, car_state(), now=1.38)
+  trk.update(None, cal, car_state(), now=1.45)
+  assert missed() == [2]
+  trk.update(detections(trk, 'wide', 1.46, [], frame_id=6), cal, car_state(), now=1.46)
+  assert missed() == [3]
+  trk.update(detections(trk, 'road', 1.5, [(PERSON, 12., 0.2, 0.8)], frame_id=7), cal, car_state(), now=1.5)
+  assert missed() == [0]

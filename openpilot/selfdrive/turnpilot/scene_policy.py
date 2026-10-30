@@ -8,8 +8,9 @@ curve can't make it. shouldStop is only set at the stop point near standstill, b
 state ignores the accel target and ramps the brakes on its own.
 
 A track is evidence, not fact: a stop that needs harder braking than the curve only gets it from a confirmed track
-(enough hits at a high enough confidence, or many hits at any, CONFIRM_RECENT_HITS of them in the last CONFIRM_WINDOW_S,
-and published on every frame since: ScenePolicy.update_evidence), so a two-hit false positive slows the car on the curve
+(enough hits at a high enough confidence, or many hits at any, CONFIRM_RECENT_HITS of them in the last CONFIRM_WINDOW_S on
+every frame, the detector still matching it, and published on every frame since: ScenePolicy.update_evidence), so a
+two-hit false positive, or a burst the tracker coasts on, slows the car on the curve
 instead of stopping it hard, and the accel cap ramps in at a bounded jerk rather than stepping. A confirmed person moving
 along the path is followed like a lead, not stopped for, and one on a confirmed, moving bicycle or motorcycle is its
 rider, left to the driving model like any vehicle; an unconfirmed track's velocity is mostly range noise, so it never
@@ -45,7 +46,8 @@ Hard braking (Kellen, 2026-10-28: confirmed in-path pedestrian and oncoming stop
 careful, phantom emergency braking is really dangerous"). Only these stops ever ask for more than -2.0 m/s^2, the floor
 of every map, light and speed-cap stop, and only from a confirmed track: CONFIRM_HITS matched detections at CONFIRM_CONF
 or more, or CONFIRM_STEADY_HITS at any (a track starts only at the tracker's NEW_TRACK_CONF), CONFIRM_RECENT_HITS of them within
-CONFIRM_WINDOW_S and the track published on every frame since (a phantom seen once a second never confirms), ranged (the tracker
+CONFIRM_WINDOW_S, kept only while that still holds and the detector still matches it (HARD_MISSED_RUNS, LOST_CLOSE_M: a coast
+is no detection) and the track is published (a phantom seen once a second never confirms), ranged (the tracker
 publishes only tracks with a ground position), in the path (in_path), or for the oncoming hold also VEL_TRUST_HITS so
 its motion is the tracker's, not range noise. A track the tracker published for one detector frame (MIN_HITS) or a
 few never does: its stop brakes on the comfortable curve (no accel cap, a speed cap no lower than STOP_DECEL takes).
@@ -81,6 +83,17 @@ CONFIRM_STEADY_HITS = 10    # or this many at any: a person YOLO sees at 0.45-0.
 # 1 Hz) built up 5-12 hits, never braked between them, then on one new frame asked for -2.6 to -8.8 m/s^2 cold
 CONFIRM_RECENT_HITS = 5
 CONFIRM_WINDOW_S = 1.0
+# ...and only while the detector still sees it (skeptic G1 residual): a confirmed track keeps the hard tier only while it is
+# steady (the above, on every frame) and has missed no more than HARD_MISSED_RUNS forward runs of its camera since its last
+# match (TrackedObject.missedRuns: a stalled detector misses none). A 5-6 frame phantom at 14 m, then never seen, was kept
+# published by the tracker's CLOSE_HOLD_S and braked at -5.5 to -8 m/s^2 for up to 1.65 s after its last detection. The
+# stop itself stays (the comfortable curve) as long as the tracker publishes it. One exception, LOST_CLOSE_M: a track whose
+# last match was this close (camera to person: within a metre of its stop point, PED_STOP_GAP_M), in the path, confirmed
+# then, keeps the hard tier while the tracker keeps it (CLOSE_HOLD_S): a real person there leaves the frame or fills it (the
+# BeamNG mannequin was lost at 5.3 m), and the car still moving there needs every bit of braking. Owner's call (Kellen):
+# HARD_MISSED_RUNS 0 is the strictest, LOST_CLOSE_M 0 drops the exception
+HARD_MISSED_RUNS = 2
+LOST_CLOSE_M = 6.               # m: PED_STOP_GAP_M plus a metre
 
 PATH_HALF_WIDTH_M = 1.5     # corridor around the car's axis for objects the tracker hasn't flagged inPath
 NEAR_PATH_M = 15.           # ...used for anything this close ahead
@@ -368,7 +381,8 @@ class TrackEvidence:
   seen_t: float = 0.                            # ScenePolicy.t when last seen
   recent: deque = field(default_factory=deque)  # times of its hits in the last RECENT_S
   earned: bool = False                          # confirmed_track() with CONFIRM_RECENT_HITS recent hits, once
-  confirmed: bool = False                       # earned a hard stop, published on every frame since (or steady again)
+  confirmed: bool = False                       # earned a hard stop, and steady and seen now (update_evidence)
+  hit_x: float = math.inf                       # m ahead at its last new hit (LOST_CLOSE_M)
   walker: bool = False                          # earned a crosswalk hold
   leaving: int = 0                              # frames in a row leaving the turn's crosswalk
 
@@ -481,13 +495,15 @@ class ScenePolicy:
     """This frame's tracks into their evidence. A track missing from this frame keeps its evidence for KEEP_EVIDENCE_S:
     the tracker stops publishing a track it hasn't matched for a moment, and may match it again under the same id. An id
     back with fewer hits than it had is another track (a restarted tracker), and starts afresh.
-    Confirmation (a hard stop) needs confirmed_track() and CONFIRM_RECENT_HITS in the last CONFIRM_WINDOW_S, and is lost
-    once the track is missing from a frame: the tracker stopped publishing it (no hit for MAX_COAST_S; a close pedestrian
-    in the path stays published CLOSE_HOLD_S). A track back from that is confirmed again once it has CONFIRM_RECENT_HITS
-    in the window (its confidence then needn't be CONFIRM_CONF again), which one occluded for half a second has at once
-    and a 1 Hz phantom never does. For confirmation a track's hits at first sight count as recent ones then
-    (the tracker publishes a track from MIN_HITS on, so a real one is first seen with two); the crosswalk's steady hits
-    count only those seen since."""
+    Confirmation (a hard stop) needs confirmed_track() once and, on every frame, CONFIRM_RECENT_HITS in the last
+    CONFIRM_WINDOW_S and no more than HARD_MISSED_RUNS missed forward runs since its last match (skeptic G1 residual: a
+    coasting track is no detection), but for a track last matched within LOST_CLOSE_M confirmed (it keeps it while
+    published: a person that close leaves the frame); and it is lost once the track is missing from a frame: the tracker
+    stopped publishing it (no hit for MAX_COAST_S; a close pedestrian in the path stays published CLOSE_HOLD_S, its stop
+    on the comfortable curve). A track back from that is confirmed again once it has CONFIRM_RECENT_HITS in the window (its
+    confidence then needn't be CONFIRM_CONF again), which one occluded for half a second has at once and a 1 Hz phantom
+    never does. For confirmation a track's hits at first sight count as recent ones then (the tracker publishes a track
+    from MIN_HITS on, so a real one is first seen with two); the crosswalk's steady hits count only those seen since."""
     tracks = {tid: ev for tid, ev in self.tracks.items() if self.t - ev.seen_t <= KEEP_EVIDENCE_S}
     present = {obj.trackId for obj in objects}
     for tid, ev in tracks.items():
@@ -496,15 +512,19 @@ class ScenePolicy:
     for obj in objects:
       ev = tracks.get(obj.trackId)
       if ev is None or obj.age < ev.hits:
-        ev = TrackEvidence(obj.age, self.t, obj.age)
+        ev = TrackEvidence(obj.age, self.t, obj.age, hit_x=float(obj.x))
+      elif obj.age > ev.hits:
+        ev.hit_x = float(obj.x)
       ev.recent.extend([self.t] * max(obj.age - ev.hits, 0))
       ev.hits, ev.seen_t = obj.age, self.t
       while ev.recent and ev.recent[0] <= self.t - RECENT_S:
         ev.recent.popleft()
       first = ev.first_hits if self.t - ev.first_t < CONFIRM_WINDOW_S else 0
       steady = first + self.recent_hits(ev, CONFIRM_WINDOW_S) >= CONFIRM_RECENT_HITS
+      seen = int(getattr(obj, 'missedRuns', 0)) <= HARD_MISSED_RUNS
       ev.earned = ev.earned or (confirmed_track(obj) and steady)
-      ev.confirmed = ev.confirmed or (ev.earned and steady)
+      lost_close = ev.confirmed and ev.hit_x < LOST_CLOSE_M
+      ev.confirmed = ev.earned and ((steady and seen) or lost_close)
       ev.walker = ev.walker or (crosswalk_walker(obj) and self.recent_hits(ev, CROSSWALK_STEADY_S) >= CROSSWALK_STEADY_HITS)
       tracks[obj.trackId] = ev
     self.tracks = tracks

@@ -197,6 +197,7 @@ class Track:
   bearing_seen: float | None = None  # deg left of the calibrated axis of its last match's bottom centre (stop_evidence.py)
   width_seen: float = 0.             # px, its last match's box width in its camera's frame
   span_seen: tuple | None = None     # (right edge, left edge) bearings of its last match's bottom (visibility.py's occluders)
+  misses: int = 0                    # forward runs of its camera since its last match (TrackedObject.missedRuns)
 
   @property
   def cls(self) -> int:
@@ -327,6 +328,7 @@ class SceneTracker:
     trk.box, trk.box_seen, trk.camera, trk.t_seen, trk.conf = m.box, m.box, camera, t, m.conf
     trk.class_votes[m.cls] = trk.class_votes.get(m.cls, 0.0) + m.conf
     trk.hits += 1
+    trk.misses = 0
     trk.view = view
     trk.bearing_seen, trk.width_seen, trk.span_seen = m.bearing, float(m.box[2] - m.box[0]), m.span
     if m.xy is None:
@@ -412,6 +414,14 @@ class SceneTracker:
         self.predict(trk, t, v_ego, yaw_rate)
       meas = [m for m in (self.measure(d, camera, calibration) for d in detections.detections if int(d.cls) in OBJECT_CLASS) if m.plausible]
       pairs, unmatched = self.associate(meas, camera)
+      matched = {i for i, _ in pairs}
+      if not view.startswith('side'):
+        # a forward run that could have matched it and didn't: a miss. Its own camera's, or the wide camera's, which sees all
+        # the road camera does (a turn holds the wide camera WIDE_HOLD_S); a side view's never, nor the road camera's for a
+        # wide track (it may be outside the road camera's view)
+        for i, trk in enumerate(self.tracks):
+          if i not in matched and camera in (trk.camera, 'wide'):
+            trk.misses += 1
       for i, j in pairs:
         self.correct(self.tracks[i], meas[j], camera, t, view)
       for j in unmatched:
@@ -562,4 +572,5 @@ class SceneTracker:
       o.camera = Camera.wide if trk.camera == 'wide' else Camera.road
       o.view, o.farHits = getattr(View, trk.view, View.full), trk.far_hits
       o.tSeen = float(trk.t_seen)
+      o.missedRuns = min(trk.misses, 255)
       o.box = [float(np.clip(v / s, 0, 1)) for v, s in zip(trk.box_seen, (w, h, w, h), strict=True)]
