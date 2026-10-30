@@ -783,3 +783,52 @@ def test_a_side_pkl_is_checked_at_load():
                           ({'metadata': meta, 'input_specs': side_input_specs(1344, 760, 'AMD')}, size + 128)):
     with pytest.raises(ValueError):
       check_side_specs(art, frame_size)
+
+
+def test_the_side_views_maps_and_warm_up_are_on_the_frames_device(monkeypatch, tmp_path):
+  """BUILD_FINDINGS N4: every diag run's modeld logged 'turnpilot side views failed to load', a tinygrad JitError: the compiled
+  side pkl's inputs and the wide frame on the sim host's AMD eGPU, the warm-up's blank maps made on tinygrad's default device
+  (METAL). With no side views every sim stop sign ended 'Stop-sign go off: no camera measurements'. The warm-up's blanks and
+  every view's maps (upload_maps) go on the frame's device, and a pkl compiled for another device is refused at load, said."""
+  from types import SimpleNamespace
+  from tinygrad import Device, Tensor
+  import tinygrad.engine.realize as realize
+  from openpilot.selfdrive.turnpilot.detector import modeld_detector as md
+  from openpilot.selfdrive.turnpilot.detector.graph import side_input_specs
+  from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
+  frame_dev = next(d for d in ('CPU', 'PYTHON') if d != Device.DEFAULT)  # never tinygrad's default here
+  stride, y_height, uv_height, _ = get_nv12_info(1344, 760)
+  size = stride * (y_height + uv_height)
+  frame = Tensor(np.zeros(size, np.uint8), device=frame_dev).realize()
+
+  class DeviceRecordingRun:
+    def __init__(self):
+      self.captured, self.devices = SimpleNamespace(_linear=[]), []
+
+    def __call__(self, input_frame, luma_idx, chroma_idx, weights):
+      self.devices.append({Device.canonicalize(t.device) for t in (input_frame, luma_idx, chroma_idx, weights)})
+      return FakeOutput(np.zeros((1, 300, 6), np.float32))
+
+  def art(device):
+    return {'metadata': {'kind': 'side', 'camera_size': (1344, 760), 'input_size': (768, 512)},
+            'input_specs': side_input_specs(1344, 760, device), 'run': DeviceRecordingRun()}
+
+  pkl = tmp_path / 'side.pkl'
+  pkl.write_bytes(b'')
+  loaded = {}
+  monkeypatch.setattr(md, 'side_detector_pkl_path', lambda *a: pkl)
+  monkeypatch.setattr(md, 'frame_view', lambda state, index: frame)
+  monkeypatch.setattr(realize, 'lower_and_compile', lambda linear: linear)
+  import openpilot.selfdrive.modeld.helpers as helpers
+  monkeypatch.setattr(helpers, 'load_oob', lambda path, chestnut: loaded['art'])
+  state = SimpleNamespace(chestnut=True, frame_copy_size=size)
+  loaded['art'] = art(frame_dev)
+  side = md.load_side(state, 1344, 760, 1, None)
+  assert side is not None, "loaded"
+  assert loaded['art']['run'].devices and all(d == {frame_dev} for d in loaded['art']['run'].devices), loaded['art']['run'].devices
+  maps = side.upload('sideLeft', SimpleNamespace(luma_idx=np.zeros(4, np.int32), chroma_idx=np.zeros(4, np.int32),
+                                                 weights=np.zeros((3, 4), np.uint8)))
+  assert all(Device.canonicalize(t.device) == frame_dev for t in maps)
+  # compiled for another device than the frame's: refused at load, logged, never run
+  loaded['art'] = art(Device.DEFAULT)
+  assert md.load_side(state, 1344, 760, 1, None) is None and not loaded['art']['run'].devices

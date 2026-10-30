@@ -348,20 +348,39 @@ class FarCrop:
       self.disable(f"pushed the step past {STEP_BUDGET_S * 1e3:.0f} ms {sum(self.overruns)} times in {len(self.overruns)} runs")
 
 
-def upload_maps(name: str, side_map: SideMap) -> tuple:
-  """A side view's maps on the device, as its graph takes them (luma_idx, chroma_idx, weights)."""
+def upload_maps(name: str, side_map: SideMap, device: str | None = None) -> tuple:
+  """A side view's maps on device (the wide frame's: SideViews.frame_device; None, tinygrad's default), as its graph takes them
+  (luma_idx, chroma_idx, weights). On another device than the frame's the compiled graph refuses them (BUILD_FINDINGS N4: a
+  JitError on the sim host, the frame on its AMD eGPU, the maps on METAL)."""
   from tinygrad import Tensor
-  return tuple(Tensor(a).realize() for a in (side_map.luma_idx, side_map.chroma_idx, side_map.weights))
+  return tuple(Tensor(a, device=device).realize() for a in (side_map.luma_idx, side_map.chroma_idx, side_map.weights))
+
+
+def blank_maps(device: str | None = None) -> tuple:
+  """A view's maps of zeros on device, for the side graph's warm-up at load."""
+  n = SIDE_INPUT_SIZE[0] * SIDE_INPUT_SIZE[1]
+  return upload_maps('blank', SideMap(np.zeros(n, np.int32), np.zeros(n, np.int32), np.zeros((3, n), np.uint8)), device)
+
+
+def check_side_device(art: dict, device: str) -> None:
+  """The side pkl's inputs (input_specs, graph.side_input_specs: compile_detector writes the device it compiled for) are on
+  device, the wide frame's. Raises ValueError otherwise: its jit would refuse every run."""
+  from tinygrad import Device
+  want = Device.canonicalize(device)
+  got = {Device.canonicalize(v[2]) for v in art['input_specs'].values() if len(v) > 2 and v[2]}
+  if got and got != {want}:
+    raise ValueError(f"side views compiled for {sorted(got)}, the wide frame is on {want}")
 
 
 class SideViews:
   """The stop sweep's side views (module docstring): their compiled graph run(input_frame=, luma_idx=, chroma_idx=,
   weights=), the wide frame's device view, their maps for the bus's calibration (geometry and its device copies),
   recomputed off the step by the executor, each view's own time estimate, and their budget for the drive."""
-  def __init__(self, run, cam_w: int, cam_h: int, frame, sm=None, executor=None, upload=None):
+  def __init__(self, run, cam_w: int, cam_h: int, frame, sm=None, executor=None, upload=None, frame_device: str | None = None):
     self.run, self.cam_w, self.cam_h, self.frame, self.sm = run, cam_w, cam_h, frame, sm
     self.executor = executor
-    self.upload = upload or upload_maps
+    self.frame_device = frame_device  # the wide frame's: every map the graph takes goes there (upload_maps)
+    self.upload = upload or (lambda name, side_map: upload_maps(name, side_map, self.frame_device))
     self.lens: Lens | None = None
     self.times: dict[str, deque] = {name: deque(maxlen=TIME_WINDOW) for name in SIDE_VIEWS}  # each view's estimate
     self.recent: deque[float] = deque(maxlen=TIME_WINDOW)    # every side run's time, for SIDE_BUDGET_S
@@ -884,7 +903,6 @@ def load_side(model_state, cam_w: int, cam_h: int, index: int, bus) -> SideViews
   """The side views on the wide camera, packed frame `index`, or None: no side pkl for this device (logged), or it failed
   to load (logged); the forward views run either way, and a sweep then runs only them (sideViewStatus off)."""
   try:
-    from tinygrad import Tensor
     from tinygrad.engine.realize import lower_and_compile
     from openpilot.selfdrive.modeld.helpers import load_oob
     path = side_detector_pkl_path(cam_w, cam_h, model_state.chestnut)
@@ -893,11 +911,12 @@ def load_side(model_state, cam_w: int, cam_h: int, index: int, bus) -> SideViews
       return None
     art = load_oob(path, model_state.chestnut)
     check_side_specs(art, model_state.frame_copy_size)
+    frame = frame_view(model_state, index)
+    check_side_device(art, frame.device)  # the maps and the warm-up go on the frame's device, never tinygrad's default
     run = art['run']
     run.captured._linear = lower_and_compile(run.captured._linear)
-    side = SideViews(run, cam_w, cam_h, frame_view(model_state, index), bus)
-    n = SIDE_INPUT_SIZE[0] * SIDE_INPUT_SIZE[1]
-    blank = (Tensor(np.zeros(n, np.int32)).realize(), Tensor(np.zeros(n, np.int32)).realize(), Tensor(np.zeros((3, n), np.uint8)).realize())
+    side = SideViews(run, cam_w, cam_h, frame, bus, frame_device=frame.device)
+    blank = blank_maps(side.frame_device)
     times = []
     for _ in range(3):  # warm up, and a first time estimate
       t0 = time.perf_counter()
