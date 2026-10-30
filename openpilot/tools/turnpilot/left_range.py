@@ -52,7 +52,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from openpilot.selfdrive.turnpilot.route_follower import LEFT
-from openpilot.selfdrive.turnpilot.scene.tracker import GROUND_GATE_FRAC, GROUND_GATE_M, iou, is_calibrated
+from openpilot.selfdrive.turnpilot.scene.tracker import GROUND_GATE_FRAC, GROUND_GATE_M, NEAR_PX, iou, is_calibrated
 from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_Y_FAR_M, ONCOMING_Y_NEAR_M, velocity_trusted
 from openpilot.selfdrive.turnpilot.turnpilotd import LEFT_RANGE_MAX_M
 from openpilot.selfdrive.turnpilot.unprotected_left import CLEAR_WINDOW_S, ROUTE_REACH_MARGIN_M, band_blockers, reach_at_line
@@ -99,9 +99,11 @@ class Sample:
   road_m: float = 0.  # confirmed range on the road camera's full pass, near_m
   road_why: str = ''
   road_gap_s: float = 0.
+  road_ground_m: float = 0.  # the ground range (hypot of the box's xy) of the road chain's farthest box: said, never used
   far_m: float = 0.   # ...on the full pass and the far crop together
   far_why: str = ''
   far_gap_s: float = 0.
+  far_ground_m: float = 0.
   boxes: frozenset = frozenset()  # (run index, box index) of its chain, to tell one car's two tracks apart
 
 
@@ -237,13 +239,14 @@ def in_band(boxes) -> list:
   return band_blockers(boxes, 0., LEFT, math.inf, 0.)
 
 
-def chain(runs: list[Run], seed: tuple, speed: float, ego: Ego, views: tuple) -> tuple[float, str, float, set]:
-  """(confirmed near_m, why it ends, s back to the run where it ended, its boxes as (run, box) indices) for the car whose
+def chain(runs: list[Run], seed: tuple, speed: float, ego: Ego, views: tuple) -> tuple[tuple[float, float], str, float, set]:
+  """((confirmed near_m, that box's ground range), why it ends, s back to the run where it ended, its boxes as (run, box)
+  indices) for the car whose
   box is seed (run index, box index, RawBox), closing at speed over the ground: back through the runs of these views
   (module docstring)."""
   i_seed, j_seed, last = seed
   last_t, last_log = runs[i_seed].t, runs[i_seed].t_log
-  far_m = last.near_m
+  far_box = last
   used = {(i_seed, j_seed)}
   seen_calibrated = seen_uncalibrated = False
   for i in range(i_seed - 1, -1, -1):
@@ -255,7 +258,7 @@ def chain(runs: list[Run], seed: tuple, speed: float, ego: Ego, views: tuple) ->
       continue
     if back > MAX_DROPOUT_S + 1e-6:
       why = 'unboxed' if seen_calibrated else 'uncalibrated' if seen_uncalibrated else 'noRuns'
-      return far_m, why, back, used
+      return (far_box.near_m, math.hypot(*far_box.xy)), why, back, used
     if r.frame is None:
       seen_uncalibrated = True
       continue
@@ -268,14 +271,14 @@ def chain(runs: list[Run], seed: tuple, speed: float, ego: Ego, views: tuple) ->
     hits = [(j, b) for j, b in enumerate(r.frame.boxes) if b.xy is not None and b.near_m is not None and in_band([b]) and
             abs(math.hypot(*b.xy) - rng) <= gate_m and abs(b.bearing_deg - bearing) <= gate_deg]
     if len(hits) > 1:
-      return far_m, 'ambiguous', 0., used
+      return (far_box.near_m, math.hypot(*far_box.xy)), 'ambiguous', 0., used
     if hits:
       j, last = hits[0]
       last_t, last_log = r.t, r.t_log
-      far_m = max(far_m, last.near_m)
+      far_box = last if last.near_m > far_box.near_m else far_box
       used.add((i, j))
       seen_calibrated = seen_uncalibrated = False
-  return far_m, 'logStart', 0., used
+  return (far_box.near_m, math.hypot(*far_box.xy)), 'logStart', 0., used
 
 
 def seeds(drive: Drive) -> list:
@@ -362,8 +365,8 @@ def measure(drive: Drive, allow_misses: bool = False) -> Result:
       missing += 1
       continue
     s = Sample(o.trackId, o.cls, t_log - (drive.t0 or 0.), -o.vx)
-    s.road_m, s.road_why, s.road_gap_s, used = chain(runs, found, s.speed, ego, ('full',))
-    s.far_m, s.far_why, s.far_gap_s, used_far = chain(runs, found, s.speed, ego, ('full', 'far'))
+    (s.road_m, s.road_ground_m), s.road_why, s.road_gap_s, used = chain(runs, found, s.speed, ego, ('full',))
+    (s.far_m, s.far_ground_m), s.far_why, s.far_gap_s, used_far = chain(runs, found, s.speed, ego, ('full', 'far'))
     s.boxes = frozenset(used | used_far)
     res.samples.append(s)
   res.facts['seeds_without_box'] = missing
@@ -431,6 +434,8 @@ def render(res: Result) -> list[str]:
     road = sorted(s.road_m for s in res.samples)
     out.append(f"  confirmed range on the road camera, near_m: shortest {road[0]:.0f} m, 5th percentile " +
                f"{np.percentile(road, 5):.0f} m, median {np.median(road):.0f} m, longest {road[-1]:.0f} m")
+    out.append(f"  (those boxes' own ground range, not used: median {np.median([s.road_ground_m for s in res.samples]):.0f} m; " +
+               f"near_m takes the box bottom {NEAR_PX:.0f} px lower, as the left's gap rule does)")
     out.append("  the shortest five:")
     out += [sample_line(s) for s in sorted(res.samples, key=lambda s: s.road_m)[:5]]
     if f.get('far'):
