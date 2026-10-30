@@ -274,6 +274,23 @@ def test_C1_V25_a_car_waiting_at_its_line_is_crossed_past_no_band_abort_no_h5(tm
   assert any(str(p.stopGo.state) == 'done' for p in plans) and sim.s > S_LINE + 15.
 
 
+def test_V9_V10_a_car_at_its_line_that_never_goes_is_a_deadlock_resolved_by_one_creep_and_our_go_no_handback(tmp_path):
+  # closed loop: a car stands at the left line from before our arrival and never takes its turn (a driver waving us
+  # through): one creep go (cause creep, certified for G5's lift) after DEADLOCK_S, then the stop-sign go with the order
+  # waived, and across with it still standing; never a handback (SG4a had H3 after 3 x DEADLOCK_S)
+  sim = StopSim(tmp_path, model='goes')
+  sim.tracks = lambda s: shield_tracks(s, 'left')
+  run_to_line(sim)
+  sim.run(25.)
+  plans = sim.plans()
+  causes = [str(p.goCertified.cause) for p in plans]
+  k = go_frame(sim)
+  assert 'creep' in causes and k is not None and causes.index('creep') < k
+  assert not any(p.controlPrompt == 'stopSignTakeControl' for p in plans)
+  assert any(str(p.stopGo.state) == 'done' for p in plans) and sim.s > S_LINE + 15.
+  assert all(p.accelCap >= -2. - 1e-9 for p in plans)
+
+
 def test_G18_a_second_stop_sign_20_m_on_never_takes_over_a_holding_encounter(tmp_path):
   # a frontage stop 20 m past the first, engaged while the car stands at the first: after a withdrawn go (the latch let go
   # with the 'clear') and after H5, the first junction's decider still holds the car and says its handback

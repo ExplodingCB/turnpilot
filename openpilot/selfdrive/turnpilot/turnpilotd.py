@@ -272,6 +272,7 @@ RELEASE_UNSIGNALIZED = False
 # the stop-sign decider's go causes (stop_go.py, go_override.CAUSES): its own watchdog (the gate, G5's window, GO_RETRIES, H5)
 # follows them, never the no-move clock, and turnRelease never certifies alongside one
 STOP_GO_CAUSES = ('stopSign', 'rollUp', 'creep', 'clearBox')
+OWN_CAP_TOL = 0.05  # m/s a creep go's own cap may be undercut (its ramp near its end) before something else's counts as a hold
 YAW20_M = 20.  # m of travel the approach yaw (go condition 3) is integrated over
 STOP_GO_HOLDS_PULSE = ('approach', 'stopped', 'rollUp', 'observe')  # the decider's states a turn's pulse waits for its go in
 
@@ -344,6 +345,7 @@ class TurnPilot:
     self._rf_ticked = self._yaw_ticked = False  # update() dead-reckoned the route, and counted the yaw, this frame
     self.go_override = GO_OVERRIDE_DEFAULT  # TurnPilotGoOverride (main())
     self.go_cert = GoCertifier()  # the go certified for plannerd's lift (go_override.py): its ids never repeat while this runs
+    self.go_own_cap: float | None = None  # m/s: a creep go's own creep cap, which isn't a hold that blocks it (go_blocked)
     self.sweeping = False  # the last plan asked modeld for a stop sweep (stopSweep, stopSweepGo): the tracker coasts longer
     self.sweep_on = False  # the held cycle is wanted (junction_watch.sweep_wanted: walking pace, with hysteresis)
     self.watch = JunctionWatch()  # step S3's evidence at the swept stop or yield (junction_watch.py): logged, never acted on
@@ -1062,7 +1064,8 @@ class TurnPilot:
     scene, a hold, a lead, the path) still apply. A go of its own still out (a roll-up's) ends first: one go at a time, each
     its own id and window. Uncertified (the param off, a blocker), the decider's go stands on the model alone; its watchdog
     withdraws it if the model never takes over."""
-    why = 'param' if not self.go_override else self.go_blocked(sm, cs, available, objects, raw, decision, took_over)
+    own = float(sg.creep[1]) if sg.go_cause == 'creep' and sg.creep is not None else None
+    why = 'param' if not self.go_override else self.go_blocked(sm, cs, available, objects, raw, decision, took_over, own)
     if why:
       cloudlog.event("turnpilot.go_not_certified", cause=sg.go_cause, why=why, blocker=path_blocker(objects, raw) if why == 'inPath' else '',
                      distance=round(-sg.position_m, 1))
@@ -1070,7 +1073,7 @@ class TurnPilot:
     if self.go_cert.active and self.go_cert.cause in STOP_GO_CAUSES:
       self.go_cert.withdraw('replaced')
     if self.go_cert.start(sg.go_cause, position=round(sg.position_m, 2), state=sg.state, retries=sg.retries):
-      self.go_lifted, self.go_cert_id = True, self.go_cert.id
+      self.go_lifted, self.go_cert_id, self.go_own_cap = True, self.go_cert.id, own
 
   def fill_stop_go(self, plan, sg: StopGoDecision, decision) -> None:
     """turnpilotPlan.stopGo, and the decider's prompt, reason and alert where the latch's (map_controls) say nothing: its wait
@@ -1128,15 +1131,17 @@ class TurnPilot:
     cloudlog.event("turnpilot.post_go", profile=name, unprotected=left, turned_deg=round(turned_deg, 1), distance=round(distance, 1),
                    at_line=at_line)
 
-  def go_blocked(self, sm, cs, available: bool, objects, raw, decision, took_over: bool) -> str:
+  def go_blocked(self, sm, cs, available: bool, objects, raw, decision, took_over: bool, own_cap: float | None = None) -> str:
     """Why TurnPilot's go can't be certified for plannerd's lift now, '' if it can (go_override.py): the driver on a pedal or
     disengaged, no live scene to see the path by, a hold of TurnPilot's in force (a walker's, a map stop's), a lead within
-    GO_CLEAR_M, or a road user in the path within it (path_blocker)."""
+    GO_CLEAR_M, or a road user in the path within it (path_blocker). own_cap: a creep go's own cap (the stop-sign decider's
+    deadlock creep, map_controls' creep path): that cap is what bounds the creep's move, so only shouldStop or a cap of
+    something else's below it is a hold."""
     if not sm['carControl'].enabled or took_over or cs.gasPressed or cs.brakePressed:
       return 'driver'
     if not available:
       return 'scene'
-    if decision.should_stop or decision.holding:
+    if decision.should_stop or (decision.holding and (own_cap is None or decision.speed_cap < own_cap - OWN_CAP_TOL)):
       return 'hold'
     if close_lead(sm['modelV2']):
       return 'lead'
@@ -1185,7 +1190,8 @@ class TurnPilot:
     gc = self.go_cert
     if not gc.active:
       return
-    why = 'handback' if not acting else self.go_blocked(sm, cs, available, objects, raw, decision, took_over)
+    own = self.go_own_cap if gc.cause == 'creep' else None
+    why = 'handback' if not acting else self.go_blocked(sm, cs, available, objects, raw, decision, took_over, own)
     if not why and gc.cause == 'unprotectedLeft' and (self.left_now is None or self.left_now.state not in LEFT_GO_STATES):
       why = 'left'
     if not why and gc.cause == 'turnRelease':

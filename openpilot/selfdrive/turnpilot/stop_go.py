@@ -26,8 +26,12 @@ decider computes would_go only (logged once a stop). Acting:
   4.6). All of them for CLEAR_S is the go: map_controls' latch let go (release, cause 'clear', no span release past it), G5's
   go (go_cause stopSign) and the stopGo chime. Waiting is silent (waitingForCross, its reason) with an info chime at
   WAIT_INFO_S and every WAIT_INFO_S after while dynamic; a static wait has STATIC_WAIT_S, then the ladder, which in this group
-  is H3 (its creep and other-turn rungs are SG4c's); an earlier arrival that holds its turn 3 x DEADLOCK_S is H3 (until SG4b's
-  deadlock creep); a junction the route already found uncertifiable is H3 right after the full stop (7.1).
+  is H3 (its creep and other-turn rungs are SG4c's); a junction the route already found uncertifiable is H3 right after the
+  full stop (7.1). The deadlock (4.5 step 5, V9, V10): an earlier arrival that holds its turn DEADLOCK_S with nothing in the
+  junction moving gets one signalling creep of DEADLOCK_CREEP_M on the latch's creep path (DEADLOCK_CREEP_V, a G5 go with
+  cause creep, never closer than GO_ROOM_M to the closest plausible edge, never while creep_blocked: V12, V13), then the
+  order is waived and every other go condition still holds for CLEAR_S; it moving before our commit stops us short and we
+  yield (during the creep the latch holds again; during the launch the re-check's capped abort).
 - going: TurnPilot's cap STOP_GO_V_MAX until the commit point, every object, view and sector re-checked (lane reach on the
   go position's geometry, decision D13; a track known at the go judged by its ground motion since, as bearings from a moving
   car restart its trust; any new one in a conflicting lane, or a raw box no known track explains, withdraws the go); the
@@ -78,6 +82,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.turnpilot import stop_rules as sr
 from openpilot.selfdrive.turnpilot.go_override import GO_WINDOW_S, Takeover
+from openpilot.selfdrive.turnpilot.map_controls import CREEP_AT_M, CREEP_SPEED
 from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
 from openpilot.selfdrive.turnpilot.routing import certify as ce
 from openpilot.selfdrive.turnpilot.routing.junctions import survey_approach
@@ -97,8 +102,14 @@ LEAD_GO_M = 8.
 BIKE_PASS_MEMORY_S = 10.
 HIDE_S = 2.0
 TIE_S = 1.0
-DEADLOCK_S = 3.0
-DEADLOCK_H3_S = 3. * DEADLOCK_S  # an earlier arrival holding its turn this long, nothing moving: H3 (until SG4b's creep)
+DEADLOCK_S = 3.0                # s an earlier arrival may hold its turn, nothing in the junction moving, before we take ours
+DEADLOCK_CREEP_M = 0.5          # m of the one signalling creep (4.5 step 5; map_controls' creep path at CREEP_SPEED)
+DEADLOCK_CREEP_V = min(0.4, CREEP_SPEED)  # m/s, its cap: the creep path's limit or under, slow enough to end 0.5 m on (8.1)
+DEADLOCK_CYCLES = 1             # creeps an encounter takes before the order is waived (the turn passes to us after one)
+DEADLOCK_CREEP_MAX_S = GO_WINDOW_S + 1.  # s the creep may take (G5's window, a second to stop): then it is over, moved or not
+CREEP_LANE_HOLDS = ('reach', 'raw', 'u2', 'tracked', 'wrongWay', 'stale', 'hide')  # a creep in hand isn't ended by these
+CORNER_M = 15.                  # m down a cross lane a long vehicle coming toward our path is at the corner (no creep, V13)...
+CREEP_LOOK_S = 5.               # ...or will be within this (its speed toward us): the creep and the next CLEAR_S
 FRONT_ZONE_M, FRONT_ZONE_MAX_S = 3.0, 30.
 FRONT_ZONE_HALF_W = 1.2         # m either side of the axis the front zone reaches (a 1.85 m car and a margin)
 FRONT_EDGE_M = 0.6              # m inside its side edge a track that ended there ended at the edge...
@@ -343,6 +354,10 @@ class StopGo:
     self.gone: set = set()                 # earlier arrivals seen leaving their line
     self.rank = 0
     self.turn_wait_s = 0.
+    self.creep: dict | None = None  # the deadlock's signalling creep in hand: its target, start, the earlier arrivals then
+    self.creeps = 0                 # creeps taken this encounter (DEADLOCK_CYCLES)
+    self.order_waived = False       # the deadlock passed the turn to us: go condition 5 waived, and only it
+    self.creep_end = None           # (why, creep): the creep just ended (its G5 go withdrawn)
     self.clear_s = 0.
     self.static_s = 0.
     self.dynamic_s = 0.
@@ -761,6 +776,17 @@ class StopGo:
       return
     if ctl is None:
       d.stops.append(hold_here(f.v_ego, d.reason or "Stopped at stop sign"))  # the decider's own hold: the latch let go already
+    # the deadlock's signalling creep (4.5 step 5): the latch's stop point moved on at CREEP_SPEED, and one G5 go (creep) at its
+    # start for a model that holds; ended (reached, or we yield), its go withdrawn
+    if self.creep is not None and ctl is not None:
+      d.creep, d.action = (self.creep['target'], DEADLOCK_CREEP_V), 'creeping'
+      if not self.creep['went'] and acting and f.enabled and f.go_active == 'none' and standing:
+        self.creep['went'] = True
+        d.go_cause = 'creep'
+    if self.creep_end is not None:
+      if f.go_active == 'creep':
+        d.withdraw = self.creep_end[0]
+      self.creep_end = None
     go = not holds and self.clear_s >= sr.CLEAR_S - 1e-6
     self.would_go = go
     if go and not self.would_go_logged:
@@ -961,21 +987,23 @@ class StopGo:
     holds += self._view_holds(f)
     # 4 every conflicting lane: reach or a shield, its tracks, its raw boxes
     holds += self._lane_holds(f, pos, launch)
-    # 5 our turn
-    if not launch:
-      holds += self._turn_holds(f)
     # 6 the box; 7 people, the front zone, the exit; 8 a lead, a right's blind spot and a cyclist passed on the right
-    holds += self._box_holds(f, pos)
-    holds += self._people_holds(f, pos)
-    holds += self._exit_holds(f, pos)
+    box = self._box_holds(f, pos)
+    rest = self._people_holds(f, pos) + self._exit_holds(f, pos)
     if f.lead_m is not None and f.lead_m <= LEAD_GO_M:
-      holds.append(Hold('lead', "a queue ahead", DYNAMIC))
+      rest.append(Hold('lead', "a queue ahead", DYNAMIC))
     if f.maneuver == 'right':
       if f.right_blindspot:
-        holds.append(Hold('blindspot', "something in the right blind spot", DYNAMIC))
+        rest.append(Hold('blindspot', "something in the right blind spot", DYNAMIC))
       if self.bike_t is not None and self.t - self.bike_t <= BIKE_PASS_MEMORY_S:
-        holds.append(Hold('bikePassed', "a cyclist passed on the right", DYNAMIC))
-    return holds
+        rest.append(Hold('bikePassed', "a cyclist passed on the right", DYNAMIC))
+    # 5 our turn, and the deadlock: nothing in the junction moving is its condition, and the creep starts only with every other
+    # go condition met (we would go now were it our turn; never a creep toward a person in the crosswalk), and once started
+    # ends on any but its lanes' (our own creep restarts their trust: its earlier arrivals judged by ground motion)
+    if not launch:
+      lanes_only = all(h.key.split(':')[0] in CREEP_LANE_HOLDS for h in box + rest)
+      holds += self._turn_holds(f, pos, any(h.kind == DYNAMIC for h in box + rest), not holds and not box and not rest, lanes_only)
+    return holds + box + rest
 
   def _view_holds(self, f: Frame) -> list[Hold]:
     """2.4 item 2, E7, E8: a needed view older than DET_FRESH_S of camera time resets CLEAR_S; none for DET_FAULT_S on the
@@ -1141,7 +1169,8 @@ class StopGo:
       return False  # coasting: it reappears or is gone
     return abs(float(trk.x[1])) < abs(k['y']) - (sr.SHIELD_MOVE_M + 1.0)
 
-  def _turn_holds(self, f: Frame) -> list[Hold]:
+  def _turn_holds(self, f: Frame, pos: float = 0., others_moving: bool = False, ready: bool = True,
+                  creep_ok: bool = True) -> list[Hold]:
     """2.4 item 5 (4.5 steps 2, 4): every earlier arrival gone (seen leaving its line: then the box and its lane judge it), no
     tie lost. A vehicle stopping at another line within TIE_S after our arrival is a tie: we yield to the right and, facing
     each other, a left yields to the other's straight or right (others are assumed straight); one later waits for us."""
@@ -1163,14 +1192,95 @@ class StopGo:
         continue
       waiting.append(tid)  # still at its line, or unseen without having been seen leaving it: never presumed gone
     self.rank = len(waiting)
-    if not waiting:
-      self.turn_wait_s = 0.
+    if not waiting or self.order_waived:
+      self.turn_wait_s, self.creep = 0., None
       return []
-    moving = any(e.v_nom > MOVING_V for e in self.ev.values())
+    moving = others_moving or any(e.v_nom > MOVING_V for e in self.ev.values())
+    if self.creep is not None:
+      return self._creeping(f, pos, waiting, moving or not creep_ok)
     self.turn_wait_s = 0. if moving else self.turn_wait_s + f.dt
-    if self.turn_wait_s >= DEADLOCK_H3_S - 1e-6:
-      return [Hold('deadlock', "an earlier arrival isn't taking its turn", STATIC)]
+    if self.turn_wait_s >= DEADLOCK_S - 1e-6 and self.creeps < DEADLOCK_CYCLES and ready:
+      return self._deadlock(f, pos, waiting)
     return [Hold('turn', "an earlier arrival's turn", DYNAMIC)]
+
+  def creep_blocked(self, f: Frame, pos: float, known: dict | None = None) -> str:
+    """Why the car mustn't creep now ('' it may; 2.5, rows V12, V13): a vehicle whose path ends in our road's oncoming lane
+    (in the junction box or the oncoming lane ahead of us, coming toward our car: a car turning into our road may cut the
+    corner toward our bumper), or a long vehicle approaching the corner in a cross lane (coming toward our path, or its
+    direction not known yet): its swing may cross our line. One standing at its line isn't approaching. known: the tracks
+    when the creep began, judged by the tracker's ground motion once our own creep restarts their bearings' trust."""
+    x0, x1 = self._x(self.edges.d_min, pos) - CROSSWALK_M, self._x(self._far_edge(), pos) + CROSSWALK_M
+    for o in f.objects or ():
+      cls = class_name(o.cls)
+      if cls in MOTOR and x0 <= float(o.x) <= x1 and -BOX_RIGHT_M <= float(o.y) <= BOX_LEFT_M + sr.LANE_W_MAX and float(o.vx) < -MOVING_V:
+        return f"a {cls} turning into our road"
+    for tid, e in self.ev.items():
+      if e.cls not in LARGE or e.lane is None or e.lane.movement == sr.WRONG_WAY:
+        continue
+      k = (known or {}).get(tid)
+      coming = self._known_moved(f, tid, k) if k is not None else not e.v_trusted or e.v_nom > APPROACH_V
+      if coming and e.d_nom < CORNER_M + max(e.v_nom, 0.) * CREEP_LOOK_S:
+        return f"a {e.cls} coming to the corner {side_word(e.role)}"
+    return ''
+
+  def _deadlock(self, f: Frame, pos: float, waiting: list) -> list[Hold]:
+    """4.5 step 5: an earlier arrival has held its turn DEADLOCK_S with nothing in the junction moving: we take ours as a
+    driver would, with one signalling creep of DEADLOCK_CREEP_M on the latch's creep path (CREEP_SPEED, a G5 go with cause
+    creep for a model that holds). Never closer than GO_ROOM_M to the closest plausible edge (the creep floor, 2.5; G14), never
+    while creep_blocked, never from the decider's own hold (the latch let go: no creep path), so then the turn passes with
+    no creep, said in the log."""
+    self.creeps += 1
+    room = self.edges.d_min - pos - DEADLOCK_CREEP_M
+    need = sr.go_room_m(f.t_abort, right=f.maneuver == 'right')
+    blocked = self.creep_blocked(f, pos)
+    if blocked:
+      self.creeps -= 1  # not yet: the creep waits for the corner to clear
+      self.turn_wait_s = DEADLOCK_S
+      return [Hold('turn', f"an earlier arrival's turn ({blocked})", DYNAMIC)]
+    if f.control is None or room < need - 1e-6:
+      why = 'no latch to creep from' if f.control is None else f"no room to creep: {room:.2f} m to the closest edge, {need:.2f} needed"
+      return self._waive(waiting, why)
+    moved = float(getattr(f.control.state, 'moved_m', 0.))
+    # the latch holds again within CREEP_AT_M of its target, and the car runs on through the actuator delay and its stop: the
+    # target is that much short, so the car comes to rest about DEADLOCK_CREEP_M on (8.1's bounded move)
+    v = DEADLOCK_CREEP_V
+    run_on = max(v * (f.t_abort - DT_MDL - 0.1) + v * v / 2. - CREEP_AT_M, 0.)
+    self.creep = {'target': moved + max(DEADLOCK_CREEP_M - run_on, CREEP_AT_M + 0.1), 't': self.t, 'went': False,
+                  'known': self._known_tracks(f), 'moved': False, 'from': moved}
+    cloudlog.event("turnpilot.stop_go_deadlock_creep", key=list(self.key), waiting=sorted(waiting), pos=round(pos, 2),
+                   target=round(self.creep['target'], 2), room=round(room, 2))
+    return [Hold('deadlockCreep', "taking our turn: creeping forward", DYNAMIC)]
+
+  def _creeping(self, f: Frame, pos: float, waiting: list, moving: bool) -> list[Hold]:
+    """The deadlock's creep in hand: the earlier arrival moving (its ground motion, our own creep restarting its bearings'
+    trust), or anything moving in the junction, or the corner no longer clear, ends it where the car is and we yield (the
+    latch holds again, the creep's go withdrawn); reached, or its time up, the turn passes to us."""
+    c = self.creep
+    standing = f.v_ego < STAND_V
+    stirred = [tid for tid in waiting if tid in c['known'] and self._known_moved(f, tid, c['known'][tid])]
+    blocked = self.creep_blocked(f, pos, c['known'])
+    if stirred or moving or blocked:
+      why = f"track {stirred[0]} moved" if stirred else blocked or 'something moved in the junction'
+      cloudlog.event("turnpilot.stop_go_deadlock_yield", key=list(self.key), why=why, pos=round(pos, 2))
+      self.creep, self.turn_wait_s = None, 0.
+      c['yield'] = why
+      self.creep_end = ('deadlockYield', c)
+      return [Hold('turn', "an earlier arrival's turn", DYNAMIC)]
+    moved = float(getattr(f.control.state, 'moved_m', 0.)) if f.control is not None else c['target']
+    c['moved'] = c['moved'] or f.v_ego > STAND_V
+    there = moved >= c['target'] - CREEP_AT_M - 1e-6
+    if (standing and (there or (c['moved'] and self.t - c['t'] > STOP_DWELL_S))) or self.t - c['t'] >= DEADLOCK_CREEP_MAX_S - 1e-6:
+      self.creep = None
+      self.creep_end = ('creepDone', c)
+      return self._waive(waiting, f"crept {moved - c['from']:.2f} m")
+    return [Hold('deadlockCreep', "taking our turn: creeping forward", DYNAMIC)]
+
+  def _waive(self, waiting: list, why: str) -> list[Hold]:
+    """The turn passes to us (4.5 step 5): go condition 5 waived, every other still applies; one moving later stops us short
+    (the launch's re-check)."""
+    self.order_waived = True
+    cloudlog.event("turnpilot.stop_go_order_waived", key=list(self.key), waiting=sorted(waiting), why=why, t=round(self.t, 2))
+    return []
 
   def _x(self, d_along: float, pos: float) -> float:
     """Camera x (m ahead of the camera) of the point d_along m past the stop point, the bumper pos m past it."""
@@ -1441,10 +1551,6 @@ class StopGo:
       d.ledger, d.reason = FAULT, "Waiting: " + front.reason
       if acting and self.front_s >= FRONT_ZONE_MAX_S - 1e-6:
         self._fault('H7', f, d, front.reason)
-      return
-    deadlock = next((h for h in holds if h.key == 'deadlock'), None)
-    if deadlock is not None and acting:
-      self._fault('H3', f, d, deadlock.reason)
       return
     if DYNAMIC in kinds:
       # something moving: waiting is right, with no bound; a static cause starts its clock again once nothing moves

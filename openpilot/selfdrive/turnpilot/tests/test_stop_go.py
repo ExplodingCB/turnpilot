@@ -1657,3 +1657,115 @@ def test_upgrade_a_car_that_stops_at_its_line_and_proceeds_is_logged_as_a_stop_e
   stops = [kw for name, kw in events if name == 'turnpilot.stop_go_stop_event']
   assert len(stops) == 1 and stops[0]['track'] == 35 and stops[0]['role'] == 'left'
   assert all(a.tier == 'surveyed' for a in w.sg.junction.approaches if sr.effective_role(a) in ('left', 'right'))
+
+
+def arrived_at(out):
+  """The frame of our arrival: the full stop's dwell done, the decider observing."""
+  return next(k for k, d in enumerate(out) if d.state == 'observe')
+
+
+def test_V9_V10_a_deadlock_creeps_once_then_goes_in_about_7_s_with_no_handback(tmp_path):
+  # 4.5 step 5: an earlier arrival standing at the left line that never takes its turn (a driver waving us through): after
+  # DEADLOCK_S with nothing moving one signalling creep of DEADLOCK_CREEP_M on the latch's creep path (a G5 go, cause creep),
+  # then CLEAR_S of re-checking with the order waived and nothing else: the go, and across, the waver standing as we pass.
+  # Before (SG4a), an earlier arrival holding its turn 3 x DEADLOCK_S was H3
+  w = Drive(tmp_path, behaviour=lambda w: 'goes')
+  w.tracks = cars((1, 'left', at_line(t0=-10.)))
+  watch(w)
+  out = w.run(22.)
+  a = arrived_at(out)
+  assert out[a + 1].rank == 1 and not any(d.fault for d in out)
+  creeps = [k for k, d in enumerate(out) if d.go_cause == 'creep']
+  assert len(creeps) == 1 and (creeps[0] - a) * DT_MDL == pytest.approx(sg.DEADLOCK_S, abs=0.15)
+  c = out[creeps[0]]
+  assert c.creep is not None and c.creep[1] == pytest.approx(sg.DEADLOCK_CREEP_V) and c.creep[1] <= 0.7 and c.action == 'creeping'
+  assert not any(s.should_stop for s in c.stops)
+  i = first_go(out)
+  assert i is not None and 5.5 <= (i - a) * DT_MDL <= 9.0, (i - a) * DT_MDL
+  assert not [d.withdraw for d in out[i:] if d.withdraw] and any(d.state in ('inLane', 'done') for d in out[i:])
+  assert all(s.accel_cap >= -2. - 1e-9 for d in out for s in d.stops)
+
+
+@pytest.mark.parametrize('lag', [0.2, 0.3, 0.45, 0.6])
+def test_V9_a_deadlock_creep_with_a_holding_model_moves_0_5_m_and_stops(tmp_path, lag):
+  # 8.1's bounded move: model_holds with G5's gates, the creep moves 0.5 +- 0.15 m and stops, at every actuator lag the
+  # decider knows; no TurnPilot shouldStop at the step's start
+  w = Drive(tmp_path, lag_s=lag, behaviour=lambda w: 'holds')
+  w.tracks = cars((1, 'left', at_line(t0=-10.)))
+  watch(w)
+  out = w.run(5.5)
+  k = next(k for k, d in enumerate(out) if d.go_cause == 'creep')
+  pos0 = out[k].position_m
+  out += w.run(3.)
+  rest = out[k:]
+  end = next(j for j, d in enumerate(rest) if d.creep is None)
+  crept = rest[end].position_m - pos0
+  assert crept == pytest.approx(sg.DEADLOCK_CREEP_M, abs=0.15) and w.v < 0.05
+  assert not any(s.should_stop for s in out[k].stops)
+
+
+def test_V9_the_earlier_arrival_moving_during_our_creep_stops_us_short_and_we_yield(tmp_path):
+  # "If the other vehicle starts moving at any point before our commit, the car stops short and yields": it pulls away from
+  # its line 0.5 s into our creep; the creep ends where it is (the latch holds), no go while it crosses, then ours
+  w = Drive(tmp_path, behaviour=lambda w: 'goes')
+  w.tracks = cars((1, 'left', at_line(t0=-10.)))
+  watch(w)
+  out = w.run(4.4)
+  k = next(k for k, d in enumerate(out) if d.go_cause == 'creep')
+  t_go = w.t_cam - 100. - (len(out) - 1 - k) * DT_MDL + 0.5
+  w.tracks = cars((1, 'left', lambda t: LINE_D if t < t_go else LINE_D - 1.5 * (t - t_go) ** 2))
+  more = w.run(12.)
+  yielded = [d for d in more if d.creep is None and d.state == 'observe']
+  assert yielded and [d.withdraw for d in more if d.withdraw][:1] in (['deadlockYield'], [])
+  i = first_go(more)
+  assert i is not None and all(d.position_m <= out[k].position_m + sg.DEADLOCK_CREEP_M + 0.15 for d in more[:i])
+  assert not any(d.fault for d in more)
+
+
+def creep_times(w, out):
+  """The decider's clock (s from the World's start) of each creep go in out, the last run's frames."""
+  end = w.t_cam - 100.
+  return [end - (len(out) - 1 - k) * DT_MDL for k, d in enumerate(out) if d.go_cause == 'creep']
+
+
+def test_V12_V13_no_deadlock_creep_while_a_cross_car_turns_into_our_road_or_a_truck_comes_to_the_corner(tmp_path):
+  # 2.5: no creep while a cross track's path ends in our oncoming lane (a car turning left into our road cuts the corner
+  # toward our bumper) or a long vehicle approaches the corner, and "nothing in the junction moves" is the deadlock's own
+  # condition: the creep comes DEADLOCK_S after neither is so
+  w = Drive(tmp_path, behaviour=lambda w: 'goes')
+  w.tracks = cars((1, 'left', at_line(t0=-10.)))
+  w.objects = lambda ww: (vehicle(60, 15., 3.5, vx=-2.5, vy=-1.0),) if ww.t_cam - 100. < 9. else ()
+  watch(w)
+  out = w.run(14.)
+  ts = creep_times(w, out)
+  assert len(ts) == 1 and ts[0] >= 9. + sg.DEADLOCK_S - 0.1, ts
+  # a truck approaching the corner on the right lane at 8 m/s from 60 m, stopping at its line (a later arrival)
+  w = Drive(tmp_path, behaviour=lambda w: 'goes')
+  w.tracks = cars((1, 'left', at_line(t0=-10.)), (2, 'right', at_line(t0=2., d0=60., v0=8.), 7))
+  watch(w)
+  out = w.run(16.)
+  ts = creep_times(w, out)
+  assert len(ts) == 1 and ts[0] >= 2. + (60. - LINE_D) / 8. + sg.DEADLOCK_S - 0.1, ts
+
+
+def test_V9_no_deadlock_creep_toward_a_person_in_the_crosswalk_the_creep_waits_for_every_other_go_condition(tmp_path):
+  # the creep is the go's signal: it starts only with every other go condition met (we would go now were it our turn), so a
+  # person standing in the near crosswalk (the earlier arrival waiting for them too) gets no creep toward them
+  w = Drive(tmp_path, behaviour=lambda w: 'goes')
+  w.tracks = cars((1, 'left', at_line(t0=-10.)))
+  w.objects = lambda ww: (person(80, 1.9 + 4.0, -1.0),) if ww.t_cam - 100. < 10. else ()
+  watch(w)
+  out = w.run(16.)
+  ts = creep_times(w, out)
+  assert len(ts) == 1 and ts[0] >= 10. - 0.1, ts
+  assert first_go(out) is not None
+
+
+def test_V13_a_box_overlapping_0_6_m_ahead_of_the_bumper_holds_the_go(tmp_path):
+  # a truck turning into our road swings over our line: its box 4 m ahead of our bumper, in our path
+  w = World(tmp_path)
+  w.objects = lambda ww: (vehicle(70, 1.9 + 4., -0.5, vx=-1.0, cls='truck'),)
+  out = w.run(6.)
+  assert first_go(out) is None and any(h.key == 'near:70' for h in out[-1].holds)
+  w.objects = lambda ww: ()
+  assert first_go(w.run(3.5)) is not None
