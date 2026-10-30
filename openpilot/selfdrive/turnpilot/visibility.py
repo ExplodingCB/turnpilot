@@ -95,7 +95,14 @@ def ray_lane_d(lane: sr.Lane, psi_deg: float, which: str) -> float | None:
 
 
 def class_name(cls) -> str:
-  return cls if isinstance(cls, str) else CLASS_NAMES.get(int(cls), 'other')
+  """A class as its name: a name, the tracker's class index (CLASS_NAMES), or a TurnpilotScene.ObjectClass enum as turnpilotd
+  hands the scene's objects over (capnp readers), which reads as its own name (its ordinals aren't the tracker's indexes)."""
+  if isinstance(cls, str):
+    return cls
+  try:
+    return CLASS_NAMES.get(int(cls), 'other')
+  except TypeError:
+    return str(cls)
 
 
 class LiveVisibility:

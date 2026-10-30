@@ -488,6 +488,20 @@ def test_V19_a_car_backing_out_ahead_holds_the_go(tmp_path):
   assert go_frame(sim) is None and sim.trace[-1][2].shouldStop
 
 
+@pytest.mark.parametrize('cls', ['car', 'pedestrian'])
+def test_the_decider_reads_the_scenes_objects_as_turnpilotd_hands_them_over_never_failing_to_shadow(tmp_path, cls):
+  # turnpilotd hands the decider the scene's TrackedObjects as capnp readers, their cls an ObjectClass enum; class_name read it
+  # with int(), which an enum refuses, so any object near a held stop sign made the decider fail every frame (logged
+  # turnpilotd.stop_go_failed) and act as shadow: the 1 s handback, the decider never running with anything in view
+  sim = StopSim(tmp_path)
+  run_to_line(sim)
+  sim.run(4., objects=lambda s: ({'cls': cls, 'x': 30., 'y': 9., 'vx': 0., 'inPath': False, 'camera': 'wide', 'view': 'full',
+                                  'tSeen': s.t_cam},))
+  states = [str(p.stopGo.state) for p in sim.plans()[-60:]]
+  assert all(st not in ('off',) for st in states), states
+  assert str(sim.plans()[-1].controlPrompt) != 'stopSignTakeControl'
+
+
 def test_the_no_move_clock_arms_on_a_straight_release_from_a_standstill(tmp_path):
   # gap B: a hold TurnPilot let go of at a standstill on a straight road (here a sim green) the model never pulls away from is
   # withdrawn and handed back like a turn's (cantStartTakeControl), not left standing silently for NEAR_CONTROL_STAND_S
@@ -555,3 +569,4 @@ def test_C11_the_camera_stop_signs_param_off_reads_none_anything_else_reads_them
   from openpilot.selfdrive.turnpilot.turnpilotd import camera_signs_read
   assert camera_signs_read(FakeParams()) and camera_signs_read(FakeParams(TurnPilotCameraStopSigns=b'shadow'))
   assert not camera_signs_read(FakeParams(TurnPilotCameraStopSigns=b'off'))
+
