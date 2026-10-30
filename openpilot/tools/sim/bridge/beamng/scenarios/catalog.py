@@ -136,6 +136,13 @@ SCENARIOS = {
   # at 10 s headways in the outer lane beside it, then an empty road. It creeps, then goes on a clear band or hands back
   'unprotected_left_occluded': Entry('turn', junction=(-600.7, 220.9), turn='left', actor='oncoming', oncoming=3, oncoming_start_m=40.,
                                      oncoming_speed=11.18, stream_headway_s=10., occluder_past_m=10., timeout_s=250.),
+  # S19: the right at DR475_2 (-153.7, 148.7), no control of its own, at the end of the map's one straight of 240 m or more
+  # with no mapped control on it (357 m, south-west-bound, through two uncontrolled junctions 135-210 m out, where no spawn
+  # may stand), at 80 km/h from 230 m out: the rolling start engages about 54 m out at 64 km/h, already past where the turn
+  # can be made braking at -2.0 (turn_skip.can_make_turn), so it is skipped, never braked hard for, and rerouted. At 65 km/h
+  # from the nearest clear spawn (215 m) it would engage 92 m out, where the turn is still feasible and its cap slows the car
+  'too_fast_right': Entry('turn', junction=(-153.7, 148.7), turn='right', from_heading_deg=-135., approach_m=230., speed_kph=80.,
+                          timeout_s=60., expect=('skip',)),
   # gate1's approach: eastbound on the 140 m straight from the bridge's default spawn
   'ped_in_path': Entry('straight', junction=(-768.9, 661.4), turn='right', from_heading_deg=0., actor='standing', end_on_stop_s=4.,
                        timeout_s=90.),
