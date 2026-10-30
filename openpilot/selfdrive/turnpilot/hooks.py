@@ -171,6 +171,13 @@ CONTROL_ALERT_TEXT = {
   'stalledInJunction': 'Stalled in the junction: going again',
   'overrideWriteFailed': 'Stop sign junction not saved: the route may use it again',
   'otherTurn': "The route's turn can't be checked here: rerouting after it",
+  # the route's stop signs (route_notice.py): their own text is turnpilotPlan.routeNotice, these stand in without it
+  'routeAvoidsStops': 'Route avoids stop signs',
+  'routeDetour': 'Route avoids stop signs: a long detour',
+  'stopsNeedYou': 'Stop signs on this route need you',
+  'firstStopNeedsYou': 'First stop needs you',
+  'stopRoutingFailed': 'Stop-sign routing failed: stops may need you',
+  'stopAheadNeedsYou': 'Stop sign ahead needs you',
 }
 
 

@@ -385,7 +385,8 @@ def turnpilot_route_notice_alert(CP: car.CarParams, CS: car.CarState, sm: messag
   from openpilot.selfdrive.turnpilot.route_notice import CHIMES
   plan = fresh_plan(sm)
   kind = str(plan.controlAlert) if plan is not None else 'none'
-  return Alert(ROUTE_NOTICE_TITLE.get(kind, "Stop Signs"), plan.routeNotice if plan is not None else '', AlertStatus.userPrompt,
+  text = (plan.routeNotice if plan is not None else '') or CONTROL_ALERT_TEXT.get(kind, '')
+  return Alert(ROUTE_NOTICE_TITLE.get(kind, "Stop Signs"), text, AlertStatus.userPrompt,
                AlertSize.mid, Priority.LOW, VisualAlert.none, AudibleAlert.prompt if kind in CHIMES else AudibleAlert.none, .2)
 
 
