@@ -52,7 +52,9 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   that floor, cannotStopComfortably. A yellow is decided once: stop when the stopping distance at YELLOW_DECEL after T_LAT
   fits (YELLOW_DECEL, TurnPilotYellowDecel, no more than -MAP_DECEL_MAX); otherwise committed, with proceedingOnYellow,
   and a later red never reverses it. A stop is released only by a steady green (GREEN_STEADY_S): a light gone unknown
-  keeps it. The driver's gas never releases one.
+  keeps it, and held with no accepted light read for SIGNAL_UNSEEN_S it hands back (signalUnseenTakeControl, "Signal not
+  seen: take control"), still held, never released by the timeout; a light read again is TurnPilot's to release once more.
+  The driver's gas never releases one.
 - The camera's light reader (DESIGN phase 4 G2, detector/light_state.py, its heads in turnpilotDetections.lights) is a
   second source that may only ever add a stop, and this week it adds none: in shadow (TurnPilotCameraLights shadow, the
   default) its governing heads are associated with the signals (a head from CAMERA_ASSOC_BEFORE_M short of a signal's
@@ -134,6 +136,11 @@ LATCH_PAST_M = 2.             # ...or this far past it, the latch holds the car
 HOLD_ACCEL = -0.5             # m/s^2, the held car's accel cap
 STOP_SIGN_HANDBACK_S = 1.0    # s stopped at a stop sign before it hands back (DESIGN phase 4: a 1 s full stop)
 GREEN_STEADY_S = 0.5          # s of green before it counts (the sim oracle; a camera would need 1.0)
+# a held signal with no accepted light read this long hands back (signalUnseenTakeControl), held: BeamNG S14 (BUILD_FINDINGS
+# N3) stood 108.6 s on "waiting for green" once the oracle stopped listing the light it stood 1.3 m past. Longer than a
+# flicker or a read lost behind a truck, short of a silent wait; never a release
+SIGNAL_UNSEEN_S = 10.
+SIGNAL_UNSEEN_REASON = "Signal not seen: take control"
 T_LAT = 0.8                   # s from a yellow to braking
 COMMIT_SPEED = 2.0            # m/s: past the line faster than this, the car went
 YIELD_SPEED = 5.0             # m/s at a yield's line, while its rolling test passes (STOP_SIGNS.md 2.7)
@@ -402,6 +409,7 @@ class ControlState:
   yellow: bool = False          # a stop decided on a yellow
   green_t: float = 0.
   light: str = 'unknown'
+  unseen_t: float = 0.          # held at a signal: s since an accepted light was last read for it (SIGNAL_UNSEEN_S)
   dwell_t: float = 0.
   moved_m: float = 0.
   asked_m: float = 0.           # held: the furthest the latch's stop point was asked on this hold (a creep, a roll-up)
@@ -829,6 +837,12 @@ class MapControlPolicy:
         cause = 'green'
       reason = f"Red light (sim oracle){'' if c.junction else ' (crossing)'}" if st.light == 'red' else \
         f"Stopped at {what}: waiting for green"
+      # no accepted light read for it this long: handed back, held (never released by the timeout); read again, TurnPilot's
+      st.unseen_t = st.unseen_t + dt if st.light not in ('red', 'yellow', 'green') else 0.
+      if st.unseen_t >= SIGNAL_UNSEEN_S - 1e-9:
+        if st.unseen_t - dt < SIGNAL_UNSEEN_S - 1e-9:
+          cloudlog.event("turnpilot.signal_unseen", error=True, key=list(c.key), d=round(c.d, 1), unseen_s=round(st.unseen_t, 1))
+        prompt, reason = 'signalUnseenTakeControl', SIGNAL_UNSEEN_REASON
     # moved where it was asked (a creep, a roll-up) isn't driven off: only past that. The furthest asked this hold is the
     # latch's own: an undecided left's command asks no creep and a decider's fault or shadow no roll-up, yet the car stands
     # where it was moved (skeptic residual-check-1: read live, a 4 m creep then undecided was let go as driverWent)
@@ -1000,7 +1014,7 @@ class MapControlPolicy:
       st.infeasible = False
     if v < LATCH_SPEED and -LATCH_PAST_M < c.d < LATCH_NEAR_M and not gas_pressed and self.held is None:
       self.held, c.held = c.key, True
-      st.dwell_t, st.moved_m, st.infeasible = 0., 0., False
+      st.dwell_t, st.moved_m, st.infeasible, st.unseen_t = 0., 0., False, 0.
       st.asked_m, st.gas_moved_m = 0., 0.
       cloudlog.event("turnpilot.map_stop_held", kind=c.kind, key=list(c.key), d=round(c.d, 1), light=st.light)
       if c.kind == 'stop' and getattr(self, '_signs', None) is not None:

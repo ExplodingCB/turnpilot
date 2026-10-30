@@ -2108,6 +2108,33 @@ def oracle_lights(state, s_signal):
   return make
 
 
+def test_held_at_a_red_the_oracle_stops_listing_hands_back_and_stays_held():
+  """BeamNG S14 (diag s14_red_right_frames, BUILD_FINDINGS N3): held at a red 1.3 m past the mapped line, the light oracle
+  stopped listing the light and the hold waited for a green no source could give, 108.6 s with controlPrompt none. With no
+  accepted light read SIGNAL_UNSEEN_S, the plan hands back (signalUnseenTakeControl, "Signal not seen: take control") with
+  the car held throughout, and the stopped handbacks (which skip a held car) never stand in for it."""
+  from openpilot.selfdrive.turnpilot.map_controls import SIGNAL_UNSEEN_REASON, SIGNAL_UNSEEN_S
+  sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
+  sim.go_taps = False
+  sim.tp.oracle_ok = True
+  listed = {'on': True}
+  red = oracle_lights('red', 290.)
+  sim.lights = lambda sim: red(sim) if listed['on'] else messaging.new_message('turnpilotLights').as_reader().turnpilotLights
+  stop_at(sim, 290.)
+  sim.run(5.)
+  assert sim.trace[-1][2].shouldStop and sim.trace[-1][2].controlPrompt == 'none'
+  listed['on'] = False
+  sim.run(SIGNAL_UNSEEN_S - 0.3)
+  assert all(p.shouldStop and p.controlPrompt == 'none' for _, _, p in sim.trace[-5:])
+  sim.run(0.6)
+  p = sim.trace[-1][2]
+  assert p.shouldStop and p.controlPrompt == 'signalUnseenTakeControl' and p.reason == SIGNAL_UNSEEN_REASON
+  i0 = len(sim.trace)
+  sim.run(60.)
+  assert all(p.shouldStop and p.controlPrompt == 'signalUnseenTakeControl' for _, _, p in sim.trace[i0:])
+  assert sim.v == 0.
+
+
 def test_a_too_fast_turn_just_past_a_green_or_unchecked_signal_is_still_skipped():
   # a signal 8 m before the junction the car passes through on a green (or with no light source): it doesn't stop there,
   # so the turn is too fast and is skipped out loud, as with no signal (a stop sign there would be a stop: 1505)

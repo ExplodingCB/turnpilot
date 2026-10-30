@@ -180,6 +180,9 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     waitingForCross @15;            # held at a stop sign for the go conditions, the reason saying for what (visual only;
                                     # stopGo.chime: the wait's info chime at WAIT_INFO_S and every WAIT_INFO_S after)
     stopGo @16;                     # going from the stop sign: a short chime
+    # BUILD_FINDINGS (demo round 2, 2026-10-30): the stands and exits nothing else said
+    signalUnseenTakeControl @17;    # held at a signal with no accepted light read for SIGNAL_UNSEEN_S (map_controls.py): held,
+                                    # take control; never released by the timeout
   }
   enum ControlAlert {
     none @0;

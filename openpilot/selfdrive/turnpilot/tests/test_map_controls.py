@@ -319,6 +319,41 @@ def test_a_red_whose_light_is_lost_stays_stopped_until_a_steady_green():
   assert not dec.should_stop
 
 
+def test_a_held_signal_whose_light_goes_unseen_hands_back_loudly_and_stays_held():
+  """BeamNG S14 (diag s14_red_right_frames, BUILD_FINDINGS N3): held at a red, the car 1.3 m past the mapped line, the sim's
+  light oracle stopped listing the light, and the hold waited 108.6 s on "Stopped at signal: waiting for green" with no
+  prompt. A held signal with no accepted light read for SIGNAL_UNSEEN_S hands back loudly (signalUnseenTakeControl,
+  "Signal not seen: take control"), the car held: never released by the timeout. A red read meanwhile, however long, is the
+  light seen; a light read again takes the handback down, and a steady green still releases."""
+  from openpilot.selfdrive.turnpilot.map_controls import SIGNAL_UNSEEN_REASON, SIGNAL_UNSEEN_S
+  car = Car([(150., 'signal')])
+  car.run_until(held, lights=oracle('red'))
+  for _ in range(int(60. / DT_MDL)):  # a long red, read all along: no handback
+    out, dec, _ = car.step(lights=oracle('red'))
+    assert held(out, dec) and out.prompt == 'none'
+  for _ in range(int((SIGNAL_UNSEEN_S - 0.2) / DT_MDL)):  # the light gone unknown: still waiting
+    out, dec, _ = car.step(lights=NO_LIGHTS)
+    assert held(out, dec) and out.prompt == 'none', car.t
+  out, dec, _ = car.run(0.4, lights=NO_LIGHTS)
+  assert held(out, dec) and out.prompt == 'signalUnseenTakeControl' and dec.reason == SIGNAL_UNSEEN_REASON == \
+    "Signal not seen: take control"
+  for _ in range(int(60. / DT_MDL)):  # handed back, held: the timeout never lets go
+    out, dec, _ = car.step(lights=NO_LIGHTS)
+    assert held(out, dec) and out.prompt == 'signalUnseenTakeControl' and not out.released_stopped
+  out, dec, _ = car.run(0.2, lights=oracle('red'))  # read again: TurnPilot's hold to release once more
+  assert held(out, dec) and out.prompt == 'none'
+  out, dec, _ = car.run(GREEN_STEADY_S + 0.1, lights=oracle('green'))
+  assert not dec.should_stop
+  # handed back, the driver takes over and drives off: theirs (driverWent), never a stop again in the junction
+  car = Car([(150., 'signal')])
+  car.run_until(held, lights=oracle('red'))
+  out, dec, _ = car.run(SIGNAL_UNSEEN_S + 0.2, lights=NO_LIGHTS)
+  assert out.prompt == 'signalUnseenTakeControl'
+  drive_off(car)
+  out, dec, _ = car.run(3., lights=NO_LIGHTS)
+  assert not dec.should_stop and not out.stops and car.s > 160.
+
+
 def test_light_input_acceptance():
   class Msg:
     source = 'simOracle'

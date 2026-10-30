@@ -57,7 +57,7 @@ CONTROL_ALERT_FIRST = ('hardBrake', 'cannotStopComfortably', 'offRouteStopsUnkno
                        'cameraPaused', 'stalledInJunction', 'overrideWriteFailed', 'otherTurn')
 # handbacks: the car held while the driver is told to take control (map_controls.py, turnpilotd.py), above too fast to turn
 TAKE_CONTROL_PROMPTS = ('stopSignTakeControl', 'unprotectedTurnTakeControl', 'carStoppedTakeControl', 'stalledTakeControl',
-                        'cantStartTakeControl', 'leftUndecidedTakeControl')
+                        'cantStartTakeControl', 'leftUndecidedTakeControl', 'signalUnseenTakeControl')
 # shown, never heard: the unprotected left waiting at its line or creeping for a view, and a stop sign waiting for cross traffic,
 # are ordinary (no intervention); the stop sign's wait chimes once a WAIT_INFO_S (turnpilotPlan.stopGo.chime: stop_go.py)
 SILENT_PROMPTS = ('none', 'yieldAhead', 'waitingForGap', 'creepingForView', 'waitingForCross')
@@ -153,6 +153,7 @@ CONTROL_PROMPT_TEXT = {
   'leftUndecidedTakeControl': 'TurnPilot can\'t judge oncoming traffic',
   'waitingForCross': 'Waiting for cross traffic',
   'stopGo': 'Going from the stop sign',
+  'signalUnseenTakeControl': 'TurnPilot can\'t see the light',
 }
 CONTROL_ALERT_TEXT = {
   'cannotStopComfortably': 'Cannot stop gently for the stop/signal',

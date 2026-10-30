@@ -277,6 +277,18 @@ def test_the_stop_sign_deciders_schema_is_appended_in_order():
   assert list(tp.StopGoStatus.Lane.schema.fields)[:7] == ['role', 'index', 'approach', 'rSeen', 'rReq', 'binding', 'shielded']
 
 
+def test_a_signal_not_seen_while_held_is_a_loud_handback():
+  # BUILD_FINDINGS N3: held at a signal with no accepted light read for SIGNAL_UNSEEN_S, take control with the handback's
+  # chime, the reason line as its title; appended after stopGo @16
+  from openpilot.cereal import custom
+  from openpilot.selfdrive.turnpilot.hooks import CONTROL_PROMPT_TEXT, TAKE_CONTROL_PROMPTS
+  assert custom.TurnpilotPlan.ControlPrompt.schema.enumerants['signalUnseenTakeControl'] == 17
+  assert 'signalUnseenTakeControl' in TAKE_CONTROL_PROMPTS
+  a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt='signalUnseenTakeControl', reason="Signal not seen: take control")))
+  assert a.alert_text_1 == "Signal not seen: take control" and a.alert_text_2 == CONTROL_PROMPT_TEXT['signalUnseenTakeControl']
+  assert a.audible_alert == AudibleAlert.tpHandback and a.visual_alert == VisualAlert.steerRequired
+
+
 def test_the_stop_sign_wait_is_silent_its_go_chimes_and_its_faults_hand_back():
   # SG4a: waiting for cross traffic is ordinary (visual only), with an info chime at WAIT_INFO_S (stopGo.chime); the go is a
   # short chime as the left's; a fault is stopSignTakeControl with its reason line; the alerts after commit and while the
