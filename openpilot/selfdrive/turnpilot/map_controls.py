@@ -19,8 +19,9 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   only TurnPilot turned off clears it. A reroute's same control takes the latch over under its own key. A held car gone
   more than DRIVE_OFF_M at more than COMMIT_SPEED is let go: the driver's, once the hold has handed back (driverWent), or
   under the driver's gas (drivenOff); otherwise, with no go at all (the plan not applied: shadow mode turned on), an
-  overrun. The latch is never replayed down the road. A car stopped further out (a queue) isn't latched: the MPC holds
-  it behind the lead.
+  overrun. Handed back or under the gas, gone past the latch's reach (LATCH_PAST_M) at any speed is the driver's too: a
+  peek-creep past the line is never held again in the crossing lanes on a re-engage. The latch is never replayed down the
+  road. A car stopped further out (a queue) isn't latched: the MPC holds it behind the lead.
 - No gas go anywhere (Kellen, 2026-10-28; DESIGN phase 4, G1). Any gas press disengages (DisengageOnAccelerator, on by
   default): it is the driver taking over, never TurnPilot's go, and releases nothing. A hold TurnPilot has no rule to
   release ends in a loud handback, the car held while it lasts: a stop sign after STOP_SIGN_HANDBACK_S stopped
@@ -803,7 +804,11 @@ class MapControlPolicy:
     # moved where it was asked (a creep, a roll-up) isn't driven off: only past that
     asked = left.creep_m if c.kind == UNPROTECTED and left.mode == 'auto' else \
       (getattr(self, '_creep', None) or (0., 0.))[0] if is_stop(c) and stop_cmd.latch == 'wait' else 0.
-    if cause is None and st.moved_m - max(asked, 0.) > DRIVE_OFF_M and v > COMMIT_SPEED:
+    moved = st.moved_m - max(asked, 0.)
+    # handed back or under the driver's gas, past the latch's reach at any speed: a peek-creep at a walking pace is the driver
+    # going too (skeptic G1: held after a 1.45 m/s creep 3.6 m on, a re-engage stopped the car in the crossing lanes)
+    drivers = (prompt is not None or gas_pressed) and moved > LATCH_PAST_M
+    if cause is None and (drivers or (moved > DRIVE_OFF_M and v > COMMIT_SPEED)):
       # handed back, the driver took over and went: theirs, said already. Driven off under the driver's foot: lifting must
       # not stop the car in the junction. Or gone with no go at all, the plan not applied (shadow mode turned on): the
       # latch must not stop the car wherever the plan applies again

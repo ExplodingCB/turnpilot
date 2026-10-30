@@ -5,7 +5,7 @@ import pytest
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_ACCEL_MIN, plan_accel
-from openpilot.selfdrive.turnpilot.map_controls import (STOP_SIGN_HANDBACK_S, GREEN_STEADY_S, LIGHT_STALE_S, MAP_DECEL_MAX, NO_LIGHTS,
+from openpilot.selfdrive.turnpilot.map_controls import (COMMIT_SPEED, STOP_SIGN_HANDBACK_S, GREEN_STEADY_S, LIGHT_STALE_S, MAP_DECEL_MAX, NO_LIGHTS,
                                                          OFF_ROUTE_REASON, OFF_ROUTE_SPEED, T_LAT, UNPROTECTED, YIELD_SPEED, CameraLights,
                                                          Lights, MapControlPolicy, StopCommand, engage_distance, light_input, unprotected_turn)
 from openpilot.selfdrive.turnpilot.route_follower import make_maneuver
@@ -859,6 +859,48 @@ def test_the_driver_driving_off_a_handed_back_stop_is_a_clean_release():
     out, dec, _ = car.step()
     assert not dec.should_stop and car.policy.held is None, gas
     assert all(r[-1].alert != 'stopOverrun' for r in car.rows), gas
+
+
+def test_the_driver_creeping_past_a_handed_back_line_slowly_releases_it():
+  # skeptic G1 (residual): _held let a handed-back latch go only past DRIVE_OFF_M faster than COMMIT_SPEED, so a driver who
+  # took over and peeked past the line at about 1.45 m/s, 3.6 m on, then re-engaged was stopped there, 4.5 m past the line in
+  # the crossing lanes. Handed back, the car gone past the latch's reach (LATCH_PAST_M) at any speed is the driver's
+  # (driverWent); under the driver's gas, driven off (drivenOff). A peek inside the latch's reach stays held where it stands
+  for kind in ('stop', 'left'):
+    car = left_car() if kind == 'left' else Car([(150., 'stop')])
+    line = 250. - HOLD_LINE_M - 1. if kind == 'left' else 150.
+    car.run_until(held)
+    car.run(1.5)
+    assert car.rows[-1][-1].prompt in ('stopSignTakeControl', 'unprotectedTurnTakeControl')
+    while car.s < line + 3.6:  # the driver takes over (the gas disengages) and creeps to about 1.45 m/s
+      car.step(gas=True, accel=0.5 if car.v < 1.45 else 0.)
+    assert car.v < COMMIT_SPEED
+    out, dec, _ = car.step()  # re-engaged, no gas
+    assert not dec.should_stop and car.policy.held is None, kind
+    s0 = car.s
+    car.run(3.)
+    assert car.v > 1. and car.s - s0 > 3., kind  # never stopped in the junction
+    assert all(r[-1].alert != 'stopOverrun' for r in car.rows), kind
+  # a peek inside the latch's reach: still held, the handback still said
+  car = Car([(150., 'stop')])
+  car.run_until(held)
+  car.run(1.5)
+  while car.s < 150. + 1.:
+    car.step(gas=True, accel=0.5 if car.v < 1. else 0.)
+  out, dec, _ = car.run(2.)
+  assert held(out, dec) and out.prompt == 'stopSignTakeControl' and car.v < 0.3
+
+
+def test_driven_slowly_past_a_held_stop_under_the_gas_is_driven_off():
+  # the same under the driver's gas with no handback (the stop-sign decider waiting; DisengageOnAccelerator off: the gas
+  # overrides): past the latch's reach at a crawl, lifting must not stop the car in the junction
+  car = Car([(150., 'stop')])
+  car.run_until(held, stop=StopCommand('wait'))
+  while car.s < 150. + 3.:
+    out, _, _ = car.step(gas=True, accel=0.5 if car.v < 1.2 else 0., stop=StopCommand('wait'))
+    assert out.prompt == 'none' or car.policy.held is None
+  out, dec, _ = car.step(stop=StopCommand('wait'))
+  assert not dec.should_stop and car.policy.held is None
 
 
 def test_an_unprotected_left_hands_back_at_its_hold_line_and_no_gas_goes():
