@@ -43,7 +43,7 @@ import json
 
 import numpy as np
 
-from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_ACCEL_MIN, plan_accel
+from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_ACCEL_MIN, TAKE_CONTROL_PROMPTS, plan_accel
 from openpilot.selfdrive.turnpilot.lane_planner import LC_BLOCK_X_M
 from openpilot.selfdrive.turnpilot.route_follower import KEEP, TURN, classify
 from openpilot.selfdrive.turnpilot.unprotected_left import CREEP_MAX_M
@@ -93,6 +93,14 @@ TURN_DESIRES = (1, 2)  # log.Desire.turnLeft, turnRight
 # expectations (module docstring): 'handback:<kind>' (a turnpilotPlan.handback, or a take-control controlPrompt),
 # 'gasDisengage', 'skip' (tooFastToTurn, or the left skipped at route time), 'turnMissed', 'hardBrake' (controlAlert)
 EXPECTS = ('handback', 'gasDisengage', 'skip', 'turnMissed', 'hardBrake')
+# a take-control handback holds the car while the driver is told to take control (hooks.TAKE_CONTROL_PROMPTS): from it,
+# engaged, the car goes no further than a stop from its speed then, HELD_REACT_S at that speed and HELD_DECEL after it (a
+# go withdrawn rolling stops at 1.5 m/s^2, turnpilotd's STOP_DECEL), plus HELD_SLACK_M. The stop sign's comes after a full
+# stop (the last the car did before it was stand, not drive), never rolling
+HELD_REACT_S = 0.5
+HELD_DECEL = 1.0
+HELD_SLACK_M = 1.0
+FULL_STOP_HANDBACKS = ('stopSignTakeControl',)
 # the disengagement within this of the first row showing the gas is the press's: the shot's 0.2 s (carState.gasPressed to
 # disengaged, in the rlog), plus the rows' 50 ms sampling of two messages that may each land a row late
 GAS_DISENGAGE_S = 0.3
@@ -685,6 +693,31 @@ def parse_expect(expect) -> list[tuple[str, str]]:
   return out
 
 
+def held_after(rows, t: float) -> dict:
+  """From a take-control handback at t (HELD_*): the car's speed then, the metres it went engaged after it (to the first row
+  not engaged: from there the driver has it), the fastest it went, and the most a stop from that speed allows."""
+  i0 = next((i for i, r in enumerate(rows) if r['t'] >= t), len(rows) - 1)
+  v0 = rows[i0]['v']
+  went, v_max = 0., v0
+  for a, b in zip(rows[i0:], rows[i0 + 1:], strict=False):
+    if not b['enabled']:
+      break
+    went += 0.5 * (a['v'] + b['v']) * (b['t'] - a['t'])
+    v_max = max(v_max, b['v'])
+  return {'v0': v0, 'went_m': round(went, 2), 'v_max': round(v_max, 2),
+          'allowed_m': round(v0 * HELD_REACT_S + v0 ** 2 / (2 * HELD_DECEL) + HELD_SLACK_M, 2)}
+
+
+def stood_before(rows, t: float) -> bool:
+  """The last the car did before the row at t was stand (under STOPPED_V), not drive (over RESUMED_V): a full stop."""
+  for r in reversed([r for r in rows if r['t'] <= t]):
+    if r['v'] < STOPPED_V:
+      return True
+    if r['v'] > RESUMED_V:
+      return False
+  return False
+
+
 def expect_facts(rows) -> dict:
   """What the expectations look for in the rows: the first time of each handback (turnpilotPlan.handback, or a take-control
   controlPrompt), control alert, skip and missed turn; the first row showing the gas once engaged; and the turn desires and
@@ -708,8 +741,23 @@ def expect_facts(rows) -> dict:
       gas_t = r['t']
   return {'handbacks': first['handback'], 'control_alerts': first['alert'], 'skip_t': skip_t, 'turn_missed_t': missed_t,
           'gas_t': gas_t,
+          'held': {k: held_after(rows, t) for k, t in first['handback'].items() if k in TAKE_CONTROL_PROMPTS},
+          'stood_before': {k: stood_before(rows, t) for k, t in first['handback'].items() if k in FULL_STOP_HANDBACKS},
           'desire_after_skip_t': next((r['t'] for r in rows if skip_t is not None and r['t'] >= skip_t and r.get('desire') in TURN_DESIRES), None),
           'prompts_after_gas': sorted({k for k, t in first['handback'].items() if gas_t is not None and t >= gas_t})}
+
+
+def handback_problems(arg: str, t: float, facts: dict) -> list[str]:
+  """Why a handback of kind arg first seen at t isn't its shot's: a take-control handback the car wasn't held after
+  (held_after), the stop sign's without its full stop."""
+  out = []
+  h = facts.get('held', {}).get(arg)
+  if h is not None and h['went_m'] > h['allowed_m']:
+    out.append(f"moved {h['went_m']:.1f} m engaged after the {arg} handback (up to {h['v_max']:.1f} m/s), past the " +
+               f"{h['allowed_m']:.1f} m a stop from {h['v0']:.1f} m/s allows: not held")
+  if arg in FULL_STOP_HANDBACKS and not facts.get('stood_before', {}).get(arg, True):
+    out.append(f"handed back {arg} at t={t:.1f} s at {h['v0'] if h else 0.:.1f} m/s: no full stop before it")
+  return out
 
 
 def expectations(name: str, res: dict, fails: list[tuple[str, str]], expect) -> tuple[list[tuple[str, str]], list[dict]]:
@@ -730,9 +778,12 @@ def expectations(name: str, res: dict, fails: list[tuple[str, str]], expect) -> 
     t, met = None, False
     if kind == 'handback':
       t = facts['handbacks'].get(arg)
-      met = t is not None
-      if not met:
+      problems = [] if t is None else handback_problems(arg, t, facts)
+      met = t is not None and not problems
+      if t is None:
         extra.append(f"expected handback {arg}: none came")
+      elif problems:
+        extra += problems  # seen, but not the shot: it explains nothing
       else:
         before = [d for d in dis if d['t'] < t]
         explained_dis += [d for d in dis if d['t'] >= t]

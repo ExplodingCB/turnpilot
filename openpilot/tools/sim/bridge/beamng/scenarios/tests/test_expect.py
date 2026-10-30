@@ -6,7 +6,7 @@ import pytest
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import custom, log
 from openpilot.tools.sim.bridge.beamng.scenarios import score
-from openpilot.tools.sim.bridge.beamng.scenarios.tests.test_score import drive
+from openpilot.tools.sim.bridge.beamng.scenarios.tests.test_score import drive, route
 
 SOFT = 'turnpilotDetectorStopped/softDisable'
 
@@ -61,6 +61,89 @@ class TestHandback:
     explained = res['expected'][0]['explains']
     assert any('cantStartTakeControl' in x for x in explained) and any('driver brake' in x for x in explained)
     assert any('not arrived' in x for x in explained)
+
+
+def left_go(after):
+  """S02: waiting at the left's line, the go, withdrawn (cantStartTakeControl) with the car standing 17 m out; then the
+  `after` segments, and the sim driver's brake (--end-after-handback)."""
+  return drive([(3.0, {'v': 0., 'state': 'holding', 'left_state': 'waitGap', 'left_treq': 6.0, 'j_dist': 20., 'j_ahead': 20.,
+                       'reason': 'Waiting for a gap', 'control_prompt': 'waitingForGap'}),
+                (1.0, {'v': 1.0, 'left_state': 'go', 'control_prompt': 'leftGo', 'j_dist': 19., 'j_ahead': 19.})] + after +
+               [(0.5, {'v': 0., 'enabled': False, 'brake': True, 'j_dist': 5., 'j_ahead': 5.})])
+
+
+class TestHeldAfterHandback:
+  """A take-control handback holds the car (hooks.TAKE_CONTROL_PROMPTS): from it, engaged, the car goes no further than a
+  stop from its speed then (score.HELD_*). S02 'stopped short of the oncoming lanes and was held after', S03 'nothing
+  pushes the car on', S23 off 'full stop, handback, no go' (demo skeptic P2, P3)."""
+  HB = {'state': 'holding', 'left_state': 'go', 'control_prompt': 'cantStartTakeControl', 'reason': "Can't start the turn: take control"}
+
+  def test_rolling_on_after_the_lefts_handback_fails(self):
+    # the skeptic's P3: handed back standing, then 3 s rolling to 7 m/s, about 12 m into the junction, before the driver brakes
+    rows = left_go([(1.0, {'v': 0., 'j_dist': 17., 'j_ahead': 17., **self.HB}),
+                    (3.0, {'v': lambda tau: 1.0 + 2.0 * tau, 'left_state': 'go', 'control_prompt': 'cantStartTakeControl',
+                           'j_dist': lambda tau: 17. - 4. * tau, 'j_ahead': lambda tau: 17. - 4. * tau})])
+    res = score.summarize('unprotected_left_visible', rows, 'taken over', expect=('handback:cantStartTakeControl',))
+    assert not res['passed']
+    assert any(f.startswith("moved 11.7 m") and "after the cantStartTakeControl handback (up to 6.9 m/s)" in f and "not held" in f
+               for f in res['failures']), res['failures']
+    assert not res['expected'][0]['met']
+    assert any('cantStartTakeControl' in f and 'stalled' in f for f in res['failures'])  # nothing explained
+
+  def test_a_go_withdrawn_rolling_stops_and_is_held(self):
+    # withdrawn at the lift's 3 m/s, stopped at 1.5 m/s^2 (3 m) and held 4 s: the shot
+    rows = left_go([(2.0, {'v': lambda tau: max(3.0 - 1.5 * tau, 0.), 'j_dist': lambda tau: 17. - 3. * tau + 0.75 * tau * tau,
+                           'j_ahead': lambda tau: 17. - 3. * tau + 0.75 * tau * tau, **self.HB}),
+                    (4.0, {'v': 0., 'j_dist': 14., 'j_ahead': 14., **self.HB})])
+    res = score.summarize('unprotected_left_visible', rows, 'taken over', expect=('handback:cantStartTakeControl',))
+    assert res['passed'], res['failures']
+    held = res['expect_facts']['held'][('cantStartTakeControl')]
+    assert held['went_m'] == pytest.approx(3.0, abs=0.2) and held['v0'] == 3.0
+
+  def test_creeping_on_slowly_after_standing_fails_too(self):
+    rows = left_go([(1.0, {'v': 0., 'j_dist': 17., 'j_ahead': 17., **self.HB}),
+                    (6.0, {'v': 1.0, 'j_dist': lambda tau: 17. - tau, 'j_ahead': lambda tau: 17. - tau, **self.HB})])
+    res = score.summarize('unprotected_left_visible', rows, 'taken over', expect=('handback:cantStartTakeControl',))
+    assert any(f.startswith("moved 6.") and "not held" in f for f in res['failures']), res['failures']
+
+  def test_the_model_pulling_away_after_the_stall_handback_fails(self):
+    # S03: stood 3 s in the turn after the walker, stalledTakeControl, then the model drives on through the turn
+    rows = drive([(4.0, {'v': 4., 'nav_dist': lambda tau: 30. - 4. * tau}),
+                  (3.0, {'v': 0., 'nav_dist': 14., 'reason': 'pedestrian in crosswalk', 'state': 'holding'}),
+                  (3.0, {'v': 0., 'nav_dist': 14., 'control_prompt': 'stalledTakeControl', 'reason': 'Stalled in the turn: take control'}),
+                  (4.0, {'v': lambda tau: min(2. * tau, 6.), 'nav_dist': lambda tau: 14. - tau * tau}),
+                  (0.5, {'v': 0., 'enabled': False, 'brake': True})])
+    res = score.summarize('ped_crosswalk_right', rows, 'taken over', expect=('handback:stalledTakeControl',))
+    assert any("after the stalledTakeControl handback" in f and "not held" in f for f in res['failures']), res['failures']
+
+  def test_driving_on_through_the_stop_after_its_handback_fails(self):
+    # the skeptic's P2 (S23, avoidance off): the full stop, stopSignTakeControl, then on through the stop sign engaged, arrived
+    segs = route([(90., 'turn', 'straight'), (120., 'arrive', '')], v=8.)
+    rows = drive([(5.0, {'map_kind': 'stop', 'v': 8., **segs[0][1]}),
+                  (2.0, {'map_kind': 'stop', 'v': 0., 'state': 'holding', 'reason': 'Stop sign'}),
+                  (2.0, {'map_kind': 'stop', 'v': 0., 'state': 'holding', 'reason': 'Stop sign', 'control_prompt': 'stopSignTakeControl'}),
+                  (10.0, {'map_kind': 'none', 'v': 8., 'control_prompt': 'none'}),
+                  (1.0, {'v': 0., 'state': 'arrived', 'dest_dist': 3.})])
+    res = score.summarize('twoway_route_pair', rows, 'arrived', expect=('handback:stopSignTakeControl',))
+    assert not res['passed']
+    assert any(f.startswith("moved 80.") and "after the stopSignTakeControl handback" in f for f in res['failures']), res['failures']
+    assert any('took 0 of 0 maneuvers' in f for f in res['failures'])  # an unmet expectation explains nothing
+    # stood at the sign and held there until the driver took over: the shot
+    held = drive([(5.0, {'map_kind': 'stop', 'v': 8., **segs[0][1]}),
+                  (2.0, {'map_kind': 'stop', 'v': 0., 'state': 'holding', 'reason': 'Stop sign'}),
+                  (3.0, {'map_kind': 'stop', 'v': 0., 'state': 'holding', 'reason': 'Stop sign', 'control_prompt': 'stopSignTakeControl'}),
+                  (0.5, {'map_kind': 'stop', 'v': 0., 'enabled': False, 'brake': True})])
+    res = score.summarize('twoway_route_pair', held, 'taken over', expect=('handback:stopSignTakeControl',))
+    assert res['passed'], res['failures']
+
+  def test_a_stop_sign_handback_without_the_full_stop_fails(self):
+    # handed back rolling at 1.5 m/s and stopped after: not the 'full stop, handback'
+    rows = drive([(5.0, {'map_kind': 'stop', 'v': 8.}),
+                  (1.0, {'map_kind': 'stop', 'v': 1.5, 'control_prompt': 'stopSignTakeControl'}),
+                  (3.0, {'map_kind': 'stop', 'v': 0., 'control_prompt': 'stopSignTakeControl'}),
+                  (0.5, {'v': 0., 'enabled': False, 'brake': True})])
+    res = score.summarize('twoway_route_pair', rows, 'taken over', expect=('handback:stopSignTakeControl',))
+    assert "handed back stopSignTakeControl at t=5.0 s at 1.5 m/s: no full stop before it" in res['failures'], res['failures']
 
 
 class TestGasDisengage:
