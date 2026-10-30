@@ -391,6 +391,22 @@ class TestOncomingLane:
     leaving = self.lane_run(1.75, x0=11.5, metres=8.0)
     assert score.summarize('lane_change', leaving, 'arrived', road=lined)['wrong_side_m'] == pytest.approx(8.0, abs=1.0)
 
+  def test_the_oncoming_metres_on_a_lefts_approach_are_reported(self):
+    # owner decision on BUILD_FINDINGS D5-approach (diag s20_left_t_junction_rerun: 14 m over the divider about 31 m before
+    # the junction, the left's desire out 42 m out): the desire's lead stays, the wrong-side handback covers it, and the gate
+    # reports the oncoming-lane metres within LEFT_APPROACH_M short of a left's junction. Reported, never a failure of its own
+    def run(mod):
+      return drive([(4.0, {'x': lambda tau: -60.0 + 10.0 * tau, 'y': 1.75, 'heading': 0.0, 'v': 10.0,
+                           'nav_type': 'turn', 'nav_mod': mod, 'tp_dist': lambda tau: round(60.0 - 10.0 * tau, 1)})])
+    assert score.LEFT_APPROACH_M == 40.0
+    res = score.summarize('lane_change', run('left'), 'arrived', road=self.ROAD)
+    assert res['wrong_side_m'] == pytest.approx(40.0, abs=1.0)
+    assert res['wrong_side_left_approach_m'] == pytest.approx(20.0, abs=1.0), "from 40 m out to the box, 11.5 m from the node"
+    assert 'on left approaches 20' in score.report('x', res)
+    assert score.summarize('lane_change', run('right'), 'arrived', road=self.ROAD)['wrong_side_left_approach_m'] == 0.0
+    assert score.summarize('lane_change', self.lane_run(-1.75), 'arrived', road=self.ROAD)['wrong_side_left_approach_m'] == 0.0
+    assert score.summarize('lane_change', run('left'), 'arrived')['wrong_side_left_approach_m'] is None  # no road model
+
   def test_a_one_way_road_has_no_oncoming_lane_but_against_it_all_of_it_is(self):
     ours = {'links': [[-500.0, 0.0, 500.0, 0.0, 3.5, 3.5, '++']], 'junctions': []}
     assert score.summarize('lane_change', self.lane_run(1.75), 'arrived', road=ours)['wrong_side_m'] == 0.0

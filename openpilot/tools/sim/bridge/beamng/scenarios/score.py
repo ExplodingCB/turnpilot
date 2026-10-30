@@ -56,7 +56,8 @@ import numpy as np
 from openpilot.selfdrive.turnpilot.handback import EVENTS as HANDBACK_EVENTS, EventName, Handback
 from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_ACCEL_MIN, TAKE_CONTROL_PROMPTS, plan_accel
 from openpilot.selfdrive.turnpilot.lane_planner import LC_BLOCK_X_M
-from openpilot.selfdrive.turnpilot.route_follower import KEEP, TURN, classify
+from openpilot.selfdrive.turnpilot.desire_timing import TURN_DESIRE_LEAD_M
+from openpilot.selfdrive.turnpilot.route_follower import KEEP, LEFT, TURN, classify
 from openpilot.selfdrive.turnpilot.scene_policy import STOP_DECEL
 from openpilot.selfdrive.turnpilot.unprotected_left import CREEP_MAX_M
 
@@ -79,6 +80,9 @@ CAR_MIN_GAP_M = 4.     # camera mount to the other car's centre
 # it, p99): straddling the divider with the left wheels over it counts, not only a car wholly across
 WRONG_SIDE_PAST_M = -0.5
 WRONG_SIDE_MIN_M = 3.  # driving this far in the oncoming lane, outside every junction box, fails the run
+# ...and of it, what falls on a left's approach (this far short of its junction: the turn desire's lead) is reported apart
+# (owner decision on BUILD_FINDINGS D5-approach: the lead stays, the wrong-side handback is its cover)
+LEFT_APPROACH_M = TURN_DESIRE_LEAD_M
 ON_ROAD_M = 1.5        # within the road's half width plus this of a link's centreline: on that road
 ALIGNED_DEG = 35.      # the car's heading within this of a link's direction (either way): driving along it
 LINE_BOX_MARGIN_M = 2. # a junction's box reaches this far past its mapped stop line, for a car heading into the junction
@@ -509,6 +513,25 @@ def wrong_side(rows, road) -> tuple[float | None, list[dict]]:
     else:
       cur = None
   return round(total, 1), spans
+
+
+def wrong_side_left_approach(rows, road) -> float | None:
+  """m of wrong_side's oncoming-lane driving that falls on a left's approach: navd's step a left turn (classify) and the car
+  within LEFT_APPROACH_M short of its junction by turnpilotPlan.maneuverDistance (navd's distance before the first plan).
+  BUILD_FINDINGS D5-approach (diag s20_left_t_junction_rerun: 14 m over the divider about 31 m before the junction, turnLeft
+  out 42 m before it): the owner left the desire's lead as it is, with the wrong-side handback as the cover, and the gate
+  reports these metres. Reported only: wrong_side_m already fails the run. None as for wrong_side."""
+  if road is None or not road.get('links') or not any(r.get('x') is not None for r in rows):
+    return None
+  past = oncoming_offsets(rows, road)
+  total = 0.
+  for i, r in enumerate(rows):
+    d = r.get('tp_dist') if r.get('tp_dist') is not None else r.get('nav_dist')
+    if not i or past[i] is None or past[i] <= WRONG_SIDE_PAST_M or d is None or not 0. < d <= LEFT_APPROACH_M:
+      continue
+    if classify(r.get('nav_type', ''), r.get('nav_mod', '')) == (TURN, LEFT):
+      total += r['v'] * (r['t'] - rows[i - 1]['t'])
+  return round(total, 1)
 
 
 def lane_changes(rows) -> list[dict]:
@@ -1329,6 +1352,7 @@ def summarize(name: str, rows, outcome: str, road: dict | None = None, junction_
     'positions': any(r.get('x') is not None for r in rows),
     'wrong_side_m': wrong_m,
     'wrong_side': wrong_spans,
+    'wrong_side_left_approach_m': wrong_side_left_approach(rows, road),
     # the prompts TurnPilot showed with the car standing at the junction (waitingForGap, a handback)
     'stopped_for_go': sorted({r['control_prompt'] for r in rows if r.get('control_prompt', 'none') not in ('', 'none') and
                               r['v'] < STOPPED_V and near_junction(r)}),
@@ -1356,7 +1380,7 @@ def report(label: str, res: dict) -> str:
   taps = [(x['prompt'], x['stopped_s']) for x in res.get('gas_taps', [])]
   line = f"{label}: {'PASS' if res['passed'] else 'FAIL'} {res['outcome']}, {res['maneuvers_taken']}/{res['maneuvers_attempted']} maneuvers, " + \
          f"{len(res['disengagements'])} disengagements, holds {holds}, gas taps {taps}, min gap ped {res['min_gap_ped_m']} car {res['min_gap_car_m']}, " + \
-         f"oncoming lane {res.get('wrong_side_m')} m"
+         f"oncoming lane {res.get('wrong_side_m')} m (on left approaches {res.get('wrong_side_left_approach_m')} m)"
   acc = res.get('tp_accel') or {}
   if acc.get('min') is not None:
     line += f", TurnPilot accel min {acc['min']} m/s^2 (planner {acc.get('a_target_min')})"
