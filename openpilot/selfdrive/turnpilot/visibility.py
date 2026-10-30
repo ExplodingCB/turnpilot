@@ -180,17 +180,19 @@ class LiveVisibility:
 
   def lanes(self, lanes_at_stop: list, d_stop: float, vis, *, rot_deg: float, edges: sr.Edges, lighting: str = 'day',
             low_sun_sides=(), entry: dict | None = None, stamp: dict | None = None, tracks=(), evidence: dict | None = None,
-            cam_height: float | None = None, a_launch: float = sr.A_LAUNCH_PLAN) -> Report:
+            cam_height: float | None = None, a_launch: float = sr.A_LAUNCH_PLAN, ahead_m: float = 0.) -> Report:
     """Each lane's reach now (module docstring). lanes_at_stop: the held control's conflicting lanes seen from its stop
     point (stop_evidence.junction_lanes); d_stop: m our car stands short of the stop point; vis: visibility_table's
     Visibility; lighting: day, sunAhead, dusk or night at the line; low_sun_sides: the sides with low sun along an approach;
     entry: the matched survey; stamp: its passing validation stamp for our approach and this lighting (certify.pick_stamp);
     tracks: the tracker's tracks; evidence: stop_evidence's; edges: the edge band from the stop point (stop_rules.edge_band;
-    a non-stopping lane's two-way need reads its far end)."""
+    a non-stopping lane's two-way need reads its far end). ahead_m: predict the walk from that much further on (the
+    stop-sign decider's creep for a view, STOP_SIGNS.md 2.5): d_stop already the nearer point's, and every occluder with a
+    ground position re-seen from there (occluders()); the views, sectors and sun as they are now."""
     height = cam_height if cam_height is not None else (vis.height if vis.height is not None else 1.3)
     lns = [replace(ln, s_min=ln.s_min + d_stop, s_max=ln.s_max + d_stop) for ln in lanes_at_stop]
     edges_now = sr.Edges(edges.d_min + d_stop, edges.d_max + d_stop, None if edges.nominal is None else edges.nominal + d_stop)
-    occ = self.occluders(tracks)
+    occ = self.occluders(tracks, ahead_m)
     fresh = {k: self.fresh_key(k) for k in ('road', 'full', 'sideLeft', 'sideRight')}
     veil_ok = vis.veil in sr.VEIL_OK
     rows = vis.views(lighting, use='allWay') if lighting in ('day', 'sunAhead') else {}
@@ -232,11 +234,25 @@ class LiveVisibility:
       out.append(seen)
     return Report(out, self.edge_estimate(tracks, vis.setback if vis.setback is not None else 0., d_stop), len(occ), fresh)
 
-  def occluders(self, tracks) -> list:
-    """Every track's box, and every steady raw box of a fresh view, as stop_rules Occluders (module docstring)."""
+  def occluders(self, tracks, ahead_m: float = 0.) -> list:
+    """Every track's box, and every steady raw box of a fresh view, as stop_rules Occluders (module docstring). ahead_m: each
+    one with a ground position re-seen from that much further on (its span's edges taken at its own range), the trust rule
+    applied to its bearing from there; one with none (unranged) keeps its bearings, the occluder at infinity, which a creep
+    never helps (the prediction's safe side)."""
     out = []
 
-    def add(span, bearing, rng):
+    def shifted(span, bearing, rng, ground):
+      if not ahead_m or ground is None:
+        return span, bearing, rng
+
+      def see(b):
+        x, y = ground * math.cos(math.radians(b)) - ahead_m, ground * math.sin(math.radians(b))
+        return math.degrees(math.atan2(y, x)), math.hypot(x, y)
+      (b0, _), (b1, _), (bc, r) = see(span[0]), see(span[1]), see(bearing)
+      return (b0, b1), bc, None if rng is None else max(rng + r - ground, 0.1)
+
+    def add(span, bearing, rng, ground=None):
+      span, bearing, rng = shifted(span, bearing, rng, ground)
       lo, hi = sorted(span)
       trusted = rng is not None and abs(bearing) < OCCLUDER_RANGE_TRUST_DEG
       r = rng * OCCLUDER_NEAR_FRAC if trusted else None
@@ -248,13 +264,14 @@ class LiveVisibility:
       span = getattr(trk, 'span_seen', None)
       if span is None or trk.x is None:
         continue
-      add(span, trk.bearing_seen, math.hypot(float(trk.x[0]), float(trk.x[1])))
+      rng = math.hypot(float(trk.x[0]), float(trk.x[1]))
+      add(span, trk.bearing_seen, rng, rng)
     for key, frame in self.raw.items():
       if key == 'far' or not self.fresh_key(key):
         continue
       for b in frame.boxes:
         if self.steady(key, b):
-          add(b.span_deg, b.bearing_deg, b.near_m if b.xy is not None else None)
+          add(b.span_deg, b.bearing_deg, b.near_m if b.xy is not None else None, math.hypot(*b.xy) if b.xy is not None else None)
     return out
 
   def blockers(self, ln: sr.Lane, need: float, rot_deg: float, height: float) -> list:

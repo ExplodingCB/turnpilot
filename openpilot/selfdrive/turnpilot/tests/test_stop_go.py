@@ -2113,3 +2113,52 @@ def test_G14_a_stop_point_close_to_the_cross_road_creep_and_the_go_measured_from
   assert i is not None and out[i].position_m == pytest.approx(0.6, abs=0.05)
   assert max(d.position_m for d in out) <= w.sg.edges.d_min - sr.M_EDGE + 0.05
   assert all(s.accel_cap >= -2. - 1e-9 for d in out for s in d.stops)
+
+
+def corner_occluder(d_along=-1.2, y=-3.0, ranged=True):
+  """World.boxes: a car parked at our road's right curb, its front corner d_along m past the stop point and y m left of our
+  axis, a steady raw box on the right side view (an occluder once held steady, never a track) seen from where the car is now."""
+  from openpilot.selfdrive.turnpilot.tests.test_visibility import corner_box
+
+  def boxes(w):
+    pos = w.sg.pos_ref + (w.odo - w.sg.odo_ref) if w.sg.token is not None else -w.control.d
+    b = corner_box(w.sg.setback + d_along - pos, y)
+    if not ranged:
+      b = dataclasses.replace(b, xy=None, near_m=None)
+    return {'sideRight': [b]}
+  return boxes
+
+
+def test_G3_a_corner_occluder_the_creep_is_predicted_to_clear_is_crept_past_after_the_static_wait_then_the_go(tmp_path):
+  # 7.1 rung 1 (2.5): a car parked at our right curb, its front corner 1.2 m ahead of the camera and 3 m right, caps the right
+  # lane short of its reach (a static wait, "can't see far enough from the right"); at STATIC_WAIT_S the ladder's creep, 0.5 m
+  # on the latch's creep path (a G5 go, cause creep, for a model that holds), is predicted to see past the corner's plane;
+  # after it the lane measures clear for CLEAR_S and the car goes by itself, no handback. Before SG4c: H3 at the bound
+  w = Drive(tmp_path, behaviour=lambda w: 'holds')
+  w.boxes = corner_occluder()
+  out = w.run(STATIC_WAIT_S + 12.)
+  waiting = out[round(4. / DT_MDL):round(14. / DT_MDL)]
+  assert all(d.ledger == 'static' and any(h.key.startswith('reach:right') for h in d.holds) for d in waiting), \
+    [(d.state, d.reason) for d in waiting[::40]]
+  creep = next((k for k, d in enumerate(out) if d.go_cause == 'creep'), None)
+  assert creep is not None and (creep + 1) * DT_MDL >= 1.0 + STATIC_WAIT_S - 0.1, [(d.state, d.reason) for d in out[::40]]
+  assert out[creep].reason == "Creeping for view" and out[creep].action == 'creeping'
+  i = first_go(out)
+  assert i is not None and i > creep and all(d.fault == '' for d in out[:i])
+  moved = out[i].position_m - out[creep].position_m
+  assert 0.3 <= moved <= 0.7, moved
+  assert w.sg.edges.d_min - out[i].position_m >= sr.go_room_m(w.kw['t_abort']) - 1e-6
+  assert all(c[3] >= -2. - 1e-9 for c in w.cmds)
+
+
+def test_G3_no_creep_where_it_is_not_predicted_to_help_or_the_creep_floor_forbids_it_h3_at_the_bound(tmp_path):
+  # an unranged occluder (bearing-only: at infinity, no creep helps it) and the same ranged one from a stop point with no room
+  # for 0.5 m more above GO_ROOM_M: no creep, H3 with the reach's reason at STATIC_WAIT_S
+  close = junction(stop_point_distance=LANE_EDGE + 5.8, stop_point_source='survey')  # G14's: dEdgeMin 3.3 m, latched 0.6 m past
+  for kw in ({'boxes': corner_occluder(ranged=False)}, {'boxes': corner_occluder(d_along=-0.1), 'd0': -0.6, 'j': close}):
+    w = Drive(tmp_path, behaviour=lambda w: 'holds', d0=kw.get('d0', 0.5), j=kw.get('j'))
+    w.boxes = kw['boxes']
+    out = w.run(STATIC_WAIT_S + 4.)
+    assert not any(d.go_cause == 'creep' or d.creep is not None for d in out), kw
+    h3 = next((d for d in out if d.fault == 'H3'), None)
+    assert h3 is not None and "can't see far enough from the right" in h3.reason, [(d.state, d.reason) for d in out[::40]]

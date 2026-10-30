@@ -120,6 +120,9 @@ DEADLOCK_CYCLES = 1             # creeps an encounter takes before the order is 
 DEADLOCK_CREEP_TRIES = 3        # creeps an encounter may start: one something else cut short is given back, up to this many
 DEADLOCK_CREEP_MAX_S = GO_WINDOW_S + 1.  # s the creep may take (G5's window, a second to stop): then it is over, moved or not
 CREEP_LANE_HOLDS = ('reach', 'raw', 'u2', 'tracked', 'wrongWay', 'stale', 'hide')  # a creep in hand isn't ended by these
+VIEW_CREEP_M = 0.5              # m a creep for a view takes (the ladder's rung 1, 2.5, row G3), on the latch's creep path...
+VIEW_CREEP_V = DEADLOCK_CREEP_V  # ...at the deadlock creep's cap, its target short by the same run-on (a bounded move)
+VIEW_CREEP_GAIN_M = 0.25        # m the binding lane's R_seen less R_req must be predicted to gain from the step, or measured to
 CORNER_M = 15.                  # m down a cross lane a long vehicle coming toward our path is at the corner (no creep, V13)...
 CREEP_LOOK_S = 5.               # ...or will be within this (its speed toward us): the creep and the next CLEAR_S
 FRONT_ZONE_M, FRONT_ZONE_MAX_S = 3.0, 30.
@@ -187,6 +190,7 @@ STOP_SIGN_REASON = "Stop sign: take control to proceed"  # map_controls' handbac
 # junctionInfo.certification of a stop the route couldn't avoid (routing/avoid.py): announced, then handed back at the full stop
 UNAVOIDABLE = 'unavoidable'
 ROUTE_KNOWN_REASON = "this stop needs you"
+VIEW_CREEP_REASON = "Creeping for view"
 REASONS = {
   'H1': "Cross-traffic camera unavailable: take control",
   'H2': "Stop sign position uncertain: take control",
@@ -383,6 +387,8 @@ class StopGo:
     self.creep_tries = 0            # creeps started this encounter, given back or not (DEADLOCK_CREEP_TRIES)
     self.order_waived = False       # the deadlock passed the turn to us: go condition 5 waived, and only it
     self.creep_end = None           # (why, creep): the creep just ended (its G5 go withdrawn)
+    self.view_creep: dict | None = None  # the ladder's creep for a view (rung 1): phase creep, measure or over, its target...
+    self.view_steps = 0             # creeps for a view taken this encounter
     self.clear_s = 0.
     self.static_s = 0.
     self.dynamic_s = 0.
@@ -833,9 +839,11 @@ class StopGo:
     holds = self.go_holds(f, pos, launch=False)
     d.holds = holds
     self.clear_s = self.clear_s + f.dt if not holds else 0.
-    self._ledger(f, d, holds, acting)
+    self._ledger(f, d, holds, acting, pos)
     if self.state != 'observe':
       return
+    if self.view_creep is not None:
+      self._view_creeping(f, d, holds, pos, ctl, acting, standing)
     if ctl is None:
       d.stops.append(hold_here(f.v_ego, d.reason or "Stopped at stop sign"))  # the decider's own hold: the latch let go already
     # the deadlock's signalling creep (4.5 step 5): the latch's stop point moved on at CREEP_SPEED, and one G5 go (creep) at its
@@ -1119,12 +1127,9 @@ class StopGo:
       return [Hold('noLanes', "no conflicting approach to judge by", STATIC)]
     if f.live is None or f.vis is None:
       return [Hold('camera', "no live view", FAULT)]
-    row, low = self._lighting(f)
-    stamp = ce.pick_stamp(self.entry, row, self.junction.heading_in) if self.entry is not None else None
     at = self.go['pos'] if launch and self.go is not None else pos
     rot = sr.angle_bound(self.edges.nominal is not None, max(abs(f.yaw20_deg), sr.ROUTE_YAW_DEG))
-    rep = f.live.lanes(lanes, -at, f.vis, rot_deg=rot, edges=self.edges, lighting=row if row in ('day', 'sunAhead') else 'night',
-                       low_sun_sides=low, entry=self.entry, stamp=stamp, tracks=f.tracks or (), evidence=self.ev)
+    rep = self._reach_report(f, lanes, at)
     known = self.go['tracks'] if launch and self.go is not None else {}
     still = self._still_spans(f, known) if launch else []
     for ln, seen in zip(lanes, rep.lanes, strict=True):
@@ -1173,6 +1178,15 @@ class StopGo:
                              sr.V_CROSS_FACTOR * ln.limit):
         holds.append(Hold(f'tracked:{tid}', f"a {e.cls} {side_word(ln.role)}", DYNAMIC))
     return holds
+
+  def _reach_report(self, f: Frame, lanes: list, at: float, ahead_m: float = 0.):
+    """visibility.LiveVisibility.lanes for lanes from at (m past the stop point), with this frame's lighting, survey, stamp,
+    tracks and evidence; ahead_m: predicted from that much further on (the creep for a view, 2.5)."""
+    row, low = self._lighting(f)
+    stamp = ce.pick_stamp(self.entry, row, self.junction.heading_in) if self.entry is not None else None
+    rot = sr.angle_bound(self.edges.nominal is not None, max(abs(f.yaw20_deg), sr.ROUTE_YAW_DEG))
+    return f.live.lanes(lanes, -(at + ahead_m), f.vis, rot_deg=rot, edges=self.edges, lighting=row if row in ('day', 'sunAhead') else 'night',
+                        low_sun_sides=low, entry=self.entry, stamp=stamp, tracks=f.tracks or (), evidence=self.ev, ahead_m=ahead_m)
 
   @staticmethod
   def _blockers(f: Frame, ln, need: float, rot: float, pos: float) -> list:
@@ -1729,7 +1743,7 @@ class StopGo:
 
   # ---------------------------------------------------------------------------------------------------------- the ledger
 
-  def _ledger(self, f: Frame, d: StopGoDecision, holds: list[Hold], acting: bool) -> None:
+  def _ledger(self, f: Frame, d: StopGoDecision, holds: list[Hold], acting: bool, pos: float = 0.) -> None:
     """4.6: every held state says why (waitingForCross, its reason) and has a bound or a dynamic cause. Dynamic: no bound, an
     info chime at WAIT_INFO_S and every WAIT_INFO_S after. Static (every hold static): STATIC_WAIT_S, then the ladder (H3).
     A fault's: its grace, then its handback. As shadow, only said (the latch's own handback stands)."""
@@ -1783,8 +1797,119 @@ class StopGo:
     d.ledger = STATIC
     self.static_s += f.dt
     route_known = f.route_cert == 'uncertifiable' and top.key.startswith('cert:')
-    if acting and (route_known or self.static_s >= STATIC_WAIT_S - 1e-6):
-      self._fault('H3', f, d, ROUTE_KNOWN_REASON if route_known else top.reason)
+    if acting and route_known:
+      self._fault('H3', f, d, ROUTE_KNOWN_REASON)
+    elif acting and self.static_s >= STATIC_WAIT_S - 1e-6:
+      self._ladder_rungs(f, d, holds, top, pos)
+
+  def _ladder_rungs(self, f: Frame, d: StopGoDecision, holds: list[Hold], top: Hold, pos: float) -> None:
+    """7.1, the static wait's bound: rung 1, the creep for a view where 2.5 predicts a closer point helps the binding lane
+    and the creep floor allows it (_view_creep_start; while one is in hand, crept or measuring, the ladder waits on it); rung
+    3, H3 with the reason."""
+    vc = self.view_creep
+    if vc is not None and vc['phase'] in ('creep', 'measure'):
+      return
+    if vc is None and self._view_creep_start(f, d, holds, pos):
+      return
+    self.view_creep = {'phase': 'over'}
+    self._fault('H3', f, d, top.reason)
+
+  # ------------------------------------------------------------------------------------------------- the creep for a view
+
+  def _binding(self) -> LaneStatus | None:
+    """The lane short of its reach with the least margin (R_seen less R_req) this frame, None with none short."""
+    short = [x for x in self.last_lanes if x.r_seen + 1e-9 < x.r_req and not x.shielded]
+    return min(short, key=lambda x: x.r_seen - x.r_req) if short else None
+
+  def _view_creep_start(self, f: Frame, d: StopGoDecision, holds: list[Hold], pos: float) -> bool:
+    """2.5's creep for a corner occluder, the ladder's first rung (row G3): only for a wait whose every cause is a lane short
+    of its reach (a parked car, an occluder; standing back extends frame-edge reach, so the walk decides), from the latch (its
+    creep path), with the car straight and no turn desire, never while creep_blocked (V12, V13), never closer than GO_ROOM_M
+    (GO_ROOM_RIGHT_M more for a right) to the closest plausible edge after the step (at a surveyed junction measured to the
+    surveyed travel-lane edge: edge_band), and only where the walk predicted from VIEW_CREEP_M on (every ranged occluder
+    re-seen from there: visibility's ahead_m) gains the binding lane VIEW_CREEP_GAIN_M and, from the furthest point the floor
+    allows, meets its requirement (so no run of pointless steps). True: a step started."""
+    b = self._binding()
+    if b is None or f.control is None or not holds or any(not h.key.startswith('reach:') for h in holds):
+      return False
+    if abs(f.yaw20_deg) > YAW_GO_DEG or abs(f.steer_deg) > STEER_GO_DEG or (f.desire_out and not self.went):
+      return False
+    need = sr.go_room_m(f.t_abort, right=f.maneuver == 'right')
+    room = self.edges.d_min - pos - VIEW_CREEP_M
+    blocked = self.creep_blocked(f, pos)
+    if room < need - 1e-6 or blocked:
+      cloudlog.event("turnpilot.stop_go_view_creep_no", key=list(self.key), why=blocked or 'room', room=round(room, 2), need=round(need, 2))
+      return False
+    lanes = self.junction_lanes(f)
+    key = (b.role, b.index)
+
+    def margin(ahead):
+      rep = self._reach_report(f, lanes, pos, ahead)
+      for ln, seen in zip(lanes, rep.lanes, strict=True):
+        if (ln.role, ln.index) == key:
+          return seen.r_seen_m - max(seen.need_m - sr.V_CROSS_FACTOR * ln.limit * sr.T_LAT, 0.)
+      return -math.inf
+    now = b.r_seen - b.r_req
+    step = margin(VIEW_CREEP_M)
+    furthest = math.floor((self.edges.d_min - pos - need) / VIEW_CREEP_M + 1e-6) * VIEW_CREEP_M
+    best = margin(furthest) if furthest > VIEW_CREEP_M else step
+    if step < now + VIEW_CREEP_GAIN_M or best < 0.:
+      cloudlog.event("turnpilot.stop_go_view_creep_no", key=list(self.key), why='notPredicted', lane=list(key), now=round(now, 2),
+                     step=round(step, 2), best=round(best, 2), furthest=round(furthest, 2))
+      return False
+    moved = float(getattr(f.control.state, 'moved_m', 0.))
+    v = VIEW_CREEP_V
+    run_on = max(v * (f.t_abort - DT_MDL - 0.1) + v * v / 2. - CREEP_AT_M, 0.)
+    self.view_creep = {'phase': 'creep', 'target': moved + max(VIEW_CREEP_M - run_on, CREEP_AT_M + 0.1), 't': self.t, 'went': False,
+                       'from': moved, 'moved': False, 'margin0': now, 'lane': key, 'known': self._known_tracks(f)}
+    cloudlog.event("turnpilot.stop_go_view_creep", key=list(self.key), lane=list(key), pos=round(pos, 2), now=round(now, 2),
+                   predicted=round(step, 2), best=round(best, 2), room=round(room, 2), steps=self.view_steps)
+    d.creep, d.action, d.reason = (self.view_creep['target'], VIEW_CREEP_V), 'creeping', VIEW_CREEP_REASON
+    return True
+
+  def _view_creeping(self, f: Frame, d: StopGoDecision, holds: list[Hold], pos: float, ctl, acting: bool, standing: bool) -> None:
+    """The creep for a view in hand. creep: on the latch's creep path at VIEW_CREEP_V, one G5 go (cause creep) at its start
+    for a model that holds; anything moving that isn't its lanes' (a person, the box, a queue) or creep_blocked gives it back
+    where the car is (the latch holding again; the ladder may take it again at the next bound); reached, or its time up,
+    measure. measure: CLEAR_S from where it stands (the go comes on its own if every condition holds); then a margin gained
+    VIEW_CREEP_GAIN_M on the binding lane may take the next step where it is predicted to help, else the rung is over and
+    the ladder goes on."""
+    vc = self.view_creep
+    if vc['phase'] == 'creep':
+      moving = [h for h in holds if h.kind == DYNAMIC and h.key.split(':')[0] not in CREEP_LANE_HOLDS]
+      blocked = self.creep_blocked(f, pos, vc['known'])
+      if ctl is None or moving or blocked:
+        why = 'no latch' if ctl is None else blocked or moving[0].reason
+        cloudlog.event("turnpilot.stop_go_view_creep_yield", key=list(self.key), why=why, pos=round(pos, 2))
+        if f.go_active == 'creep':
+          d.withdraw = 'viewCreepYield'
+        self.view_creep = None
+        return
+      d.creep, d.action, d.reason = (vc['target'], VIEW_CREEP_V), 'creeping', VIEW_CREEP_REASON
+      if not vc['went'] and acting and f.enabled and f.go_active == 'none' and standing:
+        vc['went'] = True
+        d.go_cause = 'creep'
+      moved = float(getattr(ctl.state, 'moved_m', 0.))
+      vc['moved'] = vc['moved'] or f.v_ego > STAND_V
+      there = moved >= vc['target'] - CREEP_AT_M - 1e-6
+      if (standing and (there or (vc['moved'] and self.t - vc['t'] > STOP_DWELL_S))) or self.t - vc['t'] >= DEADLOCK_CREEP_MAX_S - 1e-6:
+        self.view_steps += 1
+        vc.update(phase='measure', t_measure=self.t)
+        if f.go_active == 'creep':
+          d.withdraw = 'creepDone'
+        cloudlog.event("turnpilot.stop_go_view_creep_done", key=list(self.key), crept=round(moved - vc['from'], 2), pos=round(pos, 2))
+      return
+    if vc['phase'] != 'measure' or self.t - vc['t_measure'] < sr.CLEAR_S - 1e-6 or not holds:
+      return
+    b = self._binding()
+    if b is None or any(not h.key.startswith('reach:') or h.kind != STATIC for h in holds):
+      self.view_creep = None  # something else now: the ladder starts over at the next bound
+      return
+    gained = (b.r_seen - b.r_req) - vc['margin0']
+    cloudlog.event("turnpilot.stop_go_view_creep_measured", key=list(self.key), lane=[b.role, b.index], gained=round(gained, 2))
+    self.view_creep = None
+    if gained < VIEW_CREEP_GAIN_M or not self._view_creep_start(f, d, holds, pos):
+      self.view_creep = {'phase': 'over'}
 
   # -------------------------------------------------------------------------------------------------- withdraw and abort
 

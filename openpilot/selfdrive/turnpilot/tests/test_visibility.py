@@ -273,6 +273,48 @@ def test_a_moving_track_caps_reach_where_its_bearing_meets_the_lane():
   assert x.why == 'occluder' and x.reach_m == pytest.approx(ln.s_min * math.tan(math.radians(lo - ROT)), abs=sr.WALK_STEP_M)
 
 
+def corner_box(x, y, view='sideRight', back_deg=40.):
+  """A steady raw box whose left edge (the one nearest our axis on the right) is a corner at (x, y) in the car frame (y left),
+  the box reaching back_deg beyond it: a car parked at our road's right curb with its front corner there."""
+  b = math.degrees(math.atan2(y, x))
+  return RawBox('wide', 'car', 0.6, b - back_deg / 2., (b - back_deg, b), (x, y), math.hypot(x, y), (0., 0., 0.1, 0.1), view)
+
+
+@pytest.mark.parametrize('kind', ['raw', 'track'])
+def test_G3_creep_prediction_an_occluder_nearer_than_the_lane_reaches_further_from_half_a_metre_on(kind):
+  # STOP_SIGNS.md 2.5: creeping forward helps only once the camera passes the occluder's plane. ahead_m predicts the walk from
+  # that much further on: the lanes nearer by it and every ranged occluder's edges re-seen from there (at their own range),
+  # so a car parked at our right curb with its front corner 1.2 m ahead of the camera and 3 m right caps the right lane at
+  # about s_min tan 68 deg now and much further 0.5 m on; one standing in the lane itself gains nothing (it caps itself)
+  ln = next(x for x in lanes() if x.role == 'right')
+  corner = (1.2, -3.0)
+  if kind == 'raw':
+    lv = live(raw={'sideRight': RawFrame([corner_box(*corner)], 'wide', T, 'sideRight')})
+    tracks = []
+  else:
+    lv = live()
+    b = math.degrees(math.atan2(corner[1], corner[0]))
+    tracks = [SimpleNamespace(track_id=7, t_seen=T, bearing_seen=b - 20., width_seen=100., view='sideRight', cls=2, hits=5,
+                              span_seen=(b - 40., b), x=np.array([corner[0], corner[1], 0., 0.]))]
+  now = lane_of(report(lv, tracks=tracks), 'right')
+  on = lane_of(lv.lanes(lanes(), -0.5, vis_file(), rot_deg=ROT, edges=EDGES, tracks=tracks, ahead_m=0.5), 'right')
+  assert now.why == 'occluder'
+  b0 = abs(math.degrees(math.atan2(corner[1], corner[0])))
+  assert now.reach_m == pytest.approx(ln.s_min * math.tan(math.radians(b0 - ROT)), abs=sr.WALK_STEP_M + 0.05)
+  # past its plane 0.5 m on (its corner at 77 deg, beyond the lane's reach there): the lane runs out at the table's range
+  assert on.reach_m > now.reach_m + 3. and on.why == 'range'
+  # ahead_m 0 is the walk as it stands
+  assert lane_of(lv.lanes(lanes(), 0., vis_file(), rot_deg=ROT, edges=EDGES, tracks=tracks, ahead_m=0.), 'right').reach_m == now.reach_m
+  # an unranged occluder keeps its bearings (at infinity): from 0.5 m on it caps the lane nearer, never further
+  if kind == 'raw':
+    b = corner_box(*corner)
+    unranged = RawBox(b.camera, b.cls, b.conf, b.bearing_deg, b.span_deg, None, None, b.box, b.view)
+    lv = live(raw={'sideRight': RawFrame([unranged], 'wide', T, 'sideRight')})
+    now = lane_of(report(lv), 'right')
+    on = lane_of(lv.lanes(lanes(), -0.5, vis_file(), rot_deg=ROT, edges=EDGES, ahead_m=0.5), 'right')
+    assert now.why == 'occluder' and on.reach_m <= now.reach_m + 1e-9
+
+
 def test_G8_a_stopped_car_in_lane_1_caps_lane_2_behind_it():
   j = junction(25.)
   j.approaches[0].lanes_in = 2
