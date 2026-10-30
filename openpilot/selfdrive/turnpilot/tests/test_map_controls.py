@@ -335,10 +335,18 @@ def test_light_input_acceptance():
 
 # --- yields ---
 
-def test_yield_caps_speed_never_stops():
+def rolling_ok(car):
+  """update()'s yields: every yield's rolling test passing now (STOP_SIGNS.md 2.7), its commit point the default."""
+  from openpilot.selfdrive.turnpilot.map_controls import YIELD_COMMIT_M
+  return {c.key: (True, YIELD_COMMIT_M) for c in car.policy.tracker.controls.values() if c.kind == 'yield'}
+
+
+def test_C5_a_yield_whose_rolling_test_passes_through_its_commit_point_caps_the_speed_and_never_stops():
+  # 2.7: while the rolling test passes the map-stop curve's cap lifts to YIELD_SPEED at the line; passing it at the rolling
+  # commit point the yield is taken rolling and passed, never shouldStop
   car = Car([(150., 'yield')])
   for _ in range(int(20. / DT_MDL)):
-    out, dec, cmd = car.step()
+    out, dec, cmd = car.step(yields=rolling_ok)
     assert not dec.should_stop and dec.accel_cap == NO_ACCEL_CAP or dec.accel_cap >= MAP_DECEL_MAX
     if 0. < 150. - car.s < 1.:
       assert car.v < YIELD_SPEED + 0.6
@@ -347,10 +355,54 @@ def test_yield_caps_speed_never_stops():
   assert car.s > 160.
 
 
-def test_cross_suspect_yield_dropped():
-  car = Car([(150., 'yield', False, True, True)])
-  out, dec, _ = car.run(15.)
+def test_C5_a_yield_whose_rolling_test_fails_is_a_stop_yieldstop_at_its_line_on_the_map_curve_latched_under_the_decider():
+  # 2.7, row C5 (mc): this week no yield's rolling test passes (no survey: 64-84 m of cross lane needed): the approach is the
+  # map-stop curve to a full stop at the yield line (-1.5, floor -2.0), it becomes a stop (yieldStop) at its rolling commit
+  # point, latches, and from then on is a stop under the decider: as shadow its 1 s handback ("Yield: take control"), under a
+  # StopCommand wait held with no handback, released by the decider's 'clear'. Before SG4c the car rolled through at 5 m/s
+  from openpilot.selfdrive.turnpilot.map_controls import YIELD_STOP, is_stop
+  car = Car([(150., 'yield')])
+  out, dec = car.run_until(held)
+  assert abs(150. - car.s) < 2.5 and min(r[3] for r in car.rows) >= MAP_DECEL_MAX - 1e-6
+  c = car.policy.held_control()
+  assert c is not None and c.kind == 'yield' and c.state.mode == YIELD_STOP and is_stop(c)
+  assert car.policy.stop_ahead() == 0.
+  out, dec, _ = car.run(STOP_SIGN_HANDBACK_S + 0.2)
+  assert held(out, dec) and out.prompt == 'stopSignTakeControl' and 'Yield' in dec.reason
+  car = Car([(150., 'yield')])
+  car.run_until(held)
+  out, dec, _ = car.run(5., stop=StopCommand('wait', 'Waiting: cross traffic', 'waitingCross'))
+  assert dec.should_stop and out.prompt == 'none' and out.shown.action == 'waitingCross'
+  key = car.policy.held_control().key
+  out, dec, _ = car.step(stop=StopCommand('wait', 'Going', 'going'), release=(key, 'clear'))
+  assert car.policy.held_control() is None and not dec.should_stop
+
+
+def test_C5_a_yield_whose_rolling_test_fails_late_becomes_a_stop_at_its_last_stopping_point_never_below_2_m_s2():
+  # on the lifted cap while the test passes, then it fails just before the last point a stop at the line is still -2.0 from
+  # the car's speed (yield_last_stop_m): a stop from there, at the floor at most, latched at the line, never an overrun into
+  # the junction (2.7's commit point 7.6 m from the edge would end that stop up to 2.5 m past the line, beyond the latch)
+  from openpilot.selfdrive.turnpilot.map_controls import YIELD_COMMIT_M, YIELD_STOP, yield_last_stop_m
+  def flip(car):  # passing until 0.3 m before its last stopping point, failing from there
+    c = next((c for c in car.policy.tracker.controls.values() if c.kind == 'yield'), None)
+    return {} if c is None else {c.key: (c.d > yield_last_stop_m(car.v) + 0.3, YIELD_COMMIT_M)}
+  car = Car([(150., 'yield')])
+  out, dec = car.run_until(held, yields=flip)
+  assert car.policy.held_control().state.mode == YIELD_STOP and abs(150. - car.s) < 2.
+  assert min(r[3] for r in car.rows) >= MAP_DECEL_MAX - 1e-6
+  assert not any(r[5].alert == 'stopOverrun' for r in car.rows)
+
+
+def test_C5_a_cross_suspect_yield_is_kept_unless_the_sidecar_confirms_it_governs_the_cross_approach():
+  # 2.7: a yield on a road that outranks every crossing one (crossSuspect) was dropped; now only where the OSM sidecar has the
+  # junction's give_way or stop on a crossing approach and none on ours (junctionInfo.crossGoverned); otherwise ours: a stop
+  info = {'status': 'ok', 'crossGoverned': True}
+  car = Car([(150., 'yield', False, True, True, info)])
+  car.run(15.)
   assert car.s > 160. and min(r[2] for r in car.rows) > 13.
+  car = Car([(150., 'yield', False, True, True, {'status': 'ok', 'crossGoverned': False})])
+  out, dec = car.run_until(held)
+  assert abs(150. - car.s) < 2.5
 
 
 def test_cross_suspect_stop_still_stops():
@@ -463,10 +515,15 @@ def test_stop_sign_at_the_junction_protects_the_left(kind):
   assert not any(d.should_stop for *_, d, o in car.rows[-140:])
 
 
-def test_yield_or_a_stop_far_upstream_leaves_the_left_unprotected():
+def test_a_yield_at_the_junction_protects_the_left_and_a_stop_far_upstream_leaves_it_unprotected():
+  # a yield at the left's junction becomes a stop there (yieldStop, STOP_SIGNS.md 2.7, SG4c), so the stop-sign decider, which
+  # watches its cross traffic, has the turn, not the unprotected left, which watches only the oncoming (it used to roll the
+  # yield at 5 m/s and hold at the left's line); a stop far upstream still leaves it unprotected
+  from openpilot.selfdrive.turnpilot.map_controls import YIELD_STOP
   car = left_car([(250. - 11., 'yield')])
   car.run_until(held)
-  assert car.rows[-1][-1].shown.kind == UNPROTECTED
+  assert car.rows[-1][-1].shown.kind == 'yield' and car.policy.held_control().state.mode == YIELD_STOP
+  assert car.policy.turn is None and abs(239. - car.s) < 2.5
   car = left_car([(150., 'stop')])
   car.run_until(held)
   car.run(STOP_SIGN_HANDBACK_S + 0.5)
@@ -748,8 +805,8 @@ def test_an_unprotected_left_hands_back_at_its_hold_line_and_no_gas_goes():
 
 def test_a_yield_is_passed_only_by_passing_it():
   car = Car([(150., 'yield')])
-  car.run_until(lambda out, dec: out.stops)
-  out, dec, _ = car.step(gas=True)
+  car.run_until(lambda out, dec: out.stops, yields=rolling_ok)
+  out, dec, _ = car.step(gas=True, yields=rolling_ok)
   assert out.stops and out.prompt == 'yieldAhead'
 
 

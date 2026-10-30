@@ -2544,6 +2544,10 @@ struct NavInstruction {
     certification @16 :Certification; # route time (SG2; unchecked before it)
     certReason @17 :CertReason;
     approaches @18 :List(JunctionApproach);  # every other road at the node(s), and the road the route leaves by (exit)
+    # TurnPilot (stop signs, SG4c; STOP_SIGNS.md 2.7): the OSM sidecar has this junction's stop or give_way on a crossing
+    # approach and none on ours, so a crossSuspect control (our road outranking every crossing one) is the cross road's: dropped.
+    # False with no current sidecar or our approach not in its record: the control is kept as ours
+    crossGoverned @19 :Bool;
   }
 
   # one road at a junction, by the leg leaving the node

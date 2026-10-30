@@ -2617,10 +2617,12 @@ def test_the_stop_sweep_is_asked_for_at_walking_pace_within_30_m_of_a_stop_until
   # the latch holds the control's distance while it holds the car, so the sweep ends a few metres on in the sim's frame
   assert sim.s > 230. and all(v == 'auto' for s, _, v in trace if s > 200. + SWEEP_PAST_M + 4.) and not sim.tp.sweeping
   assert all(v == 'auto' for _, ve, v in trace if ve > SWEEP_V_OFF + 0.1)  # pulling away: the sweep ends past SWEEP_V_OFF
-  # a yield, run through at its 5 m/s: never at walking pace, so never swept (the watch still logs it)
+  # a yield is a stop this week (its rolling test fails: yieldStop, STOP_SIGNS.md 2.7, SG4c), swept as one at walking pace
   sim = Sim([(1000., "turn", "right"), (2000., "turn", "left")], controls=[(200., 'yield')])
+  sim.go_taps = False
   trace = sweep_trace(sim, 40.)
-  assert min(ve for s, ve, _ in trace if 180. < s < 199.) > SWEEP_V_OFF and all(v == 'auto' for *_, v in trace)
+  assert sim.v < 0.05 and 195. < sim.s < 202.
+  assert all(v == 'stopSweep' for s, ve, v in trace if s > 200. - STOP_SWEEP_M + 1. and ve <= SWEEP_V_MAX - 0.1)
   # a signal never sweeps
   sim = Sim([(1000., "turn", "right"), (2000., "turn", "left")], controls=[(200., 'signal')])
   assert all(v == 'auto' for *_, v in sweep_trace(sim, 40.))

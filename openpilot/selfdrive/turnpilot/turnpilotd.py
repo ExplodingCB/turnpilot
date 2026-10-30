@@ -145,7 +145,7 @@ from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, CLEAR_DESIRE, CONT
 from openpilot.selfdrive.turnpilot.detector.light_state import LIGHT_MODE_DEFAULT, camera_lights_mode
 from openpilot.selfdrive.turnpilot.map_controls import (CAMERA_STALE_S, KEEP_TURN, LATCH_PAST_M, MAP_MARGIN_M, PROTECT_PAST_M, YELLOW_DECEL,
                                                          YELLOW_DECEL_MAX, LeftCommand, MapControlPolicy, StopCommand, camera_light_input,
-                                                         light_input, turn_stop_feasible, unprotected_turn)
+                                                         is_stop, light_input, turn_stop_feasible, unprotected_turn)
 from openpilot.selfdrive.turnpilot import stop_rules as sr
 from openpilot.selfdrive.turnpilot.control_tracker import OFF_ROUTE
 from openpilot.selfdrive.turnpilot.stop_go import MODE_DEFAULT, STOP_SWEEP_M, Frame, StopGo, StopGoDecision, mode_for, side_views_live
@@ -998,10 +998,10 @@ class TurnPilot:
     try:
       mc = self.map_controls
       ctl = mc.held_control()
-      ctl = ctl if ctl is not None and ctl.kind == 'stop' else None
+      ctl = ctl if is_stop(ctl) else None  # a stop sign, or a yield that became one (yieldStop: STOP_SIGNS.md 2.7)
       ahead = None
       if ctl is None:
-        cands = [c for c in mc.tracker.controls.values() if c.kind == 'stop' and c.engaged and not c.held and
+        cands = [c for c in mc.tracker.controls.values() if is_stop(c) and c.engaged and not c.held and
                  not (c.state is not None and c.state.done) and -LATCH_PAST_M <= c.d <= STOP_SWEEP_M]
         ahead = min(cands, key=lambda c: c.d) if cands else None
       cur = ctl or ahead

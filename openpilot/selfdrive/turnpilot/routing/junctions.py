@@ -226,6 +226,7 @@ class Junction:
   cert_reason: str = 'none'
   cert_detail: str = ''        # navd and route_audit only: why (routing/certify.py)
   approaches: list[Approach] = field(default_factory=list)
+  cross_governed: bool = False  # the sidecar has the junction's stop or give_way on a crossing approach and none on ours (SG4c)
   # navd and route_audit only
   plausible: bool = True
   survey: dict | None = None   # the matched entry, counting or not
@@ -242,7 +243,7 @@ class Junction:
             'headingIn': float(self.heading_in), 'maneuver': self.maneuver, 'turnAngle': float(self.turn_angle),
             'roundabout': self.roundabout, 'divided': self.divided, 'railDistance': float(self.rail_distance), 'sidecar': self.sidecar,
             'suspected': self.suspected, 'surveyed': self.surveyed, 'validated': self.validated, 'certification': self.certification,
-            'certReason': self.cert_reason, 'approaches': [a.to_msg() for a in self.approaches]}
+            'certReason': self.cert_reason, 'approaches': [a.to_msg() for a in self.approaches], 'crossGoverned': self.cross_governed}
 
 
 @dataclass
@@ -599,6 +600,13 @@ def classify(j: Junction, osm, ours_stops: bool, ctx: Context) -> None:
       if sa is not None:
         used.add(next(k for k, x in enumerate(record) if x is sa))
     sides.append(sa)
+  # crossGoverned (STOP_SIGNS.md 2.7): our approach in the record (our way leaving the node back the way we came, or its bearing
+  # alone) with no stop or give_way, and a crossing one with one: a crossSuspect control here is the cross road's
+  back = (j.heading_in + 180.) % 360.
+  ours_rec = [x for x in record or [] if angle_diff(float(x.get('bearing_deg', 0.)), back) <= LEG_HEADING_TOL and
+              (not j.our_way or not x.get('way_id') or int(x['way_id']) == int(j.our_way))]
+  j.cross_governed = bool(ours_rec) and not any(x.get('stops') for x in ours_rec) and \
+    any(x.get('stops') and x.get('kind') in ('stop', 'yield') for x in record or [] if not any(x is o for o in ours_rec))
   stopping = [x for x in record or [] if x.get('stops') and x.get('kind') == 'stop']
   tags = {x['stop_tag'] for x in stopping}
   minor_any = 'minor' in tags

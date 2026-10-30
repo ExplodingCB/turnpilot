@@ -97,7 +97,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.turnpilot import stop_rules as sr
 from openpilot.selfdrive.turnpilot.go_override import GO_WINDOW_S, Takeover
-from openpilot.selfdrive.turnpilot.map_controls import CREEP_AT_M, CREEP_SPEED
+from openpilot.selfdrive.turnpilot.map_controls import CREEP_AT_M, CREEP_SPEED, is_stop
 from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
 from openpilot.selfdrive.turnpilot.routing import certify as ce
 from openpilot.selfdrive.turnpilot.routing.junctions import survey_approach
@@ -493,8 +493,9 @@ class StopGo:
     return cur is not None and cur.state is not self.token and (ctl is not None or self.state in IDLE)
 
   def update(self, f: Frame) -> StopGoDecision:
-    ctl = f.control if f.control is not None and f.control.kind == 'stop' else None
-    ahead = f.approach if f.approach is not None and f.approach.kind == 'stop' else None
+    # a stop sign, or a yield that became one (yieldStop, map_controls: STOP_SIGNS.md 2.7, row C5): its go a stopSign go
+    ctl = f.control if is_stop(f.control) else None
+    ahead = f.approach if is_stop(f.approach) else None
     cur = ctl or ahead
     if self.takes(ctl, ahead):
       self._take(cur, f)

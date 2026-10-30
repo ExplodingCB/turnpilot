@@ -126,7 +126,16 @@ STOP_SIGN_HANDBACK_S = 1.0    # s stopped at a stop sign before it hands back (D
 GREEN_STEADY_S = 0.5          # s of green before it counts (the sim oracle; a camera would need 1.0)
 T_LAT = 0.8                   # s from a yellow to braking
 COMMIT_SPEED = 2.0            # m/s: past the line faster than this, the car went
-YIELD_SPEED = 5.0             # m/s at a yield's line
+YIELD_SPEED = 5.0             # m/s at a yield's line, while its rolling test passes (STOP_SIGNS.md 2.7)
+YIELD_STOP = 'yieldStop'      # ControlState.mode of a yield that became a stop (its rolling test failed): a stop from then on
+YIELD_ROLLING = 'yieldRolling'  # ...of one whose rolling test held at its rolling commit point: taken rolling at YIELD_SPEED
+# m before a yield's stop point its rolling commit point lies at least (the yields input may put it further out): see
+# yield_commit_m, the point a stop at its line is still MAP_DECEL_MAX from the car's speed
+YIELD_COMMIT_M = 4.3
+YIELD_COMMIT_MARGIN_M = 1.0
+YIELD_COMMIT_MAX_M = 15.      # m: never decided further out (the rolling test is re-read every frame until then; on the yield's
+                              # curve the car is about 6.5 m/s here, a stop at the line from it -1.5 m/s^2)
+YIELD_STOP_REASON = "Yield: take control to proceed"
 RELEASE_SPAN_M = 30.          # releasing a control releases those this far past it
 OVERRUN_PAST_M = 2.           # m past the line, moving faster than COMMIT_SPEED with no release: an overrun
 DRIVE_OFF_M = 2.              # m a held car moved under the driver's gas: driven off
@@ -187,6 +196,30 @@ class LeftCommand:
   reason: str = ''
 
 
+def yield_last_stop_m(v_ego: float) -> float:
+  """m before a yield's line the last point is, at speed v_ego, from which a stop at the line is MAP_DECEL_MAX or gentler
+  through the speed cap's lag (STOP_LAG_S), plus YIELD_COMMIT_MARGIN_M: where a yield whose rolling test fails becomes a stop."""
+  v = max(v_ego, 0.)
+  return v * STOP_LAG_S + v * v / (2. * -MAP_DECEL_MAX) + YIELD_COMMIT_MARGIN_M
+
+
+def yield_commit_m(v_ego: float, commit_m: float = YIELD_COMMIT_M) -> float:
+  """m before a yield's stop point its rolling commit point lies at speed v_ego (STOP_SIGNS.md 2.7): where the rolling test
+  passing takes it rolling, the last stopping point (yield_last_stop_m) or commit_m if further, never more than
+  YIELD_COMMIT_MAX_M out (the test re-read every frame until then). 2.7's 7.6 m from the closest edge at 5 m/s is nearer: a
+  test failing there would end the stop up to 2.5 m past the line, beyond the latch's LATCH_PAST_M (an overrun into the
+  junction with nothing to release it), so a failing test makes the yield a stop at its last stopping point instead."""
+  return min(max(commit_m, yield_last_stop_m(v_ego)), YIELD_COMMIT_MAX_M)
+
+
+def is_stop(c) -> bool:
+  """A control that is a stop: a stop sign, or a yield that became one (yieldStop: STOP_SIGNS.md 2.7), which the stop-sign
+  decider then takes as any stop sign (held_control, its go a stopSign go)."""
+  if c is None:
+    return False
+  return c.kind == 'stop' or (c.kind == 'yield' and getattr(getattr(c, 'state', None), 'mode', '') == YIELD_STOP)
+
+
 def engage_distance(v_ego: float) -> float:
   """m from the stop point a control engages: braking at MAP_STOP_DECEL, a second's lag, 15 m to spare."""
   return v_ego ** 2 / (2. * MAP_STOP_DECEL) + v_ego * STOP_LAG_S + 15.
@@ -215,8 +248,10 @@ def unprotected_turn(maneuver, right_hand_traffic: bool = True) -> bool:
 
 
 def protected(controls, distance: float) -> bool:
-  """A stop sign of the junction distance m ahead stops the car there already (a signal too, with SIGNAL_PROTECTS_LEFT)."""
-  kinds = ('stop', 'signal') if SIGNAL_PROTECTS_LEFT else ('stop',)
+  """A stop sign of the junction distance m ahead stops the car there already (a signal too, with SIGNAL_PROTECTS_LEFT), and so
+  does a yield (it becomes a stop, yieldStop, unless certified rolling: STOP_SIGNS.md 2.7), whose cross traffic the stop-sign
+  decider watches, not only the oncoming the unprotected left would."""
+  kinds = ('stop', 'yield', 'signal') if SIGNAL_PROTECTS_LEFT else ('stop', 'yield')
   return any(c.kind in kinds and distance - PROTECT_BEFORE_M <= c.d <= distance + PROTECT_PAST_M for c in controls)
 
 
@@ -318,6 +353,7 @@ class ControlState:
   sign_runs: int = 0            # a stop sign's approach, from SIGN_LOOK_M: forward runs counted (the camera's signs read)...
   sign_hits: int = 0            # ...the stop-sign boxes in them...
   sign_conf: float = 0.         # ...and the best conf (row C11's evidence)
+  yield_cap: float = NO_SPEED_CAP  # a yield's lifted cap, the curve down to YIELD_SPEED at its line (its rolling test passing)
 
 
 def description(c: TrackedControl, turn_name: str = 'left') -> str:
@@ -325,6 +361,8 @@ def description(c: TrackedControl, turn_name: str = 'left') -> str:
     return f"unprotected {turn_name}"
   if c.kind == 'stop':
     return "map stop sign (approach unverified)" if c.cross_suspect else "stop sign"
+  if c.kind == 'yield':
+    return "yield"
   return "signal" if c.junction else "signal (crossing)"
 
 
@@ -356,7 +394,9 @@ class MapControlPolicy:
       st = c.state
       if c.kind == 'signal':
         return st is not None and not st.done and st.mode == SIGNAL_STOP
-      return c.kind == 'stop' and not (st is not None and st.done)
+      if st is not None and st.done:
+        return False
+      return c.kind == 'stop' or (c.kind == 'yield' and (st is None or st.mode != YIELD_ROLLING))  # a yield stops unless taken rolling
     ds = [0. if c.held else c.d for c in self.tracker.controls.values() if stopping(c) and (c.held or c.d > -LATCH_PAST_M)]
     return min(ds) if ds else None
 
@@ -507,14 +547,17 @@ class MapControlPolicy:
 
   def update(self, nav, updated: bool, valid: bool, v_ego: float, gas_pressed: bool, lights: Lights = NO_LIGHTS,
              dt: float = DT_MDL, turn=None, left: LeftCommand | None = None, release: tuple | None = None,
-             creep: tuple | None = None, stop: StopCommand | None = None, signs: tuple | None = None) -> MapDecision:
+             creep: tuple | None = None, stop: StopCommand | None = None, signs: tuple | None = None,
+             yields: dict | None = None) -> MapDecision:
     """nav: the latest navInstruction, updated: it arrived this frame, valid: its valid flag; carState's vEgo and
     gasPressed; lights: light_input()'s; turn: (maneuver id, m to its junction, 'left' or 'right') of the route's
     unprotected_turn() the car is taking, or None; left: the unprotected left's command for its latch (None: off); release:
     (control key, cause) to let the latch go this frame (the stop-sign decider's 'clear'); creep: (m past where it latched,
     m/s cap) for a held stop sign's stop point (the decider's roll-up); stop: the decider's StopCommand for a held stop sign
     (None: shadow, as before); signs: (this tick's forward runs, their stop-sign boxes [(bearing, elevation, conf)]) for row
-    C11's evidence, None with the camera's signs not read."""
+    C11's evidence, None with the camera's signs not read; yields: {a yield's key: (its rolling test passes now, m before its
+    stop point to its rolling commit point)} (STOP_SIGNS.md 2.7), a yield not in it failing (no yield certifies this week)."""
+    self._yields = yields or {}
     self.left = left if left is not None else LeftCommand()
     self.stop_cmd = stop if stop is not None else StopCommand()
     self._creep = creep
@@ -571,7 +614,7 @@ class MapControlPolicy:
       if c.held:
         self._held(c, controls, v, gas_pressed, dt, out, prompts)
       elif c.kind == 'yield':
-        self._yield(c, v, out, prompts)
+        infeasible = self._yield(c, controls, v, gas_pressed, gas_lift, out, prompts) or infeasible
       else:
         infeasible = self._approach(c, controls, v, gas_pressed, gas_lift, out, prompts) or infeasible
 
@@ -688,16 +731,16 @@ class MapControlPolicy:
       prompt = 'unprotectedTurnTakeControl'
       reason = f"{left.reason}: take control" if left.mode == 'announce' and left.reason else \
         f"Unprotected {self.turn_name}: take control"
-    elif c.kind == 'stop' and req is not None and req[0] == c.key and stop_cmd.latch == 'wait':
+    elif is_stop(c) and req is not None and req[0] == c.key and stop_cmd.latch == 'wait':
       cause, reason = req[1], stop_cmd.reason or "Going"  # the stop-sign decider's go (cause clear)
-    elif c.kind == 'stop' and stop_cmd.latch == 'wait':
+    elif is_stop(c) and stop_cmd.latch == 'wait':
       reason = stop_cmd.reason or f"Stopped at {what}"  # the stop-sign decider waits: held, no handback
-    elif c.kind == 'stop' and stop_cmd.latch == 'fault':
-      prompt, reason = 'stopSignTakeControl', stop_cmd.reason or STOP_SIGN_REASON  # its fault: handed back now
-    elif c.kind == 'stop':
+    elif is_stop(c) and stop_cmd.latch == 'fault':
+      prompt, reason = 'stopSignTakeControl', stop_cmd.reason or self._stop_reason(c)  # its fault: handed back now
+    elif is_stop(c):
       # as shadow: a full stop, then handed back (module docstring), the decider's reason saying why
       prompt = 'stopSignTakeControl' if st.dwell_t >= STOP_SIGN_HANDBACK_S - 1e-9 else None
-      reason = (stop_cmd.reason or STOP_SIGN_REASON) if prompt is not None else f"Stopped at {what}"
+      reason = (stop_cmd.reason or self._stop_reason(c)) if prompt is not None else f"Stopped at {what}"
     else:
       if st.green_t >= GREEN_STEADY_S - 1e-9:
         cause = 'green'
@@ -705,7 +748,7 @@ class MapControlPolicy:
         f"Stopped at {what}: waiting for green"
     # moved where it was asked (a creep, a roll-up) isn't driven off: only past that
     asked = left.creep_m if c.kind == UNPROTECTED and left.mode == 'auto' else \
-      (getattr(self, '_creep', None) or (0., 0.))[0] if c.kind == 'stop' and stop_cmd.latch == 'wait' else 0.
+      (getattr(self, '_creep', None) or (0., 0.))[0] if is_stop(c) and stop_cmd.latch == 'wait' else 0.
     if cause is None and st.moved_m - max(asked, 0.) > DRIVE_OFF_M and v > COMMIT_SPEED:
       # handed back, the driver took over and went: theirs, said already. Driven off under the driver's foot: lifting must
       # not stop the car in the junction. Or gone with no go at all, the plan not applied (shadow mode turned on): the
@@ -729,13 +772,13 @@ class MapControlPolicy:
       return
     if prompt is not None:
       prompts.insert(0, prompt)  # the held control's prompt first
-    st.action = 'awaitingDriver' if prompt is not None else (stop_cmd.action or 'held') if c.kind == 'stop' and \
+    st.action = 'awaitingDriver' if prompt is not None else (stop_cmd.action or 'held') if is_stop(c) and \
       stop_cmd.latch == 'wait' else 'held'
     # the latch's stop point moved on (module docstring): the left's creep for a view, the stop-sign decider's roll-up
     creep_m, creep_v, accel = 0., CREEP_SPEED, CREEP_ACCEL
     if c.kind == UNPROTECTED and left.mode == 'auto' and prompt is None:
       creep_m = left.creep_m
-    elif c.kind == 'stop' and stop_cmd.latch == 'wait' and getattr(self, '_creep', None) is not None:
+    elif is_stop(c) and stop_cmd.latch == 'wait' and getattr(self, '_creep', None) is not None:
       creep_m, creep_v = self._creep
       accel = CREEP_ACCEL if creep_v <= CREEP_SPEED else NO_ACCEL_CAP  # a roll-up: the map curve alone, no accel cap
     creep = creep_m - st.moved_m
@@ -746,24 +789,60 @@ class MapControlPolicy:
       return
     out.stops.append(Stop(HOLD_ACCEL, 0., True, reason, 0.))
 
-  def _yield(self, c, v, out, prompts) -> None:
+  def _stop_reason(self, c) -> str:
+    return YIELD_STOP_REASON if c.kind == 'yield' else STOP_SIGN_REASON
+
+  def _yield(self, c, controls, v, gas_pressed, gas_lift, out, prompts) -> bool:
+    """A yield (STOP_SIGNS.md 2.7, row C5): a two-way stop taken rolling only while certified at the rolling speed. The approach
+    is the map-stop curve toward a full stop at its line; while its rolling test passes (update()'s yields) the cap lifts to
+    the curve down to YIELD_SPEED there. At its rolling commit point (YIELD_COMMIT_M, or the yields input's) a test that still
+    passes takes it rolling (yieldRolling, passed once by); one that fails makes it a stop (yieldStop) from there: _approach's
+    curve, its feasibility checked again (-2.0 at most, said), the latch, and the decider's from then on. Failing before then
+    with the car slow enough to latch, it is a stop at once (the same curve either way). A crossSuspect yield (our road
+    outranks every crossing one) is dropped only where the sidecar confirms it governs the cross approach (crossGoverned);
+    otherwise it is ours. True while it is infeasible."""
     st = c.state
-    if c.cross_suspect:
+    info = getattr(c, 'junction_info', None) or {}
+    if c.cross_suspect and info.get('crossGoverned'):
       st.done = 'dropped'
-      cloudlog.event("turnpilot.map_yield_dropped", kind=c.kind, key=list(c.key), reason="crossSuspect", d=round(c.d, 1))
-      return
+      cloudlog.event("turnpilot.map_yield_dropped", kind=c.kind, key=list(c.key), reason="crossGoverned", d=round(c.d, 1))
+      return False
+    if st.mode == YIELD_STOP:
+      return self._approach(c, controls, v, gas_pressed, gas_lift, out, prompts)
     if not c.engaged:
       if c.d > engage_distance(v):
-        return
+        return False
       c.engaged = True
+      st.cap, st.yield_cap = curve(v, c.d), NO_SPEED_CAP
+      if c.cross_suspect:
+        cloudlog.event("turnpilot.map_yield_kept", key=list(c.key), reason="crossSuspect, not crossGoverned", d=round(c.d, 1))
     if c.d < 0.:
       st.done, st.action = 'passed', 'released'
-      return
-    # a speed at a fixed point, not a stop: the curve down to YIELD_SPEED, no accel cap, never shouldStop
-    st.cap = min(st.cap, math.sqrt(YIELD_SPEED ** 2 + 2. * MAP_STOP_DECEL * max(c.d - v * STOP_LAG_S, 0.)))
-    st.action = 'braking' if st.cap < v + 0.5 else 'approaching'
-    out.stops.append(Stop(NO_ACCEL_CAP, st.cap, False, "Yield ahead", c.d))
+      return False
+    rolling, commit_m = getattr(self, '_yields', {}).get(c.key, (False, YIELD_COMMIT_M))
+    last, commit_m = yield_last_stop_m(v), yield_commit_m(v, commit_m)
+    if st.mode != YIELD_ROLLING:
+      if rolling and c.d <= commit_m:
+        st.mode = YIELD_ROLLING
+        cloudlog.event("turnpilot.map_yield_rolling", key=list(c.key), d=round(c.d, 1), v=round(v, 2))
+      elif not rolling and (c.d <= max(last, commit_m) or (v < LATCH_SPEED and c.d < LATCH_NEAR_M)):
+        st.mode = YIELD_STOP
+        st.cap = min(st.cap, curve(v, c.d)) if v >= LATCH_SPEED else curve(v, c.d)
+        self._check(c, v, 'yieldStop')
+        cloudlog.event("turnpilot.map_yield_stop", key=list(c.key), d=round(c.d, 1), v=round(v, 2), infeasible=st.infeasible)
+        return self._approach(c, controls, v, gas_pressed, gas_lift, out, prompts)
+    cv = curve(v, c.d)
+    st.cap = cv if v < LATCH_SPEED else min(st.cap, cv)  # the stop curve kept, for a test that fails later
+    st.yield_cap = min(st.yield_cap, math.sqrt(YIELD_SPEED ** 2 + 2. * MAP_STOP_DECEL * max(c.d - v * STOP_LAG_S, 0.)))
+    if st.mode == YIELD_ROLLING or rolling:
+      cap, accel, reason = st.yield_cap, NO_ACCEL_CAP, "Yield ahead"
+    else:
+      need = needed(v, c.d)
+      cap, accel, reason = st.cap, max(need, MAP_DECEL_MAX) if need < -MAP_STOP_DECEL else NO_ACCEL_CAP, "Yield ahead: stopping"
+    st.action = 'braking' if cap < v + 0.5 or accel < NO_ACCEL_CAP else 'approaching'
+    out.stops.append(Stop(accel, cap, False, reason, c.d))
     prompts.append('yieldAhead')
+    return st.infeasible
 
   def _approach(self, c, controls, v, gas_pressed, gas_lift, out, prompts) -> bool:
     """A stop sign or signal not held: the curve, the decisions, the latch. True while it is infeasible."""
@@ -791,6 +870,8 @@ class MapControlPolicy:
     else:
       if c.kind == UNPROTECTED:
         reason = f"Unprotected {self.turn_name} ahead"
+      elif c.kind == 'yield':
+        reason = "Yield ahead: stopping"
       else:
         reason = "Map stop sign, approach unverified" if c.cross_suspect else "Stop sign ahead"
       if gas_pressed:

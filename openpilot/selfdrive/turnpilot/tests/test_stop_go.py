@@ -2240,3 +2240,19 @@ def test_O12_a_long_dynamic_wait_takes_another_certifiable_maneuver_at_wait_alt_
   out = w.run(sg.WAIT_INFO_S + 2., approach_lanes=2, rightmost=False)
   assert first_go(out) is None and not any(d.alert == 'otherTurn' for d in out) and all(d.fault == '' for d in out)
   assert any(d.chime and d.reason == "Waiting for cross traffic" for d in out[round(59. / DT_MDL):])
+
+
+def test_C5_a_yield_that_became_a_stop_is_the_deciders_as_any_stop_sign_its_go_a_stop_sign_go(tmp_path):
+  # 2.7, row C5 (sg): map_controls makes a yield whose rolling test fails a stop (yieldStop) at its line; held there it is
+  # the decider's like a stop sign (the junction's rules, its go cause stopSign); a yield not (yet) a stop is never its
+  w = World(tmp_path)
+  w.state.mode = 'yieldStop'
+  w.control.kind = 'yield'
+  out = w.run(5.)
+  i = first_go(out)
+  assert i is not None and out[i].go_cause == 'stopSign' and out[i].release == ((0, 1), 'clear')
+  w = World(tmp_path)
+  w.state.mode = 'stop'
+  w.control.kind = 'yield'
+  out = w.run(5.)
+  assert all(d.state == 'off' and d.go_cause == 'none' for d in out)

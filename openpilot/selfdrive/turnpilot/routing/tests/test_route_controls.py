@@ -1186,6 +1186,22 @@ def test_no_wins_over_unknown_at_a_two_way_and_stop_minor(tmp_path):
   assert tiers(j) == {0: 'mapWeak', 90: 'mapWeak', 270: 'no'}
 
 
+def test_C5_cross_governed_the_sidecar_has_the_junctions_stop_or_give_way_on_a_crossing_approach_and_none_on_ours(tmp_path):
+  """STOP_SIGNS.md 2.7 (SG4c): a crossSuspect control (our road outranks every crossing one) is dropped by map_controls only
+  where the sidecar confirms it is the cross road's: its record at the node has a stop or give_way on a crossing approach and
+  none on ours (MapJunction.crossGoverned). Ours stopping, or no record of ours, is never cross-governed."""
+  unstopped = (False, 'none', 'none')
+  crossing = {700: unstopped, 790: (True, 'mid_directed', 'none'), 970: (True, 'mid_directed', 'none')}
+  v = StubJunction([(0., 100., {'stop': True, 'way_id': 50}), (100., 400., {})], four())
+  _, j = junction_of(route_controls(v, steps(), sidecar_dir=allway(tmp_path / 'cross', unstopped, crossing))[0])
+  assert j.cross_governed and j.to_msg()['crossGoverned'] is True
+  _, j = junction_of(route_controls(v, steps(), sidecar_dir=allway(tmp_path / 'ours', (True, 'mid_directed', 'none'), crossing))[0])
+  assert not j.cross_governed
+  rec = [{'way_id': 790, 'dir': 'f', 'bearing_deg': 90., 'stops': True, 'kind': 'stop', 'evidence': 'mid_directed'}]
+  _, j = junction_of(route_controls(v, steps(), sidecar_dir=allway(tmp_path / 'none', unstopped, crossing, record=rec))[0])
+  assert not j.cross_governed
+
+
 def test_without_a_current_sidecar_tiers_are_unknown_or_a_valhalla_flag(tmp_path):
   """No sidecar, or a stale one: an approach Valhalla flags is mapWeak (a Valhalla flag alone), every other unknown, never
   no (Valhalla misses a quarter of the stops: its silence proves nothing)."""
