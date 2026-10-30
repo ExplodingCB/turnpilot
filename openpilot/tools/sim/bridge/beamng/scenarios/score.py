@@ -2,7 +2,7 @@
 """Scenario scoring from recorded rows, one row per 50 ms of a run (run.py records them from msgq and the game).
 
 A row is a dict:
-  t, wall            s since the run started, and wall-clock time
+  t, wall            s since engagement (run.py; a recorded drive's: since its first turnpilotPlan), and wall-clock time
   x, y, heading, v   the ego's camera mount in BeamNG world meters, heading rad CCW from east, wheel speed m/s
   enabled            selfdriveState.enabled; alert, alert_text: its alertType and alertText1
   steer, gas, brake  carState steeringPressed, gasPressed, brakePressed
@@ -35,9 +35,11 @@ A row is a dict:
 A scenario's expectations (EXPECTS: catalog Entry.expect, or the runner's --expect and the options that imply one) are
 what its shot exists to show: a handback, a skip, a missed turn, the driver's gas press, hard braking. Each is required of
 the run (not seen: a failure), and explains only the generic failure it causes (the disengagement after the handback, the
-press itself, the route not finished), so a run's verdict means what its shot shows. One is met only as its shot shows it
-(handback_problems, the skip's junction and kind): a handback the car wasn't held after, a drop's handback late, a skip
-past its junction is seen but unmet, and explains nothing.
+press itself, the route not finished), so a run's verdict means what its shot shows. One is met only as its shot's
+pass_rule shows it (handback_problems, range_skip_problems, missed_problems, the skip's junction and kind): a handback the
+car wasn't held after, or late after its go or its stand, a drop's handback late or with the detector still running, a
+skip past its junction or held for after it, a missed turn said away from the pass or for a turn taken, is seen but unmet,
+and explains nothing.
 
 Rescore a saved result: python -m openpilot.tools.sim.bridge.beamng.scenarios.score result.json
 Score a recorded drive: python -m openpilot.tools.sim.bridge.beamng.scenarios.score --scenario route_demo rlog...
