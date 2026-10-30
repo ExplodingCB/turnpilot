@@ -25,6 +25,10 @@ The demo's options (each run's result says what it did and when):
   --expect E               what the run must show (score.EXPECTS), in place of the scenario's own; the press implies
                            gasDisengage and the drop handback:detectorStopped
 Without S, the scenario's fault_at_s (catalog: straight_cruise's lands the fault short of its junction).
+
+A scenario with a forced light (catalog.junction_lights) has its junction's signal forced at each run's setup, after the
+actors, and green green_after_s after the car first stands within GO_NEAR_M before the junction; the director logs both
+(light_events), the rows carry the state (forced_light), and the sim driver's ground truth never reads it green while red.
 """
 import argparse
 import json
@@ -52,7 +56,7 @@ from openpilot.tools.sim.bridge.beamng.scenario import heading_quat
 from openpilot.tools.sim.bridge.beamng.scenarios import score
 from openpilot.tools.sim.bridge.beamng.scenarios.catalog import DATA_JSON, ROLL_FRACTION, SCENARIOS, Plan, build, junction_distance
 from openpilot.tools.sim.bridge.beamng.scenarios.director import Director, sweep
-from openpilot.tools.sim.bridge.beamng.scenarios.timing import GoWatch
+from openpilot.tools.sim.bridge.beamng.scenarios.timing import GO_NEAR_M, STOOD_V, GoWatch
 
 SETTLE_S = 4.         # after the teleport: the car is back in D and the GPS has caught up
 CLEAR_TIMEOUT_S = 5.  # wait this long for navd to drop the old route
@@ -74,6 +78,7 @@ DROP_PARAM = 'TurnPilotSimDropDetectionsS'
 # the detector silent this long (--drop-detections-at): past turnpilotd's 1.5 s deadline and openpilot's 3 s soft disable,
 # so the disengagement completes and engaging again is refused while it lasts
 DROP_S = 20.
+LIGHTS_FRESH_S = 1.  # a row's lights: the light oracle's turnpilotLights this fresh (driver.LIGHTS_FRESH_S)
 ACTOR_FIELDS = ["wall_s", "x", "y", "z", "heading"]
 
 
@@ -128,6 +133,8 @@ class Runner:
     self.expect = tuple(dict.fromkeys((plan.expect if expect is None else tuple(expect)) + implied))
     self.handback = self.takeover = self.press = self.drop = None  # the demo options' (demo_options), per run
     self.press_until = -1.
+    self.light_state: str | None = None  # the forced light's state now (None: no forced light)
+    self.signals_running: bool | None = None  # the bridge runs --signals (from its config, at the first run)
     self.plan, self.runs, self.out_dir, self.web_url, self.token = plan, runs, out_dir, web_url, token
     self.signal_tap = signal_tap
     self.params = params
@@ -236,6 +243,11 @@ class Runner:
     b.blinker = (False, False)
     b.world.teleport(plan.spawn, heading_quat(plan.heading))
     self.setup = self.director.submit(self.director.setup, plan.actors)
+    self.signals_running = not getattr(b.cfg, 'green', True)
+    self.light_state = self.stand_t = self.green_t = None
+    if plan.lights is not None:
+      self.setup_lights = self.director.submit(self.director.set_lights, dict(plan.lights['states_at_setup']), not self.signals_running)
+      self.light_state = plan.lights['state']
     self.t0, self.t0_wall, self.phase = time.monotonic(), wall(), 'settle'
     self.rows: list[dict] = []
     self.poses: list[tuple] = []
@@ -269,7 +281,7 @@ class Runner:
       'dest_dist': None if self.plan.dest is None else round(math.hypot(self.plan.dest[0] - x, self.plan.dest[1] - y), 1),
       'blinker': 'left' if b.blinker[0] else 'right' if b.blinker[1] else '',
       'ped_gap': None, 'car_gap': None, 'pacer_dx': None, 'j_dist': junction_distance(self.plan, x, y), 'car_j_dist': None,
-      'onc': None,
+      'onc': None, 'forced_light': self.light_state, 'lights': self.oracle_lights(now),
       **score.msg_fields(sm['selfdriveState'], sm['carState'], sm['turnpilotPlan'] if sm.seen['turnpilotPlan'] else None,
                          sm['navInstruction'] if sm.seen['navInstruction'] and sm.valid['navInstruction'] else None,
                          sm['modelV2']),
@@ -296,6 +308,13 @@ class Runner:
       r['j_ahead'] = round((self.plan.junction[0] - x) * math.cos(h) + (self.plan.junction[1] - y) * math.sin(h), 2)
     return r
 
+  def oracle_lights(self, now: float) -> list | None:
+    """[[instance, state, m to its line], ...] of the light oracle's fresh turnpilotLights, else None."""
+    sm = self.sm
+    if not sm.seen.get('turnpilotLights') or now - sm.recv_time['turnpilotLights'] > LIGHTS_FRESH_S:
+      return None
+    return [[str(lt.instance), str(lt.state), round(float(lt.distance), 1)] for lt in sm['turnpilotLights'].lights]
+
   def log_pose(self, b):
     """The car's IMU pose as route_drive logs it, and each actor's pose from the director, for chase_render.py. An
     actor's pose that holds keeps its first and last rows only, so a car standing until it is released starts on time."""
@@ -321,6 +340,7 @@ class Runner:
     plan, d = self.plan, self.director
     if r['j_dist'] is not None:
       self.watch.update(r['t'], r['j_dist'], r['v'], r['state'] == 'holding', r['desire'] in TURN_DESIRES)
+    self.light_trigger(r)
     w = self.watch
     for a in plan.actors:
       if a.name in self.fired or a.trigger == 'setup':
@@ -339,6 +359,21 @@ class Runner:
         self.jobs.append((a.name, d.submit(*job)))
         where = '' if r['j_dist'] is None else f", {r['j_dist']:.0f} m from the junction"
         print(f"scenario: {a.name} goes at t={r['t']:.1f} s{where}", flush=True)
+
+  def light_trigger(self, r):
+    """The forced light's swap (module docstring): green_after_s after the car first stands within GO_NEAR_M before the
+    junction, its phase green and the cross phase red."""
+    lt = self.plan.lights
+    if lt is None or self.green_t is not None or lt['green_after_s'] <= 0.:
+      return
+    if self.stand_t is None and r['v'] < STOOD_V and r['j_dist'] is not None and r['j_dist'] <= GO_NEAR_M and (r['j_ahead'] or 0.) > 0.:
+      self.stand_t = r['t']
+      print(f"scenario: the car stands at the forced {lt['state']} at t={r['t']:.1f} s; green in {lt['green_after_s']:.0f} s", flush=True)
+    if self.stand_t is not None and r['t'] - self.stand_t >= lt['green_after_s'] - 1e-6:
+      states = {i: ('red' if s == 'green' else 'green') for i, s in lt['states_at_setup'].items()}
+      self.jobs.append(('lights', self.director.submit(self.director.set_lights, states, not self.signals_running)))
+      self.green_t, self.light_state = r['t'], states[lt['instance']]
+      print(f"scenario: the forced light goes {self.light_state} at t={r['t']:.1f} s", flush=True)
 
   def demo_options(self, b, r) -> bool:
     """The demo's options (module docstring) on this row. False: the run ended here."""
@@ -382,8 +417,9 @@ class Runner:
     p = str(plan.signalPrompt) if plan is not None else 'none'
     b.blinker = (p == 'left', p == 'right')
     now = time.monotonic()
-    gas = self.taps.update(now, plan, self.sm['selfdriveState'].enabled, b.simulator_state.wheel_speed,
-                           ground_truth_green(b.cfg, self.sm, now), plan_age_s=now - self.sm.recv_time['turnpilotPlan'])
+    green = False if self.light_state in ('red', 'yellow') else ground_truth_green(b.cfg, self.sm, now)  # a forced red: never
+    gas = self.taps.update(now, plan, self.sm['selfdriveState'].enabled, b.simulator_state.wheel_speed, green,
+                           plan_age_s=now - self.sm.recv_time['turnpilotPlan'])
     b.driver_gas = max(gas, GAS_PRESS if now < self.press_until else 0.)  # --gas-press-at's, over any tap
 
   def end_run(self, b, outcome: str, detail: str = ''):
@@ -402,6 +438,10 @@ class Runner:
     # what the demo's options did, and when (t: s since engagement)
     res.update(driver_takeover=getattr(self, 'takeover', None), gas_press=getattr(self, 'press', None),
                detection_drop=getattr(self, 'drop', None))
+    if self.plan.lights is not None:  # the forced light: what was set when (wall, from the director), and the swap's times
+      res['light_events'] = [e for e in self.director.light_log if e[0] >= self.t0_wall - 1.]
+      res['forced_light'] = {'instance': self.plan.lights['instance'], 'stand_t': getattr(self, 'stand_t', None),
+                             'green_t': getattr(self, 'green_t', None), 'green_after_s': self.plan.lights['green_after_s']}
     # every go the sim driver gave, with its reason (the score's gas_taps are the presses openpilot saw, from the rows)
     res['driver_taps'] = getattr(self, 'taps', GasTaps()).log
     res.update(run=self.run_idx + 1, detail=detail, t_start_wall=self.t0_wall, t_engaged_wall=self.t_engaged_wall, t_end_wall=end_wall,
@@ -419,7 +459,7 @@ class Runner:
     out = {'scenario': plan.name, 'started_wall': self.started_wall, 'spawn': plan.spawn, 'heading': plan.heading, 'dest': plan.dest,
            'junction': plan.junction, 'speed_kph': plan.speed_kph, 'notes': plan.notes, 'road': plan.road,
            'actors': [{'name': a.name, 'kind': a.kind, 'trigger': a.trigger, 'path': a.path, 'params': a.params} for a in plan.actors],
-           'expect': list(self.expect),
+           'expect': list(self.expect), 'lights': plan.lights, 'signals_running': self.signals_running,
            'passed': sum(r['passed'] for r in self.results), 'runs': self.results}
     with open(os.path.join(self.out_dir, 'result.json'), 'w') as f:
       json.dump(out, f, indent=1)

@@ -3,6 +3,10 @@ thread of the bridge process, so no game round trip (about one game frame each) 
 
 Jobs (any callable) run in the order submitted and return a Future. Between jobs the thread walks the mannequins, one
 re-pose per round trip, and polls the scenario cars' poses at 5 Hz into `poses`, which the runner reads for gaps.
+
+set_lights forces signal instances (a scenario's forced light) and logs each with the wall time it was set (light_log,
+which chase_render.py replays); cleanup puts them back: green and held where the bridge holds every light green, else
+back on their sequences.
 """
 import queue
 import threading
@@ -13,6 +17,7 @@ import numpy as np
 from beamngpy import BeamNGpy, Vehicle
 
 from openpilot.tools.sim.bridge.beamng import scenario
+from openpilot.tools.sim.bridge.beamng.scenario import GREEN, RED, YELLOW
 from openpilot.tools.sim.bridge.beamng.scenarios.catalog import PREFIX, Actor, project, section
 from openpilot.tools.sim.bridge.beamng.scenarios.timing import (arc_lengths, catch_up_lead, pacer_drop_s, point_at,
                                                                 script_nodes, walker_pose)
@@ -25,6 +30,11 @@ Z_ABOVE = 3.           # ground ray casts start this far above the road graph's 
 
 
 KNOWN = [f"{PREFIX}{n}" for n in ('ped', 'pacer', *(f'car{k}' for k in range(6)))]  # every name the catalog gives out
+LIGHT_STATES = {'green': GREEN, 'yellow': YELLOW, 'red': RED}
+
+
+def wall() -> float:
+  return time.time()  # noqa: TID251  the light log is aligned with the pose logs on wall-clock time
 
 
 def sweep(bng, log=print) -> int:
@@ -58,6 +68,9 @@ class Director(threading.Thread):
     self.walkers: dict[str, dict] = {}
     self.cars: dict[str, dict] = {}
     self.bng = None
+    self.forced: set[str] = set()  # signal instances set_lights forced, until cleanup puts them back
+    self.lights_green = True       # ...green and held (the bridge without --signals), else back on their sequences
+    self.light_log: list[list] = []  # [wall, instance, state] of each set_lights
     self.stopped = threading.Event()
     self._next_poll = 0.
 
@@ -155,8 +168,29 @@ class Director(threading.Thread):
     v.ai.set_script(nodes, cling=True)
     car['end_t'] = time.monotonic() + nodes[-1]['t'] + DONE_AFTER_S
 
+  def set_lights(self, states: dict[str, str], green_held: bool):
+    """Force each signal instance to its state ('red', 'yellow', 'green') and hold the sequences, which would overwrite a
+    strict state. green_held: the bridge holds every light green (no --signals), what cleanup puts them back to."""
+    self.lights_green = green_held
+    for name, state in states.items():
+      self.bng.traffic_signals.set_instance_strict_state(name, LIGHT_STATES[state])
+      self.forced.add(name)
+      self.light_log.append([round(wall(), 3), name, state])
+    scenario.hold_signals(self.bng)
+
+  def restore_lights(self):
+    if not self.forced:
+      return
+    if self.lights_green:
+      scenario.force_signals(self.bng, sorted(self.forced), GREEN)
+    else:
+      scenario.release_signals(self.bng, sorted(self.forced))
+    self.forced.clear()
+
   def cleanup(self):
-    """Remove every actor this run spawned (vehicles first: they hold the most game memory)."""
+    """Remove every actor this run spawned (vehicles first: they hold the most game memory), and put back the lights it
+    forced."""
+    self.restore_lights()
     for name, car in list(self.cars.items()):
       self._remove_car(name, car)
     for name in list(self.walkers):

@@ -12,6 +12,11 @@ wcusa_map_node_signals.json (mapsignals.py). Every spawn is clear of them: more 
 engage distance before each one on its approach (spawn_clear_m), or past it, so the car never runs over a line before
 openpilot is engaged to stop for it (the smoke's "Stop Line Passed"). A turn scenario's spawn moves to the nearest
 clear spot, a data entry that isn't clear is refused.
+
+A forced light (Entry.light, the demo's S13, S14, S18): the junction's own signal on the approach (its stop line's
+instance) is forced to that state from the run's setup and held, its opposing approach with it and the cross approaches
+the other way (their mapped headings: within PHASE_DEG of ours, or of its reverse, is our phase); green_after_s after the
+car stands at the junction the phases swap (run.py). With --signals alone the phase at the car's arrival is chance.
 """
 import json
 import math
@@ -48,6 +53,7 @@ LINE_LATERAL_M = 8.      # a control's stop line within this of the approach's c
 LINE_ALIGNED_DEG = 40.   # ...if it controls traffic within this of the approach's direction
 LINE_ASSOC_M = 40.       # a stop line this close to the junction nearest it is that junction's...
 INTO_DEG = 60.           # ...if it controls traffic heading into it, within this of the bearing to it
+PHASE_DEG = 45.          # a signal of the junction's group whose traffic heads within this of ours, or of its reverse: our phase
 
 
 @dataclass(frozen=True)
@@ -81,6 +87,8 @@ class Entry:
   heading_deg: float = 0.
   dest: tuple = ()
   expect: tuple = ()              # what the run must show (score.EXPECTS): a handback, a skip, ...; the runner's options add theirs
+  light: str = ''                 # 'red': the junction's own signal forced red from setup and held (module docstring)
+  green_after_s: float = 0.       # ...then green this long after the car stands at the junction (0: red for the whole run)
   fault_at_s: float = 0.          # the runner's --gas-press-at and --drop-detections-at with no value: this long after engagement
 
 
@@ -111,6 +119,16 @@ SCENARIOS = {
   # gate1's approach: eastbound on the 140 m straight from the bridge's default spawn
   'ped_in_path': Entry('straight', junction=(-768.9, 661.4), turn='right', from_heading_deg=0., actor='standing', end_on_stop_s=4.,
                        timeout_s=90.),
+  # forced reds (the module docstring's forced light). S13: the same straight through gate1's junction (group_80_81_82_83),
+  # its signal red from the start: with no accepted light source (the car this week) TurnPilot adds nothing for it, the
+  # model alone meets it. S14: ped_crosswalk_right's right turn without the walker, red until 8 s after the car stands.
+  # S18: the right at (-650.1, 481.7) from the south-west (G0's 62R: every pull-away at a 20 m hold went straight), its
+  # miss expected (likely, not certain)
+  'red_straight': Entry('straight', junction=(-768.9, 661.4), turn='right', from_heading_deg=0., light='red', green_after_s=8.,
+                        timeout_s=90.),
+  'red_right': Entry('turn', junction=(-768.6, 555.2), turn='right', light='red', green_after_s=8., timeout_s=120.),
+  'red_right_g62': Entry('turn', junction=(-650.1, 481.7), turn='right', from_heading_deg=45., light='red', green_after_s=8.,
+                         timeout_s=120., expect=('turnMissed',)),
   'occupied_lane': Entry('data', actor='pacer', speed_kph=45., timeout_s=150.),
   'lane_change': Entry('data', speed_kph=45., timeout_s=150.),
   # downtown: 20 m on from the bridge's default spawn (clear of the junction behind it), eastbound, to road-graph node
@@ -158,6 +176,7 @@ class Plan:
   road: dict | None = None  # road_model() around the run, for the score's oncoming-lane check
   expect: tuple = ()        # Entry.expect
   fault_at_s: float = 0.    # Entry.fault_at_s
+  lights: dict | None = None  # the forced light (junction_lights), or None
 
 
 # *** road geometry ***
@@ -286,14 +305,37 @@ def spawn_conflicts(s_spawn: float, along, speed_kph: float) -> list[tuple[float
   return [(s - s_spawn, c) for s, c in along if -SPAWN_PAST_M < s - s_spawn < clear]
 
 
-def junction_control(along, total: float) -> tuple[str, float] | None:
-  """(kind, m before the junction) of the junction's own control on its approach: a line within PROTECT_BEFORE_M before
-  it (map_controls.protected's reach), or None."""
+def own_control(along, total: float) -> tuple[float, MappedControl] | None:
+  """(m before the junction, control) of the junction's own control on its approach: a line within PROTECT_BEFORE_M
+  before it (map_controls.protected's reach), the nearest, or None."""
   own = [(total - s, c) for s, c in along if -2. < total - s <= PROTECT_BEFORE_M]
-  if not own:
-    return None
-  d, c = min(own, key=lambda dc: dc[0])
-  return c.kind, round(float(d), 1)
+  return min(own, key=lambda dc: dc[0]) if own else None
+
+
+def junction_control(along, total: float) -> tuple[str, float] | None:
+  """(kind, m before the junction) of the junction's own control on its approach (own_control), or None."""
+  own = own_control(along, total)
+  return None if own is None else (own[1].kind, round(float(own[0]), 1))
+
+
+def junction_lights(controls, own: MappedControl, state: str, green_after_s: float, signals: list[dict] | None = None) -> dict:
+  """The forced light of a junction whose own signal is `own` (module docstring): its instance, the rest of its phase
+  ('with', from the level's signal groups, scenario.SIGNALS_JSON, by mapped heading) and the cross phase, and the states
+  they are forced to at setup."""
+  from openpilot.tools.sim.bridge.beamng.scenario import load_signals
+  group = next((g for g in (load_signals() if signals is None else signals) if own.instance in g['instances']), None)
+  if group is None:
+    raise ValueError(f"{own.instance} is in no signal group of the level")
+  heading = {c.instance: c.heading for c in reversed(controls)}  # the first link each controls
+  same, cross = [], []
+  for inst in group['instances']:
+    if inst == own.instance or inst not in heading:
+      continue
+    d = abs(math.degrees(wrap(heading[inst] - own.heading)))
+    (same if min(d, 180. - d) <= PHASE_DEG else cross).append(inst)
+  other = 'green' if state == 'red' else 'red'
+  return {'instance': own.instance, 'group': group['group'], 'with': same, 'cross': cross, 'state': state,
+          'green_after_s': green_after_s, 'states_at_setup': {own.instance: state, **dict.fromkeys(same, state), **dict.fromkeys(cross, other)}}
 
 
 def window_controls(along, total: float, v: float) -> list[tuple[float, str]]:
@@ -448,6 +490,13 @@ def _turn_plan(name: str, e: Entry, graph: RoadGraph) -> Plan:
                        'controls_from_spawn': [(round(float(sc - (total - s)), 1), str(c)) for sc, c in along]}
   own = junction_control(along, total)
   notes['junction_control'], notes['stop_line_m'] = own if own is not None else ('none', None)
+  own_c = own_control(along, total)
+  notes['junction_instance'] = None if own_c is None else own_c[1].instance
+  lights = None
+  if e.light:
+    if own_c is None or own_c[1].kind != 'signal':
+      raise ValueError(f"{name}: a forced light at {jn.node}, whose approach has no signal of its own ({notes['junction_control']})")
+    lights = junction_lights(mapped_controls(graph), own_c[1], e.light, e.green_after_s)
   if e.kind == 'straight':
     if jn.straight is None:
       dest = None
@@ -492,7 +541,7 @@ def _turn_plan(name: str, e: Entry, graph: RoadGraph) -> Plan:
       actors.append(Actor(f"{PREFIX}car{k}", 'car', 'oncoming', path.tolist(), e.oncoming_speed, e.oncoming_accel, h,
                           params={'start_m': e.oncoming_start_m, 'arrive_after_s': e.arrive_after_s, 'release_after_stop_s': round(delay, 2)}))
   return Plan(name, spawn, heading, dest, (float(jn.center[0]), float(jn.center[1])), e.speed_kph, e.timeout_s,
-              e.end_on_stop_s, actors, notes)
+              e.end_on_stop_s, actors, notes, lights=lights)
 
 
 def load_data(path: str = DATA_JSON, entry: str = '') -> dict:
