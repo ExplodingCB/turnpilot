@@ -2158,7 +2158,31 @@ def test_a_model_stand_partway_round_a_turn_hands_back_whoever_stopped_the_car()
   # know): not the stall's; the empty-road handback's (STOPPED_NOTE_S, STOPPED_HANDBACK_S) as before
   sim = Sim(RIGHT_AT_A_CORNER, cruise=8.)
   model_stands_in_the_turn(sim, 10.)
+  assert sim.tp.follower.distance > 0.  # short of the maneuver point, where a line can be
   assert all(p.controlPrompt != 'stalledTakeControl' for p in stand(sim, STALL_PROMPT_S + 2.))
+
+
+@pytest.mark.parametrize("controls,deg,at", [((), 10., 1.), (((290., 'signal'),), 10., 1.), ((), 15., -2.)])
+def test_a_model_stand_under_20_deg_past_the_maneuver_point_hands_back(controls, deg, at):
+  """Skeptic SIMFIX D2 (3b9b049 dropped BUILD_FINDINGS D2 fix (1)'s 'or the car inside the junction by rf.distance'): the
+  model stood the car 10-15 deg into the route's right, 8-10 m past its maneuver point, with no go of TurnPilot's: a status
+  note at 5 s and carStoppedTakeControl only at 60 s, a mapped signal there or not. A red the map doesn't know stands the car
+  at its line, short of the point, so a stand past it with the turn's desire out is the stall's from 0 deg."""
+  sim = Sim(RIGHT_AT_A_CORNER, cruise=8., controls=list(controls))
+  while 300. - sim.s > at:
+    sim.step(engaged=True)
+    assert sim.t < 120.
+  while sim.tp.desires.turned_deg < deg:
+    sim.step(engaged=True, yaw_rate=-0.4)
+    assert sim.t < 140.
+  assert sim.tp.go_id is None and sim.tp.turn_committed and sim.tp.desires.turned_deg < STALL_MIN_DEG
+  plans = stand(sim, STALL_PROMPT_S + 1.)
+  assert sim.tp.follower.distance < 0.
+  first = next((i for i, p in enumerate(plans) if p.controlPrompt in TAKE_CONTROL_PROMPTS), None)
+  assert first is not None, f"stood {deg} deg in, {sim.tp.follower.distance:.1f} m past the point: nothing loud"
+  assert plans[first].controlPrompt == 'stalledTakeControl' and plans[first].reason == STALLED_REASON
+  assert abs(first * DT_MDL - STALL_PROMPT_S) < 0.15
+  assert not any(p.shouldStop for p in plans) and plans[-1].accelCap == NO_ACCEL_CAP  # never a hold or a push
 
 
 def test_a_lead_the_scene_corroborates_holds_a_stand_in_a_turn_only_so_long():

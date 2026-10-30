@@ -57,7 +57,8 @@ it was missed: turnMissed for MISSED_HOLD_S, which selfdrived chimes as a skip (
 navd reroutes at once. Nothing brakes for it. Standing more than STALL_PROMPT_S in any route turn in progress (its desire
 out and not done; after a go of TurnPilot's for it, done or not), STALL_MIN_DEG to STALL_MAX_DEG into it (from its start,
 after a go of TurnPilot's that came in the junction), whoever stopped the car (TurnPilot's go, or the model on its own:
-BUILD_FINDINGS D2), with no hold of TurnPilot's and no lead within STOPPED_LEAD_M that the live scene corroborates
+BUILD_FINDINGS D2; under STALL_MIN_DEG too once past the maneuver point, where a red's stop line never is), with no
+hold of TurnPilot's and no lead within STOPPED_LEAD_M that the live scene corroborates
 (watch_lead: a vehicle track or box at it; one it corroborates holds the car LEAD_STAND_MAX_S at most), it stalled in the
 junction: handed back loudly (controlPrompt stalledTakeControl, STALLED_REASON), never held there, and TurnPilot never
 goes itself. Moving in such a turn past its hold
@@ -1929,6 +1930,9 @@ class TurnPilot:
     (skeptic SIMFIX D2: a 60 deg turn stood at 56 and 70 deg, a 45 deg one at 39 and 60, were silent for 90 s), its
     STALL_MAX_DEG bound on the angle the desire cleared at, as it was.
     Under STALL_MIN_DEG with no go of TurnPilot's the car may stand at the line (a red the map doesn't know): stopped_unheld's.
+    Not past the maneuver point (the follower's distance under 0), where a red's line never is: a stand there, the turn's
+    desire out, is in the junction from its start (BUILD_FINDINGS D2 fix (1); skeptic SIMFIX: 10-15 deg into a right 8-10 m
+    past its point, a status note at 5 s and carStoppedTakeControl at 60 s).
     The stop line it left is close behind it, so stopped_unheld would wait NEAR_CONTROL_STAND_S. A model lead holds it only
     as far as the scene corroborates it, LEAD_STAND_MAX_S at most (watch_lead)."""
     d, rf = self.desires, self.follower
@@ -1937,7 +1941,9 @@ class TurnPilot:
     # TurnPilot's go for this turn (49359b2's gate): its desire out or already cleared at its angle
     go_turn = went and self.go_id == d.maneuver_id and \
       (self.go_in_junction or not self.go_at_line(rf.distance) or STALL_MIN_DEG <= turned)
-    in_turn = turned <= STALL_MAX_DEG and (go_turn or (self.turn_committed and STALL_MIN_DEG <= turned))
+    # the model's own stand in a turn in progress: partway round, or past the maneuver point at any angle
+    model_turn = self.turn_committed and (STALL_MIN_DEG <= turned or rf.distance < 0.)
+    in_turn = turned <= STALL_MAX_DEG and (go_turn or model_turn)
     standing = acting and in_turn and sm['carControl'].enabled and v_ego < STANDSTILL_SPEED and not decision.should_stop and \
       not self.go_withdrawn and \
       not decision.holding and not cs.gasPressed and not cs.brakePressed and mapd.prompt not in TAKE_CONTROL_PROMPTS
