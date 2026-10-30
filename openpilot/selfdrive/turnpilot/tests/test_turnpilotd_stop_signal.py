@@ -24,6 +24,10 @@ VETOES = {
   'hazards': lambda m: {'status': 'ready', 'block': 'hazard', 'hazard': True, 'leftLamp': True, 'rightLamp': True},
   'signalLost': lambda m: {'status': 'failed', 'fault': 'lampLost'},
 }
+# the opposing road mapped straight this far (navInstruction maneuverOpposingStraightM, 2c94f6b), as the lefts that go in
+# test_turnpilotd_left carry: under TurnPilotAutoLeft auto a left whose opposing road isn't known straight past its R_req is
+# skipped at route time (unprotectedRange), the four-way's included, before the decider ever acts there
+STRAIGHT_M = 400.
 
 
 def stop_turn_sim(tmp_path, maneuver, car_signals=True, auto_left='auto', model='goes'):
@@ -31,8 +35,8 @@ def stop_turn_sim(tmp_path, maneuver, car_signals=True, auto_left='auto', model=
   TurnPilotAutoLeft auto as on the car. car_signals: a verified Tesla whose lamp lights on the plan's side at once; else mode
   off, the driver prompted (and not answering unless the test says)."""
   sim = StopSim(tmp_path, model=model, info_kw={'maneuver': maneuver}, driver_signals=None,
-                maneuvers=[(S_LINE + 13., 'turn', maneuver, (0., 270. if maneuver == 'left' else 90., 2, 'present', 11.2, 1)),
-                           (2000., 'turn', OTHER[maneuver], (0., 90. if maneuver == 'left' else 270., 2, 'present'))])
+                maneuvers=[(S_LINE + 13., 'turn', maneuver, (0., 270. if maneuver == 'left' else 90., 2, 'present', 11.2, 1, STRAIGHT_M)),
+                           (2000., 'turn', OTHER[maneuver], (0., 90. if maneuver == 'left' else 270., 2, 'present', 0., 0, STRAIGHT_M))])
   sim.tp.auto_left, sim.tp.left_range_m = auto_left, 300.
   sim.veto, sim.turn_done = None, False
   if car_signals:
