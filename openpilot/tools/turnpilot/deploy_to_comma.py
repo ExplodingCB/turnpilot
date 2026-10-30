@@ -9,6 +9,7 @@ on the comma, verifies it, and only then swaps it in. The old /data/openpilot (s
 
   python3 openpilot/tools/turnpilot/deploy_to_comma.py <comma address> [--commit <sha>] [--dry-run]
   python3 openpilot/tools/turnpilot/deploy_to_comma.py <comma address> --rollback [--prev openpilot.prev-<stamp>]
+  python3 openpilot/tools/turnpilot/deploy_to_comma.py <comma address> --reboot
   python3 openpilot/tools/turnpilot/deploy_to_comma.py --stage-only <dir> [--commit <sha>]
 
 Exit status: 0 done, 1 failed (the output says what state the comma is in), 2 refused before changing anything.
@@ -46,7 +47,7 @@ GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_LFS
            "GIT_COMMITTER_NAME": "deploy_to_comma", "GIT_COMMITTER_EMAIL": "deploy_to_comma@localhost", "LC_ALL": "C"}
 
 # The comma's half, one POSIX sh script run as `sh -c SCRIPT <name> <action> <args>`. It prints [comma] lines, and exits 3
-# with a FAILED line when it stops. Every action but receive/verify/swap/set_param/rollback only reads.
+# with a FAILED line when it stops. Every action but receive/verify/swap/set_param/rollback/reboot only reads.
 REMOTE_SH = r'''
 set -u
 act="$1"; shift
@@ -195,6 +196,26 @@ rollback)
   else
     die "could not move $target into place, nor put $newprev back: $root/openpilot is MISSING. Run: mv $newprev $root/openpilot"
   fi
+  ;;
+reboot)
+  # checked here, in the same call as the reboot: the y/N prompt before it can wait for as long as nobody answers
+  root="$1"; ours="$2"; t="$root/openpilot"
+  require_offroad "$root"
+  [ -x "$t/launch_openpilot.sh" ] || die "$t is missing, or has no launch_openpilot.sh: the comma would boot nothing"
+  if [ "$(git -C "$t" config --get remote.origin.url 2>/dev/null || true)" = "$ours" ]; then
+    du=$(pval "$root" DisableUpdates)
+    [ "$du" = 1 ] || die "DisableUpdates is ${du:-unset}, not 1, so TurnPilot's updater would fetch from GitHub after the reboot"
+    if [ -e "$t/.overlay_init" ]; then
+      # this script never ships it: an updater still running from the old tree has set up its overlay over this one, and
+      # the launcher installs a finalized update into a tree that has it
+      staged="nothing is staged yet"
+      [ -e "$root/safe_staging/finalized/.overlay_consistent" ] &&
+        staged="and it has staged an update in $root/safe_staging/finalized, which this boot would install over TurnPilot"
+      die "$t/.overlay_init exists: the updater still running from the old tree has set up its overlay over TurnPilot ($staged)"
+    fi
+  fi
+  say "rebooting now"
+  exec sudo reboot
   ;;
 *)
   die "unknown action $act"
@@ -512,18 +533,39 @@ class Comma:
                     "offroad, and run this again")
 
 
-def ask_reboot(comma: Comma) -> None:
+  def reboot(self) -> None:
+    """Reboot, once the comma's side has checked again that it is offroad and has a tree to boot, and for a TurnPilot
+    tree that DisableUpdates is 1 and no updater has set up its overlay over it. Raises Refused when it doesn't reboot."""
+    step("rebooting the comma, once it has checked again that it is offroad")
+    rc, out = self.run("reboot", self.root, ORIGIN_URL)
+    if rc == 0 or (rc == 255 and "[comma] rebooting now" in out):  # 255: the connection dropped as it went down
+      return
+    why = [line.split("FAILED: ", 1)[1] for line in out.splitlines() if line.startswith("  [comma] FAILED: ")]
+    if why and ".overlay_init" in why[0]:
+      why[0] += (f". Remove it, so the launcher installs nothing, and reboot: ssh {self.host} rm {self.root}/openpilot/" +
+                 f".overlay_init, then {sys.argv[0]} {self.host} --reboot")
+    raise Refused(f"the comma did not reboot: {why[0]}" if why and rc == 3 else
+                  f"the reboot didn't go through (ssh exit {rc}): {out.strip()[-300:]}")
+
+
+def not_rebooted(comma: Comma, running_from: str) -> str:
+  return (f"NOT REBOOTED. Don't start the car until the comma has rebooted: until then the fork that was running keeps " +
+          f"running from {running_from}, and going onroad would start its onroad processes out of the tree now in " +
+          f"{comma.root}/openpilot. With the car off, reboot it with: {sys.argv[0]} {comma.host} --reboot")
+
+
+def ask_reboot(comma: Comma, running_from: str) -> None:
   try:
     answer = input("Reboot the comma now? [y/N] ").strip().lower()
   except EOFError:
     answer = ""
   if answer not in ("y", "yes"):
-    step(f"not rebooting. When ready: ssh {comma.host} sudo reboot")
+    step(not_rebooted(comma, running_from))
     return
-  step("rebooting the comma")
-  r = subprocess.run([comma.ssh, *SSH_OPTS, comma.host, "sudo reboot"], capture_output=True, text=True)
-  if r.returncode not in (0, 255):  # 255: the connection dropped as it went down
-    print(f"    reboot failed: {(r.stdout + r.stderr).strip()}; reboot it from Settings > Device", flush=True)
+  try:
+    comma.reboot()
+  except Refused as e:
+    raise Failed(f"{e}. {not_rebooted(comma, running_from)}") from None
 
 
 def stream_tree(stage: Path, comma: Comma, incoming: str, total: int) -> None:
@@ -631,7 +673,7 @@ def deploy(args, comma: Comma, stamp: str) -> int:
     step(f"done: {comma.root}/openpilot is TurnPilot {facts['sha'][:12]}; the old tree ({current}) is {prev}")
     info("the first boot compiles openpilot and flashes the panda; keep the comma powered until the road view shows")
     info(f"to go back: {sys.argv[0]} {comma.host} --rollback")
-    ask_reboot(comma)
+    ask_reboot(comma, prev)
     return 0
   finally:
     shutil.rmtree(stage_parent, ignore_errors=True)
@@ -662,7 +704,7 @@ def rollback(args, comma: Comma, stamp: str) -> int:
     raise Failed(f"the rollback didn't happen; {comma.root}/openpilot is as it was")
   step(f"done: {comma.root}/openpilot is {target}'s tree; the one it replaced is {newprev} (--rollback again swaps back)")
   info("DisableUpdates stays 1; turn updates back on in the restored fork's settings if you want them")
-  ask_reboot(comma)
+  ask_reboot(comma, newprev)
   return 0
 
 
@@ -673,6 +715,7 @@ def main(argv: list[str] | None = None) -> int:
   p.add_argument("--dry-run", action="store_true", help="build and check the tree, read the comma's state, change nothing")
   p.add_argument("--rollback", action="store_true", help="swap the newest /data/openpilot.prev-* back into place")
   p.add_argument("--prev", help="with --rollback: the kept tree to restore, e.g. openpilot.prev-20261031-080000")
+  p.add_argument("--reboot", action="store_true", help="only reboot the comma, after the checks a deploy's reboot makes")
   p.add_argument("--stage-only", metavar="DIR", help="only build the tree into DIR (must not exist) and keep it; no ssh")
   p.add_argument("--repo", default=str(Path(__file__).resolve().parents[3]), help="source repo (default: this checkout)")
   p.add_argument("--data-root", default="/data", help=argparse.SUPPRESS)  # tests: the fake comma's /data
@@ -680,6 +723,8 @@ def main(argv: list[str] | None = None) -> int:
   args = p.parse_args(argv)
   if args.prev and ("/" in args.prev or not args.prev.startswith("openpilot.prev-")):
     p.error("--prev takes a name like openpilot.prev-20261031-080000")
+  if args.reboot and (args.rollback or args.dry_run or args.stage_only or args.commit or args.prev):
+    p.error("--reboot takes only the comma's address")
   try:
     if args.stage_only:
       if Path(args.stage_only).exists():
@@ -690,6 +735,10 @@ def main(argv: list[str] | None = None) -> int:
     if not args.address:
       p.error("give the comma's address")
     comma = Comma(args.address, args.data_root)
+    if args.reboot:
+      comma.require_offroad(comma.probe())
+      comma.reboot()
+      return 0
     return rollback(args, comma, args.stamp) if args.rollback else deploy(args, comma, args.stamp)
   except Refused as e:
     print(f"REFUSED: {e}. Nothing on the comma changed.", flush=True)
