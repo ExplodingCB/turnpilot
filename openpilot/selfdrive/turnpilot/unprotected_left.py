@@ -165,9 +165,10 @@ LIGHT_UNKNOWN_S = 8.       # s at its line at a signal with no read of its light
 LIGHT_RED_MAX_S = 150.     # s at its line under a red: longer than a cycle (a red read that never ends), a fault
 GO_PROMPT_S = 1.5          # leftGo is shown this long
 # m to spare short of the oncoming lanes for a veto of the go (DESIGN phase4/blinker 6.6): the intent reads this frame's
-# decision (withdrawable) and the veto reaches the left a frame later (signal_veto), when the car has gone on up to v*dt and
-# its stop grown by v*a*dt/STOP_DECEL: 0.35 m at 3 m/s and 2 m/s^2, the left's go being slower than that while it can stop
-VETO_MARGIN_M = 0.5
+# decision (withdrawable) and the veto reaches the left a frame later (signal_veto), when the car has gone on v*dt and its
+# stop grown by v*a*dt/STOP_DECEL: v*dt*(1 + a/STOP_DECEL), 0.43 m at V_GO under the left's post-go cap (1.5 m/s^2), so twice
+# that for an accel past the cap or a step in the follower's distance. Inside the margin a veto finishes the turn, said
+VETO_MARGIN_M = 1.
 ALERT_S = 2.               # oncomingHolding
 VIEW_FROM_M = 60.          # the road camera from this far out (the window starts on the approach)
 
