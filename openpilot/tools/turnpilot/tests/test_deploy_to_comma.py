@@ -73,6 +73,8 @@ rc=$?
 if [ -n "${FAKE_COMMA_AFTER:-}" ] && [ "$action" = "${FAKE_COMMA_AFTER%%:*}" ]; then
   bash -c "${FAKE_COMMA_AFTER#*:}"
 fi
+# the connection drops as the comma goes down
+if [ "${FAKE_COMMA_EXIT_255_AFTER:-}" = "$action" ]; then exit 255; fi
 exit $rc
 '''
 DF_SHIM = r'''#!/usr/bin/env bash
@@ -500,6 +502,21 @@ def test_reboot_refused_once_an_updater_overlays_turnpilot(source, comma, staged
   (root / 'openpilot/.overlay_init').unlink()
   r = deploy(src, root, env, '--reboot')
   assert r.returncode == 0 and rebooted(env), r.stdout
+
+
+@pytest.mark.parametrize('how', ['dropped-as-it-went-down', 'dropped-before'])
+def test_reboot_when_ssh_exits_255(source, comma, how):
+  """A real reboot usually ends the ssh session with exit 255: that is a reboot once the comma said "rebooting now", and
+  not one when the connection ended before it."""
+  src, *_ = source
+  root, env = comma
+  extra = {'FAKE_COMMA_EXIT_255_AFTER': 'reboot'} if how == 'dropped-as-it-went-down' else {'FAKE_COMMA_DROP': 'reboot:pipe'}
+  r = deploy(src, root, env, answer='y', extra_env=extra)
+  if how == 'dropped-as-it-went-down':
+    assert r.returncode == 0 and rebooted(env), r.stdout
+  else:
+    assert r.returncode == 1 and not rebooted(env), r.stdout
+    not_rebooted_warning(r)
 
 
 def test_an_update_sunnypilot_staged_does_not_block_the_reboot(source, comma):
