@@ -1077,6 +1077,28 @@ def test_without_a_reroute_the_overruled_left_stays_handed_back(driver):
   assert all(p.shouldStop for p in after)
 
 
+def test_a_line_veto_is_forgotten_once_the_car_is_past_its_junction():
+  """The carried end of a veto at the left's line is for the same left at the line the car stands at (navd's reroute
+  there, a reading glitch's new id). Once the car is past that junction (the driver took over and drove it, then engaged
+  again) it is forgotten: a left under a new id within SAME_TURN_M after it is a turn of its own, and without junction
+  data same_junction can't tell the two apart, so ending its request would take it with no lamp and no prompt, nothing
+  said (a skip's carry, M3's, is said out loud)."""
+  from types import SimpleNamespace
+  from openpilot.selfdrive.turnpilot.route_follower import LEFT, TURN, Maneuver
+  from openpilot.selfdrive.turnpilot.turnpilotd import TurnPilot, VetoedTurn
+  vetoed_left = Maneuver(TURN, LEFT, "turn", "left", 90., geometry=True, bearings=(0., 270.))
+  next_left = Maneuver(TURN, LEFT, "turn", "left", 90.)  # no junction data
+  tp = TurnPilot()
+  tp.odo_m = 90.7  # standing at the left's line, 9.3 m short of its junction
+  tp.vetoed = VetoedTurn(vetoed_left, 100., 'driverSignal', 1, False, line=True)
+  tp.carry_veto(vetoed_left, SimpleNamespace(maneuver_id=3, distance=9.3), 0.)
+  assert tp.turn_signal.ended_id == 3, "at the line the same left under a new id stays ended"
+  tp.odo_m = 112.  # past the junction, engaged again, the next left 18 m on (30 m past the vetoed junction)
+  tp.carry_veto(next_left, SimpleNamespace(maneuver_id=5, distance=18.), 8.)
+  assert tp.turn_signal.ended_id != 5, "the next left's request ended with nothing said"
+  assert tp.vetoed is None
+
+
 @pytest.mark.parametrize("driver", ['right', 'lost'])
 def test_a_reroute_after_a_veto_at_g1s_line_never_relights_the_left(driver):
   """TurnPilotAutoLeft off (G1): the latch holds the car at the left's line, handed back (unprotectedTurnTakeControl), and a

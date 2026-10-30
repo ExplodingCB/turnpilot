@@ -987,11 +987,13 @@ class TurnPilot:
     with the car in a left-turn position, 6.6's exception), and it ended the request for the left. Carried, that request
     stays ended under the new id (TurnSignalIntent.end: never armed, signalled, prompted or handed over), before this frame's
     intent update, so the car never relights the left the driver overruled, never prompts 'Signal Left' for it with our
-    lamp put out, and a takeover never asks for it."""
+    lamp put out, and a takeover never asks for it. It is for the left at the line the car stands at, so it is forgotten
+    once the car is past that junction (the driver took over and drove it): a left of a new id after it, which without
+    junction data same_junction can't tell from it, would otherwise lose its lamp and prompt with nothing said."""
     v = self.vetoed
     if v is None:
       return
-    if self.odo_m > v.junction_odo + SAME_TURN_M:
+    if self.odo_m > v.junction_odo + SAME_TURN_M or (v.line and self.odo_m > v.junction_odo):
       self.vetoed = None
       return
     if upcoming is None or upcoming.kind not in (TURN, KEEP) or rf.maneuver_id == v.maneuver_id or \
