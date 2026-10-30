@@ -32,7 +32,9 @@ decider computes would_go only (logged once a stop). Acting:
   junction moving gets one signalling creep of DEADLOCK_CREEP_M on the latch's creep path (DEADLOCK_CREEP_V, a G5 go with
   cause creep, never closer than GO_ROOM_M to the closest plausible edge, never while creep_blocked: V12, V13), then the
   order is waived and every other go condition still holds for CLEAR_S; it moving before our commit stops us short and we
-  yield (during the creep the latch holds again; during the launch the re-check's capped abort). Off the route (O9) the
+  yield (during the creep the latch holds again; during the launch the re-check's capped abort). With nothing moving
+  DEADLOCK_S and no creep able to run (another go condition holding the go, or the encounter's creeps spent), the turn is a
+  static cause (4.6: only traffic taking turns waits with no bound): STATIC_WAIT_S, then H3. Off the route (O9) the
   maneuver is unknown, the union of the conflict sets: navd's reroute is waited for up to OFFROUTE_WAIT_S from the full stop
   (a dynamic wait, its static causes' clock running on), then the union decides and the ladder runs if it fails.
 - going: TurnPilot's cap STOP_GO_V_MAX until the commit point, every object, view and sector re-checked (lane reach on the
@@ -1047,7 +1049,10 @@ class StopGo:
     # ends on any but its lanes' (our own creep restarts their trust: its earlier arrivals judged by ground motion)
     if not launch:
       lanes_only = all(h.key.split(':')[0] in CREEP_LANE_HOLDS for h in box + rest)
-      holds += self._turn_holds(f, pos, any(h.kind == DYNAMIC for h in box + rest), not holds and not box and not rest, lanes_only)
+      turn = self._turn_holds(f, pos, any(h.kind == DYNAMIC for h in box + rest), not holds and not box and not rest, lanes_only)
+      if any(h.kind == STATIC for h in turn):
+        return holds + box + rest + turn  # a standing cause beside it is the wait's reason, and H3's
+      holds += turn
     return holds + box + rest
 
   def _view_holds(self, f: Frame) -> list[Hold]:
@@ -1244,9 +1249,15 @@ class StopGo:
     if self.creep is not None:
       return self._creeping(f, pos, waiting, moving or not creep_ok)
     self.turn_wait_s = 0. if moving else self.turn_wait_s + f.dt
-    if self.turn_wait_s >= DEADLOCK_S - 1e-6 and self.creeps < DEADLOCK_CYCLES and ready:
+    if self.turn_wait_s < DEADLOCK_S - 1e-6:
+      return [Hold('turn', "an earlier arrival's turn", DYNAMIC)]
+    if self.creeps < DEADLOCK_CYCLES and ready:
       return self._deadlock(f, pos, waiting)
-    return [Hold('turn', "an earlier arrival's turn", DYNAMIC)]
+    # nothing in the junction has moved for DEADLOCK_S and no creep can run (another go condition holds the go, so we
+    # wouldn't go were it our turn, or the encounter's creeps are spent): traffic isn't taking turns, so the turn is a static
+    # cause (4.6), its STATIC_WAIT_S then the ladder (H3); anything moving makes it dynamic again, and the creep comes once
+    # every other go condition is met
+    return [Hold('turn', "an earlier arrival isn't taking its turn", STATIC)]
 
   def creep_blocked(self, f: Frame, pos: float, known: dict | None = None) -> str:
     """Why the car mustn't creep now ('' it may; 2.5, rows V12, V13): a vehicle whose path ends in our road's oncoming lane

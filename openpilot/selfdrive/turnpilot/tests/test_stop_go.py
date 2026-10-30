@@ -1761,6 +1761,42 @@ def test_V9_no_deadlock_creep_toward_a_person_in_the_crosswalk_the_creep_waits_f
   assert first_go(out) is not None
 
 
+@pytest.mark.parametrize('case', ['person', 'V15', 'V16'])
+def test_V9_an_earlier_arrival_that_never_moves_beside_a_standing_cause_is_a_static_wait_then_h3(tmp_path, case):
+  # 4.6: waiting while traffic takes turns is the only open-ended wait. An earlier arrival standing at the left line from
+  # before ours that never goes, beside a cause that holds the go and stands too (a person standing in the near crosswalk;
+  # V15's van stopped on our exit leg; V16's car double-parked 20 m down the right lane), so the creep can't run (it starts
+  # only with every other go condition met): nothing in the junction moves at all, so DEADLOCK_S on, the turn is a static
+  # cause, the static clock runs and STATIC_WAIT_S on it is H3 with the standing cause's reason. Before, the turn stayed
+  # dynamic with nothing moving and zeroed the static clock every frame: 60 s of "an earlier arrival's turn", no handback
+  w = Drive(tmp_path, behaviour=lambda w: 'goes')
+  specs = [(1, 'left', at_line(t0=-10.))]
+  if case == 'person':
+    w.objects = lambda ww: (person(80, 1.9 + 4.0, -1.0),)
+    reason = "a pedestrian just ahead"  # the 0-6 m box hold's, ahead of its crosswalk's ped:80
+  elif case == 'V15':
+    w.objects = lambda ww: (vehicle(95, 26., 0.),)
+    reason = "no room past the junction"
+  else:
+    specs.append((96, 'right', lambda t: 20.))
+    reason = "can't see far enough from the right"
+  w.tracks = cars(*specs)
+  watch(w)
+  out = w.run(30.)
+  a = arrived_at(out)
+  assert out[a + 1].rank == 1 and not any(d.go_cause != 'none' for d in out)
+  turn = [h for h in out[a + round(1. / DT_MDL)].holds if h.key == 'turn']
+  assert turn and turn[0].kind == 'dynamic' and out[a + round(1. / DT_MDL)].ledger == 'dynamic'
+  late = out[a + round((sg.DEADLOCK_S + 0.5) / DT_MDL)]
+  assert [h.kind for h in late.holds if h.key == 'turn'] == ['static'] and late.ledger == 'static'
+  assert late.reason == "Waiting: " + reason if case != 'V16' else late.reason.startswith("Waiting: " + reason)
+  k = next(k for k, d in enumerate(out) if d.fault)
+  assert out[k].fault == 'H3' and (k - a) * DT_MDL == pytest.approx(sg.DEADLOCK_S + STATIC_WAIT_S, abs=0.25), (k - a) * DT_MDL
+  assert out[k].reason.startswith(f"Stop sign: {reason}") and out[k].prompt == 'stopSignTakeControl'
+  assert all(d.reason.startswith("Waiting: ") and d.prompt == 'waitingForCross' for d in out[a + 1:k])
+  assert all(s.accel_cap >= -2. - 1e-9 for d in out for s in d.stops) and max(d.position_m for d in out) <= 0.05
+
+
 def test_V13_a_box_overlapping_0_6_m_ahead_of_the_bumper_holds_the_go(tmp_path):
   # a truck turning into our road swings over our line: its box 4 m ahead of our bumper, in our path
   w = World(tmp_path)
