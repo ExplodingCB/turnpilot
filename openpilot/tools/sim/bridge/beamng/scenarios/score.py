@@ -21,7 +21,16 @@ A row is a dict:
   pacer_dx           m the pacer car is ahead of the ego along its heading (None without one)
   j_dist, car_j_dist m from the ego, and from the nearest oncoming car, to the scenario's junction (None without one)
   j_ahead            m the junction is ahead of the ego along its heading (negative: behind it; None without one)
-  blinker            the driver's stalk: '', 'left' or 'right'
+  blinker            the driver's stalk: '', 'left' or 'right'; lamp: carState's blinkers, what openpilot read of it
+  handback           turnpilotPlan.handback ('none', 'detectorStopped', ...); control_alert its controlAlert ('none',
+                     'hardBrake', ...); too_fast its tooFastToTurn
+  forced_light       the state the runner forced the scenario junction's own signal to ('red', 'green'; None: not forced)
+  lights             [[instance, state, m to its line], ...] of the light oracle's turnpilotLights when fresh (None otherwise)
+
+A scenario's expectations (EXPECTS: catalog Entry.expect, or the runner's --expect and the options that imply one) are
+what its shot exists to show: a handback, a skip, a missed turn, the driver's gas press, hard braking. Each is required of
+the run (not seen: a failure), and explains only the generic failure it causes (the disengagement after the handback, the
+press itself, the route not finished), so a run's verdict means what its shot shows.
 
 Rescore a saved result: python -m openpilot.tools.sim.bridge.beamng.scenarios.score result.json
 Score a recorded drive: python -m openpilot.tools.sim.bridge.beamng.scenarios.score --scenario route_demo rlog...
@@ -70,6 +79,16 @@ PET_MIN_S = 2.
 CONFLICT_M = 8.        # the conflict zone: within this of the junction's point
 APPROACH_SPEED_S = 0.5  # an oncoming car's speed at a go: from its distance this long before
 LEFT_STALLS = ('stalledTakeControl', 'cantStartTakeControl')
+TURN_DESIRES = (1, 2)  # log.Desire.turnLeft, turnRight
+# expectations (module docstring): 'handback:<kind>' (a turnpilotPlan.handback, or a take-control controlPrompt),
+# 'gasDisengage', 'skip' (tooFastToTurn, or the left skipped at route time), 'turnMissed', 'hardBrake' (controlAlert)
+EXPECTS = ('handback', 'gasDisengage', 'skip', 'turnMissed', 'hardBrake')
+# the disengagement within this of the first row showing the gas is the press's: the shot's 0.2 s (carState.gasPressed to
+# disengaged, in the rlog), plus the rows' 50 ms sampling of two messages that may each land a row late
+GAS_DISENGAGE_S = 0.3
+RED_STOP_SCENARIOS = ('red_right', 'red_right_g62')  # a forced red they must stand at and not pass (red_straight: a limit)
+RED_PAST_LINE_M = 1.  # the camera mount this far past the junction's stop line (the bumper ~3 m past it): into the junction
+RED_NEAR_M = 30.      # a stand within this before the stop line is at the red
 
 
 def msg_fields(ss, cs, tp, nav, model) -> dict:
@@ -85,6 +104,9 @@ def msg_fields(ss, cs, tp, nav, model) -> dict:
     'left_treq': 0. if tp is None else round(float(tp.unprotectedLeft.tReq), 2),
     'left_rreq': 0. if tp is None else round(float(tp.unprotectedLeft.rReq), 1),
     'turn_missed': False if tp is None else bool(tp.turnMissed),
+    'handback': 'none' if tp is None else str(tp.handback), 'control_alert': 'none' if tp is None else str(tp.controlAlert),
+    'too_fast': False if tp is None else bool(tp.tooFastToTurn),
+    'lamp': 'left' if cs.leftBlinker else 'right' if cs.rightBlinker else '',
     'lc_wait': '' if tp is None else str(tp.laneChangeWait), 'lc_want': 0 if tp is None else int(tp.laneChangeWant),
     'desire': 0 if tp is None else int(tp.desire), 'map_kind': '' if tp is None else str(tp.mapControl.kind),
     'lc_state': str(model.meta.laneChangeState),
@@ -473,87 +495,257 @@ def unprotected_left(rows) -> dict:
           'turn_missed': any(r.get('turn_missed') for r in rows)}
 
 
-def check(name: str, res: dict) -> list[str]:
-  """Why a scored run fails its scenario (empty: it passes)."""
+def _disengage_text(ds: list[dict], before: str = '') -> str:
+  return f"{len(ds)} disengagement(s){before}: {ds[0]['cause']}"
+
+
+def _fails(name: str, res: dict) -> list[tuple[str, str]]:
+  """(key, why) of each way a scored run fails its scenario before its expectations: the key says which check, for
+  expectations() to explain."""
   fails = []
   if res['disengagements']:
-    fails.append(f"{len(res['disengagements'])} disengagement(s): {res['disengagements'][0]['cause']}")
+    fails.append(('disengage', _disengage_text(res['disengagements'])))
   if res['positions'] and res['wrong_side_m'] is None:
-    fails.append("no road model: the oncoming lane was not checked")
+    fails.append(('road', "no road model: the oncoming lane was not checked"))
   elif res['wrong_side_m'] is not None and res['wrong_side_m'] >= WRONG_SIDE_MIN_M:
     w = res['wrong_side'][0]
-    fails.append(f"drove {res['wrong_side_m']:.0f} m in the oncoming lane outside the junctions, first at t={w['t']:.1f} s " +
-                 f"({w['x']:.0f}, {w['y']:.0f}), up to {max(x['max_past_m'] for x in res['wrong_side']):.1f} m past the divider")
+    fails.append(('wrong_side', f"drove {res['wrong_side_m']:.0f} m in the oncoming lane outside the junctions, first at t={w['t']:.1f} s " +
+                  f"({w['x']:.0f}, {w['y']:.0f}), up to {max(x['max_past_m'] for x in res['wrong_side']):.1f} m past the divider"))
   taps = res.get('gas_taps', [])
   if taps:  # no gas go anywhere (Kellen, 2026-10-28): any press while engaged is the driver's, a failed run
     x = taps[0]
-    fails.append(f"{len(taps)} gas press(es), no taps anywhere, first at t={x['t']:.1f} s ({x['reason'] or 'no hold'}, " +
-                 f"stood {x['stopped_s']} s)")
+    fails.append(('gas', f"{len(taps)} gas press(es), no taps anywhere, first at t={x['t']:.1f} s ({x['reason'] or 'no hold'}, " +
+                  f"stood {x['stopped_s']} s)"))
   taken, attempted = res['maneuvers_taken'], res['maneuvers_attempted']
   hs = res['holds']
   if name == 'ped_crosswalk_right':
     h = _hold_with(hs, 'crosswalk')
     if not any(x['stopped'] for x in h):
-      fails.append("never held to a stop for the pedestrian in the crosswalk")
+      fails.append(('crosswalk', "never held to a stop for the pedestrian in the crosswalk"))
     elif not any(x['resumed'] for x in h if x['stopped']):
-      fails.append("did not move on after the crosswalk cleared")
-  elif name.startswith('unprotected_left'):  # and its variants at other approaches and gap streams
+      fails.append(('stall', "did not move on after the crosswalk cleared"))
+  elif name.startswith('unprotected_left'):  # and its variants at other approaches, gap streams and the occluded view
     lr = res['left']
     if lr['undecided_t'] is not None and lr['gap_before_undecided']:
       gap = f"a gap of {max(lr['gaps_offered_s'])} s" if lr['gaps_offered_s'] else "no tReq known"
-      fails.append(f"undecided at t={lr['undecided_t']:.1f} s with {gap} (tReq {lr['t_req']} s) offered at its line")
+      fails.append(('left_undecided', f"undecided at t={lr['undecided_t']:.1f} s with {gap} (tReq {lr['t_req']} s) offered at its line"))
     elif lr['undecided_t'] is None:
       # waiting is required wherever an oncoming car was presented; the wait is the left's own at its line
       h = _hold_with(hs, 'gap') + _hold_with(hs, 'oncoming') + _hold_with(hs, 'Oncoming')
       if res.get('oncoming_presented') is False:
-        fails.append(f"no oncoming car came within {PRESENT_CAR_M:.0f} m of the junction while the car was at it: the wait went untested")
+        fails.append(('left_wait', f"no oncoming car came within {PRESENT_CAR_M:.0f} m of the junction while the car was at it: " +
+                      "the wait went untested"))
       elif not h:
-        fails.append("never waited for oncoming traffic")
+        fails.append(('left_wait', "never waited for oncoming traffic"))
       if not lr['gos']:
-        fails.append("never went at the unprotected left")
+        fails.append(('left_go', "never went at the unprotected left"))
       if lr['false_goes']:
         x = lr['false_goes'][0]
-        fails.append(f"{len(lr['false_goes'])} false go(es): at t={x['t']:.1f} s an oncoming car {x['tta_s']} s from the junction " +
-                     f"(tReq {x['t_req']} s)")
+        fails.append(('left_false_go', f"{len(lr['false_goes'])} false go(es): at t={x['t']:.1f} s an oncoming car {x['tta_s']} s from " +
+                      f"the junction (tReq {x['t_req']} s)"))
       if lr['pet_s'] is not None and lr['pet_s'] < PET_MIN_S:
-        fails.append(f"post-encroachment time {lr['pet_s']} s with an oncoming car, under {PET_MIN_S} s")
+        fails.append(('left_pet', f"post-encroachment time {lr['pet_s']} s with an oncoming car, under {PET_MIN_S} s"))
     if lr['stalls']:
-      fails.append(f"stalled or never moved on its go ({', '.join(lr['stalls'])})")
+      fails.append(('stall', f"stalled or never moved on its go ({', '.join(lr['stalls'])})"))
     if lr['turn_missed']:
-      fails.append("missed the turn")
+      fails.append(('turn_missed', "missed the turn"))
     if res['min_gap_car_m'] is not None and res['min_gap_car_m'] < CAR_MIN_GAP_M:
-      fails.append(f"came within {res['min_gap_car_m']} m of an oncoming car")
+      fails.append(('car_gap', f"came within {res['min_gap_car_m']} m of an oncoming car"))
   elif name == 'ped_in_path':
     g = res['stop_gap_m']
     if res['outcome'] != 'stopped' or g is None:
-      fails.append("did not stop for the pedestrian")
+      fails.append(('ped_stop', "did not stop for the pedestrian"))
     elif not PED_STOP_GAP[0] <= g <= PED_STOP_GAP[1]:
-      fails.append(f"stopped {g} m from the pedestrian, outside {PED_STOP_GAP[0]}-{PED_STOP_GAP[1]} m")
+      fails.append(('ped_stop', f"stopped {g} m from the pedestrian, outside {PED_STOP_GAP[0]}-{PED_STOP_GAP[1]} m"))
+  elif name == 'ped_step_out':
+    if res['outcome'] != 'stopped':
+      fails.append(('ped_stop', "did not stop for the pedestrian"))
   elif name == 'occupied_lane':
     if not res['lane_blocked']:
-      fails.append("the planner never saw the target lane as occupied")
+      fails.append(('lane_blocked', "the planner never saw the target lane as occupied"))
     if not res['lane_changes']:
-      fails.append("never changed lanes")
+      fails.append(('lane_change', "never changed lanes"))
     elif (dx := res['lane_changes'][0]['pacer_dx']) is not None and abs(dx) < LC_BLOCK_X_M:
-      fails.append(f"changed lanes with the pacer {dx:.1f} m alongside")
+      fails.append(('lane_change', f"changed lanes with the pacer {dx:.1f} m alongside"))
   elif name == 'lane_change':
     if not res['lane_changes']:
-      fails.append("never changed lanes")
+      fails.append(('lane_change', "never changed lanes"))
+  red = res.get('red_light')
+  if name in RED_STOP_SCENARIOS:
+    if red is None:
+      fails.append(('red', "no forced light in the rows: the red was not checked"))
+    else:
+      if not red['stood_at_red']:
+        fails.append(('red', "never stood at the forced red"))
+      if red['past_line_on_red_t'] is not None:
+        fails.append(('red', f"past the stop line on the forced red at t={red['past_line_on_red_t']:.1f} s"))
   undecided_ok = name.startswith('unprotected_left') and res['left']['undecided_t'] is not None and not res['left']['gap_before_undecided']
-  if (name in ('ped_crosswalk_right', 'lane_change', 'route_demo') or name.startswith('unprotected_left')) and not undecided_ok:
+  arrives = ('ped_crosswalk_right', 'lane_change', 'route_demo', 'right_green', 'left_t_junction') + RED_STOP_SCENARIOS
+  if (name in arrives or name.startswith('unprotected_left')) and not undecided_ok:
     if res['outcome'] != 'arrived':
-      fails.append(f"ended {res['outcome']}, not arrived")
+      fails.append(('not_arrived', f"ended {res['outcome']}, not arrived"))
     if attempted == 0 or taken < attempted:
-      fails.append(f"took {taken} of {attempted} maneuvers")
-  if name in ('ped_crosswalk_right', 'ped_in_path') and res['min_gap_ped_m'] is not None and res['min_gap_ped_m'] < COLLISION_GAP_M:
-    fails.append(f"came within {res['min_gap_ped_m']} m of the pedestrian")
+      fails.append(('maneuvers', f"took {taken} of {attempted} maneuvers"))
+  if name in ('ped_crosswalk_right', 'ped_in_path', 'ped_step_out') and res['min_gap_ped_m'] is not None and \
+     res['min_gap_ped_m'] < COLLISION_GAP_M:
+    fails.append(('ped_contact', f"came within {res['min_gap_ped_m']} m of the pedestrian"))
   return fails
 
 
-def summarize(name: str, rows, outcome: str, road: dict | None = None, junction_control: str | None = None) -> dict:
+def parse_expect(expect) -> list[tuple[str, str]]:
+  """[(kind, arg)] of expectation strings ('handback:detectorStopped', 'skip', ...); an unknown one is refused."""
+  out = []
+  for e in expect or ():
+    kind, _, arg = str(e).partition(':')
+    if kind not in EXPECTS or (kind == 'handback') != bool(arg):
+      raise ValueError(f"unknown expectation {e!r}: one of {', '.join(EXPECTS)} ('handback:<kind>')")
+    out.append((kind, arg))
+  return out
+
+
+def expect_facts(rows) -> dict:
+  """What the expectations look for in the rows: the first time of each handback (turnpilotPlan.handback, or a take-control
+  controlPrompt), control alert, skip and missed turn; the first row showing the gas once engaged; and the turn desires and
+  TurnPilot prompts after them."""
+  first: dict[str, dict] = {'handback': {}, 'alert': {}}
+  skip_t = missed_t = gas_t = None
+  engaged = False
+  for r in rows:
+    engaged = engaged or r['enabled']
+    hb, cp = r.get('handback', 'none'), r.get('control_prompt', 'none')
+    for k in (hb if hb not in ('', 'none') else None, cp if cp.endswith('TakeControl') else None):
+      if k is not None:
+        first['handback'].setdefault(k, r['t'])
+    if r.get('control_alert', 'none') not in ('', 'none'):
+      first['alert'].setdefault(r['control_alert'], r['t'])
+    if skip_t is None and (r.get('too_fast') or r.get('left_state') == 'skipped'):
+      skip_t = r['t']
+    if missed_t is None and r.get('turn_missed'):
+      missed_t = r['t']
+    if gas_t is None and engaged and r.get('gas'):
+      gas_t = r['t']
+  return {'handbacks': first['handback'], 'control_alerts': first['alert'], 'skip_t': skip_t, 'turn_missed_t': missed_t,
+          'gas_t': gas_t,
+          'desire_after_skip_t': next((r['t'] for r in rows if skip_t is not None and r['t'] >= skip_t and r.get('desire') in TURN_DESIRES), None),
+          'prompts_after_gas': sorted({k for k, t in first['handback'].items() if gas_t is not None and t >= gas_t})}
+
+
+def expectations(name: str, res: dict, fails: list[tuple[str, str]], expect) -> tuple[list[tuple[str, str]], list[dict]]:
+  """(the failures left, each expectation's {expect, met, t, explains}): an expectation not seen is a failure; one seen
+  explains only the generic failures it causes (module docstring)."""
+  facts = res['expect_facts']
+  dis = list(res['disengagements'])
+  explained_dis: list[dict] = []
+  out, extra = [], []
+  explains: dict[str, list[str]] = {}
+
+  def explain(e: str, keys) -> None:
+    for k, why in fails:
+      if k in keys:
+        explains.setdefault(e, []).append(why)
+  for kind, arg in parse_expect(expect):
+    e = f"{kind}:{arg}" if arg else kind
+    t, met = None, False
+    if kind == 'handback':
+      t = facts['handbacks'].get(arg)
+      met = t is not None
+      if not met:
+        extra.append(f"expected handback {arg}: none came")
+      else:
+        before = [d for d in dis if d['t'] < t]
+        explained_dis += [d for d in dis if d['t'] >= t]
+        if before:
+          extra.append(_disengage_text(before, f" before the expected handback {arg}"))
+        explain(e, ('not_arrived', 'maneuvers') + (('stall',) if arg in LEFT_STALLS else ()) +
+                (('left_go', 'left_wait') if arg == 'cantStartTakeControl' else ()))
+    elif kind == 'gasDisengage':
+      t = facts['gas_t']
+      after = [d for d in dis if t is not None and d['t'] >= t]
+      if t is None or not after:
+        extra.append("expected gasDisengage: no disengagement on the gas")
+      elif after[0]['t'] - t > GAS_DISENGAGE_S:
+        extra.append(f"disengaged {after[0]['t'] - t:.2f} s after the gas press, over {GAS_DISENGAGE_S} s")
+      else:
+        met = True
+        explained_dis.append(after[0])
+        explain(e, ('gas', 'not_arrived', 'maneuvers'))
+        if facts['prompts_after_gas']:
+          extra.append(f"TurnPilot handed back after the gas press ({', '.join(facts['prompts_after_gas'])})")
+    elif kind == 'skip':
+      t = facts['skip_t']
+      met = t is not None
+      if not met:
+        extra.append("expected skip: no turn skipped (tooFastToTurn)")
+      else:
+        explain(e, ('left_wait', 'left_go', 'not_arrived', 'maneuvers'))
+        if facts['desire_after_skip_t'] is not None:
+          extra.append(f"a turn desire after the skip, at t={facts['desire_after_skip_t']:.1f} s")
+    elif kind == 'turnMissed':
+      t = facts['turn_missed_t']
+      met = t is not None
+      if not met:
+        extra.append("expected turnMissed: the turn was taken (no turnMissed)")
+      else:
+        explain(e, ('turn_missed', 'not_arrived', 'maneuvers'))
+    elif kind == 'hardBrake':
+      t = facts['control_alerts'].get('hardBrake')
+      met = t is not None
+      if not met:
+        extra.append("expected hardBrake: no hardBrake alert")
+    out.append({'expect': e, 'met': met, 't': t, 'explains': explains.get(e, [])})
+  gone = {k for e in out for k, why in fails if why in e['explains']}
+  left = [(k, why) for k, why in fails if k not in gone and k != 'disengage']
+  if explained_dis:
+    for e in out:
+      if e['met'] and (e['expect'].startswith('handback:') or e['expect'] == 'gasDisengage'):
+        e['explains'] = [_disengage_text([d]) for d in explained_dis if d['t'] >= (e['t'] or 0.)] + e['explains']
+        break
+  rest = [d for d in dis if d not in explained_dis and not any(d['t'] < (e['t'] or 0.) and e['expect'].startswith('handback:')
+                                                                for e in out if e['met'])]
+  if rest:
+    left.insert(0, ('disengage', _disengage_text(rest)))
+  return left + [('expect', x) for x in extra], out
+
+
+def check(name: str, res: dict, expect=()) -> list[str]:
+  """Why a scored run fails its scenario (empty: it passes): its checks, then its expectations (module docstring)."""
+  fails = _fails(name, res)
+  if expect:
+    fails, res['expected'] = expectations(name, res, fails, expect)
+  return [why for _, why in fails]
+
+
+def red_light(rows, stop_line_m: float | None) -> dict | None:
+  """The forced light (the runner's forced_light rows): whether the car stood at it red (within RED_NEAR_M before the
+  junction's stop line, stop_line_m before the junction), when the camera mount was RED_PAST_LINE_M past the line with it
+  red, the speed at the line, and when it went green. None without a forced light in the rows."""
+  if not any(r.get('forced_light') for r in rows):
+    return None
+  line = stop_line_m if stop_line_m is not None else 0.
+  stood = past = v_line = green = None
+  for r in rows:
+    a = r.get('j_ahead')
+    if green is None and r.get('forced_light') == 'green':
+      green = r['t']
+    if a is None:
+      continue
+    if v_line is None and a <= line:
+      v_line = r['v']
+    if r.get('forced_light') == 'red':
+      if stood is None and r['v'] < STOPPED_V and line - RED_PAST_LINE_M <= a <= line + RED_NEAR_M:
+        stood = r['t']
+      if past is None and a < line - RED_PAST_LINE_M:
+        past = r['t']
+  return {'stood_at_red': stood is not None, 'stood_t': stood, 'past_line_on_red_t': past, 'v_at_line': v_line, 'green_t': green,
+          'stop_line_m': stop_line_m}
+
+
+def summarize(name: str, rows, outcome: str, road: dict | None = None, junction_control: str | None = None, expect=(),
+              stop_line_m: float | None = None) -> dict:
   """road: catalog.road_model's roads around the run, for the oncoming-lane check (rows with positions need one);
   junction_control: the scenario junction's own mapped control (catalog.junction_control's kind: 'signal', 'stop',
-  'none'; None: not known), recorded with the result (a signal there no longer protects a left: map_controls)."""
+  'none'; None: not known), recorded with the result (a signal there no longer protects a left: map_controls);
+  expect: the run's expectations (EXPECTS); stop_line_m: m before the junction of its own stop line (the plan's notes)."""
   ms = maneuvers(rows)
   wrong_m, wrong_spans = wrong_side(rows, road)
   res = {
@@ -580,8 +772,11 @@ def summarize(name: str, rows, outcome: str, road: dict | None = None, junction_
     'left': unprotected_left(rows),
     'lane_blocked': any(r.get('reason') == 'car in target lane' for r in rows),
     'signal_prompts': sum(1 for a, b in zip(rows, rows[1:], strict=False) if b.get('blinker') and b['blinker'] != a.get('blinker')),
+    'expect': list(expect or ()),
+    'expect_facts': expect_facts(rows),
+    'red_light': red_light(rows, stop_line_m),
   }
-  res['failures'] = check(name, res)
+  res['failures'] = check(name, res, expect)
   res['passed'] = not res['failures']
   return res
 
@@ -596,6 +791,13 @@ def report(label: str, res: dict) -> str:
   if lr is not None and (lr['gos'] or lr['undecided_t'] is not None or lr['pet_s'] is not None):
     line += f", left: PET {lr['pet_s']} s, false goes {len(lr['false_goes'])}, missed gaps {lr['missed_gaps']} of " + \
             f"{len(lr['gaps_offered_s'])} offered, gos {lr['gos']}, undecided {lr['undecided_t']}"
+  red = res.get('red_light')
+  if red is not None:
+    line += f", forced red: stood {red['stood_at_red']}, {red['v_at_line']} m/s at the line, green at {red['green_t']}"
+  met = [e for e in res.get('expected', []) if e['met']]
+  if met:
+    line += ''.join(f"\n  as expected: {e['expect']} at t={e['t']:.1f} s" + (f" (explains: {'; '.join(e['explains'])})" if e['explains'] else '')
+                    for e in met)
   return line + ''.join(f"\n  {f}" for f in res['failures'])
 
 
@@ -603,19 +805,24 @@ def main():
   ap = argparse.ArgumentParser(description="Rescore scenario results, or score a recorded drive's rlogs.")
   ap.add_argument('paths', nargs='+', help='result.json files, or with --scenario, rlog segments in order')
   ap.add_argument('--scenario', default='', help='score these rlogs as this scenario (route_demo: arrival and maneuvers)')
+  ap.add_argument('--expect', action='append', default=None,
+                  help=f"an expectation ({', '.join(EXPECTS)}; handback:<kind>), in place of the result's own; repeatable")
   args = ap.parse_args()
   if args.scenario:
     from openpilot.tools.lib.logreader import LogReader
     rows = [r for p in args.paths for r in rows_from_log(LogReader(p, sort_by_time=True))]
     print(report(f"{args.scenario} from {len(args.paths)} log(s)", summarize(args.scenario, rows, 'arrived' if any(
-      r['state'] == 'arrived' for r in rows) else 'log ended')))
+      r['state'] == 'arrived' for r in rows) else 'log ended', expect=args.expect or ())))
     return
   for path in args.paths:
     with open(path) as f:
       result = json.load(f)
+    notes = result.get('notes') or {}
     for run in result['runs']:
+      expect = args.expect if args.expect is not None else run.get('expect', result.get('expect', ()))
       print(report(f"{result['scenario']} run {run['run']}", summarize(result['scenario'], run['rows'], run['outcome'], road=result.get('road'),
-                                                                     junction_control=(result.get('notes') or {}).get('junction_control'))))
+                                                                     junction_control=notes.get('junction_control'), expect=expect,
+                                                                     stop_line_m=notes.get('stop_line_m'))))
 
 
 if __name__ == "__main__":
