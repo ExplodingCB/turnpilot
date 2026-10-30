@@ -32,7 +32,9 @@ decider computes would_go only (logged once a stop). Acting:
   junction moving gets one signalling creep of DEADLOCK_CREEP_M on the latch's creep path (DEADLOCK_CREEP_V, a G5 go with
   cause creep, never closer than GO_ROOM_M to the closest plausible edge, never while creep_blocked: V12, V13), then the
   order is waived and every other go condition still holds for CLEAR_S; it moving before our commit stops us short and we
-  yield (during the creep the latch holds again; during the launch the re-check's capped abort).
+  yield (during the creep the latch holds again; during the launch the re-check's capped abort). Off the route (O9) the
+  maneuver is unknown, the union of the conflict sets: navd's reroute is waited for up to OFFROUTE_WAIT_S from the full stop
+  (a dynamic wait, its static causes' clock running on), then the union decides and the ladder runs if it fails.
 - going: TurnPilot's cap STOP_GO_V_MAX until the commit point, every object, view and sector re-checked (lane reach on the
   go position's geometry, decision D13; a track known at the go judged by its ground motion since, as bearings from a moving
   car restart its trust; any new one in a conflicting lane, or a raw box no known track explains, withdraws the go); the
@@ -131,6 +133,7 @@ UNCOMMIT_STOP_S = 0.5
 BAND_ABORT_MARGIN_S = 1.0
 STALL_BOX_S, CLEAR_BOX_GOES = 2.0, 2
 STATIC_WAIT_S, WAIT_INFO_S, CAL_WAIT_S = 15., 60., 30.
+OFFROUTE_WAIT_S = 10.           # s off the route a stopped car waits for navd's reroute to give it a maneuver (3.5, O9)
 INFO_CHIME_S = 2.0              # s the info chime's flag (stopGo.chime) is up
 ALERT_S = 2.0                   # s an alert of the decider's is held (hooks.ABORT_HOLD_S)
 STOP_SWEEP_M = 30.
@@ -361,6 +364,7 @@ class StopGo:
     self.parked: set = set()               # standing PARKED_S while others took turns: no rank, never a shield, an occluder
     self.rank = 0
     self.turn_wait_s = 0.
+    self.route_wait_s = 0.          # s waited off the route for navd's maneuver (OFFROUTE_WAIT_S)
     self.creep: dict | None = None  # the deadlock's signalling creep in hand: its target, start, the earlier arrivals then
     self.creeps = 0                 # creeps taken this encounter (DEADLOCK_CYCLES)
     self.order_waived = False       # the deadlock passed the turn to us: go condition 5 waived, and only it
@@ -995,22 +999,27 @@ class StopGo:
     (2.6): no full stop or turn order, reach on the go position's geometry, tracks known at the go by their ground motion."""
     holds: list[Hold] = []
     j = self.junction
+    # off the route (O9, 3.5): the maneuver unknown, the union of the three conflict sets; navd's reroute is waited for up to
+    # OFFROUTE_WAIT_S from the full stop (a dynamic wait, said, its static causes' clock running meanwhile), then the union decides
+    if not launch and f.maneuver == 'unknown' and self.route_wait_s < OFFROUTE_WAIT_S - 1e-6:
+      self.route_wait_s += f.dt
+      holds.append(Hold("route", "the reroute (off the route)", DYNAMIC))
     # H2's triggers, and 10: the junction, the data
     if j is None or j.status != 'ok':
-      return [Hold('position', "the junction's position isn't known", FAULT)]
+      return holds + [Hold('position', "the junction's position isn't known", FAULT)]
     if f.position_spread > H2_SPREAD_M:
-      return [Hold('position', f"its distance read {f.position_spread:.1f} m apart", FAULT)]
+      return holds + [Hold('position', f"its distance read {f.position_spread:.1f} m apart", FAULT)]
     if self.line_fault:
-      return [Hold('position', self.line_fault, FAULT)]
+      return holds + [Hold('position', self.line_fault, FAULT)]
     # an approach downgraded on site this encounter (4.4): not stopping, so no maneuver here certifies (the union rule
     # leaves none that conflicts with no approach); before commit a go out is withdrawn for it, never once committed
     if self.downgraded:
       conflicting = {id(m.approach) for m in sr.conflict_movements(j, f.maneuver, f.approach_yaw_deg)}
       if conflicting & set(self.downgraded):
-        return [Hold('downgrade', "cross traffic doesn't stop", STATIC)]
+        return holds + [Hold('downgrade', "cross traffic doesn't stop", STATIC)]
     verdict = self.certified(f)
     if verdict.certification != 'certifiable' and verdict.reason != 'reach':
-      return [Hold('cert:' + verdict.reason, f"can't certify ({verdict.reason}: {verdict.detail})" if verdict.detail else
+      return holds + [Hold('cert:' + verdict.reason, f"can't certify ({verdict.reason}: {verdict.detail})" if verdict.detail else
                    f"can't certify ({verdict.reason})", STATIC)]
     # 9 a signal head at the junction (C20)
     if self.signal_seen:
@@ -1577,7 +1586,9 @@ class StopGo:
       return
     top = holds[0]
     d.reason = "Waiting: " + top.reason
-    kinds = {h.kind for h in holds}
+    # the wait for the route is bounded by its own OFFROUTE_WAIT_S: a static cause's clock runs on through it, so a union that
+    # can't certify meets the ladder STATIC_WAIT_S from the full stop (O9: wait for the reroute, then decide and the ladder)
+    kinds = {h.kind for h in holds if h.key != 'route'} or {DYNAMIC}
     cam = next((h for h in holds if h.key == 'camera'), None)
     position = next((h for h in holds if h.key == 'position'), None)
     front = next((h for h in holds if h.key == 'front'), None)

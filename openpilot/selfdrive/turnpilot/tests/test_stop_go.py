@@ -1849,3 +1849,31 @@ def test_P4_a_right_turn_waits_for_a_jogger_or_a_wrong_way_cyclist_coming_from_t
   out = w.run(5.)
   assert first_go(out) is None and any(h.key == 'tracked:93' for d in out for h in d.holds)
 
+
+def test_O9_off_the_route_the_decider_waits_up_to_10_s_for_navds_maneuver_then_decides_on_the_union(tmp_path):
+  # 3.5: a control off the route has maneuver unknown (the union of the three conflict sets): the car waits up to
+  # OFFROUTE_WAIT_S from its full stop for navd's reroute to give it a maneuver (a dynamic wait, said), then decides with the
+  # union and runs the ladder if that fails. Before, it went on the union at once, the route's turn never asked for
+  w = World(tmp_path, maneuver='unknown')
+  out = w.run(9.)
+  a = arrived_at(out)
+  assert first_go(out) is None and all(any(h.key == 'route' and h.kind == 'dynamic' for h in d.holds) for d in out[a + 1:])
+  assert "route" in out[-1].reason
+  out += w.run(6.)
+  i = first_go(out)
+  assert i is not None and (i - a) * DT_MDL >= sg.OFFROUTE_WAIT_S + sr.CLEAR_S - 0.1
+  # the reroute gives it a maneuver 4 s in: decided on that from there, CLEAR_S on
+  w = World(tmp_path, maneuver='unknown')
+  out = w.run(5.)
+  a = arrived_at(out)
+  w.maneuver = 'straight'
+  out += w.run(4.)
+  i = first_go(out)
+  assert i is not None and (i - a) * DT_MDL < sg.OFFROUTE_WAIT_S and out[i].maneuver == 'straight'
+  # a union that can't certify (the right approach doesn't stop): the ladder at STATIC_WAIT_S from the full stop (its static
+  # clock ran through the wait for the route), never later
+  w = World(tmp_path, j=junction(maneuver='unknown', tiers={'right': 'no'}), maneuver='unknown')
+  out = w.run(STATIC_WAIT_S + 3.)
+  a = arrived_at(out)
+  h3 = next(k for k, d in enumerate(out) if d.fault == 'H3')
+  assert first_go(out) is None and (h3 - a) * DT_MDL == pytest.approx(STATIC_WAIT_S, abs=0.2)
