@@ -43,14 +43,17 @@ ROAD_25 = {0: (25 * MPH, 1, 400.)}  # the opposing road: 25 mph mapped, one lane
 
 
 def test_a_quiet_four_way_left_passes_with_its_margin():
-  v = ls.judge(turn_steps(), ROAD_25, [], 'ok', 160.)
+  """25 mph and one lane mapped: route time's R_req, at LINE_D plus ROUTE_REACH_MARGIN_M (no mapped stop line), is about
+  200 m, so it passes under 210 m (and not under DESIGN's 134-141 m, which were at LINE_D alone)."""
   reach = reach_at_line(25 * MPH, 1, ROUTE_REACH_MARGIN_M)
+  assert 195. < reach < 205.
+  v = ls.judge(turn_steps(), ROAD_25, [], 'ok', 210.)
   assert v.ok and v.reasons == [] and v.reach == pytest.approx(reach)
-  assert v.margin == pytest.approx(min(160. - reach, LINE_D + ROUTE_REACH_MARGIN_M + 400. - reach))
+  assert v.margin == pytest.approx(min(210. - reach, LINE_D + ROUTE_REACH_MARGIN_M + 400. - reach))
 
 
 def test_a_reach_past_the_range_fails_as_route_time_skips_it():
-  v = ls.judge(turn_steps(), ROAD_25, [], 'ok', 100.)
+  v = ls.judge(turn_steps(), ROAD_25, [], 'ok', 150.)
   assert not v.ok and v.codes == ['range']
 
 
@@ -66,7 +69,8 @@ def test_an_unmapped_limit_is_45_mph_and_unknown_lanes_are_two():
   assert v.reach == pytest.approx(reach_at_line(DEFAULT_OPPOSING_SPEED, 1, ROUTE_REACH_MARGIN_M))
   assert any('45 mph' in r for r in v.notes)
   v = ls.judge(turn_steps(), {0: (25 * MPH, 0, 400.)}, [], 'ok', 400.)
-  assert v.reach == pytest.approx(reach_at_line(25 * MPH, None, ROUTE_REACH_MARGIN_M)) > reach_at_line(25 * MPH, 1, ROUTE_REACH_MARGIN_M)
+  assert v.reach == pytest.approx(reach_at_line(25 * MPH, None, ROUTE_REACH_MARGIN_M))
+  assert v.reach > reach_at_line(25 * MPH, 1, ROUTE_REACH_MARGIN_M)
   assert any('lanes' in r for r in v.notes)
   v = ls.judge(turn_steps(), {}, [], 'ok', 400.)  # no opposing road found at all: both unknown, and not straight
   assert v.codes == ['curve']
@@ -81,6 +85,18 @@ def test_a_signal_stop_or_yield_of_its_own_fails_and_one_further_back_does_not()
   # the cross road's yield (the sidecar confirms it governs a crossing approach): not ours
   v = ls.judge(turn_steps(), ROAD_25, [control('yield', cross_suspect=True, junction_info={'crossGoverned': True})], 'ok', 400.)
   assert v.ok
+
+
+def test_navds_own_junctions_are_read_as_turnpilotd_receives_them():
+  """route_controls' Control carries a routing/junctions.py Junction; turnpilotd gets it as the message's dict, which
+  map_controls' cross_road_yield and rail_between read: a cross road's yield is not ours, a rail orphan's stop short of the
+  tracks is not the junction's, and a plain stop of ours is."""
+  from openpilot.selfdrive.turnpilot.routing.junctions import Junction
+  cross = control('yield', cross_suspect=True, junction_info=Junction(cross_governed=True))
+  assert ls.judge(turn_steps(), ROAD_25, [cross], 'ok', 400.).ok
+  rail = control('stop', junction_info=Junction(rail_distance=5., stop_point_distance=20.))
+  assert ls.judge(turn_steps(), ROAD_25, [rail], 'ok', 400.).ok
+  assert ls.judge(turn_steps(), ROAD_25, [control('stop', junction_info=Junction())], 'ok', 400.).codes == ['stop']
 
 
 def test_controls_unknown_fail_and_partial_passes_said():
