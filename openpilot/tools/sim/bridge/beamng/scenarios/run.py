@@ -98,8 +98,10 @@ ORACLE_WAIT_S = 30.
 ORACLE_STALE_S = 3.
 # the speed check (score.speed_problems): the speed openpilot was given, and electrics.wheelspeed beside it, integrated over
 # the pose log's travel from each run's teleport (the rolling start before engagement is where the wheels over-read most:
-# BeamNG diag S02, 19.5%); a pose step longer than this in one 20 Hz row is the teleport, not travel
+# BeamNG diag S02, 19.5%); a pose step longer than this in one 20 Hz row is the teleport, not travel, and one shorter than
+# ODO_STAND_M with the speed at 0 both ends is a standing body's wander (smoke S14: 0.41 m over its 108 s at the red)
 ODO_JUMP_M = 2.
+ODO_STAND_M = 0.02
 ACTOR_FIELDS = ["wall_s", "x", "y", "z", "heading"]
 
 
@@ -413,17 +415,18 @@ class Runner:
         rows.append(new)
 
   def odometer(self, b, now: float):
-    """The speed check's integrals (module constants): the speed openpilot was given and the wheels' over the pose's
-    horizontal travel, a pose step over ODO_JUMP_M (the teleport) left out."""
+    """The speed check's integrals (module constants): the speed openpilot was given and the wheels' over the pose's travel
+    (3D: the speed is along the road, and unprotected_left's ~21% hill reads 2.2% short on the level), a pose step over
+    ODO_JUMP_M (the teleport) and a standing car's wander (under ODO_STAND_M with the speed at 0) left out."""
     pose, s = b.world.pose, b.simulator_state
     if pose is None:
       return
-    xy, v, vw = (float(pose.pos[0]), float(pose.pos[1])), abs(float(s.wheel_speed)), getattr(s, 'wheel_speed_electrics', None)
-    last, self.odo_last = self.odo_last, (now, xy, v, vw)
+    xyz, v, vw = tuple(float(c) for c in pose.pos[:3]), abs(float(s.wheel_speed)), getattr(s, 'wheel_speed_electrics', None)
+    last, self.odo_last = self.odo_last, (now, xyz, v, vw)
     if last is None:
       return
-    step, dt = math.hypot(xy[0] - last[1][0], xy[1] - last[1][1]), now - last[0]
-    if step > ODO_JUMP_M or dt <= 0.:
+    step, dt = math.dist(xyz, last[1]), now - last[0]
+    if step > ODO_JUMP_M or dt <= 0. or (v == 0. and last[2] == 0. and step < ODO_STAND_M):
       return
     o = self.odo
     o['travel_m'] += step

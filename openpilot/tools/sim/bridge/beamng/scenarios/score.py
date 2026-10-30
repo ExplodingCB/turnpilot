@@ -185,8 +185,10 @@ HARD_BRAKE_SHOTS = ('ped_step_out', 'ped_step_out_side')  # S10's facing walker 
 # the speed openpilot was given against the car's travel, from the run's teleport (run.Runner.odometer): off by more than
 # SPEED_TOL fails the run, as harness (BeamNG build findings D4-speed: the wheels' 14% over-read on S08's approach put the
 # route follower's junction 13 m too near, and the left undecided at the line); under SPEED_CHECK_MIN_M of travel, not said
+# (a metre of turns taken wide or a standing body's wander is 3% of 30 m). The speed integrates over wall time, as turnpilotd
+# dead-reckons, so a game running slower than real time fails it too: the follower is as far off then
 SPEED_TOL = 0.03
-SPEED_CHECK_MIN_M = 20.
+SPEED_CHECK_MIN_M = 30.
 
 
 def speed_problems(sc: dict | None) -> list[str]:
@@ -195,7 +197,8 @@ def speed_problems(sc: dict | None) -> list[str]:
     return []
   wheels = '' if sc.get('wheel_ratio') is None else f"; the wheels read {sc['wheel_ratio'] - 1.:+.0%}"
   return [f"the sim's speed integrates to {sc['v_m']} m against {sc['travel_m']} m of travel from the teleport " +
-          f"({sc['ratio'] - 1.:+.0%}, over {SPEED_TOL:.0%}{wheels}): TurnPilot dead-reckoned on a wrong vEgo (harness, not TurnPilot)"]
+          f"({sc['ratio'] - 1.:+.0%}, over {SPEED_TOL:.0%}{wheels}): TurnPilot dead-reckoned its junction on a speed that " +
+          "isn't the car's (the bridge's speed source, or the game running slower than real time; harness, not TurnPilot)"]
 
 
 def msg_fields(ss, cs, tp, nav, model, lp=None) -> dict:

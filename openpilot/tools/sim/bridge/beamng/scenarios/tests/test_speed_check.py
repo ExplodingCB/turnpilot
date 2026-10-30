@@ -4,6 +4,7 @@ bridge's speed came from electrics.wheelspeed, which over-read on S08's braking 
 near and the left went undecided at the line. The runner integrates the speed it fed openpilot (and the wheels' own, logged
 beside it) over the pose log's travel; a run whose speed is off by more than SPEED_TOL fails, as harness, not TurnPilot."""
 import json
+import math
 import os
 from types import SimpleNamespace
 
@@ -17,23 +18,27 @@ pytestmark = pytest.mark.skipif(not os.path.exists(GRAPH_JSON), reason="needs pi
 
 
 class MovingWorld(World):
-  """The fake world with the IMU pose following the car, the speed openpilot gets k times the car's, the wheels' wheel_k."""
-  def __init__(self, plan, clock, k: float, wheel_k: float):
+  """The fake world with the IMU pose following the car, the speed openpilot gets k times the car's, the wheels' wheel_k;
+  grade: the road's rise a metre (the car's speed along it, so its plan distance is the horizontal run); jitter_m: the pose
+  wanders this much a step while the car stands (a settling body)."""
+  def __init__(self, plan, clock, k: float, wheel_k: float, grade: float = 0., jitter_m: float = 0.):
     super().__init__(plan, clock)
-    self.k, self.wheel_k = k, wheel_k
+    self.k, self.wheel_k, self.grade, self.jitter_m, self.n = k, wheel_k, grade, jitter_m, 0
 
   def step(self, b):
     super().step(b)
-    v = b.simulator_state.wheel_speed
+    self.n += 1
+    v = b.simulator_state.wheel_speed * math.hypot(1., self.grade)  # along the slope
     b.simulator_state.wheel_speed, b.simulator_state.wheel_speed_electrics = v * self.k, v * self.wheel_k
     p = b.simulator_state.position
-    b.world.pose = SimpleNamespace(pos=(p.x, p.y, 0.), fwd=(1., 0., 0.), up=(0., 0., 1.))
+    wobble = self.jitter_m * (self.n % 2) if v == 0. else 0.
+    b.world.pose = SimpleNamespace(pos=(p.x + wobble, p.y, self.grade * self.s), fwd=(1., 0., 0.), up=(0., 0., 1.))
 
 
-def drive(tmp_path, monkeypatch, k=1.0, wheel_k=1.15):
+def drive(tmp_path, monkeypatch, k=1.0, wheel_k=1.15, **kw):
   clock = Clock()
   plan = catalog.build('right_green')
-  world = MovingWorld(plan, clock, k, wheel_k)
+  world = MovingWorld(plan, clock, k, wheel_k, **kw)
   monkeypatch.setattr(run, 'time', SimpleNamespace(monotonic=clock.monotonic, strftime=lambda *a: 'now'))
   monkeypatch.setattr(run, 'wall', clock.wall)
   monkeypatch.setattr(run, 'Director', FakeDirector)
@@ -67,15 +72,27 @@ def test_a_speed_off_by_more_than_the_tolerance_fails_the_run(tmp_path, monkeypa
   r = out['runs'][0]
   assert abs(r['speed_check']['ratio'] - 1.10) < 0.01
   why = next(f for f in r['failures'] if f.startswith("the sim's speed"))
-  assert 'harness' in why and '+10%' in why and not r['passed']
+  assert 'harness' in why and '+10%' in why and 'real time' in why and not r['passed']
   # a rescore keeps it
   res = score.summarize(out['scenario'], r['rows'], r['outcome'], road=out['road'], speed=r['speed_check'])
   assert why in res['failures']
+
+
+def test_a_grade_is_travel_too(tmp_path, monkeypatch):
+  # the car's speed is along the road: on unprotected_left's ~21% hill the horizontal run alone reads 2.2% short
+  r = drive(tmp_path, monkeypatch, grade=0.21)['runs'][0]
+  assert abs(r['speed_check']['ratio'] - 1.) < 0.01 and not any(f.startswith("the sim's speed") for f in r['failures'])
+
+
+def test_a_standing_cars_pose_jitter_is_no_travel(tmp_path, monkeypatch):
+  # smoke S14 stood 108 s at its red: its pose log wandered 0.41 m with the speed at 0
+  r = drive(tmp_path, monkeypatch, jitter_m=0.015)['runs'][0]
+  assert abs(r['speed_check']['ratio'] - 1.) < 0.005
 
 
 def test_the_check_bounds():
   ok = {'v_m': 102., 'wheel_m': 120., 'travel_m': 100., 'ratio': 1.02, 'wheel_ratio': 1.2}
   assert not score.speed_problems(ok)
   assert score.speed_problems(dict(ok, v_m=96.5, ratio=0.965))
-  assert not score.speed_problems(dict(ok, v_m=15., travel_m=10., ratio=1.5))  # too short a run to say
-  assert not score.speed_problems(None) and score.SPEED_TOL == 0.03
+  assert not score.speed_problems(dict(ok, v_m=36., travel_m=25., ratio=1.44))  # too short a run to say
+  assert not score.speed_problems(None) and score.SPEED_TOL == 0.03 and score.SPEED_CHECK_MIN_M == 30.
