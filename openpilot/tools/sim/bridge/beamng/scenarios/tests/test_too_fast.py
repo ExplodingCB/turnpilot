@@ -25,3 +25,11 @@ def test_engaged_inside_the_infeasible_region_of_an_uncontrolled_right():
   assert engaged_m > MIN_FIRST_PULSE_M + 10.
   # and the spawn itself is where the catalog put it: not moved (clear of junctions and controls)
   assert plan.notes['approach_m'] == e.approach_m
+
+
+def test_the_run_ends_past_the_skipped_junction():
+  # BeamNG smoke 2026-10-29: run on to its 60 s timeout, the reroute's next turns (a desire, the model 168 m in the
+  # oncoming lane on one of them) failed a run whose skip had come at engagement; the shot is the skip at this junction
+  plan = catalog.build('too_fast_right')
+  assert 20. <= plan.end_past_m <= 40.
+  assert catalog.build('ped_in_path').end_past_m == 0.

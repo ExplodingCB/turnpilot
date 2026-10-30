@@ -259,7 +259,7 @@ class Runner:
     self.jobs: list = []  # trigger jobs: a failed one explains a failed run
     self.route_pts, self.route_id, self.nav_cleared = None, 0, False
     self.t_engaged = self.t_engaged_wall = None
-    self.end_check = score.EndCheck(plan.timeout_s, plan.end_on_stop_s)
+    self.end_check = score.EndCheck(plan.timeout_s, plan.end_on_stop_s, plan.end_past_m)
     self.taps = GasTaps(self.signal_tap)
     self.watch = GoWatch()
     self.handback = self.takeover = self.press = self.drop = None  # the demo options' (demo_options)

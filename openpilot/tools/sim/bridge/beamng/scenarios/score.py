@@ -411,9 +411,11 @@ def stop_gap(rows, outcome: str = ''):
 
 
 class EndCheck:
-  """Decides live when a run is over: arrived, disengaged, stopped (standing end_on_stop_s after moving), or timeout."""
-  def __init__(self, timeout_s: float, end_on_stop_s: float = 0.):
-    self.timeout_s, self.end_on_stop_s = timeout_s, end_on_stop_s
+  """Decides live when a run is over: arrived, disengaged, stopped (standing end_on_stop_s after moving), past junction
+  (end_past_m past the scenario's junction, along the car's heading: a skip's shot ends at the junction it skipped, before
+  the reroute's own turns), or timeout."""
+  def __init__(self, timeout_s: float, end_on_stop_s: float = 0., end_past_m: float = 0.):
+    self.timeout_s, self.end_on_stop_s, self.end_past_m = timeout_s, end_on_stop_s, end_past_m
     self.engaged = self.moved = False
     self.stopped_t = None
 
@@ -423,6 +425,8 @@ class EndCheck:
       return 'disengaged'
     if (r.get('dest_dist') is not None and r['dest_dist'] < ARRIVE_M) or r.get('state') == 'arrived':
       return 'arrived'
+    if self.end_past_m > 0 and r.get('j_ahead') is not None and r['j_ahead'] < -self.end_past_m:
+      return 'past junction'
     self.moved = self.moved or r['v'] > RESUMED_V
     if self.end_on_stop_s > 0 and self.moved and r['v'] < STOPPED_V:
       self.stopped_t = r['t'] if self.stopped_t is None else self.stopped_t

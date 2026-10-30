@@ -97,6 +97,7 @@ class Entry:
   occluder_past_m: float = 0.
   pace_block_s: float = 6.        # the pacer keeps the target lane occupied this long into the lane change window
   end_on_stop_s: float = 0.       # end the run once the car has stood this long after moving
+  end_past_m: float = 0.          # end the run once the car is this far past the junction (0: never; score.EndCheck)
   spawn: tuple = ()               # route: (x, y, z), heading_deg, destination (x, y, z)
   heading_deg: float = 0.
   dest: tuple = ()
@@ -140,9 +141,11 @@ SCENARIOS = {
   # with no mapped control on it (357 m, south-west-bound, through two uncontrolled junctions 135-210 m out, where no spawn
   # may stand), at 80 km/h from 230 m out: the rolling start engages about 54 m out at 64 km/h, already past where the turn
   # can be made braking at -2.0 (turn_skip.can_make_turn), so it is skipped, never braked hard for, and rerouted. At 65 km/h
-  # from the nearest clear spawn (215 m) it would engage 92 m out, where the turn is still feasible and its cap slows the car
+  # from the nearest clear spawn (215 m) it would engage 92 m out, where the turn is still feasible and its cap slows the car.
+  # The run ends 30 m past the junction it skipped: the reroute's own turns are no part of the shot (BeamNG smoke 2026-10-29:
+  # run on to its timeout, a desire for the reroute's next turn and the model wide on it failed a run whose skip was clean)
   'too_fast_right': Entry('turn', junction=(-153.7, 148.7), turn='right', from_heading_deg=-135., approach_m=230., speed_kph=80.,
-                          timeout_s=60., expect=('skip',)),
+                          timeout_s=60., expect=('skip',), end_past_m=30.),
   # S20: route_demo's route has no right on green (its right is uncontrolled) and no left without an oncoming road (its left
   # has one straight across), so: ped_crosswalk_right's right at its signal with nothing on it, and a left from the stem of
   # the T at DR295_16 (-586.7, 631.3), no control, no road straight across, two-way all round
@@ -235,6 +238,7 @@ class Plan:
   expect: tuple = ()        # Entry.expect
   fault_at_s: float = 0.    # Entry.fault_at_s
   lights: dict | None = None  # the forced light (junction_lights), or None
+  end_past_m: float = 0.    # Entry.end_past_m
 
 
 # *** road geometry ***
@@ -724,7 +728,7 @@ def build(name: str, graph: RoadGraph | None = None, data_path: str = DATA_JSON,
   else:
     plan = _turn_plan(name, e, graph)
   plan.road = road_model(graph, [plan.spawn, plan.junction, plan.dest])
-  plan.expect, plan.fault_at_s = tuple(e.expect), e.fault_at_s
+  plan.expect, plan.fault_at_s, plan.end_past_m = tuple(e.expect), e.fault_at_s, e.end_past_m
   return plan
 
 

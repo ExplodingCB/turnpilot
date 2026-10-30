@@ -156,6 +156,16 @@ class TestEnd:
     assert e.update(row(1.0, enabled=False)) == 'disengaged'
     assert score.EndCheck(60.0).update(row(60.0)) == 'timeout'
 
+  def test_past_the_junction(self):
+    # S19's skip: the run ends once the car is end_past_m past the junction it skipped, before the reroute's own turns
+    e = score.EndCheck(60.0, end_past_m=30.0)
+    ends = [e.update(r) for r in drive([(10.0, {'j_ahead': lambda tau: round(50.0 - 10.0 * tau, 2), 'j_dist': 1.0})])]
+    first = next(i for i, x in enumerate(ends) if x)
+    assert ends[first] == 'past junction' and first * DT == pytest.approx(8.0 + DT, abs=DT)
+    # off by default, and never on rows without the junction
+    assert all(score.EndCheck(60.0).update(r) is None for r in drive([(10.0, {'j_ahead': -40.0})]))
+    assert all(score.EndCheck(60.0, end_past_m=30.0).update(r) is None for r in drive([(10.0, {'j_ahead': None})]))
+
   def test_stop(self):
     e = score.EndCheck(60.0, end_on_stop_s=4.0)
     ends = [e.update(r) for r in drive([(2.0, {'v': 0.0}), (3.0, {}), (5.0, {'v': 0.0})])]
