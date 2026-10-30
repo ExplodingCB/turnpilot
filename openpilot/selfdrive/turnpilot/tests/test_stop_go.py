@@ -1506,3 +1506,66 @@ def test_G9_a_one_way_cross_road_from_the_right_has_its_lane_where_the_road_is_n
   # the opposite approach's lanes start past the one-way's single lane, not past two
   two = {(ln.role, ln.index): ln for ln in junction_lanes(junction(), 'straight', 1.9, LANE_EDGE)}
   assert lanes[('opposite', 1)].s_min == pytest.approx(two[('opposite', 1)].s_min - sr.LANE_STEP_MIN_M)
+
+
+def wrong_way_tracks(*specs):
+  """World.tracks for cars (trackId, d(t) [, cls]) on the one-way's illegal side (the left, where its traffic leaves), d m down
+  its lane from our path: the lane where it lies (stop_rules.wrong_way_lanes, the one-way's own), seen from where our car is."""
+  def tracks(w):
+    t = w.t_cam - 100.
+    pos = w.sg.pos_ref + (w.odo - w.sg.odo_ref) if w.sg.token is not None else -w.control.d
+    from openpilot.selfdrive.turnpilot.routing.certify import cross_lanes
+    s_min, s_max = sr.lane_offsets(sr.edge_band(w.j.stop_point_distance, cross_lanes(w.j), LANE_EDGE), 1.9, 1)
+    ln = sr.Lane('left', 1, 'wrongWay', s_min, s_max, -90.)
+    out = []
+    for spec in specs:
+      tid, d_fn = spec[:2]
+      dd = d_fn(t)
+      if dd is None or dd < -12.:
+        continue
+      trk = ev_track(tid, w.t_cam, max(dd, 0.3), ln, view='sideLeft', cls=spec[2] if len(spec) > 2 else 2,
+                     s=(ln.s_min + ln.s_max) / 2. - pos)
+      half = math.degrees(math.atan2(0.9, math.hypot(ln.s_min - pos, dd)))
+      trk.span_seen = tuple(sorted((trk.bearing_seen - half, trk.bearing_seen + half)))
+      trk.hits = 5
+      out.append(trk)
+    return out
+  return tracks
+
+
+def test_V22_G9_a_track_coming_the_wrong_way_down_a_one_way_cross_road_blocks_the_go(tmp_path):
+  # only the one-way's legal approach conflicts for cars, so its illegal side had no lane: a track there was in no lane at
+  # all (stop_evidence assigns by side) and a car driving the wrong way at 8 m/s toward our path from 40 m held nothing
+  assert first_go(World(tmp_path, j=one_way()).run(5.)) is not None  # the one-way certifies on its own
+  w = World(tmp_path, j=one_way())
+  w.tracks = wrong_way_tracks((21, rolling(1.5, d0=40., v0=8.)))
+  out = w.run(5.5)
+  assert first_go(out) is None
+  held = [d for d in out if any(h.key == 'wrongWay:21' and h.kind == 'dynamic' for h in d.holds)]
+  assert held and any("wrong way" in h.reason for h in held[-1].holds)
+  out = w.run(6.)
+  assert first_go(out) is not None  # through and gone: the go
+  # legal traffic leaving by that side (receding), or a car standing far down it, holds nothing
+  for d_fn in (lambda t: 2. + 6. * t, lambda t: 45.):
+    w = World(tmp_path, j=one_way())
+    w.tracks = wrong_way_tracks((22, d_fn))
+    assert first_go(w.run(5.)) is not None
+  # a contraflow bike lane: a cyclist coming in from that side is tested as any cyclist (the tracked test); one 12 m out at
+  # 4 m/s holds the go
+  w = World(tmp_path, j=one_way(contraflow=True))
+  w.tracks = wrong_way_tracks((23, rolling(1.2, d0=16., v0=4.), 1))
+  out = w.run(4.5)
+  assert first_go(out) is None and any(h.key in ('tracked:23', 'wrongWay:23') for h in out[-1].holds)
+
+
+def test_V22_a_wrong_way_car_appearing_during_the_launch_withdraws_the_go_never_below_2_m_s2(tmp_path):
+  w = Drive(tmp_path, j=one_way(), behaviour=lambda w: 'goes')
+  out = w.run(3.2)
+  i = first_go(out)
+  assert i is not None and out[-1].state == 'going'
+  w.tracks = wrong_way_tracks((24, rolling(w.t_cam - 100., d0=30., v0=8.)))
+  out = w.run(3.)
+  wd = [d.withdraw for d in out if d.withdraw]
+  assert wd and wd[0].startswith('wrongWay')
+  assert all(s.accel_cap >= -2. - 1e-9 for d in out for s in d.stops)
+

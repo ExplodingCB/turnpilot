@@ -445,6 +445,26 @@ def conflict_lanes(j: Junction, maneuver: str, edges: Edges, setback: float, yaw
   return out
 
 
+WRONG_WAY = 'wrongWay'  # a watched lane's movement: a one-way's illegal side (wrong_way_lanes)
+
+
+def wrong_way_lanes(j: Junction, edges: Edges, setback: float) -> list[Lane]:
+  """The lanes of a one-way cross road seen toward its illegal side (rows G9, V22): for each cross leg cars only leave by
+  (outbound, not inbound), the one-way's own lanes, nearest first, laid out from our path toward that side. No legal car
+  comes in by them, so they carry no reach requirement and conflict with no maneuver; the decider watches them for a track
+  coming the wrong way (a driver, or a cyclist, on a contraflow bike lane or not), which blocks the go."""
+  out = []
+  for a in j.approaches:
+    role = effective_role(a)
+    if role not in ('left', 'right') or a.inbound or not a.outbound:
+      continue
+    rel = a.rel_bearing if a.role != 'exit' else (-abs(a.rel_bearing) if role == 'left' else abs(a.rel_bearing))
+    for i in range(1, max(a.lanes_out, 1) + 1):
+      s_min, s_max = lane_offsets(edges, setback, i)
+      out.append(Lane(role, i, WRONG_WAY, s_min, s_max, rel, 0., a.assumed_limit, False, approach=a))
+  return out
+
+
 # --------------------------------------------------------------------------------------------------------- the reach walk
 
 @dataclass

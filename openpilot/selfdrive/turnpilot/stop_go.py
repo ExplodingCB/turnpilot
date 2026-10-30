@@ -53,6 +53,11 @@ seen leaving, across views, FRONT_ZONE_MAX_S). Every hold on a standing car is s
 is the capped stop; nothing here asks for less than -2.0 m/s^2. The decider survives faults as the latch does (turnpilotd
 rebuilds it only in reset(detector=True)); the driver disengaging during the launch ends its encounter (O6, O7).
 
+A one-way cross road (G9, V22): only its legal approach conflicts for cars, and its illegal side (a leg cars only leave by,
+stop_rules.wrong_way_lanes) is watched: a track there not yet trusted, or coming toward our path, blocks the go (a driver
+going the wrong way, or a cyclist, on a contraflow bike lane or not); during the launch any new track there, or a known one
+the tracker's ground motion brings nearer, withdraws it, and in the band it is the in-band rule's threat.
+
 Phantom clears are what the go conditions are about: no detections in a lane says nothing (visibility.py's positive walk), an
 untrusted track is never stopping, a raw box blocks before it is a track, a stale view resets CLEAR_S, the shield needs a
 vehicle seen stopped on every cycle at a surveyed stopping approach, and the junction must certify by routing/certify.assess
@@ -71,7 +76,7 @@ from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
 from openpilot.selfdrive.turnpilot.routing import certify as ce
 from openpilot.selfdrive.turnpilot.routing.junctions import survey_approach
 from openpilot.selfdrive.turnpilot.scene_policy import PATH_HALF_WIDTH_M, STOP_SPEED, Stop, stop
-from openpilot.selfdrive.turnpilot.stop_evidence import StopEvidence, class_name, junction_lanes
+from openpilot.selfdrive.turnpilot.stop_evidence import APPROACH_V, StopEvidence, class_name, junction_lanes
 from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP
 
 MODES = ce.MODES                # off, shadow, trial, auto (TurnPilotStopSignGo)
@@ -310,6 +315,7 @@ class StopGo:
     self.state = 'off'
     self.junction: sr.Junction | None = None
     self.lanes_all: list = []
+    self.watch_lanes: list = []    # a one-way's illegal side, watched for a track coming the wrong way (stop_rules.wrong_way_lanes)
     self.entry = None
     self.lane_edge = None
     self.edges = sr.edge_band(13., None)
@@ -387,14 +393,15 @@ class StopGo:
       self.lane_edge = (ours or {}).get('laneEdgeM')
       self.edges = sr.edge_band(j.stop_point_distance, ce.cross_lanes(j), self.lane_edge)
       self.lanes_all = junction_lanes(j, 'unknown', self.setback, self.lane_edge)
+      self.watch_lanes = sr.wrong_way_lanes(j, self.edges, self.setback)
       lines = {}
-      for ln in self.lanes_all:
+      for ln in self.lanes_all + self.watch_lanes:
         a = ln.approach
         sv = survey_approach(self.entry, a.way_id, (a.bearing + 180.) % 360.) if self.entry is not None and a is not None else None
         line = (sv or {}).get('stopPointM') or (sv or {}).get('lineM')
         if line:
           lines[ln.role] = float(line)
-      self.evidence.set_junction(self.lanes_all, sr.angle_bound(self.edges.nominal is not None), lines)
+      self.evidence.set_junction(self.lanes_all + self.watch_lanes, sr.angle_bound(self.edges.nominal is not None), lines)
     cloudlog.event("turnpilot.stop_go_control", key=list(ctl.key), d=round(float(ctl.d), 2), held=bool(getattr(ctl, 'held', False)),
                    junction=j.status if j is not None else 'none', osmNodeId=j.osm_node_id if j is not None else 0)
 
@@ -974,6 +981,10 @@ class StopGo:
     want = {(ln.role, ln.index): ln for ln in lanes}
     cue = sr.t_cue(max(self.edges.d_max - pos, 0.))
     for tid, e in self.ev.items():
+      if e.lane is not None and e.lane.movement == sr.WRONG_WAY:
+        if self._wrong_way(f, tid, e, known if launch else None):
+          holds.append(Hold(f'wrongWay:{tid}', f"a {e.cls} coming the wrong way {side_word(e.role)}", DYNAMIC))
+        continue
       ln = want.get((e.role, e.index))
       if ln is None:
         continue
@@ -1043,6 +1054,22 @@ class StopGo:
       speed = math.hypot(float(trk.x[2]), float(trk.x[3])) if len(trk.x) > 3 else 0.
       return speed > sr.SHIELD_V + MOVING_V or moved > sr.SHIELD_MOVE_M + 1.0
     return True
+
+  def _wrong_way(self, f: Frame, tid: int, e, known: dict | None) -> bool:
+    """A track on a one-way's illegal side (rows V22, G9) that may be coming the wrong way: before the go, one whose speed
+    isn't trusted yet (its direction unknown) or that moves toward our path; legal traffic leaving by that side, or a car
+    standing there, doesn't. During the launch (known: the tracks at the go), where our car's motion restarts every track's
+    trust, a track there that wasn't known at the go, or a known one the tracker's ground motion brings nearer our path (a
+    car that stood there starting toward us). A cyclist on a contraflow bike lane is no exception: it comes in toward us."""
+    if known is None:
+      return not e.v_trusted or e.v_nom > APPROACH_V
+    k = known.get(tid)
+    if k is None:
+      return True
+    trk = next((t for t in f.tracks or () if t.track_id == tid), None)
+    if trk is None or getattr(trk, 'x', None) is None:
+      return False  # coasting: it reappears or is gone
+    return abs(float(trk.x[1])) < abs(k['y']) - (sr.SHIELD_MOVE_M + 1.0)
 
   def _turn_holds(self, f: Frame) -> list[Hold]:
     """2.4 item 5 (4.5 steps 2, 4): every earlier arrival gone (seen leaving its line: then the box and its lane judge it), no
@@ -1396,7 +1423,12 @@ class StopGo:
     # stop) is as the go found it: once our car moves stop_evidence restarts its trust, and untrusted it would read as a car
     # not stopping at v_c, so a car standing at its line turned the commonest all-way crossing into an in-band abort
     still = self._still(f)
+    known = self.go['tracks'] if self.go is not None else {}
     for tid, e in self.ev.items():
+      if e.lane is not None and e.lane.movement == sr.WRONG_WAY:
+        if e.cls in MOTOR + CYCLISTS and self._wrong_way(f, tid, e, known):
+          return f"a {e.cls} coming the wrong way {side_word(e.role)}"
+        continue
       ln = lanes.get((e.role, e.index))
       if ln is None or e.cls not in MOTOR + CYCLISTS or (e.u2 == 'stopped' and e.v_trusted) or tid in still:
         continue
