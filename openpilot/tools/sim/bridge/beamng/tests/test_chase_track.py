@@ -82,3 +82,54 @@ class TestTrack:
     assert abs(x - 1.0) < 1e-9 and abs(z - 1.0) < 1e-9
     assert abs(abs(h) - math.pi) < 0.2  # the short way round, through pi, not through 0
     assert ct.actor_at(rows, -1.0) is None and ct.actor_at(rows, 2.0) is None
+
+
+def lit_run():
+  """A run with a forced light (the director's light_events) and the oracle's readings of another light, and the stalk."""
+  rows = []
+  for k in range(100):  # 5 s at 20 Hz from wall 1000
+    w = 1000. + 0.05 * k
+    lights = [['trafficLight 9', 'green' if w < 1002. else 'yellow', 80. - k]] if k % 5 == 0 else None
+    rows.append({'wall': round(w, 3), 'lamp': 'left' if 1001. <= w < 1003. else '', 'blinker': '', 'lights': lights})
+  return {'rows': rows, 'light_events': [[1000.2, 'trafficLight 62', 'red'], [1000.2, 'trafficLight 60', 'green'],
+                                         [1003.5, 'trafficLight 62', 'green'], [1003.5, 'trafficLight 60', 'red']]}
+
+
+def test_the_light_timeline_takes_the_forced_events_and_the_oracles_changes():
+  tl = ct.light_timeline(lit_run())
+  assert tl['trafficLight 62'] == [(1000.2, 'red'), (1003.5, 'green')]
+  assert tl['trafficLight 60'] == [(1000.2, 'green'), (1003.5, 'red')]
+  # the oracle's: its first reading and each change, at the row's wall less its latency
+  assert tl['trafficLight 9'] == [(1000. - ct.ORACLE_LAG_S, 'green'), (round(1002. - ct.ORACLE_LAG_S, 3), 'yellow')]
+  assert ct.state_at(tl['trafficLight 62'], 1000.1) is None  # before it was forced: the game's own
+  assert ct.state_at(tl['trafficLight 62'], 1002.0) == 'red' and ct.state_at(tl['trafficLight 62'], 1004.0) == 'green'
+
+
+def test_a_forced_instance_takes_only_its_events():
+  run = lit_run()
+  run['rows'][0]['lights'] = [['trafficLight 62', 'green', 30.]]  # the oracle read it before the force landed
+  assert ct.light_timeline(run)['trafficLight 62'] == [(1000.2, 'red'), (1003.5, 'green')]
+
+
+def test_the_lamp_timeline_is_carstate_s_blinkers_else_the_stalk():
+  rows = lit_run()['rows']
+  assert ct.lamp_timeline(rows) == [(1000.0, ''), (1001.0, 'left'), (1003.0, '')]
+  old = [{'wall': r['wall'], 'blinker': r['lamp']} for r in rows]  # rows from before carState's lamp was recorded
+  assert ct.lamp_timeline(old) == [(1000.0, ''), (1001.0, 'left'), (1003.0, '')]
+  assert ct.lamp_at(ct.lamp_timeline(rows), 1002.) == 'left' and ct.lamp_at([], 1002.) == ''
+
+
+def test_the_replay_sets_each_change_once_and_puts_things_back():
+  sets, lamps = [], []
+  rp = ct.Replay(ct.light_timeline(lit_run()), ct.lamp_timeline(lit_run()['rows']),
+                 set_light=lambda i, s: sets.append((i, s)), set_lamp=lambda side: lamps.append(side))
+  for k in range(100):
+    rp.apply(1000. + 0.05 * k)
+  assert sets.count(('trafficLight 62', 'red')) == 1 and sets.count(('trafficLight 62', 'green')) == 1
+  assert ('trafficLight 9', 'yellow') in sets
+  assert lamps == ['', 'left', '']
+  assert rp.instances() == ['trafficLight 60', 'trafficLight 62', 'trafficLight 9']
+  sets.clear()
+  rp.close(green=True)
+  assert sorted(sets) == [('trafficLight 60', 'green'), ('trafficLight 62', 'green'), ('trafficLight 9', 'green')]
+  assert lamps[-1] == ''

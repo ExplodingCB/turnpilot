@@ -405,6 +405,15 @@ python -m openpilot.tools.turnpilot.demo_video --chase demo_chase.mp4 --ui demo_
 `record_route.sh` and `record_scenario.sh` do it all on a fresh stack (`restart_stack.sh`): the drive with the UI
 recorded by `record_ui.py`, the stats, the render and the composed video.
 
+The render also replays the lights and the indicator the run logged (`chase_track.Replay`): a forced light's states from
+its `light_events`, exactly when the director set them; any other light the light oracle read, from the rows' `lights`,
+0.3 s earlier than the row that first shows each change (the oracle's latency); and the ego's indicator from carState's
+blinkers in the rows (`lamp`), else the stalk the runner held. A light the log says nothing of stays as the render's
+world has it, every light green and held. The sidecar lists the replayed lights (`lights_replayed`,
+`indicator_replayed`) and says whether the run's own lights were running (`signals_running`, `lights_note`): with
+`--signals`, a lamp in view that wasn't replayed isn't the run's, so caption it. Not yet checked in the game: that a
+strict state set between frames shows in the next chase frame, and `set_lights` on the teleported ego.
+
 Measured on 2026-10-27:
 
 - The log is the IMU's pose at the camera mount. It holds each IMU batch for one to three 20 Hz rows and trails the

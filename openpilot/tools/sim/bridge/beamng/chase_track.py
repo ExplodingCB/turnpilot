@@ -3,6 +3,11 @@
 The log (route_drive's and the scenario runner's `poses`, 20 Hz) is the AdvancedIMU's pose at cameras.MOUNT. It holds
 each IMU batch for one to three rows and trails the game by 150 to 210 ms, so the first row of each new value is kept,
 moved back by POSE_LAG_S, fitted onto the render's 20 Hz grid, and turned into the teleport position by IMU_OFFSET.
+
+The lights and the indicator the run logged (Replay): each signal instance's states from the run's forced-light events
+(the director's light_events, exact) or, for an instance never forced, from the light oracle's readings in the rows
+(lights, each change ORACLE_LAG_S earlier than the row that first shows it); the ego's indicator from carState's blinkers
+in the rows (lamp), else the stalk the runner held (blinker). A light nothing logged is left as the game shows it.
 """
 import math
 
@@ -112,3 +117,84 @@ def actor_at(rows: list, t: float) -> tuple | None:
   a = (t - r0[0]) / max(r1[0] - r0[0], 1e-3)
   dh = (r1[4] - r0[4] + math.pi) % (2 * math.pi) - math.pi
   return (r0[1] + a * (r1[1] - r0[1]), r0[2] + a * (r1[2] - r0[2]), r0[3] + a * (r1[3] - r0[3]), r0[4] + a * dh)
+
+
+ORACLE_LAG_S = 0.3  # light_oracle.py's default --light-latency: a reading reaches the rows about this long after the game
+
+
+def light_timeline(run: dict) -> dict[str, list[tuple[float, str]]]:
+  """{instance: [(wall, state), ...]} in time order (module docstring): the forced-light events for the instances they
+  name, the oracle's first reading and each change for the others."""
+  out: dict[str, list[tuple[float, str]]] = {}
+  for w, inst, state in run.get('light_events') or []:
+    out.setdefault(inst, []).append((float(w), str(state)))
+  forced = set(out)
+  for r in run.get('rows', []):
+    if not r.get('lights') or r.get('wall') is None:
+      continue
+    for inst, state, _ in r['lights']:
+      if inst in forced:
+        continue
+      tl = out.setdefault(inst, [])
+      if not tl or tl[-1][1] != state:
+        tl.append((round(float(r['wall']) - ORACLE_LAG_S, 3), str(state)))
+  return {k: sorted(v) for k, v in out.items()}
+
+
+def state_at(timeline: list[tuple[float, str]], t: float) -> str | None:
+  """The state at wall time t, None before the first."""
+  state = None
+  for w, s in timeline:
+    if w > t:
+      break
+    state = s
+  return state
+
+
+def lamp_timeline(rows) -> list[tuple[float, str]]:
+  """[(wall, '' | 'left' | 'right'), ...] at each change of the ego's indicator (module docstring)."""
+  key = 'lamp' if any('lamp' in r for r in rows) else 'blinker'
+  out: list[tuple[float, str]] = []
+  for r in rows:
+    if r.get('wall') is None:
+      continue
+    side = r.get(key) or ''
+    if not out or out[-1][1] != side:
+      out.append((float(r['wall']), side))
+  return out
+
+
+def lamp_at(timeline: list[tuple[float, str]], t: float) -> str:
+  return state_at(timeline, t) or ''
+
+
+class Replay:
+  """The logged lights and indicator, applied frame by frame through set_light(instance, state) and set_lamp(side), each
+  only when it changes."""
+  def __init__(self, lights: dict[str, list[tuple[float, str]]], lamps: list[tuple[float, str]], set_light, set_lamp):
+    self.lights, self.lamps, self.set_light, self.set_lamp = lights, lamps, set_light, set_lamp
+    self.shown: dict[str, str] = {}
+    self.lamp: str | None = None
+
+  def instances(self) -> list[str]:
+    return sorted(self.lights)
+
+  def apply(self, t: float) -> None:
+    for inst, tl in self.lights.items():
+      st = state_at(tl, t)
+      if st is not None and self.shown.get(inst) != st:
+        self.set_light(inst, st)
+        self.shown[inst] = st
+    if self.lamps:
+      side = lamp_at(self.lamps, t)
+      if side != self.lamp:
+        self.set_lamp(side)
+        self.lamp = side
+
+  def close(self, green: bool = True) -> None:
+    """Every light it set back to green (the render's world holds every light green), the indicator off."""
+    if green:
+      for inst in self.shown:
+        self.set_light(inst, 'green')
+    if self.lamp:
+      self.set_lamp('')
