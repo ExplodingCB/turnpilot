@@ -65,7 +65,7 @@ SILENT_PROMPTS = ('none', 'yieldAhead', 'waitingForGap', 'creepingForView', 'wai
 # never sent since gas go went (2026-10-28), kept in the append-only schema: the driver's gas tap as a go, and going on red
 RETIRED_PROMPTS = ('stopSignGo', 'signalGo', 'unprotectedTurnGo', 'carStoppedGo')
 RETIRED_ALERTS = ('goingOnRed',)
-CONTROL_ALERT_EVENTS = ('stopOverrun', 'proceedingOnYellow', 'junctionUncertain')  # below the prompt, above a lane change
+CONTROL_ALERT_EVENTS = ('stopOverrun', 'proceedingOnYellow', 'junctionUncertain', 'carStoppedNote')  # below the prompt, above a lane change
 CONTROL_STATUS_ALERTS = ('mapControlsUnavailable', 'lightSourceRejected', 'farViewOff', 'sideCamerasOff')  # last of all, a status line
 # the route's stop signs (route_notice.py, STOP_SIGNS.md 3.4): said engaged or not (turnpilotRouteNotice, a permanent alert), the
 # text in turnpilotPlan.routeNotice; all but routeAvoidsStops with a chime
@@ -182,6 +182,7 @@ CONTROL_ALERT_TEXT = {
   'firstStopNeedsYou': 'First stop needs you',
   'stopRoutingFailed': 'Stop-sign routing failed: stops may need you',
   'stopAheadNeedsYou': 'Stop sign ahead needs you',
+  'carStoppedNote': 'Nothing ahead is holding the car',  # the stopped note's chime (turnpilotd.py), before its handback
 }
 
 

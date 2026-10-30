@@ -224,6 +224,9 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     firstStopNeedsYou @21;      # ...the first of them is on the origin street, said before engagement (a chime)
     stopRoutingFailed @22;      # ...the avoidance failed (avoidStatus failed): stops may need the driver (a chime)
     stopAheadNeedsYou @23;      # 300 m before a stop the route couldn't avoid, or at once if closer (a chime)
+    # PERF_BACKLOG PF-14: the model standing the car with nothing of TurnPilot's holding it (turnpilotd.py stopped_unheld),
+    # at the status line's note (STOPPED_NOTE_S), for ABORT_HOLD_S: the note's info chime, once a stand; the handback after is unchanged
+    carStoppedNote @24;
   }
   mapControl @24 :MapControlStatus;
   controlPrompt @25 :ControlPrompt;
