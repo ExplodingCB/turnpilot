@@ -3,6 +3,7 @@ import time
 from collections import deque
 
 from openpilot.cereal import log
+from openpilot.common.params import UnknownKeyName
 from openpilot.common.test import OpenpilotTestCase
 from types import SimpleNamespace
 
@@ -31,15 +32,20 @@ def run_gaps(det, pm, frames: int, model_time: float) -> list[int]:
 
 
 class FakeParams:
-  def __init__(self, enabled=False, lights=None, far=None, signs=None):
-    self.enabled, self.lights, self.far, self.signs = enabled, lights, far, signs
+  def __init__(self, enabled=False, lights=None, far=None, signs=None, drop=None):
+    self.enabled, self.lights, self.far, self.signs, self.drop = enabled, lights, far, signs, drop
+    self.read: list[str] = []
 
   def get_bool(self, key):
     assert key == "TurnPilotEnabled"
     return self.enabled
 
   def get(self, key):
-    return {"TurnPilotCameraLights": self.lights, "TurnPilotFarCrop": self.far, "TurnPilotCameraStopSigns": self.signs}[key]
+    self.read.append(key)
+    if key == "TurnPilotSimDropDetectionsS" and self.drop == 'unknown':
+      raise UnknownKeyName(key)
+    return {"TurnPilotCameraLights": self.lights, "TurnPilotFarCrop": self.far, "TurnPilotCameraStopSigns": self.signs,
+            "TurnPilotSimDropDetectionsS": self.drop}[key]
 
 
 class FakeLoad:
@@ -234,3 +240,87 @@ def test_slow_model_still_runs_inside_the_deadline(monkeypatch, hz):
   gaps = [b - a for a, b in zip(runs, runs[1:], strict=False)]
   assert len(runs) > 30 and max(gaps) <= FORCE_RUN_S + 1. / hz + 1e-6
   assert max(gaps) < DETECTOR_DEADLINE_S - STALE_S
+
+
+class SimClock:
+  def __init__(self):
+    self.t = 100.
+
+  def monotonic(self):
+    return self.t
+
+
+def drop_run(monkeypatch, environ, drop, seconds=6., set_at=1.):
+    """A host stepping at 20 Hz for `seconds`, its param set to `drop` at set_at s (None before). Returns the times of
+    the detector's steps, and the params."""
+    clock = SimClock()
+    monkeypatch.setattr(modeld_detector, 'time', SimpleNamespace(monotonic=clock.monotonic, perf_counter=time.perf_counter))
+    model, params, pm = object(), FakeParams(True), PM()
+    host = DetectorHost(params, 1344, 760, False, True, [model], load_fn=FakeLoad({model}), environ=environ)
+    host.load()
+    (_, det), = host.detectors
+    stepped = []
+    det.step = lambda *a, **k: stepped.append(round(clock.t - 100., 2))
+    t0 = clock.t
+    while clock.t - t0 < seconds:
+      if clock.t - t0 >= set_at:
+        params.drop = drop
+      host.step(pm, model, 0.010, 0.0, log.Desire.none, METAS, True)
+      clock.t = round(clock.t + 0.05, 3)
+    return stepped, params
+
+
+SIM = {'SIMULATION': '1'}
+DROP_KEY = "TurnPilotSimDropDetectionsS"
+
+
+class TestSimDetectionDrop:
+  """S01's fault (the demo shot list): TurnPilotSimDropDetectionsS seconds of no detector at all, honoured only with
+  SIMULATION=1 and the param set; anything else, and the car (no SIMULATION), runs exactly as before."""
+
+  def test_in_the_sim_the_param_silences_the_detector_for_its_seconds_once(self, monkeypatch):
+    stepped, params = drop_run(monkeypatch, SIM, 2.0)
+    gaps = [b - a for a, b in zip(stepped, stepped[1:], strict=False)]
+    assert max(gaps) == pytest.approx(2.0, abs=modeld_detector.PARAM_CHECK_S + 0.06)  # read within a check of being set
+    assert sum(g > 0.1 for g in gaps) == 1  # once: the param still set after the drop is no new drop
+    start = stepped[gaps.index(max(gaps))]
+    assert 1.0 - 0.06 <= start <= 1.0 + modeld_detector.PARAM_CHECK_S + 0.06
+    assert stepped[-1] >= 5.9  # and back at every frame after it
+
+  def test_a_new_value_is_a_new_drop(self, monkeypatch):
+    clock = SimClock()
+    monkeypatch.setattr(modeld_detector, 'time', SimpleNamespace(monotonic=clock.monotonic, perf_counter=time.perf_counter))
+    model, params = object(), FakeParams(True, drop=1.0)
+    host = DetectorHost(params, 1344, 760, False, True, [model], load_fn=FakeLoad({model}), environ=SIM)
+    host.check_enabled(clock.t)
+    assert host.dropping(clock.t) and not host.dropping(clock.t + 1.01)
+    params.drop, host.next_check = None, 0.
+    host.check_enabled(clock.t + 2.)
+    params.drop, host.next_check = 1.0, 0.
+    host.check_enabled(clock.t + 3.)
+    assert host.dropping(clock.t + 3.5)
+
+  def test_on_the_car_the_param_is_never_read(self, monkeypatch):
+    # a car's environment: no SIMULATION (launch_openpilot.sh on the device sets none), the param set anyway
+    for environ in ({}, {'SIMULATION': '0'}, {'SIMULATION': 'true'}):
+      stepped, params = drop_run(monkeypatch, environ, 2.0)
+      assert DROP_KEY not in params.read
+      assert len(stepped) == 120  # every frame of the 6 s, as before
+
+  def test_in_the_sim_without_the_param_nothing_changes(self, monkeypatch):
+    for drop in (None, 0., 'unknown'):
+      stepped, params = drop_run(monkeypatch, SIM, drop)
+      assert DROP_KEY in params.read and len(stepped) == 120
+
+  def test_the_gate_is_the_process_environment_by_default(self, monkeypatch):
+    monkeypatch.delenv('SIMULATION', raising=False)
+    assert not DetectorHost(FakeParams(True), 1344, 760, False, True, [object()]).sim
+    monkeypatch.setenv('SIMULATION', '1')
+    assert DetectorHost(FakeParams(True), 1344, 760, False, True, [object()]).sim
+
+  def test_the_param_is_cleared_with_the_manager(self):
+    # a drop left set never outlives the stack: the manager clears it at its start, as the light oracle's
+    import re
+    from pathlib import Path
+    header = (Path(__file__).parents[4] / 'common' / 'params_keys.h').read_text()
+    assert re.search(r'\{"TurnPilotSimDropDetectionsS", \{CLEAR_ON_MANAGER_START, FLOAT\}\}', header)
