@@ -4,6 +4,7 @@ thread of the bridge process, so no game round trip (about one game frame each) 
 Jobs (any callable) run in the order submitted and return a Future. Between jobs the thread walks the mannequins, one
 re-pose per round trip, and polls the scenario cars' poses at 5 Hz into `poses`, which the runner reads for gaps.
 """
+import math
 import queue
 import threading
 import time
@@ -20,11 +21,13 @@ from openpilot.tools.sim.bridge.beamng.scenarios.timing import (arc_lengths, cat
 CAR_MODEL = 'etk800'   # the ego's model, already loaded: no new assets in the PC's short RAM
 POLL_PERIOD = 0.2      # s between pose polls of the scenario cars
 DONE_AFTER_S = 3.      # a scripted car is removed this long after its script's last node
+PARK_AFTER_S = 0.3     # a car driven up to its line is parked this long after its script's last node
+STAND_S = 0.5          # ...and stands at least this long before its next leg
 PACER_AHEAD_M = 2.     # the pacer settles this far ahead of the car's camera
 Z_ABOVE = 3.           # ground ray casts start this far above the road graph's height
 
 
-KNOWN = [f"{PREFIX}{n}" for n in ('ped', 'pacer', *(f'car{k}' for k in range(6)))]  # every name the catalog gives out
+KNOWN = [f"{PREFIX}{n}" for n in ('ped', 'pacer', *(f'car{k}' for k in range(6)), *(f'cross{k}' for k in range(4)))]  # every catalog name
 
 
 def sweep(bng, log=print) -> int:
@@ -121,7 +124,7 @@ class Director(threading.Thread):
         # hold on the parking brake: BeamNG's arcade automatic reads the brake pedal at a standstill as throttle in
         # reverse, so a car held on brake=1 backs away from the junction at full power before its release
         v.control(throttle=0.0, brake=0.0, parkingbrake=1.0)
-        self.cars[a.name] = {'actor': a, 'vehicle': v, 'end_t': None}
+        self.cars[a.name] = {'actor': a, 'vehicle': v, 'end_t': None, 'park_t': None, 'parked_t': None, 'pending': None}
         self.poses[a.name] = (pos[0], pos[1], a.heading, pos[2])
 
   def walk(self, name: str):
@@ -132,6 +135,26 @@ class Director(threading.Thread):
     car = self.cars[name]
     a = car['actor']
     self._script(car, script_nodes(a.path, a.speed, a.accel))
+
+  def arrive(self, name: str):
+    """Drive a stop sign's cross car up to its line (its path: catalog.cross_actors) and stand it there, parked: from
+    standing, up to its speed, and braking at its accel to a stop at the path's end."""
+    car = self.cars[name]
+    a = car['actor']
+    length = float(arc_lengths(np.asarray(a.path, dtype=float))[-1])
+    v_top = min(a.speed, math.sqrt(a.accel * length))  # half the way up, half down where it never gets to its speed
+    self._script(car, script_nodes(a.path, a.speed, a.accel, length - v_top ** 2 / (2. * a.accel), 0.), stays=True)
+
+  def cross_on(self, name: str):
+    """Send a stop sign's cross car on from its line: across the junction (path2 after its arrive, else its path), from
+    standing. One still driving up to its line goes once it has stood there STAND_S."""
+    car = self.cars[name]
+    a = car['actor']
+    nodes = script_nodes(a.params.get('path2') or a.path, a.speed, a.accel)
+    if car['park_t'] is not None or (car['parked_t'] is not None and time.monotonic() - car['parked_t'] < STAND_S):
+      car['pending'] = nodes
+    else:
+      self._script(car, nodes)
 
   def release_pacer(self, name: str, ego_xy, v_ego: float):
     """Put the pacer in the target lane just ahead of the car, by as much as it loses getting up to speed, and send it
@@ -149,11 +172,14 @@ class Director(threading.Thread):
     drop = pacer_drop_s(s0, a.params['s_junction'], a.params['window_start_m'], a.speed, a.params['block_s'])
     self._script(car, script_nodes(section(lane, s0, end), a.speed, a.accel, drop, a.speed * a.params['drop_to']))
 
-  def _script(self, car, nodes):
+  def _script(self, car, nodes, stays: bool = False):
+    """Run an AI script; the car is removed DONE_AFTER_S after its end, or (stays) parked PARK_AFTER_S after it."""
     v = car['vehicle']
     v.control(throttle=0.0, brake=0.0, parkingbrake=0.0)
     v.ai.set_script(nodes, cling=True)
-    car['end_t'] = time.monotonic() + nodes[-1]['t'] + DONE_AFTER_S
+    end = time.monotonic() + nodes[-1]['t']
+    car['end_t'], car['park_t'] = (None, end + PARK_AFTER_S) if stays else (end + DONE_AFTER_S, None)
+    car['parked_t'] = None
 
   def cleanup(self):
     """Remove every actor this run spawned (vehicles first: they hold the most game memory)."""
@@ -190,5 +216,12 @@ class Director(threading.Thread):
         if car['end_t'] is not None and now > car['end_t']:
           self._remove_car(name, car)  # past the junction and gone: free the memory
           continue
+        if car.get('park_t') is not None and now > car['park_t']:  # up at its line: parked (catalog.cross_actors)
+          car['vehicle'].ai.set_mode('disabled')
+          car['vehicle'].control(throttle=0.0, brake=0.0, parkingbrake=1.0)
+          car['park_t'], car['parked_t'] = None, now
+        if car.get('pending') is not None and car.get('parked_t') is not None and now - car['parked_t'] >= STAND_S:
+          nodes, car['pending'] = car['pending'], None
+          self._script(car, nodes)
         (x, y, z), h = scenario.ego_pose(self.bng, name)
         self.poses[name] = (x, y, h, z)

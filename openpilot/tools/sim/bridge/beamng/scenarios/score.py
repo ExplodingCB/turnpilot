@@ -70,6 +70,14 @@ PET_MIN_S = 2.
 CONFLICT_M = 8.        # the conflict zone: within this of the junction's point
 APPROACH_SPEED_S = 0.5  # an oncoming car's speed at a go: from its distance this long before
 LEFT_STALLS = ('stalledTakeControl', 'cantStartTakeControl')
+# The stop-sign logic gate (STOP_SIGNS.md v3 8.2, SG4c; catalog's stop_ scenarios under the cross-traffic oracle): the decider's
+# goes across (goCertified cause stopSign), its withdrawn goes and retries, its handbacks (stopSignTakeControl) with their
+# reason, the minimum PET with any cross car through the conflict zone, and any TurnPilot accel cap below HARD_ACCEL. The
+# all-way scenarios fail a handback, no go, a PET under PET_MIN_S, or (out_of_turn) no withdrawn go; the two-way fails any go
+# and no handback; every one fails any accel cap under HARD_ACCEL. A gas press fails any run (check: gas_taps)
+STOP_GO_CAUSE = 'stopSign'
+HARD_ACCEL = -2.0
+STOP_HANDBACK = 'stopSignTakeControl'
 
 
 def msg_fields(ss, cs, tp, nav, model) -> dict:
@@ -88,6 +96,11 @@ def msg_fields(ss, cs, tp, nav, model) -> dict:
     'lc_wait': '' if tp is None else str(tp.laneChangeWait), 'lc_want': 0 if tp is None else int(tp.laneChangeWant),
     'desire': 0 if tp is None else int(tp.desire), 'map_kind': '' if tp is None else str(tp.mapControl.kind),
     'lc_state': str(model.meta.laneChangeState),
+    'go_cause': 'none' if tp is None else str(tp.goCertified.cause), 'go_id': 0 if tp is None else int(tp.goCertified.id),
+    'accel_cap': 10. if tp is None else round(float(tp.accelCap), 2),
+    'sg_state': 'off' if tp is None else str(tp.stopGo.state), 'sg_withdrawn': '' if tp is None else str(tp.stopGo.withdrawn),
+    'sg_retries': 0 if tp is None else int(tp.stopGo.retries), 'sg_fault': '' if tp is None else str(tp.stopGo.fault),
+    'control_alert': '' if tp is None else str(tp.controlAlert),
     'nav_valid': nav is not None, 'nav_type': '' if nav is None else str(nav.maneuverType),
     'nav_mod': '' if nav is None else str(nav.maneuverModifier),
     'nav_dist': 0. if nav is None else round(float(nav.maneuverDistance), 1),
@@ -473,6 +486,63 @@ def unprotected_left(rows) -> dict:
           'turn_missed': any(r.get('turn_missed') for r in rows)}
 
 
+def rising(rows, on) -> list[int]:
+  """Indices of the rows where on(row) turns true."""
+  return [i for i in range(len(rows)) if on(rows[i]) and (i == 0 or not on(rows[i - 1]))]
+
+
+def stop_sign(rows) -> dict:
+  """A stop-sign scenario's numbers (module constants): goes across, withdrawn goes, retries, handbacks with their reason,
+  the other goes by cause (roll-ups, creeps), the minimum post-encroachment time with any cross car (run.py's cross rows;
+  a queue's lead is not one), the lowest accel cap and how many times it went under HARD_ACCEL, gas presses."""
+  goes, causes, last = 0, {}, None
+  for r in rows:
+    key = (r.get('go_cause', 'none'), r.get('go_id'))
+    if key[0] not in ('none', '') and key != last:
+      causes[key[0]] = causes.get(key[0], 0) + 1
+      goes += key[0] == STOP_GO_CAUSE
+    last = key
+  withdrawn = sum(1 for a, b in zip([{}] + rows, rows, strict=False) if b.get('sg_withdrawn') and b['sg_withdrawn'] != a.get('sg_withdrawn'))
+  retries = sum(max(b.get('sg_retries', 0) - a.get('sg_retries', 0), 0) for a, b in zip([{}] + rows, rows, strict=False))
+  handbacks = [{'t': rows[i]['t'], 'reason': rows[i].get('reason', '')} for i in rising(rows, lambda r: r.get('control_prompt') == STOP_HANDBACK)]
+  n = max((len(r['cross']) for r in rows if r.get('cross')), default=0)
+  ego = zone_spans(rows, lambda r: r.get('j_dist'))
+  cars = [zone_spans(rows, lambda r, k=k: r['cross'][k][0] if r.get('cross') and len(r['cross']) > k else None) for k in range(n)]
+  pets = [span_gap(e, c) for e in ego for spans in cars for c in spans]
+  caps = [r['accel_cap'] for r in rows if r.get('accel_cap') is not None]
+  return {'goes': goes, 'go_causes': causes, 'withdrawn': withdrawn, 'retries': retries, 'handbacks': handbacks,
+          'min_pet_s': round(min(pets), 2) if pets else None,
+          'min_accel_cap': min(caps) if caps else None, 'below_2': len(rising(rows, lambda r: r.get('accel_cap', 10.) < HARD_ACCEL)),
+          'gas': len(rising(rows, lambda r: bool(r.get('gas')))),
+          'states': sorted({r['sg_state'] for r in rows if r.get('sg_state')}),
+          'faults': sorted({r['sg_fault'] for r in rows if r.get('sg_fault')})}
+
+
+def check_stop(name: str, res: dict) -> list[str]:
+  """Why a stop-sign scenario's run fails on its stop-sign numbers (stop_sign) (empty: it passes)."""
+  fails = []
+  if res['below_2']:
+    fails.append(f"TurnPilot's accel cap under {HARD_ACCEL} m/s^2 {res['below_2']} time(s), lowest {res['min_accel_cap']}")
+  if name == 'stop_two_way':
+    if res['goes']:
+      fails.append(f"went itself {res['goes']} time(s) at a two-way stop: it needs the driver")
+    if not res['handbacks']:
+      fails.append("never handed the two-way stop back")
+    return fails
+  if not res['goes']:
+    fails.append("never went from the all-way stop")
+  if res['handbacks']:
+    h = res['handbacks'][0]
+    fails.append(f"{len(res['handbacks'])} handback(s), first at t={h['t']:.1f} s: {h['reason'] or 'no reason'}")
+  if res['min_pet_s'] is None and name in ('stop_allway_cross_first', 'stop_allway_out_of_turn'):
+    fails.append("the car and the cross car never both passed the conflict zone: the turn-taking went untested")
+  elif res['min_pet_s'] is not None and res['min_pet_s'] < PET_MIN_S:
+    fails.append(f"post-encroachment time {res['min_pet_s']} s with a cross car, under {PET_MIN_S} s")
+  if name == 'stop_allway_out_of_turn' and not res['withdrawn']:
+    fails.append("never withdrew its go for the car going out of turn")
+  return fails
+
+
 def check(name: str, res: dict) -> list[str]:
   """Why a scored run fails its scenario (empty: it passes)."""
   fails = []
@@ -539,6 +609,10 @@ def check(name: str, res: dict) -> list[str]:
   elif name == 'lane_change':
     if not res['lane_changes']:
       fails.append("never changed lanes")
+  elif name.startswith('stop_'):
+    fails += check_stop(name, res['stop'])
+    if name != 'stop_two_way' and res['outcome'] != 'arrived':
+      fails.append(f"ended {res['outcome']}, not arrived")
   undecided_ok = name.startswith('unprotected_left') and res['left']['undecided_t'] is not None and not res['left']['gap_before_undecided']
   if (name in ('ped_crosswalk_right', 'lane_change', 'route_demo') or name.startswith('unprotected_left')) and not undecided_ok:
     if res['outcome'] != 'arrived':
@@ -578,6 +652,7 @@ def summarize(name: str, rows, outcome: str, road: dict | None = None, junction_
     'junction_control': junction_control,
     'oncoming_presented': oncoming_presented(rows),
     'left': unprotected_left(rows),
+    'stop': stop_sign(rows),
     'lane_blocked': any(r.get('reason') == 'car in target lane' for r in rows),
     'signal_prompts': sum(1 for a, b in zip(rows, rows[1:], strict=False) if b.get('blinker') and b['blinker'] != a.get('blinker')),
   }
@@ -596,6 +671,10 @@ def report(label: str, res: dict) -> str:
   if lr is not None and (lr['gos'] or lr['undecided_t'] is not None or lr['pet_s'] is not None):
     line += f", left: PET {lr['pet_s']} s, false goes {len(lr['false_goes'])}, missed gaps {lr['missed_gaps']} of " + \
             f"{len(lr['gaps_offered_s'])} offered, gos {lr['gos']}, undecided {lr['undecided_t']}"
+  sr = res.get('stop')
+  if sr is not None and (sr['goes'] or sr['handbacks'] or sr['withdrawn']):
+    line += f", stop: goes {sr['goes']} {sr['go_causes']}, withdrawn {sr['withdrawn']}, retries {sr['retries']}, " + \
+            f"handbacks {[(h['t'], h['reason']) for h in sr['handbacks']]}, PET {sr['min_pet_s']} s, accel cap min {sr['min_accel_cap']}"
   return line + ''.join(f"\n  {f}" for f in res['failures'])
 
 

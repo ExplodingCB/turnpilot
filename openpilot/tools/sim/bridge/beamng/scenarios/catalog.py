@@ -80,6 +80,13 @@ class Entry:
   spawn: tuple = ()               # route: (x, y, z), heading_deg, destination (x, y, z)
   heading_deg: float = 0.
   dest: tuple = ()
+  # the stop-sign logic gate (STOP_SIGNS.md v3 8.2, SG4c): cross cars, each (side: left, right or lead (ours, in our lane,
+  # ahead of the car), start: 'line' (standing at its stop line from the start) or m back from it, arrive: s after the car's
+  # stand at its line a car starting back drives up to its line and stops there (None: it stands), release: s after that
+  # stand, 'go' (the car's go: out of turn when it arrived after the car) or None (never) it goes on from its line, through:
+  # across the junction and away); from_stop_arm: the car's approach is the junction's arm with a stop line (a two-way)
+  cross: tuple = ()
+  from_stop_arm: bool = False
 
 
 SCENARIOS = {
@@ -105,6 +112,23 @@ SCENARIOS = {
                        timeout_s=90.),
   'occupied_lane': Entry('data', actor='pacer', speed_kph=45., timeout_s=150.),
   'lane_change': Entry('data', speed_kph=45., timeout_s=150.),
+  # the stop-sign logic gate (STOP_SIGNS.md 8.2), on the sim's mapped stops: DR439_5, a four-way all-way three blocks north
+  # of ped_in_path's junction (all four arms stopped, surveyed synthetic in maps/sim), straight across; DR560_2, a T whose stem
+  # alone stops (a two-way), from the stem. Run with TurnPilotAvoidStops off (navd keeps its junctions) and the sim gate on
+  # (the cross-traffic oracle, the sim's files): logic checks, never range evidence. empty: no one else (a go, no hard
+  # braking); cross_first: a car standing at the left line before ours arrives goes 3 s after our stand (we go after it,
+  # PET 2 s or more); queue: a lead standing at our line goes 3 s after we stand behind it (a roll-up, then our own stop and
+  # go); out_of_turn: a car up to the left line after our stand goes across on our go (a withdrawn go, then ours); shield: a
+  # car up to the left line after us stands there (its lane shielded: a go, no handback); two_way: only our approach
+  # stops (a handback, no go)
+  'stop_allway_empty': Entry('straight', junction=(-768.8, 769.2), turn='right', timeout_s=90.),
+  'stop_allway_cross_first': Entry('straight', junction=(-768.8, 769.2), turn='right', timeout_s=90.,
+                                   cross=(('left', 'line', None, 3., True),)),
+  'stop_allway_queue': Entry('straight', junction=(-768.8, 769.2), turn='right', timeout_s=90., cross=(('lead', 'line', None, 3., True),)),
+  'stop_allway_out_of_turn': Entry('straight', junction=(-768.8, 769.2), turn='right', timeout_s=90.,
+                                   cross=(('left', 10., 0., 'go', True),)),
+  'stop_allway_shield': Entry('straight', junction=(-768.8, 769.2), turn='right', timeout_s=90., cross=(('left', 25., 0.5, None, False),)),
+  'stop_two_way': Entry('turn', junction=(-768.2, 872.9), turn='right', approach_m=77., timeout_s=60., from_stop_arm=True, end_on_stop_s=6.),
   # downtown: 20 m on from the bridge's default spawn (clear of the junction behind it), eastbound, to road-graph node
   # DR249_3 about 850 m east-southeast
   'route_demo': Entry('route', spawn=(-888.82, 659.66, 111.4), heading_deg=0., dest=(-84.9, 377.0, 101.5), speed_kph=40., timeout_s=600.),
@@ -415,9 +439,107 @@ def pacer_lane(graph: RoadGraph, spawn, heading: float, junction_xy, direction: 
   return section(lane, start, total - PACER_END_BEFORE_M), total - start
 
 
+STOP_LINE_NEAR_M = 30.   # a stop line this close before a junction is its arm's
+CROSS_SPEED, CROSS_ACCEL = 8., 2.5  # m/s, m/s^2: a cross car's
+CAR_HALF_M = 2.4         # m from a car's centre to its front: standing at its line, its front there
+AFTER_M = 40.            # m a car going through drives on past the junction
+
+
+def arm_line_m(graph: RoadGraph, j: str, arm: str, stops) -> float | None:
+  """m before junction j its stop line lies on the arm arriving from neighbour arm, or None without one."""
+  toward = walk_straight(graph, j, arm, 80.)[::-1]
+  total = float(arc_lengths(toward)[-1])
+  ds = [total - sa for sa, _ in controls_along(toward, stops) if -2. < total - sa <= STOP_LINE_NEAR_M]
+  return min(ds) if ds else None
+
+
+def all_way(graph: RoadGraph, j: str, stops) -> bool:
+  """Every arm cars arrive at j by has its own stop line (the sim's mapped stops: an all-way), three or more."""
+  arms = [a for a in graph.adj[j] if j in graph.out[a]]
+  return len(arms) >= 3 and all(arm_line_m(graph, j, a, stops) is not None for a in arms)
+
+
+def stop_arm_heading(graph: RoadGraph, xy, stops) -> float:
+  """The travel heading (rad) of an arm with a stop line at the junction nearest xy (a two-way's stopped approach)."""
+  j = graph.nearest_junction(*xy)
+  for a in graph.adj[j]:
+    if j in graph.out[a] and arm_line_m(graph, j, a, stops) is not None:
+      return wrap(arm_out_heading(graph, j, a) + math.pi)
+  raise ValueError(f"no arm with a stop line at {j}")
+
+
+def side_arm(graph: RoadGraph, jn: Junction, side: str) -> str:
+  """The arm of jn's junction cross traffic comes from on that side of the car's approach (lead: the car's own)."""
+  if side == 'lead':
+    return jn.a
+  for o in graph.adj[jn.node]:
+    if o in (jn.a, jn.straight) or jn.node not in graph.out[o]:
+      continue
+    angle = wrap(arm_out_heading(graph, jn.node, o) - jn.h_in)
+    if abs(abs(math.degrees(angle)) - 90.) <= TURN_TOLERANCE_DEG and (angle > 0) == (side == 'left'):
+      return o
+  raise ValueError(f"no arm on the {side} at {jn.node}")
+
+
+def across_arm(graph: RoadGraph, j: str, arm: str) -> str | None:
+  """The arm straight across junction j from arm (where a car coming from arm goes on to)."""
+  h = wrap(arm_out_heading(graph, j, arm) + math.pi)
+  out = [o for o in graph.adj[j] if o != arm and o in graph.out[j] and abs(math.degrees(wrap(arm_out_heading(graph, j, o) - h))) < STRAIGHT_TOLERANCE_DEG]
+  return out[0] if out else None
+
+
+def cross_path(graph: RoadGraph, jn: Junction, side: str, start, through: bool, stops) -> tuple[np.ndarray, np.ndarray | None, float]:
+  """A cross car's lane (its rightmost) toward jn's junction from its start (its front at its stop line, or start m back
+  from that), ending with its front at its line; and, going through, on across the junction AFTER_M (else None); and how
+  far before the junction its line is."""
+  j = jn.node
+  arm = side_arm(graph, jn, side)
+  line = arm_line_m(graph, j, arm, stops)
+  if line is None:
+    raise ValueError(f"the {side} arm at {j} has no stop line")
+  back = 0. if start == 'line' else float(start)
+  far = walk_straight(graph, j, arm, line + back + CAR_HALF_M + 10.)
+  lanes = graph.lanes_toward(j, arm)
+  toward = offset_polyline(far[::-1], lane_offset(lanes, graph.radius[arm], 'right'))
+  total = float(arc_lengths(toward)[-1])
+  at_line = total - line - CAR_HALF_M
+  come = section(toward, max(at_line - max(back, 1.), 0.), at_line)  # standing at its line: a 1 m stub to it
+  if not through:
+    return come, None, line
+  opp = across_arm(graph, j, arm)
+  if opp is None:
+    raise ValueError(f"nothing straight across {j} from the {side} arm")
+  leave = offset_polyline(cut(walk_straight(graph, j, opp, AFTER_M + 5.), AFTER_M), lane_offset(flip(graph.lanes_toward(j, opp)), graph.radius[opp], 'right'))
+  return come, np.vstack([come[-1:], toward[-1:], leave]), line
+
+
+def cross_actors(graph: RoadGraph, jn: Junction, e: Entry) -> list:
+  """The stop-sign logic gate's cross cars (Entry.cross; STOP_SIGNS.md 8.2), trigger 'cross' (run.cross_due): each standing at
+  its start; one starting back drives up to its line on its arrive (path, stopping at its end); from its line it goes on
+  across on its release (path2 after an arrive, else path)."""
+  stops = [c for c in mapped_controls(graph) if c.kind == 'stop']
+  out = []
+  for k, (side, start, arrive, release, through) in enumerate(e.cross):
+    if (start == 'line') != (arrive is None):
+      raise ValueError(f"cross car {k}: a car standing at its line has no arrive, one starting back needs one")
+    come, across, line = cross_path(graph, jn, side, start, through, stops)
+    params = {'side': side, 'start': start, 'arrive': arrive, 'release': release, 'through': bool(through), 'line_m': round(line, 1)}
+    if start == 'line':
+      path = across if across is not None else come
+    else:
+      path = come
+      if across is not None:
+        params['path2'] = across.tolist()
+    out.append(Actor(f"{PREFIX}cross{k}", 'car', 'cross', path.tolist(), CROSS_SPEED, CROSS_ACCEL, heading_of(path[0], path[1]), params=params))
+  return out
+
+
 # *** builders ***
 def _turn_plan(name: str, e: Entry, graph: RoadGraph) -> Plan:
-  jn = find_turn(graph, e.junction, e.turn, from_heading=None if e.from_heading_deg is None else math.radians(e.from_heading_deg))
+  from_heading = None if e.from_heading_deg is None else math.radians(e.from_heading_deg)
+  if e.from_stop_arm:
+    from_heading = stop_arm_heading(graph, e.junction, [c for c in mapped_controls(graph) if c.kind == 'stop'])
+  jn = find_turn(graph, e.junction, e.turn, from_heading=from_heading)
   lanes, radius = graph.lanes_toward(jn.node, jn.a), graph.radius[jn.a]
   toward = jn.approach[::-1]  # in the car's direction of travel, ending at the junction
   total = float(arc_lengths(toward)[-1])
@@ -481,6 +603,10 @@ def _turn_plan(name: str, e: Entry, graph: RoadGraph) -> Plan:
       h = heading_of(path[0], path[1])
       actors.append(Actor(f"{PREFIX}car{k}", 'car', 'oncoming', path.tolist(), e.oncoming_speed, e.oncoming_accel, h,
                           params={'start_m': e.oncoming_start_m, 'arrive_after_s': e.arrive_after_s, 'release_after_stop_s': round(delay, 2)}))
+  if name.startswith('stop_'):
+    stops = [c for c in mapped_controls(graph) if c.kind == 'stop']
+    notes['stop_scenario'], notes['all_way'] = name, all_way(graph, jn.node, stops)
+    actors += cross_actors(graph, jn, e)
   return Plan(name, spawn, heading, dest, (float(jn.center[0]), float(jn.center[1])), e.speed_kph, e.timeout_s,
               e.end_on_stop_s, actors, notes)
 

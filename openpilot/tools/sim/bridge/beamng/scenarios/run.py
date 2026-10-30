@@ -42,7 +42,7 @@ from openpilot.tools.sim.bridge.beamng.scenario import heading_quat
 from openpilot.tools.sim.bridge.beamng.scenarios import score
 from openpilot.tools.sim.bridge.beamng.scenarios.catalog import DATA_JSON, ROLL_FRACTION, SCENARIOS, Plan, build, junction_distance
 from openpilot.tools.sim.bridge.beamng.scenarios.director import Director, sweep
-from openpilot.tools.sim.bridge.beamng.scenarios.timing import GoWatch
+from openpilot.tools.sim.bridge.beamng.scenarios.timing import GO_NEAR_M, STOOD_V, GoWatch
 
 SETTLE_S = 4.         # after the teleport: the car is back in D and the GPS has caught up
 CLEAR_TIMEOUT_S = 5.  # wait this long for navd to drop the old route
@@ -58,6 +58,17 @@ SERVICES = ['turnpilotPlan', 'selfdriveState', 'carState', 'navInstruction', 'na
 OUT_ROOT = os.path.expanduser("~/turnpilot-artifacts/scenarios")
 POSE_FIELDS = ["wall_s", "t_s", "x", "y", "z", "qx", "qy", "qz", "qw"]  # route_drive's, which chase_render.py reads
 ACTOR_FIELDS = ["wall_s", "x", "y", "z", "heading"]
+
+
+def cross_due(params: dict, held_t: float | None, went: bool, t: float, key: str = 'release') -> bool:
+  """A stop-sign scenario's cross car's leg (catalog.Entry.cross) is due: params[key] (its 'arrive' or its 'release') s after
+  the car's stand at the junction (held_t), on the car's go there ('go'), or never (None)."""
+  when = params.get(key)
+  if when is None:
+    return False
+  if when == 'go':
+    return went
+  return held_t is not None and t - held_t >= float(when)
 
 
 def wall() -> float:
@@ -202,6 +213,8 @@ class Runner:
     self.poses: list[tuple] = []
     self.actor_poses: dict[str, dict] = {}
     self.fired: set[str] = set()
+    self.arrived: set[str] = set()  # cross cars sent up to their line (their first leg)
+    self.stood_t: float | None = None  # the car's first stand near the junction, held by TurnPilot or not (a queue)
     self.jobs: list = []  # trigger jobs: a failed one explains a failed run
     self.route_pts, self.route_id, self.nav_cleared = None, 0, False
     self.t_engaged = self.t_engaged_wall = None
@@ -226,7 +239,7 @@ class Runner:
       'dest_dist': None if self.plan.dest is None else round(math.hypot(self.plan.dest[0] - x, self.plan.dest[1] - y), 1),
       'blinker': 'left' if b.blinker[0] else 'right' if b.blinker[1] else '',
       'ped_gap': None, 'car_gap': None, 'pacer_dx': None, 'j_dist': junction_distance(self.plan, x, y), 'car_j_dist': None,
-      'onc': None,
+      'onc': None, 'cross': None,
       **score.msg_fields(sm['selfdriveState'], sm['carState'], sm['turnpilotPlan'] if sm.seen['turnpilotPlan'] else None,
                          sm['navInstruction'] if sm.seen['navInstruction'] and sm.valid['navInstruction'] else None,
                          sm['modelV2']),
@@ -245,6 +258,10 @@ class Runner:
         hc = pose[2]
         ahead = (self.plan.junction[0] - pose[0]) * math.cos(hc) + (self.plan.junction[1] - pose[1]) * math.sin(hc)
         r['onc'] = (r['onc'] or []) + [[round(dj, 2), round(ahead, 2)]]
+      if a.trigger == 'cross' and a.params.get('side') != 'lead':  # a stop sign's cross car, for its PET (score.stop_sign)
+        hc = pose[2]
+        ahead = (self.plan.junction[0] - pose[0]) * math.cos(hc) + (self.plan.junction[1] - pose[1]) * math.sin(hc)
+        r['cross'] = (r['cross'] or []) + [[round(junction_distance(self.plan, pose[0], pose[1]), 2), round(ahead, 2)]]
       if a.trigger == 'pace':
         r['pacer_dx'] = round((pose[0] - x) * math.cos(h) + (pose[1] - y) * math.sin(h), 2)
     r['j_ahead'] = None
@@ -274,16 +291,28 @@ class Runner:
   def triggers(self, b, r):
     """Set the actors going on the car at its junction (timing.GoWatch): the walker steps out on the car's go there, the
     oncoming cars go a fixed time after it stands at its hold there, so the first reaches the junction arrive_after_s
-    after the go (or at once on a go that came sooner); the pacer goes once the car is engaged."""
+    after the go (or at once on a go that came sooner); the pacer goes once the car is engaged; a stop sign's cross cars
+    (cross_due) drive up to their line on their arrive and on across on their release, timed from the car's first stand
+    near the junction (held or not: behind a queue's lead) or on its go."""
     plan, d = self.plan, self.director
     if r['j_dist'] is not None:
       self.watch.update(r['t'], r['j_dist'], r['v'], r['state'] == 'holding', r['desire'] in TURN_DESIRES)
+      if self.stood_t is None and r['j_dist'] <= GO_NEAR_M and r['v'] < STOOD_V:
+        self.stood_t = r['t']
     w = self.watch
     for a in plan.actors:
       if a.name in self.fired or a.trigger == 'setup':
         continue
       go = False
-      if a.trigger == 'walk':
+      if a.trigger == 'cross' and a.params['start'] != 'line' and a.name not in self.arrived:
+        if cross_due(a.params, self.stood_t, w.went, r['t'], 'arrive'):
+          self.arrived.add(a.name)
+          self.jobs.append((a.name, d.submit(d.arrive, a.name)))
+          print(f"scenario: {a.name} drives up to its line at t={r['t']:.1f} s", flush=True)
+        continue
+      if a.trigger == 'cross':
+        go, job = cross_due(a.params, self.stood_t, w.went, r['t']), (d.cross_on, a.name)
+      elif a.trigger == 'walk':
         go, job = w.went, (d.walk, a.name)
       elif a.trigger == 'oncoming':
         # a gap stream's car only on its own timer (catalog: timed); the others at the car's go too

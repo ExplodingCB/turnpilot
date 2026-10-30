@@ -44,8 +44,16 @@ The turn scenarios use junctions from piston's list of signalized junctions with
 | `occupied_lane` | A data entry (below). When the car engages, an AI car is placed in the target lane just ahead of it and paces it at the set speed until 6 s into the lane change window, then drops back to 40%. | The planner reports "car in target lane", and the lane change starts with the pacer more than 15 m away |
 | `lane_change` | A data entry: a multi-lane approach to a turn that needs a lane change. | Changes lanes, takes the turn, arrives, no disengagement |
 | `route_demo` | From 20 m past the bridge's default spawn to road-graph node DR249_3, about 850 m away. | Arrives, takes every maneuver, no disengagement |
+| `stop_allway_empty` | Straight across DR439_5 at (-768.8, 769.2), a four-way all-way stop (every arm's stop line mapped), from the east. No one else. | The decider goes by itself (a `stopSign` go), no handback, no accel cap under -2.0, arrives |
+| `stop_allway_cross_first` | The same, with a car standing at the left arm's line from the start (it arrived first). It goes across 3 s after the car stands near the junction. | Waits for it, then goes: PET 2 s or more, no handback, arrives |
+| `stop_allway_queue` | The same, with a lead standing at the car's own line. It goes across 3 s after the car stands behind it. | Rolls up to the line, stops, goes, no handback, arrives |
+| `stop_allway_out_of_turn` | The same, with a car 10 m back from the left line that drives up to it as the car stands (it arrives after the car), then goes across on the car's go. | Withdraws its go (at least one withdrawn), then goes after it: PET 2 s or more, no handback, arrives |
+| `stop_allway_shield` | The same, with a car 25 m back from the left line that drives up to it after the car stands and waits there. | Goes (the stopped car shields its lane), no handback, arrives |
+| `stop_two_way` | A right turn at DR560_2 (-768.2, 872.9), a T where only the car's approach stops, from 77 m out: between spawn_clear_m of its line and 15 m past the all-way behind it. | Never goes by itself; hands back (`stopSignTakeControl`); ends standing |
 
 Each scenario is an `Entry` in `catalog.py`. The builders there turn an entry into world positions from the road-graph export, without touching the game.
+
+The `stop_` scenarios are the stop-sign logic gate (STOP_SIGNS.md v3 8.2). They are logic checks, never range evidence. Run them with `TurnPilotAvoidStops` off, so navd keeps their junctions. They also need the sim gate on (`SIMULATION=1`, `TurnPilotSimLightOracle`, a sim car), so turnpilotd reads the sim's visibility file and its survey of the sim's all-ways (`sim_stop_files.py`, synthetic). The light oracle then also publishes the cross-traffic oracle: every vehicle but the ego, and the mannequins, within 60 m in the car frame (`turnpilotLights.cross`). The decider takes that in place of its cameras' tracks and reach. The cross cars (`Entry.cross`, trigger `cross`) are timed from the car's first stand within 35 m of the junction, held or not, or from its go (`run.cross_due`). A car starting back drives up to its line and parks there (`director.arrive`); its second leg across waits until it has stood 0.5 s (`director.cross_on`). The score (`score.stop_sign`, `check_stop`) counts the decider's goes across, withdrawn goes, retries, handbacks with their reason, the minimum PET with any cross car (the lead isn't one) and TurnPilot accel caps under -2.0.
 
 ### Junction data
 
@@ -119,3 +127,4 @@ Everything here was built and tested offline, with unit tests and a dry run of t
 - Where the crosswalk is. It's placed from road widths (2.5 m past the edge of the road the car comes from), not from the level's crossing decals, and `result.json` notes this.
 - The mission-group sweep for mannequins (`getCount`/`getObject` on `scenetree.MissionGroup`) and the vehicle sweep by name.
 - Whether turnpilot_web and navd are up, with a route source for the sim map, in the sim launch.
+- The stop-sign scenarios (2026-10-30): the cross cars' arrive leg (an AI script braking to its end, then the parking brake), the cross-traffic oracle's poll (`be:getObject`, `getVelocity`), and whether the decider goes on it at the sim's all-ways.
