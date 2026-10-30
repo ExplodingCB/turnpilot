@@ -124,10 +124,13 @@ class RouteNotices:
       self.queue.append(('stopAheadNeedsYou', "Stop sign ahead needs you", ident))  # after a route start's own, said first
     if str(nav.controlsStatus) != 'ok':
       return  # the controls not read: nothing is known passed
-    # one held back (behind another alert) for a stop now passed, or no longer on the route: dropped, never said late
+    # one held back (behind another alert) for a stop now passed, or no longer on the route: dropped, never said late, and
+    # said again if a reroute brings that stop back ahead
     for q in [q for q in self.queue if q[2] is not None and q[2] not in ahead]:
       self.queue.remove(q)
+      self.ahead_said.discard(q[2])
       cloudlog.event("turnpilot.route_notice_dropped", kind=q[0], junction=str(q[2]), why="passed")
     if self.now_ident is not None and self.now_ident not in ahead:
+      self.ahead_said.discard(self.now_ident)
       cloudlog.event("turnpilot.route_notice_dropped", kind=self.now[0], junction=str(self.now_ident), why="passed")
       self.now, self.now_ident, self.left_s = ('none', ''), None, 0.

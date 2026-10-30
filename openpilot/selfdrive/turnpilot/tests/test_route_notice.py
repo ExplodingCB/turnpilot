@@ -165,3 +165,8 @@ def test_a_notice_held_back_behind_another_alert_is_said_in_full_once_free_and_o
       free = d < (-20. if passed else 200.)
       out.append(rn.update(msg if k % 20 == 0 else None, k % 20 == 0, valid, 13., True, free=free)[0])
     assert ('stopAheadNeedsYou' in out) == (not passed), passed
+    if passed:
+      # dropped unsaid: a reroute that brings that stop back ahead says it then
+      got = [send(rn, nav(route=1, status='unavoidable', controls=[(0, 'stop', 150., 'unavoidable', 77)]), 13., True)[0]
+             for _ in range(3)]
+      assert 'stopAheadNeedsYou' in got
