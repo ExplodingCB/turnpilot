@@ -1769,3 +1769,46 @@ def test_V13_a_box_overlapping_0_6_m_ahead_of_the_bumper_holds_the_go(tmp_path):
   assert first_go(out) is None and any(h.key == 'near:70' for h in out[-1].holds)
   w.objects = lambda ww: ()
   assert first_go(w.run(3.5)) is not None
+
+
+def through_after(t0, t_stop, d0=20., v0=6.):
+  """d(t) of a car that drives in from d0 at v0 from t0, stops at its line, stands until t_stop, then pulls away through our
+  path at 3 m/s^2 (taking its turn; under DOWNGRADE_V past its line region)."""
+  def d(t):
+    if t < t0:
+      return None
+    if t < t_stop:
+      return max(d0 - v0 * (t - t0), LINE_D)
+    return LINE_D - 1.5 * (t - t_stop) ** 2
+  return d
+
+
+def test_V18_a_car_standing_at_its_line_parked_s_while_others_take_turns_loses_its_rank_and_is_never_a_shield(tmp_path):
+  # 4.5 step 2: a car at the left line from before our arrival never goes while two cars from the right stop and take their
+  # turns: PARKED_S after it was first seen standing it is parked, its rank lost (no more an earlier arrival we wait for), never
+  # its lane's shield (a car parked at the corner may not be in the lane at all), and still an occluder: its lane short of
+  # reach, a static wait. Before, it held its rank for ever while the junction kept moving (no deadlock: things moved)
+  w = World(tmp_path)
+  w.tracks = cars((1, 'left', at_line(t0=-10.)), (2, 'right', through_after(3.5, 6.)), (3, 'right', through_after(7.5, 10.)))
+  watch(w)
+  out = w.run(11.)
+  assert out[round(1.5 / DT_MDL)].rank == 1
+  out += w.run(4.)
+  late = out[-round(1.5 / DT_MDL):]
+  assert all(d.rank == 0 for d in late) and 1 in w.sg.parked
+  assert not any(x.role == 'left' and x.shielded for d in late for x in d.lanes)
+  assert all(any(h.key.startswith('reach:left') for h in d.holds) for d in late) and first_go(out) is None
+  assert not w.sg.ev[1].shield
+  # one that moves again is no more parked
+  w.tracks = cars((1, 'left', lambda t: LINE_D - 1.5 * (t - 15.) ** 2 if t >= 15. else LINE_D))
+  w.run(2.)
+  assert 1 not in w.sg.parked
+
+
+def test_V18_a_car_stopped_3_to_15_m_back_from_its_line_has_no_rank_is_never_a_shield_and_occludes(tmp_path):
+  w = World(tmp_path)
+  w.tracks = cars((4, 'left', lambda t: LINE_D + 8.))  # 8 m back from its line, standing
+  watch(w)
+  out = w.run(6.)
+  assert all(d.rank == 0 for d in out) and not any(x.shielded for d in out for x in d.lanes)
+  assert first_go(out) is None and any(h.key.startswith('reach:left') for h in out[-1].holds)

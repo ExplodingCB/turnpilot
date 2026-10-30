@@ -21,7 +21,8 @@ decider computes would_go only (logged once a stop). Acting:
   is rollUp: the latch's stop point moved on to the stop point on map_controls' creep path (creep), the map curve its cap up
   to ROLLUP_V_MAX, with rollUp goes while the model holds. The arrival is the full stop: a vehicle already standing at another
   approach's line is earlier (V5), in the order first seen stopped; one stopping within TIE_S after it is a tie (V6: yield to
-  the right; facing, straight or right before left; another car assumed straight).
+  the right; facing, straight or right before left; another car assumed straight). One standing at its line, or up to
+  PARKED_BACK_M back, PARKED_S while others take turns is parked (V18): no rank, never a shield, still an occluder.
 - observe: section 2.4's go conditions every frame (go_holds: each one held a Hold with its reason and kind, the wait ledger of
   4.6). All of them for CLEAR_S is the go: map_controls' latch let go (release, cause 'clear', no span release past it), G5's
   go (go_cause stopSign) and the stopGo chime. Waiting is silent (waitingForCross, its reason) with an info chime at
@@ -102,6 +103,8 @@ LEAD_GO_M = 8.
 BIKE_PASS_MEMORY_S = 10.
 HIDE_S = 2.0
 TIE_S = 1.0
+PARKED_S = 10.                  # s a vehicle stands at its line, or 3-15 m back, while others take turns: parked (4.5 step 2)
+PARKED_BACK_M = 15.             # m back from its line a stopped vehicle may stand and still be watched for it
 DEADLOCK_S = 3.0                # s an earlier arrival may hold its turn, nothing in the junction moving, before we take ours
 DEADLOCK_CREEP_M = 0.5          # m of the one signalling creep (4.5 step 5; map_controls' creep path at CREEP_SPEED)
 DEADLOCK_CREEP_V = min(0.4, CREEP_SPEED)  # m/s, its cap: the creep path's limit or under, slow enough to end 0.5 m on (8.1)
@@ -352,6 +355,9 @@ class StopGo:
     self.later: set = set()
     self.stopped_since: dict[int, float] = {}
     self.gone: set = set()                 # earlier arrivals seen leaving their line
+    self.standing: dict[int, float] = {}   # trackId: since when it stands at its line or up to PARKED_BACK_M back (V18)
+    self.went_t: dict[int, float] = {}     # trackId: when it last went on through its line (a turn taken)
+    self.parked: set = set()               # standing PARKED_S while others took turns: no rank, never a shield, an occluder
     self.rank = 0
     self.turn_wait_s = 0.
     self.creep: dict | None = None  # the deadlock's signalling creep in hand: its target, start, the earlier arrivals then
@@ -555,6 +561,7 @@ class StopGo:
     # (_turn_holds), never presumed gone
     live = {getattr(t, 'track_id', None) for t in f.tracks or ()}
     self.ev = {tid: e for tid, e in self.evidence.evaluate().items() if tid in live}
+    self._parked()
     for tid, e in self.ev.items():
       if e.stopped_at_line:
         self.stopped_since.setdefault(tid, self.t - e.stopped_s)
@@ -596,6 +603,34 @@ class StopGo:
           self.bike_t = self.t
         elif self.bike_t is not None and float(o.x) > self.setback + 3.:
           self.bike_t = None
+
+  def _parked(self) -> None:
+    """4.5 step 2, row V18: a vehicle standing at its line (its line region) or up to PARKED_BACK_M back that doesn't move for
+    PARKED_S while others take turns (another vehicle went on through its line meanwhile) is parked: it loses its rank (no
+    more an earlier arrival we wait for), is never its lane's shield (one parked at the corner may not be in the lane at all,
+    and the lane behind it is unseen), and stays an occluder (visibility caps reach behind any track's box). Moving again
+    (its speed trusted over SHIELD_V) ends it. Untrusted (our own creep restarts every track's bearings) changes nothing."""
+    for tid, e in self.ev.items():
+      if e.v_trusted and e.v_nom > MOVING_V and e.front_from_line_m > sr.SHIELD_PAST_M:
+        self.went_t[tid] = self.t
+      if not e.v_trusted:
+        continue
+      if e.v_hi < sr.SHIELD_V and -PARKED_BACK_M <= e.front_from_line_m <= sr.SHIELD_PAST_M:
+        self.standing.setdefault(tid, self.t - e.stopped_s)
+      else:
+        self.standing.pop(tid, None)
+        if tid in self.parked:
+          self.parked.discard(tid)
+          cloudlog.event("turnpilot.stop_go_unparked", key=list(self.key), track=int(tid))
+    for tid, since in self.standing.items():
+      if tid not in self.parked and self.t - since >= PARKED_S - 1e-6 and any(t >= since for o, t in self.went_t.items() if o != tid):
+        self.parked.add(tid)
+        cloudlog.event("turnpilot.stop_go_parked", key=list(self.key), track=int(tid), standing_s=round(self.t - since, 1),
+                       earlier=tid in self.earlier)
+    for tid in self.parked:
+      e = self.ev.get(tid)
+      if e is not None and e.shield:
+        self.ev[tid] = replace(e, shield=False)
 
   def on_signal_seen(self, j) -> None:
     """A signal head at the junction (2.4 item 9, C20): turnpilotd's hook writes TurnPilotJunctionOverrides (signalSeen)."""
@@ -749,7 +784,7 @@ class StopGo:
     """Our arrival, at the full stop: every vehicle standing at another approach's line is earlier (V5)."""
     self.arrived_t = self.t
     for tid, e in self.ev.items():
-      if e.stopped_at_line:
+      if e.stopped_at_line and tid not in self.parked:
         self.earlier[tid] = self.stopped_since.get(tid, self.t)
     cloudlog.event("turnpilot.stop_go_arrived", key=list(self.key), earlier=sorted(self.earlier), t=round(self.t, 2))
 
@@ -1175,7 +1210,7 @@ class StopGo:
     tie lost. A vehicle stopping at another line within TIE_S after our arrival is a tie: we yield to the right and, facing
     each other, a left yields to the other's straight or right (others are assumed straight); one later waits for us."""
     for tid, e in self.ev.items():
-      if e.stopped_at_line and tid not in self.earlier and tid not in self.later and self.arrived_t is not None:
+      if e.stopped_at_line and tid not in self.earlier and tid not in self.later and tid not in self.parked and self.arrived_t is not None:
         since = self.stopped_since.get(tid, self.t)
         if since - self.arrived_t <= TIE_S and (e.role == 'right' or (e.role == 'opposite' and f.maneuver == 'left')):
           self.earlier[tid] = since
@@ -1184,7 +1219,7 @@ class StopGo:
           self.later.add(tid)
     waiting = []
     for tid in sorted(self.earlier, key=lambda k: self.earlier[k]):
-      if tid in self.gone:
+      if tid in self.gone or tid in self.parked:
         continue
       e = self.ev.get(tid)
       if e is not None and not e.stopped_at_line and (e.v_nom > sr.SHIELD_V or e.front_from_line_m > sr.SHIELD_PAST_M):
