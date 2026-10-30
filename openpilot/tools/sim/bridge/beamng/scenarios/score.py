@@ -47,6 +47,7 @@ import json
 
 import numpy as np
 
+from openpilot.selfdrive.turnpilot.handback import EVENTS as HANDBACK_EVENTS, EventName, Handback
 from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_ACCEL_MIN, TAKE_CONTROL_PROMPTS, plan_accel
 from openpilot.selfdrive.turnpilot.lane_planner import LC_BLOCK_X_M
 from openpilot.selfdrive.turnpilot.route_follower import KEEP, TURN, classify
@@ -128,7 +129,8 @@ STALL_HANDBACKS = ('stalledTakeControl',)
 STALL_PROMPT_S = 3.
 STALL_LATE_S = 0.3
 # turnpilotPlan.handback's kinds: a fault, handed back with openpilot's soft disable, which ends the drive (the car is not
-# held: it coasts engaged through the soft disable); the disengagement after one is that soft disable's
+# held: it coasts engaged through the soft disable); the disengagement after one is that soft disable's, of the event the
+# handback raises (fault_event: handback.EVENTS), not another's
 FAULT_HANDBACKS = ('detectorStopped', 'modelFellBack', 'noDetector')
 SOFT_DISABLE = '/softDisable'
 # S01's drop (run.py --drop-detections-at; summarize's drop): the detectorStopped handback within DROP_HANDBACK_S of the
@@ -139,6 +141,9 @@ SOFT_DISABLE = '/softDisable'
 DROP_HANDBACK_S = 2.0
 DETECTOR_PARAM_CHECK_S = 1.0
 DROP_BEFORE_TOL_S = 0.25
+# ...and with det_age in the rows, the handback's own row shows the detector silent for turnpilotd's DETECTOR_DEADLINE_S,
+# but a row or two (ROW_TOL_S): a detectorStopped with detections still coming isn't the drop's
+DETECTOR_DEADLINE_S = 1.5
 # the disengagement within this of the first row showing the gas is the press's: the shot's 0.2 s (carState.gasPressed to
 # disengaged, in the rlog), plus the rows' 50 ms sampling of two messages that may each land a row late
 GAS_DISENGAGE_S = 0.3
@@ -804,6 +809,7 @@ def expect_facts(rows) -> dict:
   TurnPilot prompts after them."""
   first: dict[str, dict] = {'handback': {}, 'alert': {}}
   det_t: dict[str, float | None] = {}  # each handback's detector: its last detections at the handback's first row
+  det_age: dict[str, float | None] = {}  # ...and their age then
   skip_t = range_skip_t = missed_t = gas_t = None
   ahead: dict[str, float | None] = {}  # j_ahead at the first skip row of each kind
   engaged = False
@@ -814,6 +820,7 @@ def expect_facts(rows) -> dict:
       if k is not None and k not in first['handback']:
         first['handback'][k] = r['t']
         det_t[k] = None if r.get('det_age') is None else round(r['t'] - r['det_age'], 3)
+        det_age[k] = r.get('det_age')
     if r.get('control_alert', 'none') not in ('', 'none'):
       first['alert'].setdefault(r['control_alert'], r['t'])
     if skip_t is None and (r.get('too_fast') or r.get('left_state') == 'skipped'):
@@ -827,7 +834,7 @@ def expect_facts(rows) -> dict:
   return {'handbacks': first['handback'], 'control_alerts': first['alert'], 'skip_t': skip_t, 'range_skip_t': range_skip_t,
           'skip_ahead_m': ahead.get('skip'), 'range_skip_ahead_m': ahead.get('range_skip'), 'turn_missed_t': missed_t,
           'gas_t': gas_t,
-          'handback_det_t': det_t,
+          'handback_det_t': det_t, 'handback_det_age': det_age,
           'held': {k: held_after(rows, t) for k, t in first['handback'].items() if k in TAKE_CONTROL_PROMPTS},
           'stood_at': {k: stood_at(rows, t) for k, t in first['handback'].items() if k in FULL_STOP_HANDBACKS},
           'go_before': {k: go_before(rows, t) for k, t in first['handback'].items() if k in GO_TIMED},
@@ -836,15 +843,18 @@ def expect_facts(rows) -> dict:
           'prompts_after_gas': sorted({k for k, t in first['handback'].items() if gas_t is not None and t >= gas_t})}
 
 
-def drop_problems(t: float, det_t: float | None, drop: dict | None) -> list[str]:
+def drop_problems(t: float, det_t: float | None, drop: dict | None, det_age: float | None = None) -> list[str]:
   """Why the detectorStopped handback at t isn't the drop's (DROP_HANDBACK_S): det_t, the detector's last detections
-  before it (None: the rows don't say); drop, the runner's (summarize)."""
+  before it, and det_age, their age at the handback's row (None: the rows don't say); drop, the runner's (summarize)."""
   drop_t = None if drop is None else drop.get('t')
   if drop is not None and drop_t is None:
     at = drop.get('at')
     return [f"the detection drop asked for at t={at:.1f} s never came (the run ended first)" if at is not None else
             "the detection drop never came (the run ended first)"]
   out = []
+  if det_age is not None and det_age < DETECTOR_DEADLINE_S - ROW_TOL_S - 1e-6:
+    out.append(f"handed back detectorStopped with the detector's last detections {det_age:.2f} s old, under turnpilotd's " +
+               f"{DETECTOR_DEADLINE_S} s deadline: the detector hadn't gone silent")
   if det_t is not None:
     if t - det_t > DROP_HANDBACK_S + 1e-6:
       out.append(f"handed back {t - det_t:.1f} s after the detector's last detections (t={det_t:.1f} s), over {DROP_HANDBACK_S} s")
@@ -859,6 +869,12 @@ def drop_problems(t: float, det_t: float | None, drop: dict | None) -> list[str]
   else:
     out.append(f"no detector times in the rows and no drop: the detectorStopped handback's {DROP_HANDBACK_S} s was not checked")
   return out
+
+
+def fault_event(arg: str) -> str:
+  """The selfdrived event a fault handback of kind arg raises (handback.EVENTS): its soft disable ends the drive."""
+  names = {v: k for k, v in EventName.schema.enumerants.items()}
+  return names[HANDBACK_EVENTS[Handback.schema.enumerants[arg]]]
 
 
 def handback_problems(name: str, arg: str, t: float, facts: dict, res: dict) -> list[str]:
@@ -906,8 +922,11 @@ def handback_problems(name: str, arg: str, t: float, facts: dict, res: dict) -> 
     elif SOFT_DISABLE not in after[0]['cause']:
       who = "the driver's" if after[0]['cause'].startswith('driver ') else 'for something else'
       out.append(f"the disengagement after the {arg} handback was {who} ({after[0]['cause']}), not its soft disable")
+    elif not after[0]['cause'].startswith(fault_event(arg) + SOFT_DISABLE):
+      out.append(f"the disengagement after the {arg} handback was another event's soft disable ({after[0]['cause']}), not " +
+                 f"{fault_event(arg)}'s")
   if arg == 'detectorStopped':
-    out += drop_problems(t, facts['handback_det_t'].get(arg), res.get('detection_drop'))
+    out += drop_problems(t, facts['handback_det_t'].get(arg), res.get('detection_drop'), facts.get('handback_det_age', {}).get(arg))
   return out
 
 

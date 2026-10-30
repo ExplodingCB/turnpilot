@@ -244,3 +244,57 @@ class TestStopSignFullStop:
     res = score.summarize('twoway_route_pair', self.rows(0.), 'taken over', expect=self.EXPECT)
     assert res['expect_facts']['stood_at'] == {'stopSignTakeControl': True}
     assert not any('no full stop' in f for f in res['failures']), res['failures']
+
+
+A = {'nav_type': 'arrive', 'nav_mod': ''}
+SOFT = 'turnpilotDetectorStopped/softDisable'
+
+
+def drop_handback(det_age, alert=SOFT):
+  """S01: a straight cruise, the drop at 2.4 s, the detectorStopped handback at 4.0 s with `alert`'s soft disable, which
+  ends the drive 3 s on; det_age(t) the rows' detections age."""
+  rows = drive([(4.0, dict(A)),
+                (3.0, {'handback': 'detectorStopped', 'state': 'unavailable', 'alert': alert, **A}),
+                (1.0, {'enabled': False, 'handback': 'detectorStopped', 'state': 'unavailable', **A})])
+  for r in rows:
+    r['det_age'] = det_age(r['t'])
+  return rows
+
+
+class TestDetectorSilentAtTheHandback:
+  """S01 'handback within 2.0 s of the drop (rlog: last turnpilotDetections to turnpilotPlan.handback)' (B9, B6): with the
+  rows' det_age, the detectorStopped handback's own row shows the detector silent for turnpilotd's DETECTOR_DEADLINE_S (but
+  a row or two); and the disengagement after a fault's handback is that handback's own event's soft disable."""
+  EXPECT = ('handback:detectorStopped',)
+  DROP = {'t': 2.4, 's': 20.0, 'param': 'TurnPilotSimDropDetectionsS'}
+
+  def test_the_deadline_is_turnpilots(self):
+    from openpilot.selfdrive.turnpilot.turnpilotd import DETECTOR_DEADLINE_S
+    assert score.DETECTOR_DEADLINE_S == DETECTOR_DEADLINE_S
+
+  def test_a_handback_with_detections_still_coming_fails(self):
+    # the skeptic's B9: det_age 0.05 s on every row, the drop at 2.4 s, detectorStopped at 4.0 s
+    res = score.summarize('straight_cruise', drop_handback(lambda t: 0.05), 'disengaged', expect=self.EXPECT, drop=self.DROP)
+    assert not res['passed'] and not res['expected'][0]['met']
+    want = "handed back detectorStopped with the detector's last detections 0.05 s old, under turnpilotd's 1.5 s deadline: " + \
+           "the detector hadn't gone silent"
+    assert want in res['failures'], res['failures']
+
+  def test_silent_from_the_drop_passes(self):
+    res = score.summarize('straight_cruise', drop_handback(lambda t: 0.05 if t <= 2.5 else round(t - 2.45, 3)), 'disengaged',
+                          expect=self.EXPECT, drop=self.DROP)
+    assert res['passed'], res['failures']
+    # a row short of the deadline is a row late: 1.45 s
+    res = score.summarize('straight_cruise', drop_handback(lambda t: 0.05 if t <= 2.6 else round(t - 2.55, 3)), 'disengaged',
+                          expect=self.EXPECT, drop=self.DROP)
+    assert res['passed'], res['failures']
+
+  def test_the_soft_disable_is_the_handbacks_own(self):
+    # B6: detectorStopped, then another event's soft disable ends the drive
+    res = score.summarize('straight_cruise', drop_handback(lambda t: 0.05 if t <= 2.5 else round(t - 2.45, 3), alert='commIssue/softDisable'),
+                          'disengaged', expect=self.EXPECT, drop=self.DROP)
+    assert not res['passed']
+    want = "the disengagement after the detectorStopped handback was another event's soft disable (commIssue/softDisable), " + \
+           "not turnpilotDetectorStopped's"
+    assert want in res['failures'], res['failures']
+    assert [score.fault_event(k) for k in score.FAULT_HANDBACKS] == ['turnpilotDetectorStopped', 'turnpilotModelFellBack', 'turnpilotNoDetector']
