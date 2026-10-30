@@ -383,7 +383,9 @@ def measure(drive: Drive, allow_misses: bool = False) -> Result:
   far = Pick('TurnPilotLeftFarRangeM', n=len(res.samples))
   if not far_runs:
     reading = drive.far_status.get('read', 0)
-    far.why = f"far crop off: no turnpilotFarDetections in the logs (the full pass's farStatus read on {reading} runs)"
+    far.why = f"no turnpilotFarDetections in the logs, though the full pass's farStatus read on {reading} runs: the far runs were " + \
+      "not logged, so nothing shows what the far crop boxed" if reading else \
+      "far crop off: no turnpilotFarDetections in the logs, and the full pass's farStatus never read"
   elif res.road.range_m is None:
     far.why = "no road range: turnpilotd extends the reach by the far crop only past a measured TurnPilotLeftRangeM"
   else:
