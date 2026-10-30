@@ -397,7 +397,9 @@ class TurnPilot:
       self.left = UnprotectedLeft()  # the autonomous unprotected left (unprotected_left.py); kept through a fault, as its latch
       self.stop_go = StopGo()  # the stop-sign decider: kept through a fault, as the latch it decides for
       self.stop_go.on_signal_seen = self.signal_seen_override
+      self.sg_route_maneuver: str | None = None  # the route's maneuver at its control, last frame (stop_go_update)
     self.go_cert.withdraw('reset')  # a disabled plan carries no go
+    self.decider_turn_id: int | None = None  # the route's turn whose stop sign the decider acted for last frame (update())
     self.stopped_s = 0.            # standing engaged with nothing holding the car (carStoppedTakeControl)
     self.stall_s = 0.              # standing in the turn after its go, nothing holding the car (stalledTakeControl)
     self.missed_t = 0.             # turnMissed is held while this counts down
@@ -609,8 +611,14 @@ class TurnPilot:
     # an engaged one stays through a handback and after it, as a stop sign's stop does: the stops in force stay, and the
     # detector back is no reason to cross the blind junction without its stop and its handback
     engaged = self.map_controls.turn_engaged(rf.maneuver_id) and not skipped
+    # the stop-sign decider acting for this turn's junction (last frame's decision: it runs after the left, below) judges the
+    # turn's crossing itself, a left's oncoming lanes among its conflicts (stop_rules.TURN_SETS), and its go is the turn's first
+    # pulse: the autonomous left stands aside there, its approach's pulse hold and its hold line's feasibility with it. A left
+    # whose pulse waited for the left's own go had none at the decider's go, and rolling past the left's hold line it was
+    # skipped (unprotectedStop): the decider launched for the left, the car crossed straight and its lamp went dark
+    decided = self.decider_turn_id == rf.maneuver_id and not engaged
     turn, stop_infeasible = None, False
-    if (driving or engaged) and unprotected_turn(upcoming, right_hand_traffic):
+    if (driving or engaged) and not decided and unprotected_turn(upcoming, right_hand_traffic):
       if engaged or turn_stop_feasible(v_ego, rf.distance):
         turn = (rf.maneuver_id, rf.distance, 'left' if upcoming.side == LEFT else 'right')
       else:
@@ -620,6 +628,9 @@ class TurnPilot:
     left_cmd = self.unprotected_left(turn, upcoming, rf, v_ego, acting, objects, raw, raw_far)
     # the stop-sign decider before map_update, so its release, the end of shouldStop and its go land in one plan
     sg = self.sg_now = self.stop_go_update(sm, cs, model, v_ego, acting, objects, rf)
+    turn_side = None if upcoming is None or upcoming.kind != TURN or upcoming.side == 0 else 'left' if upcoming.side == LEFT else 'right'
+    self.decider_turn_id = rf.maneuver_id if sg.acting and sg.state not in ('off', 'done') and self.sg_route_maneuver == turn_side \
+      else None
     mapd = self.map_update(sm, v_ego, cs.gasPressed, turn, left_cmd, release=sg.release, creep=sg.creep,
                            stop=StopCommand(sg.latch, sg.reason, sg.action))
     took_over = cs.gasPressed and not sm['carControl'].enabled  # the driver driving, never a go (module docstring)
@@ -1078,6 +1089,7 @@ class TurnPilot:
       junction = junction_from_info('stop', src.junction_info) if src is not None else None
       m = str(info.get('maneuver', 'straight'))
       maneuver = 'unknown' if src is not None and src.key[0] == OFF_ROUTE else m if m in ('straight', 'left', 'right') else 'unknown'
+      self.sg_route_maneuver = maneuver
       vis = self.vis_source()
       lead = model.leadsV3[0] if len(model.leadsV3) else None
       lead_m = float(lead.x[0]) if lead is not None and lead.prob > STOPPED_LEAD_PROB and len(lead.x) else None
@@ -1095,6 +1107,7 @@ class TurnPilot:
       return self.stop_go.update(f)
     except Exception:
       log_error("turnpilotd.stop_go_failed")
+      self.sg_route_maneuver = None
       return StopGoDecision(latch='shadow', withdraw='error')
 
   def signal_seen_override(self, j) -> None:
