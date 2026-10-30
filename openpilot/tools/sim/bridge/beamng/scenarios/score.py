@@ -103,13 +103,15 @@ TURN_DESIRES = (1, 2)  # log.Desire.turnLeft, turnRight
 EXPECTS = ('handback', 'gasDisengage', 'skip', 'turnMissed', 'hardBrake')
 # a take-control handback holds the car while the driver is told to take control (hooks.TAKE_CONTROL_PROMPTS): from it,
 # engaged, the car goes no further than a stop from its speed then, HELD_REACT_S at that speed and HELD_DECEL after it (a
-# go withdrawn rolling stops at turnpilotd's STOP_DECEL, 1.5 m/s^2), plus HELD_SLACK_M. The stop sign's comes after a full
-# stop (the last the car did before it was stand, not drive), never rolling. The left's withdrawn go (SHORT_OF_LANES, S02
-# 'stopped short of the oncoming lanes') is handed back outside the junction's conflict zone (CONFLICT_M) and held there:
-# engaged after it the car never comes within CONFLICT_M of the junction, nor goes further than the zone was from it
+# go withdrawn rolling stops at turnpilotd's STOP_DECEL, 1.5 m/s^2), plus HELD_SLACK_M. The stop sign's (FULL_STOP_HANDBACKS)
+# comes after a full stop: the car standing at the handback's own row, never rolling (not a stand some time back and a roll
+# up to the sign). The left's withdrawn go (SHORT_OF_LANES, S02 'stopped short of the oncoming lanes') is handed back
+# outside the junction's conflict zone (CONFLICT_M) and held there: engaged after it the car never comes within CONFLICT_M
+# of the junction, nor goes further than the zone was from it
 HELD_REACT_S = 0.5
 HELD_DECEL = STOP_DECEL
 HELD_SLACK_M = 1.0
+FULL_STOP_HANDBACKS = ('stopSignTakeControl',)
 SHORT_OF_LANES = ('cantStartTakeControl',)
 # ...and comes soon after the left's go (S02 'handback within 3.5 s of the go, 1.5 s with the lift off'): LIFT_HANDBACK_S
 # from it with plannerd's lift certified for it (go_override.GO_WINDOW_S, 3 s, then withdrawn), NO_LIFT_HANDBACK_S without
@@ -125,7 +127,6 @@ ROW_TOL_S = 0.1
 STALL_HANDBACKS = ('stalledTakeControl',)
 STALL_PROMPT_S = 3.
 STALL_LATE_S = 0.3
-FULL_STOP_HANDBACKS = ('stopSignTakeControl',)
 # turnpilotPlan.handback's kinds: a fault, handed back with openpilot's soft disable, which ends the drive (the car is not
 # held: it coasts engaged through the soft disable); the disengagement after one is that soft disable's
 FAULT_HANDBACKS = ('detectorStopped', 'modelFellBack', 'noDetector')
@@ -792,14 +793,9 @@ def stand_before(rows, t: float) -> dict:
   return {'from_t': rows[j]['t'], 'stood_s': round(t - rows[j]['t'], 2)}
 
 
-def stood_before(rows, t: float) -> bool:
-  """The last the car did before the row at t was stand (under STOPPED_V), not drive (over RESUMED_V): a full stop."""
-  for r in reversed([r for r in rows if r['t'] <= t]):
-    if r['v'] < STOPPED_V:
-      return True
-    if r['v'] > RESUMED_V:
-      return False
-  return False
+def stood_at(rows, t: float) -> bool:
+  """The car standing (under STOPPED_V) at the handback's own first row, the row at t: its full stop (FULL_STOP_HANDBACKS)."""
+  return next((r for r in rows if r['t'] >= t), rows[-1])['v'] < STOPPED_V
 
 
 def expect_facts(rows) -> dict:
@@ -833,7 +829,7 @@ def expect_facts(rows) -> dict:
           'gas_t': gas_t,
           'handback_det_t': det_t,
           'held': {k: held_after(rows, t) for k, t in first['handback'].items() if k in TAKE_CONTROL_PROMPTS},
-          'stood_before': {k: stood_before(rows, t) for k, t in first['handback'].items() if k in FULL_STOP_HANDBACKS},
+          'stood_at': {k: stood_at(rows, t) for k, t in first['handback'].items() if k in FULL_STOP_HANDBACKS},
           'go_before': {k: go_before(rows, t) for k, t in first['handback'].items() if k in GO_TIMED},
           'stand_before': {k: stand_before(rows, t) for k, t in first['handback'].items() if k in STALL_HANDBACKS},
           'desire_after_skip_t': next((r['t'] for r in rows if skip_t is not None and r['t'] >= skip_t and r.get('desire') in TURN_DESIRES), None),
@@ -901,7 +897,7 @@ def handback_problems(name: str, arg: str, t: float, facts: dict, res: dict) -> 
   if h is not None and h['went_m'] > h['allowed_m']:
     out.append(f"moved {h['went_m']:.1f} m engaged after the {arg} handback (up to {h['v_max']:.1f} m/s), past the " +
                f"{h['allowed_m']:.1f} m a stop from {h['v0']:.1f} m/s allows: not held")
-  if arg in FULL_STOP_HANDBACKS and not facts.get('stood_before', {}).get(arg, True):
+  if arg in FULL_STOP_HANDBACKS and not facts.get('stood_at', {}).get(arg, False):
     out.append(f"handed back {arg} at t={t:.1f} s at {h['v0'] if h else 0.:.1f} m/s: no full stop before it")
   if arg in FAULT_HANDBACKS:
     after = [d for d in res['disengagements'] if d['t'] >= t]

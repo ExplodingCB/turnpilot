@@ -217,3 +217,30 @@ class TestStallTimed:
       res = score.summarize('ped_crosswalk_right', walker_stall(unheld_s), 'taken over', expect=self.EXPECT)
       assert any(f.startswith(f"handed back stalledTakeControl {unheld_s:.1f} s into the car's stand") for f in res['failures']), \
         (unheld_s, res['failures'])
+
+
+class TestStopSignFullStop:
+  """S23 with avoidance off, 'full stop, handback, no go' (B3): the stop sign's handback (stopSignTakeControl) comes with the
+  car standing at its own first row, never on a roll up after a stand some time back."""
+  EXPECT = ('handback:stopSignTakeControl',)
+
+  def rows(self, v_at_handback):
+    SS = {'map_kind': 'stop', 'state': 'holding', 'reason': 'Stop sign'}
+    return drive([(5.0, {'map_kind': 'stop', 'v': 8.}),
+                  (2.0, {**SS, 'v': 0.}),
+                  (8.0, {**SS, 'v': 1.5}),
+                  (1.0, {**SS, 'v': lambda tau: max(v_at_handback - 1.5 * tau, 0.), 'control_prompt': 'stopSignTakeControl'}),
+                  (3.0, {**SS, 'v': 0., 'control_prompt': 'stopSignTakeControl'}),
+                  (0.5, {'v': 0., 'enabled': False, 'brake': True})])
+
+  def test_a_handback_rolling_after_an_old_stand_fails(self):
+    # the skeptic's B3: stood 12 m short, rolled 8 s at 1.5 m/s, handed back still rolling at 1.5 m/s
+    res = score.summarize('twoway_route_pair', self.rows(1.5), 'taken over', expect=self.EXPECT)
+    assert not res['passed'] and not res['expected'][0]['met']
+    assert "handed back stopSignTakeControl at t=15.0 s at 1.5 m/s: no full stop before it" in res['failures'], res['failures']
+    assert res['expect_facts']['stood_at'] == {'stopSignTakeControl': False}
+
+  def test_standing_at_the_handback_is_the_full_stop(self):
+    res = score.summarize('twoway_route_pair', self.rows(0.), 'taken over', expect=self.EXPECT)
+    assert res['expect_facts']['stood_at'] == {'stopSignTakeControl': True}
+    assert not any('no full stop' in f for f in res['failures']), res['failures']
