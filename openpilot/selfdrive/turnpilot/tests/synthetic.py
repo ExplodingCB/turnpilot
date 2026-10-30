@@ -15,8 +15,9 @@ def set_lanes(builder, field, lanes):
 def nav_instruction(distance, mtype="turn", modifier="left", remaining=None, lanes=(), valid=True, junction=None,
                     through=None, route_count=0, ahead=(), controls=(), controls_status=None, off_route=(), off_route_status=None):
   """A navInstruction reader. lanes: ((directions, active), ...) left to right. junction: (bearing_before,
-  bearing_after, branches[, opposing[, opposing speed m/s[, opposing lanes]]]) from Valhalla, or None for a route without
-  intersection data; opposing is NavInstruction.Opposing's name, unknown when left out; its speed and lanes 0 (unknown). through: (lanes, distance).
+  bearing_after, branches[, opposing[, opposing speed m/s[, opposing lanes[, opposing straight m]]]]) from Valhalla, or None for a
+  route without intersection data; opposing is NavInstruction.Opposing's name, unknown when left out; its speed, lanes and
+  straight span 0 (unknown). through: (lanes, distance).
   route_count: navd's routeCount. ahead: the maneuvers after this one for allManeuvers, [(distance, type, modifier[,
   junction]), ...]; allManeuvers starts with this one, as navd's does. controls: map stop controls, [(id, kind, distance[,
   line_mapped, junction, cross_suspect[, junctionInfo dict]]), ...]; controls_status: navd's controlsStatus ('ok' when there are controls).
@@ -34,6 +35,7 @@ def nav_instruction(distance, mtype="turn", modifier="left", remaining=None, lan
       m.opposing = m_junction[3] if len(m_junction) > 3 else 'unknown'
       m.opposingSpeed = float(m_junction[4]) if len(m_junction) > 4 else 0.
       m.opposingLanes = int(m_junction[5]) if len(m_junction) > 5 else 0
+      m.opposingStraightM = float(m_junction[6]) if len(m_junction) > 6 else 0.
   ni.maneuverDistance = float(distance)
   ni.maneuverType = mtype
   ni.maneuverModifier = modifier
@@ -46,6 +48,7 @@ def nav_instruction(distance, mtype="turn", modifier="left", remaining=None, lan
     ni.maneuverOpposing = junction[3] if len(junction) > 3 else 'unknown'
     ni.maneuverOpposingSpeed = float(junction[4]) if len(junction) > 4 else 0.
     ni.maneuverOpposingLanes = int(junction[5]) if len(junction) > 5 else 0
+    ni.maneuverOpposingStraightM = float(junction[6]) if len(junction) > 6 else 0.
   if through is not None:
     set_lanes(ni, 'throughLanes', through[0])
     ni.throughLanesDistance = float(through[1])

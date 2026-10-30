@@ -2509,6 +2509,11 @@ struct NavInstruction {
   # the route's first edge (the origin street: "First stop needs you" before engagement)
   unavoidableControls @30 :UInt16;
   firstUnavoidableOnOrigin @31 :Bool;
+  # TurnPilot (skeptic G4 residual): m from the maneuver's junction out along our approach's heading that the opposing road
+  # (the road straight across) stays within the unprotected left's oncoming band (routing/controls.py: opposing_straight,
+  # probed by locate at OPPOSING_STRAIGHT_STEP_M steps), 0 when not known: the left's band assumes a straight opposing road
+  # over R_req, so a left whose R_req is past it is never attempted (turnpilotd), undecided at its line (unprotected_left)
+  maneuverOpposingStraightM @32 :Float32;
 
   enum Opposing {
     unknown @0;  # no intersection data for the junction (or a navd from before the field)
@@ -2734,6 +2739,7 @@ struct NavInstruction {
     opposing @7 :Opposing;
     opposingSpeed @8 :Float32;  # as maneuverOpposingSpeed and maneuverOpposingLanes
     opposingLanes @9 :UInt8;
+    opposingStraightM @10 :Float32;  # as maneuverOpposingStraightM
   }
 }
 

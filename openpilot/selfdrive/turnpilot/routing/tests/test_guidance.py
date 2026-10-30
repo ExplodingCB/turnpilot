@@ -230,7 +230,8 @@ class TestOpposingRoad(unittest.TestCase):
       return [{'edges': [outbound, inbound]}]
     roads = opposing_roads(call, steps)
     self.assertEqual(list(roads), [0])  # the left's junction; the bend has no opposing road
-    speed, lanes = roads[0]
+    speed, lanes, straight = roads[0]
+    self.assertEqual(straight, 0.)  # its straightness probes found nothing here: not known
     self.assertAlmostEqual(speed, 40 / 3.6, places=3)
     self.assertEqual(lanes, 1)
     self.assertEqual(len(calls), 1)  # one batched call
@@ -239,13 +240,55 @@ class TestOpposingRoad(unittest.TestCase):
     for limit in (0, 255):
       roads = opposing_roads(lambda e, r, limit=limit: [{'edges': [{'heading': 270, 'distance': 0., 'edge': {'lane_count': 1},
                                                                     'edge_info': {'speed_limit': limit}}]}], steps)
-      self.assertEqual(roads[0], (0., 1))
+      self.assertEqual(roads[0], (0., 1, 0.))
     # nothing found, or the call failing: no entry (unknown), never a speed
     self.assertEqual(opposing_roads(lambda e, r: [{'edges': []}], steps), {})
 
     def boom(e, r):
       raise RuntimeError("valhalla down")
     self.assertEqual(opposing_roads(boom, steps), {})
+
+  def test_the_opposing_roads_straight_span_from_our_approach_is_probed_in_the_same_call(self):
+    # skeptic G4 (residual): the unprotected left's band is straight on from our approach, and nothing checked the opposing
+    # road's shape: on a 400 m radius curving away from the turn an oncoming car 80-135 m up was outside the band. Its straight
+    # span: locate every OPPOSING_STRAIGHT_STEP_M on that line, the road coming in found no more than OPPOSING_STRAIGHT_AWAY_M
+    # to the side away from the turn and OPPOSING_STRAIGHT_TOWARD_M toward it, out to the last of those in a row
+    import math
+    from openpilot.selfdrive.turnpilot.routing.controls import (EARTH_M_PER_DEG, OPPOSING_STRAIGHT_MAX_M, OPPOSING_STRAIGHT_RADIUS_M,
+                                                                OPPOSING_STRAIGHT_STEP_M, opposing_roads)
+    from openpilot.selfdrive.turnpilot.routing.guidance import approach_line
+    steps = steps_of('valhalla_left_then_right.json')
+    lat0, lon0, heading, side = approach_line(steps, 0)
+    self.assertEqual((round(heading), side), (90, 1))  # heading east, a left: the turn's side is our left
+
+    def road(radius=None, toward=1., inbound=True, found=True):
+      """A locate over a road that leaves the line on a circle of radius (None straight), toward the turn (1) or away (-1)."""
+      def call(endpoint, req):
+        out = []
+        for loc in req['locations']:
+          east = (loc['lon'] - lon0) * EARTH_M_PER_DEG * math.cos(math.radians(lat0))
+          north = (loc['lat'] - lat0) * EARTH_M_PER_DEG
+          rad = math.radians(heading)
+          m = east * math.sin(rad) + north * math.cos(rad)
+          y = 0. if radius is None else toward * side * m * m / (2. * radius)  # left of our heading
+          lat = loc['lat'] + y * math.sin(rad) / EARTH_M_PER_DEG  # left of heading: (east, north) = (-cos, sin)
+          lon = loc['lon'] - y * math.cos(rad) / (EARTH_M_PER_DEG * math.cos(math.radians(lat0)))
+          head = loc['heading'] if inbound else (loc['heading'] + 180) % 360
+          edge = {'heading': head, 'distance': abs(y), 'correlated_lat': lat, 'correlated_lon': lon, 'edge': {'lane_count': 1},
+                  'edge_info': {'speed_limit': 40}}
+          out.append({'edges': [edge] if found and abs(y) <= OPPOSING_STRAIGHT_RADIUS_M else []})
+        return out
+      return call
+    self.assertEqual(opposing_roads(road(), steps)[0][2], OPPOSING_STRAIGHT_MAX_M)
+    # 400 m away from the turn: 0.8 m off at 25 m, 3.1 m at 50 m (past OPPOSING_STRAIGHT_AWAY_M): straight to 25 m
+    self.assertEqual(opposing_roads(road(400., toward=-1.), steps)[0][2], OPPOSING_STRAIGHT_STEP_M)
+    # toward the turn the band reaches further: 7 m off at 75 m, 12.5 m at 100 m
+    self.assertEqual(opposing_roads(road(400., toward=1.), steps)[0][2], 3 * OPPOSING_STRAIGHT_STEP_M)
+    # 4 km away from the turn: 1.95 m off at 125 m, 2.8 m at 150 m
+    self.assertEqual(opposing_roads(road(4000., toward=-1.), steps)[0][2], 5 * OPPOSING_STRAIGHT_STEP_M)
+    # nothing coming in toward the junction there (a one-way away, or another road's edge): not straight
+    self.assertEqual(opposing_roads(road(inbound=False), steps), {})
+    self.assertEqual(opposing_roads(lambda e, r: road()(e, r)[:1] + [{'edges': []}] * (len(r['locations']) - 1), steps)[0][2], 0.)
 
   def test_into_navinstruction(self):
     steps = steps_of('valhalla_left_then_right.json')
@@ -257,6 +300,11 @@ class TestOpposingRoad(unittest.TestCase):
     self.assertEqual(instruction.allManeuvers[1].opposingSpeed, 0.)
     fill_guidance(instruction, steps, 1, 300, opposing={0: (11.11, 1)})
     self.assertEqual((instruction.maneuverOpposingSpeed, instruction.maneuverOpposingLanes), (0., 0))
+    # the straight span rides along (0 unknown, and from a road with none)
+    self.assertEqual(instruction.maneuverOpposingStraightM, 0.)
+    fill_guidance(instruction, steps, 0, 300, opposing={0: (11.11, 1, 175.)})
+    self.assertEqual((instruction.maneuverOpposingStraightM, instruction.allManeuvers[0].opposingStraightM), (175., 175.))
+    self.assertEqual(instruction.allManeuvers[1].opposingStraightM, 0.)
 
 
 class TestJunctionSchema(unittest.TestCase):

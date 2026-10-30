@@ -41,7 +41,11 @@ nothing else holding the car, for FAR_BLOCKED_UNDECIDED_S (a far box FAR_BLOCK_R
 fault, farBlocked, never an endless silent wait. Not needed, a far box blocks as the full pass's do. A full pass box
 blocks whatever the far runs say. Past both ranges, the far range unmeasured, or the far crop off, it is undecided, saying
 which (range, farUnmeasured, farOff).
-Nothing here checks the junction's own sightline (a curve or crest short of R_req): the demo junction is chosen by eye for
+The band assumes the opposing road straight on from our approach out to R_req: navd's map check of it (straight_m:
+routing/controls.py's opposing_straight, the road coming in found on that line every 25 m) must reach R_req from the
+junction, or the left is never attempted (turnpilotd skips it at route time) and is undecided ('curve') should it reach its
+hold; not known is not straight (skeptic G4: on a road curving away from the turn the band missed a car 80-135 m up).
+Nothing here checks the junction's own sightline (a crest, a hedge short of R_req): the demo junction is chosen by eye for
 a clear sightline of R_req or more. Held
 short of its line (the latch reaches LATCH_NEAR_M short), where the longer crossing puts R_req past the range, the car rolls
 up to the line first (ROLL_UP_M; undecided only after ROLL_UP_STALL_S standing in it).
@@ -194,6 +198,8 @@ class LeftInput:
   far_range_m: float = 0.        # the far crop's proven range (TurnPilotLeftFarRangeM): 0 unmeasured
   far_live: bool = False         # the far crop on (the full pass's latest farStatus read, noRoom or noCalibration): its runs'
                                  # freshness is judged here (FAR_FRESH_S, farStale)
+  straight_m: float = math.inf   # m from the junction the opposing road stays in the band straight on from our approach
+                                 # (navInstruction maneuverOpposingStraightM; turnpilotd passes 0 when not known)
 
 
 @dataclass
@@ -511,6 +517,10 @@ class UnprotectedLeft:
     # roll-up toward the junction under a red), its reach judged from the line once it has rolled up
     if rreq > range_eff and not (roll_up and held_else):
       return self._undecided(out, reach_fault(inp, rreq))
+    if inp.distance + max(inp.straight_m, 0.) < rreq:
+      # the band is straight on from our approach: an opposing road that leaves it within R_req (a curve, a skewed leg) puts
+      # its oncoming cars outside it, uncounted (skeptic G4), and one whose shape isn't known can't be judged. Out loud
+      return self._undecided(out, 'curve')
     if self.road_age > STALE_UNDECIDED_S:
       return self._undecided(out, 'stale')
     if far_needed and rreq <= range_eff and self.far_stale > STALE_UNDECIDED_S:
@@ -654,6 +664,7 @@ UNDECIDED_REASON = {
   'farStale': "Far camera not seeing oncoming traffic: take control",
   'farBlocked': "Can't tell if far traffic is coming: take control",
   'position': "Junction position unsure: take control",
+  'curve': "Oncoming road curves out of view: take control",
   'stale': "Camera not seeing oncoming traffic: take control",
   'yaw': "Not facing oncoming traffic: take control",
   'blocked': "View of oncoming traffic blocked: take control",

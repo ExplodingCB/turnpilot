@@ -86,7 +86,7 @@ from pathlib import Path
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.turnpilot.routing import junctions as jn
 from openpilot.selfdrive.turnpilot.routing import osm_sidecar
-from openpilot.selfdrive.turnpilot.routing.guidance import opposing_leg
+from openpilot.selfdrive.turnpilot.routing.guidance import approach_line, opposing_leg
 
 CONTROL_LINE_M = 10.    # m before the junction node a stop line is taken to be, without a mapped one
 MAP_MARGIN_M = 1.       # m short of the line the car stops
@@ -176,8 +176,8 @@ class Control:
 
 @dataclass
 class Opposing:
-  """route_controls' out-parameter: the route's opposing roads ({step index: (m/s, lanes)}, opposing_roads'), read in its
-  one batched Q2 locate; None until that locate ran (unsupported tiles, an early failure: opposing_roads alone then)."""
+  """route_controls' out-parameter: the route's opposing roads ({step index: (m/s, lanes, straight m)}, opposing_roads'), read
+  in its one batched Q2 locate; None until that locate ran (unsupported tiles, an early failure: opposing_roads alone then)."""
   roads: dict | None = None
 
 
@@ -381,41 +381,115 @@ OPPOSING_RADIUS_M = 8.
 UNLIMITED_KPH = 255         # Valhalla's speed_limit for no limit (kUnlimitedSpeedLimit)
 
 
+# The unprotected left's oncoming band (unprotected_left.band_blockers) is straight on from our approach: an opposing road that
+# curves or is skewed off that line within R_req leaves its oncoming cars outside the band, uncounted (skeptic G4: on a 400 m
+# radius curving away from the turn a car 80-135 m up was missed, R_req 134 m). So it is checked against the map: a locate
+# every OPPOSING_STRAIGHT_STEP_M out to OPPOSING_STRAIGHT_MAX_M on the line straight on from our approach through the junction,
+# the road coming in toward it (OPPOSING_HEADING_TOL) found within OPPOSING_STRAIGHT_RADIUS_M, its nearest point no more than
+# OPPOSING_STRAIGHT_AWAY_M to the side away from the turn (where the band's near edge loses the first oncoming lane) and no more
+# than OPPOSING_STRAIGHT_TOWARD_M toward it: the straight span is out to the last of those in a row (0 the first not)
+OPPOSING_STRAIGHT_STEP_M = 25.
+OPPOSING_STRAIGHT_MAX_M = 250.
+OPPOSING_STRAIGHT_RADIUS_M = 15.
+OPPOSING_STRAIGHT_AWAY_M = 2.
+OPPOSING_STRAIGHT_TOWARD_M = 10.
+EARTH_M_PER_DEG = 111320.
+
+
+def offset_m(lat0: float, lon0: float, lat: float, lon: float) -> tuple[float, float]:
+  """(east, north) m of (lat, lon) from (lat0, lon0), locally flat."""
+  return (lon - lon0) * EARTH_M_PER_DEG * math.cos(math.radians(lat0)), (lat - lat0) * EARTH_M_PER_DEG
+
+
+def straight_probes(steps) -> dict:
+  """{step index: (lat, lon, heading, side, [m out of each probe])} for opposing_straight: the junctions with an opposing road
+  (guidance.approach_line) whose maneuver turns."""
+  return {i: line + ([OPPOSING_STRAIGHT_STEP_M * (k + 1) for k in range(int(OPPOSING_STRAIGHT_MAX_M / OPPOSING_STRAIGHT_STEP_M))],)
+          for i in range(len(steps)) if (line := approach_line(steps, i)) is not None and line[3] != 0}
+
+
+def straight_locations(lines: dict) -> list[dict]:
+  out = []
+  for lat, lon, heading, _, at in lines.values():
+    rad = math.radians(heading)
+    for m in at:
+      out.append({'lat': lat + m * math.cos(rad) / EARTH_M_PER_DEG,
+                  'lon': lon + m * math.sin(rad) / (EARTH_M_PER_DEG * math.cos(math.radians(lat))),
+                  'heading': round((heading + 180.) % 360.) % 360, 'heading_tolerance': OPPOSING_HEADING_TOL,
+                  'radius': OPPOSING_STRAIGHT_RADIUS_M})
+  return out
+
+
+def straight_parse(lines: dict, located) -> dict[int, float]:
+  """{step index: the opposing road's straight span, m} from locate's answers for straight_locations (module constants)."""
+  out, k = {}, 0
+  located = list(located or [])
+  for i, (lat, lon, heading, side, at) in lines.items():
+    inbound, rad = (heading + 180.) % 360., math.radians(heading)
+    span = 0.
+    for m in at:
+      loc = located[k] if k < len(located) else None
+      k += 1
+      if span < m - OPPOSING_STRAIGHT_STEP_M - 1e-6:
+        continue  # already broken
+      ok = False
+      for c in (loc or {}).get('edges') or []:
+        if angle_diff(float(c.get('heading', inbound)), inbound) > OPPOSING_HEADING_TOL:
+          continue
+        if c.get('correlated_lat') is None or c.get('correlated_lon') is None:
+          ok = ok or float(c.get('distance', math.inf)) <= OPPOSING_STRAIGHT_AWAY_M  # no point to tell the side by: the strict one
+          continue
+        east, north = offset_m(lat, lon, float(c['correlated_lat']), float(c['correlated_lon']))
+        toward = (-east * math.cos(rad) + north * math.sin(rad)) * side  # left of our heading, toward the turn's side
+        ok = ok or -OPPOSING_STRAIGHT_AWAY_M <= toward <= OPPOSING_STRAIGHT_TOWARD_M
+      if ok:
+        span = m
+    out[i] = span
+  return out
+
+
 def opposing_probes(steps) -> tuple[dict, list[dict]]:
-  """({step index: (lat, lon, bearing)}, their locate locations) for opposing_roads: a point OPPOSING_PROBE_M out along the
-  road straight across each maneuver's junction (guidance.opposing_leg), by the heading coming into the junction."""
+  """({'legs': {step index: (lat, lon, bearing)}, 'lines': straight_probes'}, their locate locations) for opposing_roads: a
+  point OPPOSING_PROBE_M out along the road straight across each maneuver's junction (guidance.opposing_leg), by the heading
+  coming into the junction, then the straightness probes (straight_locations)."""
   legs = {i: leg for i in range(len(steps)) if (leg := opposing_leg(steps, i)) is not None}
-  return legs, [{'lat': lat, 'lon': lon, 'heading': round((b + 180.) % 360.) % 360, 'heading_tolerance': OPPOSING_HEADING_TOL,
-                 'radius': OPPOSING_RADIUS_M} for lat, lon, b in legs.values()]
+  lines = straight_probes(steps)
+  return {'legs': legs, 'lines': lines}, [{'lat': lat, 'lon': lon, 'heading': round((b + 180.) % 360.) % 360,
+                                           'heading_tolerance': OPPOSING_HEADING_TOL, 'radius': OPPOSING_RADIUS_M}
+                                          for lat, lon, b in legs.values()] + straight_locations(lines)
 
 
-def opposing_parse(legs: dict, located) -> dict[int, tuple[float, int]]:
-  """opposing_roads' answer from locate's answers for opposing_probes' locations."""
+def opposing_parse(probes: dict, located) -> dict[int, tuple[float, int, float]]:
+  """opposing_roads' answer from locate's answers for opposing_probes' locations: {step index: (m/s, lanes, straight m)}."""
+  legs, lines = probes['legs'], probes['lines']
+  located = list(located or [])
+  straight = straight_parse(lines, located[len(legs):])
   out = {}
-  for (i, (_, _, b)), loc in zip(legs.items(), located, strict=False):
+  for (i, (_, _, b)), loc in zip(legs.items(), located[:len(legs)], strict=False):
     inbound = (b + 180.) % 360.
     cands = [c for c in (loc or {}).get('edges') or [] if angle_diff(float(c.get('heading', inbound)), inbound) <= OPPOSING_HEADING_TOL]
     if not cands:
       continue
     c = min(cands, key=lambda c: (round(float(c.get('distance', 0.)), 1), angle_diff(float(c.get('heading', inbound)), inbound)))
     limit = float((c.get('edge_info') or {}).get('speed_limit') or 0.)
-    out[i] = (limit / 3.6 if 0. < limit < UNLIMITED_KPH else 0., int((c.get('edge') or {}).get('lane_count') or 0))
+    out[i] = (limit / 3.6 if 0. < limit < UNLIMITED_KPH else 0., int((c.get('edge') or {}).get('lane_count') or 0), straight.get(i, 0.))
   return out
 
 
-def opposing_roads(call, steps) -> dict[int, tuple[float, int]]:
-  """{step index: (speed limit m/s, lanes)} for the road straight across the junction of each maneuver that ends a step
-  (guidance.opposing_leg), from one batched verbose locate OPPOSING_PROBE_M out along it: the edge coming into the junction,
-  its edge_info.speed_limit (tagged maxspeed, km/h; 0 untagged and 255 unlimited are 0, unknown) and edge.lane_count (0
-  unknown). A leg with no such edge has no entry; a failure is logged and gives {} (unknown everywhere: the unprotected left
-  takes 45 mph, never a guess lower). route_controls reads the same in its own batched locate (Opposing), so a route makes
-  one: this is for when it didn't."""
+def opposing_roads(call, steps) -> dict[int, tuple[float, int, float]]:
+  """{step index: (speed limit m/s, lanes, straight m)} for the road straight across the junction of each maneuver that ends a
+  step (guidance.opposing_leg), from one batched verbose locate OPPOSING_PROBE_M out along it: the edge coming into the
+  junction, its edge_info.speed_limit (tagged maxspeed, km/h; 0 untagged and 255 unlimited are 0, unknown) and
+  edge.lane_count (0 unknown); and, in the same call, how far out it keeps the line straight on from our approach
+  (straight_parse, 0 unknown or none). A leg with no such edge has no entry; a failure is logged and gives {} (unknown
+  everywhere: the unprotected left takes 45 mph, never a guess lower, and no straight span: never attempted). route_controls
+  reads the same in its own batched locate (Opposing), so a route makes one: this is for when it didn't."""
 
   try:
-    legs, locs = opposing_probes(steps)
-    if not legs:
+    probes, locs = opposing_probes(steps)
+    if not probes['legs']:
       return {}
-    return opposing_parse(legs, call('locate', {'locations': locs, 'costing': 'auto', 'verbose': True}) or [])
+    return opposing_parse(probes, call('locate', {'locations': locs, 'costing': 'auto', 'verbose': True}) or [])
   except Exception:
     cloudlog.exception("turnpilot opposing roads: failed")
     return {}
@@ -970,7 +1044,7 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
     f['node_edge'] = governed_node(edges, tpts, ends, f['a'], osm.junction_pos(f['osm_node']) if osm_ok and f['osm_node'] else None)
     nodes, legs, last = f['legs'] or jn.junction_legs(edges, tpts, f['node_edge'], ahead)
     jobs.append((f, nodes, legs, last))
-  opp_legs, locs = opposing_probes(steps) if opposing is not None else ({}, [])
+  opp_legs, locs = opposing_probes(steps) if opposing is not None else ({'legs': {}, 'lines': {}}, [])
   n_opp, spans = len(locs), []
   for f, nodes, legs, last in jobs:
     mine = jn.probes(nodes, legs)

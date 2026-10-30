@@ -462,6 +462,22 @@ def test_a_scene_commit_before_any_go_is_a_fault_moving_or_standing_and_only_the
   assert j.step(released=True).why == 'position'
 
 
+def test_an_opposing_road_not_known_straight_over_r_req_is_undecided_never_a_go():
+  # skeptic G4 (residual): the band is straight on from our approach (1.5-20 m to the turn side plus BAND_TOL_DEG), so on a road
+  # curving away from the turn an oncoming car 80-135 m up a 400 m radius was outside it, uncounted, and the left went with PET
+  # 0.44-1.71 s. navd's straight span (maneuverOpposingStraightM) must reach R_req from the junction, else 'curve', out loud;
+  # not known (0) is not straight
+  for straight in (0., 60., 120.):
+    j = Junction()
+    d = j.wait(CLEAR_WINDOW_S + 1., straight_m=straight)
+    assert d.state == 'undecided' and d.why == 'curve' and d.prompt == 'leftUndecidedTakeControl', straight
+    assert not any(x.go for x in j.decisions) and d.reason == "Oncoming road curves out of view: take control"
+    assert straight + HOLD_D < d.r_req
+  j = Junction()
+  j.wait(CLEAR_WINDOW_S + 0.2, straight_m=250.)
+  assert any(x.go for x in j.decisions)
+
+
 def test_never_a_go_while_anything_else_holds_the_car_or_its_light_isnt_green():
   # skeptic G4 (blocker 2), DESIGN G4 go condition 5: with a red at the junction (accepted: the map's signal stop, other_hold;
   # or any source, the camera in shadow too: light) the band empty, it never goes; the window counts only from the green

@@ -118,6 +118,7 @@ class Maneuver:
   opposing: str = 'unknown'  # NavInstruction.Opposing: a road straight ahead whose traffic a far-side turn crosses
   opposing_speed: float = 0.  # m/s, that road's mapped limit (maneuverOpposingSpeed), 0 unknown
   opposing_lanes: int = 0     # its lanes toward the junction, 0 unknown
+  opposing_straight_m: float = 0.  # m out it stays straight on from our approach (maneuverOpposingStraightM), 0 unknown
 
   @property
   def ramp(self) -> bool:
@@ -159,13 +160,15 @@ def maneuver_from_instruction(instruction) -> Maneuver:
   return replace(make_maneuver(instruction.maneuverType, instruction.maneuverModifier, lanes_from_instruction(instruction),
                                instruction.maneuverGeometryValid, instruction.maneuverBearingBefore, instruction.maneuverBearingAfter,
                                instruction.maneuverBranches, str(instruction.maneuverOpposing)),
-                 opposing_speed=float(instruction.maneuverOpposingSpeed), opposing_lanes=int(instruction.maneuverOpposingLanes))
+                 opposing_speed=float(instruction.maneuverOpposingSpeed), opposing_lanes=int(instruction.maneuverOpposingLanes),
+                 opposing_straight_m=float(instruction.maneuverOpposingStraightM))
 
 
 def maneuver_from_ahead(ahead) -> Maneuver:
   """A Maneuver from a NavInstruction.Maneuver (allManeuvers), which has no lanes."""
   return replace(make_maneuver(ahead.type, ahead.modifier, (), ahead.geometryValid, ahead.bearingBefore, ahead.bearingAfter, ahead.branches,
-                               str(ahead.opposing)), opposing_speed=float(ahead.opposingSpeed), opposing_lanes=int(ahead.opposingLanes))
+                               str(ahead.opposing)), opposing_speed=float(ahead.opposingSpeed), opposing_lanes=int(ahead.opposingLanes),
+                 opposing_straight_m=float(ahead.opposingStraightM))
 
 
 def make_maneuver(mtype: str, modifier: str, lanes: tuple, geometry_valid: bool, bearing_before: float, bearing_after: float,

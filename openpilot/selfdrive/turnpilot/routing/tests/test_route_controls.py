@@ -1340,7 +1340,7 @@ def test_q2_rides_in_the_opposing_roads_batched_locate():
   junctions = {100.: [leg(90.), leg(270.)], 200.: [leg(0., kph=56, **{'in': 2}), leg(90.), leg(270., exit=True)]}
   v = StubJunction([(0., 100., {'stop': True}), (100., 200., {'yield': True}), (200., 400., {})], junctions)
   alone = opposing_roads(v, opposing_steps())
-  assert alone == {0: (56 / 3.6, 2)}
+  assert {i: r[:2] for i, r in alone.items()} == {0: (56 / 3.6, 2)}
   v.requests.clear()
   out = Opposing()
   controls, status = route_controls(v, opposing_steps(), opposing=out)

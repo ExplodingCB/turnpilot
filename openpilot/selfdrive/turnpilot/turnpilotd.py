@@ -172,7 +172,7 @@ from openpilot.selfdrive.turnpilot.scene_policy import (HOLD_LINE_M, NO_ACCEL_CA
                                                          far_side_turn, in_path)
 from openpilot.selfdrive.turnpilot.turn_skip import TurnSkip, can_make_turn
 from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
-from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, OFF, ROAD_RANGE_M, LeftInput, UnprotectedLeft,
+from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, LINE_D, OFF, ROAD_RANGE_M, LeftInput, UnprotectedLeft,
                                                            left_mode_for, reach_at_line)
 
 FAR_OFF_ALERT_S = ABORT_HOLD_S  # farViewOff is shown this long, once, when the far crop goes off for the drive
@@ -409,6 +409,7 @@ class TurnPilot:
     self.alt_scene_id = ALT_SCENE_ID  # the scene's maneuver id for the ladder's other turn in hand (a new one per encounter)
     self.alt_was_on = False
     self.alt_route_id: int | None = None  # the route's maneuver the ladder's other turn was taken in place of (turn_skip's)
+    self.not_straight_id: int | None = None  # the left last logged as skipped for an opposing road not known straight
     self.last_holding = False     # the last plan's scene held the car (the decider's clearBox waits it out)
     self.params = None            # Params (main()): TurnPilotJunctionOverrides is written through it (signal_seen_override)
     self.override_failed_t = 0.   # s overrideWriteFailed has left to show
@@ -682,8 +683,17 @@ class TurnPilot:
     # The far crop counts here while it is on (reading, or waiting for room or calibration), and once the left's stop is engaged
     # nothing here skips it: a reach lost there (the far crop off for the drive) is the left's own handback at its line
     # (unprotected_left: farOff), the car held, never a skip and a reroute from the line
-    out_of_range = acting and self.auto_left == AUTO and unprotected_turn(upcoming, right_hand_traffic) and not engaged and \
-      reach_at_line(upcoming.opposing_speed, upcoming.opposing_lanes or None) > self.left_reach_m(route=True)
+    # So is one whose opposing road isn't known straight out to that R_req (navd's maneuverOpposingStraightM: the band is straight
+    # on from our approach, skeptic G4), said by its own log line
+    out_of_range = False
+    if acting and self.auto_left == AUTO and unprotected_turn(upcoming, right_hand_traffic) and not engaged:
+      reach = reach_at_line(upcoming.opposing_speed, upcoming.opposing_lanes or None)
+      bent = reach > LINE_D + upcoming.opposing_straight_m
+      out_of_range = reach > self.left_reach_m(route=True) or bent
+      if bent and self.not_straight_id != rf.maneuver_id:
+        self.not_straight_id = rf.maneuver_id
+        cloudlog.event("turnpilot.left_not_straight", error=True, r_req=round(reach, 1),
+                       straight_m=round(float(upcoming.opposing_straight_m), 1), distance=round(rf.distance, 1))
     skip = self.skip.update(None if alt_replaced else upcoming, rf.distance, rf.maneuver_id, v_ego, desire_out, right_hand_traffic, lat_active,
                             rf.ahead, rf.ahead_distance, stop_d=self.map_controls.stop_ahead(), stop_infeasible=stop_infeasible,
                             pulse_at_go=pulse_at_go, out_of_range=out_of_range)
@@ -987,7 +997,8 @@ class TurnPilot:
                     released=rf.maneuver_id == scene.released_id,
                     spread_m=rf.junction_spread, other_hold=stop_d is not None and stop_d <= rf.distance + PROTECT_PAST_M,
                     light=self.map_controls.turn_light(int(turn[0]), turn[1]), far=raw_far, far_range_m=self.left_far_range_m,
-                    far_live=self.far_live(route=True))  # on: a spell without room is waited through on its runs' freshness
+                    far_live=self.far_live(route=True),  # on: a spell without room is waited through on its runs' freshness
+                    straight_m=float(upcoming.opposing_straight_m))
     d = self.left_now = self.left.update(inp, DT_MDL)
     return LeftCommand(mode, d.go, d.creep_m, d.state == 'undecided', d.reason)
 

@@ -185,14 +185,14 @@ class TestValhallaJunctions(unittest.TestCase):
     controls, status = source.controls(steps, sidecar_dir=None)
     self.assertEqual((status, [c.kind for c in controls]), ('ok', ['stop']))
     before = len(stub.requests)
-    self.assertEqual(source.opposing(steps), {0: (56 / 3.6, 2)})
+    self.assertEqual(source.opposing(steps), {0: (56 / 3.6, 2, 0.)})
     self.assertEqual(len(stub.requests), before)  # no third call
-    self.assertEqual(source.opposing(list(steps)), {0: (56 / 3.6, 2)})  # other steps: read alone
+    self.assertEqual(source.opposing(list(steps)), {0: (56 / 3.6, 2, 0.)})  # other steps: read alone
     self.assertEqual(len(stub.requests), before + 1)
     with tempfile.TemporaryDirectory() as unmarked:  # unsupported tiles: no Q2, the opposing roads read alone all the same
       steps = opposing_steps()
       self.assertEqual(source.controls(steps, unmarked, sidecar_dir=None), ([], 'unsupported'))
-      self.assertEqual(source.opposing(steps), {0: (56 / 3.6, 2)})
+      self.assertEqual(source.opposing(steps), {0: (56 / 3.6, 2, 0.)})
 
   def test_lookups_ahead_keep_q1_and_q2_in_the_sources_cache(self):
     from openpilot.selfdrive.turnpilot.routing.tests.test_route_controls import StubRoadJunction, leg, pt

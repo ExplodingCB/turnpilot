@@ -458,3 +458,8 @@ def test_the_opposing_roads_mapped_speed_and_lanes_come_with_the_maneuver():
   assert abs(a.opposing_speed - 15.6) < 1e-3 and a.opposing_lanes == 1
   m = maneuver_from_instruction(nav_instruction(100., "turn", "left", junction=(0., 270., 2, 'present')))
   assert m.opposing_speed == 0. and m.opposing_lanes == 0
+  # and its straight span from our approach (maneuverOpposingStraightM, 0 unknown: skeptic G4's curve check)
+  assert m.opposing_straight_m == 0.
+  instr = nav_instruction(100., "turn", "left", junction=(0., 270., 2, 'present', 11.18, 2, 175.),
+                          ahead=[(300., "turn", "right", (270., 0., 1, 'present', 15.6, 1, 50.))])
+  assert maneuver_from_instruction(instr).opposing_straight_m == 175. and maneuver_from_ahead(instr.allManeuvers[1]).opposing_straight_m == 50.
