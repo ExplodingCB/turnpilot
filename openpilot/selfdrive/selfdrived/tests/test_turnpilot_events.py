@@ -251,6 +251,18 @@ def test_a_left_skipped_for_the_detectors_range_says_so():
   assert a.alert_text_1 == "Can't See Far Enough to Turn" and a.alert_text_2 == 'Rerouting' and a.audible_alert == AudibleAlert.tpTooFastTurn
 
 
+def test_a_keep_that_cant_be_sent_is_skipped_out_loud():
+  # BUILD_FINDINGS D2-keep: a route keep the model sees no lane line for is skipped and said (tooFastToTurn, the skip chime,
+  # "Can't See Lanes", "Rerouting"), its reason in skipReason, appended after turnSignal @36
+  from openpilot.cereal import custom
+  assert custom.TurnpilotPlan.schema.fields['skipReason'].proto.ordinal.explicit == 37
+  a, = alerts(EventName.turnpilotTooFastToTurn, FakeSM(plan(tooFastToTurn=True, skipReason='keepNoLine', maneuverModifier='slight right')))
+  assert a.alert_text_1 == "Can't See Lanes" and a.alert_text_2 == 'Rerouting' and a.audible_alert == AudibleAlert.tpTooFastTurn
+  # any other skip's title is as before
+  a, = alerts(EventName.turnpilotTooFastToTurn, FakeSM(plan(tooFastToTurn=True, skipReason='tooFast', maneuverModifier='right')))
+  assert a.alert_text_1 == "Too Fast to Turn"
+
+
 def test_side_cameras_off_is_a_status_line():
   from openpilot.selfdrive.turnpilot.hooks import CONTROL_ALERT_TEXT, CONTROL_STATUS_ALERTS
   a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='sideCamerasOff')))

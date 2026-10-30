@@ -294,17 +294,22 @@ def turnpilot_lane_change_aborted_alert(CP: car.CarParams, CS: car.CarState, sm:
                Priority.LOW, VisualAlert.none, AudibleAlert.tpLaneChangeAbort, 2.)
 
 
+KEEP_SKIP_TITLE = {'keepNoLine': "Can't See Lanes"}  # turnpilotPlan.skipReason of a keep that couldn't be sent
+
+
 def turnpilot_too_fast_to_turn_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool,
                                      soft_disable_time: int, personality) -> Alert:
   """The turn ahead is skipped and navd reroutes (turnpilotPlan.tooFastToTurn): too fast to make it, or a map stop left no
-  room to get into its lane (laneChangeWait unreachable, lane_planner.py). Or a turn the car pulled away into from a
-  standstill went straight past its junction (turnpilotPlan.turnMissed, turnpilotd.py): missed, and navd reroutes."""
+  room to get into its lane (laneChangeWait unreachable, lane_planner.py), or a keep the model can't be sent (skipReason
+  keepNoLine: no lane line that way, turnpilotd.keep_unsent). Or a turn the car pulled away into from a standstill went
+  straight past its junction (turnpilotPlan.turnMissed, turnpilotd.py): missed, and navd reroutes."""
   plan = shown_plan(sm)
   lane = plan is not None and str(plan.laneChangeWait) == 'unreachable'
   missed = plan is not None and plan.turnMissed
   blind = plan is not None and str(plan.unprotectedLeft.state) == 'skipped'  # oncoming too fast for the detector's range
   signal = too_fast_title(plan) if plan is not None else None  # the turn signal's skips (car_signals.py: a veto, a side in doubt)
-  return Alert("Turn Missed" if missed else signal if signal else "Can't Reach Turn Lane" if lane else
+  keep = KEEP_SKIP_TITLE.get(str(plan.skipReason)) if plan is not None else None
+  return Alert("Turn Missed" if missed else signal if signal else keep if keep else "Can't Reach Turn Lane" if lane else
                "Can't See Far Enough to Turn" if blind else "Too Fast to Turn", "Rerouting",
                AlertStatus.userPrompt, AlertSize.mid,
                Priority.LOW, VisualAlert.none, AudibleAlert.tpTooFastTurn, 3.)

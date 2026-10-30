@@ -7,7 +7,9 @@ starts it is latched until the maneuver is passed (a keep: or the timeout; a tur
 or is past it, never on a clock: a slow approach in a queue to a hold took longer, and the go then had no turn to pulse,
 silently): navd's 1 Hz distance carries a few meters of noise, and dropping the desire whenever it read past the lead
 again sent the model a new rising edge each time.
-A keep toward a side where the model sees no lane line drove the car off the road there, so it is dropped.
+A keep toward a side where the model sees no lane line drove the car off the road there, so it doesn't go (the caller's
+keep_left_ok/keep_right_ok); one still unsent keep_last before its point is said and skipped, never left to the model in
+silence nor sent late (turnpilotd.keep_unsent: BUILD_FINDINGS D2-keep).
 The model forgets a pulse 132 frames after it (6.6 s at 20 Hz, its desire history; see below): where the slow
 approach took longer than that, it planned the turn and then dropped it 10 m out, and a late retry pulse brought
 the turn back at once. So a turn desire is pulsed again every REPULSE_S on the approach, and once more ENTRY_M
@@ -58,6 +60,7 @@ TURN_DESIRE_LEAD_M = 40.      # gate 1's best lead on the big model
 KEEP_DESIRE_LEAD_S = 2.5
 KEEP_DESIRE_LEAD_MIN_M = 20.
 KEEP_DESIRE_PAST_M = 5.       # a keep desire lasts this far past the maneuver point
+KEEP_LAST_FRACTION = 0.5      # a keep whose desire hasn't gone out by this share of its lead isn't sent: said (turnpilotd)
 DESIRE_TIMEOUT_S = 15.        # moving time a keep desire may be held before it is dropped for good
 REPULSE_S = 3.5               # a turn desire pulses again this often on the approach...
 ENTRY_M = 10.                 # ...and once more this far before the junction (not within ENTRY_GAP_S of the last)...
@@ -80,6 +83,11 @@ DESIRES = {(TURN, LEFT): Desire.turnLeft, (TURN, -LEFT): Desire.turnRight,
 
 def keep_lead(v_ego: float) -> float:
   return max(KEEP_DESIRE_LEAD_S * v_ego, KEEP_DESIRE_LEAD_MIN_M)
+
+
+def keep_last(v_ego: float) -> float:
+  """m before its point a keep the model can't be sent (no lane line that way) is given up on and said (turnpilotd)."""
+  return KEEP_LAST_FRACTION * keep_lead(v_ego)
 
 
 class DesireTiming:

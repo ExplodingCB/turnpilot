@@ -157,7 +157,7 @@ from openpilot.common.params import Params, UnknownKeyName
 from openpilot.common.realtime import DT_MDL, Ratekeeper
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
-from openpilot.selfdrive.turnpilot.desire_timing import ENTRY_M, TURN_STARTED_DEG, DesireTiming
+from openpilot.selfdrive.turnpilot.desire_timing import ENTRY_M, TURN_STARTED_DEG, DesireTiming, keep_last
 from openpilot.selfdrive.turnpilot.control_text import STOPPED_NOTE
 from openpilot.selfdrive.turnpilot.go_override import GO_ACCEL, GO_CLEAR_M, GO_WINDOW_S, GoCertifier
 from openpilot.selfdrive.turnpilot.handback import Handback
@@ -171,8 +171,8 @@ from openpilot.selfdrive.turnpilot.control_tracker import OFF_ROUTE
 from openpilot.selfdrive.turnpilot.stop_go import MODE_DEFAULT, STOP_SWEEP_M, Frame, StopGo, StopGoDecision, mode_for, side_views_live
 from openpilot.selfdrive.turnpilot.car_signals import (TurnSignalIntent, TurnSignalOut, driver_signals_for, read_mode,
                                                         record_matches)
-from openpilot.selfdrive.turnpilot.lane_planner import (SAMPLE_IDX, LanePlanner, Phase, lane_change_window, lane_mismatch,
-                                                        model_lanes_from_msg)
+from openpilot.selfdrive.turnpilot.lane_planner import (SAMPLE_IDX, LanePlanner, Phase, keep_blocker, lane_change_window,
+                                                        lane_mismatch, model_lanes_from_msg)
 from openpilot.selfdrive.turnpilot.route_follower import (KEEP, LEFT, RIGHT, SAME_TURN_M, TURN, UNCERTAIN_M, Maneuver, RouteFollower,
                                                            same_junction)
 from openpilot.selfdrive.turnpilot.route_notice import RouteNotices
@@ -959,6 +959,8 @@ class TurnPilot:
     self.release_go = self.release_go and not withdrawn  # handed back: a hold that comes and goes is no new go
 
     lanes = model_lanes_from_msg(model)
+    # a keep goes only where it may (lane_planner.keep_blocker: a lane line that way); one that can't go by keep_last is said
+    keep_why = {side: keep_blocker(lanes, side) for side in (LEFT, RIGHT)}
     # the stop-sign ladder's other turn (stop_go: 7.1 rung 2, O12) decides this junction: its synthesized turn is the desire
     # (from the decider's go, as a stop-sign turn's pulse is), never the route's maneuver here
     d_on, d_dist, d_id, d_passed, d_replaced = desire_on, rf.distance, rf.maneuver_id, rf.passed, rf.replaced
@@ -969,11 +971,12 @@ class TurnPilot:
     if sg.turn_missed:
       self.missed_t = MISSED_HOLD_S  # the other turn taken: the route's planned turn is missed, navd reroutes at once (3.5)
     desire = self.desires.update(d_on, d_dist, d_id, d_passed, v_ego, cs.steeringAngleDeg,
-                                 lanes.keep_left_ok, lanes.keep_right_ok, DT_MDL, default_yaw_rate(cs, model),
+                                 not keep_why[LEFT], not keep_why[RIGHT], DT_MDL, default_yaw_rate(cs, model),
                                  lat_active=lat_active, replaced=d_replaced,
                                  may_start=skip.feasible_now and not held and not hold_pulse, go=self.release_go,
                                  holding=decision.should_stop or withdrawn)
     self._yaw_ticked = True
+    self.keep_unsent(act_on, rf, v_ego, lat_active, keep_why, model, plan)
     d = self.desires
     turn_go = self.release_go and d.maneuver_id == rf.maneuver_id and d.started and d.side != 0 and not d.done and upcoming is not None
     if turn_go:
@@ -1143,6 +1146,7 @@ class TurnPilot:
     signal_skip = self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id and \
       self.skip.reason in ('driverSignal', 'hazards', 'signalLost', 'sideUncertain')
     plan.turnSignal.skip = self.skip.reason if signal_skip else 'none'
+    plan.skipReason = self.skip.reason if plan.tooFastToTurn and self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id else ''
     hazards_hold = ts.side != LaneChange.none and str(port.block) == 'hazard'
     plan.reason = decision.reason or (TURN_MISSED_REASON if plan.turnMissed else "") or lane_reason or mapd.reason or \
       (HAZARDS_REASON if hazards_hold else "") or (NO_JUNCTION_DATA_REASON if no_junction_data else "")
@@ -1307,6 +1311,25 @@ class TurnPilot:
       cloudlog.event("turnpilot.veto_line_defers", vetoed_id=v.maneuver_id, maneuver_id=rf.maneuver_id, distance=round(rf.distance, 1),
                      off_m=round(self.odo_m + rf.distance - v.junction_odo, 1))
     return True
+
+  def keep_unsent(self, keep, rf, v_ego: float, lat_active: bool, why: dict, model, plan) -> None:
+    """A route keep TurnPilot is acting on (act_on) whose desire couldn't start (why: lane_planner.keep_blocker's reason that
+    way) and still hasn't keep_last before its point is given up on out loud (BUILD_FINDINGS D2-keep, S23's slight right with no
+    lane line seen): skipped (turn_skip: tooFastToTurn, skipReason its reason; selfdrived's skip chime and line, navd's reroute
+    or its move on to the next step if the model took the route's branch anyway), logged once, never sent after (a late
+    swerve), its cap kept to its pass (a car slowing for it never speeds up into it). Never one whose desire went out, nor with
+    openpilot not steering (no desire goes then: the driver steers)."""
+    d = self.desires
+    reason = why.get(keep.side, '') if keep is not None and keep.kind == KEEP else ''
+    if not reason or not lat_active or self.skip.skipped or d.maneuver_id != rf.maneuver_id or d.started or d.done or \
+       rf.distance >= keep_last(v_ego):
+      return
+    self.skip.skip(keep, rf.distance, rf.maneuver_id, v_ego, reason)
+    self.skip_cap_id = rf.maneuver_id
+    plan.tooFastToTurn = True
+    cloudlog.event("turnpilot.keep_not_sent", error=True, side='left' if keep.side == LEFT else 'right', reason=reason,
+                   probs=[round(float(p), 2) for p in model.laneLineProbs], type=keep.type, modifier=keep.modifier,
+                   angle_deg=round(keep.angle_deg, 1), distance=round(rf.distance, 1), v=round(v_ego, 2))
 
   def check_missed(self, rf, v_ego: float, acting: bool) -> None:
     """The turn a hold let go of at standstill is passed (the follower's pass, this update) having turned under

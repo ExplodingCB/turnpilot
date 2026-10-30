@@ -303,6 +303,17 @@ def paint_lanes(lanes: ModelLanes, paint) -> ModelLanes:
   return replace(lanes, left=side(lanes.left, paint[1], paint[0]), right=side(lanes.right, paint[2], paint[3]))
 
 
+KEEP_NO_LINE = 'keepNoLine'  # TurnpilotPlan.skipReason: a keep the model sees no lane line for (ModelLanes.keep_*_ok)
+
+
+def keep_blocker(lanes: ModelLanes, direction: int) -> str:
+  """Why a keep desire toward direction (LEFT or RIGHT) may not go now, '' when it may: the model sees no lane line and road
+  that way (ModelLanes.keep_*_ok: a keep with no line drove the car off the road). turnpilotd starts one only when it may, and
+  says a keep that couldn't go by keep_last (BUILD_FINDINGS D2-keep)."""
+  ok = lanes.keep_left_ok if direction == LEFT else lanes.keep_right_ok if direction == RIGHT else False
+  return '' if ok else KEEP_NO_LINE
+
+
 def broken_white_toward(paint, side) -> bool:
   """The ego lane's line toward side (LEFT or RIGHT) reads broken white: a lane going the same way is beyond it."""
   if len(paint) != 4 or side not in (LEFT, RIGHT):

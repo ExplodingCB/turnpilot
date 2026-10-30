@@ -418,6 +418,8 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     why @9 :Text;               # the status's reason, one line (unverified, unavailable, failed)
   }
   turnSignal @36 :TurnSignal;   # tp/blinker's, after tp/integrate's routeNotice @35
+  skipReason @37 :Text;         # while tooFastToTurn: why the maneuver ahead is skipped (turn_skip.py's reason: tooFast, tooLate,
+                                # keepNoLine, ...), for selfdrived's line; empty otherwise
 }
 
 struct TurnpilotDetections @0xaedffd8f31e7b55d {
