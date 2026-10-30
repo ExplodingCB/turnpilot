@@ -1292,6 +1292,30 @@ def test_P3_a_step_toward_the_road_starts_the_curb_wait_again_and_standing_in_th
   assert 'a person in the crosswalk' in h3.reason
 
 
+@pytest.mark.parametrize("d0", [-1.0, 0.0, 1.5])
+def test_P3_a_person_who_walks_up_to_the_curb_waits_ped_curb_s_from_when_they_stand_not_from_first_sight(tmp_path, d0):
+  # D3 asks for PED_CURB_S of a person standing still at the curb: one walking along our road's sidewalk (1.4 m/s, 0.6 m past
+  # the right curb) up to the near crosswalk's curb and stopping there holds the go PED_CURB_S from when they stand. The
+  # clock had run from the first frame their band reached the curb, walking or not: the go came 2.7-4.1 s after they stopped
+  v, d1, y = 1.4, 5.5, -(sg.HALF_RIGHT_M + 0.6)
+  t_stop = (d1 - d0) / v
+
+  def objects(w):
+    t = w.t_cam - 100.
+    pos = w.sg.pos_ref + (w.odo - w.sg.odo_ref) if w.sg.token is not None else -w.control.d
+    return (person(90, w.sg.setback + min(d0 + v * t, d1) - pos, y, vx=v if t < t_stop else 0.),)
+  w = World(tmp_path)
+  w.objects = objects
+  out = w.run(20.)
+  i = first_go(out)
+  assert i is not None
+  t_go = (i + 1) * DT_MDL
+  # standing is under PED_STILL_M in PED_STILL_S, so it reads standing up to PED_STILL_S after they stop
+  assert t_stop + sg.PED_CURB_S - 1e-6 <= t_go <= t_stop + sg.PED_STILL_S + sg.PED_CURB_S + sr.CLEAR_S + 0.3, (t_stop, t_go)
+  standing = [d for d in out[round((t_stop + sg.PED_STILL_S) / DT_MDL):round((t_stop + sg.PED_CURB_S - 0.2) / DT_MDL)]]
+  assert standing and all(any(h.key == 'curb:90' for h in d.holds) for d in standing)
+
+
 def test_P15_a_still_person_whom_ranging_places_inside_the_crosswalk_but_whose_band_reaches_the_curb_is_a_curb_pedestrian(tmp_path):
   # 4.85 m right of our axis is the curb (HALF_RIGHT_M); a person read 4.4 m right, 7.9 m ahead, has a ranging band (plus or
   # minus 30% along the ray) out to 5.7 m right: past the curb, so a curb pedestrian for D3, not a person standing in the road

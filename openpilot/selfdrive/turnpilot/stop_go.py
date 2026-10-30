@@ -1673,7 +1673,8 @@ class StopGo:
 
   def _curbs(self, f: Frame, pos: float) -> None:
     """Decision D3 (rows P3, P15), every frame: each person track at a crosswalk's curb (_at_curb) who hasn't stepped toward
-    the road (_stepped) keeps a clock from when first seen there; a step starts it again once they stand (meanwhile the
+    the road (_stepped) keeps a clock from when they stand there (first seen standing, or the frame they stand again after
+    walking: D3's 5 s are of standing still, never of walking up); a step starts it again once they stand (meanwhile the
     arrival clause judges them), and one gone from the curb for PED_STILL_S is forgotten."""
     cws = self._crosswalks(f, pos)
     for o in f.objects or ():
@@ -1690,13 +1691,15 @@ class StopGo:
         if self.curb.pop(o.trackId, None) is not None:
           cloudlog.event("turnpilot.stop_go_curb_step", key=list(self.key), track=int(o.trackId), which=cw[0])
         continue
-      rec = self.curb.setdefault(o.trackId, {'since': self.t, 'logged': False})
       # standing (the arrival clause's measure: under PED_STILL_M in PED_STILL_S; too new to tell, taken as standing): one
-      # walking along the curb or away from it is the arrival clause's while it moves, its clock running on (no step yet)
+      # walking along the curb or away from it is the arrival clause's while it moves, and its clock starts once it stands
       h = self.peds.get(o.trackId) or ()
       then = next((s for s in h if s[0] >= self.t - PED_STILL_S - 1e-9), None)
       known = bool(h) and h[-1][0] - h[0][0] >= PED_STILL_S - 1e-9
       standing = not known or then is None or math.hypot(h[-1][1] - then[1], h[-1][2] - then[2]) < PED_STILL_M
+      rec = self.curb.setdefault(o.trackId, {'since': self.t, 'logged': False, 'standing': standing})
+      if standing and not rec['standing']:
+        rec['since'], rec['logged'] = self.t, False  # standing again after walking: D3's clock from now
       rec.update(which=cw[0], until=cw[6], seen=self.t, standing=standing)
       if not rec['logged'] and self.t - rec['since'] >= PED_CURB_S - 1e-6:
         rec['logged'] = True
