@@ -23,7 +23,8 @@ The demo's options (each run's result says what it did and when):
   --drop-detections-at [S] S s after engagement the sim's detector goes silent for DROP_S (DROP_PARAM, honoured only with
                            SIMULATION=1: modeld_detector.DetectorHost); the run clears it at its start and end
   --expect E               what the run must show (score.EXPECTS), in place of the scenario's own; the press implies
-                           gasDisengage and the drop handback:detectorStopped
+                           gasDisengage and the drop handback:detectorStopped (within score.DROP_HANDBACK_S of the
+                           detector going silent after the drop: the rows' det_age, from turnpilotDetections)
 Without S, the scenario's fault_at_s (catalog: straight_cruise's lands the fault short of its junction).
 
 A scenario with a forced light (catalog.junction_lights) has its junction's signal forced at each run's setup, after the

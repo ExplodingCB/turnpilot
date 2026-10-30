@@ -34,7 +34,9 @@ A row is a dict:
 A scenario's expectations (EXPECTS: catalog Entry.expect, or the runner's --expect and the options that imply one) are
 what its shot exists to show: a handback, a skip, a missed turn, the driver's gas press, hard braking. Each is required of
 the run (not seen: a failure), and explains only the generic failure it causes (the disengagement after the handback, the
-press itself, the route not finished), so a run's verdict means what its shot shows.
+press itself, the route not finished), so a run's verdict means what its shot shows. One is met only as its shot shows it
+(handback_problems, the skip's junction and kind): a handback the car wasn't held after, a drop's handback late, a skip
+past its junction is seen but unmet, and explains nothing.
 
 Rescore a saved result: python -m openpilot.tools.sim.bridge.beamng.scenarios.score result.json
 Score a recorded drive: python -m openpilot.tools.sim.bridge.beamng.scenarios.score --scenario route_demo rlog...
