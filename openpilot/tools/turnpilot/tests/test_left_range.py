@@ -360,6 +360,57 @@ def test_two_boxes_where_the_car_could_be_end_its_chain():
   assert result.road.range_m == floor10(min(s.road_m for s in result.samples))
 
 
+def late_car_stream():
+  """60 oncoming cars, car 10 (track 11) boxed only from 100 m: the true shortest, its first box's near_m about 82 m."""
+  cars = stream(60, far_from=0.)
+  cars[10].road_from = 100.
+  return cars
+
+
+def no_credit_past_its_own_boxes(result, truth):
+  """Car 10 never confirmed past its own first box, nor the recommendation past it: every sampled car's chain is its own."""
+  worst = truth[10]['road']
+  assert 80. < worst < 90.
+  s = {s.track_id: s for s in result.samples}.get(11)
+  assert s is not None and s.road_m <= worst + 0.01
+  assert result.road.range_m is not None and result.road.range_m <= floor10(worst)
+  assert all(s.road_why != 'logStart' for s in result.samples)
+
+
+@pytest.mark.parametrize("y", (5.0, 6.0, 6.6))
+@pytest.mark.parametrize("x", (100., 110., 120.))
+def test_a_car_parked_by_the_oncoming_lane_gives_no_oncoming_car_credit(x, y):
+  """Parked y m left, x m ahead when car 10 is first boxed (100 m): when car 10 has no box, the parked car's box where it
+  could be is not its, so car 10 is confirmed no farther than its own first box and the range no longer than that."""
+  cars = late_car_stream()
+  t_first = cars[10].t0 + (cars[10].x0 - 100.) / (cars[10].speed + EGO_V)
+  parked = Car(t0=t_first - 15., x0=x + EGO_V * 15., y=y, speed=0., far_from=0.)
+  msgs, truth = drive(cars + [parked], far=False)
+  result = run(msgs)
+  no_credit_past_its_own_boxes(result, truth[:60])
+  assert len(result.samples) == 60
+
+
+@pytest.mark.parametrize("gap_s", (0.5, 0.8, 1.0))
+def test_a_car_close_behind_in_the_same_lane_gives_no_credit(gap_s):
+  """A car gap_s behind car 10 in its lane, boxed from 150 m: its boxes are never car 10's."""
+  cars = late_car_stream()
+  msgs, truth = drive(cars + [Car(t0=cars[10].t0 + gap_s, far_from=0.)], far=False)
+  result = run(msgs)
+  no_credit_past_its_own_boxes(result, truth[:60])
+
+
+@pytest.mark.parametrize("x", (110., 120., 130., 140.))
+def test_a_lead_in_our_lane_gives_no_credit(x):
+  """A lead x m ahead at our speed, boxed all drive: no oncoming car's chain follows it back (logStart), none is credited its
+  boxes, and no two cars' chains merge through it."""
+  lead = Car(t0=0., x0=x, y=0., speed=-EGO_V, road_from=400., far_from=0.)
+  msgs, truth = drive(late_car_stream() + [lead], far=False)
+  result = run(msgs)
+  no_credit_past_its_own_boxes(result, truth[:60])
+  assert len(result.samples) == 60
+
+
 def test_a_spell_with_no_road_runs_is_no_range_not_a_clear_road():
   """The full pass on the wide camera for 1.2 s (a turn) while car 31 closes from about 120 m: nothing says it was boxed
   there, so it is confirmed only from its first road box after the spell (unknown is no range), said as noRuns."""
