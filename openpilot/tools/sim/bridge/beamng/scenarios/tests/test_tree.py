@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -272,33 +273,98 @@ class TestResolution:
       assert tree.git(msgq, *tree.DIFF, 'HEAD', binary=True) == f.read()
 
 
+def manager_record(cwd, env, argv=('python3', './manager.py')):
+  """A running manager as running_managers reads it: launched as launch_openpilot.sh does (./manager.py, whose shebang
+  is env python3), this venv's bin first on its PATH."""
+  return {'pid': 1, 'cwd': str(cwd), 'argv': list(argv), 'env': {'PATH': os.path.dirname(sys.executable), **env}}
+
+
+VENV_PYTHON3 = os.path.join(os.path.dirname(sys.executable), 'python3')
+
+
 class TestFindStack:
   def test_the_running_managers_checkout_is_the_stacks(self, checkout, tmp_path):
     cwd = str(checkout / 'openpilot/system/manager')
-    assert tree.find_stack('tpsim', managers=[cwd]) == (os.path.realpath(checkout), 'manager', [])
-    d, source, problems = tree.find_stack('tpsim', option=str(tmp_path), managers=[cwd])
+    d, source, problems, launch = tree.find_stack('tpsim', managers=[cwd])
+    assert (d, source, problems, launch['from']) == (os.path.realpath(checkout), 'manager', [], 'assumed')  # a bare cwd
+    d, source, problems, _ = tree.find_stack('tpsim', option=str(tmp_path), managers=[cwd])
     assert (d, source) == (os.path.realpath(checkout), 'manager') and 'not the running manager' in problems[0]
+
+  @pytest.mark.skipif(not os.path.exists(VENV_PYTHON3), reason="no python3 beside this interpreter")
+  def test_the_running_managers_launch_is_how_its_imports_are_resolved(self, checkout, tmp_path):
+    cwd = checkout / 'openpilot/system/manager'
+    d, source, problems, launch = tree.find_stack('tpsim', managers=[manager_record(cwd, {'PYTHONPATH': f"{checkout}{os.pathsep}/x y"})])
+    assert (d, source, problems) == (os.path.realpath(checkout), 'manager', [])
+    assert launch['from'] == 'manager' and launch['python'] == VENV_PYTHON3 and launch['cwd'] == str(cwd)
+    assert launch['script_dir'] == os.path.realpath(cwd) and launch['env']['PYTHONPATH'] == f"{checkout}{os.pathsep}/x y"
+    # python3 found nowhere on its PATH, or interpreter options this check doesn't model: its imports are unknown
+    for record, why in ((manager_record(cwd, {'PATH': str(tmp_path)}), "'python3' is not on its PATH"),
+                        (manager_record(cwd, {}, argv=('python3', '-E', './manager.py')), "interpreter options ['-E']")):
+      launch = tree.find_stack('tpsim', managers=[record])[3]
+      assert launch['python'] is None and why in launch['why']
+      with pytest.raises(tree.ResolveError, match="interpreter is unknown"):
+        tree.package_dirs(launch, ['msgq'])
+    # two managers in it started differently: which one's imports are the stack's isn't known
+    records = [manager_record(cwd, {'PYTHONPATH': str(checkout)}), manager_record(cwd, {'PYTHONPATH': f"/x{os.pathsep}{checkout}"})]
+    _, _, problems, launch = tree.find_stack('tpsim', managers=records)
+    assert launch['python'] is None and problems[0].startswith('2 openpilot managers run from')
+    records[1]['env']['PYTHONPATH'] = str(checkout)
+    records[1]['env']['_'] = 'another shell'  # what else differs in their environments doesn't change their imports
+    assert tree.find_stack('tpsim', managers=records)[2:] == ([], tree.launch_of(records[0]))
 
   def test_no_manager_or_two_leave_it_unknown_unless_named(self, checkout, tmp_path):
     assert tree.find_stack('tpsim', managers=[])[:2] == (None, 'none')
-    assert tree.find_stack('tpsim', option=str(checkout), managers=[])[:2] == (os.path.realpath(checkout), 'option')
+    d, source, _, launch = tree.find_stack('tpsim', option=str(checkout), managers=[])
+    assert (d, source, launch['from']) == (os.path.realpath(checkout), 'option', 'assumed')
     other = tmp_path / 'other'
     repo(other, {tree.MANAGER: ''})
-    d, source, problems = tree.find_stack('tpsim', managers=[str(checkout), str(other)])
-    assert (d, source) == (None, 'none') and problems[0].startswith('2 openpilot managers')
+    d, source, problems, launch = tree.find_stack('tpsim', managers=[str(checkout), str(other)])
+    assert (d, source, launch) == (None, 'none', None) and problems[0].startswith('2 openpilot managers')
 
-  def test_managers_found_by_ps_and_lsof(self, monkeypatch):
+  def test_managers_found_by_ps_procargs_and_lsof(self, monkeypatch):
     monkeypatch.setattr(tree.os.path, 'isdir', lambda p: False if p == '/proc/self' else os.path.isdir(p))
-    out = {('ps', '-axww'): "  101 /venv/bin/python3 ./manager.py\n  102 /venv/bin/python3 ./manager.py\n  103 vim manager.txt\n",
-           ('ps', '-wwE', '101'): "/venv/bin/python3 ./manager.py PATH=/bin OPENPILOT_PREFIX=tpsim HOME=/h\n",
-           ('ps', '-wwE', '102'): "/venv/bin/python3 ./manager.py PATH=/bin HOME=/h\n",
+    out = {('ps', '-axww'): "  101 python3 ./manager.py\n  102 python3 ./manager.py\n  103 vim manager.txt\n  104 python3 ./manager.py\n" +
+                            "  105 python3 ./manager.py.bak\n",
            ('lsof', '101'): "p101\nfcwd\nn/a/tp/openpilot/system/manager\n", ('lsof', '102'): "p102\nfcwd\nn/b\n"}
+    args = {101: (['python3', './manager.py'], {'PATH': '/bin', 'OPENPILOT_PREFIX': 'tpsim', 'PYTHONPATH': '/a b/c:/d'}),
+            102: (['python3', './manager.py'], {'PATH': '/bin'}), 104: None,  # another user's: unreadable
+            105: (['python3', './manager.py.bak'], {'OPENPILOT_PREFIX': 'tpsim'})}
 
     def run(cmd, **kw):
-      key = (cmd[0], cmd[1]) if cmd[1] == '-axww' else (cmd[0], cmd[1], cmd[3]) if cmd[0] == 'ps' else (cmd[0], cmd[3])
-      return SimpleNamespace(stdout=out[key])
-    assert tree.manager_dirs('tpsim', run=run) == ['/a/tp/openpilot/system/manager']
-    assert tree.manager_dirs('', run=run) == ['/b']
+      return SimpleNamespace(stdout=out[(cmd[0], cmd[1]) if cmd[0] == 'ps' else (cmd[0], cmd[3])])
+    assert tree.running_managers('tpsim', run=run, read_args=args.get) == [
+      {'pid': 101, 'cwd': '/a/tp/openpilot/system/manager', 'argv': ['python3', './manager.py'], 'env': args[101][1]}]
+    assert [m['cwd'] for m in tree.running_managers('', run=run, read_args=args.get)] == ['/b']
+
+  @pytest.mark.skipif(sys.platform != 'darwin' and not os.path.isdir('/proc/self'), reason="no way to read a process's environment here")
+  @pytest.mark.skipif(not os.path.exists(VENV_PYTHON3), reason="no python3 beside this interpreter")
+  def test_a_live_managers_environment_is_read_exactly(self, checkout, tmp_path):
+    # a stub manager.py launched as launch_openpilot.sh launches the real one (exec ./manager.py, env python3), its
+    # PYTHONPATH holding a dir with a space in it (ps -wwE's output can't tell where such a value ends)
+    spaced = tmp_path / 'with space'
+    repo(spaced, {'zz_tree_probe_pkg/__init__.py': ""})
+    mdir = checkout / 'openpilot/system/manager'
+    write(mdir / 'manager.py', "#!/usr/bin/env python3\nimport time\ntime.sleep(60)\n")
+    os.chmod(mdir / 'manager.py', 0o755)
+    prefix = f"tptree{os.getpid()}"
+    env = {'PATH': f"{os.path.dirname(sys.executable)}{os.pathsep}/usr/bin{os.pathsep}/bin", 'OPENPILOT_PREFIX': prefix,
+           'PYTHONPATH': f"{checkout}{os.pathsep}{spaced}", 'HOME': str(tmp_path)}
+    proc = subprocess.Popen(['./manager.py'], cwd=mdir, env=env)
+    try:
+      for _ in range(100):
+        found = tree.running_managers(prefix)
+        if found:
+          break
+        time.sleep(0.1)
+      (m,) = found
+      assert m['pid'] == proc.pid and os.path.realpath(m['cwd']) == os.path.realpath(mdir)
+      assert m['argv'] == ['python3', './manager.py'] and m['env']['PYTHONPATH'] == env['PYTHONPATH']
+      d, source, problems, launch = tree.find_stack(prefix)
+      assert (d, source, problems, launch['python']) == (os.path.realpath(checkout), 'manager', [], VENV_PYTHON3)
+      assert tree.package_dirs(launch, ['zz_tree_probe_pkg']) == {'zz_tree_probe_pkg': str(spaced / 'zz_tree_probe_pkg')}
+    finally:
+      proc.kill()
+      proc.wait()
 
 
 class TestTreeJson:
@@ -317,6 +383,26 @@ class TestTreeJson:
     tree.finish(str(run_dir), doc, resolve=own_packages(checkout))
     on_disk = json.load(open(run_dir / 'tree.json'))
     assert on_disk['changed_during_run'] is False and on_disk['end_checked_at'] is not None and 'at_end' not in on_disk
+
+  @pytest.mark.skipif(not os.path.exists(VENV_PYTHON3), reason="no python3 beside this interpreter")
+  def test_the_stacks_launch_is_recorded_and_the_end_check_resolves_it_again(self, checkout, tmp_path):
+    other = tmp_path / 'other'
+    repo(other, {'opendbc/__init__.py': "X = 1\n"})
+    os.symlink('msgq_repo/msgq', checkout / 'msgq')
+    record = manager_record(checkout / 'openpilot/system/manager', {'PYTHONPATH': f"{checkout}{os.pathsep}{other}", 'TP_SECRET': 'hunter2'})
+    head = git(checkout, 'rev-parse', 'HEAD')
+    doc = tree.start(str(tmp_path), 'tpsim', git_commit=head, managers=[record])
+    text = open(tmp_path / 'tree.json').read()
+    on_disk = json.loads(text)
+    assert on_disk['stack_import'] == {'from': 'manager', 'python': VENV_PYTHON3, 'cwd': record['cwd'],
+                                       'script_dir': os.path.realpath(record['cwd']), 'pythonpath': record['env']['PYTHONPATH']}
+    assert 'hunter2' not in text and '_launch' not in on_disk  # the manager's environment is never written
+    sub = next(x for x in on_disk['submodules'] if x['path'] == 'opendbc_repo')
+    assert sub['dir'] == os.path.realpath(other) and not on_disk['clean'] and [p.split(':')[0] for p in on_disk['problems']] == ['opendbc_repo']
+    # the end check resolves as the manager did, though it has exited (the runner's own environment has no other/)
+    tree.finish(str(tmp_path), doc)
+    on_disk = json.load(open(tmp_path / 'tree.json'))
+    assert on_disk['changed_during_run'] is False and len(on_disk['problems']) == 1
 
   def test_an_edit_during_the_run_is_changed(self, checkout, tmp_path):
     write(checkout / 'openpilot/selfdrive/x.py', "X = 2\n")  # dirty from the start: the same status line at the end
@@ -347,7 +433,7 @@ def test_run_writes_it_at_the_start_and_checks_it_after_the_drive(monkeypatch, t
     def run(self, q):
       seen['at_drive'] = json.load(open(next((tmp_path / 'out').iterdir()) / 'tree.json'))
       return SimpleNamespace(join=lambda: None)
-  monkeypatch.setattr(run.tree, 'manager_dirs', lambda prefix: [str(checkout)])
+  monkeypatch.setattr(run.tree, 'running_managers', lambda prefix: [str(checkout)])
   monkeypatch.setattr(run.tree, 'package_dirs', own_packages(checkout))
   monkeypatch.setattr(sys, 'argv', ['run.py', 'ped_in_path', '--out', str(tmp_path / 'out')])
   monkeypatch.setattr(run, 'build', lambda *a, **k: SimpleNamespace(spawn=(0., 0., 0.), heading=0., notes={}))
@@ -367,7 +453,7 @@ def test_a_refused_expectation_writes_nothing(monkeypatch, tmp_path):
   # an argument error is no run: no run dir, so no tree.json without a result file (a page refuses such a dir as a run
   # killed in its first run)
   from openpilot.tools.sim.bridge.beamng.scenarios import run
-  monkeypatch.setattr(run.tree, 'manager_dirs', lambda prefix: [])
+  monkeypatch.setattr(run.tree, 'running_managers', lambda prefix: [])
   monkeypatch.setattr(sys, 'argv', ['run.py', 'ped_in_path', '--out', str(tmp_path / 'out'), '--expect', 'handbak:detectorStopped'])
   monkeypatch.setattr(run, 'build', lambda *a, **k: SimpleNamespace(spawn=(0., 0., 0.), heading=0., notes={}))
   monkeypatch.setattr(run, 'Params', lambda: SimpleNamespace(get_bool=lambda k: True, get=lambda k: None))

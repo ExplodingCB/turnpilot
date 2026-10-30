@@ -8,7 +8,11 @@ tools/turnpilot/README.md), so the rlogs can't say whether a run's code had unco
   stack_dir         the checkout the stack was launched from: the working directory of the running openpilot manager whose
                     OPENPILOT_PREFIX is the runner's (stack_dir_source 'manager'), else --stack-dir ('option'); null when
                     neither names one (then nothing below describes the stack, and clean is false)
-  head, tree        its HEAD and HEAD^{tree}; openpilot_tree HEAD:openpilot (null without one)
+  stack_import      how the stack's imports are resolved for submodules below: {from ('manager': as the running manager
+                    was started, its argv and environment read exactly (running_managers, launch_of); 'assumed': as
+                    launch_openpilot.sh starts it, for --stack-dir), python (its interpreter; null when unknown, with why),
+                    cwd, script_dir, pythonpath (its PYTHONPATH)}; the rest of its environment is never written
+  head, tree       its HEAD and HEAD^{tree}; openpilot_tree HEAD:openpilot (null without one)
   tracked_changes   git status --porcelain=v1 --untracked-files=no --ignore-submodules=all, one line each
   untracked_py      untracked *.py, *.capnp, *.h and *.cc outside the gitignored build output (git ls-files --others
                     --exclude-standard)
@@ -228,73 +232,171 @@ def snapshot(stack_dir: str, resolve=None, launch: dict | None = None) -> dict:
           'untracked_py': untracked, 'submodules': subs, 'clean': clean, 'digest': h.hexdigest(), 'problems': problems}
 
 
-def manager_dirs(prefix: str, run=subprocess.run) -> list[str]:
-  """The working directories of the running openpilot managers (a manager.py) whose OPENPILOT_PREFIX is prefix ('' for
-  none): Linux from /proc, macOS from ps and lsof."""
+def procargs(pid: int) -> tuple[list[str], dict[str, str]] | None:
+  """(argv, environment) a macOS process was started with, exactly, from sysctl KERN_PROCARGS2: argc, the path it
+  exec'd, then each argument and each environment string NUL-terminated (the kernel's own strings follow an empty one).
+  ps -wwE prints the same joined by spaces, so a value with a space in it can't be told from the next. None when it
+  can't be read (another user's process, gone)."""
+  import ctypes
+  libc = ctypes.CDLL(None, use_errno=True)
+  argmax = ctypes.c_int(0)
+  size = ctypes.c_size_t(ctypes.sizeof(argmax))
+  if libc.sysctl((ctypes.c_int * 2)(1, 8), 2, ctypes.byref(argmax), ctypes.byref(size), None, 0) != 0:  # CTL_KERN, KERN_ARGMAX
+    return None
+  buf = ctypes.create_string_buffer(argmax.value)
+  size = ctypes.c_size_t(argmax.value)
+  if libc.sysctl((ctypes.c_int * 3)(1, 49, pid), 3, buf, ctypes.byref(size), None, 0) != 0:  # CTL_KERN, KERN_PROCARGS2
+    return None
+  raw = buf.raw[:size.value]
+  if len(raw) < 4:
+    return None
+  argc = int.from_bytes(raw[:4], sys.byteorder)
+  parts = raw[4:].partition(b'\0')[2].lstrip(b'\0').split(b'\0')
+  if len(parts) < argc:
+    return None
+  env: dict[str, str] = {}
+  for kv in parts[argc:]:
+    if not kv:
+      break
+    k, eq, v = os.fsdecode(kv).partition('=')
+    if eq:
+      env.setdefault(k, v)  # the first, as getenv takes it
+  return [os.fsdecode(a) for a in parts[:argc]], env
+
+
+def proc_args(pid: int) -> tuple[list[str], dict[str, str]] | None:
+  """(argv, environment) of a Linux process from /proc, None when it can't be read."""
+  try:
+    with open(f'/proc/{pid}/cmdline', 'rb') as f:
+      argv = [os.fsdecode(a) for a in f.read().split(b'\0')[:-1]]
+    with open(f'/proc/{pid}/environ', 'rb') as f:
+      env: dict[str, str] = {}
+      for kv in f.read().split(b'\0'):
+        k, eq, v = os.fsdecode(kv).partition('=')
+        if eq:
+          env.setdefault(k, v)
+  except OSError:
+    return None
+  return argv, env
+
+
+def running_managers(prefix: str, run=subprocess.run, read_args=None) -> list[dict]:
+  """The running openpilot managers (a process with a manager.py argument) whose OPENPILOT_PREFIX is prefix ('' for
+  none), each {pid, cwd, argv, env} as the process has them: Linux from /proc, macOS from ps (the pids), procargs (argv
+  and environment) and lsof (the working directory). The environment stays in memory: tree.json never holds it."""
   out = []
   if os.path.isdir('/proc/self'):
     for pid in os.listdir('/proc'):
-      if not pid.isdigit():
+      args = proc_args(int(pid)) if pid.isdigit() else None
+      if args is None or not any(a.endswith('manager.py') for a in args[0]) or args[1].get('OPENPILOT_PREFIX', '') != prefix:
         continue
       try:
-        with open(f'/proc/{pid}/cmdline', 'rb') as f:
-          if not any(a.endswith(b'manager.py') for a in f.read().split(b'\0')):
-            continue
-        with open(f'/proc/{pid}/environ', 'rb') as f:
-          env = dict(kv.split(b'=', 1) for kv in f.read().split(b'\0') if b'=' in kv)
-        if env.get(b'OPENPILOT_PREFIX', b'').decode() == prefix:
-          out.append(os.readlink(f'/proc/{pid}/cwd'))
+        out.append({'pid': int(pid), 'cwd': os.readlink(f'/proc/{pid}/cwd'), 'argv': args[0], 'env': args[1]})
       except OSError:
         continue
     return out
+  read_args = read_args or procargs
   ps = run(['ps', '-axww', '-o', 'pid=,command='], capture_output=True, text=True).stdout
   for line in ps.splitlines():
     pid, _, cmd = line.strip().partition(' ')
-    if not pid.isdigit() or not any(a.endswith('manager.py') for a in cmd.split()):
+    if not pid.isdigit() or 'manager.py' not in cmd:
       continue
-    env = run(['ps', '-wwE', '-p', pid, '-o', 'command='], capture_output=True, text=True).stdout.split()
-    if next((a.partition('=')[2] for a in env if a.startswith('OPENPILOT_PREFIX=')), '') != prefix:
+    args = read_args(int(pid))
+    if args is None or not any(a.endswith('manager.py') for a in args[0]) or args[1].get('OPENPILOT_PREFIX', '') != prefix:
       continue
     cwd = run(['lsof', '-a', '-p', pid, '-d', 'cwd', '-Fn'], capture_output=True, text=True).stdout
-    out += [ln[1:] for ln in cwd.splitlines() if ln.startswith('n')]
+    out += [{'pid': int(pid), 'cwd': ln[1:], 'argv': args[0], 'env': args[1]} for ln in cwd.splitlines() if ln.startswith('n')]
   return out
 
 
-def find_stack(prefix: str, option: str = '', managers=None) -> tuple[str | None, str, list[str]]:
-  """(the stack's checkout, how it was found, problems): the running manager's for prefix (manager_dirs), else option."""
-  dirs = manager_dirs(prefix) if managers is None else managers
-  tops = sorted({t for t in (toplevel(d) for d in dirs) if t is not None and os.path.exists(os.path.join(t, MANAGER))})
+def interpreter(argv0: str, env: dict, cwd: str) -> str | None:
+  """The interpreter a process started as argv0 runs, as python itself takes it (getpath): argv0 when it is a path, else
+  the first match on its PATH (as /usr/bin/env found it for manager.py's shebang); None for none."""
+  for d in ([''] if os.sep in argv0 else env.get('PATH', os.defpath).split(os.pathsep)):
+    p = os.path.normpath(os.path.join(cwd, d, argv0))
+    if os.path.isfile(p) and os.access(p, os.X_OK):
+      return p
+  return None
+
+
+def launch_of(manager: dict) -> dict:
+  """How a running manager (running_managers) was started, for package_dirs: its interpreter, environment and working
+  directory, its script's dir first on its path. python None, with why, when that can't be told: no manager.py script
+  in its arguments, interpreter options before it (-E, -I, -S and the like change the path; none is modelled), or an
+  interpreter found nowhere."""
+  cwd, argv, env = manager['cwd'], manager['argv'], manager['env']
+  launch = {'from': 'manager', 'python': None, 'cwd': cwd, 'script_dir': None, 'env': env}
+  i = next((i for i, a in enumerate(argv) if i and a.endswith('manager.py')), None)
+  if i is None:
+    return {**launch, 'why': f"its arguments {argv!r} run no manager.py script"}
+  if argv[1:i]:
+    return {**launch, 'why': f"it was started with interpreter options {argv[1:i]!r}, which this check doesn't model"}
+  launch['script_dir'] = os.path.dirname(os.path.realpath(os.path.join(cwd, argv[i])))
+  launch['python'] = interpreter(argv[0], env, cwd)
+  return launch if launch['python'] is not None else {**launch, 'why': f"{argv[0]!r} is not on its PATH"}
+
+
+def imports_key(launch: dict) -> tuple:
+  """What decides where a launch's imports come from: its interpreter, working directory, script dir and PYTHON*
+  environment."""
+  return (launch['python'], launch['cwd'], launch['script_dir'], sorted((k, v) for k, v in launch['env'].items() if k.startswith('PYTHON')))
+
+
+def import_record(launch: dict) -> dict:
+  """tree.json's stack_import: how the stack's imports were resolved, without its environment but PYTHONPATH."""
+  return {'from': launch['from'], 'python': launch['python'], 'cwd': launch['cwd'], 'script_dir': launch['script_dir'],
+          'pythonpath': launch['env'].get('PYTHONPATH'), **({'why': launch['why']} if launch.get('why') else {})}
+
+
+def find_stack(prefix: str, option: str = '', managers=None) -> tuple[str | None, str, list[str], dict | None]:
+  """(the stack's checkout, how it was found, problems, how it was launched): the running manager's for prefix
+  (running_managers; launch_of), else option (assumed_launch, as for a manager given as a bare working directory)."""
+  found = running_managers(prefix) if managers is None else managers
+  by_top: dict[str, list[dict]] = {}
+  for m in ({'cwd': m} if isinstance(m, str) else m for m in found):
+    t = toplevel(m['cwd'])
+    if t is not None and os.path.exists(os.path.join(t, MANAGER)):
+      by_top.setdefault(t, []).append(m)
   problems = []
-  if len(tops) == 1:
-    if option and os.path.realpath(option) != tops[0]:
-      problems.append(f"--stack-dir {option} is not the running manager's checkout {tops[0]}: the manager's is recorded")
-    return tops[0], 'manager', problems
-  if len(tops) > 1:
-    return None, 'none', [f"{len(tops)} openpilot managers run with OPENPILOT_PREFIX={prefix!r} ({', '.join(tops)}): which is the stack's isn't known"]
+  if len(by_top) == 1:
+    ((top, ms),) = by_top.items()
+    if option and os.path.realpath(option) != top:
+      problems.append(f"--stack-dir {option} is not the running manager's checkout {top}: the manager's is recorded")
+    launches = [launch_of(m) if 'argv' in m else assumed_launch(top) for m in ms]
+    if len({repr(imports_key(x)) for x in launches}) > 1:
+      problems.append(f"{len(ms)} openpilot managers run from {top} with OPENPILOT_PREFIX={prefix!r}, started differently: " +
+                      "where the stack imports from isn't known")
+      return top, 'manager', problems, {**launches[0], 'python': None, 'why': f"{len(ms)} managers started differently"}
+    return top, 'manager', problems, launches[0]
+  if len(by_top) > 1:
+    return None, 'none', [f"{len(by_top)} openpilot managers run with OPENPILOT_PREFIX={prefix!r} ({', '.join(sorted(by_top))}): " +
+                          "which is the stack's isn't known"], None
   if option:
     top = toplevel(option)
     if top is None:
-      return None, 'none', [f"--stack-dir {option} is not a git checkout"]
-    return top, 'option', [f"no running openpilot manager found with OPENPILOT_PREFIX={prefix!r}: --stack-dir taken as the stack's"]
-  return None, 'none', [f"no running openpilot manager found with OPENPILOT_PREFIX={prefix!r}: the stack's checkout is unknown (--stack-dir)"]
+      return None, 'none', [f"--stack-dir {option} is not a git checkout"], None
+    return top, 'option', [f"no running openpilot manager found with OPENPILOT_PREFIX={prefix!r}: --stack-dir taken as the stack's"], assumed_launch(top)
+  return None, 'none', [f"no running openpilot manager found with OPENPILOT_PREFIX={prefix!r}: the stack's checkout is unknown (--stack-dir)"], None
 
 
 def write(run_dir: str, doc: dict):
+  """doc as tree.json, but its in-memory keys (_launch, the stack's launch with its environment, for finish)."""
   doc['written_at'] = round(time.time(), 3)  # noqa: TID251  unix s, for the page
   tmp = os.path.join(run_dir, TREE_JSON + '.tmp')
   with open(tmp, 'w') as f:
-    json.dump(doc, f, indent=1)
+    json.dump({k: v for k, v in doc.items() if not k.startswith('_')}, f, indent=1)
   os.replace(tmp, os.path.join(run_dir, TREE_JSON))
 
 
 def start(run_dir: str, prefix: str, option: str = '', git_commit=None, managers=None, resolve=None) -> dict:
   """tree.json at the invocation's start (module docstring): written, and returned for finish()."""
-  stack_dir, source, problems = find_stack(prefix, option, managers)
+  stack_dir, source, problems, launch = find_stack(prefix, option, managers)
   doc: dict = {'schema': SCHEMA, 'stack_dir': None, 'stack_dir_source': source, 'head': None, 'tree': None, 'openpilot_tree': None,
-               'tracked_changes': [], 'untracked_py': [], 'submodules': [], 'clean': False}
+               'tracked_changes': [], 'untracked_py': [], 'submodules': [], 'clean': False,
+               'stack_import': None if launch is None else import_record(launch), '_launch': launch}
   if stack_dir is not None:
     try:
-      snap = snapshot(stack_dir, resolve)
+      snap = snapshot(stack_dir, resolve, launch)
       problems += snap.pop('problems')
       doc.update(snap)
     except (subprocess.CalledProcessError, OSError) as e:
@@ -317,7 +419,7 @@ def finish(run_dir: str, doc: dict, resolve=None) -> dict:
   end = None
   if doc.get('stack_dir') is not None:
     try:
-      end = snapshot(doc['stack_dir'], resolve)
+      end = snapshot(doc['stack_dir'], resolve, doc.get('_launch'))
       new = [p for p in end.pop('problems') if p not in doc.get('problems', [])]
       if new:
         doc['problems'] = doc.get('problems', []) + [f"at the end check, {p}" for p in new]
