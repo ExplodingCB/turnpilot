@@ -334,3 +334,45 @@ class LiveVisibility:
         half = (sr.NEAR_LANE_MIN_M + sr.NEAR_LANE_MAX_M) / 2.
         out[side] = {'n': n, 'xMedM': med, 'edgeFromStopM': med - setback - half - d_stop}
     return out
+
+
+class OracleLive:
+  """The sim's cross-traffic oracle as the stop-sign decider's live view (STOP_SIGNS.md 8.2, SG4c; turnpilotd passes it in
+  LiveVisibility's place only under the light oracle's gate): every view fresh, no raw boxes, and every lane seen out to the
+  oracle's range from wherever the car is (binding 'oracle': synthetic, a logic check's, never range evidence), its need and
+  shields read as lanes() reads them. BeamNG's 57.7 deg pinhole shows about 10.6 m of the near lane from the stop point, so
+  no sim all-way could certify by vision, and widening a sim table would count unrendered cars as clear."""
+  available = True
+
+  def __init__(self, range_m: float):
+    self.range_m = float(range_m)
+    self.raw: dict = {}
+
+  def fresh_key(self, key: str) -> bool:
+    return True
+
+  def fresh(self, view: str, side: str) -> bool:
+    return True
+
+  def blockers(self, *args, **kwargs) -> list:
+    return []
+
+  def occluders(self, *args, **kwargs) -> list:
+    return []
+
+  def lanes(self, lanes_at_stop: list, d_stop: float, vis, *, rot_deg: float, edges: sr.Edges, tracks=(), evidence: dict | None = None,
+            a_launch: float = sr.A_LAUNCH_PLAN, ahead_m: float = 0., **kwargs) -> Report:
+    lns = [replace(ln, s_min=ln.s_min + d_stop, s_max=ln.s_max + d_stop) for ln in lanes_at_stop]
+    edges_now = sr.Edges(edges.d_min + d_stop, edges.d_max + d_stop, None if edges.nominal is None else edges.nominal + d_stop)
+    out = []
+    for ln in lns:
+      v_c = sr.V_CROSS_FACTOR * ln.limit
+      seen = LaneSeen(ln.role, ln.index, ln.movement, ln.stopping, ln.limit, lane_need(ln, edges_now, a_launch), self.range_m,
+                      max(self.range_m - v_c * sr.T_LAT, 0.), 'oracle')
+      for tid, e in (evidence or {}).items():
+        if (e.role, e.index) == (ln.role, ln.index) and e.stopped_at_line:
+          seen.candidates.append(tid)
+          if e.shield:
+            seen.shields.append(tid)
+      out.append(seen)
+    return Report(out, {}, 0, dict.fromkeys(('road', 'full', 'sideLeft', 'sideRight'), True))

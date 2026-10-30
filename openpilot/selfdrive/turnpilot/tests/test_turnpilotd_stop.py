@@ -622,3 +622,59 @@ def test_the_route_start_and_pre_stop_notices_reach_the_plan_disengaged(tmp_path
   while sim.s < S_LINE - 20.:
     seen.append(str(sim.step().controlAlert))
   assert 'stopAheadNeedsYou' in seen
+
+
+def oracle_msg(cars=(), range_m=60.):
+  """turnpilotLights from the sim's oracle: no lights, the cross traffic [(id, x, y, vx, vy, cls)] in the car frame."""
+  from openpilot.cereal import messaging
+  msg = messaging.new_message('turnpilotLights')
+  tl = msg.turnpilotLights
+  tl.source, tl.crossRangeM = 'simOracle', range_m
+  cs = tl.init('cross', len(cars))
+  for c, (i, x, y, vx, vy, cls) in zip(cs, cars, strict=True):
+    c.id, c.x, c.y, c.vx, c.vy, c.cls = i, x, y, vx, vy, cls
+  return msg.as_reader().turnpilotLights
+
+
+def test_the_sim_cross_traffic_oracle_feeds_the_decider_ground_truth_under_the_gate_and_is_refused_out_loud_off_it(tmp_path):
+  # STOP_SIGNS.md 8.2 (SG4c): in the sim the decider takes ground-truth cross traffic and the oracle's range as each lane's reach
+  # (labelled synthetic: binding 'oracle'), only under the light oracle's gate; a car standing at the left line before our
+  # arrival is an earlier arrival: we wait for it to go (3 s after our stop, pulling away through our path) and go after it.
+  # Off the gate the message is refused and said (lightSourceRejected), the cameras' reach stands
+  from openpilot.selfdrive.turnpilot.tests.test_stop_go import LINE_D
+  sim = StopSim(tmp_path)
+  sim.tp.oracle_ok = True
+  st = {'stop': None}
+
+  def lights(s):
+    sg = s.tp.stop_go
+    if st['stop'] is None and s.v < 0.05 and abs(S_LINE - s.s) < 6.:
+      st['stop'] = s.t
+    ln = next((x for x in sg.lanes_all if (x.role, x.index) == ('left', 1)), None)
+    if sg.token is None or ln is None:
+      return oracle_msg()
+    pos = sg.pos_ref + (s.tp.odo_m - sg.odo_ref)
+    t_go = (st['stop'] + 3.) if st['stop'] is not None else float('inf')
+    gone = max(s.t - t_go, 0.)
+    d = LINE_D - 1.5 * gone ** 2
+    v = -3. * gone
+    return oracle_msg([(7, (ln.s_min + ln.s_max) / 2. - pos, d, 0., v, 'car')] if d > -25. else [])
+  sim.lights = lights
+  run_to_line(sim)
+  sim.run(12.)
+  plans = sim.plans()
+  lanes = [ln for p in plans[-100:] for ln in p.stopGo.lanes]
+  assert lanes and all(ln.binding == 'oracle' for ln in lanes)
+  assert all(ln.rSeen == pytest.approx(60. - sr.V_CROSS_FACTOR * 25. * MPH * sr.T_LAT, abs=0.05) for ln in lanes)
+  k = go_frame(sim)
+  assert k is not None and st['stop'] is not None, [(str(p.stopGo.state), p.reason) for p in plans[-240::20]]
+  t_go = next(t for t, (_, _, p) in zip([i * DT_MDL for i in range(len(sim.trace))], sim.trace, strict=True) if p is plans[k])
+  assert t_go > st['stop'] + 3., (t_go, st['stop'])
+  assert not any(str(p.controlPrompt) == 'stopSignTakeControl' for p in plans)
+  sim = StopSim(tmp_path)
+  sim.tp.oracle_ok = False
+  sim.lights = lambda s: oracle_msg([(7, 14.5, 30., 0., 0., 'car')])
+  run_to_line(sim)
+  sim.run(4.)
+  assert all(ln.binding != 'oracle' for p in sim.plans()[-60:] for ln in p.stopGo.lanes)
+  assert any(str(p.controlAlert) == 'lightSourceRejected' for p in sim.plans())

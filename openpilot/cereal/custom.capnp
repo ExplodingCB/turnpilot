@@ -574,6 +574,19 @@ struct TurnpilotLights @0xda96579883444c35 {
   source @0 :Source;
   lights @1 :List(Light);
   shadow @2 :Bool;   # source camera: logged by turnpilotd, never acted on (TurnPilotCameraLights shadow)
+  # STOP_SIGNS.md v3 SG4c, 8.2: the sim's cross-traffic oracle (source simOracle only), the ground truth the stop-sign decider
+  # takes in place of the cameras' tracks and reach in the sim, under the light oracle's gate (SIMULATION=1, the
+  # TurnPilotSimLightOracle param and a sim car): logic checks only, never range evidence. Every road user within crossRangeM
+  struct CrossCar {
+    id @0 :UInt32;
+    x @1 :Float32;      # m forward of the ego's camera, its ground point nearest the ego (the car frame)
+    y @2 :Float32;      # m left
+    vx @3 :Float32;     # m/s, ground, in the car frame
+    vy @4 :Float32;
+    cls @5 :Text;       # car, truck, bus, motorcycle, cyclist, pedestrian
+  }
+  cross @3 :List(CrossCar);
+  crossRangeM @4 :Float32;  # m around the ego the oracle sees every road user (each lane's reach); 0: no cross-traffic oracle
 }
 
 struct TurnpilotFarDetections @0x80ae746ee2596b11 {

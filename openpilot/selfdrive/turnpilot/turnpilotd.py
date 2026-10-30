@@ -130,6 +130,10 @@ import datetime
 import math
 import os
 import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
 
 from opendbc.car.structs import car
 from openpilot.cereal import custom, log, messaging
@@ -143,7 +147,7 @@ from openpilot.selfdrive.turnpilot.go_override import GO_ACCEL, GO_CLEAR_M, GO_W
 from openpilot.selfdrive.turnpilot.handback import Handback
 from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, CLEAR_DESIRE, CONTROL_STATUS_ALERTS, TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.detector.light_state import LIGHT_MODE_DEFAULT, camera_lights_mode
-from openpilot.selfdrive.turnpilot.map_controls import (CAMERA_STALE_S, KEEP_TURN, LATCH_PAST_M, MAP_MARGIN_M, PROTECT_PAST_M, YELLOW_DECEL,
+from openpilot.selfdrive.turnpilot.map_controls import (CAMERA_STALE_S, KEEP_TURN, LATCH_PAST_M, LIGHT_STALE_S, MAP_MARGIN_M, PROTECT_PAST_M, YELLOW_DECEL,
                                                          YELLOW_DECEL_MAX, LeftCommand, MapControlPolicy, StopCommand, camera_light_input,
                                                          is_stop, light_input, turn_stop_feasible, unprotected_turn)
 from openpilot.selfdrive.turnpilot import stop_rules as sr
@@ -154,7 +158,8 @@ from openpilot.selfdrive.turnpilot.lane_planner import (OPENPILOT_SIGNALS_BRANDS
 from openpilot.selfdrive.turnpilot.route_follower import KEEP, LEFT, RIGHT, TURN, UNCERTAIN_M, Maneuver, RouteFollower
 from openpilot.selfdrive.turnpilot.route_notice import RouteNotices
 from openpilot.selfdrive.turnpilot.scene.lane_paint import lane_paint_from_msg
-from openpilot.selfdrive.turnpilot.scene.tracker import MAX_COAST_S, STALE_S, SWEEP_COAST_S, SceneTracker, default_yaw_rate
+from openpilot.selfdrive.turnpilot.scene.tracker import MAX_COAST_S, STALE_S, SWEEP_COAST_S, RawFrame, SceneTracker, default_yaw_rate
+from openpilot.selfdrive.turnpilot.visibility import OracleLive
 from openpilot.selfdrive.turnpilot.junction_watch import JunctionWatch, detector_view, junction_from_info, sweep_control, sweep_wanted
 from openpilot.selfdrive.turnpilot import visibility_table
 from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
@@ -227,6 +232,13 @@ MISSED_HOLD_S = 3.     # turnMissed is held this long, for the alert and for nav
 # the stop-sign ladder's other turn (stop_go.py: 7.1 rung 2, O12) is a maneuver of its own for DesireTiming, never a route's id, so
 # navd's reroute after it (turnMissed) never clears its pulse as a replaced maneuver's
 ALT_MANEUVER_ID = -7
+# the sim's cross-traffic oracle (cross_oracle): its road users' track ids, and their classes as the tracker's (COCO) indexes
+ORACLE_ID = 1_000_000
+SIM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'maps', 'sim')
+SIM_VISIBILITY = Path(SIM_DIR) / 'visibility_sim.json'  # the sim's files (set_sim), read only under its gate
+SIM_SURVEYS = Path(SIM_DIR) / 'surveyed_junctions_sim.json'
+SIM_SUN_UTC_H = 17     # the sim's sun: 13:00 EDT at the sim tiles' Indianapolis frame
+ORACLE_CLASS = {'pedestrian': 0, 'cyclist': 1, 'car': 2, 'motorcycle': 3, 'bus': 5, 'truck': 7}
 ALT_LANES_M = 30.      # navd's lane guidance is our approach's when its maneuver is this close to the held stop's junction
 TURN_MISSED_REASON = "Turn missed — rerouting"
 STALL_PROMPT_S = 3.    # standing this long after the go, STALL_MIN_DEG to STALL_MAX_DEG into the turn, nothing holding it:
@@ -371,6 +383,7 @@ class TurnPilot:
     self.stop_sign_mode, self.stop_sign_known = MODE_DEFAULT, True
     self.vis_source = visibility_table.cached
     self.survey_source = survey_file.cached
+    self.sim_files = False        # the sim's own visibility and survey files and sun (set_sim: SIMULATION=1, the param, a sim car)
     self.wall_clock = lambda: datetime.datetime.now(datetime.UTC).timestamp() if system_time_valid() else None
     self.cp_delay = 0.15          # CarParams.longitudinalActuatorDelay (main()); T_ABORT takes the larger of it and the file's
     self.odo_m = 0.               # m driven since turnpilotd started (faults included): the decider's position after its latch
@@ -1025,6 +1038,14 @@ class TurnPilot:
       m = str(info.get('maneuver', 'straight'))
       maneuver = 'unknown' if src is not None and src.key[0] == OFF_ROUTE else m if m in ('straight', 'left', 'right') else 'unknown'
       vis = self.vis_source()
+      live, tracks, runs, objs, side_status = self.watch.live, tuple(self.tracks_now), tuple(self.runs_now), objects, self.side_status
+      oracle = self.cross_oracle(sm)
+      lenses = dict(self.lenses)
+      if oracle is not None:
+        # the sim's cross-traffic oracle (8.2): ground truth for the decider in the cameras' place, under the gate only (no
+        # camera's lens then decides anything, so none is checked against the file's)
+        live, tracks, runs, objs, side_status = oracle
+        lenses = {}
       lead = model.leadsV3[0] if len(model.leadsV3) else None
       lead_m = float(lead.x[0]) if lead is not None and lead.prob > STOPPED_LEAD_PROB and len(lead.x) else None
       d = self.desires
@@ -1034,8 +1055,8 @@ class TurnPilot:
       to_node = (float(src.d) + float(info.get('stopPointDistance', 0.) or 0.)) if src is not None else None
       ours = len(up.lanes) if up is not None and up.lanes and to_node is not None and abs(rf.distance - to_node) <= ALT_LANES_M else 0
       f = Frame(control=ctl, approach=ahead, junction=junction, route_cert=str(info.get('certification', 'unchecked')), maneuver=maneuver,
-                objects=objects, tracks=tuple(self.tracks_now), runs=tuple(self.runs_now), live=self.watch.live, vis=vis,
-                surveys=self.survey_source(), wall_t=self.wall_clock(), side_status=self.side_status, lenses=dict(self.lenses),
+                objects=objs, tracks=tracks, runs=runs, live=live, vis=vis,
+                surveys=self.survey_source(), wall_t=self.decider_clock(), side_status=side_status, lenses=lenses,
                 position_spread=src.fix_spread if src is not None else 0., v_ego=v_ego, a_ego=float(cs.aEgo), odo_m=self.odo_m,
                 yaw20_deg=sum(y for _, y in self.yaw20), approach_yaw_deg=self.approach_yaw_deg, turned_deg=self.sg_turned,
                 steer_deg=float(cs.steeringAngleDeg), desire_out=d.maneuver_id == alt_id and d.started and d.side != 0 and not d.done,
@@ -1048,6 +1069,58 @@ class TurnPilot:
     except Exception:
       log_error("turnpilotd.stop_go_failed")
       return StopGoDecision(latch='shadow', withdraw='error')
+
+  def set_sim(self, ok: bool) -> None:
+    """The sim's files for the stop-sign decider (STOP_SIGNS.md 8.2), only under visibility_table.sim_accepted (SIMULATION=1,
+    TurnPilotSimLightOracle and a sim car in CarParams): the sim visibility file (camera fields, a passing launchVerified, all
+    synthetic) and the sim survey of the scenario junctions (maps/sim/), and the sim's own sun (SIM_SUN_UTC_H on the day).
+    Off it the shipped files and the wall clock; the sim's are never read."""
+    if ok == self.sim_files:
+      return
+    self.sim_files = ok
+    cloudlog.event("turnpilot.sim_stop_files", on=ok, visibility=str(SIM_VISIBILITY), surveys=str(SIM_SURVEYS))
+    if ok:
+      self.vis_source = lambda: visibility_table.cached(SIM_VISIBILITY, sim_ok=True)
+      self.survey_source = lambda: survey_file.cached(SIM_SURVEYS)
+    else:
+      self.vis_source, self.survey_source = visibility_table.cached, survey_file.cached
+
+  def decider_clock(self) -> float | None:
+    """The stop-sign decider's wall clock (its light check): the sim's own sun under the sim's files, SIM_SUN_UTC_H of today
+    (BeamNG renders its own daylight, not Indiana's), else the wall clock while valid."""
+    t = self.wall_clock()
+    if not self.sim_files or t is None:
+      return t
+    day = datetime.datetime.fromtimestamp(t, datetime.UTC).replace(hour=SIM_SUN_UTC_H, minute=0, second=0, microsecond=0)
+    return day.timestamp()
+
+  def cross_oracle(self, sm):
+    """The sim's cross-traffic oracle for the decider (STOP_SIGNS.md 8.2), or None: turnpilotLights from the simOracle with a
+    crossRangeM, fresh (LIGHT_STALE_S), and only while the light oracle's gate holds (oracle_ok: SIMULATION=1 and
+    TurnPilotSimLightOracle); off it map_controls refuses the message out loud (lightSourceRejected) and nothing here reads it.
+    (OracleLive, its tracks as the tracker's, the runs of every view, its road users as the scene's objects, 'running')."""
+    data = getattr(sm, 'data', {})
+    if 'turnpilotLights' not in data:
+      return None
+    self.oracle_age = 0. if sm.updated['turnpilotLights'] else getattr(self, 'oracle_age', float('inf')) + DT_MDL
+    msg = sm['turnpilotLights']
+    if not self.oracle_ok or self.oracle_age > LIGHT_STALE_S or str(msg.source) != 'simOracle' or float(msg.crossRangeM) <= 0.:
+      return None
+    self.oracle_t = getattr(self, 'oracle_t', 0.) + DT_MDL
+    t = self.oracle_t
+    tracks, objs = [], []
+    for c in msg.cross:
+      x, y, vx, vy, cls = float(c.x), float(c.y), float(c.vx), float(c.vy), str(c.cls)
+      r = max(math.hypot(x, y), 0.5)
+      b = math.degrees(math.atan2(y, x))
+      half = math.degrees(math.atan2(0.9, r))
+      view = 'full' if abs(b) < 40. else 'sideLeft' if b > 0. else 'sideRight'
+      tracks.append(SimpleNamespace(track_id=ORACLE_ID + int(c.id), t_seen=t, bearing_seen=b, width_seen=1.8 * 904. / r, view=view,
+                                    cls=ORACLE_CLASS.get(cls, 2), x=np.array([x, y, vx, vy]), span_seen=(b - half, b + half), hits=5))
+      objs.append(SimpleNamespace(trackId=ORACLE_ID + int(c.id), cls=cls, x=x, y=y, vx=vx, vy=vy))
+    runs = tuple((v, t, RawFrame([], 'road' if v == 'road' else 'wide', t, v if v.startswith('side') else 'full'), None)
+                 for v in ('road', 'full', 'sideLeft', 'sideRight'))
+    return OracleLive(float(msg.crossRangeM)), tuple(tracks), runs, objs, 'running'
 
   def signal_seen_override(self, j) -> None:
     """A signal head at a stop-sign junction (stop_go: 2.4 item 9, C20): TurnPilotJunctionOverrides names it signalSeen so
@@ -1810,6 +1883,7 @@ def main():
       long_control = long_control_for(params)
       disengage_on_accel = params.get_bool("DisengageOnAccelerator")
       tp.oracle_ok = oracle_accepted(os.environ, read_bool(params, "TurnPilotSimLightOracle", False))
+      tp.set_sim(visibility_table.sim_accepted(os.environ, read_bool(params, visibility_table.SIM_PARAM, False), car_params(params)))
       tp.yellow_decel = yellow_decel_for(params)
       tp.camera_mode = camera_lights_mode(params)
       tp.post_go_profile = post_go_profile_for(params, "TurnPilotPostGoProfile", POST_GO_DEFAULT)

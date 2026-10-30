@@ -1,0 +1,1770 @@
+[
+ {
+  "osmNodeId": 3059,
+  "lat": 39.7685233,
+  "lon": -86.1566794,
+  "date": "2026-10-30",
+  "source": "inPerson",
+  "confirmedBy": [
+   "inPerson"
+  ],
+  "synthetic": true,
+  "note": "synthetic: the sim's (sim_stop_files.py), a logic check's, never range evidence",
+  "approaches": [
+   {
+    "wayId": 166,
+    "bearingDeg": 322.5,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 20,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   },
+   {
+    "wayId": 962,
+    "bearingDeg": 234.5,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 30,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   },
+   {
+    "wayId": 2563,
+    "bearingDeg": 143.0,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 30,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   }
+  ],
+  "validations": [
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 322.5,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   },
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 234.5,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   },
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 143.0,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   }
+  ]
+ },
+ {
+  "osmNodeId": 3903,
+  "lat": 39.7753275,
+  "lon": -86.1670742,
+  "date": "2026-10-30",
+  "source": "inPerson",
+  "confirmedBy": [
+   "inPerson"
+  ],
+  "synthetic": true,
+  "note": "synthetic: the sim's (sim_stop_files.py), a logic check's, never range evidence",
+  "approaches": [
+   {
+    "wayId": 1348,
+    "bearingDeg": 0.5,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 25,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   },
+   {
+    "wayId": 1349,
+    "bearingDeg": 269.8,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 25,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   },
+   {
+    "wayId": 1689,
+    "bearingDeg": 90.1,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 25,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   },
+   {
+    "wayId": 2306,
+    "bearingDeg": 179.6,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 25,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   }
+  ],
+  "validations": [
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 0.5,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   },
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 269.8,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   },
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 90.1,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   },
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 179.6,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   }
+  ]
+ },
+ {
+  "osmNodeId": 3909,
+  "lat": 39.7723695,
+  "lon": -86.1688405,
+  "date": "2026-10-30",
+  "source": "inPerson",
+  "confirmedBy": [
+   "inPerson"
+  ],
+  "synthetic": true,
+  "note": "synthetic: the sim's (sim_stop_files.py), a logic check's, never range evidence",
+  "approaches": [
+   {
+    "wayId": 1405,
+    "bearingDeg": 0.0,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 25,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   },
+   {
+    "wayId": 1507,
+    "bearingDeg": 270.2,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 25,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   },
+   {
+    "wayId": 2659,
+    "bearingDeg": 180.0,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 25,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   }
+  ],
+  "validations": [
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 0.0,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   },
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 270.2,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   },
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 180.0,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   }
+  ]
+ },
+ {
+  "osmNodeId": 5241,
+  "lat": 39.7708468,
+  "lon": -86.1681472,
+  "date": "2026-10-30",
+  "source": "inPerson",
+  "confirmedBy": [
+   "inPerson"
+  ],
+  "synthetic": true,
+  "note": "synthetic: the sim's (sim_stop_files.py), a logic check's, never range evidence",
+  "approaches": [
+   {
+    "wayId": 161,
+    "bearingDeg": 317.3,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 25,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   },
+   {
+    "wayId": 1492,
+    "bearingDeg": 33.6,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 25,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   },
+   {
+    "wayId": 1493,
+    "bearingDeg": 226.1,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 25,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   },
+   {
+    "wayId": 2651,
+    "bearingDeg": 134.1,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 25,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   }
+  ],
+  "validations": [
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 317.3,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   },
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 33.6,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   },
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 226.1,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   },
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 134.1,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   }
+  ]
+ },
+ {
+  "osmNodeId": 5725,
+  "lat": 39.7709317,
+  "lon": -86.1633483,
+  "date": "2026-10-30",
+  "source": "inPerson",
+  "confirmedBy": [
+   "inPerson"
+  ],
+  "synthetic": true,
+  "note": "synthetic: the sim's (sim_stop_files.py), a logic check's, never range evidence",
+  "approaches": [
+   {
+    "wayId": 179,
+    "bearingDeg": 221.2,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 20,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   },
+   {
+    "wayId": 1656,
+    "bearingDeg": 44.1,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 20,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   },
+   {
+    "wayId": 2653,
+    "bearingDeg": 135.0,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 25,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   }
+  ],
+  "validations": [
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 221.2,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   },
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 44.1,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   },
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 135.0,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   }
+  ]
+ },
+ {
+  "osmNodeId": 7943,
+  "lat": 39.784085,
+  "lon": -86.1560025,
+  "date": "2026-10-30",
+  "source": "inPerson",
+  "confirmedBy": [
+   "inPerson"
+  ],
+  "synthetic": true,
+  "note": "synthetic: the sim's (sim_stop_files.py), a logic check's, never range evidence",
+  "approaches": [
+   {
+    "wayId": 96,
+    "bearingDeg": 162.3,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 35,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   },
+   {
+    "wayId": 942,
+    "bearingDeg": 339.8,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 35,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   },
+   {
+    "wayId": 1055,
+    "bearingDeg": 73.6,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 35,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   }
+  ],
+  "validations": [
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 162.3,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   },
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 339.8,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   },
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 73.6,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   }
+  ]
+ },
+ {
+  "osmNodeId": 7959,
+  "lat": 39.7654509,
+  "lon": -86.1538271,
+  "date": "2026-10-30",
+  "source": "inPerson",
+  "confirmedBy": [
+   "inPerson"
+  ],
+  "synthetic": true,
+  "note": "synthetic: the sim's (sim_stop_files.py), a logic check's, never range evidence",
+  "approaches": [
+   {
+    "wayId": 567,
+    "bearingDeg": 185.4,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 35,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   },
+   {
+    "wayId": 650,
+    "bearingDeg": 277.1,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 35,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   },
+   {
+    "wayId": 800,
+    "bearingDeg": 4.9,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 35,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   },
+   {
+    "wayId": 1156,
+    "bearingDeg": 96.7,
+    "stops": true,
+    "plaque": true,
+    "postedMph": 35,
+    "laneEdgeM": 3.5,
+    "lineM": 7.0,
+    "nearestParkingM": {
+     "left": 60.0,
+     "right": 60.0
+    },
+    "sightM": 100.0,
+    "stopPointM": null
+   }
+  ],
+  "validations": [
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 185.4,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   },
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 277.1,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   },
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 4.9,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   },
+   {
+    "lighting": "day",
+    "date": "2026-10-30",
+    "passes": 3,
+    "approachBearingDeg": 96.7,
+    "cars": {
+     "left": 10,
+     "right": 10,
+     "opposite": 10
+    },
+    "minFirstTrackM": {
+     "left": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "right": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ],
+     "opposite": [
+      60.0,
+      60.0,
+      60.0,
+      60.0
+     ]
+    },
+    "maxDropoutS": {
+     "left": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "right": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ],
+     "opposite": [
+      0.2,
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    "allStopped": true,
+    "verdict": "pass",
+    "synthetic": true
+   }
+  ]
+ }
+]
