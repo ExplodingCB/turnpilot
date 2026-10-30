@@ -54,6 +54,18 @@ if [ -n "${FAKE_COMMA_CUT_BYTES:-}" ] && [ "$action" = receive ]; then
   head -c "$FAKE_COMMA_CUT_BYTES" | bash -c "$cmd"
   exit 255
 fi
+# FAKE_COMMA_DROP=<action>:pipe|hup: the connection ends during that action. pipe: every write the comma's side makes goes
+# to a closed connection (SIGPIPE). hup: the comma's shell gets SIGHUP right after its first mv.
+if [ -n "${FAKE_COMMA_DROP:-}" ] && [ "$action" = "${FAKE_COMMA_DROP%%:*}" ]; then
+  case "${FAKE_COMMA_DROP#*:}" in
+    pipe) "$FAKE_COMMA_PY" -c 'import os, subprocess, sys
+r, w = os.pipe()
+os.close(r)
+sys.exit(subprocess.call(["bash", "-c", sys.argv[1]], stdout=w, stderr=w))' "$cmd" ;;
+    hup) FAKE_COMMA_HUP_AFTER_MV="$FAKE_COMMA_LOG.hup" bash -c "$cmd" ;;
+  esac
+  exit 255
+fi
 bash -c "$cmd"
 rc=$?
 if [ -n "${FAKE_COMMA_ONROAD_AFTER_RECEIVE:-}" ] && [ "$action" = receive ]; then
@@ -70,6 +82,15 @@ else
 fi
 '''
 SUDO_SHIM = '#!/usr/bin/env bash\necho "sudo $*" >> "$FAKE_COMMA_LOG"\nexit 1\n'
+MV_SHIM = r'''#!/usr/bin/env bash
+/bin/mv "$@"
+rc=$?
+if [ -n "${FAKE_COMMA_HUP_AFTER_MV:-}" ] && [ ! -e "$FAKE_COMMA_HUP_AFTER_MV" ]; then
+  touch "$FAKE_COMMA_HUP_AFTER_MV"
+  kill -HUP "$PPID"
+fi
+exit $rc
+'''
 SHA256SUM_SHIM = '#!/usr/bin/env bash\nexec shasum -a 256 "$@"\n'
 
 
@@ -159,14 +180,14 @@ def comma(tmp_path):
 
   shims = tmp_path / 'shims'
   comma_bin = tmp_path / 'comma_bin'
-  for d, files in ((shims, {'ssh': SSH_SHIM}), (comma_bin, {'df': DF_SHIM, 'sudo': SUDO_SHIM})):
+  for d, files in ((shims, {'ssh': SSH_SHIM}), (comma_bin, {'df': DF_SHIM, 'sudo': SUDO_SHIM, 'mv': MV_SHIM})):
     d.mkdir()
     for name, text in files.items():
       put(d, name, text.encode(), 0o755)
   if not any((Path(p) / 'sha256sum').exists() for p in os.environ['PATH'].split(os.pathsep)):
     put(comma_bin, 'sha256sum', SHA256SUM_SHIM.encode(), 0o755)
   env = {**os.environ, 'PATH': f'{shims}{os.pathsep}{os.environ["PATH"]}', 'FAKE_COMMA_BIN': str(comma_bin),
-         'FAKE_COMMA_LOG': str(tmp_path / 'ssh.log')}
+         'FAKE_COMMA_LOG': str(tmp_path / 'ssh.log'), 'FAKE_COMMA_PY': sys.executable}
   return root, env
 
 
@@ -351,6 +372,51 @@ def test_copy_that_fails_midway_leaves_both_trees(source, comma):
   assert len(incoming) == 1 and incoming[0].name in r.stdout
   assert 'Both trees are intact' in r.stdout
   assert (root / 'params/d/DisableUpdates').read_text() == '0'
+
+
+def assert_state_unknown(r, env, drop):
+  assert r.returncode == 1, r.stdout
+  assert 'state is unknown' in r.stdout and '--dry-run' in r.stdout
+  assert 'intact' not in r.stdout and 'as it was' not in r.stdout and 'rm -rf' not in r.stdout
+  if drop == 'hup':
+    assert Path(env['FAKE_COMMA_LOG'] + '.hup').exists()  # the hangup did land, after the first mv
+
+
+@pytest.mark.parametrize('drop', ['pipe', 'hup'])
+def test_ssh_drop_during_swap(source, comma, drop):
+  """The connection ends during the swap: the comma's side still does both moves (a hangup, or a write to the closed
+  connection, must not stop it between them with /data/openpilot gone), and the script says the comma's state is unknown,
+  never that both trees are intact. DisableUpdates was never set, which the script can't know."""
+  src, _, second, panda1 = source
+  root, env = comma
+  sunny = tree_of(root, 'openpilot')
+  r = deploy(src, root, env, '--stamp', '20261031-080000', extra_env={'FAKE_COMMA_DROP': f'swap:{drop}'})
+  assert (root / 'openpilot').is_dir(), r.stdout
+  check_deployed(root / 'openpilot', second, panda1)
+  assert prevs(root) == ['openpilot.prev-20261031-080000']
+  assert tree_of(root, 'openpilot.prev-20261031-080000') == sunny
+  assert not list(root.glob('openpilot.tp-incoming-*'))
+  assert (root / 'params/d/DisableUpdates').read_text() == '0'
+  assert_state_unknown(r, env, drop)
+  assert 'DisableUpdates' in r.stdout
+
+
+@pytest.mark.parametrize('drop', ['pipe', 'hup'])
+def test_ssh_drop_during_rollback(source, comma, drop):
+  """The connection ends during the rollback: /data/openpilot is always a whole tree, either one, with the other kept
+  beside it, and the script says the state is unknown."""
+  src, *_ = source
+  root, env = comma
+  sunny = tree_of(root, 'openpilot')
+  assert deploy(src, root, env, '--stamp', '20261031-080000').returncode == 0
+  turnpilot = tree_of(root, 'openpilot')
+  r = deploy(src, root, env, '--rollback', '--stamp', '20261031-100000', extra_env={'FAKE_COMMA_DROP': f'rollback:{drop}'})
+  assert (root / 'openpilot').is_dir(), r.stdout
+  trees = [tree_of(root, name) for name in ['openpilot', *prevs(root)]]
+  assert len(trees) == 2 and sunny in trees and turnpilot in trees
+  if drop == 'hup':  # the hangup came after the first mv: the second still happened
+    assert trees[0] == sunny
+  assert_state_unknown(r, env, drop)
 
 
 def test_rollback(source, comma):
