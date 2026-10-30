@@ -14,11 +14,16 @@ tools/turnpilot/README.md), so the rlogs can't say whether a run's code had unco
                     --exclude-standard)
   submodules        each gitlink in HEAD: {path, gitlink (the sha HEAD records), head (the sha checked out), tracked_changes
                     (its git status lines), patch_ok (msgq_repo only: its diff is exactly the documented MSGQ_PATCH; null
-                    for the others), dir (where it was read)}. A submodule the stack's checkout has no repo for (a worktree's
-                    empty submodule dirs) is read where the stack imports it from: its package (SUBMODULE_PACKAGES) as the
-                    venv resolves it with the checkout first on the path, the main checkout's for every worktree here
-  clean             tracked_changes and untracked_py empty, and every submodule at its gitlink with no tracked changes but
-                    msgq_repo's diff being exactly MSGQ_PATCH
+                    for the others), dir (the repo read), own_dir (the checkout's own repo at path; null for a worktree's
+                    empty submodule dir)}. Each is read where the stack imports it from, never just because the checkout
+                    has a repo of its own there: its package (SUBMODULE_PACKAGES) as the stack's interpreter finds it, the
+                    manager's dir and PYTHONPATH first (submodule_repos). That is the main checkout's for every checkout
+                    here, a populated worktree submodule too: launch_openpilot.sh puts only the checkout root on PYTHONPATH,
+                    which has no package dirs, so the venv's editable finders and _openpilot.pth give them. A checkout whose
+                    own repo at path is not the one the stack imports, or a package found nowhere or outside any submodule
+                    repo, is a problem
+  clean             tracked_changes, untracked_py and the submodules' problems empty, and every submodule at its gitlink with
+                    no tracked changes but msgq_repo's diff being exactly MSGQ_PATCH
   changed_during_run  null until the end check (finish) has read the checkout again (a run that never reached it, or
                     whose checkout couldn't be read then, is unverified), then whether anything differed; at_end holds the
                     end's snapshot when it did
@@ -73,32 +78,107 @@ def status_lines(cwd: str, *extra: str) -> list[str]:
   return [ln for ln in out.splitlines() if ln.strip()]
 
 
-def package_dir(stack_dir: str, package: str) -> str | None:
-  """Where the stack imports package from: the venv's resolution with the checkout first on the path, as
-  launch_openpilot.sh's PYTHONPATH puts it (the venv's .pth and editable finders after it)."""
-  code = "\n".join(["import importlib.util, sys", "sys.path.insert(0, sys.argv[1])", "s = importlib.util.find_spec(sys.argv[2])",
-                     "print((list(s.submodule_search_locations or []) or [s.origin or ''])[0] if s else '')"])
+class ResolveError(Exception):
+  """Where the stack imports its packages from couldn't be found out."""
+
+
+# run by the stack's interpreter (package_dirs): argv[1] the manager script's dir ('' for none) first on the path, as
+# python puts ./manager.py's, then each package of argv[2:] found as the stack finds it; the last line is {name: where}
+RESOLVE = "\n".join([
+  "import importlib.util, json, sys",
+  "sys.path[:0] = [sys.argv[1]] if sys.argv[1] else []",
+  "def where(name):",
+  "  try:",
+  "    s = importlib.util.find_spec(name)",
+  "  except Exception:",
+  "    return None",
+  "  return ((list(s.submodule_search_locations or []) or [s.origin or ''])[0] or None) if s else None",
+  "print('\\n' + json.dumps({n: where(n) for n in sys.argv[2:]}))"])
+
+
+def assumed_launch(stack_dir: str) -> dict:
+  """How launch_openpilot.sh starts the stack from stack_dir, for a stack whose manager isn't found running (--stack-dir):
+  this interpreter, in this environment with the checkout first on PYTHONPATH (${PYTHONPATH:+:$PYTHONPATH}), the
+  manager's dir first on its path."""
+  env = dict(os.environ)
+  env['PYTHONPATH'] = stack_dir + (os.pathsep + env['PYTHONPATH'] if env.get('PYTHONPATH') else '')
+  mdir = os.path.join(stack_dir, os.path.dirname(MANAGER))
+  return {'from': 'assumed', 'python': sys.executable, 'cwd': stack_dir, 'script_dir': mdir, 'env': env}
+
+
+def package_dirs(launch: dict, packages: list[str]) -> dict[str, str | None]:
+  """{package: where the stack imports it from (its dir, or its file for a module), None for nowhere}, as launch's
+  interpreter finds it in launch's environment and working directory (its PYTHONPATH, then the venv's site, .pth files
+  and editable finders), with the manager script's dir first. ResolveError when that can't be run."""
+  if not packages:
+    return {}
+  if not launch.get('python'):
+    raise ResolveError("the stack's interpreter is unknown" + (f" ({launch['why']})" if launch.get('why') else ''))
+  first = '' if launch['env'].get('PYTHONSAFEPATH') else launch.get('script_dir') or ''
   try:
-    out = subprocess.run([sys.executable, '-I', '-c', code, stack_dir, package], capture_output=True, text=True, timeout=30,
-                         cwd=stack_dir).stdout.strip()
-  except (OSError, subprocess.TimeoutExpired):
-    return None
-  return out or None
+    out = subprocess.run([launch['python'], '-P', '-c', RESOLVE, first, *packages], capture_output=True, text=True, timeout=60,
+                         env=launch['env'], cwd=launch['cwd'], stdin=subprocess.DEVNULL)
+  except (OSError, subprocess.TimeoutExpired) as e:
+    raise ResolveError(f"the stack's interpreter {launch['python']} could not be run: {e!r}") from e
+  try:
+    found = json.loads(out.stdout.rstrip().rpartition('\n')[2]) if out.returncode == 0 else None
+  except ValueError:
+    found = None
+  if not isinstance(found, dict):
+    raise ResolveError(f"the stack's interpreter {launch['python']} could not resolve its packages (exit {out.returncode}): " +
+                       out.stderr.strip()[-300:])
+  return {p: found.get(p) for p in packages}
 
 
-def submodule_dir(stack_dir: str, path: str, resolve=None) -> str | None:
-  """The repo the stack runs a submodule's code from: its own checkout in stack_dir, else where its package resolves."""
-  d = os.path.realpath(os.path.join(stack_dir, path))
-  if os.path.isdir(d) and toplevel(d) == d:
-    return d
-  pkg = SUBMODULE_PACKAGES.get(path)
-  loc = (resolve or package_dir)(stack_dir, pkg) if pkg else None
-  top = toplevel(os.path.dirname(loc) if loc and os.path.isfile(loc) else loc) if loc else None
-  return top if top is not None and top != toplevel(stack_dir) else None
+def submodule_repos(stack_dir: str, paths: list[str], launch: dict | None = None, resolve=None) -> tuple[dict, list[str]]:
+  """({path: (the repo the stack runs path's code from, the checkout's own repo at path, why they are in doubt)}, the
+  problems resolving them). A submodule with a package (SUBMODULE_PACKAGES) is read where the stack imports that
+  package from (package_dirs, as launch starts the stack; launch_openpilot.sh's when None), whatever the checkout's own
+  folder holds: the stack's path never has the checkout's own submodule repos on it here (launch_openpilot.sh puts
+  the checkout root first, which has no package dirs, and the venv's editable finders and _openpilot.pth give the main
+  checkout's). The checkout's own repo there (None for a worktree's empty submodule dir) is a cross-check: one that
+  isn't the repo the stack imports is in doubt. A gitlink with no package is read in its own repo."""
+  launch = launch or assumed_launch(stack_dir)
+  self_top = toplevel(stack_dir)
+  pkgs = [SUBMODULE_PACKAGES[p] for p in paths if p in SUBMODULE_PACKAGES]
+  problems = []
+  try:
+    locs = (resolve or package_dirs)(launch, pkgs) if pkgs else {}
+  except ResolveError as e:
+    problems.append(str(e))
+    locs = None
+  out = {}
+  for path in paths:
+    d = os.path.realpath(os.path.join(stack_dir, path))
+    own = d if os.path.isdir(d) and toplevel(d) == d else None
+    pkg = SUBMODULE_PACKAGES.get(path)
+    if pkg is None:
+      out[path] = (own, own, None)
+      continue
+    loc = None if locs is None else locs.get(pkg)
+    top = toplevel(os.path.dirname(loc) if os.path.isfile(loc) else loc) if loc else None
+    why = None
+    if locs is None:
+      why = f"where the stack imports {pkg} from is unknown"
+    elif loc is None:
+      why = f"the stack's interpreter finds no {pkg} package"
+    elif top is None or top == self_top:
+      why, top = f"the stack imports {pkg} from {loc}, which is in no submodule checkout", None
+    elif own is not None and own != top:
+      short = {r: git(r, 'rev-parse', '--short', 'HEAD').strip() for r in (top, own)}
+      why = f"the stack imports {pkg} from {top} ({short[top]}), not from this checkout's own {path} ({own}, {short[own]})"
+    out[path] = (top, own, why)
+  return out, problems
 
 
-def snapshot(stack_dir: str, resolve=None) -> dict:
-  """The tree fields of stack_dir (module docstring), and a digest of its uncommitted content for the end check."""
+def submodule_dir(stack_dir: str, path: str, launch: dict | None = None, resolve=None) -> str | None:
+  """The repo the stack runs a submodule's code from (submodule_repos)."""
+  return submodule_repos(stack_dir, [path], launch, resolve)[0][path][0]
+
+
+def snapshot(stack_dir: str, resolve=None, launch: dict | None = None) -> dict:
+  """The tree fields of stack_dir (module docstring), a digest of its uncommitted content for the end check, and the
+  problems that put its submodules in doubt (submodule_repos; they make it unclean)."""
   refresh(stack_dir)
   h = hashlib.sha256()
   head = git(stack_dir, 'rev-parse', 'HEAD').strip()
@@ -123,14 +203,14 @@ def snapshot(stack_dir: str, resolve=None) -> dict:
       patch = f.read()
   except OSError:
     patch = None
+  links = [(e.partition('\t')[2], e.split()[2]) for e in git(stack_dir, 'ls-tree', '-r', '-z', 'HEAD').split('\0') if e.startswith('160000 ')]
+  repos, problems = submodule_repos(stack_dir, [path for path, _ in links], launch, resolve)
   subs = []
-  for entry in git(stack_dir, 'ls-tree', '-r', '-z', 'HEAD').split('\0'):
-    meta, _, path = entry.partition('\t')
-    if not meta.startswith('160000 '):
-      continue
-    gitlink = meta.split()[2]
-    d = submodule_dir(stack_dir, path, resolve)
-    sub = {'path': path, 'gitlink': gitlink, 'head': None, 'tracked_changes': [], 'patch_ok': None, 'dir': d}
+  for path, gitlink in links:
+    d, own, why = repos[path]
+    if why is not None:
+      problems.append(f"{path}: {why}")
+    sub = {'path': path, 'gitlink': gitlink, 'head': None, 'tracked_changes': [], 'patch_ok': None, 'dir': d, 'own_dir': own}
     if d is not None:
       refresh(d)
       sub['head'] = git(d, 'rev-parse', 'HEAD').strip()
@@ -142,10 +222,10 @@ def snapshot(stack_dir: str, resolve=None) -> dict:
     elif path == MSGQ_PATH:
       sub['patch_ok'] = False
     subs.append(sub)
-  clean = not tracked and not untracked and all(
+  clean = not tracked and not untracked and not problems and all(
     s['head'] == s['gitlink'] and (not s['tracked_changes'] or (s['path'] == MSGQ_PATH and s['patch_ok'])) for s in subs)
   return {'stack_dir': os.path.realpath(stack_dir), 'head': head, 'tree': tree, 'openpilot_tree': op_tree, 'tracked_changes': tracked,
-          'untracked_py': untracked, 'submodules': subs, 'clean': clean, 'digest': h.hexdigest()}
+          'untracked_py': untracked, 'submodules': subs, 'clean': clean, 'digest': h.hexdigest(), 'problems': problems}
 
 
 def manager_dirs(prefix: str, run=subprocess.run) -> list[str]:
@@ -214,7 +294,9 @@ def start(run_dir: str, prefix: str, option: str = '', git_commit=None, managers
                'tracked_changes': [], 'untracked_py': [], 'submodules': [], 'clean': False}
   if stack_dir is not None:
     try:
-      doc.update(snapshot(stack_dir, resolve))
+      snap = snapshot(stack_dir, resolve)
+      problems += snap.pop('problems')
+      doc.update(snap)
     except (subprocess.CalledProcessError, OSError) as e:
       problems.append(f"the stack's checkout {stack_dir} could not be read: {e!r}")
   if isinstance(git_commit, bytes):
@@ -236,6 +318,9 @@ def finish(run_dir: str, doc: dict, resolve=None) -> dict:
   if doc.get('stack_dir') is not None:
     try:
       end = snapshot(doc['stack_dir'], resolve)
+      new = [p for p in end.pop('problems') if p not in doc.get('problems', [])]
+      if new:
+        doc['problems'] = doc.get('problems', []) + [f"at the end check, {p}" for p in new]
     except (subprocess.CalledProcessError, OSError) as e:
       doc['problems'] = doc.get('problems', []) + [f"the end check could not read {doc['stack_dir']}: {e!r}"]
   changed = None if end is None else any(end[k] != doc.get(k) for k in COMPARED)

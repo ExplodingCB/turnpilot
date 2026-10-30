@@ -29,8 +29,8 @@ Without S, the scenario's fault_at_s (catalog: straight_cruise's lands the fault
 
 Each invocation writes tree.json in its directory before it touches the game and checks it again after the bridge exits
 (tree.py): the stack's checkout (the running manager's for this OPENPILOT_PREFIX, or --stack-dir), its HEAD, uncommitted
-edits, untracked sources and submodules, whether that is clean, and whether it changed during the runs. initData.dirty is
-set on every sim run here, so this is what says which code a run drove on.
+edits, untracked sources and submodules (each read where the stack imports it from), whether that is clean, and whether
+it changed during the runs. initData.dirty is set on every sim run here, so this is what says which code a run drove on.
 
 A scenario with a forced light (catalog.junction_lights) has its junction's signal forced at each run's setup, after the
 actors, and green green_after_s after the car first stands within GO_NEAR_M before the junction; the director logs both

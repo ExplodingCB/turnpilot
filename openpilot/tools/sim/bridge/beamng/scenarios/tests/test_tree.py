@@ -1,6 +1,7 @@
 """tree.json (scenarios/tree.py): what code a scenario invocation drove on, since initData.dirty is set on every sim run
 here. Each test builds a checkout in tmp_path: openpilot/ with a source file, msgq_repo and opendbc_repo as gitlinks with
-their own repos, and the documented msgq patch committed and applied, as the main checkout keeps it."""
+their own repos, and the documented msgq patch committed and applied, as the main checkout keeps it. Where the stack
+imports msgq and opendbc from is faked (own_packages: the checkout's own repos) unless a test resolves it for real."""
 import json
 import os
 import subprocess
@@ -65,12 +66,20 @@ def checkout(tmp_path):
   return root
 
 
-def no_packages(stack_dir, package):
-  return None
+REPOS = {'msgq': 'msgq_repo', 'opendbc': 'opendbc_repo'}
+
+
+def no_packages(launch, packages):
+  return dict.fromkeys(packages)
+
+
+def own_packages(root):
+  """The stack imports the checkout's own submodule repos (as upstream's layout links them at the root)."""
+  return lambda launch, packages: {p: str(root / REPOS[p] / p) for p in packages}
 
 
 def snap(root):
-  return tree.snapshot(str(root), resolve=no_packages)
+  return tree.snapshot(str(root), resolve=own_packages(root))
 
 
 class TestSnapshot:
@@ -134,19 +143,122 @@ class TestSnapshot:
     git(checkout, 'worktree', 'add', '-q', '--detach', str(wt))
     assert os.listdir(wt / 'msgq_repo') == []
     found = {'msgq': str(checkout / 'msgq_repo/msgq'), 'opendbc': str(checkout / 'opendbc_repo/opendbc/__init__.py')}
-    s = tree.snapshot(str(wt), resolve=lambda stack_dir, pkg: found.get(pkg))
+    s = tree.snapshot(str(wt), resolve=lambda launch, pkgs: {p: found.get(p) for p in pkgs})
     subs = {x['path']: x for x in s['submodules']}
     assert s['clean'] and subs['msgq_repo']['dir'] == os.path.realpath(checkout / 'msgq_repo') and subs['msgq_repo']['patch_ok']
-    assert subs['opendbc_repo']['dir'] == os.path.realpath(checkout / 'opendbc_repo')
-    # one that resolves nowhere (or to the worktree itself) has no head: not clean
-    s = tree.snapshot(str(wt), resolve=lambda stack_dir, pkg: str(wt / 'msgq_repo') if pkg == 'msgq' else found.get(pkg))
-    assert not s['clean'] and next(x for x in s['submodules'] if x['path'] == 'msgq_repo')['head'] is None
+    assert subs['opendbc_repo']['dir'] == os.path.realpath(checkout / 'opendbc_repo') and s['problems'] == []
+    assert subs['msgq_repo']['own_dir'] is None and subs['opendbc_repo']['own_dir'] is None
+    # one that resolves nowhere, or to the worktree itself, has no head: not clean, and said
+    for where in (str(wt / 'msgq_repo'), None):
+      s = tree.snapshot(str(wt), resolve=lambda launch, pkgs, where=where: {p: where if p == 'msgq' else found.get(p) for p in pkgs})
+      assert not s['clean'] and next(x for x in s['submodules'] if x['path'] == 'msgq_repo')['head'] is None
+      assert [p.split(':')[0] for p in s['problems']] == ['msgq_repo']
 
-  def test_the_venvs_resolution_is_the_stacks(self, tmp_path):
-    pkg = tmp_path / 'site' / 'zz_tree_probe_pkg'
-    write(pkg / '__init__.py', "")
-    assert tree.package_dir(str(tmp_path / 'site'), 'zz_tree_probe_pkg') == str(pkg)
-    assert tree.package_dir(str(tmp_path), 'zz_tree_probe_missing') is None
+  def test_the_checkouts_own_submodule_repo_isnt_read_when_the_stack_imports_another(self, checkout, tmp_path):
+    # tp-blinker's: its own opendbc_repo is checked out at its gitlink, but the stack imports opendbc from the main
+    # checkout's (the venv's editable finder), at another commit
+    main = tmp_path / 'main_opendbc'
+    git(tmp_path, 'clone', '-q', str(checkout / 'opendbc_repo'), str(main))
+    write(main / 'opendbc/car.py', "")
+    git(main, 'add', '-A')
+    git(main, 'commit', '-q', '-m', 'main')
+    found = {'msgq': str(checkout / 'msgq_repo/msgq'), 'opendbc': str(main / 'opendbc')}
+    s = tree.snapshot(str(checkout), resolve=lambda launch, pkgs: {p: found[p] for p in pkgs})
+    sub = next(x for x in s['submodules'] if x['path'] == 'opendbc_repo')
+    assert sub['dir'] == os.path.realpath(main) and sub['own_dir'] == os.path.realpath(checkout / 'opendbc_repo')
+    assert sub['head'] == git(main, 'rev-parse', 'HEAD') != sub['gitlink'] and not s['clean']
+    (problem,) = s['problems']
+    assert problem.startswith('opendbc_repo: ') and os.path.realpath(main) in problem and os.path.realpath(checkout / 'opendbc_repo') in problem
+    # the other repo at the gitlink: the code that runs is the gitlink's, but not the checkout's own repo: in doubt, not clean
+    git(main, 'reset', '-q', '--hard', 'HEAD~1')
+    s = tree.snapshot(str(checkout), resolve=lambda launch, pkgs: {p: found[p] for p in pkgs})
+    sub = next(x for x in s['submodules'] if x['path'] == 'opendbc_repo')
+    assert sub['head'] == sub['gitlink'] and sub['tracked_changes'] == [] and not s['clean'] and len(s['problems']) == 1
+    # the stack imports the checkout's own: clean
+    assert snap(checkout)['clean'] and snap(checkout)['problems'] == []
+
+  def test_a_package_the_stacks_interpreter_cant_resolve_isnt_clean(self, checkout):
+    def broken(launch, packages):
+      raise tree.ResolveError("the stack's interpreter /nowhere/python3 could not be run")
+    s = tree.snapshot(str(checkout), resolve=broken)
+    assert not s['clean'] and all(x['dir'] is None and x['head'] is None for x in s['submodules'])
+    assert s['problems'][0] == "the stack's interpreter /nowhere/python3 could not be run"
+    assert sorted(p.split(':')[0] for p in s['problems'][1:]) == ['msgq_repo', 'opendbc_repo']
+
+  def test_a_populated_submodule_the_stack_doesnt_import_isnt_clean(self, checkout, tmp_path, monkeypatch):
+    # the reviewer's tree_repro.sh, resolved for real: the checkout's own opendbc_repo is a repo at its gitlink, but its
+    # root has no opendbc/ (this repo's layout), so the stack (the checkout first on PYTHONPATH) imports opendbc from
+    # the venv's editable finder, the main checkout's, or finds none: either way not the checkout's own
+    monkeypatch.delenv('PYTHONPATH', raising=False)
+    run_dir = tmp_path / 'run'
+    run_dir.mkdir()
+    doc = tree.finish(str(run_dir), tree.start(str(run_dir), 'tpsim', git_commit=git(checkout, 'rev-parse', 'HEAD'),
+                                               managers=[str(checkout / 'openpilot/system/manager')]))
+    on_disk = json.load(open(run_dir / 'tree.json'))
+    sub = next(x for x in on_disk['submodules'] if x['path'] == 'opendbc_repo')
+    assert not on_disk['clean'] and on_disk['changed_during_run'] is False and doc['clean'] is False
+    assert sub['own_dir'] == os.path.realpath(checkout / 'opendbc_repo') and sub['dir'] != sub['own_dir']
+    assert any(p.startswith('opendbc_repo: ') for p in on_disk['problems'])
+
+  def test_the_stack_importing_its_own_submodules_is_clean_resolved_for_real(self, checkout, monkeypatch):
+    # upstream's layout: msgq and opendbc linked at the root, which launch_openpilot.sh puts first on PYTHONPATH
+    monkeypatch.delenv('PYTHONPATH', raising=False)
+    os.symlink('msgq_repo/msgq', checkout / 'msgq')
+    os.symlink('opendbc_repo/opendbc', checkout / 'opendbc')
+    git(checkout, 'add', 'msgq', 'opendbc')
+    git(checkout, 'commit', '-q', '-m', 'links')
+    s = tree.snapshot(str(checkout))
+    assert s['clean'] and s['problems'] == []
+    assert {x['path']: x['dir'] for x in s['submodules']} == {p: os.path.realpath(checkout / p) for p in ('msgq_repo', 'opendbc_repo')}
+
+  def test_another_opendbc_on_the_stacks_pythonpath_is_what_it_runs(self, checkout, tmp_path, monkeypatch):
+    # launch_openpilot.sh keeps the PYTHONPATH it was started with after the checkout: an opendbc there is the stack's
+    other = tmp_path / 'other'
+    repo(other, {'opendbc/__init__.py': "X = 1\n"})
+    os.symlink('msgq_repo/msgq', checkout / 'msgq')
+    monkeypatch.setenv('PYTHONPATH', str(other))
+    s = tree.snapshot(str(checkout))
+    sub = next(x for x in s['submodules'] if x['path'] == 'opendbc_repo')
+    assert sub['dir'] == os.path.realpath(other) and sub['head'] == git(other, 'rev-parse', 'HEAD') and not s['clean']
+    assert [p.split(':')[0] for p in s['problems']] == ['opendbc_repo']
+
+
+class TestResolution:
+  def test_the_stacks_path_then_the_venvs(self, tmp_path, monkeypatch):
+    a, b, m = tmp_path / 'a', tmp_path / 'b', tmp_path / 'm'
+    for d in (a, b):
+      write(d / 'zz_tree_probe_pkg/__init__.py', "")
+    write(b / 'zz_tree_probe_mod.py', "")
+    monkeypatch.setenv('PYTHONPATH', str(b))  # the runner's own path is not the stack's
+    launch = {'python': sys.executable, 'cwd': str(tmp_path), 'script_dir': str(m), 'env': {'PYTHONPATH': f"{a}{os.pathsep}{b}"}}
+    names = ['zz_tree_probe_pkg', 'zz_tree_probe_mod', 'zz_tree_probe_missing', 'pytest']
+    found = tree.package_dirs(launch, names)
+    assert found['zz_tree_probe_pkg'] == str(a / 'zz_tree_probe_pkg') and found['zz_tree_probe_mod'] == str(b / 'zz_tree_probe_mod.py')
+    assert found['zz_tree_probe_missing'] is None and os.path.isdir(found['pytest'])  # the venv's site is still there
+    # relative entries are the manager's cwd's, as python takes them
+    launch['env'] = {'PYTHONPATH': f"b{os.pathsep}a"}
+    assert tree.package_dirs(launch, names)['zz_tree_probe_pkg'] == str(b / 'zz_tree_probe_pkg')
+    # the manager script's own dir is first, as for ./manager.py
+    write(m / 'zz_tree_probe_pkg/__init__.py', "")
+    assert tree.package_dirs(launch, names)['zz_tree_probe_pkg'] == str(m / 'zz_tree_probe_pkg')
+    assert tree.package_dirs({**launch, 'env': {'PYTHONPATH': str(a)}}, []) == {}
+    with pytest.raises(tree.ResolveError, match="could not be run"):
+      tree.package_dirs({**launch, 'python': str(tmp_path / 'no_python')}, names)
+    with pytest.raises(tree.ResolveError, match="interpreter is unknown"):
+      tree.package_dirs({**launch, 'python': None}, names)
+
+  def test_the_assumed_launch_is_launch_openpilot_shs(self, tmp_path, monkeypatch):
+    # no manager found (--stack-dir): this interpreter, the checkout first on PYTHONPATH, then the one it was given
+    monkeypatch.delenv('PYTHONPATH', raising=False)
+    launch = tree.assumed_launch(str(tmp_path))
+    assert launch['python'] == sys.executable and launch['env']['PYTHONPATH'] == str(tmp_path) and launch['from'] == 'assumed'
+    assert launch['script_dir'] == str(tmp_path / 'openpilot/system/manager')
+    other = tmp_path / 'other'
+    write(other / 'zz_tree_probe_pkg/__init__.py', "")
+    monkeypatch.setenv('PYTHONPATH', str(other))
+    launch = tree.assumed_launch(str(tmp_path))
+    assert launch['env']['PYTHONPATH'] == f"{tmp_path}{os.pathsep}{other}"
+    assert tree.package_dirs(launch, ['zz_tree_probe_pkg']) == {'zz_tree_probe_pkg': str(other / 'zz_tree_probe_pkg')}
 
   def test_this_checkouts_msgq_diff_is_the_documented_patch(self, monkeypatch):
     # the real thing: the msgq_repo this checkout's stack runs (its own, or the main checkout's for a worktree) carries the
@@ -195,22 +307,22 @@ class TestTreeJson:
     run_dir.mkdir()
     cwd = str(checkout / 'openpilot/system/manager')
     head = git(checkout, 'rev-parse', 'HEAD')
-    doc = tree.start(str(run_dir), 'tpsim', git_commit=head, managers=[cwd], resolve=no_packages)
+    doc = tree.start(str(run_dir), 'tpsim', git_commit=head, managers=[cwd], resolve=own_packages(checkout))
     on_disk = json.load(open(run_dir / 'tree.json'))
     assert on_disk['schema'] == 1 and on_disk['clean'] and on_disk['stack_dir'] == os.path.realpath(checkout)
     assert on_disk['changed_during_run'] is None and on_disk['end_checked_at'] is None  # unverified until the end check
     assert on_disk['problems'] == [] and on_disk['stack_git_commit'] == head
     for k in ('head', 'tree', 'openpilot_tree', 'tracked_changes', 'untracked_py', 'submodules', 'written_at'):
       assert k in on_disk
-    tree.finish(str(run_dir), doc, resolve=no_packages)
+    tree.finish(str(run_dir), doc, resolve=own_packages(checkout))
     on_disk = json.load(open(run_dir / 'tree.json'))
     assert on_disk['changed_during_run'] is False and on_disk['end_checked_at'] is not None and 'at_end' not in on_disk
 
   def test_an_edit_during_the_run_is_changed(self, checkout, tmp_path):
     write(checkout / 'openpilot/selfdrive/x.py', "X = 2\n")  # dirty from the start: the same status line at the end
-    doc = tree.start(str(tmp_path), 'tpsim', managers=[str(checkout)], resolve=no_packages)
+    doc = tree.start(str(tmp_path), 'tpsim', managers=[str(checkout)], resolve=own_packages(checkout))
     write(checkout / 'openpilot/selfdrive/x.py', "X = 3\n")
-    tree.finish(str(tmp_path), doc, resolve=no_packages)
+    tree.finish(str(tmp_path), doc, resolve=own_packages(checkout))
     on_disk = json.load(open(tmp_path / 'tree.json'))
     assert on_disk['changed_during_run'] is True and not on_disk['clean'] and on_disk['at_end']['tracked_changes'] == on_disk['tracked_changes']
 
@@ -236,7 +348,7 @@ def test_run_writes_it_at_the_start_and_checks_it_after_the_drive(monkeypatch, t
       seen['at_drive'] = json.load(open(next((tmp_path / 'out').iterdir()) / 'tree.json'))
       return SimpleNamespace(join=lambda: None)
   monkeypatch.setattr(run.tree, 'manager_dirs', lambda prefix: [str(checkout)])
-  monkeypatch.setattr(run.tree, 'package_dir', no_packages)
+  monkeypatch.setattr(run.tree, 'package_dirs', own_packages(checkout))
   monkeypatch.setattr(sys, 'argv', ['run.py', 'ped_in_path', '--out', str(tmp_path / 'out')])
   monkeypatch.setattr(run, 'build', lambda *a, **k: SimpleNamespace(spawn=(0., 0., 0.), heading=0., notes={}))
   monkeypatch.setattr(run, 'Params', lambda: SimpleNamespace(get_bool=lambda k: True, get=lambda k: None))
