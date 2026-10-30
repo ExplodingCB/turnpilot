@@ -1,7 +1,7 @@
 """car_preflight (CHASE_CAR.md, "Preflight tool spec") on synthetic logs built with cereal's messaging: a good car and Chase's
 startup, an unknown EPS string, a 2-bit car, longitudinal off, a refusal after the tesla time, a panda that never reaches
-tesla, no 0x3E9, a zero VIN, the big model down, calibration incomplete, a param this build's library lacks, a qlog and a
-sunnypilot log. Each case states the exact status of the lines it is about and the exit status, live (the device's Params,
+tesla, no 0x3E9, a zero VIN, the big model down, the detector at its real cadence, slow and stopped, calibration
+incomplete, a param this build's library lacks, a qlog and a sunnypilot log. Each case states the exact status of the lines it is about and the exit status, live (the device's Params,
 faked) and from an rlog written to disk."""
 import ast
 import json
@@ -19,6 +19,8 @@ from opendbc.car.tesla.values import CAR
 from openpilot.cereal import messaging
 from openpilot.common.params import Params, UnknownKeyName
 from openpilot.common.prefix import OpenpilotPrefix
+from openpilot.selfdrive.modeld.constants import ModelConstants
+from openpilot.selfdrive.turnpilot.detector.modeld_detector import FORCE_RUN_FRAMES, RUN_EVERY
 from openpilot.tools.lib.logreader import save_log
 from openpilot.tools.turnpilot import car_preflight as cpf
 from openpilot.tools.turnpilot.car_preflight import GO, INFO, NO_GO, UNKNOWN, WARN
@@ -36,7 +38,8 @@ TESLA_T = 4.      # s: the panda enters tesla safety
 LOADED_T = 3.     # s: the big model has loaded
 FAIL_T = 6.       # s: the big model fails, in the 'failed' case
 END_T = 12.       # s of log
-CAN_DT = 0.05     # can, sendcan, carState, modelV2 and the detections at 20 Hz
+CAN_DT = 0.05     # can, sendcan, carState and modelV2 at 20 Hz; the detections on every RUN_EVERY-th of those frames
+DET_START_T = 0.5  # s: the detector's first run
 OFFSET_S = 100.   # logMonoTime of t 0
 LAT, LON = 39.765432, -86.123456  # a GPS position in every log, and in a param: never printed
 
@@ -75,6 +78,8 @@ DEFAULTS = {
   "big": "ok",                # ok, false (never up), failed (bigModelFailed at FAIL_T), loading (still loading at the end)
   "supply_fault": False, "calibration": "calibrated", "sensor": "os04c10", "events": (),
   "model": True, "detections": True, "plan_fault": "none",
+  "det_every": RUN_EVERY,     # the detector's full pass on every this-many model frames (modeld_detector.RUN_EVERY parked)
+  "det_skip": (),             # (start, end) s: frames where the detector doesn't run (room() refusing, a retry): the run waits
 }
 
 
@@ -149,6 +154,7 @@ def drive(**kw) -> list:
     msgs.append(stamped(msg, t))
 
   sends = refused_before = refused_after = 0
+  since_run = c.det_every  # modeld_detector: the first frame runs, then every det_every-th; a frame it can't run on delays the next
   for i, t in enumerate(ticks(CAN_DT)):
     ap = AP if tesla(t) else PARTY
     frames = [(0x257, b'\x00' * 8, PARTY)]
@@ -190,11 +196,14 @@ def drive(**kw) -> list:
       up = {"ok": t >= LOADED_T, "false": False, "failed": LOADED_T <= t < FAIL_T, "loading": False}[c.big]
       m.modelV2.big, m.modelV2.modelExecutionTime = up, 0.035
       msgs.append(stamped(m, t))
-    if turnpilot_log and c.detections and t >= 0.5:
-      det = messaging.new_message('turnpilotDetections')
-      det.turnpilotDetections.executionTime, det.turnpilotDetections.camera = 0.021, 'road'
-      det.turnpilotDetections.lanePaintStatus, det.turnpilotDetections.lightStatus = 'read', 'read'
-      msgs.append(stamped(det, t))
+    if turnpilot_log and c.detections and t >= DET_START_T - 1e-9:
+      since_run += 1
+      if since_run >= c.det_every and not any(a - 1e-9 <= t < b - 1e-9 for a, b in c.det_skip):
+        since_run = 0
+        det = messaging.new_message('turnpilotDetections')
+        det.turnpilotDetections.executionTime, det.turnpilotDetections.camera = 0.021, 'road'
+        det.turnpilotDetections.lanePaintStatus, det.turnpilotDetections.lightStatus = 'read', 'read'
+        msgs.append(stamped(det, t))
     plan = messaging.new_message('turnpilotPlan')  # on a sunnypilot log, sunnypilot's own message on this slot
     plan.turnpilotPlan.state, plan.turnpilotPlan.fault, plan.turnpilotPlan.shadow = 'following', c.plan_fault, True
     msgs.append(stamped(plan, t))
@@ -534,6 +543,44 @@ def test_other_camera(tmp_path):
   assert statuses(lines)["road camera"] == NO_GO
 
 
+# ------------------------------------------------------------------------------------------------------------ the detector
+
+def test_detector_at_its_cadence(tmp_path):
+  """Parked, modeld runs the detector on every RUN_EVERY-th 20 Hz model frame (modeld_detector.py:93, 10 Hz): GO at exactly
+  that rate."""
+  lines = run_live(tmp_path)
+  assert statuses(lines)["detector"] == GO, line(lines, "detector")
+  assert "10.0 Hz" in line(lines, "detector").detail
+  assert cpf.exit_code(lines) == 0
+
+
+def test_detector_one_run_put_off(tmp_path):
+  """A frame room() refuses puts the run off to the next frame (modeld_detector.py:606-616): one in the window is GO, not the
+  9.9 Hz NO-GO an 18 / 10 Hz band gave."""
+  lines = run_live(tmp_path, det_skip=((8., 8. + CAN_DT),))
+  assert statuses(lines)["detector"] == GO, line(lines, "detector")
+  assert cpf.exit_code(lines) == 0
+
+
+def test_detector_slow(tmp_path):
+  """Runs put off on many frames: WARN under 0.9 of the detector's rate, NO-GO under half of it. room()'s own floor, a forced
+  run every FORCE_RUN_FRAMES with no gap near the deadline, is NO-GO."""
+  slow = run_live(tmp_path, det_every=RUN_EVERY + 1)
+  assert statuses(slow)["detector"] == WARN, line(slow, "detector")
+  assert cpf.exit_code(slow) == 0
+  floor = run_live(tmp_path, det_every=FORCE_RUN_FRAMES)
+  assert statuses(floor)["detector"] == NO_GO, line(floor, "detector")
+  assert "under" in line(floor, "detector").detail and line(floor, "detector").fix
+  assert cpf.exit_code(floor) == 1
+
+
+def test_detector_gap(tmp_path):
+  """No detections for over DETECTOR_DEADLINE_S, turnpilotd's handback: NO-GO."""
+  lines = run_route(tmp_path, det_skip=((6., 6. + cpf.DETECTOR_DEADLINE_S + 0.1),))
+  assert statuses(lines)["detector"] == NO_GO and "gap" in line(lines, "detector").detail
+  assert cpf.exit_code(lines) == 1
+
+
 # ------------------------------------------------------------------------------------------------------- calibration
 
 @pytest.mark.parametrize("status, words", [("uncalibrated", "won't engage"), ("recalibrating", "won't engage"), ("invalid", "mount")])
@@ -702,6 +749,12 @@ def test_runs_on_the_device_python():
 def test_constants_follow_their_sources():
   from openpilot.selfdrive.turnpilot import turnpilotd
   assert cpf.DETECTOR_DEADLINE_S == turnpilotd.DETECTOR_DEADLINE_S
+  # the detector's bands come from its real rate: the model's 20 Hz over RUN_EVERY (10 Hz), never the 20 Hz of a stop sweep
+  assert cpf.MODEL_HZ == ModelConstants.MODEL_RUN_FREQ and cpf.DETECTOR_RUN_EVERY == RUN_EVERY
+  nominal = ModelConstants.MODEL_RUN_FREQ / RUN_EVERY
+  assert cpf.DETECTOR_HZ == pytest.approx(nominal)
+  assert cpf.DETECTOR_GO_HZ == pytest.approx(0.9 * nominal) and cpf.DETECTOR_MIN_HZ == pytest.approx(0.5 * nominal)
+  assert cpf.DETECTOR_MIN_HZ > ModelConstants.MODEL_RUN_FREQ / FORCE_RUN_FRAMES  # room()'s forced-run floor is NO-GO
   keys = (REPO / "openpilot/common/params_keys.h").read_text()
   dont_log = set()
   for key in cpf.PARAM_KEYS:
@@ -726,3 +779,15 @@ def test_suite_catches_a_broken_check(tmp_path, monkeypatch):
     test_unknown_eps(tmp_path)
   monkeypatch.undo()
   test_unknown_eps(tmp_path)
+
+
+def test_suite_catches_a_broken_detector(tmp_path, monkeypatch):
+  """Turn the detector's NO-GO off (no rate floor, no deadline): the slow and gap cases must fail."""
+  monkeypatch.setattr(cpf, "DETECTOR_MIN_HZ", 0.)
+  monkeypatch.setattr(cpf, "DETECTOR_DEADLINE_S", float("inf"))
+  for case in (test_detector_slow, test_detector_gap):
+    with pytest.raises(AssertionError):
+      case(tmp_path)
+  monkeypatch.undo()
+  test_detector_slow(tmp_path)
+  test_detector_gap(tmp_path)
