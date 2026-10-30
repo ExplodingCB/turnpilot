@@ -190,12 +190,15 @@ class Runner:
         return True
       self.start_run(b)
     elif self.phase == 'settle':
-      if now - self.t0 > max(SETTLE_S, TP_RESET_S) and self.setup.done():
+      lights_done = self.setup_lights is None or self.setup_lights.done()
+      if now - self.t0 > max(SETTLE_S, TP_RESET_S) and self.setup.done() and lights_done:
         if self.tp_off_t is not None:  # TurnPilot back on, a fresh one, before the destination goes out (TP_RESET_S)
           self.params.put_bool('TurnPilotEnabled', True)
           self.tp_off_t = None
         if self.setup.exception() is not None:
           self.end_run(b, 'error', f"setup: {self.setup.exception()!r}")
+        elif self.setup_lights is not None and self.setup_lights.exception() is not None:  # never a red the game didn't show
+          self.end_run(b, 'error', f"the forced light: {self.setup_lights.exception()!r}")
         elif plan.dest is None:
           self.engage(b)
         else:
@@ -244,7 +247,7 @@ class Runner:
     b.world.teleport(plan.spawn, heading_quat(plan.heading))
     self.setup = self.director.submit(self.director.setup, plan.actors)
     self.signals_running = not getattr(b.cfg, 'green', True)
-    self.light_state = self.stand_t = self.green_t = None
+    self.light_state = self.stand_t = self.green_t = self.setup_lights = None
     if plan.lights is not None:
       self.setup_lights = self.director.submit(self.director.set_lights, dict(plan.lights['states_at_setup']), not self.signals_running)
       self.light_state = plan.lights['state']

@@ -4,6 +4,7 @@ way; logged for the chase render; the sim driver never taps on it red; put back 
 import json
 import math
 import os
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pytest
@@ -170,3 +171,42 @@ def test_the_director_forces_holds_logs_and_puts_back(monkeypatch):
   calls.clear()
   d.cleanup()  # --signals: back on their sequences
   assert ('strict', 'trafficLight 62', None) in calls and ('lua', "core_trafficSignals.setActive(true)") in calls
+
+
+class FailingLights(LightDirector):
+  """The game refused the forced state: the job's future carries the exception, as the real director's does."""
+  def submit(self, fn, *args):
+    if getattr(fn, '__name__', '') == 'set_lights':
+      self.calls.append(('set_lights', args))
+      self.times.append(None if self.clock is None else self.clock.t)
+      f: Future = Future()
+      f.set_exception(RuntimeError("no such signal instance"))
+      return f
+    return super().submit(fn, *args)
+
+
+def test_a_forced_light_that_fails_to_set_ends_the_run_loudly(tmp_path, monkeypatch):
+  # otherwise the rows would say forced_light red for a light the game never showed red
+  clock = Clock()
+  plan = catalog.build('red_right')
+  world = World(plan, clock)
+  monkeypatch.setattr(run, 'time', SimpleNamespace(monotonic=clock.monotonic, strftime=lambda *a: 'now'))
+  monkeypatch.setattr(run, 'wall', clock.wall)
+  monkeypatch.setattr(run, 'Director', FailingLights)
+  monkeypatch.setattr(FakeDirector, 'clock', clock)
+  monkeypatch.setattr(run, 'web_call', world.web)
+  monkeypatch.setattr(run.messaging, 'SubMaster', lambda services: FakeSM(world))
+  runner = run.Runner(plan, 1, str(tmp_path), 'http://127.0.0.1:8088', 'tok', 'host', 0)
+  b = bridge()
+  b.cfg.green = True
+  b.world.teleport = lambda pos, rot: (b.teleports.append(pos), setattr(world, 's', 0.0), setattr(world, 'hold', None))
+  b.simulator_state.position, b.simulator_state.bearing, b.simulator_state.wheel_speed = SimpleNamespace(x=0, y=0, z=0), 0.0, 0.0
+  for _ in range(int(60 / DT)):
+    world.step(b)
+    if runner(b):
+      break
+    b.rk_frame += 1
+    clock.t += DT
+  (r,) = json.load(open(tmp_path / 'result.json'))['runs']
+  assert r['outcome'] == 'error' and 'forced light' in r['detail'] and 'no such signal instance' in r['detail']
+  assert not r['rows']  # never engaged on it
