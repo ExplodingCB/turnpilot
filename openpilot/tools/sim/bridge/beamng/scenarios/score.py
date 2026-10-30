@@ -570,6 +570,9 @@ def _fails(name: str, res: dict) -> list[tuple[str, str]]:
   elif name == 'lane_change':
     if not res['lane_changes']:
       fails.append(('lane_change', "never changed lanes"))
+  if name == 'twoway_route_pair' and res.get('stop_met_t') is not None:
+    fails.append(('stop_met', f"met a stop sign at t={res['stop_met_t']:.1f} s: the route was to go around it (with " +
+                              "TurnPilotAvoidStops off, run it with --expect handback:stopSignTakeControl)"))
   red = res.get('red_light')
   if name in RED_STOP_SCENARIOS:
     if red is None:
@@ -580,7 +583,7 @@ def _fails(name: str, res: dict) -> list[tuple[str, str]]:
       if red['past_line_on_red_t'] is not None:
         fails.append(('red', f"past the stop line on the forced red at t={red['past_line_on_red_t']:.1f} s"))
   undecided_ok = name.startswith('unprotected_left') and res['left']['undecided_t'] is not None and not res['left']['gap_before_undecided']
-  arrives = ('ped_crosswalk_right', 'lane_change', 'route_demo', 'right_green', 'left_t_junction') + RED_STOP_SCENARIOS
+  arrives = ('ped_crosswalk_right', 'lane_change', 'route_demo', 'right_green', 'left_t_junction', 'twoway_route_pair') + RED_STOP_SCENARIOS
   if (name in arrives or name.startswith('unprotected_left')) and not undecided_ok:
     if res['outcome'] != 'arrived':
       fails.append(('not_arrived', f"ended {res['outcome']}, not arrived"))
@@ -657,6 +660,7 @@ def expectations(name: str, res: dict, fails: list[tuple[str, str]], expect) -> 
         if before:
           extra.append(_disengage_text(before, f" before the expected handback {arg}"))
         explain(e, ('not_arrived', 'maneuvers') + (('stall',) if arg in LEFT_STALLS else ()) +
+                (('stop_met',) if arg == 'stopSignTakeControl' else ()) +
                 (('left_go', 'left_wait') if arg == 'cantStartTakeControl' else ()))
     elif kind == 'gasDisengage':
       t = facts['gas_t']
@@ -775,6 +779,7 @@ def summarize(name: str, rows, outcome: str, road: dict | None = None, junction_
     'expect': list(expect or ()),
     'expect_facts': expect_facts(rows),
     'red_light': red_light(rows, stop_line_m),
+    'stop_met_t': next((r['t'] for r in rows if r.get('map_kind') == 'stop' and r['enabled']), None),  # a stop sign the plan met
   }
   res['failures'] = check(name, res, expect)
   res['passed'] = not res['failures']
