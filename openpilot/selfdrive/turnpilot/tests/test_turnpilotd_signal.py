@@ -9,7 +9,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.car_signals import ARM_LAG_S, LEAD_LONG_M
 from openpilot.selfdrive.turnpilot.desire_timing import TURN_STARTED_DEG
 from openpilot.selfdrive.turnpilot.hooks import CLEAR_DESIRE
-from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of
+from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of, nav_instruction
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Sim
 
 Status = custom.TurnpilotPlan.TurnSignal.Status
@@ -894,6 +894,83 @@ def test_a_veto_at_rest_in_the_junction_a_holds_go_rolled_into_finishes_the_turn
   plans = [step() for _ in range(int(2. / DT_MDL))]
   assert str(plans[0].turnSignal.notice) == 'changedMidTurn', str(plans[0].turnSignal.notice)
   assert not any(p.tooFastToTurn or p.desire == CLEAR_DESIRE for p in plans), "skipped inside the junction"
+
+
+# ---------------------------------------------------------------- a reroute after a veto (M3)
+
+REROUTE_J, REROUTE_NEXT = 300., 1500.
+
+
+def veto_then_reroute(driver, rerouted_at=REROUTE_J):
+  """A right turn at 300 m, the car signalling it; driver ('lost': our lamp put out, the port failed for the drive, or
+  'left': the driver's lamp the other way, off again a second later) overrules it about 95 m short: skipped out loud. navd
+  then reroutes before the junction (an off-route drift, the stop-avoidance re-run, an ETA drift on a certified control):
+  one invalid update, then routeCount 1 with a right at rerouted_at (the same junction, same bearings, by default), the
+  next left after it. Returns (sim, the maneuver id at the veto, the plans after the veto's second)."""
+  sim = Sim([(REROUTE_J, "turn", "right", junction_of("right")), (REROUTE_NEXT, "turn", "left", junction_of("left"))],
+            driver_signals=None)
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  state = {'driver': 'none'}
+  sim.car_signal = overruling_port(state)
+
+  def step():
+    return sim.step(engaged=True, blinker=state['driver'] == 'left')
+  while sim.distance() > 95.:
+    step()
+  assert sim.trace[-1][2].turnSignal.side == LaneChange.right
+  state['driver'] = driver
+  vetoed = [step() for _ in range(int(1. / DT_MDL))]
+  assert vetoed[0].tooFastToTurn and sim.tp.skip.skipped, "the veto skips the turn out loud"
+  old_id = sim.tp.follower.maneuver_id
+  if driver == 'left':
+    state['driver'] = 'none'  # the driver's lamp out again: the port ready, nothing vetoing a turn taken up again
+  k = [0]
+
+  def reroute(s, instr):
+    k[0] += 1
+    if k[0] == 1:
+      return nav_instruction(REROUTE_J - s.s, "turn", "right", remaining=REROUTE_NEXT - s.s, junction=junction_of("right")), False
+    if s.s < rerouted_at + 10.:
+      return nav_instruction(rerouted_at - s.s, "turn", "right", remaining=REROUTE_NEXT - s.s, junction=junction_of("right"),
+                             route_count=1, ahead=[(REROUTE_NEXT - s.s, "turn", "left", junction_of("left"))]), True
+    return nav_instruction(REROUTE_NEXT - s.s, "turn", "left", remaining=REROUTE_NEXT - s.s, junction=junction_of("left"),
+                           route_count=1), True
+  sim.nav_filter = reroute
+  after = []
+  while sim.s < rerouted_at + 30. and sim.t < 120.:
+    after.append(step())
+  return sim, old_id, after
+
+
+@pytest.mark.parametrize("driver,skip", [('lost', 'signalLost'), ('left', 'driverSignal')])
+def test_a_reroute_onto_the_same_junction_never_revives_a_vetoed_turn(driver, skip):
+  """The veto's skip is the junction's, not the maneuver id's: navd's new route turning right at the same junction (same
+  bearings, within SAME_TURN_M of where it was) under a new id is still the turn the driver overruled, skipped for the
+  same reason out loud, never prompted, signalled or pulsed. With our lamp put out the port is failed for the drive, so
+  nothing could veto it again (verification of tp/blinker, M3)."""
+  sim, old_id, after = veto_then_reroute(driver)
+  new_id = sim.tp.follower.maneuver_id
+  assert new_id != old_id, "navd's reroute is a new maneuver"
+  prompts = [p for p in after if p.turnSignal.prompt != LaneChange.none]
+  sides = [p for p in after if p.turnSignal.side != LaneChange.none]
+  pulses = [p for p in after if p.desire == Desire.turnRight]
+  taken = f"{len(prompts)} frames prompting 'Signal Right', {len(sides)} with our side set"
+  assert not pulses, f"maneuver id {old_id} -> {new_id} on the reroute: the turn the driver overruled ({skip}) taken ({taken})"
+  assert not prompts and not sides
+  rerouted = [p for p in after if p.routeValid and p.maneuverDistance > 0. and str(p.maneuverModifier) == 'right']
+  assert rerouted and all(p.tooFastToTurn and str(p.turnSignal.skip) == skip for p in rerouted), \
+    "the new route's turn at the vetoed junction is skipped out loud, for the veto's reason"
+  assert not any(str(p.state) == 'turning' for p in after)
+
+
+def test_a_reroute_onto_the_next_junction_the_same_way_takes_that_turn():
+  """Only the vetoed junction stays skipped: a new route turning right at the next junction the same way, 100 m on (the
+  same bearings on a grid, more than SAME_TURN_M from the vetoed one), is a turn of its own, signalled and taken."""
+  sim, _, after = veto_then_reroute('left', rerouted_at=REROUTE_J + 100.)
+  near = [p for p in after if p.routeValid and 0. < p.maneuverDistance < 60. and str(p.maneuverModifier) == 'right']
+  assert near and not any(p.tooFastToTurn for p in near)
+  assert any(p.desire == Desire.turnRight for p in after), "the next junction's right is taken"
+  assert any(p.turnSignal.side == LaneChange.right for p in after)
 
 
 # ---------------------------------------------------------------- hazards holding the port off: said on the reason line (7.7)

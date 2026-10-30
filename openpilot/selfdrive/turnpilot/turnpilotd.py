@@ -130,6 +130,7 @@ import datetime
 import math
 import os
 import time
+from dataclasses import dataclass
 
 from opendbc.car.structs import car
 from openpilot.cereal import custom, log, messaging
@@ -152,7 +153,7 @@ from openpilot.selfdrive.turnpilot.stop_go import MODE_DEFAULT, STOP_SWEEP_M, Fr
 from openpilot.selfdrive.turnpilot.car_signals import (TurnSignalIntent, TurnSignalOut, driver_signals_for, read_mode,
                                                         record_matches)
 from openpilot.selfdrive.turnpilot.lane_planner import LanePlanner, Phase, lane_change_window, lane_mismatch, model_lanes_from_msg
-from openpilot.selfdrive.turnpilot.route_follower import KEEP, LEFT, TURN, UNCERTAIN_M, RouteFollower
+from openpilot.selfdrive.turnpilot.route_follower import KEEP, LEFT, SAME_TURN_M, TURN, UNCERTAIN_M, RouteFollower, same_junction
 from openpilot.selfdrive.turnpilot.scene.lane_paint import lane_paint_from_msg
 from openpilot.selfdrive.turnpilot.scene.tracker import MAX_COAST_S, STALE_S, SWEEP_COAST_S, SceneTracker, default_yaw_rate
 from openpilot.selfdrive.turnpilot.junction_watch import JunctionWatch, detector_view, junction_from_info, sweep_control, sweep_wanted
@@ -321,6 +322,18 @@ class ErrorLog:
 log_error = ErrorLog()
 
 
+@dataclass
+class VetoedTurn:
+  """A turn the driver overruled (a signal veto's skip): its maneuver (type, modifier, bearings), where its junction is on
+  turnpilotd's odometer (odo_m plus the follower's distance at the veto), the veto's reason, the id it is skipped under now,
+  and whether its desire was out (its cap kept to its pass, skip_cap_id). TurnPilot.carry_veto."""
+  maneuver: object
+  junction_odo: float
+  reason: str
+  maneuver_id: int
+  capped: bool
+
+
 class TurnPilot:
   def __init__(self):
     self.big_seen = False  # modelV2 came from the big model this drive (kept when TurnPilot is turned off and on)
@@ -421,6 +434,7 @@ class TurnPilot:
       self.turn_held_id: int | None = None  # ...whose turn desire was out: held to its clear, never cancelled
       self.skip_cap_id: int | None = None  # a dropped turn skipped on taking it up: its cap stays until it is passed
       self.veto_hold_id: int | None = None  # a turn vetoed standing at a hold: the hold keeps it until it lets go
+      self.vetoed: VetoedTurn | None = None  # the turn the driver overruled, by its junction: skipped across a reroute
       self.go_id: int | None = None  # the turn a hold let go of at standstill: checked for a miss and a stall
       self.go_rolled = False         # ...the car has rolled since that go (STANDSTILL_SPEED or more)
       self.go_spent = False          # ...and then come to rest again short of the hold line: no longer under way (went)
@@ -658,6 +672,7 @@ class TurnPilot:
     # (unprotected_left: farOff), the car held, never a skip and a reroute from the line
     out_of_range = acting and self.auto_left == AUTO and unprotected_turn(upcoming, right_hand_traffic) and not engaged and \
       reach_at_line(upcoming.opposing_speed, upcoming.opposing_lanes or None) > self.left_reach_m(route=True)
+    self.carry_veto(upcoming, rf, v_ego)
     skip = self.skip.update(upcoming, rf.distance, rf.maneuver_id, v_ego, desire_out, right_hand_traffic, lat_active,
                             rf.ahead, rf.ahead_distance, stop_d=self.map_controls.stop_ahead(), stop_infeasible=stop_infeasible,
                             pulse_at_go=pulse_at_go, out_of_range=out_of_range)
@@ -850,6 +865,7 @@ class TurnPilot:
         # too close to pulse again: the hold's go is never the vetoed turn
         self.skip.skip(act_on, rf.distance, rf.maneuver_id, v_ego, ts.skip)
         plan.tooFastToTurn = True
+        self.vetoed = VetoedTurn(act_on, self.odo_m + rf.distance, ts.skip, rf.maneuver_id, committed)
         if committed:
           self.desires.cancel()
           self.skip_cap_id = rf.maneuver_id
@@ -940,6 +956,32 @@ class TurnPilot:
     else:
       plan.state = State.following
     return msg
+
+  def carry_veto(self, upcoming, rf, v_ego: float) -> None:
+    """The turn the driver overruled (a signal veto's skip, DESIGN 6.6) stays skipped at its junction whatever id the route
+    gives it: navd's reroute before the junction (an off-route drift, the stop-avoidance re-run, an ETA drift) that turns the
+    same way there again is a new maneuver id (route_follower: a new route, the turn not committed after the veto's cancel),
+    and taken up fresh it would be prompted, signalled and taken, with our lamp put out by nothing that could veto it again.
+    The same junction: same_junction (type, modifier, bearings when both have them) and within SAME_TURN_M of where the veto
+    put it on the odometer; skipped for the veto's reason, out loud (tooFastToTurn, navd's skip), its cap kept if the vetoed
+    turn's was. Forgotten once the car is SAME_TURN_M past it. Before this frame's TurnSkip.update, which then keeps it."""
+    v = self.vetoed
+    if v is None:
+      return
+    if self.odo_m > v.junction_odo + SAME_TURN_M:
+      self.vetoed = None
+      return
+    if upcoming is None or upcoming.kind != TURN or rf.maneuver_id == v.maneuver_id or \
+       (self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id):
+      return
+    if not same_junction(upcoming, v.maneuver) or abs(self.odo_m + rf.distance - v.junction_odo) > SAME_TURN_M:
+      return
+    cloudlog.event("turnpilot.veto_carried", error=True, why=v.reason, vetoed_id=v.maneuver_id, maneuver_id=rf.maneuver_id,
+                   distance=round(rf.distance, 1), off_m=round(self.odo_m + rf.distance - v.junction_odo, 1))
+    self.skip.skip(upcoming, rf.distance, rf.maneuver_id, v_ego, v.reason)
+    if v.capped:
+      self.skip_cap_id = rf.maneuver_id
+    v.maneuver_id = rf.maneuver_id
 
   def check_missed(self, rf, v_ego: float, acting: bool) -> None:
     """The turn a hold let go of at standstill is passed (the follower's pass, this update) having turned under
