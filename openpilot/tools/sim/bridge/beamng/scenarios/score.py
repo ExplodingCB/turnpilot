@@ -49,6 +49,7 @@ import numpy as np
 from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_ACCEL_MIN, TAKE_CONTROL_PROMPTS, plan_accel
 from openpilot.selfdrive.turnpilot.lane_planner import LC_BLOCK_X_M
 from openpilot.selfdrive.turnpilot.route_follower import KEEP, TURN, classify
+from openpilot.selfdrive.turnpilot.scene_policy import STOP_DECEL
 from openpilot.selfdrive.turnpilot.unprotected_left import CREEP_MAX_M
 
 STOPPED_V = 0.3        # m/s: standing
@@ -101,11 +102,14 @@ TURN_DESIRES = (1, 2)  # log.Desire.turnLeft, turnRight
 EXPECTS = ('handback', 'gasDisengage', 'skip', 'turnMissed', 'hardBrake')
 # a take-control handback holds the car while the driver is told to take control (hooks.TAKE_CONTROL_PROMPTS): from it,
 # engaged, the car goes no further than a stop from its speed then, HELD_REACT_S at that speed and HELD_DECEL after it (a
-# go withdrawn rolling stops at 1.5 m/s^2, turnpilotd's STOP_DECEL), plus HELD_SLACK_M. The stop sign's comes after a full
-# stop (the last the car did before it was stand, not drive), never rolling
+# go withdrawn rolling stops at turnpilotd's STOP_DECEL, 1.5 m/s^2), plus HELD_SLACK_M. The stop sign's comes after a full
+# stop (the last the car did before it was stand, not drive), never rolling. The left's withdrawn go (SHORT_OF_LANES, S02
+# 'stopped short of the oncoming lanes') is handed back outside the junction's conflict zone (CONFLICT_M) and held there:
+# engaged after it the car never comes within CONFLICT_M of the junction, nor goes further than the zone was from it
 HELD_REACT_S = 0.5
-HELD_DECEL = 1.0
+HELD_DECEL = STOP_DECEL
 HELD_SLACK_M = 1.0
+SHORT_OF_LANES = ('cantStartTakeControl',)
 FULL_STOP_HANDBACKS = ('stopSignTakeControl',)
 # turnpilotPlan.handback's kinds: a fault, handed back with openpilot's soft disable, which ends the drive (the car is not
 # held: it coasts engaged through the soft disable); the disengagement after one is that soft disable's
@@ -727,17 +731,23 @@ def parse_expect(expect) -> list[tuple[str, str]]:
 
 def held_after(rows, t: float) -> dict:
   """From a take-control handback at t (HELD_*): the car's speed then, the metres it went engaged after it (to the first row
-  not engaged: from there the driver has it), the fastest it went, and the most a stop from that speed allows."""
+  not engaged: from there the driver has it), the fastest it went, and the most a stop from that speed allows; the
+  junction's distance then (j_dist), the nearest the car came to it engaged after (min_j_dist), and the metres to the
+  junction's conflict zone at the handback (zone_m), None without one in the rows."""
   i0 = next((i for i, r in enumerate(rows) if r['t'] >= t), len(rows) - 1)
-  v0 = rows[i0]['v']
-  went, v_max = 0., v0
+  v0, j0 = rows[i0]['v'], rows[i0].get('j_dist')
+  went, v_max, min_j = 0., v0, j0
   for a, b in zip(rows[i0:], rows[i0 + 1:], strict=False):
     if not b['enabled']:
       break
     went += 0.5 * (a['v'] + b['v']) * (b['t'] - a['t'])
     v_max = max(v_max, b['v'])
+    if b.get('j_dist') is not None:
+      min_j = b['j_dist'] if min_j is None else min(min_j, b['j_dist'])
   return {'v0': v0, 'went_m': round(went, 2), 'v_max': round(v_max, 2),
-          'allowed_m': round(v0 * HELD_REACT_S + v0 ** 2 / (2 * HELD_DECEL) + HELD_SLACK_M, 2)}
+          'allowed_m': round(v0 * HELD_REACT_S + v0 ** 2 / (2 * HELD_DECEL) + HELD_SLACK_M, 2),
+          'j_dist': j0, 'min_j_dist': None if min_j is None else round(min_j, 2),
+          'zone_m': None if j0 is None else round(j0 - CONFLICT_M, 2)}
 
 
 def stood_before(rows, t: float) -> bool:
@@ -811,13 +821,27 @@ def drop_problems(t: float, det_t: float | None, drop: dict | None) -> list[str]
   return out
 
 
-def handback_problems(arg: str, t: float, facts: dict, res: dict) -> list[str]:
+def handback_problems(name: str, arg: str, t: float, facts: dict, res: dict) -> list[str]:
   """Why a handback of kind arg first seen at t isn't its shot's: another handback before it; a take-control handback the
-  car wasn't held after (held_after), the stop sign's without its full stop; a fault's disengagement not its soft disable;
-  the detection drop's not within DROP_HANDBACK_S of the detector going silent after the drop (drop_problems)."""
+  car wasn't held after (held_after), the left's withdrawn go not held short of the junction's conflict zone
+  (SHORT_OF_LANES), the stop sign's without its full stop; a fault's disengagement not its soft disable; the detection
+  drop's not within DROP_HANDBACK_S of the detector going silent after the drop (drop_problems)."""
   out = [f"handed back {k} at t={tk:.1f} s, before the expected handback {arg}"
          for k, tk in sorted(facts['handbacks'].items(), key=lambda kv: kv[1]) if k != arg and tk < t]
   h = facts.get('held', {}).get(arg)
+  if h is not None and arg in SHORT_OF_LANES and name.startswith('unprotected_left'):
+    if h['j_dist'] is None:
+      out.append(f"no junction distance in the rows at the {arg} handback: 'short of the oncoming lanes' was not checked")
+    elif h['j_dist'] <= CONFLICT_M:
+      out.append(f"handed back {arg} {h['j_dist']:.1f} m from the junction, inside its {CONFLICT_M:.0f} m conflict zone: not short " +
+                 "of the oncoming lanes")
+    else:
+      if h['min_j_dist'] <= CONFLICT_M:
+        out.append(f"came within {h['min_j_dist']:.1f} m of the junction engaged after the {arg} handback, into its " +
+                   f"{CONFLICT_M:.0f} m conflict zone: not held short of the oncoming lanes")
+      if h['went_m'] > h['zone_m']:
+        out.append(f"moved {h['went_m']:.1f} m engaged after the {arg} handback, past the {h['zone_m']:.1f} m to the junction's " +
+                   f"{CONFLICT_M:.0f} m conflict zone")
   if h is not None and h['went_m'] > h['allowed_m']:
     out.append(f"moved {h['went_m']:.1f} m engaged after the {arg} handback (up to {h['v_max']:.1f} m/s), past the " +
                f"{h['allowed_m']:.1f} m a stop from {h['v0']:.1f} m/s allows: not held")
@@ -853,7 +877,7 @@ def expectations(name: str, res: dict, fails: list[tuple[str, str]], expect) -> 
     t, met = None, False
     if kind == 'handback':
       t = facts['handbacks'].get(arg)
-      problems = [] if t is None else handback_problems(arg, t, facts, res)
+      problems = [] if t is None else handback_problems(name, arg, t, facts, res)
       met = t is not None and not problems
       if t is None:
         extra.append(f"expected handback {arg}: none came")
