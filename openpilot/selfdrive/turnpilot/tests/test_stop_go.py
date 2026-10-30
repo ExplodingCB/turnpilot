@@ -1812,3 +1812,40 @@ def test_V18_a_car_stopped_3_to_15_m_back_from_its_line_has_no_rank_is_never_a_s
   out = w.run(6.)
   assert all(d.rank == 0 for d in out) and not any(x.shielded for d in out for x in d.lanes)
   assert first_go(out) is None and any(h.key.startswith('reach:left') for h in out[-1].holds)
+
+
+def test_P4_a_right_turn_waits_for_a_person_in_the_right_roads_crosswalk_a_straight_crossing_doesnt(tmp_path):
+  # 2.1: a right's conflict set has the exit leg's crosswalk, across the right road beside the box (x 8.4-22.8 m, y -6.85 to
+  # -2.35 m in the camera's frame at the test junction): a person crossing the right road there, 5.8 m right of our axis, held
+  # nothing (the near crosswalk and the box end 4.85 and 2.85 m right; the far one is a straight crossing's only)
+  def walker(ww):
+    return (person(90, 15., -5.8, vx=1.2),)
+  w = World(tmp_path, maneuver='right')
+  w.objects = walker
+  out = w.run(6.)
+  assert first_go(out) is None and any(h.key == 'ped:90' and 'exit crosswalk' in h.reason for h in out[-1].holds)
+  w.objects = lambda ww: ()
+  assert first_go(w.run(3.5)) is not None
+  w = World(tmp_path, maneuver='straight')
+  w.objects = walker
+  assert first_go(w.run(5.)) is not None
+  # one walking along the right road's far sidewalk toward that crosswalk's end, 9 m out at 1.4 m/s: the arrival clause
+  # (P16's) for the exit crosswalk too
+  w = World(tmp_path, maneuver='right')
+  w.objects = lambda ww: (person(91, 23.5, -16. + 1.4 * (ww.t_cam - 100.), vy=1.4),)
+  out = w.run(5.)
+  assert first_go(out) is None and any(h.key.startswith('pedArrive:91') for d in out for h in d.holds)
+
+
+def test_P4_a_right_turn_waits_for_a_jogger_or_a_wrong_way_cyclist_coming_from_the_right(tmp_path):
+  # a jogger on the near sidewalk of the right road running for the corner (the near crosswalk's arrival clause), and a
+  # cyclist riding the wrong way toward our path from the right (a bicycle: the non-stopping tracked test)
+  w = World(tmp_path, maneuver='right')
+  w.objects = lambda ww: (person(92, 7.9, -18. + 3. * (ww.t_cam - 100.), vy=3.),)
+  out = w.run(4.)
+  assert first_go(out) is None and any(h.key.startswith('pedArrive:92') for d in out for h in d.holds)
+  w = World(tmp_path, maneuver='right')
+  w.tracks = cars((93, 'right', rolling(0.5, d0=30., v0=5.), 1))
+  out = w.run(5.)
+  assert first_go(out) is None and any(h.key == 'tracked:93' for d in out for h in d.holds)
+

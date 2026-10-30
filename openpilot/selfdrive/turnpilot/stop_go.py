@@ -120,6 +120,7 @@ FRONT_LEAVE_V = 0.5             # ...moving sideways over this...
 FRONT_LEAVE_S = 1.0             # ...and a person track starting outside on that side within this: the same person, left
 EXIT_ROOM_M = 4.7 + 2.0         # the car and 2 m past the exit crosswalk
 CROSSWALK_M = 3.0               # m a crosswalk is deep
+EXIT_TURN_M = 10.               # m a right turn's path runs from the cross road's near edge to the exit leg's crosswalk
 CAR_LEN_M = 4.7
 BOX_HOLD_M = 6.                 # any box overlapping 0-6 m ahead of the bumper holds the go (V13)
 ROLLUP_GOES = 4
@@ -1367,12 +1368,17 @@ class StopGo:
   def _people_holds(self, f: Frame, pos: float) -> list[Hold]:
     """2.4 item 7, the conservative zones (P1, P2, P10): any person track or raw person box in the near or far crosswalk band
     (our half of the road plus one lane, its ranging band of plus or minus PED_RANGE_BAND included) or in the box blocks the
-    go; moving, a dynamic wait, standing, a static one (the curb rule is SG4c's). A person heading for a crosswalk on our path
-    (the arrival clause, P16: _arrival_holds). The front zone (P6)."""
+    go; moving, a dynamic wait, standing, a static one (the curb rule is SG4c's). A right turn (and off the route, the union)
+    has its exit leg's crosswalk too, across the right road beside the box, and the sidewalk users heading for it (P4; a left's
+    is scene_policy's junction hold's, P2). A person heading for a crosswalk on our path (the arrival clause, P16:
+    _arrival_holds). The front zone (P6)."""
     holds = []
     near0, near1 = self._x(0., pos) - 1., self._x(self.edges.d_max, pos)
     box0, box1 = self._x(self.edges.d_min, pos), self._x(self._far_edge(), pos)
     far0, far1 = box1, box1 + CROSSWALK_M + 1.
+    # a right's exit leg's crosswalk (P4): across the right road beside the box, its sidewalk ends at the corners
+    exit_on = f.maneuver in ('right', 'unknown')
+    ex0, ex1, ey0, ey1 = box0 - 1., box1 + 1., -(BOX_RIGHT_M + CROSSWALK_M + 1.), -BOX_RIGHT_M + 0.5
 
     def zone(x_lo, x_hi, y) -> str:
       if near0 <= x_hi and x_lo <= near1 and -HALF_RIGHT_M <= y <= HALF_LEFT_M:
@@ -1381,6 +1387,8 @@ class StopGo:
         return 'the junction'
       if f.maneuver in ('straight', 'unknown') and far0 <= x_hi and x_lo <= far1 and -HALF_RIGHT_M <= y <= HALF_LEFT_M:
         return 'the far crosswalk'
+      if exit_on and ex0 <= x_hi and x_lo <= ex1 and ey0 <= y <= ey1:
+        return 'the exit crosswalk'
       return ''
 
     for o in f.objects or ():
@@ -1401,8 +1409,12 @@ class StopGo:
             if zone(x * (1. - PED_RANGE_BAND), x * (1. + PED_RANGE_BAND), y):
               holds.append(Hold(f'pedRaw:{key}', "a person at the crosswalk", DYNAMIC))
               break
-    holds += self._arrival_holds(f, pos, ((near0, near1, self.edges.d_min, 'near'),) +
-                                 (((far0, far1, self._far_edge() + CROSSWALK_M + 1., 'far'),) if f.maneuver in ('straight', 'unknown') else ()))
+    walks = [(near0, near1, -HALF_RIGHT_M, HALF_LEFT_M, self.edges.d_min, 'near')]
+    if f.maneuver in ('straight', 'unknown'):
+      walks.append((far0, far1, -HALF_RIGHT_M, HALF_LEFT_M, self._far_edge() + CROSSWALK_M + 1., 'far'))
+    if exit_on:
+      walks.append((ex0, ex1, ey0, ey1, self.edges.d_min + EXIT_TURN_M + CROSSWALK_M, 'exit'))
+    holds += self._arrival_holds(f, pos, walks)
     holds += self._front_zone(f)
     return holds
 
@@ -1422,21 +1434,21 @@ class StopGo:
 
   def _arrival_holds(self, f: Frame, pos: float, walks) -> list[Hold]:
     """2.4 item 7's arrival clause (P16): a person not standing still, a track or a raw box seen on RAW_PED_RUNS of the last
-    RAW_PED_OF runs of its view, that would reach a crosswalk on our path (walks: (x0, x1 camera x, its far edge m past the stop
-    point, which)) before our rear bumper has cleared it plus PED_ARRIVE_MARGIN_S blocks the go: t_arr = d_lo / v_hi, d_lo its
+    RAW_PED_OF runs of its view, that would reach a crosswalk on our path (walks: (x0, x1 camera x, y0, y1 camera y, its far
+    edge m past the stop point, which)) before our rear bumper has cleared it plus PED_ARRIVE_MARGIN_S blocks the go: t_arr = d_lo / v_hi, d_lo its
     distance to the crosswalk at the near end of its ranging band, v_hi its speed toward it plus 2 sigma once trusted
     (VEL_TRUST_S with VEL_TRUST_SAMPLES), PED_V_UNTRUSTED before. One moving away doesn't block; one standing still (under
     PED_STILL_M in PED_STILL_S) is D3's (P3). A dynamic wait; during the launch the re-check withdraws the go (_going)."""
     holds = []
-    clears = [(x0, x1, self.t_clear(f, pos, edge) + PED_ARRIVE_MARGIN_S, which) for x0, x1, edge, which in walks]
+    clears = [(x0, x1, y0, y1, self.t_clear(f, pos, edge) + PED_ARRIVE_MARGIN_S, which) for x0, x1, y0, y1, edge, which in walks]
 
-    def dist(x, y, x0, x1) -> float:
+    def dist(x, y, x0, x1, y0, y1) -> float:
       dx = max(x0 - x, 0., x - x1)
-      dy = max(-HALF_RIGHT_M - y, 0., y - HALF_LEFT_M)
+      dy = max(y0 - y, 0., y - y1)
       return math.hypot(dx, dy)
 
-    def d_lo(x, y, x0, x1) -> float:
-      return min(dist(k * x, k * y, x0, x1) for k in (1. - PED_RANGE_BAND, 1. - PED_RANGE_BAND / 2., 1., 1. + PED_RANGE_BAND / 2.,
+    def d_lo(x, y, x0, x1, y0, y1) -> float:
+      return min(dist(k * x, k * y, x0, x1, y0, y1) for k in (1. - PED_RANGE_BAND, 1. - PED_RANGE_BAND / 2., 1., 1. + PED_RANGE_BAND / 2.,
                                                        1. + PED_RANGE_BAND))
 
     people = []
@@ -1463,17 +1475,18 @@ class StopGo:
         if seen >= RAW_PED_RUNS:
           people.append((f'pedArriveRaw:{key}', x, y, None))
     for key, x, y, window in people:
-      for x0, x1, need, which in clears:
-        lo = d_lo(x, y, x0, x1)
+      for x0, x1, y0, y1, need, which in clears:
+        lo = d_lo(x, y, x0, x1, y0, y1)
+        name = {'far': 'far ', 'exit': 'exit '}.get(which, '')
         if lo <= 0.:
           # its ranging band (along the ray: range and offset together) reaches into the crosswalk, wherever it walks
-          holds.append(Hold(f'{key}:{which}', f"a person at the {'far ' if which == 'far' else ''}crosswalk", DYNAMIC))
+          holds.append(Hold(f'{key}:{which}', f"a person at the {name}crosswalk", DYNAMIC))
           break
         if window is None:
           v_hi = PED_V_UNTRUSTED
         else:
           ts = [s[0] for s in window]
-          ds = [dist(s[1] - pos, s[2], x0, x1) for s in window]
+          ds = [dist(s[1] - pos, s[2], x0, x1, y0, y1) for s in window]
           t_bar = sum(ts) / len(ts)
           stt = sum((t - t_bar) ** 2 for t in ts)
           slope = sum((t - t_bar) * (d - sum(ds) / len(ds)) for t, d in zip(ts, ds, strict=True)) / max(stt, 1e-9)
@@ -1483,7 +1496,7 @@ class StopGo:
         if v_hi <= 0.05:
           continue  # moving away from it, or along it
         if lo / v_hi < need:
-          holds.append(Hold(f'{key}:{which}', f"a person heading for the {'far ' if which == 'far' else ''}crosswalk", DYNAMIC))
+          holds.append(Hold(f'{key}:{which}', f"a person heading for the {name}crosswalk", DYNAMIC))
           break
     return holds
 
