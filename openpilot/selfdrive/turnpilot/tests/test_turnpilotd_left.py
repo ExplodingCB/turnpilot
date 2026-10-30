@@ -164,16 +164,36 @@ def test_a_car_standing_in_the_way_is_a_loud_handback_never_an_endless_silent_wa
     assert not any(p.desire == Desire.turnLeft for p in plans) and sim.s < LINE + 1.
 
 
-def test_moving_traffic_is_waited_through_however_long_never_called_standing():
-  # a stream of oncoming cars at the limit 3 s apart for 70 s, each a box and a moving velocity-trusted track: ordinary
-  # waiting (no intervention), never the standing fault; a car that moves on from where it stood is no longer standing
-  stream = [JUNCTION + 60. + V_25 * 25. + k * 3. * V_25 for k in range(24)]
+def test_moving_traffic_with_no_gap_is_never_called_standing_and_a_wait_under_45_s_is_silent():
+  # a stream of oncoming cars at the limit 3 s apart for 40 s, each a box and a moving velocity-trusted track: ordinary
+  # waiting, silent, never the standing fault, and a go once it has passed; a car that moves on is no longer standing
+  stream = [JUNCTION + 60. + V_25 * 25. + k * 3. * V_25 for k in range(13)]
   sim, plans = standing_run(None, None, 110., stream=stream)
   assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
   waited = sum(p.shouldStop for p in plans) * DT_MDL
-  assert waited > STAND_UNDECIDED_S + 10. and any(p.desire == Desire.turnLeft for p in plans) and sim.s > JUNCTION + 10.
-  sim, plans = standing_run(None, (6., -5.), 90., vx=3.)  # in the junction box, moving: traffic, its wait unbounded
-  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  assert 30. < waited < STAND_UNDECIDED_S and any(p.desire == Desire.turnLeft for p in plans) and sim.s > JUNCTION + 10.
+
+
+def test_a_wait_at_the_line_with_no_gap_is_a_loud_handback_at_45_s_whatever_the_tracker_says():
+  """Owner decision (ii), 2026-10-30, Kellen's delegate (DESIGN's UNDECIDED row: no gap in 45 s): 154bdaa bounded the wait
+  at the line only on what the tracker says stands, so a car parked in the band seen only as raw boxes (never tracked: a
+  box nothing tracks can't be told standing from coming) held the car at its line silently with no limit, and an oncoming
+  stream with no gap, or a car moving in the junction box, was waited through however long. Every wait at the line for a
+  gap now ends at STAND_UNDECIDED_S in the loud handback (leftUndecidedTakeControl, "No gap in oncoming traffic: take
+  control"; 'standing' where the tracker says so), the car held, never let go, never a go."""
+  stream = [JUNCTION + 60. + V_25 * 25. + k * 3. * V_25 for k in range(24)]
+  for raw_at, track_at, vx, movers in (((50., 7.5), None, 0., ()), (None, None, 0., stream), (None, (6., -5.), 3., ())):
+    sim, plans = standing_run(raw_at, track_at, 110., vx=vx, stream=movers)
+    case = (raw_at, track_at, vx, len(movers))
+    held = next(i for i, p in enumerate(plans) if p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap')
+    first = next((i for i, p in enumerate(plans) if str(p.controlPrompt) in TAKE_CONTROL_PROMPTS), None)
+    assert first is not None, f"{case}: waited at the line {(len(plans) - held) * DT_MDL:.0f} s with no gap, silently"
+    assert abs((first - held) * DT_MDL - STAND_UNDECIDED_S) < 1., (case, (first - held) * DT_MDL)
+    assert str(plans[first].controlPrompt) == 'leftUndecidedTakeControl' and plans[first].unprotectedLeft.why == 'noGap', case
+    assert plans[first].reason == "No gap in oncoming traffic: take control", case
+    assert all(str(p.controlPrompt) == 'waitingForGap' for p in plans[held + 5:first]), case
+    assert all(str(p.controlPrompt) == 'leftUndecidedTakeControl' and p.shouldStop for p in plans[first:]), case
+    assert not any(p.desire == Desire.turnLeft for p in plans) and sim.s < LINE + 1. and sim.v < 0.05, case
 
 
 def test_no_road_camera_runs_is_a_fault_never_a_go():

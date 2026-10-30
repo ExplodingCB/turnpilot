@@ -9,7 +9,8 @@ from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M, VEL_TRU
 from openpilot.selfdrive.turnpilot.tests.synthetic import scene
 from openpilot.selfdrive.turnpilot.unprotected_left import (BLOCKED_UNDECIDED_S, CLEAR_WINDOW_S, CREEP_MAX_M, CREEP_SHORT_M, CREEP_STALL_S, HELD_MIN_M,
                                                            LIGHT_RED_MAX_S, LIGHT_UNKNOWN_S, PET_S, RAW_CONF,
-                                                           ROAD_FRESH_S, SPEED_MARGIN, STALE_UNDECIDED_S, LeftInput, RawBox, RawFrame,
+                                                           ROAD_FRESH_S, SPEED_MARGIN, STALE_UNDECIDED_S, STAND_UNDECIDED_S, LeftInput, RawBox,
+                                                           RawFrame,
                                                            UnprotectedLeft, band_blockers, r_req, t_clear, t_req)
 
 HOLD_D = 9.     # m from the hold line (map_controls: HOLD_LINE_M + MAP_MARGIN_M) to the maneuver point
@@ -806,12 +807,15 @@ def test_moving_traffic_and_other_holds_never_make_a_far_car_a_fault():
       if d.go:
         break
     return j
-  # a 45 mph stream at an 8 s headway (no gap of T_req): waited through, however long, never a fault
+  # a 45 mph stream at an 8 s headway (no gap of T_req): waited through, never the farBlocked fault (traffic reaches the full
+  # pass's range); no gap in STAND_UNDECIDED_S, the noGap handback (owner decision (ii))
   j = stream(V_45, 8., 400., 3. * FAR_BLOCKED_UNDECIDED_S)
-  assert not any(x.state == 'undecided' for x in j.decisions)
-  # one slow car (8 m/s) from 400 m: in the full pass's range within FAR_BLOCKED_UNDECIDED_S, then past: no fault, and a go
-  # once it has passed
-  j = stream(8., 1000., 400., (400. + 20.) / 8. + CLEAR_WINDOW_S + 1.)
+  und = [k for k, x in enumerate(j.decisions) if x.state == 'undecided']
+  assert und and j.decisions[und[0]].why == 'noGap' and abs(und[0] * DT_MDL - STAND_UNDECIDED_S) < 0.2
+  assert not any(x.go for x in j.decisions)
+  # one slow car (8 m/s) from 300 m: in the full pass's range within FAR_BLOCKED_UNDECIDED_S, then past: no fault, and a go
+  # once it has passed, inside STAND_UNDECIDED_S (from 400 m, 56 s: noGap)
+  j = stream(8., 1000., 300., (300. + 20.) / 8. + CLEAR_WINDOW_S + 1.)
   assert not any(x.state == 'undecided' for x in j.decisions) and j.decisions[-1].go
   # another hold keeps the car where it is (a red: LIGHT_RED_MAX_S): the far car isn't what holds it, never a fault under
   # it; at the green the wait on the far car alone starts from there
@@ -899,3 +903,39 @@ def test_the_lefts_own_hold_short_of_the_oncoming_lanes_lets_go_before_a_hold_co
   roll(j, 1., lambda k: max(0.5 - k * DT_MDL, 0.))
   ds = [j.step([raw(100., 3.6)], v=0., distance=j.distance - 4.) for _ in range(40)]
   assert all(d.stops and not d.crossed for d in ds) and ds[-1].state == 'undecided' and ds[-1].why == 'position'
+
+
+def test_every_wait_at_the_line_for_a_gap_ends_in_the_loud_handback_at_45_s_never_a_go():
+  """Owner decision (ii), 2026-10-30, Kellen's delegate (DESIGN's UNDECIDED row: no gap in 45 s): a car parked in the band
+  seen only as raw boxes, and a stream with no gap, each waited on silently with no limit (154bdaa bounded only what the
+  tracker says stands). Every wait at its line for a gap is now the noGap fault at STAND_UNDECIDED_S ('standing' where the
+  tracker says so), the car held, said. Another hold keeps the car where it is (a red, no lamp lit): that is no wait for a
+  gap, so the count pauses (their own bounds hold: LIGHT_RED_MAX_S, LEFT_SIGNAL_WAIT_S), and a go starts it over."""
+  from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
+  for boxes in (lambda t: [raw(50., 7.5)], lambda t: [raw(x, 3.6) for x in (120. - 11. * (t % 3.), 150. - 11. * (t % 3.))]):
+    j = Junction()
+    for k in range(round((STAND_UNDECIDED_S + 5.) / DT_MDL)):
+      d = j.step(boxes(k * DT_MDL))
+      if d.state == 'undecided':
+        break
+    assert d.state == 'undecided' and d.why == 'noGap' and d.prompt in TAKE_CONTROL_PROMPTS and not d.stops
+    assert d.reason == "No gap in oncoming traffic: take control"
+    assert abs(j.t - STAND_UNDECIDED_S) < 0.1 and not any(x.go for x in j.decisions)
+    assert all(x.state == 'waitGap' for x in j.decisions[:-1])
+  # under a red for 60 s, then 40 s on the green with the band blocked: no wait for a gap under the red, so no fault
+  j = Junction()
+  j.wait(60., boxes=[raw(50., 7.5)], light='red')
+  d = j.wait(STAND_UNDECIDED_S - 5., boxes=[raw(50., 7.5)], light='green')
+  assert d.state == 'waitGap' and not any(x.state == 'undecided' for x in j.decisions)
+  d = j.wait(6., boxes=[raw(50., 7.5)], light='green')
+  assert d.state == 'undecided' and d.why == 'noGap'
+  # a go after 40 s, withdrawn at its first motion: the wait on its own hold is counted afresh from there
+  j = Junction()
+  j.wait(40., boxes=[raw(50., 7.5)])
+  go(j)
+  d = j.step([raw(110., 3.6)], v=0.5, distance=HOLD_D - 0.05)
+  assert d.state == 'waitGap' and j.left.hold_here
+  d = j.wait(STAND_UNDECIDED_S - 5., boxes=[raw(100., 3.6)], v=0.)
+  assert d.state == 'waitGap' and d.stops
+  d = j.wait(6., boxes=[raw(100., 3.6)], v=0.)
+  assert d.state == 'undecided' and d.why == 'noGap' and d.stops  # held, its own hold

@@ -2,15 +2,17 @@
 traffic of the road ahead (map_controls.unprotected_turn), taken from its hold line with no gas tap.
 
 Kellen, 2026-10-28: "No it has to ship taking the turn", and for this version no intervention. So while the car can judge
-the junction it waits at the hold line for a gap it can certify, however long the traffic takes, as a careful driver does,
-and never hands back for ordinary waiting. A handback (UNDECIDED: leftUndecidedTakeControl, the handback chime, the car
-held) is only for a fault: road camera frames stale, the junction's position unknown, its reach past the detector's proven
+the junction it waits at the hold line for a gap it can certify, as a careful driver does, up to STAND_UNDECIDED_S (DESIGN's
+UNDECIDED row, no gap in 45 s: owner decision (ii), 2026-10-30, Kellen's delegate), and never hands back for a shorter wait.
+A handback (UNDECIDED: leftUndecidedTakeControl, the handback chime, the car held) is only for a fault: road camera frames
+stale, the junction's position unknown, its reach past the detector's proven
 range (route time should have rerouted it: turnpilotd), the car standing yawed past YAW_UNDECIDED_DEG, the view still
 blocked BLOCKED_UNDECIDED_S after the full creep, a creep the car hasn't made after standing CREEP_STALL_S in it with
 nothing else holding it (the model holding a standstill), a far-needed left waiting FAR_BLOCKED_UNDECIDED_S on the far
 crop's boxes alone (farBlocked: a car standing far up the road can't be told from one coming), or waiting STAND_UNDECIDED_S
-on something the tracker says stands, in the band or the exit zones (standing: a parked car never clears). A missing frame
-is never clear.
+at its line for a gap, whatever the tracker says (noGap; standing where it says something stands in the band or the exit
+zones: a parked car never clears, and one seen only as raw boxes can't be told from traffic), the car held, never let go.
+A missing frame is never clear.
 
 TurnPilotAutoLeft (turnpilotd) picks the mode: auto (the default), announce (the car stops at the hold line and says
 whether it would go, then hands back as before: debugging only), or off (the hold line's handback, G1's).
@@ -147,14 +149,16 @@ FAR_BLOCKED_UNDECIDED_S = 35.
 FAR_BLOCK_RECENT_S = CLEAR_WINDOW_S  # a far box in the band this recently keeps that count going (the far crop finds a far
                                     # car on one run in several; further apart, the window fills between them instead)
 YAW_UNDECIDED_DEG = 15.    # standing yawed further either way (after a withdrawn go): the road camera isn't up the oncoming approach
-# waiting at its line this long on something standing (skeptic g4c, SIMFIX: a car parked 50 m up the oncoming curb, or at
-# the curb 6 m past the junction in its box, held the car at the line for a 240 s run, 'waitingForGap' only, no sound): the
-# 'standing' fault (DESIGN's UNDECIDED row, 'no gap in 45 s'), never an endless silent wait. Traffic that moves is ordinary
-# waiting, however long (Kellen: no intervention), and never counts. Standing is what the tracker says stands (stands_still():
-# velocity trusted, under STAND_SPEED): a band box matched to such a vehicle track (a dropout of its box up to
-# CLEAR_WINDOW_S keeps it), or such tracks alone in the exit crosswalk and the junction box. Counted only waiting with
-# nothing else holding the car (a red, a stop sign, no lamp pause it). A raw box nothing tracks can't be told standing from
-# coming by range alone (a stream 3 s apart always has a car near any range): it stays traffic
+# waiting at its line for a gap this long, whatever the tracker says: the noGap fault (DESIGN's UNDECIDED row, 'no gap in
+# 45 s'; owner decision (ii), 2026-10-30, Kellen's delegate), the car held, never let go, never an endless silent wait.
+# Skeptic g4c, SIMFIX: a car parked 50 m up the oncoming curb, or at the curb 6 m past the junction in its box, held the car
+# at the line for a 240 s run, 'waitingForGap' only, no sound; 154bdaa bounded only what the tracker says stands, so the same
+# car seen only as raw boxes (a box nothing tracks can't be told standing from coming), a stream with no gap, or a car moving
+# in the junction box, was still waited on with no limit. Said as 'standing' where the tracker says something stands
+# (stands_still(): velocity trusted, under STAND_SPEED): a band box matched to such a vehicle track (a dropout of its box up
+# to CLEAR_WINDOW_S keeps it), or such tracks alone in the exit crosswalk and the junction box. Counted waiting or creeping at
+# its line or its own hold, from the hold and from a go; another hold keeping the car where it is (a red, a stop sign, no
+# lamp) is no wait for a gap and pauses it (their own bounds: LIGHT_RED_MAX_S, LEFT_SIGNAL_WAIT_S)
 STAND_UNDECIDED_S = 45.
 
 STAND_SPEED = 1.           # m/s: a velocity-trusted track slower than this stands
@@ -479,6 +483,7 @@ class UnprotectedLeft:
     self.band_stand_age = math.inf  # s since a road run's band box matched a standing track (STAND_UNDECIDED_S)
     self.band_stand_s = 0.        # s waiting at its line with the band so blocked
     self.exit_stand_s = 0.        # s waiting at its line with the exit zones blocked by standing tracks alone
+    self.wait_s = 0.              # s waiting at its line (or its own hold) for a gap, nothing else holding the car
 
   def update(self, inp: LeftInput, dt: float) -> LeftDecision:
     if inp.mode not in (AUTO, ANNOUNCE):
@@ -596,7 +601,7 @@ class UnprotectedLeft:
     if self.latch_d is None:
       # held at the line: the window starts here (hold, then judge), never carried over from the approach
       self.latch_d, self.clear_s, self.far_stale, self.far_only_s = inp.distance, 0., 0., 0.
-      self.band_stand_s = self.exit_stand_s = 0.
+      self.band_stand_s = self.exit_stand_s = self.wait_s = 0.
       out.clear_s = 0.
     certified = self.clear_s >= CLEAR_WINDOW_S - 1e-6 and not blocked_view and crosswalk and inp.scene_clear and not held_else
     out.view = 'roadAndWide'
@@ -663,6 +668,19 @@ class UnprotectedLeft:
       # never while openpilot is disengaged (the driver's pedal): a go then would let go of the latch under the driver, a
       # crossing nobody certified (owner decision (b), 2026-10-30). The window goes on counting: re-engaged, it goes on it
       return self._go(inp, out, rreq)
+    # every wait at its line for a gap, whatever the tracker says, ends at STAND_UNDECIDED_S out loud, the car held (owner
+    # decision (ii)); 'standing' where the tracker says something stands. Another hold keeping the car pauses it
+    if not held_else:
+      self.wait_s += dt
+      band_standing = self.blocked and self.band_stand_age <= CLEAR_WINDOW_S
+      self.band_stand_s = self.band_stand_s + dt if band_standing else 0.
+      self.exit_stand_s = self.exit_stand_s + dt if exits and all(stands_still(o) for o in exits) else 0.
+      if self.wait_s >= STAND_UNDECIDED_S - 1e-6:
+        why = 'standing' if max(self.band_stand_s, self.exit_stand_s) > 0. else 'noGap'
+        cloudlog.event("turnpilot.left_no_gap", error=True, why=why, wait_s=round(self.wait_s, 1), band_s=round(self.band_stand_s, 1),
+                       exit_s=round(self.exit_stand_s, 1), blockers=len(raw_blockers or ()), hold=self.hold_here,
+                       exits=[(str(o.cls), round(float(o.x), 1), round(float(o.y), 1)) for o in exits])
+        return self._undecided(out, why, inp.v_ego)
     if blocked_view and not self.blocked and not self.hold_here and not held_else:
       self.creep_to = creep_max
       done = crept >= creep_max - CREEP_DONE_M
@@ -687,16 +705,6 @@ class UnprotectedLeft:
     self.far_only_s = self.far_only_s + dt if far_only else 0.
     if self.far_only_s >= FAR_BLOCKED_UNDECIDED_S - 1e-6:
       return self._undecided(out, 'farBlocked')
-    # on something standing (STAND_UNDECIDED_S), nothing else holding the car (which pauses the count): out loud, never an
-    # endless silent wait
-    if not held_else:
-      band_standing = self.blocked and self.band_stand_age <= CLEAR_WINDOW_S
-      self.band_stand_s = self.band_stand_s + dt if band_standing else 0.
-      self.exit_stand_s = self.exit_stand_s + dt if exits and all(stands_still(o) for o in exits) else 0.
-      if max(self.band_stand_s, self.exit_stand_s) >= STAND_UNDECIDED_S - 1e-6:
-        cloudlog.event("turnpilot.left_standing", error=True, band_s=round(self.band_stand_s, 1), exit_s=round(self.exit_stand_s, 1),
-                       exits=[(str(o.cls), round(float(o.x), 1), round(float(o.y), 1)) for o in exits])
-        return self._undecided(out, 'standing')
     self.creep_to = min(self.creep_to, max(crept, 0.))
     out.state = self.state = 'waitGap'
     out.prompt, out.reason, out.creep_m = 'waitingForGap', NO_SIGNAL_REASON if no_signal else "Waiting for a gap", self.creep_to
@@ -706,7 +714,7 @@ class UnprotectedLeft:
 
   def _go(self, inp: LeftInput, out: LeftDecision, rreq: float) -> LeftDecision:
     self.went, self.moved, self.hold_here, self.go_t, self.far_only_s = True, False, False, 0., 0.
-    self.band_stand_s = self.exit_stand_s = 0.
+    self.band_stand_s = self.exit_stand_s = self.wait_s = 0.
     cloudlog.event("turnpilot.left_go", distance=round(inp.distance, 1), r_req=round(rreq, 1), clear_s=round(self.clear_s, 1),
                    v_limit=round(out.v_limit, 1), heading_deg=round(inp.heading_deg, 1))
     out.state = self.state = 'go'
@@ -845,6 +853,7 @@ UNDECIDED_REASON = {
   'farStale': "Far camera not seeing oncoming traffic: take control",
   'farBlocked': "Can't tell if far traffic is coming: take control",
   'standing': "Blocked by something standing: take control",
+  'noGap': "No gap in oncoming traffic: take control",
   'position': "Junction position unsure: take control",
   'curve': "Oncoming road curves out of view: take control",
   'stale': "Camera not seeing oncoming traffic: take control",
