@@ -27,7 +27,9 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   release ends in a loud handback, the car held while it lasts: a stop sign after STOP_SIGN_HANDBACK_S stopped
   (stopSignTakeControl, "Stop sign: take control to proceed"), an unprotected turn at once at its hold line
   (unprotectedTurnTakeControl) unless the autonomous left holds it. Releasing a control releases those RELEASE_SPAN_M
-  past it too (the far side of a divided road), but never past the stop-sign decider's 'clear': each line has its own.
+  past it too (the far side of a divided road), but never past the stop-sign decider's 'clear': each line has its own; nor
+  across rail tracks (near_rail: a released stop near a mapped rail crossing releases nothing, and one near it is never
+  released by another's), so a rail orphan's stop and the junction's either side of the tracks each stop the car.
 - A held stop sign under the stop-sign decider (stop_go.py, STOP_SIGNS.md v3 SG4a, through turnpilotd; update()'s stop, a
   StopCommand): wait holds it with no handback while the decider waits (its reason and action shown), fault hands it back
   now (stopSignTakeControl, the decider's reason: its faults only), shadow (TurnPilotStopSignGo shadow or off, auto without
@@ -80,10 +82,11 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   under the driver's foot is the same.
 - An unprotected turn (Kellen, 2026-10-27: the same rule as stop signs and lights) is a routed far-side turn (a left on the
   right) across an oncoming approach (navInstruction.maneuverOpposing present, or unknown: no junction data is never
-  clear) with no stop sign of its own at the junction (one within PROTECT_BEFORE_M before it to PROTECT_PAST_M past it: a
-  stop sign already stops; the maneuver stays protected once seen so, after its control drops out behind the car). A
-  signal there doesn't protect it (SIGNAL_PROTECTS_LEFT): a left on a green ball is unprotected. turnpilotd hands it in each frame
-  (update()'s turn) and it becomes a control of its own, kind unprotectedTurn, at the junction's hold line less
+  clear) with no stop sign of its own at the junction (one within PROTECT_BEFORE_M before it to PROTECT_PAST_M past it, not
+  a rail orphan's with the tracks between it and the junction (rail_between): a stop sign already stops; the maneuver stays
+  protected once seen so, after its control drops out behind the car). A signal there doesn't protect it
+  (SIGNAL_PROTECTS_LEFT): a left on a green ball is unprotected. turnpilotd hands it in each frame (update()'s turn) and
+  it becomes a control of its own, kind unprotectedTurn, at the junction's hold line less
   MAP_MARGIN_M: the curve, the latch and the stop sign's rules. Held, it does what the unprotected left asks (update()'s
   left, a LeftCommand from unprotected_left.py through turnpilotd; TurnPilotAutoLeft): auto (the default; Kellen,
   2026-10-28, "No it has to ship taking the turn", no intervention) holds it, never handing back but for the left's fault
@@ -258,12 +261,28 @@ def cross_road_yield(c) -> bool:
     bool((getattr(c, 'junction_info', None) or {}).get('crossGoverned'))
 
 
+def near_rail(c) -> bool:
+  """A control near a mapped rail level crossing (junctionInfo.railDistance >= 0: routing/controls.py, the OSM sidecar's): a
+  rail orphan's stop before its tracks, or a junction's within 30 m of them. Never released by another's release (_release)."""
+  rail = (getattr(c, 'junction_info', None) or {}).get('railDistance')
+  return rail is not None and float(rail) >= 0.
+
+
+def rail_between(c) -> bool:
+  """Its mapped rail crossing lies between its stop point and its node (railDistance under stopPointDistance): the stop is the
+  tracks', a rail orphan's, never its junction's (protecting())."""
+  info = getattr(c, 'junction_info', None) or {}
+  return near_rail(c) and float(info.get('railDistance', -1.)) < float(info.get('stopPointDistance', 0.))
+
+
 def protecting(c) -> str:
   """How control c stops the car at its junction (protected()): 'stop' a stop sign (a signal too, with SIGNAL_PROTECTS_LEFT) or
   a yield that became one (yieldStop), whose cross traffic the stop-sign decider watches, not only the oncoming the unprotected
   left would; 'pending' a yield of ours not yet decided (it becomes a stop unless certified rolling at its commit point:
   STOP_SIGNS.md 2.7); '' one that won't stop the car: taken rolling (yieldRolling, nobody watching the oncoming), passed or
   dropped, or the cross road's (cross_road_yield: read here before _yield has dropped it, a new control has no state yet)."""
+  if rail_between(c):
+    return ''  # a rail orphan's: it stops the car short of the tracks, not at the junction past them (residual-check-2)
   if c.kind == 'stop' or (c.kind == 'signal' and SIGNAL_PROTECTS_LEFT):
     return 'stop'
   if c.kind != 'yield' or cross_road_yield(c):
@@ -588,7 +607,9 @@ class MapControlPolicy:
         break  # past a turn's hold line the route is on another road: nothing there is the same junction's
       if cause == 'clear':
         break  # the stop-sign decider's go certifies its own line only: a second line (a divided road) has its own (G11)
-      if o is not c and c.d <= o.d <= c.d + RELEASE_SPAN_M and o.kind not in ('yield', UNPROTECTED):
+      if near_rail(c):
+        break  # tracks past it: whatever is past them stops the car itself (residual-check-2)
+      if o is not c and c.d <= o.d <= c.d + RELEASE_SPAN_M and o.kind not in ('yield', UNPROTECTED) and not near_rail(o):
         o.state = o.state or ControlState()
         o.state.done = 'released'
     cloudlog.event("turnpilot.map_stop_released", kind=c.kind, key=list(c.key), cause=cause, d=round(c.d, 1), v=round(v, 2))

@@ -1078,6 +1078,62 @@ def test_a_red_or_yellow_at_a_junction_with_no_mapped_signal_is_read_for_the_lef
   assert car.policy.turn_light(7, d) == 'none' and car.policy.release_light(d) == 'none'
 
 
+def rail(rail_m, stop_point_m=10.):
+  """A stop's junctionInfo near a mapped rail crossing: railDistance from its node, stopPointDistance from its stop point."""
+  return {'railDistance': rail_m, 'stopPointDistance': stop_point_m}
+
+
+def second_stop_after_a_handback_at_the_first(controls, drive_s=2.):
+  """Held and handed back at the first stop, the driver takes over and goes for drive_s, then the plan applies again: (where
+  it applied, where the car was held next or None, what was said after)."""
+  car = Car(controls)
+  car.run_until(held)
+  car.run(STOP_SIGN_HANDBACK_S + 0.3)
+  assert car.rows[-1][-1].prompt == 'stopSignTakeControl'
+  drive_off(car, drive_s)
+  s_engage, said = car.s, set()
+  for _ in range(int(30. / DT_MDL)):
+    out, dec, _ = car.step()
+    said |= {x for x in (out.alert, out.prompt) if x and x != 'none'}
+    if held(out, dec):
+      return s_engage, car.s, said
+  return s_engage, None, said
+
+
+def test_a_released_stop_never_releases_a_stop_across_rail_tracks():
+  # residual-check-2: _release let go of every non-yield control up to RELEASE_SPAN_M past a released one, so after a handback
+  # at a junction's stop (Indianapolis 17464804:b) the driver's go released the rail orphan's stop 29.6 m on (the tracks 8 m
+  # past it), and the reverse (a junction's stop 20 m past a rail orphan's), both silently: re-engaged before them the car
+  # crossed at 13.4 m/s with nothing said. A control near a mapped rail crossing (junctionInfo.railDistance >= 0) is never
+  # released by another's release, and releasing one releases nothing past it: each stops the car itself
+  s_engage, stopped, said = second_stop_after_a_handback_at_the_first(
+    [(126.5, 'stop', False, True, False, rail(25., 12.5)), (156.1, 'stop', False, False, False, rail(7.9, 37.9))])
+  assert s_engage < 150. and stopped is not None and stopped < 164. - 4.6, (s_engage, stopped, said)
+  s_engage, stopped, said = second_stop_after_a_handback_at_the_first(
+    [(120., 'stop', False, False, False, rail(6., 30.)), (140., 'stop', False, True, False, {'railDistance': -1.})])
+  assert stopped is not None and abs(140. - stopped) < 5., (s_engage, stopped, said)
+  # with no rail anywhere, a second line RELEASE_SPAN_M on is the same junction's (a divided road): released with the first
+  s_engage, stopped, said = second_stop_after_a_handback_at_the_first([(126.5, 'stop'), (150., 'stop')])
+  assert stopped is None
+
+
+def test_a_rail_stop_before_a_left_never_protects_it():
+  # residual-check-2: protected() counted a rail orphan's stop up to PROTECT_BEFORE_M before a junction as its own, so a route
+  # left there with no stop sign of its own was taken as protected and never held for its gap. A stop whose rail crossing lies
+  # between it and its node (railDistance under stopPointDistance) is the tracks', never the junction's
+  orphan = (225., 'stop', False, False, False, rail(18., 25.))
+  car = left_car([orphan])
+  car.run_until(held)
+  car.run(STOP_SIGN_HANDBACK_S + 0.5)
+  drive_off(car, 2.)
+  out, dec = car.run_until(held, max_s=20.)
+  assert out.shown.kind == UNPROTECTED and 250. - HOLD_LINE_M - car.s < 3.
+  # the junction's own stop sign, near tracks past it, still protects its left (one stop, the stop sign's)
+  car = left_car([(240., 'stop', False, True, False, rail(20., 10.))])
+  car.run_until(held)
+  assert car.policy.held_control().kind == 'stop' and car.policy.turn is None
+
+
 # --- the stop-sign decider's latch (STOP_SIGNS.md v3 SG4a: stop_go.py through turnpilotd) ---
 
 def stand_at(car, line):
