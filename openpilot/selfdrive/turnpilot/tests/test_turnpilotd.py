@@ -2072,6 +2072,32 @@ def test_stalled_in_the_junction_after_the_go_hands_back_and_never_goes():
   assert any(p.shouldStop for p in plans) and all(p.controlPrompt == 'none' for p in plans if p.shouldStop)
 
 
+@pytest.mark.parametrize("angle,deg", [(90., 78.), (60., 55.), (60., 70.), (45., 38.), (45., 60.)])
+def test_a_stand_after_the_go_past_where_its_desire_cleared_still_hands_back(angle, deg):
+  """Skeptic SIMFIX D2 (3b9b049): the stall's handback came to need turn_committed, the desire not done, and DesireTiming
+  clears a turn at max(angle - 10, 0.75 angle), turned_deg stopping there. So after TurnPilot's go in a turn under 90 deg
+  a stand past that angle (a 60 deg turn at 56 and 70 deg, a 45 deg one at 39 and 60) said nothing until
+  carStoppedTakeControl at NEAR_CONTROL_STAND_S, 90 s; on 49359b2 each handed back at 3 s, as here. A 90 deg turn clears at
+  80 (STALL_MAX_DEG), the control."""
+  sim = Sim([(300., "turn", "left", junction_of("left", angle=angle, opposing='none')), (1500., "turn", "right", junction_of("right"))],
+            controls=[(290., 'signal')])
+  go_from_the_hold(sim)
+  yawed = 0.
+  while yawed < deg:  # the car's own heading, on past the angle the desire cleared at
+    sim.step(engaged=True, yaw_rate=0.5)
+    yawed += math.degrees(0.5 * DT_MDL)
+    assert sim.t < 120.
+  plans = []
+  for _ in range(int(round((STALL_PROMPT_S + 1.) / DT_MDL))):
+    sim.v = 0.  # the model stands the car: nothing in the plan does
+    plans.append(sim.step(engaged=True))
+  first = next((i for i, p in enumerate(plans) if p.controlPrompt != 'none'), None)
+  assert first is not None and plans[first].controlPrompt == 'stalledTakeControl', \
+    f"{angle} deg turn stood at {yawed:.0f} deg after the go: {sorted({str(p.controlPrompt) for p in plans})}"
+  assert abs(first * DT_MDL - STALL_PROMPT_S) < 0.15 and plans[first].reason == STALLED_REASON
+  assert not any(p.shouldStop for p in plans) and plans[-1].accelCap == NO_ACCEL_CAP  # never a hold or a push
+
+
 def test_a_shallow_turn_taken_from_a_stop_is_not_called_missed():
   """Skeptic probe, 2026-10-28: a turn under 20 deg clears its desire at max(angle - 10, 0.75 angle), under 15 deg, and
   turned_deg stops there. Released from a stop (a red, here) 20 m before it at cruise 10 m/s and yawed through its full angle, the

@@ -55,11 +55,12 @@ was taken about half the time (2026-10-28). Past its junction (the follower's pa
 its desire not cleared at the turn's angle (a turn under 20 deg clears under MISSED_TURN_DEG, and that one was taken),
 it was missed: turnMissed for MISSED_HOLD_S, which selfdrived chimes as a skip ("Turn Missed", "Rerouting") and on which
 navd reroutes at once. Nothing brakes for it. Standing more than STALL_PROMPT_S in any route turn in progress (its desire
-out and not done), STALL_MIN_DEG to STALL_MAX_DEG into it (from its start, after a go of TurnPilot's that came in the
-junction), whoever stopped the car (TurnPilot's go, or the model on its own: BUILD_FINDINGS D2), with no hold of TurnPilot's
-and no lead within STOPPED_LEAD_M that the live scene corroborates (watch_lead: a vehicle track or box at it; one it
-corroborates holds the car LEAD_STAND_MAX_S at most), it stalled in the junction: handed back loudly (controlPrompt
-stalledTakeControl, STALLED_REASON), never held there, and TurnPilot never goes itself. Moving in such a turn past its hold
+out and not done; after a go of TurnPilot's for it, done or not), STALL_MIN_DEG to STALL_MAX_DEG into it (from its start,
+after a go of TurnPilot's that came in the junction), whoever stopped the car (TurnPilot's go, or the model on its own:
+BUILD_FINDINGS D2), with no hold of TurnPilot's and no lead within STOPPED_LEAD_M that the live scene corroborates
+(watch_lead: a vehicle track or box at it; one it corroborates holds the car LEAD_STAND_MAX_S at most), it stalled in the
+junction: handed back loudly (controlPrompt stalledTakeControl, STALLED_REASON), never held there, and TurnPilot never
+goes itself. Moving in such a turn past its hold
 line, under half of it turned, the model steering away from it (modelV2.action.desiredCurvature, TURN_ABANDON_S) is a turn
 abandoned (BUILD_FINDINGS N1): handed back loudly (turnAbandonedTakeControl) until the driver takes over, nothing steered
 or held, the turn's caps kept.
@@ -1923,13 +1924,20 @@ class TurnPilot:
     speed, stood silently for 60-103 s). STALL_MIN_DEG to STALL_MAX_DEG into the turn; or, after TurnPilot's go for it, from
     its start if the go came in the junction (go_in_junction: never withdrawn, never silent) or the car stands in it now (not
     go_at_line: a go from the line it crept on from into the cross street's lanes, skeptic G3, 89.95 s silent at 5.5 deg).
+    After TurnPilot's go its desire may be done already (DesireTiming clears a turn at max(angle - CLEAR_MARGIN_DEG,
+    CLEAR_MIN_FRACTION * angle) and turned_deg stops there): a stand after the go is the stall's done or not, as before D2
+    (skeptic SIMFIX D2: a 60 deg turn stood at 56 and 70 deg, a 45 deg one at 39 and 60, were silent for 90 s), its
+    STALL_MAX_DEG bound on the angle the desire cleared at, as it was.
     Under STALL_MIN_DEG with no go of TurnPilot's the car may stand at the line (a red the map doesn't know): stopped_unheld's.
     The stop line it left is close behind it, so stopped_unheld would wait NEAR_CONTROL_STAND_S. A model lead holds it only
     as far as the scene corroborates it, LEAD_STAND_MAX_S at most (watch_lead)."""
     d, rf = self.desires, self.follower
+    turned = d.turned_deg
     went = self.go_id is not None and self.go_id == rf.maneuver_id
-    in_turn = self.turn_committed and d.turned_deg <= STALL_MAX_DEG and \
-      ((went and (self.go_in_junction or not self.go_at_line(rf.distance))) or STALL_MIN_DEG <= d.turned_deg)
+    # TurnPilot's go for this turn (49359b2's gate): its desire out or already cleared at its angle
+    go_turn = went and self.go_id == d.maneuver_id and \
+      (self.go_in_junction or not self.go_at_line(rf.distance) or STALL_MIN_DEG <= turned)
+    in_turn = turned <= STALL_MAX_DEG and (go_turn or (self.turn_committed and STALL_MIN_DEG <= turned))
     standing = acting and in_turn and sm['carControl'].enabled and v_ego < STANDSTILL_SPEED and not decision.should_stop and \
       not self.go_withdrawn and \
       not decision.holding and not cs.gasPressed and not cs.brakePressed and mapd.prompt not in TAKE_CONTROL_PROMPTS
