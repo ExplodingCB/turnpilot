@@ -160,6 +160,9 @@ PED_HISTORY_S = 2.0             # s of each person's ground positions kept (the 
 RAW_PED_RUNS, RAW_PED_OF = 2, 3  # a raw person box counts for the arrival clause seen on 2 of the last 3 runs of its view
 RAW_PED_SAME_M = 1.5            # m: a raw box this near a person track, or a box of another run, is the same person
 PED_RANGE_BAND = 0.3            # a person's ranging band, plus or minus this of range
+PED_CURB_S = 5.                 # s a person standing at a crosswalk's curb holds the go (decision D3, rows P3, P15)
+CURB_M = 1.0                    # m past a crosswalk's end (onto the sidewalk) its curb reaches
+BAND_KS = (1. - PED_RANGE_BAND, 1. - PED_RANGE_BAND / 2., 1., 1. + PED_RANGE_BAND / 2., 1. + PED_RANGE_BAND)  # along the ray
 RAW_PERSON_CONF = 0.35
 MOVING_V = 0.5                  # m/s: a vehicle moving
 RAW_KNOWN_DEG = 3.              # deg a raw box may lie outside a known track's live span and still be its box (raw_known)
@@ -397,6 +400,8 @@ class StopGo:
     self.peds: dict[int, deque] = {}       # person trackId: (t, x ground, y) the last PED_HISTORY_S (the arrival clause)
     self.raw_peds: dict[str, deque] = {}   # view key: the person boxes' (x ground, y) of its last RAW_PED_OF runs
     self.ped_carry_on = False              # the launch carries on across the near crosswalk (the arrival clause, 2.6)
+    self.curb: dict[int, dict] = {}        # person trackId at a crosswalk's curb, still toward the road (D3): since, which, until
+    self.curb_until: float | None = None   # m past the stop point the go's STOP_GO_V_MAX holds to (D3: past that crosswalk)
     self.bike_t: float | None = None
     self.large_left: dict[str, float] = {}  # lane role: when a large vehicle last left it
     self.large_seen: dict[int, str] = {}
@@ -607,6 +612,7 @@ class StopGo:
         seen_peds.add(o.trackId)
     for tid in [k for k, h in self.peds.items() if k not in seen_peds and (not h or h[-1][0] < self.t - PED_STILL_S)]:
       del self.peds[tid]
+    self._curbs(f, pos)
     for key, _t, raw, _sectors in f.runs or ():
       if raw is not None and key != 'far':
         boxes = [(float(b.xy[0]) + pos, float(b.xy[1])) for b in raw.boxes
@@ -857,6 +863,9 @@ class StopGo:
       return
     self.go = {'pos': pos, 't': self.t, 'reach': {(x.role, x.index): x.r_seen for x in self.last_lanes},
                'tracks': self._known_tracks(f)}
+    self.curb_until = self.curb_cap_until()  # D3: past a curb person's crosswalk at STOP_GO_V_MAX at most
+    if self.curb_until is not None:
+      cloudlog.event("turnpilot.stop_go_curb_cap", key=list(self.key), until=round(self.curb_until, 2), people=sorted(self.curb))
     self.takeover.reset()
     self.takeover_s, self.uncommit_s = -1., 0.
     self.state, self.clear_s, self.went, self.ped_carry_on = 'going', 0., True, False
@@ -954,7 +963,8 @@ class StopGo:
 
   def _inlane(self, f: Frame, d: StopGoDecision, pos: float) -> None:
     d.action, d.committed, d.in_lane, d.detector_view = 'committed', True, True, 'stopSweepGo'
-    if pos - CAR_LEN_M > self._far_edge() or abs(f.turned_deg) >= CROSS_DONE_YAW_DEG:
+    curb_past = self.curb_until is None or pos > self.curb_until  # D3's cap held until past that crosswalk
+    if (pos - CAR_LEN_M > self._far_edge() or abs(f.turned_deg) >= CROSS_DONE_YAW_DEG) and curb_past:
       self.state, self.go = 'done', None
       d.detector_view = 'auto'
       cloudlog.event("turnpilot.stop_go_done", key=list(self.key), pos=round(pos, 2), turned=round(f.turned_deg, 1))
@@ -1050,7 +1060,7 @@ class StopGo:
     holds += self._lane_holds(f, pos, launch)
     # 6 the box; 7 people, the front zone, the exit; 8 a lead, a right's blind spot and a cyclist passed on the right
     box = self._box_holds(f, pos)
-    rest = self._people_holds(f, pos) + self._exit_holds(f, pos)
+    rest = self._people_holds(f, pos, launch) + self._exit_holds(f, pos)
     if f.lead_m is not None and f.lead_m <= LEAD_GO_M:
       rest.append(Hold('lead', "a queue ahead", DYNAMIC))
     if f.maneuver == 'right':
@@ -1407,10 +1417,11 @@ class StopGo:
         holds.append(Hold(f'hide:{role}', f"a large vehicle just passed {side_word(role)}", DYNAMIC))
     return holds
 
-  def _people_holds(self, f: Frame, pos: float) -> list[Hold]:
+  def _people_holds(self, f: Frame, pos: float, launch: bool = False) -> list[Hold]:
     """2.4 item 7, the conservative zones (P1, P2, P10): any person track or raw person box in the near or far crosswalk band
     (our half of the road plus one lane, its ranging band of plus or minus PED_RANGE_BAND included) or in the box blocks the
-    go; moving, a dynamic wait, standing, a static one (the curb rule is SG4c's). A right turn (and off the route, the union)
+    go; moving, a dynamic wait, standing, a static one. A person standing at a crosswalk's curb (D3, P3, P15: _curbs) is the
+    curb rule's: PED_CURB_S, then the go at STOP_GO_V_MAX past that crosswalk (_curb_holds). A right turn (and off the route, the union)
     has its exit leg's crosswalk too, across the right road beside the box, and the sidewalk users heading for it (P4; a left's
     is scene_policy's junction hold's, P2). A person heading for a crosswalk on our path (the arrival clause, P16:
     _arrival_holds). The front zone (P6)."""
@@ -1433,14 +1444,19 @@ class StopGo:
         return 'the exit crosswalk'
       return ''
 
+    curb_xy = []  # the curb people's own positions: their track decides (D3), so their raw box never blocks as a stranger's
     for o in f.objects or ():
       if class_name(o.cls) != PERSON:
         continue
       x, y = float(o.x), float(o.y)
+      if self.curb.get(o.trackId, {}).get('standing'):
+        curb_xy.append((x, y))
+        continue  # at a curb, standing (D3, P15): the curb rule's, never a person standing in the road
       where = zone(x * (1. - PED_RANGE_BAND), x * (1. + PED_RANGE_BAND), y)
       if where:
         v = math.hypot(float(o.vx), float(o.vy))
         holds.append(Hold(f'ped:{o.trackId}', f"a person in {where}", DYNAMIC if v > PED_STILL_V else STATIC))
+    holds += self._curb_holds(launch)
     if f.live is not None:
       for key, frame in f.live.raw.items():
         if key == 'far' or not f.live.fresh_key(key):
@@ -1448,6 +1464,8 @@ class StopGo:
         for b in frame.boxes:
           if b.cls == PERSON and b.conf >= RAW_PERSON_CONF and b.xy is not None:
             x, y = float(b.xy[0]), float(b.xy[1])
+            if any(math.hypot(x - cx, y - cy) <= RAW_PED_SAME_M for cx, cy in curb_xy):
+              continue
             if zone(x * (1. - PED_RANGE_BAND), x * (1. + PED_RANGE_BAND), y):
               holds.append(Hold(f'pedRaw:{key}', "a person at the crosswalk", DYNAMIC))
               break
@@ -1459,6 +1477,115 @@ class StopGo:
     holds += self._arrival_holds(f, pos, walks)
     holds += self._front_zone(f)
     return holds
+
+  def _crosswalks(self, f: Frame, pos: float) -> list:
+    """The crosswalks on our path from where the car is now (2.4 item 7's zones): (which, x0, x1, y0, y1 in camera x and y, the
+    axis a person crosses it along, m past the stop point to its far edge along our path). The near one across our road
+    (our half plus one lane, to the right curb), the far one going straight (and off the route), the exit leg's across the
+    right road for a right (P4)."""
+    near0, near1 = self._x(0., pos) - 1., self._x(self.edges.d_max, pos)
+    box0, box1 = self._x(self.edges.d_min, pos), self._x(self._far_edge(), pos)
+    out = [('near', near0, near1, -HALF_RIGHT_M, HALF_LEFT_M, 'y', self.edges.d_max)]
+    if f.maneuver in ('straight', 'unknown'):
+      out.append(('far', box1, box1 + CROSSWALK_M + 1., -HALF_RIGHT_M, HALF_LEFT_M, 'y', self._far_edge() + CROSSWALK_M + 1.))
+    if f.maneuver in ('right', 'unknown'):
+      out.append(('exit', box0 - 1., box1 + 1., -(BOX_RIGHT_M + CROSSWALK_M + 1.), -BOX_RIGHT_M + 0.5, 'x',
+                  self.edges.d_min + EXIT_TURN_M + CROSSWALK_M))
+    return out
+
+  @staticmethod
+  def _at_curb(x: float, y: float, cw) -> bool:
+    """A person read at (x, y) is at crosswalk cw's curb (D3, P15): read outside it with their ranging band (along the ray)
+    reaching it or its curb (CURB_M past either end, across its width), or read inside it with that band reaching past an
+    end, onto the curb. Read inside with the band inside, they stand in the road."""
+    _which, x0, x1, y0, y1, axis, _until = cw
+
+    def inside(px, py):
+      return x0 <= px <= x1 and y0 <= py <= y1
+
+    def curb(px, py):
+      if axis == 'y':
+        return x0 <= px <= x1 and (y0 - CURB_M <= py < y0 or y1 < py <= y1 + CURB_M)
+      return y0 <= py <= y1 and (x0 - CURB_M <= px < x0 or x1 < px <= x1 + CURB_M)
+
+    def past_end(px, py):
+      return (py < y0 or py > y1) and x0 <= px <= x1 if axis == 'y' else (px < x0 or px > x1) and y0 <= py <= y1
+
+    band = [(k * x, k * y) for k in BAND_KS]
+    if inside(x, y):
+      return any(past_end(px, py) for px, py in band)
+    beyond = (y < y0 or y > y1) if axis == 'y' else (x < x0 or x > x1)  # read out on the sidewalk past one of its ends
+    return beyond and any(inside(px, py) or curb(px, py) for px, py in band)
+
+  @staticmethod
+  def _inside(x: float, y: float, cw) -> bool:
+    return cw[1] <= x <= cw[2] and cw[3] <= y <= cw[4]
+
+  def _stepped(self, tid: int, cw, pos: float) -> bool:
+    """D3's measure: the person moved PED_STILL_M or more toward the road (along cw's crossing axis, toward its middle) in
+    the last PED_STILL_S, from their ground positions (the arrival clause's history)."""
+    h = self.peds.get(tid)
+    if not h:
+      return False
+    then = next((s for s in h if s[0] >= self.t - PED_STILL_S - 1e-9), h[-1])
+    now = h[-1]
+    _which, x0, x1, y0, y1, axis, _until = cw
+    if axis == 'y':
+      mid = (y0 + y1) / 2.
+      toward = abs(then[2] - mid) - abs(now[2] - mid)
+    else:
+      mid = (x0 + x1) / 2. + pos  # ground x
+      toward = abs(then[1] - mid) - abs(now[1] - mid)
+    return toward >= PED_STILL_M - 1e-9
+
+  def _curbs(self, f: Frame, pos: float) -> None:
+    """Decision D3 (rows P3, P15), every frame: each person track at a crosswalk's curb (_at_curb) who hasn't stepped toward
+    the road (_stepped) keeps a clock from when first seen there; a step starts it again once they stand (meanwhile the
+    arrival clause judges them), and one gone from the curb for PED_STILL_S is forgotten."""
+    cws = self._crosswalks(f, pos)
+    for o in f.objects or ():
+      if class_name(o.cls) != PERSON:
+        continue
+      x, y = float(o.x), float(o.y)
+      # read inside a crosswalk (or the box): at a curb only by that crosswalk's own band (P15), else in the road
+      box = ('box', self._x(self.edges.d_min, pos), self._x(self._far_edge(), pos), -BOX_RIGHT_M, BOX_LEFT_M, 'y', 0.)
+      home = [c for c in cws + [box] if self._inside(x, y, c)]
+      cw = next((c for c in (home or cws) if c[0] != 'box' and self._at_curb(x, y, c)), None)
+      if cw is None:
+        continue
+      if self._stepped(o.trackId, cw, pos):
+        if self.curb.pop(o.trackId, None) is not None:
+          cloudlog.event("turnpilot.stop_go_curb_step", key=list(self.key), track=int(o.trackId), which=cw[0])
+        continue
+      rec = self.curb.setdefault(o.trackId, {'since': self.t, 'logged': False})
+      # standing (the arrival clause's measure: under PED_STILL_M in PED_STILL_S; too new to tell, taken as standing): one
+      # walking along the curb or away from it is the arrival clause's while it moves, its clock running on (no step yet)
+      h = self.peds.get(o.trackId) or ()
+      then = next((s for s in h if s[0] >= self.t - PED_STILL_S - 1e-9), None)
+      known = bool(h) and h[-1][0] - h[0][0] >= PED_STILL_S - 1e-9
+      standing = not known or then is None or math.hypot(h[-1][1] - then[1], h[-1][2] - then[2]) < PED_STILL_M
+      rec.update(which=cw[0], until=cw[6], seen=self.t, standing=standing)
+      if not rec['logged'] and self.t - rec['since'] >= PED_CURB_S - 1e-6:
+        rec['logged'] = True
+        cloudlog.event("turnpilot.stop_go_curb", key=list(self.key), track=int(o.trackId), which=cw[0], waited_s=round(self.t - rec['since'], 1),
+                       x=round(float(o.x), 2), y=round(float(o.y), 2))
+    for tid in [k for k, r in self.curb.items() if r['seen'] < self.t - PED_STILL_S - 1e-9]:
+      del self.curb[tid]
+
+  def _curb_holds(self, launch: bool) -> list[Hold]:
+    """D3: a person at a crosswalk's curb holds the go PED_CURB_S from when first seen there standing (a dynamic wait, bounded by
+    itself); then the go may come, at STOP_GO_V_MAX at most until our rear bumper is past that crosswalk (curb_until), with
+    scene_policy's in-path pedestrian stop armed. During the launch a curb person (however new) withdraws nothing: they arm
+    the cap; a step toward the road is the arrival clause's, re-checked to commit."""
+    if launch:
+      return []
+    return [Hold(f'curb:{tid}', f"a person at the curb of {({'far': 'the far ', 'exit': 'the exit '}).get(rec['which'], 'the ')}crosswalk",
+                 DYNAMIC) for tid, rec in self.curb.items() if rec['standing'] and self.t - rec['since'] < PED_CURB_S - 1e-6]
+
+  def curb_cap_until(self) -> float | None:
+    """m past the stop point the go's STOP_GO_V_MAX holds to for the curb people seen (D3), None with none."""
+    ends = [r['until'] + CAR_LEN_M for r in self.curb.values()]
+    return max(ends) if ends else None
 
   def t_clear(self, f: Frame, pos: float, far_edge: float) -> float:
     """s until our rear bumper is past far_edge (m past the stop point; 2.4 item 7's t_clear): T_GO_LAT from rest, then the G5
@@ -1765,6 +1892,14 @@ class StopGo:
   # ------------------------------------------------------------------------------------------------------------- output
 
   def _finish(self, f: Frame, d: StopGoDecision, acting: bool, why: str) -> None:
+    if self.state in ('going', 'committed', 'inLane'):
+      # D3: a person at a crosswalk's curb, seen at the go or since, keeps the launch at STOP_GO_V_MAX until our rear bumper is
+      # past that crosswalk, past commit too (scene_policy's in-path stop armed; never braked for here)
+      end = self.curb_cap_until()
+      if end is not None:
+        self.curb_until = end if self.curb_until is None else max(self.curb_until, end)
+      if self.curb_until is not None and d.position_m <= self.curb_until:
+        d.speed_cap = min(d.speed_cap, sr.STOP_GO_V_MAX)
     d.state, d.acting = self.state, acting
     self.latched = f.control is not None
     d.clear_s, d.rank, d.retries, d.crept_m = self.clear_s, self.rank, self.retries, self.crept_m

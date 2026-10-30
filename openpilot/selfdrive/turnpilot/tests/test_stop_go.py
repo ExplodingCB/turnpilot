@@ -1175,13 +1175,18 @@ def test_P16_a_person_heading_for_the_near_crosswalk_blocks_the_go_until_they_ha
   approaching = out[round(1.2 / DT_MDL):round(7. / DT_MDL)]
   assert all(any(h.key.startswith('pedArrive:50') for h in d.holds) and d.ledger == 'dynamic' for d in approaching)
   assert all(s.accel_cap >= -2. - 1e-9 for d in out for s in d.stops)
-  # moving away from it, or standing still at the curb (D3, the curb rule's), doesn't block: the go at the usual time
+  # moving away from it doesn't block: the go at the usual time; standing still at the curb is D3's (the curb rule, SG4c):
+  # not an arrival, the go PED_CURB_S after they were first seen there
   calm = first_go(World(tmp_path).run(5.))
-  for walk in (walker(51, 5.5, -6., -1.4), walker(52, 5.5, -7., 0.)):
-    w = World(tmp_path)
-    w.objects = walk
-    out = w.run(6.)
-    assert first_go(out) == calm, [h.key for h in out[calm].holds]
+  w = World(tmp_path)
+  w.objects = walker(51, 5.5, -6., -1.4)
+  out = w.run(6.)
+  assert first_go(out) == calm, [h.key for h in out[calm].holds]
+  w = World(tmp_path)
+  w.objects = walker(52, 5.5, -7., 0.)
+  out = w.run(9.)
+  assert first_go(out) is not None and (first_go(out) + 1) * DT_MDL >= sg.PED_CURB_S + sr.CLEAR_S - 0.15
+  assert not any(h.key.startswith('pedArrive:52') for d in out[round(1.5 / DT_MDL):] for h in d.holds)
   # a raw person box no track explains, on 2 of the last 3 runs of its view, is taken at PED_V_UNTRUSTED: it blocks; one
   # seen on a single run doesn't
   box = dataclasses.replace(raw_box(-50., conf=0.5, xy=(7.9, -9.), view='full'), cls='pedestrian')
@@ -1225,6 +1230,84 @@ def test_P16_a_person_heading_for_the_near_crosswalk_during_the_launch_stops_us_
       assert not [d.withdraw for d in out if d.withdraw.startswith('pedArrive')]
       assert any(d.state in ('committed', 'inLane') for d in out)
       assert all(c[1] <= sr.STOP_GO_V_MAX + 0.1 for c in w.cmds if c[6] == 'going')
+
+
+def stander(tid, d_along, y, steps=()):
+  """World.objects: a person standing d_along m past the stop point, y m left of our axis, seen from where the car is now;
+  steps: (t0, t1, vy) spells in which they walk at vy m/s (toward the road from the right curb: vy > 0)."""
+  def objects(w):
+    t = w.t_cam - 100.
+    pos = w.sg.pos_ref + (w.odo - w.sg.odo_ref) if w.sg.token is not None else -w.control.d
+    yy, vy = y, 0.
+    for t0, t1, v in steps:
+      yy += v * min(max(t - t0, 0.), t1 - t0)
+      vy = v if t0 <= t < t1 else vy
+    return (person(tid, w.sg.setback + d_along - pos, yy, vy=vy),)
+  return objects
+
+
+def test_P3_a_person_standing_still_at_the_curb_waits_ped_curb_s_then_we_go_at_2_m_s_past_that_crosswalk(tmp_path):
+  # decision D3: a person standing at the right curb of the near crosswalk (0.75 m onto the sidewalk past HALF_RIGHT_M, their
+  # ranging band reaching the crosswalk) who doesn't step toward the road (under 0.4 m of it in any 1 s) holds the go
+  # PED_CURB_S, a dynamic wait said as such; then the go, its cap STOP_GO_V_MAX kept past commit until our rear bumper has
+  # cleared that crosswalk (scene_policy's in-path stop armed throughout). Before SG4c the go came at 3 s, the person ignored
+  calm = first_go(World(tmp_path).run(5.))
+  w = Drive(tmp_path, behaviour=lambda w: 'goes')
+  w.objects = stander(80, 5.5, -(sg.HALF_RIGHT_M + 0.75))
+  out = w.run(22.)
+  i = first_go(out)
+  assert i is not None and calm is not None
+  assert (i + 1) * DT_MDL >= sg.PED_CURB_S + sr.CLEAR_S - 0.15 and (i + 1) * DT_MDL <= sg.PED_CURB_S + sr.CLEAR_S + 0.5, (i + 1) * DT_MDL
+  waiting = out[round(1.3 / DT_MDL):round(4.8 / DT_MDL)]
+  assert all(any(h.key == 'curb:80' for h in d.holds) and d.ledger == 'dynamic' and 'curb' in d.reason for d in waiting)
+  # past commit the cap stays until the rear bumper is past the near crosswalk's far edge (dEdgeMax), then lifts
+  until = out[i].edges.d_max + sg.CAR_LEN_M
+  after = [d for d in out[i:] if d.state in ('committed', 'inLane')]
+  assert after, [d.state for d in out[i::10]]
+  assert all(d.speed_cap <= sr.STOP_GO_V_MAX + 1e-9 for d in out[i:] if d.state != 'off' and d.position_m < until - 0.2)
+  assert any(d.speed_cap > 10. for d in out[i:] if d.position_m > until + 0.2)
+  assert all(c[3] >= -2. - 1e-9 for c in w.cmds)
+  # with nobody at the curb the cap lifts at commit
+  w = Drive(tmp_path, behaviour=lambda w: 'goes')
+  out = w.run(10.)
+  assert any(d.state == 'committed' and d.speed_cap > 10. for d in out)
+
+
+def test_P3_a_step_toward_the_road_starts_the_curb_wait_again_and_standing_in_the_road_is_a_static_wait(tmp_path):
+  # a step of 0.6 m toward the road at 1.0 m/s 3 s in: the curb clock starts again once they stand (the arrival clause holds
+  # them while they move); the go comes PED_CURB_S after that, not 5 s from first seen
+  w = World(tmp_path)
+  w.objects = stander(81, 5.5, -(sg.HALF_RIGHT_M + 1.2), steps=((3., 3.6, 1.0),))
+  out = w.run(14.)
+  i = first_go(out)
+  assert i is not None and (i + 1) * DT_MDL >= 3.6 + sg.PED_CURB_S + sr.CLEAR_S - 0.15, (i + 1) * DT_MDL
+  # one who walks on into the road and stands there (nominal in our half, their band nowhere near a curb) is in our path: a
+  # static wait, then H3 with its reason
+  w = World(tmp_path)
+  w.objects = stander(82, 5.5, -(sg.HALF_RIGHT_M + 0.6), steps=((2., 5., 1.0),))
+  out = w.run(5. + STATIC_WAIT_S + 2.)
+  assert first_go(out) is None
+  assert any(h.key == 'ped:82' and h.kind == 'static' for h in out[round(7. / DT_MDL)].holds)
+  h3 = next(d for d in out if d.fault == 'H3')
+  assert 'a person in the crosswalk' in h3.reason
+
+
+def test_P15_a_still_person_whom_ranging_places_inside_the_crosswalk_but_whose_band_reaches_the_curb_is_a_curb_pedestrian(tmp_path):
+  # 4.85 m right of our axis is the curb (HALF_RIGHT_M); a person read 4.4 m right, 7.9 m ahead, has a ranging band (plus or
+  # minus 30% along the ray) out to 5.7 m right: past the curb, so a curb pedestrian for D3, not a person standing in the road
+  w = World(tmp_path)
+  w.objects = stander(83, 5.5, -4.4)
+  out = w.run(10.)
+  i = first_go(out)
+  assert i is not None and (i + 1) * DT_MDL >= sg.PED_CURB_S + sr.CLEAR_S - 0.15
+  assert not any(h.key == 'ped:83' for d in out for h in d.holds)
+  assert all(d.fault == '' for d in out)
+  # read 2.5 m right (its band to 3.25 m: inside the road whatever the ranging) and standing: in our path, a static wait, H3
+  w = World(tmp_path)
+  w.objects = stander(84, 5.5, -2.5)
+  out = w.run(STATIC_WAIT_S + 3.)
+  assert first_go(out) is None and any(d.fault == 'H3' for d in out)
+  assert any(h.key == 'ped:84' and h.kind == 'static' for h in out[round(5. / DT_MDL)].holds)
 
 
 def test_P2_a_person_in_the_far_crosswalk_holds_a_straight_crossing_not_a_right(tmp_path):
@@ -1928,9 +2011,12 @@ def test_P4_a_right_turn_waits_for_a_person_in_the_right_roads_crosswalk_a_strai
   assert first_go(out) is None and any(h.key == 'ped:90' and 'exit crosswalk' in h.reason for h in out[-1].holds)
   w.objects = lambda ww: ()
   assert first_go(w.run(3.5)) is not None
+  # going straight that crosswalk isn't ours; the person's ranging band reaches our near crosswalk's right end, so they are a
+  # curb pedestrian for it (D3, P15, SG4c): PED_CURB_S, then the go, never a hold for the exit crosswalk
   w = World(tmp_path, maneuver='straight')
   w.objects = walker
-  assert first_go(w.run(5.)) is not None
+  out = w.run(sg.PED_CURB_S + sr.CLEAR_S + 0.5)
+  assert first_go(out) is not None and not any(h.key == 'ped:90' for d in out for h in d.holds)
   # one walking along the right road's far sidewalk toward that crosswalk's end, 9 m out at 1.4 m/s: the arrival clause
   # (P16's) for the exit crosswalk too
   w = World(tmp_path, maneuver='right')
