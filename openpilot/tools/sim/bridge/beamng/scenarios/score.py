@@ -26,6 +26,9 @@ A row is a dict:
                      'hardBrake', ...); too_fast its tooFastToTurn
   forced_light       the state the runner forced the scenario junction's own signal to ('red', 'green'; None: not forced)
   lights             [[instance, state, m to its line], ...] of the light oracle's turnpilotLights when fresh (None otherwise)
+  accel_cap          turnpilotPlan.accelCap; tp_accel: TurnPilot's accel candidate in plannerd from it and the plan's speedCap
+                     (hooks.plan_accel), m/s^2 (None before the first plan); a_target: longitudinalPlan.aTarget, what plannerd
+                     asked of the car whoever asked it (None without one)
 
 A scenario's expectations (EXPECTS: catalog Entry.expect, or the runner's --expect and the options that imply one) are
 what its shot exists to show: a handback, a skip, a missed turn, the driver's gas press, hard braking. Each is required of
@@ -40,6 +43,7 @@ import json
 
 import numpy as np
 
+from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_ACCEL_MIN, plan_accel
 from openpilot.selfdrive.turnpilot.lane_planner import LC_BLOCK_X_M
 from openpilot.selfdrive.turnpilot.route_follower import KEEP, TURN, classify
 from openpilot.selfdrive.turnpilot.unprotected_left import CREEP_MAX_M
@@ -96,11 +100,19 @@ PROTECTED_TURNS = ('right_green', 'left_t_junction')  # S20: taken without TurnP
 RED_STOP_SCENARIOS = ('red_right', 'red_right_g62')  # a forced red they must stand at and not pass (red_straight: a limit)
 RED_PAST_LINE_M = 1.  # the camera mount this far past the junction's stop line (the bumper ~3 m past it): into the junction
 RED_NEAR_M = 30.      # a stand within this before the stop line is at the red
+# TurnPilot's accel request (the rows' tp_accel) below the -2.0 m/s^2 floor of every map, light and speed-cap stop
+# (hooks.SPEED_CAP_ACCEL_MIN) fails a run (most shots' 'no TurnPilot accel below -2.0'): only a confirmed track's hard stop
+# asks for more (scene_policy.py), said on the same plan (controlAlert hardBrake), and only where the scenario has a
+# pedestrian or oncoming traffic to brake for (a run expecting the left's skip never meets its oncoming traffic); one
+# without the alert is never anyone's (the float32 plan read back: ACCEL_TOL)
+ACCEL_FLOOR = SPEED_CAP_ACCEL_MIN
+ACCEL_TOL = 0.01
+HARD_BRAKE_PREFIXES = ('ped_', 'unprotected_left')
 
 
-def msg_fields(ss, cs, tp, nav, model) -> dict:
+def msg_fields(ss, cs, tp, nav, model, lp=None) -> dict:
   """The message part of a row from selfdriveState, carState, turnpilotPlan (None before the first), navInstruction (None
-  while navd has no valid route) and modelV2 readers."""
+  while navd has no valid route), modelV2 and longitudinalPlan (None before the first) readers."""
   return {
     'enabled': bool(ss.enabled), 'alert': str(ss.alertType), 'alert_text': str(ss.alertText1),
     'steer': bool(cs.steeringPressed), 'gas': bool(cs.gasPressed), 'brake': bool(cs.brakePressed),
@@ -114,6 +126,9 @@ def msg_fields(ss, cs, tp, nav, model) -> dict:
     'turn_missed': False if tp is None else bool(tp.turnMissed),
     'handback': 'none' if tp is None else str(tp.handback), 'control_alert': 'none' if tp is None else str(tp.controlAlert),
     'too_fast': False if tp is None else bool(tp.tooFastToTurn),
+    'accel_cap': None if tp is None else round(float(tp.accelCap), 2),
+    'tp_accel': None if tp is None else round(float(plan_accel(tp.accelCap, tp.speedCap, cs.vEgo)), 2),
+    'a_target': None if lp is None else round(float(lp.aTarget), 2),
     'lamp': 'left' if cs.leftBlinker else 'right' if cs.rightBlinker else '',
     'lc_wait': '' if tp is None else str(tp.laneChangeWait), 'lc_want': 0 if tp is None else int(tp.laneChangeWant),
     'desire': 0 if tp is None else int(tp.desire), 'map_kind': '' if tp is None else str(tp.mapControl.kind),
@@ -131,7 +146,7 @@ def route_id(coords) -> int:
   return hash((n, round(coords[0].latitude, 6), round(coords[n - 1].longitude, 6))) if n else 0
 
 
-LOG_SERVICES = ('selfdriveState', 'carState', 'turnpilotPlan', 'navInstruction', 'navRoute', 'modelV2')
+LOG_SERVICES = ('selfdriveState', 'carState', 'turnpilotPlan', 'navInstruction', 'navRoute', 'modelV2', 'longitudinalPlan')
 
 
 def rows_from_log(msgs) -> list[dict]:
@@ -157,7 +172,8 @@ def rows_from_log(msgs) -> list[dict]:
                  'dest_dist': None, 'blinker': 'left' if cs.leftBlinker else 'right' if cs.rightBlinker else '',
                  'ped_gap': None, 'car_gap': None, 'pacer_dx': None, 'j_dist': None, 'car_j_dist': None, 'onc': None,
                  **msg_fields(latest['selfdriveState'].selfdriveState, cs, m.turnpilotPlan,
-                              nav.navInstruction if nav is not None and nav.valid else None, latest['modelV2'].modelV2)})
+                              nav.navInstruction if nav is not None and nav.valid else None, latest['modelV2'].modelV2,
+                              latest['longitudinalPlan'].longitudinalPlan if 'longitudinalPlan' in latest else None)})
   return rows
 
 
@@ -515,6 +531,32 @@ def unprotected_left(rows) -> dict:
           'blocked_at_undecided': blocked_at_undecided, 'go_blocked': go_blocked, 'creep_m': creep_m}
 
 
+def tp_accel(rows) -> dict:
+  """TurnPilot's accel request while engaged (rows' tp_accel): its minimum, and the first row below ACCEL_FLOOR without a
+  confirmed track's hard stop (unannounced) and with one (hard), each {t, accel, alert}; the planner's minimum aTarget."""
+  out: dict = {'min': None, 'unannounced': None, 'hard': None, 'a_target_min': None}
+  for r in rows:
+    if not r.get('enabled'):
+      continue
+    if r.get('a_target') is not None:
+      out['a_target_min'] = r['a_target'] if out['a_target_min'] is None else min(out['a_target_min'], r['a_target'])
+    a = r.get('tp_accel')
+    if a is None:
+      continue
+    out['min'] = a if out['min'] is None else min(out['min'], a)
+    if a < ACCEL_FLOOR - ACCEL_TOL:
+      key = 'hard' if r.get('control_alert') == 'hardBrake' else 'unannounced'
+      if out[key] is None:
+        out[key] = {'t': r['t'], 'accel': a, 'alert': r.get('control_alert', 'none')}
+  return out
+
+
+def hard_brake_ok(name: str, expect) -> bool:
+  """A confirmed track's hard stop is the scenario's to show (ACCEL_FLOOR's comment)."""
+  kinds = {str(e).partition(':')[0] for e in expect or ()}
+  return 'hardBrake' in kinds or (name.startswith(HARD_BRAKE_PREFIXES) and 'skip' not in kinds)
+
+
 def _disengage_text(ds: list[dict], before: str = '') -> str:
   return f"{len(ds)} disengagement(s){before}: {ds[0]['cause']}"
 
@@ -536,6 +578,13 @@ def _fails(name: str, res: dict) -> list[tuple[str, str]]:
     x = taps[0]
     fails.append(('gas', f"{len(taps)} gas press(es), no taps anywhere, first at t={x['t']:.1f} s ({x['reason'] or 'no hold'}, " +
                   f"stood {x['stopped_s']} s)"))
+  acc = res.get('tp_accel') or {}
+  if (x := acc.get('unannounced')) is not None:
+    fails.append(('accel', f"TurnPilot asked for {x['accel']} m/s^2 at t={x['t']:.1f} s, below {ACCEL_FLOOR} m/s^2 without a " +
+                  "confirmed track's hard stop (no hardBrake)"))
+  if (x := acc.get('hard')) is not None and not hard_brake_ok(name, res.get('expect')):
+    fails.append(('accel', f"TurnPilot braked hard ({x['accel']} m/s^2, hardBrake) at t={x['t']:.1f} s: {name} has nothing to " +
+                  f"brake past {ACCEL_FLOOR} m/s^2 for"))
   taken, attempted = res['maneuvers_taken'], res['maneuvers_attempted']
   hs = res['holds']
   if name == 'ped_crosswalk_right':
@@ -810,6 +859,7 @@ def summarize(name: str, rows, outcome: str, road: dict | None = None, junction_
     'expect_facts': expect_facts(rows),
     'red_light': red_light(rows, stop_line_m),
     'stop_met_t': next((r['t'] for r in rows if r.get('map_kind') == 'stop' and r['enabled']), None),  # a stop sign the plan met
+    'tp_accel': tp_accel(rows),
   }
   res['failures'] = check(name, res, expect)
   res['passed'] = not res['failures']
@@ -822,6 +872,9 @@ def report(label: str, res: dict) -> str:
   line = f"{label}: {'PASS' if res['passed'] else 'FAIL'} {res['outcome']}, {res['maneuvers_taken']}/{res['maneuvers_attempted']} maneuvers, " + \
          f"{len(res['disengagements'])} disengagements, holds {holds}, gas taps {taps}, min gap ped {res['min_gap_ped_m']} car {res['min_gap_car_m']}, " + \
          f"oncoming lane {res.get('wrong_side_m')} m"
+  acc = res.get('tp_accel') or {}
+  if acc.get('min') is not None:
+    line += f", TurnPilot accel min {acc['min']} m/s^2 (planner {acc.get('a_target_min')})"
   lr = res.get('left')
   if lr is not None and (lr['gos'] or lr['undecided_t'] is not None or lr['pet_s'] is not None):
     line += f", left: PET {lr['pet_s']} s, false goes {len(lr['false_goes'])}, missed gaps {lr['missed_gaps']} of " + \

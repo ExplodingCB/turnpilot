@@ -474,3 +474,49 @@ def test_undecided_at_once_with_an_empty_road_after_the_stream_fails():
     r['left_treq'] = 0.
   res = score.summarize('unprotected_left_gap4', rows, 'timeout')
   assert any('undecided' in f for f in res['failures']), res['failures']
+
+
+class TestTurnPilotAccel:
+  """The pass_rules' 'no TurnPilot accel below -2.0 m/s^2' (S01, S03, S05, S14, S18, S19): TurnPilot's candidate in plannerd
+  (hooks.plan_accel of the plan's accelCap and speedCap) below the -2.0 floor fails a run, unless a confirmed track's hard
+  stop asks for it (controlAlert hardBrake, the same plan) in a scenario with something to brake for."""
+  def cruise(self, accel_cap=10., alert='none'):
+    """Engaged on a straight, TurnPilot's accel cap at accel_cap (its request with no speed cap) for 1 s from t=2."""
+    return drive([(2.0, {'accel_cap': 10., 'tp_accel': 10., 'nav_type': 'arrive', 'nav_mod': ''}),
+                  (1.0, {'accel_cap': accel_cap, 'tp_accel': accel_cap, 'control_alert': alert, 'nav_type': 'arrive', 'nav_mod': ''}),
+                  (2.0, {'accel_cap': 10., 'tp_accel': 10., 'nav_type': 'arrive', 'nav_mod': ''})])
+
+  def test_rows_carry_turnpilots_accel_request(self):
+    tp = messaging.new_message('turnpilotPlan')
+    tp.turnpilotPlan.accelCap, tp.turnpilotPlan.speedCap = -2.6, 100.
+    ss, cs, model, lp = (messaging.new_message(s) for s in ('selfdriveState', 'carState', 'modelV2', 'longitudinalPlan'))
+    cs.carState.vEgo = 8.
+    lp.longitudinalPlan.aTarget = -2.9
+    f = score.msg_fields(ss.selfdriveState, cs.carState, tp.as_reader().turnpilotPlan, None, model.modelV2, lp.as_reader().longitudinalPlan)
+    assert (f['accel_cap'], f['tp_accel'], f['a_target']) == (-2.6, -2.6, -2.9)
+    tp.turnpilotPlan.accelCap, tp.turnpilotPlan.speedCap = 10., 3.  # a speed cap alone brakes no harder than -2.0
+    f = score.msg_fields(ss.selfdriveState, cs.carState, tp.as_reader().turnpilotPlan, None, model.modelV2)
+    assert (f['tp_accel'], f['a_target']) == (-2.0, None)
+    f = score.msg_fields(ss.selfdriveState, cs.carState, None, None, model.modelV2)
+    assert (f['accel_cap'], f['tp_accel']) == (None, None)
+
+  def test_below_the_floor_without_a_confirmed_track_fails_every_scenario(self):
+    for name in ('straight_cruise', 'too_fast_right', 'red_right', 'ped_crosswalk_right', 'ped_step_out', 'unprotected_left_visible'):
+      res = score.summarize(name, self.cruise(-2.5), 'arrived')
+      assert any(f.startswith("TurnPilot asked for -2.5 m/s^2 at t=2.0 s, below -2.0") for f in res['failures']), (name, res['failures'])
+    res = score.summarize('straight_cruise', self.cruise(-2.0), 'arrived')
+    assert not any('TurnPilot asked for' in f for f in res['failures']) and res['tp_accel']['min'] == -2.0
+
+  def test_a_confirmed_hard_stop_only_where_there_is_something_to_brake_for(self):
+    res = score.summarize('ped_step_out', self.cruise(-3.2, 'hardBrake'), 'stopped')
+    assert not any('braked hard' in f or 'TurnPilot asked for' in f for f in res['failures']), res['failures']
+    for name in ('straight_cruise', 'too_fast_right', 'red_right_g62'):
+      res = score.summarize(name, self.cruise(-3.2, 'hardBrake'), 'arrived')
+      assert any(f.startswith("TurnPilot braked hard (-3.2 m/s^2, hardBrake) at t=2.0 s") for f in res['failures']), (name, res['failures'])
+    # the left skipped at route time (S05) never meets its oncoming traffic: nothing there to brake hard for
+    res = score.summarize('unprotected_left_visible', self.cruise(-3.2, 'hardBrake'), 'arrived', expect=('skip',))
+    assert any(f.startswith("TurnPilot braked hard") for f in res['failures']), res['failures']
+
+  def test_old_rows_without_the_field_are_not_judged(self):
+    res = score.summarize('straight_cruise', drive([(2.0, {'nav_type': 'arrive', 'nav_mod': ''})]), 'arrived')
+    assert res['tp_accel']['min'] is None and not any('TurnPilot asked' in f for f in res['failures'])

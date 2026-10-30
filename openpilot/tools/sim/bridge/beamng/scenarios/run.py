@@ -72,7 +72,7 @@ WEB_RETRY_S = 1.
 ENGAGE_TIMEOUT_S = 30.
 
 TURN_DESIRES = (int(log.Desire.turnLeft), int(log.Desire.turnRight))
-SERVICES = ['turnpilotPlan', 'selfdriveState', 'carState', 'navInstruction', 'navRoute', 'modelV2', 'turnpilotLights']
+SERVICES = ['turnpilotPlan', 'selfdriveState', 'carState', 'navInstruction', 'navRoute', 'modelV2', 'turnpilotLights', 'longitudinalPlan']
 OUT_ROOT = os.path.expanduser("~/turnpilot-artifacts/scenarios")
 POSE_FIELDS = ["wall_s", "t_s", "x", "y", "z", "qx", "qy", "qz", "qw"]  # route_drive's, which chase_render.py reads
 GAS_PRESS, GAS_PRESS_S = 0.3, 0.5  # --gas-press-at: the driver's press (a GasTaps tap is 0.25 for 1 s)
@@ -320,7 +320,7 @@ class Runner:
       'onc': None, 'forced_light': self.light_state, 'lights': self.oracle_lights(now),
       **score.msg_fields(sm['selfdriveState'], sm['carState'], sm['turnpilotPlan'] if sm.seen['turnpilotPlan'] else None,
                          sm['navInstruction'] if sm.seen['navInstruction'] and sm.valid['navInstruction'] else None,
-                         sm['modelV2']),
+                         sm['modelV2'], sm['longitudinalPlan'] if sm.seen['longitudinalPlan'] else None),
     }
     for a in self.plan.actors:
       pose = self.director.poses.get(a.name)
