@@ -297,6 +297,21 @@ class TestSkip:
     res = score.summarize('unprotected_left_visible', self.skipped(desire_after=True), 'timeout', expect=('skip',))
     assert not res['passed'] and any('turn desire after the skip' in f for f in res['failures']), res['failures']
 
+  def test_the_lefts_skip_is_the_range_skip(self):
+    # the skeptic's P4 (S05): tooFastToTurn set, but the left never 'skipped': a tooLate or laneUnreachable skip, not the
+    # range skip the shot is about ("Can't See Far Enough to Turn")
+    rows = drive([(4.0, {'v': 8., 'left_state': 'approach', 'j_dist': 60., 'j_ahead': 60.}),
+                  (6.0, {'v': 8., 'too_fast': True, 'left_state': 'approach', 'j_dist': 30., 'j_ahead': 30.}),
+                  (4.0, {'v': 8., 'j_dist': 10., 'j_ahead': -10.})])
+    res = score.summarize('unprotected_left_visible', rows, 'timeout', expect=('skip',))
+    assert not res['passed']
+    want = ("expected skip: the left never skipped for range (unprotectedLeft.state skipped); tooFastToTurn at t=4.0 s is " +
+            "another skip (tooLate, laneUnreachable or tooFast)")
+    assert want in res['failures'], res['failures']
+    assert any('never went' in f for f in res['failures'])  # unmet: nothing explained
+    # elsewhere tooFastToTurn is the skip (S19)
+    assert score.summarize('too_fast_right', rows, 'timeout', expect=('skip',))['expected'][0]['met']
+
   def test_an_expected_skip_that_never_comes_fails(self):
     rows = drive([(4.0, {'nav_mod': 'left'})])
     res = score.summarize('too_fast_right', rows, 'timeout', expect=('skip',))
