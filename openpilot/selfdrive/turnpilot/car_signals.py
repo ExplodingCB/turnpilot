@@ -24,7 +24,8 @@ the other side, hazards, or our lamp put out): the turn is skipped out loud and 
 junction across a reroute: turnpilotd's carry_veto), except at the unprotected left's hold line and in
 its go while the car can still stop short of the oncoming lanes, where the left hands back (a skip there would let go of
 the car in a left-turn position; the go is withdrawn) and the request for the left ends there: never signalled again,
-prompted or handed over for that maneuver. Once the turn has started (moving into it with its desire out and no stop in
+prompted or handed over for that maneuver, nor for the same left there under a new id (navd's reroute: turnpilotd's
+carry_veto, end()). Once the turn has started (moving into it with its desire out and no stop in
 force, or TurnPilot's go from a standstill out into it and not spent) it finishes, said ("Turn Signal Changed"), and a
 stop that then has the car never skips it: one veto, one decision per maneuver. A wrongSide fault with the other side's
 lamp lit (ours on the wrong side, or the driver's) is a veto too: the car never turns with the other side lit.
@@ -462,6 +463,14 @@ class TurnSignalIntent:
       out.notice = self.notice
     out.why = self.why
     return out
+
+  def end(self, maneuver_id) -> None:
+    """The request for maneuver_id is over from this frame: disarmed if armed for it, never armed again for it, and never
+    handed over (no "Signal Off"). turnpilotd's carry_veto: a veto at the unprotected left's line carried to the same left
+    under a new maneuver id (navd's reroute), whose request the veto ended."""
+    self.ended_id = maneuver_id
+    if self.armed_id == maneuver_id:
+      self.armed_id, self.arm_side = None, LaneChange.none
 
   def _notice(self, notice: str) -> None:
     self.notice, self.notice_t = notice, NOTICE_S

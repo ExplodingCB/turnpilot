@@ -335,13 +335,16 @@ def test_intent_never_both_sides_never_opposite_never_after_a_veto(seed):
     assert intent.notice == 'changedMidTurn'
 
 
+@pytest.mark.parametrize("reroute", [False, True])
 @pytest.mark.parametrize("veto", ['stalk', 'hazards'])
 @pytest.mark.parametrize("seed", range(3))
-def test_a_veto_at_the_lefts_line_never_relights_the_left_through_the_port(veto, seed):
+def test_a_veto_at_the_lefts_line_never_relights_the_left_through_the_port(veto, seed, reroute):
   """B8 end to end: the intent (at 20 Hz) gives the port its want (controlsd's command_side), behind the real panda and
   the body model. Standing at the unprotected left's line with our left lit, the driver's right stalk or the hazards
   overrule it: the left hands back and its request ends, so once the driver's lamp is out the port never claims or
-  lights the left again, and taking over never asks for it."""
+  lights the left again, and taking over never asks for it. reroute: navd then gives the same left a new maneuver id
+  and turnpilotd's carry_veto ends its request (TurnSignalIntent.end) before that frame's update, as it does for a veto
+  at the line carried to the same junction (K2): the port still never claims the left."""
   rng = random.Random(seed)
   body = BodyModel(semantics='level', on_latency=0.2, rng=rng, glitch_rate=0., early_rate=0.)
   h = PortHarness(new_port(), body=body, rng=rng)
@@ -349,6 +352,7 @@ def test_a_veto_at_the_lefts_line_never_relights_the_left_through_the_port(veto,
   intent = TurnSignalIntent()
   m = maneuver("left")
   d = types.SimpleNamespace(maneuver_id=0, started=True, done=False, turned_deg=0.)  # G1's desire out on the approach
+  mid = [0]
   outs = []
 
   def frame(engaged=True):
@@ -359,7 +363,7 @@ def test_a_veto_at_the_lefts_line_never_relights_the_left_through_the_port(veto,
     status = intent.status_for(int(TeslaFlags.CAR_SIGNALS), 'on', port, 0.05)
     _, left, right = h.blinkers[-1] if h.blinkers else (0., False, False)
     out = intent.update(status=status, port=port, gates_ok=True, engaged=engaged, lane_side=LaneChange.none, lane_pending=False,
-                        maneuver=m, maneuver_id=0, distance=8., desires=d, missed=False, v_ego=0., dt=0.05,
+                        maneuver=m, maneuver_id=mid[0], distance=8., desires=d, missed=False, v_ego=0., dt=0.05,
                         left_lamp=left or port.leftLamp, right_lamp=right or port.rightLamp, at_left_line=True, standing=True)
     h.engaged = engaged
     h.want = {LaneChange.left: LEFT, LaneChange.right: RIGHT}.get(out.side, NONE) if status == Status.ready else NONE
@@ -378,6 +382,10 @@ def test_a_veto_at_the_lefts_line_never_relights_the_left_through_the_port(veto,
   vetoed = run(2.)
   assert any(o.left_veto for o in vetoed), "no handback at the line on the driver's veto"
   (body.driver_stalk(RIGHT, False) if veto == 'stalk' else body.hazards(False))
+  if reroute:
+    run(0.5)
+    mid[0] = 1  # the same left under a new id (the auto left's pulse held at its line: not committed, a new route's)
+    intent.end(1)
   later = run(3.)
   assert h.port.phase not in ('requesting', 'lit') and not h.port.mask.lamp[LEFT], \
     f"the port claimed the left again after the driver's {veto} went out: phase {h.port.phase}"

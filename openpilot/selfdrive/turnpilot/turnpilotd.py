@@ -326,12 +326,15 @@ log_error = ErrorLog()
 class VetoedTurn:
   """A turn or keep the driver overruled (a signal veto's skip): its maneuver (type, modifier, bearings), where its
   junction is on turnpilotd's odometer (odo_m plus the follower's distance at the veto), the veto's reason, the id it is
-  skipped under now, and whether its desire was out (its cap kept to its pass, skip_cap_id). TurnPilot.carry_veto."""
+  skipped under now, and whether its desire was out (its cap kept to its pass, skip_cap_id). line: a veto at the
+  unprotected left's hold line or in its go while withdrawable (the intent's left_veto), the left's handback and the end
+  of the request for the left, never a skip; carried as that end. TurnPilot.carry_veto."""
   maneuver: object
   junction_odo: float
   reason: str
   maneuver_id: int
   capped: bool
+  line: bool = False
 
 
 class TurnPilot:
@@ -881,6 +884,11 @@ class TurnPilot:
           self.veto_hold_id = rf.maneuver_id
       else:
         cloudlog.event("turnpilot.turn_signal_veto_dropped", error=True, why=ts.skip, turned_deg=round(self.desires.turned_deg, 1))
+    if ts.left_veto and desire_on is not None:
+      # a veto at the left's line, or in its go while withdrawable, is the left's handback and ends the request for the left
+      # (car_signals.py), never a skip (6.6's exception). It is the junction's too: carry_veto keeps that request ended for
+      # the same left there under a new id
+      self.vetoed = VetoedTurn(desire_on, self.odo_m + rf.distance, ts.left_veto, rf.maneuver_id, False, line=True)
     signal_skip = self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id and \
       self.skip.reason in ('driverSignal', 'hazards', 'signalLost', 'sideUncertain')
     plan.turnSignal.skip = self.skip.reason if signal_skip else 'none'
@@ -974,7 +982,12 @@ class TurnPilot:
     modifier is a keep (a city Y junction's slight right, a fork, an off ramp). The same junction: same_junction (type,
     modifier, bearings when both have them) and within SAME_TURN_M of where the veto put it on the odometer; skipped for the
     veto's reason, out loud (tooFastToTurn, navd's skip), its cap kept if the vetoed turn's was. Forgotten once the car is
-    SAME_TURN_M past it. Before this frame's TurnSkip.update, which then keeps it."""
+    SAME_TURN_M past it. Before this frame's TurnSkip.update, which then keeps it.
+    A veto at the unprotected left's line (v.line) is the left's handback there, never a skip (a skip lets go of the latch
+    with the car in a left-turn position, 6.6's exception), and it ended the request for the left. Carried, that request
+    stays ended under the new id (TurnSignalIntent.end: never armed, signalled, prompted or handed over), before this frame's
+    intent update, so the car never relights the left the driver overruled, never prompts 'Signal Left' for it with our
+    lamp put out, and a takeover never asks for it."""
     v = self.vetoed
     if v is None:
       return
@@ -986,8 +999,12 @@ class TurnPilot:
       return
     if not same_junction(upcoming, v.maneuver) or abs(self.odo_m + rf.distance - v.junction_odo) > SAME_TURN_M:
       return
-    cloudlog.event("turnpilot.veto_carried", error=True, why=v.reason, vetoed_id=v.maneuver_id, maneuver_id=rf.maneuver_id,
-                   distance=round(rf.distance, 1), off_m=round(self.odo_m + rf.distance - v.junction_odo, 1))
+    cloudlog.event("turnpilot.veto_carried", error=True, why=v.reason, handback=v.line, vetoed_id=v.maneuver_id,
+                   maneuver_id=rf.maneuver_id, distance=round(rf.distance, 1), off_m=round(self.odo_m + rf.distance - v.junction_odo, 1))
+    if v.line:
+      self.turn_signal.end(rf.maneuver_id)
+      v.maneuver_id = rf.maneuver_id
+      return
     self.skip.skip(upcoming, rf.distance, rf.maneuver_id, v_ego, v.reason)
     if v.capped:
       self.skip_cap_id = rf.maneuver_id

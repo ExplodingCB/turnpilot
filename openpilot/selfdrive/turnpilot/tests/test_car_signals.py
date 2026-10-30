@@ -341,6 +341,27 @@ def test_a_veto_at_the_left_line_ends_the_request_for_good(p):
   assert all(o.handed_over == LaneChange.none and o.side == LaneChange.none for o in outs)
 
 
+@pytest.mark.parametrize("armed", [False, True])
+def test_end_ends_a_maneuvers_request_for_good_and_never_hands_it_over(armed):
+  """TurnSignalIntent.end(id): turnpilotd's carry_veto for a veto at the left's line carried to the same left under a new
+  id (K2). The request for that id is over: never armed for it again, never signalled or prompted, and a takeover after it
+  asks for nothing (no "Signal Off"); armed already, it is disarmed the same way."""
+  drive = Drive(m=maneuver("turn", "left"), distance=12., v=0.)
+  drive.port = port(status='lit', left=True, left_lamp=True)
+  if armed:
+    assert drive.step(maneuver_id=3).side == LaneChange.left
+  drive.intent.end(3)
+  outs = [drive.step(20, maneuver_id=3, at_left_line=True, standing=True)]
+  drive.port = port()
+  outs += [drive.step(maneuver_id=3, at_left_line=True, standing=True) for _ in range(40)]
+  assert all(o.side == LaneChange.none and o.prompt == LaneChange.none for o in outs)
+  drive.status, drive.port = Status.failed, port(status='failed', fault='lampLost')  # the car's signal gone: no prompt either
+  assert all(drive.step(maneuver_id=3).prompt == LaneChange.none for _ in range(20))
+  drive.status, drive.port = Status.ready, port()
+  assert all(drive.step(maneuver_id=3, engaged=False).handed_over == LaneChange.none for _ in range(80))
+  assert drive.step(maneuver_id=4).side == LaneChange.left, "another maneuver's request is its own"
+
+
 def test_a_lamp_on_when_the_turn_arms_vetoes():
   drive = Drive(distance=200.)
   drive.port = port(block='otherSide', right_lamp=True)
