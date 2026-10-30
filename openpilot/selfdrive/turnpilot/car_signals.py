@@ -17,11 +17,13 @@ maneuver still ahead, tells the driver to signal it ("Signal Off", handedOver), 
 or more; a turn the maneuver ended (done, skipped, passed, missed) never does.
 
 With the car signalling, the driver overrules it before the turn starts, or while a TurnPilot stop brings the car to
-rest short of the junction, braking toward it or standing at it, under TURN_STARTED_DEG into the turn (their lamp on the
-other side, hazards, or our lamp put out): the turn is skipped out loud and navd reroutes, except at the unprotected
-left's hold line, where the left hands back (a skip there would let go of the car in a left-turn position) and the
-request for the left ends there: never signalled again, prompted or handed over for that maneuver. Once the turn
-has started (moving into it with its desire out and no stop in force) it finishes, said ("Turn Signal Changed"), and a
+rest short of the junction, braking toward it or standing at it, or with the car at rest short of it whatever stopped it
+(a lead in the queue: turnpilotd's at_rest), under TURN_STARTED_DEG into the turn (their lamp on the other side, hazards,
+or our lamp put out): the turn is skipped out loud and navd reroutes, except at the unprotected left's hold line and in
+its go while the car can still stop short of the oncoming lanes, where the left hands back (a skip there would let go of
+the car in a left-turn position; the go is withdrawn) and the request for the left ends there: never signalled again,
+prompted or handed over for that maneuver. Once the turn has started (moving into it with its desire out and no stop in
+force, or TurnPilot's go from a standstill out into it) it finishes, said ("Turn Signal Changed"), and a
 stop that then has the car never skips it: one veto, one decision per maneuver. A wrongSide fault with the other side's
 lamp lit (ours on the wrong side, or the driver's) is a veto too: the car never turns with the other side lit.
 """
@@ -320,7 +322,8 @@ class TurnSignalIntent:
     dropped or handed back; desires: DesireTiming; missed: turnMissed; left_lamp/right_lamp: the lamps as UI_warning shows
     them (ours and the driver's); at_left_line: the unprotected left stands at its hold line; standing: the car stands
     held at a line; stopping: a TurnPilot stop in force brings the car to rest at or short of the junction (shouldStop
-    at its end: a hold, a red, a stop sign), braking toward it or standing at it; go_now: TurnPilot's go from a line this
+    at its end: a hold, a red, a stop sign), braking toward it or standing at it, or the car stands at rest short of it,
+    whatever stopped it, with no go of TurnPilot's out into the turn (turnpilotd's short_of_turn); go_now: TurnPilot's go from a line this
     frame; skipped: TurnSkip has skipped this maneuver (too fast, lane unreachable, side uncertain, a veto); passed: the
     route follower counts it passed and navd hasn't moved on."""
     out = TurnSignalOut(status=status)
@@ -379,8 +382,9 @@ class TurnSignalIntent:
       out.arm_m = self.arm_m
 
     # the driver overrules the car's signal (DESIGN 6.6): before the turn starts, or while a stop brings the car to rest
-    # short of the junction (braking toward it or standing at it) under TURN_STARTED_DEG into the turn (its desire out
-    # from the approach or not), a skip out loud; at the unprotected left's line, its handback, which ends the request
+    # short of the junction (braking toward it or standing at it) or it stands at rest there whatever stopped it, under
+    # TURN_STARTED_DEG into the turn (its desire out from the approach or not), a skip out loud; at the unprotected left's
+    # line or in its go while still withdrawable (at_left_line), its handback, which ends the request
     # for the left from this frame (never claimed again once the driver's lamp is out, never handed over); once started
     # (moving into it with its desire out and no stop in force, or TURN_STARTED_DEG into it), finished and said. Decided
     # once per maneuver: a turn said to be finishing is never skipped after (a stop that then has the car, the lamp on)

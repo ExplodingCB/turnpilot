@@ -803,6 +803,16 @@ class TurnPilot:
     at_left_line = (left_d is not None and (left_d.state in ('waitGap', 'creep', 'undecided', 'announce') or
                                             (left_d.state == 'go' and left_d.withdrawable))) or \
       (tc is not None and tc.held and self.map_controls.turn_engaged(rf.maneuver_id))
+    # the car at rest short of the junction under TURN_STARTED_DEG into its turn hasn't started it, whatever stopped it (a
+    # TurnPilot stop: stopping; a lead in the queue, the model: openpilot's own longitudinal), so a veto there skips the turn
+    # out loud (DESIGN 6.6's standing clause, B9). Never once TurnPilot's own go from a standstill is out into the turn (a
+    # hold's go, the stop-sign decider's, the left's: go_id, this frame's included, and not withdrawn since; the left's go
+    # while it can still stop is at_left_line's) nor once the scene committed or was released into the junction: the turn
+    # is under way there and a skip would send the car straight on a go made for the turn (6.6: finished, and said)
+    went = self.go_id == rf.maneuver_id and not self.go_withdrawn
+    at_rest = v_ego < STANDSTILL_SPEED and rf.distance > -PROTECT_PAST_M and self.desires.turned_deg < TURN_STARTED_DEG and \
+      not went and rf.maneuver_id not in (self.scene.committed_id, self.scene.released_id)
+    short_of_turn = stopping or at_rest  # one boolean for the intent's started and the skip gate below
     ts = self.turn_signal.update(status=signal_status, port=port, gates_ok=acting and not shadow, engaged=sm['carControl'].enabled,
                                  lane_side=self.lanes.signal_side, lane_pending=self.lanes.phase != Phase.IDLE or
                                  (lc.want != 0 and lc.wait in LANE_PENDING_WAITS),
@@ -810,15 +820,15 @@ class TurnPilot:
                                  missed=plan.turnMissed, v_ego=v_ego, dt=DT_MDL, limit_ms=sm['navInstruction'].speedLimit,
                                  left_lamp=cs.leftBlinker or port.leftLamp, right_lamp=cs.rightBlinker or port.rightLamp,
                                  at_left_line=at_left_line, standing=decision.should_stop or at_left_line,
-                                 stopping=stopping, go_now=self.release_go,
+                                 stopping=short_of_turn, go_now=self.release_go,
                                  skipped=self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id,
                                  passed=rf.valid and rf.upcoming is None)
     self.signal_out = ts
     ts.fill(plan.turnSignal)
-    # a turn whose desire is out is skipped only while a stop brings the car to rest short of the junction, under
-    # TURN_STARTED_DEG into it (the intent's own rule, on the same stopping): a right turn pulses 40 m out, so every hold
-    # short of it finds its desire out, the car braking toward it or standing at it
-    stop_veto = stopping and not at_left_line and self.desires.turned_deg < TURN_STARTED_DEG
+    # a turn whose desire is out is skipped only while a stop brings the car to rest short of the junction, or it stands at
+    # rest short of it, under TURN_STARTED_DEG into it (the intent's own rule, on the same short_of_turn): a right turn
+    # pulses 40 m out, so every hold short of it, and every queue standing there, finds its desire out
+    stop_veto = short_of_turn and not at_left_line and self.desires.turned_deg < TURN_STARTED_DEG
     if ts.skip != 'none' and act_on is not None and not self.skip.skipped:
       if not committed or stop_veto:
         # the driver overruled the car's signal: skipped out loud, navd reroutes. A desire out from the approach comes

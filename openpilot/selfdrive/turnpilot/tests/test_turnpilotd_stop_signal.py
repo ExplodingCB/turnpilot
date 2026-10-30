@@ -173,6 +173,25 @@ def test_a_veto_after_the_deciders_go_finishes_the_turn_out_loud(tmp_path, maneu
 
 
 @pytest.mark.parametrize('maneuver', ['left', 'right'])
+def test_a_veto_on_the_deciders_go_with_the_car_still_standing_finishes_the_turn(tmp_path, maneuver):
+  # the decider's go is out (its pulse, goCertified stopSign) with the car not yet moving: TurnPilot's go from a standstill
+  # is out into the turn, so the car at rest there has started it (DESIGN 6.6, B9's at_rest never counts it): the turn
+  # finishes and says so, never a skip that would send the car straight across on a go certified for the turn's lanes
+  sim = stop_turn_sim(tmp_path, maneuver)
+  run_to_line(sim)
+  until(sim, maneuver, lambda s: go_frame(s) is not None)
+  assert sim.v < 0.3 and sim.tp.go_id == sim.tp.follower.maneuver_id, (sim.v, sim.tp.go_id)
+  n0 = len(sim.trace)
+  sim.veto = VETOES['driverSignal'](maneuver)
+  run(sim, maneuver, 12.)  # from a standstill: the same launch and turn as with no veto
+  plans = sim.plans()[n0:]
+  assert sim.trace[n0][1] < 0.3, "the veto came with the car still standing"
+  assert str(plans[0].turnSignal.notice) == 'changedMidTurn', str(plans[0].turnSignal.notice)
+  assert not sim.tp.skip.skipped and not any(p.tooFastToTurn for p in plans)
+  assert sim.turn_done
+
+
+@pytest.mark.parametrize('maneuver', ['left', 'right'])
 def test_a_veto_while_a_withdrawn_go_brings_the_car_to_rest_skips_the_turn(tmp_path, maneuver):
   # the model never takes over: the decider's go is withdrawn and its capped abort stops the car short of the first
   # conflicting lane (stop_go.capped_abort), the turn's desire out from the go. A veto while it brakes is a veto at a stop
