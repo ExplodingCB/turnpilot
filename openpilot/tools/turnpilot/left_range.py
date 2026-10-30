@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+"""left_range: TurnPilotLeftRangeM and TurnPilotLeftFarRangeM, measured on rlogs this fork recorded on the car in shadow
+mode (the checklist's step 17 drive), never set by it (LEFT_RANGE.md).
+
+  python3 -m openpilot.tools.turnpilot.left_range [--allow-misses] <rlog.zst or a directory of them> [...]
+
+What the range has to mean. The unprotected left certifies a gap from the absence of road camera boxes (unprotected_left.py:
+band_blockers): every full-pass run's vehicle boxes at RAW_CONF or more in the oncoming band whose nearest plausible range
+(RawBox.near_m, the box bottom NEAR_PX lower) is within R_req break the clear window, and CLEAR_WINDOW_S of runs with none is
+the go. A left is attempted only where R_req fits under TurnPilotLeftRangeM (turnpilotd's route time, reach_at_line), and
+past it under TurnPilotLeftFarRangeM while the far crop reads, whose boxes in the band block at any range. So the range is
+safe only if an oncoming car inside it is boxed on the road runs, with no stretch of them long enough for the window to
+fill: CRITIQUE REQUIRED 2 sets the window at least 3x the longest dropout at R_req, so a car is confirmed from the
+farthest near_m from which it never went MAX_DROPOUT_S (CLEAR_WINDOW_S / 3) without a box. R_req's own margins (the opposing
+road's limit x SPEED_MARGIN 1.3, PET_S, the lanes) are route time's, and this measures only the eyes.
+
+How. Every oncoming car the drive saw near is a sample: a turnpilotScene vehicle track (car, truck, bus, motorcycle) on the
+road camera, velocity-trusted (scene_policy.velocity_trusted), SEED_MIN_M..SEED_MAX_M ahead in the oncoming lanes
+(ONCOMING_Y_NEAR_M..ONCOMING_Y_FAR_M to the left: right-hand traffic) and closing over the ground at ONCOMING_MIN_MPS or more.
+A car parked by the road stands still over the ground and is never one, nor is a lead. From the track's box on its run
+(the fork's tracker publishes the box it matched, at the run's camera time) the car is followed back run by run through
+the logged boxes, ranged and borne by the fork's own SceneTracker.raw_frame with that moment's calibration: the box in
+the band (band_blockers) where the car would have been, by its ground speed and the car's own (carState.vEgo), within the
+tracker's ground gate. Its confirmed range is the farthest near_m of that chain, which ends at MAX_DROPOUT_S without its
+box: unboxed (runs went on, none boxed it: the detector's reach, or the car wasn't there yet), noRuns (no road run: the full
+pass on the wide camera, the detector stopped) or uncalibrated (the runs can't be ranged), all of them no range: unknown is
+never a clear road. A run with two boxes where the car could be ends it too (ambiguous): no credit for a guess. The far
+crop's range is the same chain through the far crop's runs as well (turnpilotFarDetections, view far).
+
+The recommendation is conservative. With n samples the k-th shortest confirmed range is a one-sided 95% lower confidence
+bound on the 5th percentile (Wilks: P(Bin(n, 0.05) >= k) >= 0.95), so at 95% confidence 95% of oncoming cars are confirmed
+by it, DESIGN section 6's 95% recall. By default k is 1, the shortest of them all, which needs MIN_VEHICLES (59: the rule of
+three's 3/n under 5% says the same): every sampled car was confirmed by it, so CRITIQUE REQUIRED 2 holds for each one it
+saw. --allow-misses (off by default: it loosens) takes Wilks' largest k, which lets the k-1 shortest fall short; they are
+listed. Fewer than MIN_VEHICLES recommends nothing. It is rounded down to ROUND_M, never past what the samples reached, and
+capped at turnpilotd's LEFT_RANGE_MAX_M. The far crop's is given only with a road range (turnpilotd extends the reach by it
+only then) and past it. The preflight --set command is printed only with a recommendation, for Kellen to run parked.
+
+It reads only: rlogs through LogReader, no params, no sockets. It reads no location service, so it prints no position. A
+sunnypilot log (initData.gitRemote) is refused: sunnypilot's own messages sit on turnpilotDetections' union slot.
+Exit 0 with a road range recommended, 2 without one, 1 for a log it can't use.
+"""
+import argparse
+import bisect
+import math
+import sys
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+
+from openpilot.selfdrive.turnpilot.route_follower import LEFT
+from openpilot.selfdrive.turnpilot.scene.tracker import GROUND_GATE_FRAC, GROUND_GATE_M, iou, is_calibrated
+from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_Y_FAR_M, ONCOMING_Y_NEAR_M, velocity_trusted
+from openpilot.selfdrive.turnpilot.turnpilotd import LEFT_RANGE_MAX_M
+from openpilot.selfdrive.turnpilot.unprotected_left import CLEAR_WINDOW_S, ROUTE_REACH_MARGIN_M, band_blockers, reach_at_line
+
+MAX_DROPOUT_S = CLEAR_WINDOW_S / 3.  # CRITIQUE REQUIRED 2: the window at least 3x the longest dropout
+COVERAGE, CONFIDENCE = 0.95, 0.95    # DESIGN section 6: the range where recall is 95%; at 95% confidence
+MIN_VEHICLES = 59                    # the fewest for which the shortest is that bound (1 - 0.95^n >= 0.95)
+ROUND_M = 10.                        # recommended ranges round down to this
+MOTOR_VEHICLES = ('car', 'truck', 'bus', 'motorcycle')  # the samples: what comes at a left's R_req speeds
+SEED_MIN_M, SEED_MAX_M = 10., 80.    # m ahead an oncoming track is taken as a sample: near, its velocity trusted
+ONCOMING_MIN_MPS = 3.                # m/s toward the car over the ground: moving, not parked (velocity noise near is ~1 m/s)
+SPEED_ERR_MPS = 3.                   # the gate grows by this x the time back from the car's last box
+BEARING_GATE_DEG = 1.                # deg either side of where the car would be...
+BEARING_RATE_DEG_S = 1.              # ...plus this per s back from its last box (the car's own yaw, a lane change)
+SEED_IOU = 0.5                       # the track's box is its run's box at this overlap
+MPH = 0.44704
+PREFLIGHT = "python3 -m openpilot.selfdrive.turnpilot.preflight"
+REASONS = {
+  'unboxed': "no box of it for {gap} with runs going (the detector's reach, or it wasn't there yet)",
+  'noRuns': "no road run for {gap} (the full pass on the wide camera, or the detector stopped): unknown, no range",
+  'uncalibrated': "runs not calibrated for {gap}: unknown, no range",
+  'ambiguous': "two boxes where it could be: no credit",
+  'logStart': "the log starts",
+}
+
+
+@dataclass
+class Run:
+  t: float            # camera time, s (timestampEof)
+  t_log: float        # logMonoTime, s
+  view: str           # 'full' (the road camera's full pass) or 'far'
+  det: object         # the run's detections (raw_frame's input)
+  cal: object         # extrinsicsCalibration then, None before one
+  crop: tuple | None = None
+  frame: object = None  # RawFrame, None uncalibrated
+
+
+@dataclass
+class Sample:
+  track_id: int
+  cls: str
+  t: float            # s into the drive the track became a sample
+  speed: float        # m/s over the ground toward the car
+  road_m: float = 0.  # confirmed range on the road camera's full pass, near_m
+  road_why: str = ''
+  road_gap_s: float = 0.
+  far_m: float = 0.   # ...on the full pass and the far crop together
+  far_why: str = ''
+  far_gap_s: float = 0.
+  boxes: frozenset = frozenset()  # (run index, box index) of its chain, to tell one car's two tracks apart
+
+
+@dataclass
+class Pick:
+  key: str
+  n: int = 0
+  k: int = 0
+  stat_m: float | None = None   # the k-th shortest confirmed range
+  range_m: int | None = None    # the recommendation, None for none
+  why: str = ''
+  misses: list = field(default_factory=list)
+
+
+@dataclass
+class Result:
+  refused: str = ''
+  samples: list = field(default_factory=list)
+  road: Pick = field(default_factory=lambda: Pick('TurnPilotLeftRangeM'))
+  far: Pick = field(default_factory=lambda: Pick('TurnPilotLeftFarRangeM'))
+  allow_misses: bool = False
+  facts: dict = field(default_factory=dict)
+
+
+def wilks_k(n: int, coverage: float = COVERAGE, confidence: float = CONFIDENCE) -> int:
+  """The largest k for which the k-th smallest of n is a one-sided lower confidence bound on the (1 - coverage) quantile:
+  P(Bin(n, 1 - coverage) >= k) >= confidence. 0 when even the smallest isn't."""
+  p, k = 1. - coverage, 0
+  pmf = [math.comb(n, i) * p ** i * (1. - p) ** (n - i) for i in range(n + 1)]
+  tail = 1.
+  for i in range(n + 1):  # tail = P(X >= i + 1) after taking pmf[i] off
+    tail -= pmf[i]
+    if tail >= confidence - 1e-12:
+      k = i + 1
+    else:
+      break
+  return k
+
+
+def supported_mph(range_m: float, lanes: int | None = None) -> int:
+  """The fastest mapped opposing limit (whole mph) whose left route time attempts under range_m, at a junction with no
+  mapped stop line (reach_at_line with ROUTE_REACH_MARGIN_M), lanes None the unknown-lanes rule; 0 for none."""
+  mph = 0
+  while reach_at_line((mph + 1) * MPH, lanes, ROUTE_REACH_MARGIN_M) <= range_m and mph < 200:
+    mph += 1
+  return mph
+
+
+def snapshot_detections(d) -> SimpleNamespace:
+  dets = [SimpleNamespace(cls=int(x.cls), conf=float(x.conf), x0=float(x.x0), y0=float(x.y0), x1=float(x.x1), y1=float(x.y1))
+          for x in d.detections]
+  return SimpleNamespace(detections=dets, lightBoxes=(), signs=())
+
+
+class Drive:
+  """What the logs hold that the measure needs, fed one message at a time (LogReader order)."""
+  def __init__(self):
+    self.remote = None
+    self.device_type = ''
+    self.sensor = ''
+    self.cal = None
+    self.ego_t: list[float] = []
+    self.ego_v: list[float] = []
+    self.runs: list[Run] = []
+    self.scene: list[tuple[float, list]] = []
+    self.far_status = Counter()
+    self.wide_runs = 0
+    self.t0: float | None = None
+    self.t1 = 0.
+
+  def feed(self, msg) -> None:
+    which = msg.which()
+    t_log = msg.logMonoTime * 1e-9
+    self.t0 = t_log if self.t0 is None else self.t0
+    self.t1 = max(self.t1, t_log)
+    if which == 'initData':
+      self.remote = str(msg.initData.gitRemote)
+      if not self.device_type and str(msg.initData.deviceType) != 'unknown':
+        self.device_type = str(msg.initData.deviceType)
+      return
+    if self.sunnypilot:
+      return  # its own messages on our union slots: never read
+    if which == 'deviceState' and str(msg.deviceState.deviceType) != 'unknown':
+      self.device_type = str(msg.deviceState.deviceType)
+    elif which == 'narrowRoadCameraState':
+      self.sensor = str(msg.narrowRoadCameraState.sensor)
+    elif which == 'extrinsicsCalibration':
+      c = msg.extrinsicsCalibration
+      self.cal = SimpleNamespace(rpyCalib=list(c.rpyCalib), calStatus=str(c.calStatus), height=list(c.height),
+                                 wideFromDeviceEuler=list(c.wideFromDeviceEuler))
+    elif which == 'carState':
+      self.ego_t.append(t_log)
+      self.ego_v.append(float(msg.carState.vEgo))
+    elif which == 'turnpilotDetections':
+      d = msg.turnpilotDetections
+      self.far_status[str(d.farStatus)] += 1
+      if str(d.view) != 'full':
+        return  # a stop sweep's side views
+      if str(d.camera) != 'road':
+        self.wide_runs += 1
+        return
+      if d.timestampEof > 0:
+        self.runs.append(Run(d.timestampEof * 1e-9, t_log, 'full', snapshot_detections(d), self.cal))
+    elif which == 'turnpilotFarDetections':
+      f = msg.turnpilotFarDetections
+      if f.run.timestampEof > 0 and str(f.run.view) == 'far':
+        self.runs.append(Run(f.run.timestampEof * 1e-9, t_log, 'far', snapshot_detections(f.run), self.cal, tuple(f.crop)))
+    elif which == 'turnpilotScene':
+      if msg.turnpilotScene.available:
+        self.scene.append((t_log, [SimpleNamespace(trackId=int(o.trackId), cls=str(o.cls), x=float(o.x), y=float(o.y),
+                                                   vx=float(o.vx), vy=float(o.vy), age=int(o.age), camera=str(o.camera),
+                                                   view=str(o.view), box=tuple(o.box), tSeen=float(o.tSeen))
+                                   for o in msg.turnpilotScene.objects]))
+
+  @property
+  def sunnypilot(self) -> bool:
+    return self.remote is not None and 'sunnypilot' in self.remote.lower()
+
+
+class Ego:
+  """The car's own distance travelled, from carState.vEgo over log time."""
+  def __init__(self, t, v):
+    self.t = np.asarray(t, dtype=np.float64)
+    v = np.asarray(v, dtype=np.float64)
+    self.s = np.concatenate([[0.], np.cumsum(np.diff(self.t) * (v[1:] + v[:-1]) / 2.)]) if len(self.t) else np.zeros(0)
+
+  def between(self, a: float, b: float) -> float:
+    return float(np.interp(b, self.t, self.s) - np.interp(a, self.t, self.s))
+
+
+def in_band(boxes) -> list:
+  """The left's own band test on a straight approach (heading 0, its maneuver point at the car, reach unlimited)."""
+  return band_blockers(boxes, 0., LEFT, math.inf, 0.)
+
+
+def chain(runs: list[Run], seed: tuple, speed: float, ego: Ego, views: tuple) -> tuple[float, str, float, set]:
+  """(confirmed near_m, why it ends, s back to the run where it ended, its boxes as (run, box) indices) for the car whose
+  box is seed (run index, box index, RawBox), closing at speed over the ground: back through the runs of these views
+  (module docstring)."""
+  i_seed, j_seed, last = seed
+  last_t, last_log = runs[i_seed].t, runs[i_seed].t_log
+  far_m = last.near_m
+  used = {(i_seed, j_seed)}
+  seen_calibrated = seen_uncalibrated = False
+  for i in range(i_seed - 1, -1, -1):
+    r = runs[i]
+    if r.view not in views:
+      continue
+    back = last_t - r.t
+    if back <= 0.:
+      continue
+    if back > MAX_DROPOUT_S + 1e-6:
+      why = 'unboxed' if seen_calibrated else 'uncalibrated' if seen_uncalibrated else 'noRuns'
+      return far_m, why, back, used
+    if r.frame is None:
+      seen_uncalibrated = True
+      continue
+    seen_calibrated = True
+    x = last.xy[0] + speed * back + ego.between(r.t_log, last_log)
+    y = last.xy[1]
+    rng, bearing = math.hypot(x, y), math.degrees(math.atan2(y, x))
+    gate_m = GROUND_GATE_M + GROUND_GATE_FRAC * rng + SPEED_ERR_MPS * back
+    gate_deg = BEARING_GATE_DEG + BEARING_RATE_DEG_S * back
+    hits = [(j, b) for j, b in enumerate(r.frame.boxes) if b.xy is not None and b.near_m is not None and in_band([b]) and
+            abs(math.hypot(*b.xy) - rng) <= gate_m and abs(b.bearing_deg - bearing) <= gate_deg]
+    if len(hits) > 1:
+      return far_m, 'ambiguous', 0., used
+    if hits:
+      j, last = hits[0]
+      last_t, last_log = r.t, r.t_log
+      far_m = max(far_m, last.near_m)
+      used.add((i, j))
+      seen_calibrated = seen_uncalibrated = False
+  return far_m, 'logStart', 0., used
+
+
+def seeds(drive: Drive) -> list:
+  """The first snapshot of each track that is an oncoming car near (module docstring): (track, scene log time)."""
+  out, done = [], set()
+  for t_log, objects in drive.scene:
+    for o in objects:
+      if o.trackId in done or o.camera != 'road' or o.cls not in MOTOR_VEHICLES or not velocity_trusted(o):
+        continue
+      if SEED_MIN_M <= o.x <= SEED_MAX_M and ONCOMING_Y_NEAR_M <= o.y <= ONCOMING_Y_FAR_M and o.vx <= -ONCOMING_MIN_MPS and \
+         abs(o.vy) <= abs(o.vx):
+        done.add(o.trackId)
+        out.append((o, t_log))
+  return out
+
+
+def seed_box(runs: list[Run], times: list[float], o):
+  """(run index, box index, box) of the full-pass run the track's box came from (its tSeen), or None."""
+  i = bisect.bisect_left(times, o.tSeen - 1e-4)
+  while i < len(runs) and runs[i].t <= o.tSeen + 1e-4:
+    r = runs[i]
+    if r.view == 'full' and r.frame is not None and len(o.box) == 4 and r.frame.boxes:
+      scores = iou(np.array([o.box]), np.array([b.box for b in r.frame.boxes]))[0]
+      j = int(np.argmax(scores))
+      b = r.frame.boxes[j]
+      if scores[j] >= SEED_IOU and b.xy is not None and b.near_m is not None and in_band([b]):
+        return i, j, b
+    i += 1
+  return None
+
+
+def pick(key: str, values: list[tuple[float, Sample]], allow_misses: bool, cap: float = LEFT_RANGE_MAX_M) -> Pick:
+  """The recommendation over (confirmed range, sample) pairs (module docstring)."""
+  n = len(values)
+  p = Pick(key, n=n)
+  if n < MIN_VEHICLES:
+    p.why = f"{n} oncoming cars, {MIN_VEHICLES} needed: no range"
+    return p
+  k = wilks_k(n) if allow_misses else 1
+  ordered = sorted(values, key=lambda v: v[0])
+  p.k, p.stat_m = k, ordered[k - 1][0]
+  p.range_m = int(math.floor(min(p.stat_m, cap) / ROUND_M) * ROUND_M)
+  p.misses = [s for m, s in ordered if m < p.range_m]
+  if p.range_m <= 0:
+    p.range_m, p.why = None, f"the {ordinal(k)} shortest confirmed range is {p.stat_m:.0f} m: no range"
+  return p
+
+
+def ordinal(k: int) -> str:
+  return {1: '', 2: 'second', 3: 'third'}.get(k, f"{k}th")
+
+
+def measure(drive: Drive, allow_misses: bool = False) -> Result:
+  from openpilot.common.transformations.camera import DEVICE_CAMERAS
+  from openpilot.selfdrive.turnpilot.scene.tracker import SceneTracker
+  res = Result(allow_misses=allow_misses)
+  res.facts = {'s': drive.t1 - (drive.t0 or drive.t1), 'wide': drive.wide_runs, 'far_status': dict(drive.far_status)}
+  if drive.sunnypilot:
+    res.refused = f"a sunnypilot log ({drive.remote}): its own messages sit on turnpilotDetections' slot, so it is never read"
+  elif drive.remote is None:
+    res.refused = "no initData: not a log this fork can be told from"
+  elif (drive.device_type, drive.sensor) not in DEVICE_CAMERAS:
+    res.refused = f"no camera to range by (deviceType {drive.device_type or 'none'}, road sensor {drive.sensor or 'none'})"
+  elif not drive.ego_t:
+    res.refused = "no carState: the car's own motion is unknown"
+  if res.refused:
+    res.road.why = res.far.why = res.refused
+    return res
+  tracker = SceneTracker(DEVICE_CAMERAS[(drive.device_type, drive.sensor)], drive.device_type)
+  runs = sorted(drive.runs, key=lambda r: r.t)
+  for r in runs:
+    if is_calibrated(r.cal):
+      r.frame = tracker.raw_frame(r.det, 'road', r.cal, r.t, r.view, r.crop)
+  times = [r.t for r in runs]
+  full = [r for r in runs if r.view == 'full']
+  far_runs = [r for r in runs if r.view == 'far']
+  res.facts.update(full=len(full), calibrated=sum(r.frame is not None for r in full), far=len(far_runs),
+                   far_calibrated=sum(r.frame is not None for r in far_runs))
+  ego = Ego(drive.ego_t, drive.ego_v)
+  missing = 0
+  for o, t_log in seeds(drive):
+    found = seed_box(runs, times, o)
+    if found is None:
+      missing += 1
+      continue
+    s = Sample(o.trackId, o.cls, t_log - (drive.t0 or 0.), -o.vx)
+    s.road_m, s.road_why, s.road_gap_s, used = chain(runs, found, s.speed, ego, ('full',))
+    s.far_m, s.far_why, s.far_gap_s, used_far = chain(runs, found, s.speed, ego, ('full', 'far'))
+    s.boxes = frozenset(used | used_far)
+    res.samples.append(s)
+  res.facts['seeds_without_box'] = missing
+  # one car's two tracks (the tracker lost it and started again): chains through the same boxes are one car, its shorter
+  merged: list[Sample] = []
+  for s in sorted(res.samples, key=lambda s: (s.road_m, s.far_m)):
+    if not any(s.boxes & m.boxes for m in merged):
+      merged.append(s)
+  res.samples = sorted(merged, key=lambda s: s.t)
+  if res.facts['calibrated'] == 0:
+    res.road.why = res.far.why = "no calibrated road run in the logs: nothing can be ranged"
+    return res
+  res.road = pick('TurnPilotLeftRangeM', [(s.road_m, s) for s in res.samples], allow_misses)
+  far = Pick('TurnPilotLeftFarRangeM', n=len(res.samples))
+  if not far_runs:
+    reading = drive.far_status.get('read', 0)
+    far.why = f"far crop off: no turnpilotFarDetections in the logs (the full pass's farStatus read on {reading} runs)"
+  elif res.road.range_m is None:
+    far.why = "no road range: turnpilotd extends the reach by the far crop only past a measured TurnPilotLeftRangeM"
+  else:
+    far = pick('TurnPilotLeftFarRangeM', [(s.far_m, s) for s in res.samples], allow_misses)
+    if far.range_m is not None and far.range_m <= res.road.range_m:
+      far.why, far.range_m = f"the far crop adds no reach ({far.range_m} m, not past the road camera's {res.road.range_m} m)", None
+  res.far = far
+  return res
+
+
+def sample_line(s: Sample, far: bool = False) -> str:
+  m, why = (s.far_m, s.far_why) if far else (s.road_m, s.road_why)
+  return f"    t {s.t:7.1f} s  track {s.track_id} {s.cls} closing {s.speed:.0f} m/s: {m:.0f} m, " + \
+    REASONS.get(why, why).format(gap=f"over {MAX_DROPOUT_S:.2f} s")
+
+
+def pick_lines(p: Pick, label: str, far: bool) -> list[str]:
+  out = [f"{label}: {p.n} oncoming cars"]
+  if p.range_m is None:
+    out.append(f"  no {p.key}: {p.why}")
+    return out
+  rule = f"the {ordinal(p.k) + ' ' if p.k > 1 else ''}shortest confirmed range of {p.n} (k={p.k})"
+  passes = "the full pass or the far crop" if far else "the road camera's full pass"
+  out.append(f"  recommend {p.key} {p.range_m} m: {rule}, {p.stat_m:.1f} m rounded down to {ROUND_M:.0f} m. A one-sided " +
+             f"{CONFIDENCE:.0%} lower bound on the 5th percentile (Wilks): at {CONFIDENCE:.0%} confidence {COVERAGE:.0%} of oncoming " +
+             f"cars are boxed by {passes} from there in, never {MAX_DROPOUT_S:.2f} s (CLEAR_WINDOW_S / 3) without a box")
+  reading = " with the far crop reading" if far else ""
+  out.append(f"  a left with no mapped stop line is attempted{reading} up to a mapped opposing limit of " +
+             f"{supported_mph(p.range_m)} mph ({supported_mph(p.range_m, 1)} mph with one opposing lane mapped)")
+  if p.misses:
+    out.append(f"  short of it (--allow-misses): {len(p.misses)}")
+    out += [sample_line(s, far) for s in p.misses]
+  return out
+
+
+def render(res: Result) -> list[str]:
+  f = res.facts
+  if res.refused:
+    return [f"left_range: refused: {res.refused}", "no recommendation"]
+  out = [f"left_range: {f.get('s', 0.):.0f} s of log; road camera full-pass runs {f.get('full', 0)} " +
+         f"({f.get('calibrated', 0)} calibrated), wide camera runs {f.get('wide', 0)}, far crop runs {f.get('far', 0)} " +
+         f"({f.get('far_calibrated', 0)} calibrated)",
+         f"oncoming cars sampled: {len(res.samples)} (tracks {SEED_MIN_M:.0f}-{SEED_MAX_M:.0f} m ahead in the oncoming lanes, " +
+         f"closing {ONCOMING_MIN_MPS:.0f} m/s or more over the ground, velocity trusted); {MIN_VEHICLES} needed"]
+  if f.get('seeds_without_box'):
+    out.append(f"  {f['seeds_without_box']} more had no box on their own run (not counted)")
+  if res.samples:
+    road = sorted(s.road_m for s in res.samples)
+    out.append(f"  confirmed range on the road camera, near_m: shortest {road[0]:.0f} m, 5th percentile " +
+               f"{np.percentile(road, 5):.0f} m, median {np.median(road):.0f} m, longest {road[-1]:.0f} m")
+    out.append("  the shortest five:")
+    out += [sample_line(s) for s in sorted(res.samples, key=lambda s: s.road_m)[:5]]
+    if f.get('far'):
+      far = sorted(s.far_m for s in res.samples)
+      out.append(f"  confirmed range with the far crop too, near_m: shortest {far[0]:.0f} m, median {np.median(far):.0f} m, " +
+                 f"longest {far[-1]:.0f} m")
+  out += pick_lines(res.road, "road camera", False)
+  out += pick_lines(res.far, "far crop", True)
+  if res.road.range_m is not None:
+    sets = [f"--set {res.road.key}={res.road.range_m}"]
+    if res.far.range_m is not None:
+      sets.append(f"--set {res.far.key}={res.far.range_m}")
+    out.append("to set, on the comma, parked in P (Kellen's call, not this tool's):")
+    out.append(f"  {PREFLIGHT} {' '.join(sets)}")
+    if res.far.range_m is not None:
+      out.append("  the far range counts only with TurnPilotFarCrop on")
+  else:
+    out.append("nothing to set: TurnPilotLeftRangeM stays 0, and every unprotected left is skipped and rerouted")
+  return out
+
+
+def main(argv=None) -> int:
+  from openpilot.tools.lib.logreader import LogReader
+  from openpilot.tools.turnpilot.car_preflight import route_files
+  ap = argparse.ArgumentParser(description="TurnPilotLeftRangeM and TurnPilotLeftFarRangeM from shadow-drive rlogs: read only")
+  ap.add_argument('route', nargs='+', help="rlog files, or directories holding them")
+  ap.add_argument('--allow-misses', action='store_true',
+                  help="take Wilks' largest k, not the shortest: lets the k-1 shortest fall short (off: it loosens)")
+  args = ap.parse_args(argv)
+  try:
+    paths = route_files(args.route)
+  except FileNotFoundError as e:
+    print(f"left_range: no such file or directory: {e}", file=sys.stderr)
+    return 1
+  if not paths:
+    print("left_range: no rlog in " + ' '.join(args.route), file=sys.stderr)
+    return 1
+  drive = Drive()
+  for p in paths:
+    for msg in LogReader(str(Path(p)), only_union_types=True):
+      drive.feed(msg)
+  res = measure(drive, args.allow_misses)
+  print('\n'.join(render(res)))
+  if res.refused:
+    return 1
+  return 0 if res.road.range_m is not None else 2
+
+
+if __name__ == "__main__":
+  sys.exit(main())
