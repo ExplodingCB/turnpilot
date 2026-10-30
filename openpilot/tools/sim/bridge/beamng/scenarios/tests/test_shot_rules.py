@@ -176,3 +176,44 @@ class TestWithdrawnGoTimed:
     ss, cs, model = (messaging.new_message(s) for s in ('selfdriveState', 'carState', 'modelV2'))
     assert score.msg_fields(ss.selfdriveState, cs.carState, tp.as_reader().turnpilotPlan, None, model.modelV2)['go_cert'] == 'unprotectedLeft'
     assert score.msg_fields(ss.selfdriveState, cs.carState, None, None, model.modelV2)['go_cert'] == 'none'
+
+
+def walker_stall(unheld_s, stalled_s=3.0):
+  """S03 (ped_crosswalk_right): into the turn, held for the walker 5 s standing, then standing unheld_s with nothing
+  holding the car, the stall's handback (stalledTakeControl) held stalled_s, and the driver's brake."""
+  return drive([(4.0, {'v': lambda tau: max(6. - 1.5 * tau, 0.)}),
+                (5.0, {'v': 0., 'state': 'holding', 'reason': 'pedestrian in crosswalk'})] +
+               ([(unheld_s, {'v': 0.})] if unheld_s else []) +
+               [(stalled_s, {'v': 0., **SC, 'state': 'following'}),
+                (0.5, {'v': 0., 'enabled': False, 'brake': True})])
+
+
+class TestStallTimed:
+  """S03 'handback 3 s after the stand' (B2c): the stall's handback (stalledTakeControl) comes STALL_PROMPT_S (turnpilotd's)
+  into the car's stand with nothing holding it: from the later of the stand's start and the end of TurnPilot's hold in
+  it, the clock turnpilotd's stall counts on, to the handback, within a row early and STALL_LATE_S late."""
+  EXPECT = ('handback:stalledTakeControl',)
+
+  def test_the_prompt_is_turnpilots(self):
+    from openpilot.selfdrive.turnpilot.turnpilotd import STALL_PROMPT_S
+    assert score.STALL_PROMPT_S == STALL_PROMPT_S
+
+  def test_a_stall_handback_12_s_after_the_stand_fails(self):
+    # the skeptic's B2c: held for the walker, released, standing 12 s, then stalledTakeControl
+    res = score.summarize('ped_crosswalk_right', walker_stall(12.0), 'taken over', expect=self.EXPECT)
+    assert not res['passed'] and not res['expected'][0]['met']
+    assert "handed back stalledTakeControl 12.0 s into the car's stand with nothing holding it (from t=9.0 s), not 3.0 s" in \
+      res['failures'], res['failures']
+    assert "did not move on after the crosswalk cleared" in res['failures']  # unmet: the stall isn't explained
+
+  def test_three_s_after_the_walkers_hold_lets_go_passes(self):
+    res = score.summarize('ped_crosswalk_right', walker_stall(3.0), 'taken over', expect=self.EXPECT)
+    assert res['passed'], res['failures']
+    assert res['expect_facts']['stand_before']['stalledTakeControl'] == {'from_t': 9.0, 'stood_s': 3.0}
+    assert score.summarize('ped_crosswalk_right', walker_stall(3.25), 'taken over', expect=self.EXPECT)['passed']
+
+  def test_a_stall_handback_with_no_unheld_stand_before_it_fails(self):
+    for unheld_s in (0., 2.0, 3.5):
+      res = score.summarize('ped_crosswalk_right', walker_stall(unheld_s), 'taken over', expect=self.EXPECT)
+      assert any(f.startswith(f"handed back stalledTakeControl {unheld_s:.1f} s into the car's stand") for f in res['failures']), \
+        (unheld_s, res['failures'])

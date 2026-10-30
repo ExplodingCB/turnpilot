@@ -12,7 +12,7 @@ import openpilot.cereal.messaging as messaging
 from openpilot.cereal import custom
 from openpilot.common.params import UnknownKeyName
 from openpilot.selfdrive.selfdrived.state import SOFT_DISABLE_TIME
-from openpilot.selfdrive.turnpilot.turnpilotd import DETECTOR_DEADLINE_S
+from openpilot.selfdrive.turnpilot.turnpilotd import DETECTOR_DEADLINE_S, STALL_PROMPT_S
 from openpilot.tools.sim.bridge.beamng.roadgraph import GRAPH_JSON
 from openpilot.tools.sim.bridge.beamng.scenarios import catalog, run
 from openpilot.tools.sim.bridge.beamng.scenarios.tests.test_runner import DT, Clock, FakeDirector, FakeSM, World, bridge
@@ -23,26 +23,31 @@ pytestmark = pytest.mark.skipif(not os.path.exists(GRAPH_JSON), reason="needs pi
 class DriverWorld(World):
   """test_runner's World, with openpilot's answer to the driver's pedals: the brake disengages, and so does the gas
   (DisengageOnAccelerator, on as on the car). carState shows both. take_control: at the stop line TurnPilot holds the car
-  for good and shows this take-control prompt from a second into the stand."""
+  its HOLD_S for the walker and lets go, and the car stands on (the model stalled: S03), shown this take-control prompt from
+  turnpilotd's STALL_PROMPT_S into that stand with nothing holding it."""
   def __init__(self, plan, clock, take_control: str = ''):
     super().__init__(plan, clock)
     self.take_control = take_control
 
   def step(self, b):
     gas, brake = getattr(b, 'driver_gas', 0.) > 0., getattr(b, 'driver_brake', 0.) > 0.
-    if self.take_control and self.hold is not None:
-      self.hold = (self.hold[0], math.inf)
+    stalled = bool(self.take_control) and self.hold is not None and self.clock.t >= self.hold[1]
+    s = self.s
     super().step(b)
+    if stalled:
+      self.s, b.simulator_state.wheel_speed = s, 0.
     if gas or brake:
       self.enabled = False
       self.msgs['selfdriveState'].selfdriveState.enabled = False
     cs = messaging.new_message('carState', valid=True)
     cs.carState.gasPressed, cs.carState.brakePressed = gas, brake
     self.msgs['carState'] = cs
-    if self.take_control and self.hold is not None and self.clock.t >= self.hold[0] + 1.0:
-      tp = self.msgs['turnpilotPlan'].turnpilotPlan
-      tp.controlPrompt = self.take_control
+    tp = self.msgs['turnpilotPlan'].turnpilotPlan
+    if self.take_control and tp.state == custom.TurnpilotPlan.State.holding:
       tp.reason = 'pedestrian in crosswalk'
+    if stalled and self.clock.t >= self.hold[1] + STALL_PROMPT_S + DT:
+      tp.controlPrompt = self.take_control
+      tp.reason = 'Stalled in the turn: take control'
 
 
 class DetectorWorld(DriverWorld):

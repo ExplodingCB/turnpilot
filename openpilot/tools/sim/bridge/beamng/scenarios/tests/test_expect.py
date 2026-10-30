@@ -205,14 +205,16 @@ class TestHeldAfterHandback:
     assert any(f.startswith("moved 6.") and "not held" in f for f in res['failures']), res['failures']
 
   def test_the_model_pulling_away_after_the_stall_handback_fails(self):
-    # S03: stood 3 s in the turn after the walker, stalledTakeControl, then the model drives on through the turn
+    # S03: held for the walker, stood 3 s in the turn after, stalledTakeControl, then the model drives on through the turn
     rows = drive([(4.0, {'v': 4., 'nav_dist': lambda tau: 30. - 4. * tau}),
                   (3.0, {'v': 0., 'nav_dist': 14., 'reason': 'pedestrian in crosswalk', 'state': 'holding'}),
+                  (3.0, {'v': 0., 'nav_dist': 14.}),
                   (3.0, {'v': 0., 'nav_dist': 14., 'control_prompt': 'stalledTakeControl', 'reason': 'Stalled in the turn: take control'}),
                   (4.0, {'v': lambda tau: min(2. * tau, 6.), 'nav_dist': lambda tau: 14. - tau * tau}),
                   (0.5, {'v': 0., 'enabled': False, 'brake': True})])
     res = score.summarize('ped_crosswalk_right', rows, 'taken over', expect=('handback:stalledTakeControl',))
     assert any("after the stalledTakeControl handback" in f and "not held" in f for f in res['failures']), res['failures']
+    assert not any("into the car's stand" in f for f in res['failures'])  # handed back on time: only the pull-away fails it
 
   def test_driving_on_through_the_stop_after_its_handback_fails(self):
     # the skeptic's P2 (S23, avoidance off): the full stop, stopSignTakeControl, then on through the stop sign engaged, arrived

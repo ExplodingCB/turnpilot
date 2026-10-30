@@ -119,6 +119,12 @@ LIFT_HANDBACK_S = 3.5
 NO_LIFT_HANDBACK_S = 1.5
 # a row or two: the plan's message and the car's each land in the 50 ms rows up to a row late
 ROW_TOL_S = 0.1
+# the stall's handback (S03 'handback 3 s after the stand') comes STALL_PROMPT_S (turnpilotd's) into the car's stand with
+# nothing holding it (no TurnPilot hold, no pedal, engaged: the clock turnpilotd's stall counts on), a row early at most
+# and STALL_LATE_S late (its count passing 3 s, the plan's frame, carState's speed a little behind the game's)
+STALL_HANDBACKS = ('stalledTakeControl',)
+STALL_PROMPT_S = 3.
+STALL_LATE_S = 0.3
 FULL_STOP_HANDBACKS = ('stopSignTakeControl',)
 # turnpilotPlan.handback's kinds: a fault, handed back with openpilot's soft disable, which ends the drive (the car is not
 # held: it coasts engaged through the soft disable); the disengagement after one is that soft disable's
@@ -774,6 +780,18 @@ def go_before(rows, t: float) -> dict | None:
           'bound_s': NO_LIFT_HANDBACK_S if lift is False else LIFT_HANDBACK_S}
 
 
+def stand_before(rows, t: float) -> dict:
+  """The car's stand with nothing holding it up to the handback at t (STALL_HANDBACKS): the first row of the run of rows
+  before it standing (under STOPPED_V), engaged, no pedal and no TurnPilot hold (state holding), and the s from it to t; 0
+  s from t itself without one."""
+  i_t = next((i for i, r in enumerate(rows) if r['t'] >= t), len(rows) - 1)
+  j = i_t
+  while j > 0 and (r := rows[j - 1])['v'] < STOPPED_V and r['enabled'] and not (r.get('gas') or r.get('brake')) and \
+        r.get('state') != 'holding':
+    j -= 1
+  return {'from_t': rows[j]['t'], 'stood_s': round(t - rows[j]['t'], 2)}
+
+
 def stood_before(rows, t: float) -> bool:
   """The last the car did before the row at t was stand (under STOPPED_V), not drive (over RESUMED_V): a full stop."""
   for r in reversed([r for r in rows if r['t'] <= t]):
@@ -817,6 +835,7 @@ def expect_facts(rows) -> dict:
           'held': {k: held_after(rows, t) for k, t in first['handback'].items() if k in TAKE_CONTROL_PROMPTS},
           'stood_before': {k: stood_before(rows, t) for k, t in first['handback'].items() if k in FULL_STOP_HANDBACKS},
           'go_before': {k: go_before(rows, t) for k, t in first['handback'].items() if k in GO_TIMED},
+          'stand_before': {k: stand_before(rows, t) for k, t in first['handback'].items() if k in STALL_HANDBACKS},
           'desire_after_skip_t': next((r['t'] for r in rows if skip_t is not None and r['t'] >= skip_t and r.get('desire') in TURN_DESIRES), None),
           'prompts_after_gas': sorted({k for k, t in first['handback'].items() if gas_t is not None and t >= gas_t})}
 
@@ -874,6 +893,11 @@ def handback_problems(name: str, arg: str, t: float, facts: dict, res: dict) -> 
     elif g['after_s'] > g['bound_s'] + ROW_TOL_S:
       lift = {True: "with plannerd's lift", False: "without the lift: no goCertified", None: "the lift not in the rows"}[g['lift']]
       out.append(f"handed back {arg} {g['after_s']:.1f} s after the left's go at t={g['go_t']:.1f} s, over {g['bound_s']} s ({lift})")
+  if arg in STALL_HANDBACKS:
+    st = facts.get('stand_before', {}).get(arg)
+    if st is not None and not STALL_PROMPT_S - ROW_TOL_S <= st['stood_s'] <= STALL_PROMPT_S + STALL_LATE_S:
+      out.append(f"handed back {arg} {st['stood_s']:.1f} s into the car's stand with nothing holding it (from t={st['from_t']:.1f} s), " +
+                 f"not {STALL_PROMPT_S} s")
   if h is not None and h['went_m'] > h['allowed_m']:
     out.append(f"moved {h['went_m']:.1f} m engaged after the {arg} handback (up to {h['v_max']:.1f} m/s), past the " +
                f"{h['allowed_m']:.1f} m a stop from {h['v0']:.1f} m/s allows: not held")
