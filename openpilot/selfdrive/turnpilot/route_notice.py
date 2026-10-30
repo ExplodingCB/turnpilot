@@ -1,8 +1,8 @@
 """What the driver hears about the route's stop signs (STOP_SIGNS.md v3 section 3.4; SG4c), from navd's navInstruction, said as
 turnpilotPlan.controlAlert with its text in turnpilotPlan.routeNotice (selfdrived's turnpilotRouteNotice, engaged or not).
 
-At route start (a route appearing after ROUTE_GAP_S with none, or a new one while the car stands disengaged: never a reroute
-while driving), in this order, each held NOTICE_S:
+At route start (the first route, a route appearing after ROUTE_GAP_S with none while the car stands, or a new one while it
+stands disengaged: never a reroute while driving, however long it was off the route), in this order, each held NOTICE_S:
 - avoidStatus failed: "Stop-sign routing failed: stops may need you" (stopRoutingFailed, a chime);
 - avoidedControls N: "Route avoids N stop signs (+M min)" with the time avoidance added (avoidAddedS), shown only
   (routeAvoidsStops), or with a chime past DETOUR_WARN, the larger of +50% of the route without it and +5 min (routeDetour),
@@ -72,7 +72,10 @@ class RouteNotices:
 
   def _route(self, nav, v_ego: float, engaged: bool) -> None:
     route = int(nav.routeCount)
-    start = route != self.route and (self.no_route_s >= ROUTE_GAP_S or (v_ego < START_V and not engaged))
+    # the first route seen, a route after ROUTE_GAP_S with none while the car stands (a new destination at the origin), or a
+    # new one while it stands disengaged; a reroute while driving, however long off the route, is no start
+    standing = v_ego < START_V
+    start = route != self.route and (self.route is None or (standing and (self.no_route_s >= ROUTE_GAP_S or not engaged)))
     self.route, self.no_route_s = route, 0.
     if not start:
       return

@@ -124,3 +124,8 @@ def test_a_reroute_while_driving_doesnt_say_the_route_start_again():
   assert out and out[0][0] == 'routeAvoidsStops'
   out = said(rn, round(8. / DT_MDL), nav(route=2, avoided=3, added=90.), v=12., engaged=True)
   assert out == []
+  # off the route 20 s while driving (navd's messages invalid), then a reroute: still no route start
+  rn.update(*nav(route=2, valid=False)[:1], True, False, 12., True)
+  for _ in range(round(20. / DT_MDL)):
+    rn.update(None, False, True, 12., True)
+  assert said(rn, round(8. / DT_MDL), nav(route=3, avoided=3, added=90.), v=12., engaged=True) == []
