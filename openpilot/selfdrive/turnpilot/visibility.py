@@ -5,8 +5,9 @@ LiveVisibility is fed every detector run turnpilotd drains (observe_run: its vie
 view's run, its sectors' quality) and, each frame, whether the scene is available (set_available: the tracker's staleness on
 turnpilotd's clock, so a detector that stops leaves nothing fresh). lanes() then walks each lane with:
 
-- Freshness on camera time: a view counts while its newest run is within DET_FRESH_S of the newest run of any view (the
-  side view on the lane's side for 'side'), and only while the scene is available.
+- Freshness on camera time: a view counts while its newest run is within DET_FRESH_S of the newest run of any view, that
+  newest run's own age since it arrived (turnpilotd's clock: a whole detector stall) added (the side view on the lane's side
+  for 'side'), and only while the scene is available.
 - Sector quality over the whole CLEAR_S window, not only the latest frame: a side-view bearing counts only if every run of
   that side's view in the window listed an ok sector covering it, at the point's bearing and at it unrotated (a run without a
   reading counts as not ok). The inner band (40 deg to the side views' inner edge) also needs the innermost sector ok.
@@ -116,6 +117,7 @@ class LiveVisibility:
     self.history: dict[str, deque] = {}                  # view key: (camera time, boxes) over STEADY_S
     self.newest_t: float | None = None
     self.available = True
+    self.recv_age_s = 0.  # s since the newest run arrived, on turnpilotd's clock (set_available)
 
   # ------------------------------------------------------------------------------------------------------------ input
 
@@ -141,14 +143,20 @@ class LiveVisibility:
       while w and w[0][0] < t - sr.CLEAR_S - 1e-9:
         w.popleft()
 
-  def set_available(self, available: bool) -> None:
+  def set_available(self, available: bool, recv_age_s: float = 0.) -> None:
+    """available: the scene's (the tracker's staleness); recv_age_s: s since the newest run arrived, on turnpilotd's clock: a
+    whole detector stall ages every view though no run's camera time moves (skeptic SG3b q1)."""
     self.available = bool(available)
+    self.recv_age_s = max(float(recv_age_s), 0.)
 
   # -------------------------------------------------------------------------------------------------------- the inputs
 
   def fresh_key(self, key: str) -> bool:
+    """The view's newest run within DET_FRESH_S: its camera time behind the newest run of any view, plus the time since that
+    run arrived (recv_age_s)."""
     t = self.view_t.get(key)
-    return self.available and t is not None and self.newest_t is not None and self.newest_t - t <= sr.DET_FRESH_S + 1e-9
+    return self.available and t is not None and self.newest_t is not None and \
+      self.newest_t - t + self.recv_age_s <= sr.DET_FRESH_S + 1e-9
 
   def fresh(self, view: str, side: str) -> bool:
     return self.fresh_key(SIDE_VIEW[side] if view == 'side' else VIEW_KEY.get(view, view))

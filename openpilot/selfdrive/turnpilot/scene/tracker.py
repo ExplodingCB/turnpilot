@@ -257,6 +257,7 @@ class SceneTracker:
     self.last_key: tuple | None = None
     self.last_t: float | None = None     # camera time of the latest detections, s
     self.last_recv: float | None = None  # the caller's clock when they arrived
+    self.last_now: float | None = None   # ...and at the latest update(), arrived or not (the runs' receipt age: visibility.py)
     self.available = False
     self.raw: RawFrame | None = None     # the latest run's boxes (raw_frame)
     self.raw_new = False                 # ...which arrived in the last update()
@@ -396,6 +397,7 @@ class SceneTracker:
     now: the caller's clock in s, for staleness (default time.monotonic()). yaw_rate: rad/s, left positive (default
     default_yaw_rate()). Returns the tracks to publish."""
     now = time.monotonic() if now is None else now
+    self.last_now = now
     view = str(detections.view) if detections is not None else 'full'
     key = (str(detections.camera), view, detections.frameId, detections.timestampEof) if detections is not None else None
     self.raw_new = False

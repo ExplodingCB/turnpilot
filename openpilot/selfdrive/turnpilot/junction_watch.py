@@ -139,11 +139,12 @@ class JunctionWatch:
 
   # ------------------------------------------------------------------------------------------------------------ input
 
-  def observe_runs(self, runs, available: bool) -> None:
-    """runs: the tracker's new_runs this tick, (view key, camera time, RawFrame, sectors); available: the scene's."""
+  def observe_runs(self, runs, available: bool, recv_age_s: float = 0.) -> None:
+    """runs: the tracker's new_runs this tick, (view key, camera time, RawFrame, sectors); available: the scene's; recv_age_s:
+    s since the tracker's newest run arrived (LiveVisibility.set_available)."""
     for key, t, raw, sectors in runs:
       self.live.observe_run(key, t, raw=raw, sectors=sectors)
-    self.live.set_available(available)
+    self.live.set_available(available, recv_age_s)
 
   def update(self, control, v_ego: float, tracks, vis, surveys, wall_t: float | None, dt: float = 0.05) -> None:
     """control: sweep_control()'s, or None; tracks: the tracker's; vis: visibility_table's Visibility (or None); surveys:

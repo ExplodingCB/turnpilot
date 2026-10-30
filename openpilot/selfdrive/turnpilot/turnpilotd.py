@@ -994,7 +994,9 @@ class TurnPilot:
   def observe_runs(self, tracker) -> None:
     """This tick's detector runs and tracks, for the junction watch (main(), after the tracker)."""
     try:
-      self.watch.observe_runs(tracker.new_runs, bool(tracker.available))
+      last_recv, last_now = getattr(tracker, 'last_recv', None), getattr(tracker, 'last_now', None)
+      recv_age = last_now - last_recv if last_recv is not None and last_now is not None else 0.
+      self.watch.observe_runs(tracker.new_runs, bool(tracker.available), recv_age)
       self.tracks_now = list(tracker.tracks)
       self.runs_now = list(tracker.new_runs)
       if getattr(tracker, 'lens_spec', None):

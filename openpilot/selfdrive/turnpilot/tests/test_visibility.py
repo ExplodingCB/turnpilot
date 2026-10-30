@@ -508,3 +508,40 @@ def test_V16_a_car_double_parked_in_the_near_lane_caps_it_and_isnt_its_shield():
   lo = min(abs(b) for b in car.span_seen)
   assert x.why == 'occluder' and x.reach_m == pytest.approx(ln.s_min * math.tan(math.radians(lo - ROT)), abs=sr.WALK_STEP_M)
   assert not x.shields
+
+
+def test_a_view_ages_with_the_time_since_the_newest_run_arrived_through_a_whole_detector_stall():
+  # skeptic SG3b q1: a view's age was measured only against the newest run of any view (camera time), so with the whole detector
+  # stalled (modeld's room() can skip every run for up to FORCE_RUN_S 0.8 s under load) nothing ever went stale on camera time:
+  # the right side view, 0.40 s behind the newest run when the stall began, read fresh with its 24.5 m of reach at a real gap of
+  # 0.50, 0.70 and 0.89 s against DET_FRESH_S 0.45 (and T_LAT's 1.0 s budget). Its age is its camera time behind the newest run
+  # plus the time since that run arrived (turnpilotd's clock, set_available's recv_age_s)
+  lv = live(until=T)
+  for v, cam in (('full', 'wide'), ('sideLeft', 'wide'), ('road', 'road')):
+    lv.observe_run(v, T + 0.40, raw=RawFrame([], cam, T + 0.40, v if v.startswith('side') else 'full'),
+                   sectors=sectors(v) if v.startswith('side') else None)
+  lv.set_available(True, recv_age_s=0.)
+  assert lv.fresh_key('sideRight') and lane_of(report(lv), 'right').reach_m > 0.
+  for stall in (0.1, 0.3, 0.49):
+    lv.set_available(True, recv_age_s=stall)
+    real = lv.newest_t - lv.view_t['sideRight'] + stall
+    assert lv.fresh_key('sideRight') == (real <= sr.DET_FRESH_S + 1e-9), stall
+    assert lv.fresh_key('road') == (stall <= sr.DET_FRESH_S + 1e-9), stall
+  assert not lv.fresh_key('sideRight') and lane_of(report(lv), 'right').reach_m == 0.
+
+
+def test_the_watch_hands_the_trackers_receipt_age_to_the_live_visibility():
+  # turnpilotd's observe_runs passes the tracker's time since its last run arrived (on the tracker's own clock)
+  from types import SimpleNamespace
+  from openpilot.selfdrive.turnpilot.junction_watch import JunctionWatch
+  w = JunctionWatch()
+  w.observe_runs([('road', T, RawFrame([], 'road', T, 'full'), None)], True, recv_age_s=0.)
+  assert w.live.fresh_key('road')
+  w.observe_runs([], True, recv_age_s=0.6)
+  assert not w.live.fresh_key('road')
+  from openpilot.selfdrive.turnpilot.turnpilotd import TurnPilot
+  tp = TurnPilot()
+  tracker = SimpleNamespace(new_runs=[('road', T, RawFrame([], 'road', T, 'full'), None)], available=True, tracks=[], last_recv=5.0,
+                            last_now=5.7)
+  tp.observe_runs(tracker)
+  assert tp.watch.live.view_t['road'] == T and not tp.watch.live.fresh_key('road')
