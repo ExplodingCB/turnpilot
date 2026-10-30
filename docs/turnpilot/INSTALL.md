@@ -37,11 +37,11 @@ The installer path in "Install" below can't install this build. The build's `ope
 
 1. It reads the comma's state over SSH and changes nothing. It refuses if the comma is onroad (`IsOffroad` is 0, `IsOnroad` is 1, or neither is set), if SSH fails, or if `/data` has less free space than the tree, plus a copy of the LFS files that git-lfs on the comma makes, plus 3 GB for the first build (about 5.3 GB in all).
 2. It builds the tree in a temporary directory from the Mac's own clones: the commit on branch `turnpilot`, tracking `origin/turnpilot` (origin is `https://github.com/kaileh57/turnpilot.git`, which nothing fetches while `DisableUpdates` is 1), depth 1. Each submodule is at its gitlink, from `.git/modules/<name>`. A submodule commit missing there comes from the public URL in `.gitmodules`; the opendbc commit is on the Mac. Every git-lfs file (the driving models, the fonts, the AGNOS updater) is its real bytes, checked against its sha256. No build output from the Mac goes, because the tree comes from git objects, not from a working copy.
-3. It copies the tree to `/data/openpilot.tp-incoming-<stamp>`, then checks it on the comma: every file's sha256 against the Mac's manifest, the file count, the symlinks, `HEAD`, the branch and its upstream, and each submodule's commit. It runs the same git commands as `is_dirty()` in `openpilot/common/version.py`, which also makes git-lfs hash the model files once, so the first boot doesn't.
-4. It checks again that the comma is offroad, renames `/data/openpilot` to `/data/openpilot.prev-<stamp>`, and moves the new tree to `/data/openpilot`.
-5. It sets `DisableUpdates` to 1, so the updater doesn't try GitHub, and asks before it reboots the comma.
+3. It copies the tree to `/data/openpilot.tp-incoming-<stamp>`, then checks it on the comma: every file's sha256 against the Mac's manifest, the file count, the symlinks, `HEAD`, the branch and its upstream, and each submodule's commit. It runs the same git commands as `is_dirty()` in `openpilot/common/version.py`, which also makes git-lfs hash the model files once, so the first boot doesn't. The tree's own git config sets git-lfs's clean filter (`filter.lfs.clean`, `filter.lfs.required`), so this check and the device's `is_dirty()` don't depend on how AGNOS configures git for user `comma`. It sets no smudge filter, so checkouts keep whatever AGNOS gives them.
+4. It checks again that the comma is offroad, renames `/data/openpilot` to `/data/openpilot.prev-<stamp>`, and moves the new tree to `/data/openpilot`. The comma does both moves even if the SSH connection drops between them.
+5. It sets `DisableUpdates` to 1, so the updater doesn't try GitHub, and asks before it reboots the comma. Before the reboot, the comma checks again that it is offroad, that `DisableUpdates` is 1, and that `/data/openpilot/.overlay_init` doesn't exist. Sunnypilot's updater keeps running until the reboot, and it creates that file when it sets up its overlay over the new tree. With the file there, the next boot would install any update the updater stages from GitHub over the deployed build.
 
-If a step fails, the script stops and says which state the comma is in: as it was, or with both trees intact (the old one still in `/data/openpilot`, the new one beside it). A leftover `openpilot.tp-incoming-*` directory is listed on the next run with the command that removes it.
+If a step fails, the script stops and says which state the comma is in: as it was, with both trees intact (the old one still in `/data/openpilot`, the new one beside it), or unknown. The state is unknown when the SSH connection ends during the swap or the rollback. Then don't reboot the comma or start the car until `--dry-run` has shown what `/data/openpilot` holds. The message gives the commands that put a missing tree back and that set `DisableUpdates`. A leftover `openpilot.tp-incoming-*` directory is listed on the next run with the command that removes it.
 
 ### Run it
 
@@ -69,13 +69,19 @@ Do the first install on home Wi-Fi, with the Mac and the comma on the same netwo
    python3 openpilot/tools/turnpilot/deploy_to_comma.py comma@<address>
    ```
 
-4. Answer `y` to reboot, or reboot later with `ssh comma@<address> sudo reboot`.
+4. Answer `y` to reboot. If you answer `n`, don't start the car until the comma has rebooted. Until then sunnypilot keeps running from the renamed tree, and going onroad would start its processes out of TurnPilot's unbuilt tree. Reboot later, with the car off, with the same checks:
+
+   ```
+   python3 openpilot/tools/turnpilot/deploy_to_comma.py comma@<address> --reboot
+   ```
+
+   If the reboot is refused because `/data/openpilot/.overlay_init` exists, remove that file (`ssh comma@<address> rm /data/openpilot/.overlay_init`), then run `--reboot`. Without the file, the launcher installs nothing.
 
 The copy is about 1.2 GB (1.18 GB and 4,229 files for commit `c8dff2e`; the 776 MB big driving model is most of it). It doesn't compress. At 5 MB/s it takes about 4 minutes, and at 1 MB/s about 20. Every deploy sends the whole tree again, so a later deploy over the phone hotspot takes as long as the first.
 
 ### What the first boot does
 
-The comma boots `/data/openpilot` the way sunnypilot's tree booted (`/data/continue.sh` starts `launch_openpilot.sh`). The branch has no `prebuilt` file, so the first boot compiles openpilot from source, with a progress bar, and then pandad flashes the panda with this build's debug firmware ("What the branch name does" explains why). Nobody has timed the compile on this branch. Keep the comma powered until the road view shows. The tree has no `.overlay_init`, so the launcher doesn't install an update that sunnypilot left in `/data/safe_staging`. Then continue at "Turn on SSH" below. SSH is already on, because the settings carry over.
+The comma boots `/data/openpilot` the way sunnypilot's tree booted (`/data/continue.sh` starts `launch_openpilot.sh`). The branch has no `prebuilt` file, so the first boot compiles openpilot from source, with a progress bar, and then pandad flashes the panda with this build's debug firmware ("What the branch name does" explains why). Nobody has timed the compile on this branch. Keep the comma powered until the road view shows. The tree has no `.overlay_init`, so the launcher doesn't install an update that sunnypilot left in `/data/safe_staging`. If sunnypilot's updater creates one after the swap, the script refuses to reboot. Then continue at "Turn on SSH" below. SSH is already on, because the settings carry over.
 
 ### What stays
 
@@ -103,7 +109,8 @@ Each kept tree takes about 1.2 GB, more once it has been built. The script delet
 
 The script's tests run the whole flow against a stand-in comma on the Mac (`openpilot/tools/turnpilot/tests/test_deploy_to_comma.py`). A real comma four can differ in these places:
 
-- that AGNOS has git-lfs set up for user `comma`. Without it, the script warns, and `is_dirty()` reads True, though every file is still checked.
+- that AGNOS has git-lfs installed. Its git config for user `comma` doesn't matter, because the tree's own config sets the clean filter. Without git-lfs, the script warns and `is_dirty()` reads True, though every file is still checked.
+- that sunnypilot's updater behaves like this fork's `openpilot/system/updated/updated.py` between the swap and the reboot: it stages in `/data/safe_staging` and creates `.overlay_init` in `/data/openpilot` when it sets up its overlay. The reboot check looks for that file.
 - that sunnypilot keeps `IsOffroad` in `/data/params/d`.
 - that `/data/continue.sh` on this comma starts `/data/openpilot`. The script warns if it doesn't name it.
 - how long the first compile takes, and whether 3 GB of headroom covers it.
