@@ -53,7 +53,8 @@ def oracle(monkeypatch):
 def run_main(monkeypatch, tmp_path, flags):
   monkeypatch.setattr(sys, 'argv', ['run.py', 'ped_in_path', '--out', str(tmp_path), *flags])
   monkeypatch.setattr(run, 'build', lambda *a, **k: SimpleNamespace(spawn=(0., 0., 0.), heading=0., notes={}))
-  monkeypatch.setattr(run, 'Params', lambda: SimpleNamespace(get_bool=lambda k: True))
+  monkeypatch.setattr(run, 'Params', lambda: SimpleNamespace(get_bool=lambda k: True, get=lambda k: None))
+  monkeypatch.setattr(run.tree, 'manager_dirs', lambda prefix: [])  # tree.json: no stack found, said in it
   monkeypatch.setattr(run, 'ensure_token', lambda params: 'tok')
   monkeypatch.setattr(run, 'sweep_game', lambda host, port: None)
   monkeypatch.setattr(run, 'Runner', lambda *a, **k: None)

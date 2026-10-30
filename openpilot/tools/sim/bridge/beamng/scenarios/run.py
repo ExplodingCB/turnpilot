@@ -27,6 +27,11 @@ The demo's options (each run's result says what it did and when):
                            detector going silent after the drop: the rows' det_age, from turnpilotDetections)
 Without S, the scenario's fault_at_s (catalog: straight_cruise's lands the fault short of its junction).
 
+Each invocation writes tree.json in its directory before it touches the game and checks it again after the bridge exits
+(tree.py): the stack's checkout (the running manager's for this OPENPILOT_PREFIX, or --stack-dir), its HEAD, uncommitted
+edits, untracked sources and submodules, whether that is clean, and whether it changed during the runs. initData.dirty is
+set on every sim run here, so this is what says which code a run drove on.
+
 A scenario with a forced light (catalog.junction_lights) has its junction's signal forced at each run's setup, after the
 actors, and green green_after_s after the car first stands within GO_NEAR_M before the junction; the director logs both
 (light_events), the rows carry the state (forced_light), and the sim driver's ground truth never reads it green while red.
@@ -55,7 +60,7 @@ from openpilot.tools.sim.bridge.beamng import frame
 from openpilot.tools.sim.bridge.beamng.driver import GasTaps, ground_truth_green
 from openpilot.tools.sim.bridge.beamng.pose import beamng_quat
 from openpilot.tools.sim.bridge.beamng.scenario import heading_quat
-from openpilot.tools.sim.bridge.beamng.scenarios import score
+from openpilot.tools.sim.bridge.beamng.scenarios import score, tree
 from openpilot.tools.sim.bridge.beamng.scenarios.catalog import DATA_JSON, ROLL_FRACTION, SCENARIOS, Plan, build, junction_distance
 from openpilot.tools.sim.bridge.beamng.scenarios.director import Director, sweep
 from openpilot.tools.sim.bridge.beamng.scenarios.timing import GO_NEAR_M, STOOD_V, GoWatch, step_out_distance
@@ -562,6 +567,8 @@ def main():
                   help=f"the sim's detector goes silent for {DROP_S:.0f} s, S s after engagement (SIMULATION=1 only; no S: fault_at_s)")
   ap.add_argument('--expect', action='append', default=None, metavar='E',
                   help=f"what the run must show, in place of the scenario's own: {', '.join(score.EXPECTS)} (handback:<kind>); repeatable")
+  ap.add_argument('--stack-dir', default='', metavar='DIR',
+                  help="the checkout the stack was launched from, for tree.json, when no running manager for OPENPILOT_PREFIX says")
   args, rest = ap.parse_known_args()
 
   from openpilot.tools.sim.bridge.beamng.run_bridge import config_from_args, light_oracle, parse_args
@@ -591,19 +598,32 @@ def main():
       params.put_bool(key, True)
       print(f"set {key}: navd, turnpilotd and turnpilot_web run on it", flush=True)
 
-  sweep_game(bargs.host, bargs.port)
-  ui = start_ui_recording(os.path.join(run_dir, 'ui.mp4')) if args.record and not args.no_ui else None
-  q: Queue = Queue()
-  score.parse_expect(args.expect)  # an unknown expectation is refused before the game is touched
-  bridge = BeamNGBridge(cfg, scenario=Runner(plan, args.runs, run_dir, args.web.rstrip('/'), token, bargs.host, bargs.port,
-                                             signal_tap=args.signal_tap == 'on', params=params, end_after_handback=args.end_after_handback,
-                                             gas_press_at=args.gas_press_at, drop_detections_at=args.drop_detections_at, expect=args.expect))
-  with light_oracle(bargs):
-    drive(bridge, q, ui, bargs)
+  stack = tree.start(run_dir, os.environ.get('OPENPILOT_PREFIX', ''), option=args.stack_dir, git_commit=stack_commit(params))
+  try:
+    sweep_game(bargs.host, bargs.port)
+    ui = start_ui_recording(os.path.join(run_dir, 'ui.mp4')) if args.record and not args.no_ui else None
+    q: Queue = Queue()
+    score.parse_expect(args.expect)  # an unknown expectation is refused before the game is touched
+    bridge = BeamNGBridge(cfg, scenario=Runner(plan, args.runs, run_dir, args.web.rstrip('/'), token, bargs.host, bargs.port,
+                                               signal_tap=args.signal_tap == 'on', params=params, end_after_handback=args.end_after_handback,
+                                               gas_press_at=args.gas_press_at, drop_detections_at=args.drop_detections_at, expect=args.expect))
+    with light_oracle(bargs):
+      drive(bridge, q, ui, bargs)
+  finally:
+    tree.finish(run_dir, stack)  # the end check: whatever ended the drive, tree.json says whether the code changed under it
   result = os.path.join(run_dir, 'result.json')
   if args.record and not args.no_chase and os.path.exists(result):
     render_chases(result, run_dir, bargs.host, bargs.port)
   print(f"results: {result}")
+
+
+def stack_commit(params):
+  """The manager's GitCommit param (manager_init writes its checkout's HEAD), for tree.json's cross-check; None unread."""
+  try:
+    return params.get('GitCommit')
+  except Exception as e:
+    print(f"tree.json: the GitCommit param could not be read ({e!r})", flush=True)
+    return None
 
 
 def drive(bridge, q, ui, bargs):
