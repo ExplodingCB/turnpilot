@@ -94,6 +94,11 @@ def test_the_stop_sign_score_counts_goes_withdrawals_retries_handbacks_pet_and_h
   assert score.stop_sign(rows)['min_pet_s'] == pytest.approx(2., abs=0.11)
   rows = [row(k * 0.05, accel_cap=-2.5 if k == 3 else 10.) for k in range(10)]
   assert score.stop_sign(rows)['below_2'] == 1
+  # rows from before the first plan have no accel cap (msg_fields: None), no cap of TurnPilot's at all
+  rows = [row(k * 0.05, accel_cap=None if k < 3 else -2.5 if k == 5 else 10.) for k in range(10)]
+  res = score.stop_sign(rows)
+  assert res['below_2'] == 1 and res['min_accel_cap'] == pytest.approx(-2.5)
+  assert score.stop_sign([row(0., accel_cap=None)])['below_2'] == 0
 
 
 def test_the_shield_is_untested_unless_its_car_stood_at_its_line_before_the_go():

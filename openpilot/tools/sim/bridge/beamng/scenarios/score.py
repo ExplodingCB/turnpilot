@@ -237,10 +237,8 @@ def msg_fields(ss, cs, tp, nav, model, lp=None) -> dict:
     'desire': 0 if tp is None else int(tp.desire), 'map_kind': '' if tp is None else str(tp.mapControl.kind),
     'lc_state': str(model.meta.laneChangeState),
     'go_cause': 'none' if tp is None else str(tp.goCertified.cause), 'go_id': 0 if tp is None else int(tp.goCertified.id),
-    'accel_cap': 10. if tp is None else round(float(tp.accelCap), 2),
     'sg_state': 'off' if tp is None else str(tp.stopGo.state), 'sg_withdrawn': '' if tp is None else str(tp.stopGo.withdrawn),
     'sg_retries': 0 if tp is None else int(tp.stopGo.retries), 'sg_fault': '' if tp is None else str(tp.stopGo.fault),
-    'control_alert': '' if tp is None else str(tp.controlAlert),
     'nav_valid': nav is not None, 'nav_type': '' if nav is None else str(nav.maneuverType),
     'nav_mod': '' if nav is None else str(nav.maneuverModifier),
     'nav_dist': 0. if nav is None else round(float(nav.maneuverDistance), 1),
@@ -676,7 +674,8 @@ def stop_sign(rows) -> dict:
   first_go_t = next((r['t'] for r in rows if r.get('go_cause') == STOP_GO_CAUSE), None)
   return {'goes': goes, 'go_causes': causes, 'withdrawn': withdrawn, 'retries': retries, 'handbacks': handbacks,
           'min_pet_s': round(min(pets), 2) if pets else None, 'present_t': present_t, 'first_go_t': first_go_t,
-          'min_accel_cap': min(caps) if caps else None, 'below_2': len(rising(rows, lambda r: r.get('accel_cap', 10.) < HARD_ACCEL)),
+          'min_accel_cap': min(caps) if caps else None,
+          'below_2': len(rising(rows, lambda r: r.get('accel_cap') is not None and r['accel_cap'] < HARD_ACCEL)),  # None: no plan yet
           'gas': len(rising(rows, lambda r: bool(r.get('gas')))),
           'states': sorted({r['sg_state'] for r in rows if r.get('sg_state')}),
           'faults': sorted({r['sg_fault'] for r in rows if r.get('sg_fault')})}
