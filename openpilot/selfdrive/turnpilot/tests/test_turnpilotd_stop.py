@@ -648,6 +648,7 @@ def test_the_sim_cross_traffic_oracle_feeds_the_decider_ground_truth_under_the_g
   from openpilot.selfdrive.turnpilot.tests.test_stop_go import LINE_D
   sim = StopSim(tmp_path, info_kw={'certification': cert} if cert else None)
   sim.tp.oracle_ok = True
+  sim.tp.sim_files = True  # a sim car (set_sim's gate), with this test's own files and clock in place of the sim's
   st = {'stop': None}
 
   def lights(s):
@@ -682,3 +683,41 @@ def test_the_sim_cross_traffic_oracle_feeds_the_decider_ground_truth_under_the_g
   sim.run(4.)
   assert all(ln.binding != 'oracle' for p in sim.plans()[-60:] for ln in p.stopGo.lanes)
   assert any(str(p.controlAlert) == 'lightSourceRejected' for p in sim.plans())
+
+
+@pytest.mark.parametrize('car', ['tesla', 'none'])
+def test_the_sim_cross_traffic_oracle_is_refused_out_loud_without_a_sim_car(tmp_path, car, monkeypatch):
+  # 8.2: the cross-traffic oracle is gated as the sim's files are, SIMULATION=1, the param and a sim car in CarParams
+  # (visibility_table.sim_accepted). With SIMULATION=1 and the param but a real car's CarParams (or none yet), its message is
+  # refused, logged once and said (lightSourceRejected, its reason where the status line has none), and no lane reads its
+  # reach (binding 'oracle'): the oracle had been taken on oracle_ok alone, OracleLive's 60 m reach in every lane over the
+  # shipped files, nothing said
+  from types import SimpleNamespace
+  from openpilot.selfdrive.turnpilot import turnpilotd, visibility_table
+  from openpilot.selfdrive.turnpilot.turnpilotd import oracle_accepted
+  events = []
+  orig = turnpilotd.cloudlog.event
+  monkeypatch.setattr(turnpilotd.cloudlog, 'event', lambda name, *a, **kw: (events.append((name, kw)), orig(name, *a, **kw)))
+  env = {'SIMULATION': '1'}
+  cp = SimpleNamespace(fingerprintSource='can', brand='tesla') if car == 'tesla' else None
+  sim = StopSim(tmp_path)
+  sim.tp.oracle_ok = oracle_accepted(env, True)
+  sim.tp.set_sim(visibility_table.sim_accepted(env, True, cp))
+  assert sim.tp.oracle_ok and not sim.tp.sim_files
+  sim.lights = lambda s: oracle_msg([(7, 14.5, 30., 0., 0., 'car')])
+  run_to_line(sim)
+  sim.run(3.)
+  plans = sim.plans()
+  assert all(ln.binding != 'oracle' for p in plans[-40:] for ln in p.stopGo.lanes)
+  assert any(ln.binding != 'oracle' for p in plans[-40:] for ln in p.stopGo.lanes)
+  assert any(str(p.controlAlert) == 'lightSourceRejected' for p in plans[-40:])
+  refusals = [kw for name, kw in events if name == 'turnpilot.cross_oracle_refused']
+  assert len(refusals) == 1 and refusals[0]['error'] and refusals[0]['reason'] == "not a sim car"
+  # under the whole gate (a sim car) it is read, and nothing is refused
+  sim = StopSim(tmp_path)
+  sim.tp.oracle_ok, sim.tp.sim_files = True, True
+  sim.lights = lambda s: oracle_msg([(7, 14.5, 30., 0., 0., 'car')])
+  run_to_line(sim)
+  sim.run(3.)
+  assert any(ln.binding == 'oracle' for p in sim.plans()[-40:] for ln in p.stopGo.lanes)
+  assert not any(str(p.controlAlert) == 'lightSourceRejected' for p in sim.plans())

@@ -234,6 +234,7 @@ MISSED_HOLD_S = 3.     # turnMissed is held this long, for the alert and for nav
 ALT_MANEUVER_ID = -7
 # the sim's cross-traffic oracle (cross_oracle): its road users' track ids, and their classes as the tracker's (COCO) indexes
 ORACLE_ID = 1_000_000
+CROSS_ORACLE_REFUSED_REASON = "Sim cross traffic refused: not a sim car"  # the light oracle's gate without a sim car (cross_oracle)
 SIM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'maps', 'sim')
 SIM_VISIBILITY = Path(SIM_DIR) / 'visibility_sim.json'  # the sim's files (set_sim), read only under its gate
 SIM_SURVEYS = Path(SIM_DIR) / 'surveyed_junctions_sim.json'
@@ -384,6 +385,7 @@ class TurnPilot:
     self.vis_source = visibility_table.cached
     self.survey_source = survey_file.cached
     self.sim_files = False        # the sim's own visibility and survey files and sun (set_sim: SIMULATION=1, the param, a sim car)
+    self.cross_refused = False    # this frame the sim's cross-traffic oracle sent cross traffic and wasn't a sim car's (cross_oracle)
     self.wall_clock = lambda: datetime.datetime.now(datetime.UTC).timestamp() if system_time_valid() else None
     self.cp_delay = 0.15          # CarParams.longitudinalActuatorDelay (main()); T_ABORT takes the larger of it and the file's
     self.odo_m = 0.               # m driven since turnpilotd started (faults included): the decider's position after its latch
@@ -806,6 +808,9 @@ class TurnPilot:
     if self.side_off_t > 0. and str(plan.controlAlert) == 'none':  # the side views off for the drive: said once, a status line,
       plan.controlAlert = 'sideCamerasOff'                            # its time running only while it is shown
       self.side_off_t = max(self.side_off_t - DT_MDL, 0.)
+    if self.cross_refused and str(plan.controlAlert) == 'none':  # the sim's cross traffic refused on a car that isn't the sim's
+      plan.controlAlert = 'lightSourceRejected'
+      plan.reason = plan.reason or CROSS_ORACLE_REFUSED_REASON
     if self.override_failed_t > 0. and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS:
       plan.controlAlert = 'overrideWriteFailed'  # a signal seen or a downgrade at a stop sign not saved for navd: chimed (O16)
     self.override_failed_t = max(self.override_failed_t - DT_MDL, 0.)
@@ -1096,15 +1101,25 @@ class TurnPilot:
 
   def cross_oracle(self, sm):
     """The sim's cross-traffic oracle for the decider (STOP_SIGNS.md 8.2), or None: turnpilotLights from the simOracle with a
-    crossRangeM, fresh (LIGHT_STALE_S), and only while the light oracle's gate holds (oracle_ok: SIMULATION=1 and
-    TurnPilotSimLightOracle); off it map_controls refuses the message out loud (lightSourceRejected) and nothing here reads it.
-    (OracleLive, its tracks as the tracker's, the runs of every view, its road users as the scene's objects, 'running')."""
+    crossRangeM, fresh (LIGHT_STALE_S), and only under the sim's whole gate: the light oracle's (oracle_ok: SIMULATION=1 and
+    TurnPilotSimLightOracle) and a sim car in CarParams (sim_files, set_sim's: visibility_table.sim_accepted). Off the light
+    oracle's gate map_controls refuses the message out loud (lightSourceRejected) and nothing here reads it; under it without a
+    sim car (or before CarParams is in) its cross traffic is refused, logged and said (cross_refused: lightSourceRejected with
+    CROSS_ORACLE_REFUSED_REASON), and the decider reads the cameras. (OracleLive, its tracks as the tracker's, the runs of every
+    view, its road users as the scene's objects, 'running')."""
+    was, self.cross_refused = self.cross_refused, False
     data = getattr(sm, 'data', {})
     if 'turnpilotLights' not in data:
       return None
     self.oracle_age = 0. if sm.updated['turnpilotLights'] else getattr(self, 'oracle_age', float('inf')) + DT_MDL
     msg = sm['turnpilotLights']
     if not self.oracle_ok or self.oracle_age > LIGHT_STALE_S or str(msg.source) != 'simOracle' or float(msg.crossRangeM) <= 0.:
+      return None
+    if not self.sim_files:
+      self.cross_refused = True
+      if not was:
+        cloudlog.event("turnpilot.cross_oracle_refused", error=True, reason="not a sim car", cars=len(msg.cross),
+                       range_m=round(float(msg.crossRangeM), 1))
       return None
     self.oracle_t = getattr(self, 'oracle_t', 0.) + DT_MDL
     t = self.oracle_t
