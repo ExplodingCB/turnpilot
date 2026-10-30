@@ -218,6 +218,8 @@ def test_enough_oncoming_cars_recommend_the_shortest_confirmed_range_and_print_t
   assert all(s.road_m == pytest.approx(t['road'], abs=0.01) for s, t in zip(sorted(result.samples, key=lambda s: s.track_id), truth,
                                                                             strict=True))
   assert result.road.range_m == floor10(shortest) and result.road.k == 1 and result.road.n == 60
+  # near_m is the nearest plausible range: a car first boxed 150 m out reads about 113 m, its box's ground range about 150 m
+  assert all(s.road_ground_m == pytest.approx(150., abs=1.) for s in result.samples) and 110. < shortest < 116.
   assert result.road.range_m <= max(s.road_m for s in result.samples)  # never past what the samples reached
   out = text(result)
   assert f"--set TurnPilotLeftRangeM={floor10(shortest)}" in out and "TurnPilotLeftFarRangeM=" not in out
