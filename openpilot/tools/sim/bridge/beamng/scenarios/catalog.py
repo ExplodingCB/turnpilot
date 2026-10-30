@@ -143,6 +143,11 @@ SCENARIOS = {
   # from the nearest clear spawn (215 m) it would engage 92 m out, where the turn is still feasible and its cap slows the car
   'too_fast_right': Entry('turn', junction=(-153.7, 148.7), turn='right', from_heading_deg=-135., approach_m=230., speed_kph=80.,
                           timeout_s=60., expect=('skip',)),
+  # S20: route_demo's route has no right on green (its right is uncontrolled) and no left without an oncoming road (its left
+  # has one straight across), so: ped_crosswalk_right's right at its signal with nothing on it, and a left from the stem of
+  # the T at DR295_16 (-586.7, 631.3), no control, no road straight across, two-way all round
+  'right_green': Entry('turn', junction=(-768.6, 555.2), turn='right', timeout_s=120.),
+  'left_t_junction': Entry('turn', junction=(-586.7, 631.3), turn='left', from_heading_deg=45., timeout_s=120.),
   # gate1's approach: eastbound on the 140 m straight from the bridge's default spawn
   'ped_in_path': Entry('straight', junction=(-768.9, 661.4), turn='right', from_heading_deg=0., actor='standing', end_on_stop_s=4.,
                        timeout_s=90.),

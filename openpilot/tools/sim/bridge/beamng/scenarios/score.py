@@ -92,6 +92,7 @@ EXPECTS = ('handback', 'gasDisengage', 'skip', 'turnMissed', 'hardBrake')
 # the disengagement within this of the first row showing the gas is the press's: the shot's 0.2 s (carState.gasPressed to
 # disengaged, in the rlog), plus the rows' 50 ms sampling of two messages that may each land a row late
 GAS_DISENGAGE_S = 0.3
+PROTECTED_TURNS = ('right_green', 'left_t_junction')  # S20: taken without TurnPilot holding the car to a stop
 RED_STOP_SCENARIOS = ('red_right', 'red_right_g62')  # a forced red they must stand at and not pass (red_straight: a limit)
 RED_PAST_LINE_M = 1.  # the camera mount this far past the junction's stop line (the bumper ~3 m past it): into the junction
 RED_NEAR_M = 30.      # a stand within this before the stop line is at the red
@@ -593,6 +594,10 @@ def _fails(name: str, res: dict) -> list[tuple[str, str]]:
   if name == 'twoway_route_pair' and res.get('stop_met_t') is not None:
     fails.append(('stop_met', f"met a stop sign at t={res['stop_met_t']:.1f} s: the route was to go around it (with " +
                               "TurnPilotAvoidStops off, run it with --expect handback:stopSignTakeControl)"))
+  if name in PROTECTED_TURNS:
+    stood = [h for h in hs if h['stopped']]
+    if stood:
+      fails.append(('held', f"TurnPilot held the car to a stop at a protected turn ({stood[0]['reason']}, {stood[0]['duration_s']} s)"))
   red = res.get('red_light')
   if name in RED_STOP_SCENARIOS:
     if red is None:
