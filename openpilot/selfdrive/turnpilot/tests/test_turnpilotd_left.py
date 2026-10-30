@@ -450,6 +450,40 @@ def test_runs_before_calibration_never_let_the_left_go_with_a_car_in_the_band():
   assert decisions[-1].state == 'undecided' and decisions[-1].why == 'stale'
 
 
+def test_a_detector_run_modeld_marks_invalid_never_reaches_the_tracker_or_the_left():
+  # skeptic G4 (residual, part b): modeld_detector publishes valid=False when the network's output isn't finite, and decode
+  # drops the NaN rows, so the run carries no boxes: fed to the tracker it reads as a fresh, empty, available road run. On
+  # turnpilotd's path it never is: DetectionDrain (cd25319) takes no run from an invalid message (logged once a spell,
+  # turnpilot.detector_run_invalid), so the tracker sees none, the scene goes stale and the left's stale fault comes, never a go
+  from unittest import mock
+  import numpy as np
+  from openpilot.cereal import messaging as msgs
+  from openpilot.selfdrive.turnpilot import turnpilotd as tpd
+  from openpilot.selfdrive.turnpilot.detector.decoder import fill_detections
+  from openpilot.selfdrive.turnpilot.scene.tests.test_tracker import CAMS, calibration, car_state
+  from openpilot.selfdrive.turnpilot.scene.tracker import SceneTracker
+  from openpilot.selfdrive.turnpilot.unprotected_left import AUTO, LeftInput, UnprotectedLeft
+
+  def invalid_run(t, i):
+    msg = msgs.new_message('turnpilotDetections', valid=False)
+    fill_detections(msg.turnpilotDetections, np.zeros((0, 6), dtype=np.float32), i, int(t * 1e9), 'road', 0.005)
+    return msg.as_reader()
+  trk, left, decisions = SceneTracker(CAMS, 'mici'), UnprotectedLeft(), []
+  drain = tpd.DetectionDrain(None)
+  with mock.patch.object(tpd.messaging, 'drain_sock') as drain_sock, mock.patch.object(tpd, 'cloudlog') as log:
+    for i in range(int(6. / DT_MDL)):
+      t = 1. + i * DT_MDL
+      drain_sock.return_value = [invalid_run(t, i)] if i % 2 == 0 else []
+      trk.update_runs(drain.runs(), calibration(), car_state(), now=t)
+      assert not trk.raw_new and trk.raw is None and not trk.new_views
+      decisions.append(left.update(LeftInput(AUTO, 1, 1, 9., 0., True, trk.raw if trk.raw_new else None, [], 0., V_25, 1,
+                                             TEST_RANGE_M), DT_MDL))
+  assert not trk.available and not any(d.go for d in decisions)
+  assert decisions[-1].state == 'undecided' and decisions[-1].why == 'stale'
+  assert sum(c.args[0] == 'turnpilot.detector_run_invalid' for c in log.event.call_args_list) == 1
+  tpd.INVALID_RUNS.clear()
+
+
 class GoHeldSim(Sim):
   """The model holding the car at a standstill once TurnPilot's turn pulse (its go) has gone out: it never pulls away."""
   went = False
