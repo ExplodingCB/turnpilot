@@ -2257,3 +2257,20 @@ def test_C5_a_yield_that_became_a_stop_is_the_deciders_as_any_stop_sign_its_go_a
   w.control.kind = 'yield'
   out = w.run(5.)
   assert all(d.state == 'off' and d.go_cause == 'none' for d in out)
+
+
+def test_ladder_rung_2_never_takes_another_turn_on_a_frame_whose_shared_conditions_werent_read(tmp_path, monkeypatch):
+  # go_holds returns early on a certification failure (and a position fault, a downgrade) before the box, the views, the yaw,
+  # the front zone and the turn are read; the other turn's probe takes those from this frame's own evaluation, so on such a
+  # frame it has none to take and must not take a turn: here a car moving through the box, which a straight crossing's probe
+  # would have held for, and the route's left failing certification at the line: H3 at the bound, no other turn
+  w = World(tmp_path, maneuver='left')
+  real = w.sg.certified
+
+  def certified(f, probe=False):
+    v = real(f, probe)
+    return v if probe else dataclasses.replace(v, certification='uncertifiable', reason='light', detail='dusk')
+  monkeypatch.setattr(w.sg, 'certified', certified)
+  w.objects = lambda ww: (vehicle(96, 14., 4.5 - 2. * ((ww.t_cam - 100.) % 4.), vy=-2.),)
+  out = w.run(STATIC_WAIT_S + 3.)
+  assert not any(d.alert == 'otherTurn' for d in out) and any(d.fault == 'H3' for d in out)

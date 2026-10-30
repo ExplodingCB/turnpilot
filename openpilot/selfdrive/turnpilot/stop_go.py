@@ -407,7 +407,8 @@ class StopGo:
     self.view_creep: dict | None = None  # the ladder's creep for a view (rung 1): phase creep, measure or over, its target...
     self.view_steps = 0             # creeps for a view taken this encounter
     self.alt: dict | None = None    # the other turn taken (7.1 rung 2, O12): the decider's maneuver from then on
-    self._shared: list = []         # this frame's holds that are the same for every maneuver (SHARED_HOLDS)
+    self._shared: list = []         # this frame's holds that are the same for every maneuver (SHARED_HOLDS)...
+    self._shared_t = -1.            # ...and the decider's clock when they were read (go_holds' early returns read none)
     self.clear_s = 0.
     self.static_s = 0.
     self.dynamic_s = 0.
@@ -1119,6 +1120,7 @@ class StopGo:
       lanes_only = all(h.key.split(':')[0] in CREEP_LANE_HOLDS for h in box + rest)
       turn = self._turn_holds(f, pos, any(h.kind == DYNAMIC for h in box + rest), not holds and not box and not rest, lanes_only)
       self._shared = [h for h in holds + box + rest + turn if h.key.split(':')[0] in SHARED_HOLDS]
+      self._shared_t = self.t
       if any(h.kind == STATIC for h in turn):
         return holds + box + rest + turn  # a standing cause beside it is the wait's reason, and H3's
       holds += turn
@@ -1478,7 +1480,12 @@ class StopGo:
     for) and O12 (empty True: a wait past WAIT_ALT_S, a maneuver whose every go condition holds now): the first of
     _alternatives that qualifies is taken, said once (otherTurn, "Turning right instead"), and decides from then on; its side
     and angle from its approach's relBearing for turnpilotd's synthesized turn (desire from the go), the route's planned turn
-    published missed once the encounter is done. True: taken."""
+    published missed once the encounter is done. True: taken. Never on a frame whose shared conditions (the box, the views,
+    the yaw, the front zone, the turn) go_holds didn't read (its early returns: a position fault, a downgrade, the route's
+    maneuver failing certification): the probe would have none of them, so the ladder goes on to H3."""
+    if abs(self._shared_t - self.t) > 1e-9:
+      cloudlog.event("turnpilot.stop_go_other_turn_no", key=list(self.key), why='shared conditions not read this frame')
+      return False
     for m, a in self._alternatives(f):
       holds = self._alt_holds(f, pos, m)
       if (empty and holds) or any(h.kind in (STATIC, FAULT) for h in holds):
