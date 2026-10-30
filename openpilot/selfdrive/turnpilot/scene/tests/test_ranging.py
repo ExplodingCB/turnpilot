@@ -66,3 +66,41 @@ class TestRanging(OpenpilotTestCase):
     lens = road_lens(COMMA_FOUR.narrow_road)
     cx, cy = lens.center
     assert ground(lens, calib_from_view([0, 0.02, 0]), HEIGHT, cx, cy + 60)[0] < ground(lens, calib_from_view([0, 0, 0]), HEIGHT, cx, cy + 60)[0]
+
+
+class TestLensFile(OpenpilotTestCase):
+  # one lens for every consumer (STOP_SIGNS.md section 1.1): the S1 fit in maps/visibility.json when it has one, else the
+  # repo's equidistant fit; each consumer says which (Lens.spec) so the stop-sign decider can refuse a mismatch
+  def test_equisolid_round_trip_and_bearings(self):
+    lens = Lens(1344, 760, 452., fisheye=True, k=0.3)
+    for u, v in ((10., 380.), (672., 100.), (1300., 700.)):
+      np.testing.assert_allclose(lens.project(lens.ray(u, v)), (u, v), atol=1e-6)
+    us, vs = np.array([10., 672., 1300.]), np.array([380., 100., 700.])
+    np.testing.assert_allclose(np.stack(lens.project_many(lens.rays(us, vs))), np.stack([us, vs]), atol=1e-6)
+    np.testing.assert_allclose(lens.rays(us, vs)[1], lens.ray(672., 100.), atol=1e-12)
+    # k 0.3 reads a frame-edge pixel wider than the equidistant fit: repo 80 deg is about 82.5 true (verify.md finding 1)
+    repo = Lens(1344, 760, 452., fisheye=True)
+    u = 672 - 452. * np.radians(80.)
+    off_axis = lambda lens: np.degrees(np.arccos(lens.ray(u, 380.)[2]))  # noqa: E731
+    assert abs(off_axis(repo) - 80.) < 1e-6 and 82. < off_axis(lens) < 83.
+
+  def test_the_file_lens_or_the_repo_fit(self):
+    import json
+    import tempfile
+    from pathlib import Path
+    from openpilot.selfdrive.turnpilot.scene.ranging import file_lens
+    with tempfile.TemporaryDirectory() as d:
+      path = Path(d) / 'visibility.json'
+      assert file_lens(path) is None  # no file: the repo fit
+      lens = wide_lens(COMMA_FOUR.wide_road, 'mici', path)
+      assert (lens.f, lens.k, lens.source) == (452., 0., 'repo') and lens.spec == 'equidistant f=452.0 k=0.0 repo'
+      path.write_text(json.dumps({'lens': {}}))
+      assert wide_lens(COMMA_FOUR.wide_road, 'mici', path).source == 'repo'  # an empty lens: not fitted yet
+      path.write_text(json.dumps({'lens': {'model': 'equisolid', 'f': 450.5, 'k': 0.3, 'edgeDeg': {'left': 88., 'right': 87.}}}))
+      lens = wide_lens(COMMA_FOUR.wide_road, 'mici', path)
+      assert (lens.f, lens.k, lens.source, lens.fisheye) == (450.5, 0.3, 'visibility.json', True)
+      assert lens.spec == 'equisolid f=450.5 k=0.3 visibility.json'
+      path.write_text(json.dumps({'lens': {'model': 'equidistant', 'f': 451.}}))
+      assert wide_lens(COMMA_FOUR.wide_road, 'mici', path).spec == 'equidistant f=451.0 k=0.0 visibility.json'
+      # the sim's pinhole stays a pinhole whatever the file says (a comma four's lens is not the sim's)
+      assert not wide_lens(COMMA_FOUR.wide_road, 'pc', path).fisheye

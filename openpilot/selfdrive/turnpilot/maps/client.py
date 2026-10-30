@@ -194,8 +194,9 @@ class MapClient:
     rather than by urllib3, which accepts a gzip stream that stops short of its end. So a download that broke off is
     caught three ways: fewer bytes than Content-Length, a gzip stream that never reached its end, and (in unpack) a tar
     that ends early. progress(received, total or None) counts bytes off the wire against Content-Length."""
-    resp = self.request('POST', '/v1/corridor', json={'start': list(start), 'destination': list(destination)}, stream=True,
-                        timeout=CORRIDOR_TIMEOUT)
+    # osm_controls: the OSM stop-sign sidecar's shards for the corridor's tiles (corridor.py, routing/osm_sidecar.py)
+    resp = self.request('POST', '/v1/corridor', json={'start': list(start), 'destination': list(destination), 'osm_controls': True},
+                        stream=True, timeout=CORRIDOR_TIMEOUT)
     with resp:
       if resp.status_code == 422:
         raise refusal(resp, coverage_names)

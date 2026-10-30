@@ -1,5 +1,6 @@
 """turnpilotd as a process: when the manager runs it, and its loop living through exceptions, since a dead process
 soft-disables openpilot for the rest of the drive."""
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -65,8 +66,8 @@ class LoopSM:
     for service in ('deviceState', 'narrowRoadCameraState', 'extrinsicsCalibration'):
       self.data[service] = getattr(messaging.new_message(service).as_reader(), service)
     self.updated = dict.fromkeys(self.data, False)
-    self.valid = dict.fromkeys(self.data, True)
-    self.seen = {'deviceState': True, 'narrowRoadCameraState': True, 'turnpilotDetections': False}
+    self.valid = dict.fromkeys([*self.data, 'turnpilotDetections', 'turnpilotFarDetections'], True)
+    self.seen = {'deviceState': True, 'narrowRoadCameraState': True, 'turnpilotDetections': False, 'turnpilotFarDetections': False}
     self.frame, self.failing_frames, self.checks = -1, failing_frames, checks
 
   def update(self, timeout):
@@ -80,6 +81,13 @@ class LoopSM:
   def all_checks(self, services):
     return self.checks(self.frame)
 
+  def drain(self):
+    """What turnpilotd's own turnpilotDetections socket drains this frame (messaging.drain_sock): the message the SubMaster
+    holds while it is updated, as an Event with its valid."""
+    if not self.updated.get('turnpilotDetections'):
+      return []
+    return [SimpleNamespace(valid=self.valid['turnpilotDetections'], turnpilotDetections=self.data['turnpilotDetections'])]
+
 
 def run_main(frames, failing_frames=0, tracker=None, checks=lambda frame: True, **params):
   sent, sm = [], LoopSM(failing_frames, checks)
@@ -89,6 +97,8 @@ def run_main(frames, failing_frames=0, tracker=None, checks=lambda frame: True, 
   rk.keep_time.side_effect = [None] * (frames - 1) + [Stop()]
   params = FakeParams(**{'TurnPilotEnabled': True, 'CarParams': car_params_bytes(), 'DisengageOnAccelerator': True, **params})
   with mock.patch.object(messaging, 'SubMaster', return_value=sm), mock.patch.object(messaging, 'PubMaster', return_value=pm), \
+       mock.patch.object(messaging, 'sub_sock', return_value=mock.MagicMock()), \
+       mock.patch.object(messaging, 'drain_sock', side_effect=lambda sock, wait_for_one=False: sm.drain()), \
        mock.patch.object(turnpilotd, 'Params', return_value=params), mock.patch.object(turnpilotd, 'Ratekeeper', return_value=rk), \
        mock.patch.object(turnpilotd, 'SceneTracker', return_value=tracker or mock.MagicMock()), \
        mock.patch.object(turnpilotd, 'DEVICE_CAMERAS', mock.MagicMock()), \
@@ -121,9 +131,87 @@ def test_disengage_on_accelerator_off_faults_out_loud():
   assert not errors
 
 
+def test_the_far_crops_runs_go_to_the_tracker_and_its_raw_run_to_the_plan():
+  # DESIGN phase 4 G5: turnpilotFarDetections (optional) to SceneTracker.update_far with the calibration, never to update();
+  # a new far run to the plan as raw_far (the unprotected left's), TurnPilotLeftFarRangeM read with the other params
+  tracker = mock.MagicMock()
+  tracker.raw_new, tracker.raw_far_new = False, True
+  far = messaging.new_message('turnpilotFarDetections').as_reader().turnpilotFarDetections
+  got = {}
+  real_plan = turnpilotd.TurnPilot.plan
+
+  def plan(self, *a, **k):
+    got.update(k, far_range=self.left_far_range_m)
+    return real_plan(self, *a, **k)
+  orig = LoopSM.__init__
+
+  def init(self, *a, **k):
+    orig(self, *a, **k)
+    self.data['turnpilotFarDetections'], self.seen['turnpilotFarDetections'] = far, True
+  with mock.patch.object(LoopSM, '__init__', init), mock.patch.object(turnpilotd.TurnPilot, 'plan', plan):
+    run_main(frames=3, tracker=tracker, TurnPilotLeftFarRangeM=260.)
+  args = tracker.update_far.call_args.args
+  assert args[0] is far and len(args) == 2
+  assert got['raw_far'] is tracker.raw_far and got['raw'] is None and got['far_range'] == 260.
+
+
+def nan_runs(trk):
+  """A full pass run and a far crop run whose model output wasn't finite, as modeld publishes them: valid False, the
+  non-finite rows dropped by the decoders (no boxes), the far run's crop still set."""
+  import numpy as np
+  from openpilot.selfdrive.turnpilot.detector.decoder import decode, decode_far, fill_detections, fill_far
+  from openpilot.selfdrive.turnpilot.detector.graph import letterbox
+  from openpilot.selfdrive.turnpilot.scene.tests.test_tracker import far_crop_at_horizon
+  nan = np.full((1, 300, 6), np.nan, np.float32)
+  full = messaging.new_message('turnpilotDetections', valid=bool(np.isfinite(nan).all()))
+  fill_detections(full.turnpilotDetections, decode(nan, letterbox(1344, 760)), 1, int(1e9), 'road', 0.006)
+  crop, _ = far_crop_at_horizon(trk)
+  far = messaging.new_message('turnpilotFarDetections', valid=bool(np.isfinite(nan).all()))
+  fill_far(far.turnpilotFarDetections, decode_far(nan, crop), crop, 0., 2, int(1.05e9), 0.006)
+  assert not full.valid and not far.valid
+  return full.as_reader().turnpilotDetections, far.as_reader().turnpilotFarDetections
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_an_invalid_detector_run_is_no_run_never_a_clear_one(valid):
+  # skeptic G6: a run whose output wasn't finite carries no boxes, and a far one still its crop, so taken as a run it is a
+  # clear one: the far crop's covering the band (the left's far_age reset, the run counted clear) and the full pass's a
+  # fresh clear road run. SubMaster takes msg.valid into sm.valid even for the optional services (ignore_valid): an
+  # invalid run never reaches the tracker, for either pass, so the left sees no run (never clear; stale is its fault)
+  from openpilot.selfdrive.turnpilot.scene.tests.test_tracker import CAMS, calibration
+  from openpilot.selfdrive.turnpilot.scene.tracker import SceneTracker
+  tracker = SceneTracker(CAMS, 'mici')
+  full, far = nan_runs(tracker)
+  got = []
+  real_plan = turnpilotd.TurnPilot.plan
+
+  def plan(self, *a, **k):
+    got.append((k['raw'], k['raw_far']))
+    return real_plan(self, *a, **k)
+  orig = LoopSM.__init__
+
+  def init(self, *a, **k):
+    orig(self, *a, **k)
+    self.data['extrinsicsCalibration'] = calibration()
+    for s, msg in (('turnpilotDetections', full), ('turnpilotFarDetections', far)):
+      self.data[s], self.seen[s], self.updated[s], self.valid[s] = msg, True, True, valid
+  with mock.patch.object(LoopSM, '__init__', init), mock.patch.object(turnpilotd.TurnPilot, 'plan', plan), \
+       mock.patch.dict(turnpilotd.INVALID_RUNS, clear=True), mock.patch.object(turnpilotd.cloudlog, 'event') as event:
+    _, _, errors = run_main(frames=3, tracker=tracker)
+    invalid = [c.kwargs['service'] for c in event.call_args_list if c.args[0] == "turnpilot.detector_run_invalid"]
+    assert sorted(invalid) == ([] if valid else ['turnpilotDetections', 'turnpilotFarDetections'])  # once a spell, logged
+    assert turnpilotd.INVALID_RUNS == ({} if valid else {'turnpilotDetections': 3, 'turnpilotFarDetections': 3})
+  assert not errors and len(got) == 3
+  raws, raw_fars = [r for r, _ in got if r is not None], [f for _, f in got if f is not None]
+  if valid:  # the same runs, valid (no boxes, nothing there): a clear road run and a covering clear far run, once each
+    assert len(raws) == len(raw_fars) == 1 and raws[0].boxes == raw_fars[0].boxes == [] and raw_fars[0].cover_deg is not None
+  else:
+    assert raws == raw_fars == [] and tracker.raw is None and tracker.raw_far is None and not tracker.available
+
+
 def test_scene_failure_publishes_an_empty_scene_and_goes_on():
   tracker = mock.MagicMock()
-  tracker.update.side_effect = RuntimeError("synthetic failure")
+  tracker.update_runs.side_effect = RuntimeError("synthetic failure")  # every run goes through update_runs (DetectionDrain)
   plans, scenes, errors = run_main(frames=5, failing_frames=0, tracker=tracker)
   assert len(plans) == len(scenes) == 5
   # an empty scene: unavailable, so TurnPilot doesn't act (waiting for the detector; once it has run, a stopped detector)
@@ -203,3 +291,38 @@ def test_main_reads_the_no_move_limit(value, limit):
   with mock.patch.object(turnpilotd, 'TurnPilot', side_effect=make):
     run_main(frames=3, TurnPilotNoMoveS=value)
   assert made[0].no_move_s == limit
+
+
+@pytest.mark.parametrize("value,on", [(None, True), (True, True), (False, False), ('0', False)])
+def test_main_reads_the_go_override(value, on):
+  """TurnPilotGoOverride (go_override.py, G5), read once a second: unset is on."""
+  made, real = [], turnpilotd.TurnPilot
+  def make():
+    made.append(real())
+    return made[-1]
+  with mock.patch.object(turnpilotd, 'TurnPilot', side_effect=make):
+    run_main(frames=3, TurnPilotGoOverride=value)
+  assert made[0].go_override is on
+
+
+def test_a_sweep_coasts_the_trackers_tracks_longer_and_the_watch_sees_every_run():
+  # STOP_SIGNS.md section 9: MAX_COAST_S 0.65 s while a stop sweep runs (the last plan asked for one), 0.5 s otherwise; and
+  # the junction watch gets the tracker's runs and tracks every frame
+  from openpilot.selfdrive.turnpilot.scene.tracker import MAX_COAST_S, SWEEP_COAST_S
+  tracker = mock.MagicMock()
+  tracker.raw_new, tracker.raw_far_new, tracker.new_runs, tracker.tracks = False, False, [('road', 1.0, None, None)], []
+  coasts, observed = [], []
+  real_plan = turnpilotd.TurnPilot.plan
+
+  def plan(self, *a, **k):
+    coasts.append(tracker.coast_s)
+    msg = real_plan(self, *a, **k)
+    self.sweeping = len(coasts) >= 2  # the second plan asks for a sweep
+    return msg
+
+  def observe(self, trk):
+    observed.append(list(trk.new_runs))
+  with mock.patch.object(turnpilotd.TurnPilot, 'plan', plan), mock.patch.object(turnpilotd.TurnPilot, 'observe_runs', observe):
+    run_main(frames=4, tracker=tracker)
+  assert coasts == [MAX_COAST_S, MAX_COAST_S, SWEEP_COAST_S, SWEEP_COAST_S]
+  assert observed == [[('road', 1.0, None, None)]] * 4

@@ -1,0 +1,319 @@
+{
+ "about": "Writes routing/tests/fixtures/valhalla_unflagged_stop.json: a synthetic Valhalla trace_attributes and locate for a route due east, 150 m on way 901 to a junction, then 150 m on way 902, where Valhalla's locate has no stop_sign on way 901's edge but the OSM sidecar maps a directed stop 15 m before the junction (research_allway.md section 0: about a quarter of mapped stop approaches).",
+ "steps": [
+  {
+   "geometry": {
+    "type": "LineString",
+    "coordinates": [
+     [
+      -86.17,
+      39.77
+     ],
+     [
+      -86.16988299515036,
+      39.77
+     ],
+     [
+      -86.1697659903007,
+      39.77
+     ],
+     [
+      -86.16964898545106,
+      39.77
+     ],
+     [
+      -86.1695319806014,
+      39.77
+     ],
+     [
+      -86.16941497575176,
+      39.77
+     ],
+     [
+      -86.16929797090211,
+      39.77
+     ],
+     [
+      -86.16918096605247,
+      39.77
+     ],
+     [
+      -86.16906396120281,
+      39.77
+     ],
+     [
+      -86.16894695635317,
+      39.77
+     ],
+     [
+      -86.16882995150351,
+      39.77
+     ],
+     [
+      -86.16871294665387,
+      39.77
+     ],
+     [
+      -86.16859594180421,
+      39.77
+     ],
+     [
+      -86.16847893695457,
+      39.77
+     ],
+     [
+      -86.16836193210492,
+      39.77
+     ],
+     [
+      -86.16824492725527,
+      39.77
+     ]
+    ]
+   },
+   "distance": 150.0,
+   "maneuver": {
+    "type": "depart",
+    "location": [
+     -86.17,
+     39.77
+    ]
+   },
+   "name": "Street 901"
+  },
+  {
+   "geometry": {
+    "type": "LineString",
+    "coordinates": [
+     [
+      -86.16824492725527,
+      39.77
+     ],
+     [
+      -86.16812792240562,
+      39.77
+     ],
+     [
+      -86.16801091755597,
+      39.77
+     ],
+     [
+      -86.16789391270632,
+      39.77
+     ],
+     [
+      -86.16777690785668,
+      39.77
+     ],
+     [
+      -86.16765990300703,
+      39.77
+     ],
+     [
+      -86.16754289815738,
+      39.77
+     ],
+     [
+      -86.16742589330774,
+      39.77
+     ],
+     [
+      -86.16730888845808,
+      39.77
+     ],
+     [
+      -86.16719188360844,
+      39.77
+     ],
+     [
+      -86.16707487875878,
+      39.77
+     ],
+     [
+      -86.16695787390914,
+      39.77
+     ],
+     [
+      -86.16684086905948,
+      39.77
+     ],
+     [
+      -86.16672386420984,
+      39.77
+     ],
+     [
+      -86.16660685936019,
+      39.77
+     ],
+     [
+      -86.16648985451054,
+      39.77
+     ]
+    ]
+   },
+   "distance": 150.0,
+   "maneuver": {
+    "type": "continue",
+    "location": [
+     -86.16824492725527,
+     39.77
+    ]
+   },
+   "name": "Street 902"
+  }
+ ],
+ "trace_attributes": {
+  "shape": "_xjzjA~wkjcD?iF?iF?iF?iF?iF?iF?iF?iF?iF?iF?iF?iF?iF?iF?iF?iF?iF?iF?iF?iF?iF?iF?iF?iF?iF?iF?iF?iF?iF?iF",
+  "edges": [
+   {
+    "id": 81604378,
+    "way_id": 901,
+    "forward": true,
+    "length": 0.15,
+    "begin_shape_index": 0,
+    "end_shape_index": 15,
+    "traffic_signal": false,
+    "internal_intersection": false,
+    "road_class": "residential",
+    "end_node": {
+     "type": "street_intersection",
+     "traffic_signal": false,
+     "intersecting_edges": [
+      {
+       "road_class": "tertiary"
+      },
+      {
+       "road_class": "tertiary"
+      }
+     ]
+    }
+   },
+   {
+    "id": 81604379,
+    "way_id": 902,
+    "forward": true,
+    "length": 0.15,
+    "begin_shape_index": 15,
+    "end_shape_index": 30,
+    "traffic_signal": false,
+    "internal_intersection": false,
+    "road_class": "residential",
+    "end_node": {
+     "type": "street_intersection",
+     "traffic_signal": false,
+     "intersecting_edges": [
+      {
+       "road_class": "residential"
+      }
+     ]
+    }
+   }
+  ]
+ },
+ "locate": [
+  {
+   "input_lat": 39.77,
+   "input_lon": -86.16825662774023,
+   "nodes": [],
+   "edges": [
+    {
+     "edge_id": {
+      "value": 81604378,
+      "level": 2,
+      "tile_id": 747735
+     },
+     "percent_along": 0.9933,
+     "distance": 0.0,
+     "edge": {
+      "stop_sign": false,
+      "yield_sign": false,
+      "traffic_signal": false,
+      "forward": true,
+      "lane_count": 1,
+      "classification": {
+       "classification": "residential",
+       "use": "road",
+       "internal": false,
+       "link": false
+      }
+     },
+     "edge_info": {
+      "way_id": 901,
+      "names": [
+       "Street 901"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "input_lat": 39.77,
+   "input_lon": -86.1665015549955,
+   "nodes": [],
+   "edges": [
+    {
+     "edge_id": {
+      "value": 81604379,
+      "level": 2,
+      "tile_id": 747735
+     },
+     "percent_along": 0.9933,
+     "distance": 0.0,
+     "edge": {
+      "stop_sign": false,
+      "yield_sign": false,
+      "traffic_signal": false,
+      "forward": true,
+      "lane_count": 1,
+      "classification": {
+       "classification": "residential",
+       "use": "road",
+       "internal": false,
+       "link": false
+      }
+     },
+     "edge_info": {
+      "way_id": 902,
+      "names": [
+       "Street 902"
+      ]
+     }
+    }
+   ]
+  }
+ ],
+ "meta": {
+  "osm_timestamp": "2026-10-26T21:24:46Z"
+ },
+ "osm_controls": {
+  "747735": {
+   "version": 1,
+   "osm_timestamp": "2026-10-26T21:24:46Z",
+   "tile": 747735,
+   "controls": {
+    "901:f": [
+     {
+      "kind": "stop",
+      "line": [
+       39.77,
+       -86.1684204
+      ],
+      "junction_node": 5001,
+      "stop_tag": "minor",
+      "evidence": "mid_directed"
+     }
+    ]
+   },
+   "junctions": {
+    "5001": {
+     "pos": [
+      39.77,
+      -86.1682449
+     ],
+     "approaches": []
+    }
+   },
+   "rail": []
+  }
+ }
+}

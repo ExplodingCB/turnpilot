@@ -325,12 +325,15 @@ CONTROL_PROMPT_TITLE = {'yieldAhead': "Yield Ahead", 'stopSignTakeControl': "Sto
                         'carStoppedTakeControl': "Car Stopped: Take Control", 'stalledTakeControl': "Stalled: Take Control",
                         'cantStartTakeControl': "Can't Start Turn: Take Control", 'waitingForGap': "Waiting for a Gap",
                         'creepingForView': "Creeping for a View", 'leftGo': "Turning",
-                        'leftUndecidedTakeControl': "Unprotected Turn: Take Control"}
+                        'leftUndecidedTakeControl': "Unprotected Turn: Take Control", 'waitingForCross': "Waiting for Cross Traffic",
+                        'stopGo': "Going"}
 CONTROL_ALERT_TITLE = {'cannotStopComfortably': "Take Control", 'stopOverrun': "Stop Line Passed",
                        'proceedingOnYellow': "Proceeding on Yellow",
                        'mapControlsUnavailable': "Map Stops Unavailable", 'lightSourceRejected': "Light Source Rejected",
                        'junctionUncertain': "Junction Position Uncertain", 'offRouteStopsUnknown': "Off Route",
-                       'hardBrake': "Braking Hard", 'oncomingHolding': "Oncoming: Holding"}
+                       'hardBrake': "Braking Hard", 'oncomingHolding': "Oncoming: Holding", 'farViewOff': "Far View Off",
+                       'sideCamerasOff': "Side Cameras Off", 'crossTrafficAfterCommit': "Cross Traffic", 'cameraPaused': "Camera Paused",
+                       'stalledInJunction': "Stalled in Junction", 'overrideWriteFailed': "Junction Not Saved"}
 TURNPILOT_CONTROL_ALERT_S = 3.  # an overrun, a yellow or a red go is held up this long
 
 
@@ -345,9 +348,11 @@ def turnpilot_control_prompt_alert(CP: car.CarParams, CS: car.CarState, sm: mess
   if prompt in TAKE_CONTROL_PROMPTS:
     return Alert(plan.reason or CONTROL_PROMPT_TITLE.get(prompt, "Take Control"), CONTROL_PROMPT_TEXT.get(prompt, ''),
                  AlertStatus.critical, AlertSize.mid, Priority.MID, VisualAlert.steerRequired, AudibleAlert.tpHandback, .1)
+  # a stop sign's wait is silent but for its info chime, once a WAIT_INFO_S (stop_go.py: stopGo.chime)
+  chime = prompt not in SILENT_PROMPTS or (prompt == 'waitingForCross' and plan.stopGo.chime)
   return Alert(plan.reason if plan is not None and plan.reason else CONTROL_PROMPT_TITLE.get(prompt, "TurnPilot"),
                CONTROL_PROMPT_TEXT.get(prompt, ''), AlertStatus.userPrompt, AlertSize.mid, Priority.LOW, VisualAlert.none,
-               AudibleAlert.none if prompt in SILENT_PROMPTS else AudibleAlert.prompt, .1)
+               AudibleAlert.prompt if chime else AudibleAlert.none, .1)
 
 
 def turnpilot_control_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int,

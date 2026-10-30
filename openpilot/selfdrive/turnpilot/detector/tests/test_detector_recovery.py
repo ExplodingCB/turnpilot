@@ -31,16 +31,15 @@ def run_gaps(det, pm, frames: int, model_time: float) -> list[int]:
 
 
 class FakeParams:
-  def __init__(self, enabled=False, lights=None):
-    self.enabled, self.lights = enabled, lights
+  def __init__(self, enabled=False, lights=None, far=None, signs=None):
+    self.enabled, self.lights, self.far, self.signs = enabled, lights, far, signs
 
   def get_bool(self, key):
     assert key == "TurnPilotEnabled"
     return self.enabled
 
   def get(self, key):
-    assert key == "TurnPilotCameraLights"
-    return self.lights
+    return {"TurnPilotCameraLights": self.lights, "TurnPilotFarCrop": self.far, "TurnPilotCameraStopSigns": self.signs}[key]
 
 
 class FakeLoad:
@@ -136,6 +135,42 @@ class TestDetectorRecovery(OpenpilotTestCase):
     params.lights, host.next_check = None, 0.
     host.step(pm, model, 0.010, 0.0, log.Desire.none, METAS, True)
     assert det.light_mode == 'shadow'
+
+  def test_host_passes_the_far_crop_param_and_aim(self):
+    # TurnPilotFarCrop (unset: on) and turnpilotPlan.farCropBearing reach the detector
+    model, params, pm = object(), FakeParams(True), PM()
+    host = DetectorHost(params, 1344, 760, False, True, [model], load_fn=FakeLoad({model}))
+    host.load()
+    (_, det), = host.detectors
+    got = []
+    det.far_step = lambda pm, ms, t, metas, bearing: got.append(bearing)
+    host.step(pm, model, 0.010, 0.0, log.Desire.none, METAS, True, 'auto', 6.5)
+    host.step(pm, model, 0.010, 0.0, log.Desire.none, METAS, True, 'auto', 6.5)
+    assert det.far_on and got == [6.5]  # the frame between the full runs
+    params.far, host.next_check = False, 0.
+    host.step(pm, model, 0.010, 0.0, log.Desire.none, METAS, True)
+    assert not det.far_on
+    params.far, host.next_check = b'1', 0.
+    host.step(pm, model, 0.010, 0.0, log.Desire.none, METAS, True)
+    assert det.far_on
+
+  def test_host_passes_the_sweep_inputs_and_the_stop_signs_mode(self):
+    # STOP_SIGNS.md SG3a: carState.vEgo (the side views' speed gate), a signal mapped near (the sweep's light reader) and
+    # TurnPilotCameraStopSigns (unset: shadow) reach the detector
+    model, params, pm = object(), FakeParams(True), PM()
+    host = DetectorHost(params, 1344, 760, False, True, [model], load_fn=FakeLoad({model}))
+    host.load()
+    (_, det), = host.detectors
+    got = []
+    det.side_step = lambda pm, ms, t, metas, gated: got.append(gated)
+    host.step(pm, model, 0.010, 0.0, log.Desire.none, METAS, True, 'stopSweep', 0., 1.5, True)
+    host.step(pm, model, 0.010, 0.0, log.Desire.none, METAS, True, 'stopSweep', 0., 1.5, True)
+    host.step(pm, model, 0.010, 0.0, log.Desire.none, METAS, True, 'stopSweep', 0., 3.0, True)
+    host.step(pm, model, 0.010, 0.0, log.Desire.none, METAS, True, 'stopSweep', 0., 3.0, True)
+    assert got == [True, False] and det.signs_mode == 'shadow'
+    params.signs, host.next_check = 'off', 0.
+    host.step(pm, model, 0.010, 0.0, log.Desire.none, METAS, True)
+    assert det.signs_mode == 'off'
 
   def test_host_without_a_detector_for_the_fallback(self):
     big, small = object(), object()

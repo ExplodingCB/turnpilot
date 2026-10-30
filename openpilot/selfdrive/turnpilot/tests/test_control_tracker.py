@@ -1,7 +1,7 @@
 """ControlTracker: the route's stop signs, yields and signals between navd's 1 Hz fixes (control_tracker.py)."""
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.turnpilot.control_tracker import (CORRECTION_M, DROP_PAST_M, GAP_MAX_M, JUMP_M, OFF_ROUTE, OFF_ROUTE_GRACE_S,
-                                                            ControlTracker)
+from openpilot.selfdrive.turnpilot.control_tracker import (CORRECTION_M, DROP_PAST_M, FIX_SPREAD_M, GAP_MAX_M, JUMP_M, OFF_ROUTE,
+                                                            OFF_ROUTE_GRACE_S, ControlTracker)
 from openpilot.selfdrive.turnpilot.tests.synthetic import nav_instruction
 
 
@@ -60,6 +60,29 @@ def test_held_ignores_fixes():
   assert tr.controls[(1, 0)].d == 2.  # frozen: the latch is position-free
 
 
+def test_fix_spread_is_how_far_navds_moving_fixes_disagree_over_the_last_20_m():
+  # STOP_SIGNS.md 7.1 H2: the stop-sign decider's position fault reads how far navd's fixes of the control disagree, the
+  # car's own travel taken out, over the last FIX_SPREAD_M (20 m) driven; fixes while slow, and a held control's, are noise
+  tr = ControlTracker()
+  step(tr, nav([(0, 'stop', 100.)]), v=0.)
+  d = 100.
+  for _ in range(3):  # fixes 1 s apart at 10 m/s that agree with the odometer
+    d -= 10. * 20 * DT_MDL
+    step(tr, nav([(0, 'stop', d)]), v=10., n=20)
+  assert tr.controls[(1, 0)].fix_spread < 0.01
+  step(tr, nav([(0, 'stop', d - 10. * 20 * DT_MDL + 4.)]), v=10., n=20)  # one fix 4 m behind the others
+  assert abs(tr.controls[(1, 0)].fix_spread - 4.) < 0.01
+  d -= 10. * 20 * DT_MDL
+  for _ in range(int(FIX_SPREAD_M / 10.) + 1):  # over 20 m on, the odd fix is gone
+    d -= 10. * 20 * DT_MDL
+    step(tr, nav([(0, 'stop', d)]), v=10., n=20)
+  assert tr.controls[(1, 0)].fix_spread < 0.01
+  step(tr, nav([(0, 'stop', d + 9.)]), v=0.3, n=1)  # creeping: GPS noise, not a fix
+  tr.controls[(1, 0)].held = True
+  step(tr, nav([(0, 'stop', d + 15.)]), v=1., n=1)  # held: the latch is position-free
+  assert tr.controls[(1, 0)].fix_spread < 0.01
+
+
 def test_new_route_drops_unengaged_and_carries_engaged():
   tr = ControlTracker()
   step(tr, nav([(0, 'stop', 50.), (1, 'signal', 300.)]), v=0.)
@@ -72,6 +95,25 @@ def test_new_route_drops_unengaged_and_carries_engaged():
   # a reroute that doesn't list it: carried under its old key
   out = step(tr, nav([(0, 'yield', 200.)], route_count=3), v=0.)
   assert [c.key for c in out] == [(2, 4), (3, 0)]
+
+
+def test_junction_info_rides_with_the_control_and_a_reroute_brings_its_own():
+  """A stop or yield's junction (MapControl.junctionInfo) is copied to the tracked control as a plain dict (the message's
+  buffer isn't kept); a signal has none. A reroute's same control takes over an engaged one's state, and the junction
+  it carries is the new route's own (its maneuver may have changed); the lookups ahead off the route carry theirs."""
+  tr = ControlTracker()
+  left = {'status': 'ok', 'osmNodeId': 900, 'maneuver': 'left', 'approaches': [{'role': 'exit', 'tier': 'no', 'wayId': 812}]}
+  stop, signal = step(tr, nav([(0, 'stop', 50., False, True, False, left), (1, 'signal', 300.)]), v=0.)
+  assert isinstance(stop.junction_info, dict) and stop.junction_info['osmNodeId'] == 900 and signal.junction_info is None
+  a = stop.junction_info['approaches'][0]
+  assert (a['role'], a['tier'], a['wayId']) == ('exit', 'no', 812)
+  stop.engaged, stop.state = True, 'mine'
+  straight = left | {'maneuver': 'straight'}
+  out = step(tr, nav([(4, 'stop', 58., False, True, False, straight)], route_count=2), v=0.)
+  assert out[0].key == (2, 4) and out[0].state == 'mine' and out[0].junction_info['maneuver'] == 'straight'
+  ahead = {'status': 'ok', 'osmNodeId': 901, 'maneuver': 'unknown'}
+  out = step(tr, nav([], valid=False, off=[(7, 'stop', 40., False, True, False, ahead)]), valid=False, v=0.)
+  assert [c.junction_info['osmNodeId'] for c in out if c.key[0] == OFF_ROUTE] == [901]
 
 
 def test_dropped_once_past():

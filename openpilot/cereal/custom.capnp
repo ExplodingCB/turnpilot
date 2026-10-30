@@ -116,6 +116,11 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
       proceedingOnYellow @6; # a yellow too late to stop for: committed, no cap
       overrun @7;            # passed the line moving, never released: dropped (logged, alerted)
       infeasible @8;         # can't stop at -2.0 m/s^2: braking at the floor, alert
+      # STOP_SIGNS.md v3 SG4a, the stop-sign decider (stop_go.py) at a held stop sign
+      waitingCross @9;       # held: the decider waits for its go conditions (its reason on the plan)
+      creeping @10;          # held, its stop point moved on: a roll-up to the stop point (and SG4b's creeps)
+      going @11;             # released on the decider's go, under STOP_GO_V_MAX, short of the commit point
+      committed @12;         # past the commit point (the band, then in a lane): never braked for a cross car in a lane
     }
     enum LightState {
       unknown @0;
@@ -170,6 +175,11 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     leftGo @13;                     # going: a short chime
     leftUndecidedTakeControl @14;   # can't judge the oncoming traffic (stale camera, position unknown, beyond the detector's
                                     # range, yawed, view blocked after the full creep): held, take control
+    # STOP_SIGNS.md v3 SG4a: the stop-sign decider's wait and go. stopSignTakeControl @6 is now its faults only (H1-H8 and the
+    # ladder's end, the reason line saying which); under TurnPilotStopSignGo shadow or off it is the 1 s handback, as before
+    waitingForCross @15;            # held at a stop sign for the go conditions, the reason saying for what (visual only;
+                                    # stopGo.chime: the wait's info chime at WAIT_INFO_S and every WAIT_INFO_S after)
+    stopGo @16;                     # going from the stop sign: a short chime
   }
   enum ControlAlert {
     none @0;
@@ -187,6 +197,15 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
                                 # (scene_policy.py), while it lasts; logged with its evidence (turnpilot.hard_brake)
     oncomingHolding @10;        # an unprotected left's go withdrawn before its commit for a car in the oncoming band:
                                 # stopping short of the oncoming lanes on the comfortable curve, waiting again
+    farViewOff @11;             # the far crop went off for the drive (failed or over budget): no unprotected left needing it
+    sideCamerasOff @12;         # the side views went off for the drive (failed or overran, turnpilotDetections.sideViewStatus
+                                # disabled): stop sweeps run the full wide pass and the road camera only (STOP_SIGNS.md 1.3)
+    # STOP_SIGNS.md v3 SG4a, the stop-sign decider
+    crossTrafficAfterCommit @13; # a cross vehicle met past the in-lane point: said, never braked for (stopping in a lane is worse)
+    cameraPaused @14;           # a view the decider needs hasn't run for DET_FAULT_S: held, waiting FAULT_GRACE_S for it (H1 after)
+    stalledInJunction @15;      # standing past the in-lane point: a clearBox go (up to CLEAR_BOX_GOES), then H5
+    overrideWriteFailed @16;    # a TurnPilotJunctionOverrides entry (a signal head seen at a stop-sign junction) couldn't be
+                                # written: navd may route through that junction again; logged with the entry (STOP_SIGNS.md O16)
   }
   mapControl @24 :MapControlStatus;
   controlPrompt @25 :ControlPrompt;
@@ -224,6 +243,10 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     road @1;         # the road camera only: an unprotected left from its go to its commit (CRITIQUE REQUIRED 3)
     roadAndWide @2;  # the road camera, the wide camera one run in WIDE_EVERY: held at an unprotected left's line (its exit
                      # crosswalk)
+    # The stop sweeps (STOP_SIGNS.md section 1.3): the detector's even steps run the forward views, its odd steps the side
+    # views (only at or under SIDE_VIEW_V_MAX); lane paint and the far crop are off, lights read only near a mapped signal
+    stopSweep @3;    # held at a stop or yield: full wide, side left, road, side right
+    stopSweepGo @4;  # crossing, from the commit point: full wide, side left, full wide, side right
   }
   detectorView @30 :DetectorView;
   # The autonomous unprotected left's decision (unprotected_left.py), for the logs and the sim's scorer
@@ -250,8 +273,96 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     crosswalkClear @8 :Bool;   # the exit crosswalk and the junction box
     creepM @9 :Float32;        # m past its line the hold may creep to
     why @10 :Text;             # undecided: its fault; announce: go or wait
+    farRangeM @11 :Float32;    # the far crop's proven range (TurnPilotLeftFarRangeM), 0 when unmeasured or the crop is off
+    farNeeded @12 :Bool;       # rReq is past rangeM: the band out to rReq is judged on the far crop's runs too
+    farBlockers @13 :UInt8;    # raw boxes in the band on the last far crop run
   }
   unprotectedLeft @31 :UnprotectedLeftStatus;
+  # TurnPilot's certified go (selfdrive/turnpilot/go_override.py; DESIGN phase 4 decision 1, G5): asserted on every frame of
+  # the go, from the go until it ends (GO_WINDOW_S at most) or is withdrawn. plannerd lifts the e2e model's hold on the car
+  # for it, bounded: +0.5 m/s^2 at most, 3 s at most, under 3 m/s, only while nothing else holds the car. One go at a time,
+  # each a new id; clearing it (cause none) ends the lift that frame
+  struct GoCertified {
+    enum Cause {
+      none @0;
+      turnRelease @1;      # a turn TurnPilot's hold let go of at a standstill (its walker cleared, its light went green)
+      unprotectedLeft @2;  # the autonomous unprotected left's gap certified (unprotected_left.py)
+      stopSign @3;         # a stop sign's cross traffic certified clear from the line, also a yield that became a stop
+      rollUp @4;           # rolling up to the stop line after a queue
+      creep @5;            # one creep step
+      clearBox @6;         # stalled past the in-lane point after the commit
+    }
+    cause @0 :Cause;
+    id @1 :UInt32;     # a new one for every go (never repeated in a drive): plannerd gives each go its own window
+    t @2 :Float32;     # s since the go
+  }
+  goCertified @32 :GoCertified;
+  # The far crop's aim (DESIGN phase 4 G5, detector/modeld_detector.py): deg left of the calibrated forward axis, read by
+  # modeld through fresh_plan (shadow too). 0 is straight ahead; an unprotected left aims it up the oncoming approach
+  farCropBearing @33 :Float32;
+
+  # STOP_SIGNS.md v3 SG4a: the stop-sign decider (selfdrive/turnpilot/stop_go.py) at the stop control in hand, every frame; what
+  # step S4a's launch_verify.py reads per go (goT, takeoverS, retries, withdrawn), and the runtime inputs navd's certifier reads
+  # (sideViewsLive, mapsValid, mode)
+  struct StopGoStatus {
+    enum State {
+      off @0;        # no stop control in hand
+      approach @1;   # an engaged stop sign within STOP_SWEEP_M, not yet held (a queue's roll-up goes from here)
+      stopped @2;    # held at its line: the full stop's dwell (STOP_DWELL_S)
+      rollUp @3;     # held short of its stop point: its stop point moved on to it (map_controls' creep path)
+      observe @4;    # the go conditions (section 2.4) every frame; CLEAR_S of them and our turn is the go
+      going @5;      # released: the launch under STOP_GO_V_MAX, short of the commit point, every object re-checked
+      committed @6;  # the band: past the commit point, short of the in-lane point
+      inLane @7;     # past the in-lane point: carried on, never braked for a cross car
+      done @8;       # its rear bumper past the farthest conflicting lane (or 60 deg turned)
+      ladder @9;     # a handback (H1-H8, the ladder's end): held, stopSignTakeControl with the reason
+    }
+    enum Ledger {
+      none @0;
+      dynamic @1;    # traffic taking turns, people moving, a queue: no bound, an info chime at WAIT_INFO_S
+      static @2;     # nothing moving that would end it: STATIC_WAIT_S, then the ladder
+      fault @3;      # a fault's grace or its handback
+    }
+    enum Mode {
+      off @0;
+      shadow @1;
+      trial @2;
+      auto @3;
+    }
+    struct Lane {
+      role @0 :Text;       # left, right, opposite (where its traffic comes from)
+      index @1 :UInt8;     # 1 nearest
+      approach @2 :UInt8;  # its approach's index in the control's junctionInfo.approaches
+      rSeen @3 :Float32;   # m seen down it from our conflict point, less v_c T_LAT (at the go position once going)
+      rReq @4 :Float32;    # m it needs (all-way or two-way)
+      binding @5 :Text;    # what ended its reach walk (stop_rules.reach_walk_why), or why it isn't walked
+      shielded @6 :Bool;   # a vehicle stopped at its line satisfies it (section 2.3)
+    }
+    state @0 :State;
+    reason @1 :Text;          # what it waits for, or why it goes, or its fault
+    ledger @2 :Ledger;
+    wouldGo @3 :Bool;         # every go condition held CLEAR_S and our turn: what auto would do (logged in shadow)
+    maneuver @4 :Text;        # straight, left, right or unknown (off the route)
+    lanes @5 :List(Lane);
+    arrivalRank @6 :UInt8;    # earlier arrivals still to go before us
+    dEdgeMin @7 :Float32;     # m from the stop point to the closest plausible edge of the first conflicting lane
+    dEdgeMax @8 :Float32;     # ...and to its farthest plausible edge
+    committed @9 :Bool;
+    inLane @10 :Bool;
+    retries @11 :UInt8;       # goes withdrawn this encounter
+    creptM @12 :Float32;      # m the car moved on from where it latched (a roll-up)
+    sideViewsLive @13 :Bool;  # the side views run (turnpilotDetections.sideViewStatus running or noRoom, fresh)
+    mapsValid @14 :Bool;      # the side views' maps match the calibration (sideViewStatus not mapsStale)
+    mode @15 :Mode;           # TurnPilotStopSignGo as acted on: auto without its data acts as shadow (H4, H8)
+    clearS @16 :Float32;      # s the go conditions have held
+    goT @17 :Float32;         # s since the decider's go, 0 with none
+    takeoverS @18 :Float32;   # s from the go to the model's takeover (go_override.model_takes_over held TAKEOVER_S), -1 not yet
+    withdrawn @19 :Text;      # why the last go was withdrawn ('' none)
+    positionM @20 :Float32;   # m the car's bumper is past the stop point (negative: short of it)
+    chime @21 :Bool;          # the dynamic wait's info chime is due (with waitingForCross)
+    fault @22 :Text;          # the fault in hand (H1-H8), '' none
+  }
+  stopGo @34 :StopGoStatus;
 
   # TurnPilot's turn signal (turnpilot/car_signals.py): who signals each maneuver, the car itself (a verified Tesla,
   # opendbc car_signal.py) or the driver, prompted. Named TurnSignal, not CarSignal, to keep it apart from opendbc's
@@ -282,7 +393,7 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     armM @8 :Float32;           # m before the maneuver the current turn armed at (lead plus ARM_LAG_S travel)
     why @9 :Text;               # the status's reason, one line (unverified, unavailable, failed)
   }
-  turnSignal @32 :TurnSignal;   # renumber at merge with tp/integrate (where goCertified holds @32)
+  turnSignal @35 :TurnSignal;   # renumber at merge with tp/integrate (tp/blinker's; e639725 ends at stopGo @34)
 }
 
 struct TurnpilotDetections @0xaedffd8f31e7b55d {
@@ -329,6 +440,7 @@ struct TurnpilotDetections @0xaedffd8f31e7b55d {
     wideCamera @2;   # this run was on the wide camera; the paint is only read on the road camera
     noModel @3;      # no modelV2 for this very frame yet, or no device type to pick the lens
     disabled @4;     # the paint failed earlier and is off for the drive, or modeld has no road camera
+    sweep @5;        # a stop sweep runs (turnpilotPlan.detectorView): no paint read
   }
   lanePaintStatus @6 :LanePaintStatus;
   lanePaintTime @7 :Float32;      # s spent reading the paint in this step, 0 when not read; executionTime is the detector's alone
@@ -342,9 +454,77 @@ struct TurnpilotDetections @0xaedffd8f31e7b55d {
     noCalibration @3;  # no calibration yet, so no horizon to gate the boxes by: nothing read
     disabled @4;     # the reader failed or ran over its budget earlier and is off for the drive
     off @5;          # TurnPilotCameraLights off, or modeld has no road camera
+    sweep @6;        # a stop sweep runs with no signal mapped within SWEEP_SIGNAL_M (60 m): no colour read (lightBoxes are)
   }
   lightStatus @9 :LightStatus;
   lightTime @10 :Float32;         # s spent reading the lights in this step, 0 when not read
+  # DESIGN phase 4 G5, the far crop (detector/graph.py Crop): a native-resolution window of the road camera's frame, run on
+  # the model frames between the full pass's runs and published apart (turnpilotFarDetections), its run a TurnpilotDetections
+  # of the road camera with view far: boxes in the road camera's full-frame pixels, so they range with its lens
+  enum View {
+    full @0;         # the whole camera frame, letterboxed (turnpilotDetections); with camera road it is the sweep's road slot
+    far @1;          # the far crop (turnpilotFarDetections.run)
+    # STOP_SIGNS.md section 1.3, the stop sweep's side views (detector/sideview.py): a level pinhole at yaw 75 deg left or
+    # right of the calibrated forward axis, f 904 px, 768x512, gathered from the wide frame; camera wide, boxes mapped back
+    # to the wide camera's fisheye pixels
+    sideLeft @2;
+    sideRight @3;
+  }
+  view @11 :View;
+  enum FarStatus {
+    unset @0;          # a log from before the field
+    read @1;           # the far crop ran within FAR_STATUS_S
+    off @2;            # TurnPilotFarCrop off, no far pkl for this device, or no road camera
+    disabled @3;       # it failed, or ran over its budget or the step's: off for the drive (logged, said once)
+    noCalibration @4;  # no calibrated horizon to aim it by yet
+    noRoom @5;         # on, but no frame between the full runs had room for it within FAR_STATUS_S
+    sweep @6;          # on, suspended while a stop sweep runs (its frames are the side views')
+  }
+  farStatus @12 :FarStatus;  # the full pass's messages say what the far crop is doing
+  # STOP_SIGNS.md SG3a. Stop signs (COCO 11), decoded apart like the lights and never into detections: in shadow
+  # (TurnPilotCameraStopSigns), read by no stop, cap or release; the luma below each, for labelling all-way plaques
+  struct Sign {
+    box @0 :Detection;             # full-frame pixels of this run's camera
+    plaque @1 :Data;               # luma (0-255, the camera's own range), row-major, plaqueW x plaqueH, subsampled
+    plaqueW @2 :UInt16;
+    plaqueH @3 :UInt16;
+    plaqueRect @4 :List(Float32);  # x0, y0, x1, y1 of the plaque crop in full-frame pixels
+  }
+  signs @13 :List(Sign);
+  # Image quality per 5 deg of bearing on a side view's horizon band (STOP_SIGNS.md section 1.3; detector/sideview.py
+  # SectorQuality), on that view's messages: anything but ok has zero reach
+  struct Sector {
+    enum Quality {
+      unknown @0;
+      ok @1;
+      degraded @2;   # contrast ratio under 0.5 of the full wide frame's 10-35 deg band
+      washed @3;     # 5th-percentile lift over 50 DN with contrast under 0.35, or 30% of pixels saturated
+      dark @4;       # median luma under the dark threshold
+      frozen @5;     # no frame-to-frame change over the noise floor for 1.0 s
+      blocked @6;    # half its pixels static and dark
+    }
+    inner @0 :Float32;   # deg left of the calibrated forward axis of its edge nearer the axis (a right one's negative)
+    outer @1 :Float32;   # ...and of its edge farther out
+    quality @2 :Quality;
+  }
+  sectorQuality @14 :List(Sector);
+  # What the side views are doing, on every message: the stop-sign decider counts a side view's freshness only while the
+  # gate runs them (running, noRoom)
+  enum SideViewStatus {
+    unset @0;          # a log from before the field
+    off @1;            # no side-view pkl for this device, or no wide camera
+    idle @2;           # no stop sweep asked for
+    running @3;        # a sweep at or under SIDE_VIEW_V_MAX: the odd steps alternate the side views
+    speedGated @4;     # a sweep above SIDE_VIEW_V_MAX: the odd steps idle, no side view
+    noCalibration @5;  # no calibration to map the views by yet
+    mapsStale @6;      # the calibration moved more than 0.3 deg from the maps': invalid until they are recomputed
+    noRoom @7;         # running, but no side view had room within SIDE_STATUS_S
+    disabled @8;       # failed or overran: off for the drive (sideCamerasOff, said once)
+  }
+  sideViewStatus @15 :SideViewStatus;
+  lightBoxes @16 :List(Detection);  # every forward run's traffic light boxes (COCO 9), read or not: a signal head at a junction
+  lens @17 :Text;                   # the wide lens a side view was mapped with (ranging.Lens.spec); empty on forward runs
+  sectorTime @18 :Float32;          # s spent on sectorQuality in this step
 }
 
 struct TurnpilotScene @0xf35cc4560bbf6ec2 {
@@ -369,6 +549,11 @@ struct TurnpilotScene @0xf35cc4560bbf6ec2 {
     inPath @8 :Bool;    # inside the planned driving corridor
     camera @9 :TurnpilotDetections.Camera;
     box @10 :List(Float32);  # x0, y0, x1, y1 normalized 0-1 in that camera's frame, for the UI
+    view @11 :TurnpilotDetections.View;  # the pass of its last match: far for the far crop (its camera is road)
+    farHits @12 :UInt32;     # matches in the far crop; age counts the full pass's alone (a hard stop's confirmation reads age)
+    # STOP_SIGNS.md 1.3: the camera time of its last match (TurnpilotDetections.timestampEof, s), the stop-sign evidence's
+    # clock (never turnpilotd's). view above is the pass of that match: sideLeft or sideRight for a side view's
+    tSeen @13 :Float64;
   }
   available @0 :Bool;          # false when detections are stale; never read as "nothing there"
   objects @1 :List(TrackedObject);
@@ -405,7 +590,14 @@ struct TurnpilotLights @0xda96579883444c35 {
   shadow @2 :Bool;   # source camera: logged by turnpilotd, never acted on (TurnPilotCameraLights shadow)
 }
 
-struct CustomReserved4 @0x80ae746ee2596b11 {
+struct TurnpilotFarDetections @0x80ae746ee2596b11 {
+  # The far crop's run (DESIGN phase 4 G5; detector/modeld_detector.py FarCrop), published by modeld on the model frames
+  # between the full pass's runs. Its own service, so the full pass's stream (turnpilotDetections: the scene's freshness,
+  # turnpilotd's detector deadline, the lane paint) is untouched by it.
+  run @0 :TurnpilotDetections;  # camera road, view far; detections in the road camera's full-frame pixels; lights its class-9
+                                # heads (a reader of its own, shadow unless TurnPilotCameraLights is addOnly)
+  crop @1 :List(Float32);       # x0, y0, x1, y1 of the crop, road camera full-frame pixels
+  bearing @2 :Float32;          # the aim it was given (turnpilotPlan.farCropBearing), deg left of the calibrated forward axis
 }
 
 struct CustomReserved5 @0xa5cd762cd951a455 {

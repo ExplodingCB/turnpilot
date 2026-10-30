@@ -421,3 +421,139 @@ def test_raw_boxes_of_every_run_with_bearing_and_range():
   d = detections(trk, 'wide', 1.3, [(CAR, 20., 3.6, 0.5)], frame_id=3)
   trk.update(d, cal, car_state(), now=1.3)
   assert trk.raw.camera == 'wide' and trk.raw.boxes[0].camera == 'wide' and abs(trk.raw.boxes[0].xy[0] - 20.) < 1.5
+
+
+def far_run(trk, crop, t, objects, frame_id=0, bearing=0.):
+  """A turnpilotFarDetections reader as modeld publishes it: objects (cls, x, y, conf) standing at ground points, their
+  boxes in the road camera's frame taken into the crop's input pixels and back out through decode_far (graph.Crop)."""
+  from openpilot.selfdrive.turnpilot.detector.decoder import decode_far, fill_far
+  raw = np.zeros((1, 300, 6), np.float32)
+  for i, (cls, x, y, conf) in enumerate(objects):
+    x0, y0, x1, y1 = box(trk, 'road', cls, x, y)
+    raw[0, i] = [*crop.to_input(x0, y0), *crop.to_input(x1, y1), conf, cls]
+  msg = messaging.new_message('turnpilotFarDetections')
+  fill_far(msg.turnpilotFarDetections, decode_far(raw, crop), crop, bearing, frame_id, int(t * 1e9), 0.006)
+  return msg.as_reader().turnpilotFarDetections
+
+
+def far_crop_at_horizon(trk, x0=None):
+  """The far crop with the calibrated horizon straight ahead at its FAR_HORIZON_ROW (as modeld aims it), or at column x0."""
+  from openpilot.selfdrive.turnpilot.detector.graph import FAR_HORIZON_ROW, Crop, crop_at
+  u, v = trk.lenses['road'].project(calib_from_view(RPY).T @ np.array([1., 0., 0.]))
+  crop = crop_at(1344, 760, u, v)
+  return crop if x0 is None else Crop(1344, 760, x0, crop.y0), v - FAR_HORIZON_ROW
+
+
+def test_far_boxes_at_120_to_220_m_range_and_bear_as_the_road_cameras():
+  # DESIGN phase 4 G5: the far crop's boxes, in the road camera's full-frame pixels by the crop's offset, range and bear with
+  # the road lens exactly as a full pass box at the same pixels would. At 220 m one pixel of box bottom is about 30 m, so
+  # this is to the centimetre, never a tolerance a pixel's error could pass
+  trk = SceneTracker(CAMS, 'mici')
+  cal = calibration()
+  for i, x0 in enumerate((288, 352, 416)):
+    crop, _ = far_crop_at_horizon(trk, x0)
+    assert crop.x0 > 0 and crop.y0 > 0
+    for k, (x, y) in enumerate([(120., 3.6), (150., 7.2), (180., 3.6), (200., -3.6), (220., 10.8)]):
+      t = 1. + i + 0.1 * k
+      fd = far_run(trk, crop, t, [(CAR, x, y, 0.4)], frame_id=10 * i + k)
+      trk.update_far(fd, cal, now=t)
+      assert trk.raw_far_new and trk.raw_far.view == 'far' and trk.raw_far.camera == 'road' and abs(trk.raw_far.t - t) < 1e-6
+      (b,) = trk.raw_far.boxes
+      assert b.view == 'far' and b.camera == 'road' and b.cls == 'car' and abs(b.conf - 0.4) < 1e-6
+      assert b.xy is not None and abs(np.hypot(*b.xy) - np.hypot(x, y)) < 0.05, (x0, x, y, b.xy)
+      assert abs(b.xy[1] - y) < 0.01 and abs(b.bearing_deg - np.degrees(np.arctan2(y, x))) < 0.002
+      assert b.near_m is not None and b.near_m < np.hypot(x, y)  # its nearest plausible range: never further
+  # the crop's horizon bearings: what the far run covers, straight ahead between them
+  lo, hi = trk.raw_far.cover_deg
+  assert lo < 0. < hi and abs((hi - lo) - 2 * np.degrees(np.arctan2(320, CAMS.narrow_road.focal_length))) < 0.5
+
+
+def test_far_run_cover_needs_the_horizon_inside_the_crop():
+  from openpilot.selfdrive.turnpilot.detector.graph import Crop
+  trk = SceneTracker(CAMS, 'mici')
+  cal = calibration()
+  crop, _ = far_crop_at_horizon(trk)
+  trk.update_far(far_run(trk, crop, 1., []), cal, now=1.)
+  assert trk.raw_far.cover_deg is not None and trk.raw_far.boxes == []
+  low = Crop(1344, 760, crop.x0, 760 - 384)  # the horizon above the crop's top rows: it sees the road near the car only
+  trk.update_far(far_run(trk, low, 1.1, [], frame_id=1), cal, now=1.1)
+  assert trk.raw_far_new and trk.raw_far.cover_deg is None
+  # no calibration: nothing ranged, no cover
+  trk.update_far(far_run(trk, crop, 1.2, [(CAR, 150., 3.6, 0.5)], frame_id=2), None, now=1.2)
+  assert trk.raw_far.cover_deg is None and trk.raw_far.boxes == []
+
+
+def test_far_matches_tag_tracks_and_never_feed_confirmation():
+  # a far match tags the track (view far, farHits) and nothing else: no new track, no hit (TrackedObject.age is a hard
+  # stop's confirmation: scene_policy), no Kalman update, no time seen, no freshness. A far run alone never makes the
+  # scene available, never starts a track
+  trk = SceneTracker(CAMS, 'mici')
+  cal = calibration()
+  for k in range(3):
+    trk.update(detections(trk, 'road', 1. + 0.1 * k, [(CAR, 60., 3.6, 0.8)], frame_id=k), cal, car_state(), now=1. + 0.1 * k)
+  (car,) = trk.published()
+  hits, x, t_seen, key, recv = car.hits, car.x.copy(), car.t_seen, trk.last_key, trk.last_recv
+  crop, _ = far_crop_at_horizon(trk)
+  trk.update_far(far_run(trk, crop, 1.25, [(CAR, 60., 3.6, 0.8), (PERSON, 70., -3., 0.9)], frame_id=10), cal, now=1.25)
+  assert car.far_hits == 1 and car.view == 'far' and len(trk.tracks) == 1  # the person: no track from a far run
+  assert car.hits == hits and np.array_equal(car.x, x) and car.t_seen == t_seen and trk.last_key == key and trk.last_recv == recv
+  trk.update_far(far_run(trk, crop, 1.25, [(CAR, 60., 3.6, 0.8)], frame_id=10), cal, now=1.3)
+  assert car.far_hits == 1 and not trk.raw_far_new  # the same run again: nothing new
+  msg = messaging.new_message('turnpilotScene')
+  trk.update(None, cal, car_state(), now=1.3)
+  trk.fill_scene(msg.turnpilotScene)
+  (o,) = msg.as_reader().turnpilotScene.objects
+  assert str(o.view) == 'far' and o.farHits == 1 and o.age == hits and str(o.camera) == 'road'
+  # the full pass matching it again: view full
+  trk.update(detections(trk, 'road', 1.35, [(CAR, 60., 3.6, 0.8)], frame_id=4), cal, car_state(), now=1.35)
+  assert car.view == 'full' and car.hits == hits + 1 and car.far_hits == 1
+  # far runs alone: nothing tracked, never available
+  fresh = SceneTracker(CAMS, 'mici')
+  for k in range(10):
+    fresh.update_far(far_run(fresh, crop, 2. + 0.1 * k, [(PERSON, 10., 0., 0.9)], frame_id=k), cal, now=2. + 0.1 * k)
+    assert fresh.update(None, cal, car_state(), now=2. + 0.1 * k) == [] and not fresh.available
+  assert fresh.tracks == [] and fresh.raw is None and fresh.raw_far is not None
+
+
+def test_stop_signs_never_become_tracks_or_raw_boxes():
+  # a stop sign (COCO 11) rides in the message's signs, in shadow: the tracker reads detections only, so no track, raw box,
+  # and so no stop, cap or release comes of one
+  tracker = SceneTracker(CAMS, 'mici')
+  sign = detections(tracker, 'road', 1.0, [(CAR, 12.0, 0.0, 0.8)])
+  msg = messaging.new_message('turnpilotDetections')
+  td = msg.turnpilotDetections
+  fill_detections(td, np.zeros((0, 6), np.float32), 0, int(1e9), 'road', 0.005)
+  s = td.init('signs', 1)[0]
+  d = sign.detections[0]
+  s.box.cls, s.box.conf, s.box.x0, s.box.y0, s.box.x1, s.box.y1 = 11, 0.9, d.x0, d.y0, d.x1, d.y1
+  for k in range(5):
+    tracks = tracker.update(msg.as_reader().turnpilotDetections, calibration(), car_state(0.), now=1.0 + 0.1 * k)
+  assert tracks == [] and tracker.raw is not None and tracker.raw.boxes == []
+
+
+def test_the_tracker_says_which_lens_it_uses():
+  from openpilot.selfdrive.turnpilot.scene.ranging import wide_lens
+  tracker = SceneTracker(CAMS, 'mici')
+  assert tracker.lens_spec == wide_lens(CAMS.wide_road, 'mici').spec == tracker.lenses['wide'].spec
+
+
+def test_a_forward_runs_traffic_light_boxes_come_with_their_bearing_and_elevation():
+  # the stop-sign decider's signal-head check (STOP_SIGNS.md 2.4 item 9, C20) reads RawFrame.lights: modeld publishes every
+  # forward run's class-9 boxes (lightBoxes), which no RawFrame carried, so the check never saw a head on the car. A head
+  # 25 m ahead, 1 m right, its centre 5.5 m above the road: its bearing, its elevation above the horizon and its conf
+  trk = SceneTracker(CAMS, 'mici')
+  cal = calibration()
+  lens = trk.lenses['road']
+  rot = calib_from_view(RPY, None).T
+  u, v = lens.project(rot @ np.array([25., 1., HEIGHT - 5.5]))
+  msg = messaging.new_message('turnpilotDetections')
+  fill_detections(msg.turnpilotDetections, np.zeros((0, 6), np.float32), 0, int(1e9), 'road', 0.005)
+  o, = msg.turnpilotDetections.init('lightBoxes', 1)
+  o.cls, o.conf, o.x0, o.y0, o.x1, o.y1 = 9, 0.7, float(u) - 4., float(v) - 10., float(u) + 4., float(v) + 10.
+  trk.update(msg.as_reader().turnpilotDetections, cal, car_state(), now=1.0)
+  (bearing, elevation, conf), = trk.raw.lights
+  assert abs(bearing - np.degrees(np.arctan2(-1., 25.))) < 0.1 and abs(elevation - np.degrees(np.arctan2(5.5 - HEIGHT, 25.))) < 0.1
+  assert abs(conf - 0.7) < 1e-6
+  # a run with none carries none
+  trk.update(detections(trk, 'road', 1.1, [(CAR, 20., 0., 0.6)], frame_id=1), cal, car_state(), now=1.1)
+  assert trk.raw.lights == ()

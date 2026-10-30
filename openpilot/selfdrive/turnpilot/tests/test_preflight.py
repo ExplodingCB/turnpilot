@@ -110,6 +110,23 @@ def test_detector(tmp_path):
   assert missing.status == FAIL and "no chestnut" in missing.detail
 
 
+def test_far_crop(tmp_path):
+  # DESIGN phase 4 G5: the far crop (and its measured range) are what a 45-55 mph left needs; without either the car drives,
+  # those lefts skipped and rerouted, so a warning, never a failure
+  path = tmp_path / "big_far_detector_1344x760_tinygrad.pkl"
+  missing = preflight.check_far_crop(path, 300., True)
+  assert missing.status == WARN and "missing" in missing.detail
+  path.write_bytes(b"version https://git-lfs.github.com/spec/v1\n")
+  assert preflight.check_far_crop(path, 300., True).status == WARN
+  path.write_bytes(b"\0" * 5000)
+  unmeasured = preflight.check_far_crop(path, 0., True)
+  assert unmeasured.status == WARN and "TurnPilotLeftFarRangeM" in unmeasured.detail
+  off = preflight.check_far_crop(path, 300., False)
+  assert off.status == WARN and "TurnPilotFarCrop" in off.detail
+  ok = preflight.check_far_crop(path, 300., True)
+  assert ok.status == PASS and "300 m" in ok.detail
+
+
 def test_big_model():
   assert preflight.check_big_model(True).status == PASS
   assert preflight.check_big_model(False).status == FAIL
@@ -196,7 +213,7 @@ def test_collect_runs():
   checks = preflight.collect(FakeSettings())
   names = [c.name for c in checks]
   assert len(names) == len(set(names))
-  assert {"non-release branch", "car", "alpha longitudinal", "valhalla tiles", "detector pkl", "chestnut", "pairing URL"} <= set(names)
+  assert {"non-release branch", "car", "alpha longitudinal", "valhalla tiles", "detector pkl", "far crop", "chestnut", "pairing URL"} <= set(names)
   assert all(c.status in (PASS, FAIL, WARN, INFO) for c in checks)
   assert preflight.render(checks)
 

@@ -212,3 +212,27 @@ def test_a_path_component_longer_than_a_filename_is_a_bad_pack():
   with pytest.raises(MapError) as e:
     member_path('tiles/2/' + 'a' * 300 + '.gph')
   assert e.value.code == 'bad_pack'
+
+
+SHARD = 'osm_controls/756425.json'
+
+
+def test_sidecar_shards_unpack_with_their_checksums(tmp_path):
+  """The OSM stop-sign sidecar's shards (routing/osm_sidecar.py) come in the pack beside the tiles, listed with their
+  SHA-256 like the tiles; they say nothing about where the pack covers."""
+  files = {**FILES, SHARD: b'{"osm_timestamp": "t"}'}
+  pack = unpack(tmp_path, make_pack(files, manifest_extra={'osm_timestamp': 't'}))
+  assert (pack.path / SHARD).read_bytes() == b'{"osm_timestamp": "t"}'
+  assert pack.level2 == frozenset({123456}) and pack.manifest['osm_timestamp'] == 't'
+
+
+def test_a_sidecar_shard_with_a_bad_checksum_rejects_the_pack(tmp_path):
+  files = {**FILES, SHARD: b'{}'}
+  listed = {n: hashlib.sha256(d).hexdigest() for n, d in files.items()}
+  listed[SHARD] = hashlib.sha256(b'something else').hexdigest()
+  rejected(tmp_path, make_pack(files, manifest_files=listed), f'checksum mismatch for {SHARD}')
+
+
+@pytest.mark.parametrize('name', ['osm_controls/x.json', 'osm_controls/1.txt', 'osm_controls/1/2.json', 'osm_controls/-1.json'])
+def test_only_numbered_shards_under_osm_controls(tmp_path, name):
+  rejected(tmp_path, make_pack({**FILES, name: b'{}'}), 'unexpected file')

@@ -1,6 +1,9 @@
 """turnpilotd closed loop: synthetic navd, model and scene around a point-mass car that follows the plan's limits."""
 import math
+from types import SimpleNamespace
 from unittest import mock
+
+import pytest
 
 from opendbc.car.structs import car
 import openpilot.cereal.messaging as messaging
@@ -61,6 +64,9 @@ class Sim:
     # the default) is test_turnpilotd_left's
     self.tp.auto_left = 'off'
     self.raw = None  # the detector's raw boxes (scene.tracker.RawFrame) of this frame's run, a function of the sim, or None
+    self.raw_far = None  # the far crop's run (RawFrame, view far) of this frame, a function of the sim, or None
+    self.far_status = None  # turnpilotDetections.farStatus to send each frame (a full pass message), a function of the sim
+    self.side_status = None  # turnpilotDetections.sideViewStatus to send each frame, a function of the sim
     self.lights = None  # turnpilotLights to send each frame, a function of the sim
     self.paint, self.paint_rule, self.inputs_valid = paint, paint_rule, True
     self.s, self.v, self.cruise, self.t = 0., cruise, cruise, 0.
@@ -68,6 +74,9 @@ class Sim:
     self.disengage_on_accel = disengage_on_accel
     self.big = False
     self.model_kw = {}  # synthetic.road() keywords for the model's lanes
+    self.model_holds = False  # the model holds the car (stand()): its shouldStop, no motion planned; otherwise it drives on
+    self.model = None  # (sim) -> the modelV2 to send instead of the synthetic one
+    self.accel = None  # (sim, plan) -> the car's accel instead of following the plan's limits (a planner in the loop)
     self.model_running = True  # modeld publishing modelV2 (it doesn't while it loads the detector)
     self.nav_filter = None  # (sim, instruction) -> (instruction, valid): what navd sends instead
     # the driver takes over TAKE_OVER_S after TurnPilot stops the car at an unprotected turn and hands back (no gas go:
@@ -110,15 +119,26 @@ class Sim:
                                       car_signal=self.car_signal(self) if self.car_signal is not None else None))
     self.sm.put('carControl', car_control(lat_active, engaged))
     if self.model_running:
-      self.sm.put('modelV2', model_v2(*self.model_lanes, big=self.big, **self.model_kw))
+      self.sm.put('modelV2', self.model(self) if self.model is not None else
+                  model_v2(*self.model_lanes, big=self.big, holds=self.model_holds, **self.model_kw))
     if self.lights is not None:
       self.sm.put('turnpilotLights', self.lights(self))
+    if self.far_status is not None or self.side_status is not None:
+      td = messaging.new_message('turnpilotDetections')
+      if self.far_status is not None:
+        td.turnpilotDetections.farStatus = self.far_status(self)
+      if self.side_status is not None:
+        td.turnpilotDetections.sideViewStatus = self.side_status(self)
+      self.sm.put('turnpilotDetections', td.as_reader().turnpilotDetections)
     plan = self.tp.plan(self.sm, scene(objects, available), True, self.shadow, self.driver_signals, paint=self.paint,
                         paint_rule=self.paint_rule, inputs_valid=self.inputs_valid, raw=self.raw(self) if self.raw is not None else None,
+                        raw_far=self.raw_far(self) if self.raw_far is not None else None,
                         long_control=self.long_control, disengage_on_accel=self.disengage_on_accel).as_reader().turnpilotPlan
     a = min(plan_accel(plan.accelCap, plan.speedCap, self.v), (self.cruise - self.v) / 2., 1.5)
     if plan.shouldStop:
       a = min(a, -1.)
+    if self.accel is not None:
+      a = self.accel(self, plan)
     if driver:
       a = TAKE_OVER_ACCEL  # the driver's foot, openpilot disengaged: the plan isn't applied
     self.v = max(self.v + max(a, -3.5) * DT_MDL, 0.)
@@ -1439,17 +1459,26 @@ def stop_at(sim, s_line, limit=60.):
   return sim.step()
 
 
-def test_stop_sign_on_the_route_stops_and_hands_back():
+@pytest.mark.parametrize("mode, reason, fault", [
+  ('shadow', "Stop sign: take control to proceed", 'H6'),  # STOP_SIGNS.md H6: shadow and off keep today's handback
+  ('off', "Stop sign: take control to proceed", 'H6'),
+  # auto with the shipped visibility.json (no camera measurements yet): the decider can't certify a go, so it is the
+  # same 1 s handback, saying why (STOP_SIGNS.md H4); the go itself is test_turnpilotd_stop.py's
+  ('auto', "Stop-sign go off: no camera measurements", 'H4'),
+])
+def test_stop_sign_on_the_route_stops_and_hands_back(mode, reason, fault):
   sim = Sim([(1000., "turn", "right"), (2000., "turn", "left")], controls=[(200., 'stop')])
   sim.go_taps = False
+  sim.tp.stop_sign_mode = mode
   plan = stop_at(sim, 200.)
   assert -2. < 200. - sim.s < 5.
   assert plan.shouldStop and plan.state == State.holding and plan.reason == "Stopped at stop sign"
   assert plan.mapControl.kind == 'stop' and str(plan.mapControl.action) == 'held' and plan.mapControl.controlsStatus == 'ok'
   sim.run(1.5)
   plan = sim.trace[-1][2]
-  assert plan.controlPrompt == 'stopSignTakeControl' and plan.reason == "Stop sign: take control to proceed"
+  assert plan.controlPrompt == 'stopSignTakeControl' and plan.reason == reason
   assert str(plan.mapControl.action) == 'awaitingDriver'
+  assert str(plan.stopGo.mode) == mode and plan.stopGo.fault == fault and not plan.stopGo.wouldGo
   held_s = sim.s
   sim.run(20.)
   assert sim.s - held_s < 0.05 and sim.trace[-1][2].shouldStop
@@ -1825,13 +1854,16 @@ def test_tiles_without_controls_are_said_out_loud():
 
 
 def stand(sim, seconds, **kw):
-  """The model holds the car standing for seconds, engaged (nothing in the plan does). lead_prob, lead_x: its lead."""
+  """The model holds the car standing for seconds, engaged (nothing in the plan does): its shouldStop, no motion planned.
+  lead_prob, lead_x: its lead."""
   lead, lead_x = kw.pop('lead_prob', None), kw.pop('lead_x', 30.)
   plans = []
+  sim.model_holds = True
   for _ in range(int(round(seconds / DT_MDL))):
     sim.model_kw = {} if lead is None else {'lead_prob': lead, 'lead_x': lead_x}
     sim.v = 0.
     plans.append(sim.step(engaged=True, **kw))
+  sim.model_holds = False
   return plans
 
 
@@ -1917,9 +1949,9 @@ def test_a_turn_lane_a_map_stop_leaves_no_room_for_is_skipped_out_loud_never_tur
 LEFT_AT_A_RED = [(300., "turn", "left", T_LEFT), (1500., "turn", "right", junction_of("right"))]
 
 
-def go_from_a_red(sim, s_signal=290., wait=1., limit=60.):
+def go_from_a_red(sim, s_signal=290., wait=1., limit=60., desire=Desire.turnLeft):
   """Held at the signal s_signal, red in the sim's light oracle, for wait s, then its green: the hold lets go at
-  standstill. Returns the plan that let go."""
+  standstill, pulsing desire. Returns the plan that let go."""
   sim.go_taps = False
   sim.tp.oracle_ok = True
   light = {'state': 'red'}
@@ -1937,7 +1969,7 @@ def go_from_a_red(sim, s_signal=290., wait=1., limit=60.):
     sim.step(engaged=True)
     assert sim.t < limit + wait + 5.
   plan = sim.trace[-1][2]
-  assert plan.desire == Desire.turnLeft  # the go pulse, at standstill
+  assert plan.desire == desire  # the go pulse, at standstill
   return plan
 
 
@@ -2478,3 +2510,150 @@ def test_the_no_move_limit_is_a_param_for_the_sweep():
   assert tp.no_move_limit == 20.
   tp.start_post_go(left, 9., 0., True)
   assert tp.no_move_limit == LEFT_NO_MOVE_S
+
+
+def test_side_cameras_going_off_is_said_once():
+  # STOP_SIGNS.md row E9: modeld turns the side views off for the drive when they overrun (sideViewStatus disabled): said
+  # once (controlAlert sideCamerasOff, a status line, about ABORT_HOLD_S) and logged, never again for the drive
+  sim = Sim([(3000., "turn", "right")])
+  sim.side_status = lambda sim: 'disabled' if sim.t >= 2. else 'running'
+  with mock.patch('openpilot.selfdrive.turnpilot.turnpilotd.cloudlog.event') as event:
+    sim.run(8.)
+  plans = [p for _, _, p in sim.trace]
+  said = [i for i, p in enumerate(plans) if str(p.controlAlert) == 'sideCamerasOff']
+  assert said and abs(said[0] * DT_MDL - 2.) < 0.1 and said == list(range(said[0], said[0] + len(said)))
+  assert abs(len(said) * DT_MDL - ABORT_HOLD_S) < 0.11
+  assert [c.args[0] for c in event.call_args_list].count('turnpilot.side_cameras_off') == 1
+
+
+def test_a_far_crop_suspended_for_a_stop_sweep_is_on_at_route_time_but_not_reading():
+  # a sweep suspends G6's far crop (farStatus sweep): route time still counts it on, so a 45-55 mph left beyond a stop
+  # isn't skipped for it; the left itself needs it reading
+  sim = Sim([(3000., "turn", "right")])
+  sim.far_status = lambda sim: 'sweep'
+  sim.run(1.)
+  assert sim.tp.far_live(route=True) and not sim.tp.far_live()
+
+
+class RecordingTracker:
+  """A SceneTracker stand-in that records every detector run handed to it, by frameId, once each."""
+  def __init__(self):
+    self.frames, self.tracks, self.raw_by_view, self.new_views, self.new_runs, self.coast_s = [], [], {}, set(), [], 0.5
+    self.raw = self.raw_far = None
+    self.raw_new = self.raw_far_new = self.available = False
+
+  def update(self, det, *a, **k):
+    if det is not None and (not self.frames or self.frames[-1] != det.frameId):
+      self.frames.append(det.frameId)
+    return []
+
+  def update_runs(self, runs, *a, **k):
+    for d in runs:
+      self.update(d)
+    return []
+
+  def update_far(self, *a, **k):
+    pass
+
+  def fill_scene(self, scene, tracks=None):
+    scene.available = False
+
+
+def test_E13_no_detector_message_lost_at_20_hz_out_of_phase():
+  # STOP_SIGNS.md 1.3, E13: modeld publishes turnpilotDetections at 20 Hz, a view a step, and turnpilotd's 20 Hz loop isn't
+  # in step with it: with modeld's phase just under a poll's and a few ms of jitter, two runs land between some polls and
+  # none between others. A conflated socket keeps the latest only, so a run (a side view's, say) is lost; turnpilotd's own
+  # socket, drained, hands the tracker every one, in camera-time order
+  from openpilot.selfdrive.turnpilot.detector.decoder import fill_detections
+  from openpilot.selfdrive.turnpilot.tests import test_turnpilotd_main as tm
+  frames, period, phase = 60, DT_MDL, 0.049
+  views = ['full', 'sideLeft', 'full', 'sideRight']
+
+  def run_msg(k):
+    m = messaging.new_message('turnpilotDetections')
+    fill_detections(m.turnpilotDetections, [], k, int((k * period + phase) * 1e9), 'wide', 0.005)
+    m.turnpilotDetections.view = views[k % 4]
+    return m.as_reader().turnpilotDetections
+  published = [(k * period + phase + 0.003 * math.sin(1.7 * k), run_msg(k)) for k in range(frames)]
+
+  class Bus(tm.LoopSM):
+    def __init__(self, *a, **k):
+      super().__init__(*a, **k)
+      self.seen['turnpilotDetections'], self.batch = True, []
+
+    def update(self, timeout):
+      super().update(timeout)
+      t, prev = self.frame * period, (self.frame - 1) * period
+      self.batch = [m for tp, m in published if prev < tp <= t]
+      if self.batch:
+        self.data['turnpilotDetections'] = self.batch[-1]  # SubMaster's conflated socket: the latest
+      self.updated['turnpilotDetections'] = bool(self.batch)
+
+    def drain(self):
+      return [tm.SimpleNamespace(valid=True, turnpilotDetections=m) for m in self.batch]
+
+  tracker = RecordingTracker()
+  with mock.patch.object(tm, 'LoopSM', Bus):
+    tm.run_main(frames=frames, tracker=tracker)
+  sent = [m.frameId for tp, m in published if tp <= (frames - 1) * period]
+  batches = [sum(1 for tp, _ in published if (j - 1) * period < tp <= j * period) for j in range(frames)]
+  assert max(batches) == 2 and 0 in batches[1:]  # the phase really does put two runs between some polls
+  assert tracker.frames == sent  # every run, once each, in camera-time order
+
+
+def sweep_trace(sim, seconds):
+  out = []
+  for _ in range(int(seconds / DT_MDL)):
+    plan = sim.step()
+    out.append((sim.s, sim.v, str(plan.detectorView)))
+  return out
+
+
+def test_the_stop_sweep_is_asked_for_at_walking_pace_within_30_m_of_a_stop_until_passed_engaged_or_not():
+  # STOP_SIGNS.md SG3b: turnpilotd asks modeld for the held cycle (stopSweep) at every stop and yield map_controls has
+  # engaged, from 30 m before it until the car has passed it, with openpilot engaged or not (step S3's dwell is driven with
+  # it off and TurnPilot on): Sim's carControl is never enabled here; but only at or under SWEEP_V_MAX (2.0 m/s), held to
+  # SWEEP_V_OFF once asked: the held cycle halves the road camera's rate, which the approach at road speed needs at 10 Hz
+  from openpilot.selfdrive.turnpilot.junction_watch import STOP_SWEEP_M, SWEEP_PAST_M, SWEEP_V_MAX, SWEEP_V_OFF
+  sim = Sim([(1000., "turn", "right"), (2000., "turn", "left")], controls=[(200., 'stop')])
+  sim.go_taps = False
+  trace = sweep_trace(sim, 40.)
+  assert sim.v < 0.05 and 195. < sim.s < 202.
+  assert all(v == 'auto' for s, _, v in trace if s < 200. - STOP_SWEEP_M - 1.)
+  inside = [(s, ve, v) for s, ve, v in trace if s > 200. - STOP_SWEEP_M + 1.]
+  assert any(ve > SWEEP_V_OFF for _, ve, _ in inside)  # the car came into the 30 m at road speed
+  assert all(v == 'auto' for _, ve, v in inside if ve > SWEEP_V_OFF + 0.1)
+  assert all(v == 'stopSweep' for _, ve, v in inside if ve <= SWEEP_V_MAX - 0.1)
+  assert sim.tp.sweeping
+  sim.go_taps, sim.take_over_on = True, ('stopSignTakeControl',)  # the driver drives on
+  trace = sweep_trace(sim, 15.)
+  # the latch holds the control's distance while it holds the car, so the sweep ends a few metres on in the sim's frame
+  assert sim.s > 230. and all(v == 'auto' for s, _, v in trace if s > 200. + SWEEP_PAST_M + 4.) and not sim.tp.sweeping
+  assert all(v == 'auto' for _, ve, v in trace if ve > SWEEP_V_OFF + 0.1)  # pulling away: the sweep ends past SWEEP_V_OFF
+  # a yield, run through at its 5 m/s: never at walking pace, so never swept (the watch still logs it)
+  sim = Sim([(1000., "turn", "right"), (2000., "turn", "left")], controls=[(200., 'yield')])
+  trace = sweep_trace(sim, 40.)
+  assert min(ve for s, ve, _ in trace if 180. < s < 199.) > SWEEP_V_OFF and all(v == 'auto' for *_, v in trace)
+  # a signal never sweeps
+  sim = Sim([(1000., "turn", "right"), (2000., "turn", "left")], controls=[(200., 'signal')])
+  assert all(v == 'auto' for *_, v in sweep_trace(sim, 40.))
+
+
+def test_a_stop_approached_at_road_speed_keeps_the_road_camera_at_10_hz_for_hard_brake_confirmation():
+  # SG3b skeptic (p1_confirm_rate.py): the held cycle alternates the full wide pass and the road camera on the even steps,
+  # so the road camera ran at 5 Hz from 30 m before every stop at any speed; scene_policy confirms a hard brake on
+  # CONFIRM_RECENT_HITS hits in CONFIRM_WINDOW_S, so a pedestrian 18 m ahead of a car at 9 m/s that only the road camera
+  # sees was reached at up to 7.4 m/s. Nothing asks for the sweep above walking pace: approaching at 9 m/s, the plans fed
+  # to modeld's camera choice run the road camera on every even step (10 Hz) until the car is down to SWEEP_V_MAX
+  from openpilot.selfdrive.turnpilot.detector.modeld_detector import RUN_EVERY, ModeldDetector
+  from openpilot.selfdrive.turnpilot.junction_watch import SWEEP_V_MAX
+  from openpilot.selfdrive.turnpilot.scene_policy import CONFIRM_RECENT_HITS, CONFIRM_WINDOW_S
+  sim = Sim([(1000., "turn", "right"), (2000., "turn", "left")], cruise=9., controls=[(200., 'stop')])
+  sim.go_taps = False
+  trace = sweep_trace(sim, 40.)
+  fast = [v for s, ve, v in trace if 200. - 30. < s < 200. and ve > SWEEP_V_MAX + 0.1]
+  assert len(fast) > 40
+  det = SimpleNamespace(frames={'road': 0, 'wide': 1}, wide_until=-1., sweep_runs=0, view_runs=0)
+  cams = [ModeldDetector.choose_camera(det, 0., log.Desire.none, k * RUN_EVERY * DT_MDL, v) for k, v in enumerate(fast[::RUN_EVERY])]
+  road_hz = cams.count('road') / len(cams) / (RUN_EVERY * DT_MDL)
+  assert road_hz == pytest.approx(10.) and road_hz * CONFIRM_WINDOW_S >= 2 * CONFIRM_RECENT_HITS

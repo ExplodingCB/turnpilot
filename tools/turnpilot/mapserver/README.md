@@ -23,8 +23,8 @@ Every call except `/v1/health` needs `Authorization: Bearer <key>`. The key is i
 `GET /v1/coverage`
 : Returns the fences as a GeoJSON FeatureCollection, with a `version` that changes whenever a region is rebuilt.
 
-`POST /v1/corridor` with `{"start": [lon, lat], "destination": [lon, lat]}`
-: Returns a tar of `manifest.json` and every tile within 15 km of the route, gzip-compressed, with each tile's SHA-256 in the manifest. If either end is outside the fences, or the two ends are in different regions, or Valhalla finds no route, it returns a 422 with `error` set to `outside_coverage` (with `which`), `different_regions`, or `no_route`.
+`POST /v1/corridor` with `{"start": [lon, lat], "destination": [lon, lat], "osm_controls": true}`
+: Returns a tar of `manifest.json` and every tile within 15 km of the route, gzip-compressed, with each tile's SHA-256 in the manifest. With `"osm_controls": true`, which the car sends, it also holds the OSM stop-sign sidecar's shards for those tiles (`osm_controls/<level-2 tile>.json`), listed the same way, and the manifest carries the region's `osm_timestamp`, which the car checks the shards against. A car from before the sidecar doesn't ask, and gets the tiles alone. If either end is outside the fences, or the two ends are in different regions, or Valhalla finds no route, it returns a 422 with `error` set to `outside_coverage` (with `which`), `different_regions`, or `no_route`.
 
 ## Build and deploy
 
@@ -45,6 +45,14 @@ VALHALLA_PYTHON=.venv/bin/python ~/turnpilot_data/mapbuild-venv/bin/python -I to
 ```
 
 It downloads the states from Geofabrik if they aren't in `~/turnpilot_data/osm`, and writes the region to `~/turnpilot_data/mapserver/regions/<region>`.
+
+Right after the tiles, the build writes the OSM stop-sign sidecar (`osm_controls.py`) from the same PBF: every stop sign, yield and level crossing, by the approach it governs, one shard per level-2 tile in `osm_controls/`, stamped with the region's `osm_timestamp` and listed in `index.json` beside the tiles. Valhalla misses about a quarter of the mapped stop approaches, and the car unions the sidecar's with Valhalla's (`openpilot/selfdrive/turnpilot/routing/controls.py`). To rebuild only the sidecar of a built region, from its PBF and with its timestamp, which takes about a minute for Indianapolis, run:
+
+```bash
+.venv/bin/python -I tools/turnpilot/mapserver/build_region.py indianapolis --sidecar-only
+```
+
+`deploy.sh` refuses a region whose index lists no sidecar shards.
 
 To set up a new VM (once), then copy the server and the built regions and restart it, run:
 

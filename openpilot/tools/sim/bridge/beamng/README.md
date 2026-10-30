@@ -321,9 +321,64 @@ done
 | --- | --- | --- |
 | `TurnPilotAutoLeft` | `off` (hand back at the line, G1), `announce` (hold, say whether it would go, hand back), `auto` | `auto` |
 | `TurnPilotLeftRangeM` | m, 0 to 400: the detector's proven range for oncoming traffic, from a measurement; a left whose R_req is past it is skipped at route time | `0.0` (unmeasured: every autonomous left skipped and rerouted) |
+| `TurnPilotLeftFarRangeM` | m, 0 to 400: the far crop's proven range (below); while the far crop reads it extends the reach, so a 45-55 mph left (R_req 231-296 m) needs it | `0.0` (unmeasured: no left past `TurnPilotLeftRangeM`) |
+| `TurnPilotFarCrop` | the far crop on (`1`) or off (`0`) in modeld | `1` (runs when its pkl is in `selfdrive/turnpilot/models`) |
 
-Without G5's bounded go the model may hold the car at its go (G0: 14 of 24 tapless goes stood); then the go is withdrawn
-after 1.0 s and handed back (`cantStartTakeControl`), which the score fails as a stall.
+The far crop (DESIGN phase 4 G5): modeld runs a 640x384 window of the road frame at native resolution (twice the full pass's
+pixel density) on the frames between the full pass's runs, aimed up the oncoming approach while a left is in hand
+(`turnpilotPlan.farCropBearing`), published as `turnpilotFarDetections`; the full pass's messages say what it is doing
+(`farStatus`). An R_req past `TurnPilotLeftRangeM` is judged on its runs too: one covering the band past that range every
+0.3 s, and any car it sees in the band blocks at any range. It going off for the drive is said once (`farViewOff`) and a left
+needing it hands back at its line (`farOff`). `unprotectedLeft.farNeeded`, `farRangeM` and `farBlockers` log it. In the sim
+it sees BeamNG's frames; its range there is no measure of the car's.
+
+The model may hold the car at its go (G0: 14 of 24 tapless goes stood). G5's bounded go (next section) lifts that hold;
+with `TurnPilotGoOverride` off, or a go the car doesn't follow, the go is withdrawn and handed back (`cantStartTakeControl`),
+which the score fails as a stall.
+
+## Bounded go (G5)
+
+TurnPilot's go from a standstill (a turn its hold let go of, or the autonomous left's go) is certified to plannerd
+(`turnpilotPlan.goCertified`, cause `turnRelease` or `unprotectedLeft`, `selfdrive/turnpilot/go_override.py`). For it the
+longitudinal planner lifts the model's standstill hold: the e2e candidate goes to +0.5 m/s^2 at most and its shouldStop is
+dropped, for 3 s at most, under 3 m/s, and only while nothing else holds the car (no lead within 15 m, no TurnPilot hold,
+the mpc and cruise candidates not holding, no pedal). Lead, cruise and TurnPilot's caps stay in the min(). The lift ends
+once the model takes over (its shouldStop false and its planned speed 0.5 m/s or more from 1 s to 2 s ahead, held 0.3 s),
+and at once on a brake or gas press, a road user in the path within 15 m (a track or a raw box), a lead, a hold, or the
+go withdrawn. Alone it moves the car 2.25 m at most, at 1.5 m/s at most.
+
+A `turnRelease` go (a turn TurnPilot's own hold let go of: its walker cleared, its red went green) certifies only that
+TurnPilot's blocker left the path, never why the model still holds the car, so it rests on its junction's own
+certification, as the left's go rests on its gap: the junction's signal read green by an accepted source (here the light
+oracle), checked at the go and on every frame of it (`turnpilot.go_not_certified` why `light`, `turnpilot.go_end` reason
+`light`). The camera's shadow reader never certifies one (its red or yellow keeps one off), and with no signal mapped at
+the junction there is none (`RELEASE_UNSIGNALIZED` in `turnpilotd.py`). On the car, where no light source is accepted,
+a walker clearing at a signal is the model's go or the no-move handback, as before G5. Nor is a `turnRelease` ever
+certified for a turn across the oncoming road (its go is the left's, on its gap) or for a far-side turn released in the
+junction (why `unprotected`, `junction`): nothing the lift checks sees the lanes it crosses, and the stall's handback
+(`stalledTakeControl`) covers that stand.
+
+A go the model never takes over is withdrawn at its 3 s and handed back (`cantStartTakeControl`, the car stopped at 1.5
+m/s^2 and held): with a model that holds, the car ends about 3.0 m past its line. A go the car doesn't move on within 2.0 s
+(1.0 s for the left) is withdrawn as before. With an actuator lag over about 0.4 s the lift doesn't reach 0.3 m/s inside
+the left's 1.0 s, so the left's go is withdrawn and handed back; measure the lag (`carState.aEgo` behind
+`carControl.actuators.accel`) before relying on it. That is the total from turnpilotd's go to the wheels: the plan's hop to
+plannerd and controlsd and the CAN frame add about 0.1-0.15 s on the car to the actuator's own lag.
+
+The left's go is lifted only from its line (4.5 m or more short of the oncoming lanes: the nudge, its stop and 1.5 m), never
+from a creep, and it is followed into the oncoming lanes only by a launch: a car under 2.0 m/s with 1.5 m left to stop short
+of them is withdrawn and handed back (`turnpilot.left_not_launched`). A model that only keeps the speed the lift gave it
+satisfies the takeover predicate, and would otherwise coast across at under 1 m/s.
+
+| param | values | default |
+| --- | --- | --- |
+| `TurnPilotGoOverride` | BOOL: TurnPilot's go certified for the planner's lift | `1` (on); a build that doesn't know the key is on |
+
+The planner logs `longitudinalPlan.turnpilotGoLift` (lifted this frame) and `turnpilotGoEnd` (why the last lift ended:
+`window`, `takeover`, `speed`, `driver`, `lead`, `holder`, `modelBrake`, `withdrawn`, `replaced`; it keeps the last go's
+reason until the next go starts), and cloudlog events
+`turnpilot.go_lift` and `turnpilot.go_lift_end`. turnpilotd logs `turnpilot.go_certified`, `turnpilot.go_not_certified`
+(with why), `turnpilot.go_end` and `turnpilot.go_not_moving`.
 
 ## Post-go profile sweep
 

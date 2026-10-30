@@ -49,7 +49,8 @@ BIN="$("$PY" -m valhalla print_bin_path)"
 helper() { "$PY" -I "$HERE/valhalla_tiles_helper.py" "$@"; }
 START=$SECONDS
 
-rm -rf "$OUT/tiles" "$OUT/tiles.tar" "$OUT/admin.sqlite" "$OUT/admin.osm" "$OUT/controls_built" "$OUT/controls.json"
+# osm_controls/ too: an OSM stop-sign sidecar from before is for other tiles (build_region.py and build_sim_tiles.sh rebuild it)
+rm -rf "$OUT/tiles" "$OUT/tiles.tar" "$OUT/admin.sqlite" "$OUT/admin.osm" "$OUT/controls_built" "$OUT/controls.json" "$OUT/osm_controls"
 mkdir -p "$OUT/tiles"
 
 build() {
