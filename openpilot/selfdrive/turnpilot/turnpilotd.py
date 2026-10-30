@@ -433,6 +433,12 @@ def model_lines_at(model):
           [float(s) for s in model.roadEdgeStds])
 
 
+def map_handback(mapd) -> bool:
+  """A map control's own take-control holds or explains the car this frame (its latch's handback), so the stand handbacks
+  wait. A line crossed with no go (map_controls.Driven: no hold) isn't one: a stall or a stand in it is said for what it is."""
+  return mapd.prompt in TAKE_CONTROL_PROMPTS and not mapd.driven
+
+
 def lead_corroboration(model, objects, raw) -> str:
   """What in the live scene shows modelV2's lead, '' if nothing (LEAD_CORROBORATE_M): a vehicle track in the path near its x
   (scene_policy.in_path), or a vehicle box of this frame's detector run (scene.tracker.RawFrame) at it, ranged near its x
@@ -579,6 +585,10 @@ class TurnPilot:
       # the map stops' latch is position-free and outlives faults, nav gaps, reroutes and handbacks: only turning
       # TurnPilot off clears it (map_controls.py)
       self.map_controls = MapControlPolicy(self.yellow_decel)
+      # an unprotected turn's line crossed with no go of TurnPilot's (map_controls.Driven): [its maneuver id, its side, deg
+      # turned toward it since], checked at its pass for a turn driven straight through (check_driven_left)
+      self.driven_left: list | None = None
+      self.driven_checked: tuple | None = None  # ...the crossing (map_controls.Driven's key) last checked: once each
       self.lights_age = float('inf')  # s since the last turnpilotLights
       self.camera_read = None         # the camera's lights from the last road run (or a reader off), camera_light_input's
       self.camera_age = float('inf')  # s since it
@@ -814,6 +824,7 @@ class TurnPilot:
       self._take_up_dropped(upcoming, rf, v_ego, right_hand_traffic)
     self.acting = acting
     self.check_missed(rf, v_ego, acting)
+    self.check_driven_left(rf, default_yaw_rate(cs, model), v_ego, acting)
     self.track_yaw(upcoming, rf, default_yaw_rate(cs, model), v_ego)
     self.track_yaw20(default_yaw_rate(cs, model), v_ego)
 
@@ -840,7 +851,7 @@ class TurnPilot:
         stop_infeasible = True
     elif engaged and upcoming is None:
       turn = KEEP_TURN  # the route gone with the handback: it carries on, dead-reckoned
-    left_cmd = self.unprotected_left(turn, upcoming, rf, v_ego, acting, objects, raw, raw_far)
+    left_cmd = self.unprotected_left(turn, upcoming, rf, v_ego, acting, objects, raw, raw_far, enabled=bool(sm['carControl'].enabled))
     # the stop-sign decider before map_update, so its release, the end of shouldStop and its go land in one plan
     sg = self.sg_now = self.stop_go_update(sm, cs, model, v_ego, acting, objects, rf)
     # the stop-sign ladder's other turn in hand (stop_go: 7.1 rung 2, O12), or done in place of the route's turn here: the route's
@@ -1162,6 +1173,8 @@ class TurnPilot:
     fill_map_control(plan, mapd)
     self.fill_left(plan, decision)
     self.fill_stop_go(plan, sg, decision)
+    if mapd.driven and str(plan.controlPrompt) == mapd.prompt:
+      plan.reason = mapd.driven  # a line crossed with no go: said for what it is (map_controls.Driven)
     # the stop sweep at every engaged stop and yield, engaged or not, at walking pace only, the left's own view first
     # (junction_watch.py), the stop-sign decider's too while it holds or launches; the watch logs the control's whole window
     # whatever the speed. From the decider's commit point the crossing cycle (stopSweepGo) at any speed
@@ -1353,6 +1366,32 @@ class TurnPilot:
       cloudlog.event("turnpilot_turn_missed", error=True, turned_deg=round(d.turned_deg, 1), v_ego=round(v_ego, 2),
                      distance=round(rf.distance, 1))
 
+  def check_driven_left(self, rf, yaw_rate: float, v_ego: float, acting: bool) -> None:
+    """An unprotected turn whose line was crossed with no go of TurnPilot's (map_controls.Driven: the driver's gas, or an
+    overrun; owner decision (b), 2026-10-30) passed by the follower (not rerouted away from) having turned under MISSED_TURN_DEG
+    toward it since: driven straight through, so missed (turnMissed: "Turn Missed", "Rerouting", navd's reroute at once),
+    as a go missed straight on is. Last frame's crossing; yaw counted moving (YAW_MIN_SPEED)."""
+    dr = self.map_controls.driven
+    if dr is not None and dr.maneuver_id is not None and self.driven_checked != dr.key:
+      self.driven_checked = dr.key
+      side = rf.upcoming.side if rf.maneuver_id == dr.maneuver_id and rf.upcoming is not None else LEFT
+      self.driven_left = [dr.maneuver_id, side, 0.]
+    dl = self.driven_left
+    if dl is None:
+      return
+    if v_ego >= YAW_MIN_SPEED:
+      dl[2] += math.degrees(yaw_rate * DT_MDL) * dl[1]
+    if rf.maneuver_id == dl[0] and not rf.passed:
+      return
+    # passed (the follower's pass moves it on to the next maneuver that update), or gone from the route without one (navd's
+    # reroute already away from it: nothing to say)
+    self.driven_left = None
+    if acting and rf.passed and dl[2] < MISSED_TURN_DEG:
+      self.missed_t = MISSED_HOLD_S
+      self.post_go = None
+      cloudlog.event("turnpilot_turn_missed", error=True, driven=True, turned_deg=round(dl[2], 1), v_ego=round(v_ego, 2),
+                     distance=round(rf.distance, 1), passed=bool(rf.passed))
+
   def watch_far(self, sm) -> None:
     """The far crop's state from the full pass's latest farStatus: read, or off for the drive (said once, farViewOff,
     and logged). Its shadow heads are logged on every change of what they read (never acted on). The side views going off
@@ -1389,7 +1428,8 @@ class TurnPilot:
     far = self.far_live(route) and self.left_range_m > 0.
     return max(self.left_range_m, self.left_far_range_m) if far else self.left_range_m
 
-  def unprotected_left(self, turn, upcoming, rf, v_ego: float, acting: bool, objects, raw, raw_far=None) -> LeftCommand | None:
+  def unprotected_left(self, turn, upcoming, rf, v_ego: float, acting: bool, objects, raw, raw_far=None,
+                       enabled: bool = True) -> LeftCommand | None:
     """This frame's autonomous unprotected left (unprotected_left.py; left_now) for the route's unprotected turn the car is
     taking (turn, map_controls' tuple), and its command for the hold line's latch. TurnPilotAutoLeft off, or TurnPilot not
     acting (handed back): off, the latch handed back as G1's. Fed the last frame's latch and scene (whether they held)."""
@@ -1420,7 +1460,8 @@ class TurnPilot:
                     light=self.map_controls.turn_light(int(turn[0]), turn[1]), far=raw_far, far_range_m=self.left_far_range_m,
                     far_live=self.far_live(route=True),  # on: a spell without room is waited through on its runs' freshness
                     straight_m=float(upcoming.opposing_straight_m),
-                    signal_lit=self.signal_out.signal_lit, signal_veto=self.signal_out.left_veto)
+                    signal_lit=self.signal_out.signal_lit, signal_veto=self.signal_out.left_veto,
+                    enabled=enabled)
     d = self.left_now = self.left.update(inp, DT_MDL)
     return LeftCommand(mode, d.go, d.creep_m, d.state == 'undecided', d.reason)
 
@@ -1944,7 +1985,7 @@ class TurnPilot:
     in_turn = turned <= STALL_MAX_DEG and (go_turn or model_turn)
     standing = acting and in_turn and sm['carControl'].enabled and v_ego < STANDSTILL_SPEED and not decision.should_stop and \
       not self.go_withdrawn and \
-      not decision.holding and not cs.gasPressed and not cs.brakePressed and mapd.prompt not in TAKE_CONTROL_PROMPTS
+      not decision.holding and not cs.gasPressed and not cs.brakePressed and not map_handback(mapd)
     self.stall_stand_s = self.stall_stand_s + DT_MDL if standing else 0.
     lead_keeps = self.lead_held and self.stall_stand_s < LEAD_STAND_MAX_S - 1e-6
     self.stall_s = self.stall_s + DT_MDL if standing and not lead_keeps else 0.
@@ -2037,7 +2078,7 @@ class TurnPilot:
             if c is not None and abs(c.d) < STOPPED_CONTROL_M]
     unheld = acting and sm['carControl'].enabled and v_ego < STANDSTILL_SPEED and not decision.should_stop and \
       not self.go_withdrawn and \
-      not decision.holding and not lead and not cs.gasPressed and not cs.brakePressed and mapd.prompt not in TAKE_CONTROL_PROMPTS
+      not decision.holding and not lead and not cs.gasPressed and not cs.brakePressed and not map_handback(mapd)
     limit = NEAR_CONTROL_STAND_S if near else STOPPED_HANDBACK_S
     was = self.stopped_s >= limit - 1e-6
     self.stopped_s = self.stopped_s + DT_MDL if unheld else 0.

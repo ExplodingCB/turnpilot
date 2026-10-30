@@ -237,6 +237,7 @@ class LeftInput:
                                  # freshness is judged here (FAR_FRESH_S, farStale)
   straight_m: float = math.inf   # m from the junction the opposing road stays in the band straight on from our approach
                                  # (navInstruction maneuverOpposingStraightM; turnpilotd passes 0 when not known)
+  enabled: bool = True           # openpilot engaged (carControl.enabled): disengaged (the driver's pedal) it never goes
 
 
 @dataclass
@@ -628,7 +629,9 @@ class UnprotectedLeft:
 
     crept = self.latch_d - inp.distance
     creep_max = min(CREEP_MAX_M, max(self.latch_d - (ONCOMING_ENTRY_M + CREEP_SHORT_M), 0.))
-    if certified:
+    if certified and inp.enabled:
+      # never while openpilot is disengaged (the driver's pedal): a go then would let go of the latch under the driver, a
+      # crossing nobody certified (owner decision (b), 2026-10-30). The window goes on counting: re-engaged, it goes on it
       return self._go(inp, out, rreq)
     if blocked_view and not self.blocked and not self.hold_here and not held_else:
       self.creep_to = creep_max

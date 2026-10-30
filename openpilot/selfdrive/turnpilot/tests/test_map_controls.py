@@ -5,7 +5,8 @@ import pytest
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_ACCEL_MIN, plan_accel
-from openpilot.selfdrive.turnpilot.map_controls import (COMMIT_SPEED, STOP_SIGN_HANDBACK_S, GREEN_STEADY_S, LIGHT_STALE_S, MAP_DECEL_MAX, NO_LIGHTS,
+from openpilot.selfdrive.turnpilot.map_controls import (COMMIT_SPEED, DRIVEN_THROUGH_M, STOP_SIGN_HANDBACK_S, GREEN_STEADY_S, LIGHT_STALE_S,
+                                                         MAP_DECEL_MAX, NO_LIGHTS,
                                                          OFF_ROUTE_REASON, OFF_ROUTE_SPEED, T_LAT, UNPROTECTED, YIELD_SPEED, CameraLights,
                                                          Lights, MapControlPolicy, StopCommand, engage_distance, light_input, unprotected_turn)
 from openpilot.selfdrive.turnpilot.route_follower import make_maneuver
@@ -561,11 +562,18 @@ def test_unprotected_left_stops_before_the_hold_line_and_hands_back():
   s_held = car.s
   out, dec, _ = car.run(20.)
   assert held(out, dec) and car.s - s_held < 0.05
+  n = len(car.rows)
   drive_off(car, 2.)
   out, dec, _ = car.run(5.)
   assert not dec.should_stop and out.prompt == 'none' and out.shown.kind == 'none'
   assert car.s > 250.
-  assert not any(o.prompt == 'unprotectedTurnTakeControl' for *_, o in car.rows[-100:])  # never a second stop
+  # never a second stop; the crossing the driver made with no go is said until the car is through (DRIVEN_THROUGH_M past
+  # the line, owner decision (b)), then nothing
+  line = 250. - HOLD_LINE_M - 1.
+  after = car.rows[n:]
+  assert not any(r[4].should_stop for r in after if r[1] > line + 3.)
+  assert all(r[5].prompt == 'unprotectedTurnTakeControl' for r in after if line + 3. < r[1] < line + DRIVEN_THROUGH_M - 1.)
+  assert all(r[5].prompt == 'none' for r in after if r[1] > line + DRIVEN_THROUGH_M + 1.)
 
 
 def test_unprotected_left_approach_reason_and_engage():
@@ -1017,6 +1025,93 @@ def test_a_hold_turnpilot_moved_on_and_then_handed_back_is_never_let_go_with_no_
     assert all(held(out, dec) for out, dec, _ in rows[int(STOP_SIGN_HANDBACK_S / DT_MDL) + 1:]), stop
     assert all(out.prompt == 'stopSignTakeControl' for out, _, _ in rows[int(STOP_SIGN_HANDBACK_S / DT_MDL) + 1:]), stop
     assert car.policy.held is not None and abs(car.s - 150.) < 0.5 and car.v < 0.3, stop
+
+
+def test_a_gas_nudge_short_of_the_line_never_lets_the_latch_go():
+  """Skeptic residual-check-1 / SG-residual-main (90c67c0, still at be3c0ed): the latch was let go as the driver's on 2.2 m
+  moved under the gas, with nothing subtracted for what TurnPilot asked and no check that the car was past the stop point. A
+  queue latch 5 m short that the decider rolls up (StopCommand wait, creep (5, 3)), nudged 2.2 m at 0.5 m/s and lifted
+  2.58 m short of the line, let go and drove on 38.7 m past at 5 m/s, prompt 'none'. Owner decision (a): let go as the
+  driver going only past the stop point by the driver's own gas, never by metres TurnPilot asked (a roll-up, a creep)."""
+  for nudge_m in (1.5, 2.2, 3.0, 4.0):
+    car = Car([(150., 'stop')], v=5.)
+    car.lead_stop = 146.5
+    car.run_until(held, stop=StopCommand('wait'))
+    target = car.policy.held_control().d
+    assert target > 3.
+    car.lead_stop = None
+    wait = StopCommand('wait', '', 'creeping')
+    car.run(0.5, stop=wait, creep=(target, 3.0))  # the roll-up under way
+    s0 = car.s
+    while car.s < s0 + nudge_m:
+      car.step(gas=True, accel=0.4 if car.v < 0.5 else 0., stop=wait, creep=(target, 3.0))
+    assert car.s < 150., nudge_m
+    assert car.policy.held is not None, f"let go {150. - car.s:.2f} m short of the line by a {nudge_m} m gas nudge"
+    rows = [car.step(stop=wait, creep=(target, 3.0)) for _ in range(int(10. / DT_MDL))]
+    assert car.policy.held is not None and car.s <= 150.3 and car.v < 0.05, nudge_m  # rolled up to the line, held there
+    assert any(dec.should_stop for _, dec, _ in rows[-20:]) and getattr(car.policy, 'driven', None) is None, nudge_m
+  # the left's creep for a view asked 4 m; the driver's gas moves the car 2.2 m inside that ask, past the hold line: still
+  # TurnPilot's, held (skeptic: 2.63 m past the line, let go)
+  car = left_car()
+  held_left(car, left_cmd(reason="Waiting for a gap"))
+  line = car.s
+  creep = left_cmd(creep_m=4., reason="Creeping for a view")
+  run_left(car, 1., creep)
+  s0 = car.s
+  while car.s < s0 + 2.2:
+    car.step(gas=True, accel=0.4 if car.v < 0.6 else 0., left=creep)
+  assert car.s - line > 2. and car.policy.held is not None, f"let go {car.s - line:.2f} m past the line inside a 4 m creep"
+  out, dec, _ = run_left(car, 5., creep)
+  assert held(out, dec) and car.policy.driven is None and car.s - line < 4.3
+
+
+def test_a_line_crossed_under_the_drivers_gas_is_said_until_the_car_is_through():
+  """Owner decision (b), 2026-10-30 (skeptic SG-residual-main): the driver's gas taking the car past a stop line, or a left's
+  hold line, with no go of TurnPilot's let the latch go and left the crossing silent: re-engaged, the car drove through the
+  junction with no check and no prompt. Now its take-control (stopSignTakeControl, unprotectedTurnTakeControl) and its
+  reason stay up, engaged or not, until the car is DRIVEN_THROUGH_M past the stop point, a re-engage inside the junction
+  hearing it again; nothing holds or brakes the car for it. The same for a stop sign overrun on the approach."""
+  for kind in ('stop', 'left'):
+    if kind == 'left':
+      car = left_car()
+      held_left(car, left_cmd(reason="Waiting for a gap"))
+      line, cmd, prompt = 250. - HOLD_LINE_M - 1., {'left': left_cmd(reason="Waiting for a gap")}, 'unprotectedTurnTakeControl'
+      reason = "Unprotected left not checked: take control"
+    else:
+      car = Car([(150., 'stop')])
+      car.run_until(held, stop=StopCommand('wait'))
+      line, cmd, prompt = 150., {'stop': StopCommand('wait')}, 'stopSignTakeControl'
+      reason = "Stop sign passed unchecked: take control"
+    while car.s < line + 3.:  # the driver crawls past the line under the gas (openpilot disengaged), and lifts
+      car.step(gas=True, accel=0.4 if car.v < 1. else 0., **cmd)
+    assert car.policy.held is None, kind
+    rows = []
+    while car.s < line + DRIVEN_THROUGH_M + 5.:  # re-engaged rolling: the model drives on through the junction
+      rows.append((car.s,) + car.step(accel=0.5, **cmd))
+    inside = [(out, dec) for s, out, dec, _ in rows if s < line + DRIVEN_THROUGH_M - 0.5]
+    assert inside and all(out.prompt == prompt and out.driven == reason for out, _ in inside), kind
+    assert not any(dec.should_stop or dec.speed_cap < car.v - 1. for _, dec in inside), kind  # said, never held
+    assert all(out.prompt == 'none' and not out.driven for s, out, _, _ in rows if s > line + DRIVEN_THROUGH_M + 0.5), kind
+  # a gas nudge, then the car rolling on past the latch's reach (no gas: a coast, a creep mode): the driver's gas moved it,
+  # so it is theirs, never a hold in the crossing lanes on a re-engage; said the same
+  car = Car([(150., 'stop')])
+  car.run_until(held, stop=StopCommand('wait'))
+  s0 = car.s
+  while car.s < s0 + 0.5:
+    car.step(gas=True, accel=0.4, stop=StopCommand('wait'))
+  while car.s < 150. + 3.5:
+    car.step(accel=0. if car.v > 0.3 else 0.2, stop=StopCommand('wait'))  # disengaged: the plan isn't applied
+  out, dec, _ = car.step(stop=StopCommand('wait'))
+  assert car.policy.held is None and not dec.should_stop and out.prompt == 'stopSignTakeControl'
+  # overrun on the approach: the driver's gas over the line, lifting past the latch's reach
+  car = Car([(200., 'stop')], v=1.5, cruise=1.5)
+  car.s = 180.
+  car.run_until(lambda out, dec: out.stops)
+  car.run_until(lambda out, dec: car.s > 203., gas=True, accel=0.)
+  out, dec, _ = car.step()
+  assert out.prompt == 'stopSignTakeControl' and out.driven == "Stop sign passed unchecked: take control" and not dec.should_stop
+  car.run_until(lambda out, dec: car.s > 200. + DRIVEN_THROUGH_M + 1., accel=0.5)
+  assert car.step()[0].prompt == 'none'
 
 
 def test_a_gas_nudge_past_a_red_and_a_re_engage_still_stops_for_the_red():

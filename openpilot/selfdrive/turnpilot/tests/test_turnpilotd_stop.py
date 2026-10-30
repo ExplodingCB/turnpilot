@@ -966,3 +966,89 @@ def test_one_decider_error_after_the_commit_never_drops_the_other_turn(tmp_path,
   assert not [k for k in range(raised, min(raised + 80, len(seen))) if seen[k][0] or seen[k][1]]
   assert all(p.accelCap >= -2. - 1e-9 for p in plans)
   assert [c for c in log.event.call_args_list if c.args[0] == 'turnpilot.stop_go_carried']
+
+
+def short_latch_nudge(tmp_path, mode, nudge_m, short=4.3):
+  """Skeptic SG-residual-main's closed loop: something ahead stops the car `short` m short of the stop line, inside the latch's
+  reach (it then clears); the driver nudges on under the gas (openpilot disengaged) nudge_m at a walking pace, still short of
+  the line, lifts and re-engages rolling. (sim, the plans after the re-engage, metres short of the line at the lift)"""
+  sim = StopSim(tmp_path, mode=mode, model='goes')
+  base = sim.planner
+
+  def planner(s, plan):
+    a = base(s, plan)
+    room = S_LINE - short - s.s
+    if s.v > 0.01 and room < 25.:
+      a = min(a, -s.v * s.v / (2. * max(room, 0.2)))
+    return a
+  sim.accel = planner
+  while not (sim.v < 0.02 and sim.s > S_LINE - 30.):
+    sim.step()
+    assert sim.t < 80.
+  sim.accel = base
+  sim.run(1.5)
+  s0 = sim.s
+  sim.engaged = False
+  sim.accel = lambda s, plan: (0.4 if s.v < 0.5 else 0.)
+  while sim.s < s0 + nudge_m:
+    sim.step(gas=True)
+  lift_short = S_LINE - sim.s
+  sim.engaged, sim.accel = True, base
+  k0 = len(sim.trace)
+  sim.run(12.)
+  return sim, sim.trace[k0:], lift_short
+
+
+@pytest.mark.parametrize("nudge_m", [2.2, 3.0])
+@pytest.mark.parametrize("mode", ['auto', 'shadow'])
+def test_a_gas_nudge_short_of_the_line_then_a_re_engage_goes_back_to_the_full_check(tmp_path, mode, nudge_m):
+  """Skeptic SG-residual-main (map_controls._held since 90c67c0): latched 4.05 m short in the decider's roll-up, a 2.2 m gas
+  nudge let the latch go 1.8 m short of the line; re-engaged rolling the car crossed it at 1.32 m/s and never stopped there,
+  shouldStop on 0 of 240 frames, prompt 'none', no go certified, 74.9 m past at 12.4 m/s (3.0 m: crossed at 0.54 m/s). The
+  shadow handback the same. A silent stop-sign run with no cross-traffic check. Owner decision (c): a re-engage short of the
+  line goes back to the full check: the car stands at the line, and under auto observes and goes on its certified stopSign
+  go; under shadow it stays held and handed back."""
+  sim, after, lift_short = short_latch_nudge(tmp_path, mode, nudge_m)
+  assert lift_short > 0.5, lift_short
+  first_past = next((k for k, (s, _, _) in enumerate(after) if s > S_LINE + 0.3), None)
+  stood = any(v < 0.05 and S_LINE - 2. < s <= S_LINE + 0.3 for s, v, _ in after[:first_past])
+  assert first_past is None or stood, f"{mode} {nudge_m}: ran the line from {lift_short:.2f} m short without standing at it"
+  plans = [p for _, _, p in after]
+  if mode == 'auto':
+    gos = [k for k, p in enumerate(plans) if str(p.goCertified.cause) == 'stopSign']
+    assert gos and first_past is not None and gos[0] < first_past, f"{nudge_m}: crossed with no certified stopSign go"
+    assert any(str(p.stopGo.state) == 'observe' for p in plans[:gos[0]])
+  else:
+    assert first_past is None and all(p.shouldStop and str(p.controlPrompt) == 'stopSignTakeControl' for p in plans[20:])
+
+
+@pytest.mark.parametrize("past", [3., 5.])
+def test_a_crawl_past_the_line_under_the_gas_is_said_through_the_junction_never_held_in_it(tmp_path, past):
+  """Skeptic SG-residual-main (owner decision (b)): latched at the line with the decider observing, the driver crawled 3-5 m
+  past under the gas and re-engaged rolling; the decider went off and the car drove through the junction with no check and
+  no prompt (its go had come while the driver drove: a go of TurnPilot's with openpilot disengaged let the latch go). Now
+  the decider never goes disengaged, the car's motion past the line under the driver lets the latch go, and that crossing is
+  said (stopSignTakeControl, "Stop sign passed unchecked") until the car is DRIVEN_THROUGH_M past the line, a re-engage in
+  the junction hearing it, never a hold of the decider's own there."""
+  from openpilot.selfdrive.turnpilot.map_controls import DRIVEN_THROUGH_M
+  sim = StopSim(tmp_path, mode='auto', model='goes')
+  run_to_line(sim)
+  sim.run(1.5)
+  assert str(sim.plans()[-1].stopGo.state) == 'observe'
+  base = sim.planner
+  sim.engaged = False
+  sim.accel = lambda s, plan: (0.4 if s.v < 1.0 else 0.)
+  k_gas = len(sim.trace)
+  while sim.s < S_LINE + past:
+    sim.step(gas=True)
+  during = [p for _, _, p in sim.trace[k_gas:]]
+  assert not any(str(p.stopGo.state) == 'going' or str(p.goCertified.cause) == 'stopSign' for p in during), "a go while the driver drove"
+  sim.engaged, sim.accel = True, base
+  k0 = len(sim.trace)
+  sim.run(10.)
+  after = sim.trace[k0:]
+  inside = [p for s, _, p in after if s < S_LINE + DRIVEN_THROUGH_M - 1.]
+  assert inside and all(str(p.controlPrompt) == 'stopSignTakeControl' and p.reason == "Stop sign passed unchecked: take control"
+                        for p in inside), sorted({(str(p.controlPrompt), p.reason) for p in inside})
+  assert not any(p.shouldStop for _, _, p in after) and min(v for _, v, _ in after) > 0.5, "held in the junction"
+  assert all(str(p.controlPrompt) == 'none' for s, _, p in after if s > S_LINE + DRIVEN_THROUGH_M + 1.)

@@ -1136,3 +1136,57 @@ def test_a_car_standing_far_up_the_road_is_a_loud_handback_never_an_endless_wait
   assert all(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS and p.shouldStop for p in und)
   assert not any(p.desire == Desire.turnLeft for p in plans) and sim.s <= LINE + 0.1 and sim.v < 0.1
   assert min(p.accelCap for p in plans) >= -2.0 - 1e-6
+
+
+def gas_crawl_at_the_line(crawl_m, v_crawl=0.7):
+  """LEFT_25 held at its line waiting through an oncoming stream with no gap (cars 3 s apart); the driver presses the gas
+  (openpilot disengaged), crawls crawl_m at v_crawl, lifts and re-engages rolling, the model driving straight on. (sim, the
+  plans after the lift, m past the line at the lift)"""
+  stream = [JUNCTION + 60. + k * 3. * V_25 for k in range(40)]
+  t0 = [None]
+
+  def cars(sim):
+    if t0[0] is None and JUNCTION - sim.s < 60.:
+      t0[0] = sim.t
+    dt = sim.t - t0[0] if t0[0] is not None else 0.
+    return [(s - V_25 * dt, 3.6) for s in stream]
+  sim = left_sim(cars)
+  while not (sim.tp.left_now is not None and sim.tp.left_now.state == 'waitGap' and sim.v < 0.05):
+    drive(sim, DT_MDL)
+    assert sim.t < 60.
+  drive(sim, 3.)
+  s0 = sim.s
+  sim.accel = lambda sim, plan: (0.5 if sim.v < v_crawl else 0.)
+  while sim.s < s0 + crawl_m:
+    sim.step(engaged=False, gas=True)
+  past = sim.s - LINE
+  sim.accel = None
+  return sim, drive(sim, 20., yaw=False), past
+
+
+def test_a_gas_crawl_into_the_left_is_said_through_the_junction_and_a_straight_drive_is_missed():
+  """Skeptic SG-residual-main (owner decision (b)): held at the left's line waiting for a gap, a 2.3 m gas crawl and a re-engage
+  drove straight through the junction; take-control showed about 4.5 s, then nothing, and turnMissed was never set. Now
+  the crossing is said (unprotectedTurnTakeControl, "Unprotected left not checked") until the car is DRIVEN_THROUGH_M past
+  the line, the re-engage hearing it; TurnPilot never pulses the left it didn't check; and driven straight past the
+  junction the left is missed: turnMissed ("Turn Missed", "Rerouting")."""
+  from openpilot.selfdrive.turnpilot.map_controls import DRIVEN_THROUGH_M
+  sim, after, past = gas_crawl_at_the_line(2.3)
+  rows = list(zip(sim.trace[-len(after):], after, strict=True))
+  inside = [p for (s, _, _), p in rows if LINE + past + 0.5 < s < LINE + DRIVEN_THROUGH_M - 1.]
+  assert inside and all(str(p.controlPrompt) == 'unprotectedTurnTakeControl' and p.reason == "Unprotected left not checked: take control"
+                        for p in inside), sorted({(str(p.controlPrompt), p.reason) for p in inside})
+  assert not any(p.desire == Desire.turnLeft for p in after), "TurnPilot pulsed the left it never checked"
+  missed = [k for k, p in enumerate(after) if p.turnMissed]
+  assert missed and sim.trace[-len(after) + missed[0]][0] > JUNCTION, "driven straight through the left, never missed"
+  assert sim.s > JUNCTION + 30. and not any(p.shouldStop for p in after[5:])
+
+
+def test_a_gas_nudge_short_of_the_lefts_reach_stays_held_for_the_full_check():
+  # owner decision (a), (c): a nudge under the latch's reach past the line (LATCH_PAST_M) lets nothing go; re-engaged, the car
+  # is held where it stands, the left still waiting for its gap, never driven on unchecked
+  sim, after, past = gas_crawl_at_the_line(1.5)
+  assert past < 2.
+  assert all(p.shouldStop for p in after[20:]) and sim.v < 0.05 and sim.s < LINE + 2.5
+  assert {str(p.unprotectedLeft.state) for p in after[20:]} == {'waitGap'}
+  assert not any(p.desire == Desire.turnLeft or str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in after)

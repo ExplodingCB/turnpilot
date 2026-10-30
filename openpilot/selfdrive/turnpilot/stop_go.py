@@ -97,7 +97,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.turnpilot import stop_rules as sr
 from openpilot.selfdrive.turnpilot.go_override import GO_WINDOW_S, Takeover
-from openpilot.selfdrive.turnpilot.map_controls import CREEP_AT_M, CREEP_SPEED, is_stop
+from openpilot.selfdrive.turnpilot.map_controls import CREEP_AT_M, CREEP_SPEED, CROSSED_CAUSES, is_stop
 from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
 from openpilot.selfdrive.turnpilot.routing import certify as ce
 from openpilot.selfdrive.turnpilot.routing.junctions import survey_approach
@@ -564,7 +564,16 @@ class StopGo:
 
   def _driver(self, f: Frame, d: StopGoDecision, ctl) -> None:
     """The driver taking over (openpilot disengaged: a pedal, O6 and O7). During the launch the encounter is theirs at once; a
-    hold of the decider's own (the latch already let go) ends once they drive off."""
+    hold of the decider's own (the latch already let go) ends once they drive off, or at once when it was the car's motion
+    under them past the line that let the latch go (map_controls.CROSSED_CAUSES, owner decision (a), 2026-10-30): never a
+    hold of the decider's own in the crossing lanes on a re-engage, the crossing said by the latch (map_controls.Driven: its
+    take-control until through), never silent."""
+    if ctl is None and self.state in ('observe', 'ladder') and \
+       getattr(getattr(self.control, 'state', None), 'cause', '') in CROSSED_CAUSES:
+      cloudlog.event("turnpilot.stop_go_driver", key=list(self.key), state=self.state, crossed=True)
+      self.go = self.aborting = None
+      self.state = 'done'
+      return
     if f.enabled:
       self.disengaged_odo = None
       return
@@ -913,7 +922,10 @@ class StopGo:
     if go and not self.would_go_logged:
       self.would_go_logged = True
       cloudlog.event("turnpilot.stop_go_would_go", key=list(self.key), acting=acting, why=why, t=round(self.t, 2), pos=round(pos, 2))
-    if not go or not acting:
+    if not go or not acting or not f.enabled:
+      # openpilot disengaged (the driver's pedal: DisengageOnAccelerator): never a go of TurnPilot's, which would let go of
+      # the latch while the driver drives and leave a crossing nobody certified silent (owner decision (b), 2026-10-30).
+      # The window goes on counting: re-engaged short of the line, the go comes on it
       return
     room = self.edges.d_min - pos
     need = sr.go_room_m(f.t_abort, right=f.maneuver == 'right')
