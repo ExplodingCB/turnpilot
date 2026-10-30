@@ -353,7 +353,7 @@ class TestFindStack:
     try:
       for _ in range(100):
         found = tree.running_managers(prefix)
-        if found:
+        if found and found[0]['argv'][0] != '/usr/bin/env':  # on Linux /proc shows env itself until it execs python3
           break
         time.sleep(0.1)
       (m,) = found
