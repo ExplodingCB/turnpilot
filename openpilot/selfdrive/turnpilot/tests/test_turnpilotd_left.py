@@ -13,7 +13,8 @@ from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of, nav_instr
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Sim
 from openpilot.selfdrive.turnpilot.turn_speed import POST_GO_PROFILES
 from openpilot.selfdrive.turnpilot.turnpilotd import GO_LINE_M, LEFT_NO_MOVE_S, TurnPilot, auto_left_for, left_range_for
-from openpilot.selfdrive.turnpilot.unprotected_left import (CLEAR_WINDOW_S, CREEP_STALL_S, HELD_MIN_M, LIGHT_UNKNOWN_S, ROAD_RANGE_M, STALE_UNDECIDED_S,
+from openpilot.selfdrive.turnpilot.unprotected_left import (CLEAR_WINDOW_S, CREEP_STALL_S, HELD_MIN_M, LIGHT_UNKNOWN_S, ROAD_RANGE_M,
+                                                           STALE_UNDECIDED_S, STAND_UNDECIDED_S,
                                                            r_req, t_req)
 
 Desire = log.Desire
@@ -114,6 +115,65 @@ def test_it_waits_through_an_oncoming_stream_silently_and_goes_after_it():
   assert len(waited) * DT_MDL > 15. and not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
   assert all(str(p.controlPrompt) == 'waitingForGap' for p in waited[5:])
   assert sim.trace[go - 1][1] < 0.3 and t_go[0] <= LINE + 0.1 and sim.s > JUNCTION + 30.
+
+
+def standing_run(raw_at, track_at, seconds, vx=0., stream=()):
+  """LEFT_25 at its line with a car standing at (m past the junction, m left) raw_at (a road run box every other frame,
+  None: none) and track_at (a velocity-trusted track at vx, None: none), and oncoming stream cars (absolute s, moving at
+  V_25, a box and a track each). (sim, plans)"""
+  frame = [0]
+
+  def movers(sim):
+    return [(s0 - V_25 * sim.t, 3.6) for s0 in stream if -5. < s0 - V_25 * sim.t - sim.s < 400.]
+
+  def raw(sim):
+    frame[0] += 1
+    if frame[0] % 2:
+      return None
+    boxes = [raw_box(JUNCTION + raw_at[0] - sim.s, raw_at[1])] if raw_at is not None else []
+    boxes += [raw_box(s - sim.s, y) for s, y in movers(sim)]
+    return RawFrame([b for b in boxes if b.xy[0] > 0.], 'road', sim.t)
+  sim = left_sim()
+  sim.raw = raw
+  plans = []
+  for _ in range(int(seconds / DT_MDL)):
+    turning = sim.tp.desires.started and abs(JUNCTION - sim.s) < 12. and sim.v > 0.3
+    objs = [{'cls': 'car', 'x': JUNCTION + track_at[0] - sim.s, 'y': track_at[1], 'vx': vx, 'vy': 0., 'age': 60, 'trackId': 40,
+             'conf': 0.8, 'camera': 'road'}] if track_at is not None else []
+    objs += [{'cls': 'car', 'x': s - sim.s, 'y': y, 'vx': -V_25, 'vy': 0., 'age': 60, 'trackId': 50 + k, 'conf': 0.8, 'camera': 'road'}
+             for k, (s, y) in enumerate(movers(sim))]
+    plans.append(sim.step(tuple(objs), engaged=True, yaw_rate=sim.v / 8. if turning else 0.))
+  return sim, plans
+
+
+def test_a_car_standing_in_the_way_is_a_loud_handback_never_an_endless_silent_wait():
+  """Skeptic g4c (still open after SIMFIX; the same on 49359b2 and be3c0ed): the left had no bound on its wait. A car parked
+  50 m up the oncoming curb (in the band: a box and a track) or at the curb 6 m past the junction, 5 m right (in the junction
+  box: a track) held the car at its line the whole 240 s run with only 'waitingForGap' (shown, never heard): no chime, no
+  handback, and stopped_unheld can't fire with TurnPilot holding the car. The owner's 'loud alert if undecided': waiting
+  STAND_UNDECIDED_S on what the tracker says stands is the 'standing' fault, the car held, said."""
+  for raw_at, track_at in (((50., 7.5), (50., 7.5)), (None, (6., -5.))):
+    sim, plans = standing_run(raw_at, track_at, 90.)
+    held = next(i for i, p in enumerate(plans) if p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap')
+    first = next((i for i, p in enumerate(plans) if str(p.controlPrompt) in TAKE_CONTROL_PROMPTS), None)
+    assert first is not None, f"stood at the line behind a car parked at {raw_at or track_at}, no chime, no handback"
+    assert str(plans[first].controlPrompt) == 'leftUndecidedTakeControl' and plans[first].unprotectedLeft.why == 'standing'
+    assert plans[first].reason == "Blocked by something standing: take control"
+    assert abs((first - held) * DT_MDL - STAND_UNDECIDED_S) < 1., (first - held) * DT_MDL
+    assert all(str(p.controlPrompt) == 'leftUndecidedTakeControl' and p.shouldStop for p in plans[first:])
+    assert not any(p.desire == Desire.turnLeft for p in plans) and sim.s < LINE + 1.
+
+
+def test_moving_traffic_is_waited_through_however_long_never_called_standing():
+  # a stream of oncoming cars at the limit 3 s apart for 70 s, each a box and a moving velocity-trusted track: ordinary
+  # waiting (no intervention), never the standing fault; a car that moves on from where it stood is no longer standing
+  stream = [JUNCTION + 60. + V_25 * 25. + k * 3. * V_25 for k in range(24)]
+  sim, plans = standing_run(None, None, 110., stream=stream)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  waited = sum(p.shouldStop for p in plans) * DT_MDL
+  assert waited > STAND_UNDECIDED_S + 10. and any(p.desire == Desire.turnLeft for p in plans) and sim.s > JUNCTION + 10.
+  sim, plans = standing_run(None, (6., -5.), 90., vx=3.)  # in the junction box, moving: traffic, its wait unbounded
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
 
 
 def test_no_road_camera_runs_is_a_fault_never_a_go():

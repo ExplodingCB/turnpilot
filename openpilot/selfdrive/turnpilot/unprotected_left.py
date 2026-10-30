@@ -7,9 +7,10 @@ and never hands back for ordinary waiting. A handback (UNDECIDED: leftUndecidedT
 held) is only for a fault: road camera frames stale, the junction's position unknown, its reach past the detector's proven
 range (route time should have rerouted it: turnpilotd), the car standing yawed past YAW_UNDECIDED_DEG, the view still
 blocked BLOCKED_UNDECIDED_S after the full creep, a creep the car hasn't made after standing CREEP_STALL_S in it with
-nothing else holding it (the model holding a standstill), or a far-needed left waiting FAR_BLOCKED_UNDECIDED_S on the far
-crop's boxes alone (farBlocked: a car standing far up the road can't be told from one coming). A missing frame is never
-clear.
+nothing else holding it (the model holding a standstill), a far-needed left waiting FAR_BLOCKED_UNDECIDED_S on the far
+crop's boxes alone (farBlocked: a car standing far up the road can't be told from one coming), or waiting STAND_UNDECIDED_S
+on something the tracker says stands, in the band or the exit zones (standing: a parked car never clears). A missing frame
+is never clear.
 
 TurnPilotAutoLeft (turnpilotd) picks the mode: auto (the default), announce (the car stops at the hold line and says
 whether it would go, then hands back as before: debugging only), or off (the hold line's handback, G1's).
@@ -135,6 +136,15 @@ FAR_BLOCKED_UNDECIDED_S = 35.
 FAR_BLOCK_RECENT_S = CLEAR_WINDOW_S  # a far box in the band this recently keeps that count going (the far crop finds a far
                                     # car on one run in several; further apart, the window fills between them instead)
 YAW_UNDECIDED_DEG = 15.    # standing yawed further either way (after a withdrawn go): the road camera isn't up the oncoming approach
+# waiting at its line this long on something standing (skeptic g4c, SIMFIX: a car parked 50 m up the oncoming curb, or at
+# the curb 6 m past the junction in its box, held the car at the line for a 240 s run, 'waitingForGap' only, no sound): the
+# 'standing' fault (DESIGN's UNDECIDED row, 'no gap in 45 s'), never an endless silent wait. Traffic that moves is ordinary
+# waiting, however long (Kellen: no intervention), and never counts. Standing is what the tracker says stands (stands_still():
+# velocity trusted, under STAND_SPEED): a band box matched to such a vehicle track (a dropout of its box up to
+# CLEAR_WINDOW_S keeps it), or such tracks alone in the exit crosswalk and the junction box. Counted only waiting with
+# nothing else holding the car (a red, a stop sign, no lamp pause it). A raw box nothing tracks can't be told standing from
+# coming by range alone (a stream 3 s apart always has a car near any range): it stays traffic
+STAND_UNDECIDED_S = 45.
 
 STAND_SPEED = 1.           # m/s: a velocity-trusted track slower than this stands
 OCCLUDER_PAST_M = 30.      # an occluder stands within this past the maneuver point...
@@ -385,21 +395,33 @@ def view_blocked(occ, heading_deg: float, side: int, reach_m: float) -> bool:
   return False
 
 
-def exit_clear(objects, heading_deg: float, side: int, distance: float, occ, spread_m: float = 0.) -> bool:
-  """No pedestrian in the exit crosswalk, and no vehicle but an occluder in the junction box (module docstring), each zone
+def exit_blockers(objects, heading_deg: float, side: int, distance: float, occ, spread_m: float = 0.) -> list:
+  """The pedestrians in the exit crosswalk and the vehicles but an occluder in the junction box (module docstring), each zone
   stretched over the readings of the junction (spread_m past the nearest)."""
   ids = {o.trackId for o in occ}
   spread = max(spread_m, 0.)
+  out = []
   for obj in objects:
     x, y = road_xy(obj, heading_deg, side)
     rel = x - distance
     if str(obj.cls) == 'pedestrian' and -CROSSWALK_X_BEFORE_M <= rel <= CROSSWALK_X_AFTER_M + spread and \
        EXIT_Y_NEAR_M <= y <= EXIT_Y_FAR_M:
-      return False
-    if str(obj.cls) in VEHICLES and obj.trackId not in ids and -BOX_X_BEFORE_M <= rel <= BOX_X_AFTER_M + spread and \
+      out.append(obj)
+    elif str(obj.cls) in VEHICLES and obj.trackId not in ids and -BOX_X_BEFORE_M <= rel <= BOX_X_AFTER_M + spread and \
        -BOX_Y_RIGHT_M <= y <= BOX_Y_LEFT_M:
-      return False
-  return True
+      out.append(obj)
+  return out
+
+
+def exit_clear(objects, heading_deg: float, side: int, distance: float, occ, spread_m: float = 0.) -> bool:
+  """No pedestrian in the exit crosswalk, and no vehicle but an occluder in the junction box (exit_blockers)."""
+  return not exit_blockers(objects, heading_deg, side, distance, occ, spread_m)
+
+
+def stands_still(obj) -> bool:
+  """A track standing still by the tracker: its velocity trusted (VEL_TRUST_HITS), slower than STAND_SPEED."""
+  return velocity_trusted(obj) and math.hypot(obj.vx, obj.vy) < STAND_SPEED
+
 
 
 class UnprotectedLeft:
@@ -434,6 +456,9 @@ class UnprotectedLeft:
     self.far_stale = 0.           # s at its line without a far run covering the band
     self.far_block_age = math.inf # s since the last far run with a car in the band
     self.far_only_s = 0.          # s waiting at its line on the far crop's boxes alone (FAR_BLOCKED_UNDECIDED_S)
+    self.band_stand_age = math.inf  # s since a road run's band box matched a standing track (STAND_UNDECIDED_S)
+    self.band_stand_s = 0.        # s waiting at its line with the band so blocked
+    self.exit_stand_s = 0.        # s waiting at its line with the exit zones blocked by standing tracks alone
 
   def update(self, inp: LeftInput, dt: float) -> LeftDecision:
     if inp.mode not in (AUTO, ANNOUNCE):
@@ -452,10 +477,14 @@ class UnprotectedLeft:
     rreq = r_req(v_limit, treq, d_far)
     occ = occluders(inp.objects, inp.heading_deg, side, inp.distance)
     self.road_age += dt
+    self.band_stand_age += dt
     raw_blockers = None
     if inp.raw is not None and inp.raw.camera == 'road':
       exempt = [b for b in inp.raw.boxes if any(matches(b, o) for o in occ)]
       raw_blockers = band_blockers(inp.raw.boxes, inp.heading_deg, side, rreq, inp.distance, exempt)
+      stands = [o for o in inp.objects if str(o.cls) in VEHICLES and stands_still(o)]
+      if any(matches(b, o) for b in raw_blockers for o in stands):
+        self.band_stand_age = 0.
       fresh_run = self.road_age <= ROAD_FRESH_S
       self.road_age = 0.
       self.blocked = bool(raw_blockers)
@@ -494,7 +523,8 @@ class UnprotectedLeft:
     held_else = inp.other_hold or not light_go or no_signal  # something else keeps it where it is: no go, no creep
     if held_else:
       self.clear_s = 0.  # the window counts only from where nothing else holds it (hold, then judge: a fresh one at the green)
-    crosswalk = exit_clear(inp.objects, inp.heading_deg, side, inp.distance, occ, inp.spread_m)
+    exits = exit_blockers(inp.objects, inp.heading_deg, side, inp.distance, occ, inp.spread_m)
+    crosswalk = not exits
     if not crosswalk:
       self.clear_s = 0.  # everything the go is certified on holds for the whole window (DESIGN G4), not on one frame
     out = LeftDecision(t_req=treq, r_req=rreq, v_limit=v_limit, clear_s=self.clear_s, view_blocked=blocked_view,
@@ -535,6 +565,7 @@ class UnprotectedLeft:
     if self.latch_d is None:
       # held at the line: the window starts here (hold, then judge), never carried over from the approach
       self.latch_d, self.clear_s, self.far_stale, self.far_only_s = inp.distance, 0., 0., 0.
+      self.band_stand_s = self.exit_stand_s = 0.
       out.clear_s = 0.
     certified = self.clear_s >= CLEAR_WINDOW_S - 1e-6 and not blocked_view and crosswalk and inp.scene_clear and not held_else
     out.view = 'roadAndWide'
@@ -623,6 +654,16 @@ class UnprotectedLeft:
     self.far_only_s = self.far_only_s + dt if far_only else 0.
     if self.far_only_s >= FAR_BLOCKED_UNDECIDED_S - 1e-6:
       return self._undecided(out, 'farBlocked')
+    # on something standing (STAND_UNDECIDED_S), nothing else holding the car (which pauses the count): out loud, never an
+    # endless silent wait
+    if not held_else:
+      band_standing = self.blocked and self.band_stand_age <= CLEAR_WINDOW_S
+      self.band_stand_s = self.band_stand_s + dt if band_standing else 0.
+      self.exit_stand_s = self.exit_stand_s + dt if exits and all(stands_still(o) for o in exits) else 0.
+      if max(self.band_stand_s, self.exit_stand_s) >= STAND_UNDECIDED_S - 1e-6:
+        cloudlog.event("turnpilot.left_standing", error=True, band_s=round(self.band_stand_s, 1), exit_s=round(self.exit_stand_s, 1),
+                       exits=[(str(o.cls), round(float(o.x), 1), round(float(o.y), 1)) for o in exits])
+        return self._undecided(out, 'standing')
     self.creep_to = min(self.creep_to, max(crept, 0.))
     out.state = self.state = 'waitGap'
     out.prompt, out.reason, out.creep_m = 'waitingForGap', NO_SIGNAL_REASON if no_signal else "Waiting for a gap", self.creep_to
@@ -632,6 +673,7 @@ class UnprotectedLeft:
 
   def _go(self, inp: LeftInput, out: LeftDecision, rreq: float) -> LeftDecision:
     self.went, self.moved, self.hold_here, self.go_t, self.far_only_s = True, False, False, 0., 0.
+    self.band_stand_s = self.exit_stand_s = 0.
     cloudlog.event("turnpilot.left_go", distance=round(inp.distance, 1), r_req=round(rreq, 1), clear_s=round(self.clear_s, 1),
                    v_limit=round(out.v_limit, 1), heading_deg=round(inp.heading_deg, 1))
     out.state = self.state = 'go'
@@ -734,6 +776,7 @@ UNDECIDED_REASON = {
   'farOff': "Far camera off: take control",
   'farStale': "Far camera not seeing oncoming traffic: take control",
   'farBlocked': "Can't tell if far traffic is coming: take control",
+  'standing': "Blocked by something standing: take control",
   'position': "Junction position unsure: take control",
   'curve': "Oncoming road curves out of view: take control",
   'stale': "Camera not seeing oncoming traffic: take control",
