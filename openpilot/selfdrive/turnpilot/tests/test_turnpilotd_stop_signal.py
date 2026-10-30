@@ -342,3 +342,31 @@ def test_a_veto_of_the_other_turn_before_it_starts_hands_back_held_and_the_car_n
   assert all(p.accelCap >= -2. - 1e-9 for p in after)
   if when == 'going':
     assert any(str(p.stopGo.withdrawn) == 'signalVeto' for p in after[:3]), sorted({str(p.stopGo.withdrawn) for p in after})
+
+
+def test_a_route_notice_never_covers_the_turn_signals_prompt_and_is_said_once_it_is_gone(tmp_path):
+  # turnpilotRouteNotice (integrate, STOP_SIGNS.md 3.4) and turnpilotCarSignal (tp/blinker) are both selfdrived's
+  # permanent alerts at one priority, so the later one shows: "Stop sign ahead needs you" falling due 300 m out while
+  # "Signal Left" is up covered the prompt for NOTICE_S. The route notice waits for a free slot (route_notice.py), and the
+  # turn signal's own line (its prompt, a notice, "Signal Off") holds it back: said in full once that is gone
+  from openpilot.selfdrive.turnpilot.route_notice import NOTICE_S
+  sim = StopSim(tmp_path, info_kw={'certification': 'unavoidable'})
+  sim.engaged, sim.v = True, 13.
+  update = sim.tp.turn_signal.update
+
+  t0 = sim.t
+
+  def prompting(**kw):  # the driver asked to signal for the drive's first 3 s, the notice due at once (the stop under 300 m)
+    out = update(**kw)
+    if sim.t - t0 < 3.:
+      out.prompt = LaneChange.left
+    return out
+  sim.tp.turn_signal.update = prompting
+  seen = []
+  while sim.s < S_LINE - 20.:
+    p = sim.step()
+    seen.append((str(p.controlAlert), p.turnSignal.prompt))
+  asked = [k for k, (_, prompt) in enumerate(seen) if prompt != LaneChange.none]
+  said = [k for k, (alert, _) in enumerate(seen) if alert == 'stopAheadNeedsYou']
+  assert asked and said and not set(asked) & set(said)
+  assert said[0] > asked[-1] and abs(len(said) * DT_MDL - NOTICE_S) <= DT_MDL + 1e-6

@@ -1063,8 +1063,11 @@ class TurnPilot:
     # engaged or not (selfdrived's turnpilotRouteNotice), only where the slot is free (no handback, no alert but a status line,
     # no take-control prompt: hooks.plan_events would show those instead), and used up only on frames it is said, so held
     # back (not lost) behind another. In shadow nothing is shown by selfdrived, and the plan carries it as before
+    # nor while the turn signal's own line is up (turnpilotCarSignal: the prompt to signal, a notice, "Signal Off"), a permanent
+    # alert at the same priority, which the later one covers
     free = handback == Handback.none and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS and \
-      str(plan.controlPrompt) not in TAKE_CONTROL_PROMPTS
+      str(plan.controlPrompt) not in TAKE_CONTROL_PROMPTS and plan.turnSignal.prompt == LaneChange.none and \
+      str(plan.turnSignal.notice) == 'none' and plan.turnSignal.handedOver == LaneChange.none
     notice, notice_text = self.notices.update(sm['navInstruction'], sm.updated['navInstruction'], sm.valid['navInstruction'], v_ego,
                                               bool(sm['carControl'].enabled), free=free)
     if notice != 'none':
