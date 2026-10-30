@@ -53,6 +53,41 @@ def test_a_synthetic_lens_is_recovered_within_0_2_deg():
                                                              if any(abs(d.t0 - 10. * ORDER.index(m)) < 1e-9 for d in dw)]
 
 
+def outer(dw):
+  """The indices of the left and the right 88 deg dwells (the outermost on each side)."""
+  return min(range(len(dw)), key=lambda i: dw[i].u), max(range(len(dw)), key=lambda i: dw[i].u)
+
+
+def test_a_box_cut_off_at_the_frame_edge_is_seen_but_not_fitted():
+  """At 88 deg a person is half out of the frame, and the box's bottom centre sits about 6 px inside the feet: fitted, that
+  pulls k up and moves the edge 0.4 deg out, so a clipped dwell is left out of the fit."""
+  lens = true_lens()
+  base = cf.solve(dwells_for(lens, 0.1, noise_px=0.), ORDER, CAL, TAPE.height)
+  dw = dwells_for(lens, 0.1, noise_px=0.)
+  li, ri = outer(dw)
+  dw[li].u += 6.
+  dw[ri].u -= 6.
+  biased = cf.solve([cf.Dwell(**d.__dict__) for d in dw], ORDER, CAL, TAPE.height)
+  assert biased.edge['left'] > base.edge['left'] + 0.2  # what fitting a cut-off box does
+  dw[li].clipped = dw[ri].clipped = True
+  fit = cf.solve(dw, ORDER, CAL, TAPE.height)
+  for side in ('left', 'right'):
+    assert abs(fit.edge[side] - base.edge[side]) < 0.05
+  assert len(fit.resid_b) == len(fit.assignment) - 2
+  # a clipped dwell the fit puts well inside the frame is refused
+  dw = dwells_for(lens, 0.1, noise_px=0.)
+  dw[4].clipped = True  # the left 85 deg mark, 3 deg inside the edge
+  with pytest.raises(cf.Refusal, match="frame's edge"):
+    cf.solve(dw, ORDER, CAL, TAPE.height)
+
+
+def test_a_dwell_is_clipped_when_its_boxes_touch_the_edge():
+  pts = [(i * 0.25, 'sideLeft', 3., 420., i % 3 == 0) for i in range(24)]
+  assert cf.find_dwells(pts)[0].clipped
+  assert not cf.find_dwells([p[:4] + (False,) for p in pts])[0].clipped
+  assert cf.touches_edge(0.5, 30., 400.) and cf.touches_edge(1300., 1343.2, 400.) and not cf.touches_edge(5., 30., 400.)
+
+
 def test_a_1_deg_yaw_offset_is_refused():
   with pytest.raises(cf.Refusal, match='yaw offset'):
     cf.solve(dwells_for(true_lens(), 1.0), ORDER, CAL, TAPE.height)

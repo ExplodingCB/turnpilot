@@ -22,7 +22,9 @@ Park in every carState, calibration calibrated in every message and moving less 
    bottom centre of their box; a side view's feet point goes back to fisheye pixels through that view's own index map
    (feet_from_map), the pixels the view was gathered from, so it doesn't depend on the lens the map was built with.
 2. Dwells: one view's feet point within DWELL_PX of its median for DWELL_S or more (find_dwells); a dwell the full pass and
-   a side view both saw is one, at the side view's point (merge_dwells).
+   a side view both saw is one, at the side view's point (merge_dwells). A box cut off by the fisheye frame's edge has its
+   feet point pulled inside (6 px on the 88 deg marks moved the fitted edge 0.4 deg out), so a dwell whose boxes touch the
+   edge is clipped: its mark counts as seen and must sit within CLIPPED_EDGE_DEG of the fitted edge, but it isn't fitted.
 3. Assignment. Each mark's pixel box over the lens bracket (f F_RANGE, k K_RANGE, yaw offset +-DELTA_MAX_DEG) gates which
    dwells may be it; the outer marks' boxes overlap, so the standing order decides: every order-keeping assignment of the
    dwells to the marks the boxes allow is fitted, and exactly one must pass every check below. A dwell no box takes, or
@@ -97,6 +99,9 @@ GATE_PX = 8.                       # px around a mark's bracket box a dwell may 
 B_RMS_MAX, RESID_MAX, E_RMS_MAX = 0.5, 1.0, 0.5
 DWELL_PX, DWELL_S, DWELL_GAP_S = 4., 4., 1.0
 DWELL_MIN_POINTS = 8
+EDGE_TOUCH_PX = 1.5                # px from the fisheye frame's edge a box's side or bottom touches it
+CLIPPED_FRAC = 0.1                 # a dwell is clipped when more of its points than this touched the edge
+CLIPPED_EDGE_DEG = 2.5             # deg from the fitted frame edge a clipped mark must be (half a person at 10 m is 1.3 deg)
 MERGE_PX = 15.                     # px apart a full-pass and a side-view dwell at the same time are the same one
 DETECT_HZ = 4.
 MASK_HZ = 2.
@@ -159,6 +164,8 @@ class Dwell:
   v: float
   view: str         # 'full', 'sideLeft', 'sideRight'
   n: int
+  clipped: bool = False  # the box ran into the fisheye frame's edge in over CLIPPED_FRAC of its points: its feet point is
+                         # pulled inside, so it is seen but never fitted
 
 
 @dataclass
@@ -254,8 +261,8 @@ REPO_LENS = lens_of(REPO_F, 0.)
 # ------------------------------------------------------------------------------------------------------------ dwells
 
 def find_dwells(dets) -> list[Dwell]:
-  """dets: (t, view, u, v) feet points. Per view, a run of points within DWELL_PX of its median, no gap over DWELL_GAP_S,
-  lasting DWELL_S or more."""
+  """dets: (t, view, u, v[, clipped]) feet points. Per view, a run of points within DWELL_PX of its median, no gap over
+  DWELL_GAP_S, lasting DWELL_S or more; clipped when over CLIPPED_FRAC of them touched the frame's edge."""
   out = []
   for view in sorted({d[1] for d in dets}):
     pts = sorted((d for d in dets if d[1] == view), key=lambda d: d[0])
@@ -277,8 +284,9 @@ def find_dwells(dets) -> list[Dwell]:
       mu, mv = float(np.median([p[2] for p in c])), float(np.median([p[3] for p in c]))
       keep = [p for p in c if math.hypot(p[2] - mu, p[3] - mv) <= DWELL_PX]
       if len(keep) >= DWELL_MIN_POINTS and keep[-1][0] - keep[0][0] >= DWELL_S - 1e-9:
+        clipped = sum(1 for p in keep if len(p) > 4 and p[4]) > CLIPPED_FRAC * len(keep)
         out.append(Dwell(keep[0][0], keep[-1][0], float(np.median([p[2] for p in keep])), float(np.median([p[3] for p in keep])),
-                         view, len(keep)))
+                         view, len(keep), clipped))
   return sorted(out, key=lambda d: d.t0)
 
 
@@ -292,6 +300,8 @@ def merge_dwells(dwells: list[Dwell]) -> list[Dwell]:
             math.hypot(d.u - s.u, d.v - s.v) <= MERGE_PX]
     if not same:
       out.append(d)
+    for s in same:
+      s.clipped |= d.clipped  # cut off in either view: not fitted
   return sorted(out, key=lambda d: d.t0)
 
 
@@ -341,13 +351,15 @@ def check_lens_bracket(f: float, k: float) -> None:
 
 
 def fit_lens(pairs, rot: np.ndarray, height: float, range_m: float) -> Fit:
+  """Least squares over the pairs whose dwell isn't clipped; the assignment keeps them all (the clipped ones are seen)."""
   from scipy.optimize import least_squares
   el = mark_elev(height, range_m)
+  fitted = [(dw, m) for dw, m in pairs if not dw.clipped]
 
   def resid(x):
     lens = Lens(CAM_W, CAM_H, float(x[0]), fisheye=True, k=float(x[1]))
     rb, re = [], []
-    for dw, m in pairs:
+    for dw, m in fitted:
       b, e = unproject(lens, rot, dw.u, dw.v)
       rb.append(b - x[2] - m.signed)
       re.append(e - el)
@@ -355,7 +367,7 @@ def fit_lens(pairs, rot: np.ndarray, height: float, range_m: float) -> Fit:
   sol = least_squares(resid, x0=[REPO_F, 0.3, 0.], bounds=([380., 0., -5.], [530., 0.95, 5.]), x_scale=[10., 0.1, 0.5])
   f, k, d = (float(x) for x in sol.x)
   r = resid(sol.x)
-  n = len(pairs)
+  n = len(fitted)
   rb, re = [float(x) for x in r[:n]], [float(x) for x in r[n:]]
   return Fit(f, k, d, list(pairs), rb, re, float(np.sqrt(np.mean(np.square(rb)))), float(np.sqrt(np.mean(np.square(re)))),
              cost=float(sol.cost))
@@ -364,8 +376,9 @@ def fit_lens(pairs, rot: np.ndarray, height: float, range_m: float) -> Fit:
 def judge_fit(fit: Fit, marks: list[Mark], rot: np.ndarray, height: float, range_m: float) -> str:
   """Why the fitted assignment fails S1's checks, or ''."""
   seen = {(m.side, m.bearing) for _, m in fit.assignment}
+  clipped = {(m.side, m.bearing) for dw, m in fit.assignment if dw.clipped}
   for side in ('left', 'right'):
-    inner = sum(1 for s, b in seen if s == side and b in INNER_BEARINGS)
+    inner = sum(1 for s, b in seen - clipped if s == side and b in INNER_BEARINGS)
     if inner < MIN_INNER:
       return f"{inner} of the 40-80 deg marks seen on the {side} side, {MIN_INNER} needed"
   try:
@@ -383,9 +396,14 @@ def judge_fit(fit: Fit, marks: list[Mark], rot: np.ndarray, height: float, range
     return f"elevation RMS {fit.rms_e:.2f} deg, over {E_RMS_MAX}: check heightM and that the lot is level"
   lens = lens_of(fit.f, fit.k)
   el = mark_elev(height, range_m)
+  edge = edge_deg(lens, rot)
   for m in marks:
     signed = m.signed + fit.delta
-    if (m.side, m.bearing) in seen:
+    if (m.side, m.bearing) in clipped:
+      if abs(abs(signed) - edge[m.side]) > CLIPPED_EDGE_DEG:
+        return (f"the {m.side} {m.bearing} deg mark's box ran into the frame's edge, but the fit puts the edge at {edge[m.side]:.1f} deg, " +
+                f"over {CLIPPED_EDGE_DEG} deg from it")
+    elif (m.side, m.bearing) in seen:
       if not inside(*project(lens, rot, calib_ray(signed, el))):
         return f"the {m.side} {m.bearing} deg mark was seen but the fit puts it outside the frame"
     else:
@@ -678,8 +696,10 @@ def report(fit: Fit, mask: dict, dark: float, sigma: float, n_mask: int, tape: T
   lines = [f"camera_fit {tape.date}: f {fit.f:.2f} px, k {fit.k:.4f}, yaw offset {fit.delta:+.3f} deg, bearing RMS {fit.rms_b:.3f} deg, " +
            f"elevation RMS {fit.rms_e:.3f} deg", f"frame edge: left {fit.edge['left']:.2f} deg, right {fit.edge['right']:.2f} deg",
            "marks (residual bearing, elevation; deg):"]
-  for (dw, m), rb, re in zip(fit.assignment, fit.resid_b, fit.resid_e, strict=True):
+  for (dw, m), rb, re in zip([a for a in fit.assignment if not a[0].clipped], fit.resid_b, fit.resid_e, strict=True):
     lines.append(f"  {m.side:5s} {m.bearing:2d}: {rb:+.2f} {re:+.2f}  ({dw.view} u {dw.u:.1f} v {dw.v:.1f}, {dw.t0:.1f}-{dw.t1:.1f} s)")
+  for dw, m in (a for a in fit.assignment if a[0].clipped):
+    lines.append(f"  {m.side:5s} {m.bearing:2d}: seen, its box at the frame's edge, not fitted  ({dw.view} u {dw.u:.1f} v {dw.v:.1f})")
   lines.append(f"mask from {n_mask} frames ({n_mask / MASK_HZ:.0f} s); darkThreshold {dark:.1f} DN; S1 parked noise {sigma:.2f} DN")
   for side in ('left', 'right'):
     rows = {int(b): (lo, hi) for b, lo, hi in mask[side]}
@@ -827,6 +847,11 @@ def accumulate(paths: list[Path], groups: dict[int, list[FrameMeta]], step: int)
   return accs
 
 
+def touches_edge(u0: float, u1: float, v1: float) -> bool:
+  """A box (its sides and bottom in fisheye pixels) running into the frame's edge: the person is cut off there."""
+  return bool(u0 <= EDGE_TOUCH_PX or u1 >= CAM_W - EDGE_TOUCH_PX or v1 >= CAM_H - EDGE_TOUCH_PX)
+
+
 def camerad_nv12(img: np.ndarray) -> np.ndarray:
   from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
   stride, y_height, uv_height, _ = get_nv12_info(CAM_W, CAM_H)
@@ -856,14 +881,17 @@ def detect(paths: list[Path], logs: list[SegmentLog], cal: Calib) -> list[tuple]
       frame = Tensor(camerad_nv12(buf)).realize()
       for x0, _, x1, y1, conf, cls in decoder.decode(full(input_frame=frame).numpy(), lb):
         if int(cls) == PERSON:
-          out.append((t, 'full', float((x0 + x1) / 2.), float(y1), float(conf)))
+          out.append((t, 'full', float((x0 + x1) / 2.), float(y1), float(conf), touches_edge(x0, x1, y1)))
       for name in SIDE_VIEWS:
         luma_idx, chroma_idx, weights = maps[name]
         raw = np.asarray(side(input_frame=frame, luma_idx=luma_idx, chroma_idx=chroma_idx, weights=weights).numpy(), np.float32).reshape(-1, 6)
         for x0, _, x1, y1, conf, _cls in raw[(raw[:, 4] >= decoder.MIN_CONF) & (np.rint(raw[:, 5]) == PERSON)]:
           feet = feet_from_map(geom.maps[name], geom.stride, float((x0 + x1) / 2.), float(y1))
-          if feet is not None:
-            out.append((t, name, feet[0], feet[1], float(conf)))
+          if feet is None:
+            continue
+          sides = [feet_from_map(geom.maps[name], geom.stride, float(x), float(y1)) for x in (x0, x1)]
+          clipped = any(q is None for q in sides) or touches_edge(min(q[0] for q in sides), max(q[0] for q in sides), feet[1])
+          out.append((t, name, feet[0], feet[1], float(conf), bool(clipped)))
   return out
 
 
@@ -913,7 +941,7 @@ def run(args) -> int:
     if args.save_detections:
       Path(args.save_detections).write_text(json.dumps({'tool': 'camera_fit.py', 'segments': [str(p) for p in s1_paths],
                                                         'calib': asdict(cal), 'dets': dets}) + '\n')
-  dwells = merge_dwells(find_dwells([d[:4] for d in dets]))
+  dwells = merge_dwells(find_dwells([(d[0], d[1], d[2], d[3], bool(d[5]) if len(d) > 5 else False) for d in dets]))
   fit = solve(dwells, marks, cal, tape.height, range_m)
   lens, rot = fitted_lens(fit), cal.rot
   # the mask: the drive at MASK_HZ, and S1 parked for the noise floor
