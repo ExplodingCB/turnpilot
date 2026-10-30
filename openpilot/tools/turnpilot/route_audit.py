@@ -278,6 +278,21 @@ def audit(call, steps, tiles_dir, sidecar_dir, context: junctions.Context | None
                 dict(context.overrides) if context is not None else {}, [], visibility, runtime, eta, entries)
 
 
+def router_reroute(route):
+  """reroute(exclude) for audit_avoidance from route(exclude) -> steps (Valhalla's route() around the exclusions): a router
+  error is None, a failed iteration, as navd's router.reroute makes it (routing/sources.py), so avoid.run keeps the best
+  route and marks the stops it couldn't route around unavoidable. Valhalla raises "No path could be found for input" when
+  the exclusions cut the destination off; the audit says so on stderr rather than dying."""
+  def reroute(exclude):
+    try:
+      return route(exclude)
+    except Exception as e:
+      print(f"note: no route around {len(exclude)} exclusion{'' if len(exclude) == 1 else 's'} ({type(e).__name__}: {e}): " +
+            "the avoidance loop keeps the best route", file=sys.stderr)
+      return None
+  return reroute
+
+
 def audit_avoidance(report: Report, steps, reroute, route_controls, eta: float | None = None, headings=None) -> avoid.AvoidResult:
   """navd's avoidance loop (routing/avoid.py) on the report's route, certified as the report was; reroute(exclude) -> steps."""
   eta = report.eta if eta is None else eta
@@ -620,8 +635,9 @@ def main(argv=None):
     j = sr.junction_from_control(c)
     return certify.certify(j, 'unknown', report.visibility, report.entries, report.eta, report.runtime)
   report.continuations = continuations(report.controls, lookahead, certify_ahead)
-  result = audit_avoidance(report, steps, lambda exclude: source.route((olon, olat), (dlon, dlat), None, None, exclude=exclude),
-                           lambda s: route_controls(call, s, tiles_dir, sidecar_dir, context=context), headings=source.exclusion_headings)
+  reroute = router_reroute(lambda exclude: source.route((olon, olat), (dlon, dlat), None, None, exclude=exclude))
+  result = audit_avoidance(report, steps, reroute, lambda s: route_controls(call, s, tiles_dir, sidecar_dir, context=context),
+                           headings=source.exclusion_headings)
   if args.json:
     doc = as_json(report)
     doc['avoidance'] = {'status': result.status, 'avoided': result.avoided, 'iterations': result.iterations, 'added_s': round(result.added_s, 1)}

@@ -294,6 +294,28 @@ def test_the_time_avoidance_added(tmp_path):
   assert 'avoidance: clean, 1 stop routed around' in '\n'.join(route_audit.avoidance_lines(result))
 
 
+def test_a_reroute_the_router_refuses_keeps_the_best_route_without_a_crash(tmp_path, capsys):
+  """The audit's reroute is Valhalla's route() around the exclusions, which raises (ValhallaError "No path could be found
+  for input", seen at 39.957202,-86.121411 -> 39.958551,-86.123166) where navd's router.reroute returns None. Wrapped
+  (router_reroute), a router error is a failed iteration: avoid.run keeps the best route, the stop it couldn't route
+  around is unavoidable, and the audit says why on stderr instead of dying."""
+  from openpilot.selfdrive.turnpilot.routing.tests.test_route_controls import survey
+  v, side, ctx = stub_allway(tmp_path, [survey()], [(0., 50., {'way_id': 49}), (50., 100., {'stop': True, 'way_id': 50}), (100., 400., {})])
+  report = route_audit.audit(v, steps(), None, side, ctx, eta=ETA)
+  calls = []
+
+  def refuses(exclude):
+    calls.append(exclude)
+    raise RuntimeError("No path could be found for input")
+  result = route_audit.audit_avoidance(report, steps(), reroute=route_audit.router_reroute(refuses), route_controls=lambda s: ([], 'ok'), eta=ETA)
+  assert len(calls) == 1 and (result.status, result.avoided, result.iterations) == ('keptBest', 0, 1)
+  assert [c.certification for c in result.controls if c.kind == 'stop'] == ['unavoidable']
+  assert 'No path could be found' in capsys.readouterr().err
+  assert 'keptBest' in '\n'.join(route_audit.avoidance_lines(result))
+  ok = route_audit.router_reroute(lambda exclude: [{'distance': 1.}])
+  assert ok([]) == [{'distance': 1.}]  # a route it gives passes through as it is
+
+
 def test_the_straight_continuations_first_control_at_a_certified_all_way_where_the_route_turns(tmp_path):
   """N12: the car may miss a turn and run straight through; for each certified all-way where the route turns, the audit
   looks straight on from the junction and lists the first stop or yield there with its certification."""
