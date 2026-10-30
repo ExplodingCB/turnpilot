@@ -59,7 +59,10 @@ out and not done), STALL_MIN_DEG to STALL_MAX_DEG into it (from its start, after
 junction), whoever stopped the car (TurnPilot's go, or the model on its own: BUILD_FINDINGS D2), with no hold of TurnPilot's
 and no lead within STOPPED_LEAD_M that the live scene corroborates (watch_lead: a vehicle track or box at it; one it
 corroborates holds the car LEAD_STAND_MAX_S at most), it stalled in the junction: handed back loudly (controlPrompt
-stalledTakeControl, STALLED_REASON), never held there, and TurnPilot never goes itself.
+stalledTakeControl, STALLED_REASON), never held there, and TurnPilot never goes itself. Moving in such a turn past its hold
+line, under half of it turned, the model steering away from it (modelV2.action.desiredCurvature, TURN_ABANDON_S) is a turn
+abandoned (BUILD_FINDINGS N1): handed back loudly (turnAbandonedTakeControl) until the driver takes over, nothing steered
+or held, the turn's caps kept.
 From the go such a turn is driven under its post-go profile (turn_speed.py: PostGo; DESIGN phase 4 section 3): accel and
 speed capped by the heading it has turned, DesireTiming.turned_deg at the go and the car's yaw after, until 60 deg or
 POST_GO_MAX_M on, and dropped at the pass of a turn missed straight on. TurnPilotPostGoProfile names the profile
@@ -271,6 +274,16 @@ STALLED_REASON = "Stalled in the turn: take control"
 # the wide camera's turns included). A lead nothing corroborates exempts no stand; a corroborated one keeps a stand in a turn
 # LEAD_STAND_MAX_S at most (stalled_in_turn), a go's stand NO_MOVE_MAX_S from the go (no_move), and a stand off any turn as long
 # as it is there (stopped_unheld: a queue). Never a go through it: the go's own lead check (go_blocked) is close_lead's
+# a route turn the model abandons in the junction (BUILD_FINDINGS N1, BeamNG S20: steering unwound from -97 to +28 deg with
+# 24 deg of a 90 deg right turned, turnRight still out, onto the corner's sidewalk; the smoke run hit a fixed object): past
+# the hold line, under TURN_ABANDON_FRACTION of its angle turned, moving, modelV2.action.desiredCurvature (positive right)
+# away from the turn's side by more than TURN_ABANDON_CURV for TURN_ABANDON_S is handed back (turnAbandonedTakeControl,
+# TURN_ABANDONED_REASON) until the driver takes over: no steering, no new hold, the turn's caps stay. S20's unwinding read
+# -0.012 to -0.019 for 0.5-0.75 s; a 200 m radius is the dead band, past the exit's own straightening noise
+TURN_ABANDON_FRACTION = 0.5
+TURN_ABANDON_CURV = 0.005
+TURN_ABANDON_S = 0.5
+TURN_ABANDONED_REASON = "Turn abandoned: take control"
 LEAD_CORROBORATE_M = 3.
 LEAD_BEARING_TOL_DEG = 3.
 LEAD_SEEN_HOLD_S = 1.
@@ -533,6 +546,8 @@ class TurnPilot:
     self.stall_s = 0.              # standing in a route turn, nothing holding the car (stalledTakeControl)
     self.stall_stand_s = 0.        # ...standing there, a corroborated lead or not (LEAD_STAND_MAX_S)
     self.stall_said = False        # ...handed back for it (its log once)
+    self.abandon_s = 0.            # the model steering away from the route's turn in the junction (turn_abandoned)
+    self.abandoned_id: int | None = None  # ...the maneuver handed back for it, until the driver takes over
     self.lead_seen_s = float('inf')  # since the live scene last corroborated modelV2's close lead (watch_lead)
     self.lead_why = ''             # ...what did
     self.lead_held = False         # this frame: a close lead the scene corroborates, within LEAD_SEEN_HOLD_S (watch_lead)
@@ -1110,8 +1125,11 @@ class TurnPilot:
       plan.controlAlert = 'hardBrake'
     stalled = self.stalled_in_turn(sm, cs, v_ego, acting, decision, mapd)
     stopped = self.stopped_unheld(sm, cs, v_ego, acting, decision, mapd)
+    abandoned = self.turn_abandoned(sm, cs, v_ego, acting)
     if withdrawn:
       plan.controlPrompt, plan.reason = 'cantStartTakeControl', NO_MOVE_REASON
+    elif abandoned:
+      plan.controlPrompt, plan.reason = 'turnAbandonedTakeControl', TURN_ABANDONED_REASON
     elif stalled:
       plan.controlPrompt, plan.reason = 'stalledTakeControl', STALLED_REASON
     elif stopped == STOPPED_NOTE:
@@ -1833,6 +1851,31 @@ class TurnPilot:
                      go=went, distance=round(rf.distance, 1), **self.lead_log(sm['modelV2']))
     self.stall_said = now
     return now
+
+  def turn_abandoned(self, sm, cs, v_ego: float, acting: bool) -> bool:
+    """The model is steering away from the route's turn in the junction (TURN_ABANDON_*: a route turn in progress,
+    turn_committed, the follower's distance under HOLD_LINE_M, under TURN_ABANDON_FRACTION of its angle turned, moving,
+    modelV2.action.desiredCurvature away from its side): handed back from TURN_ABANDON_S on (module constants), held until
+    the driver takes over (openpilot disengaged) or the turn is over. Nothing here steers, holds or lifts a cap."""
+    d, rf = self.desires, self.follower
+    m = rf.upcoming
+    enabled = sm['carControl'].enabled
+    if self.abandoned_id is not None:
+      if enabled and self.abandoned_id == rf.maneuver_id and self.turn_committed:
+        return True
+      self.abandoned_id = None
+    in_turn = acting and enabled and self.turn_committed and m is not None and m.kind == TURN and rf.distance < HOLD_LINE_M and \
+      d.turned_deg < TURN_ABANDON_FRACTION * m.angle_deg
+    away = float(sm['modelV2'].action.desiredCurvature) * m.side if m is not None else 0.  # positive right: away from a right
+    leaving = in_turn and v_ego >= STANDSTILL_SPEED and away > TURN_ABANDON_CURV and not cs.gasPressed
+    self.abandon_s = self.abandon_s + DT_MDL if leaving else 0.
+    if self.abandon_s < TURN_ABANDON_S - 1e-6:
+      return False
+    self.abandoned_id, self.abandon_s = rf.maneuver_id, 0.
+    cloudlog.event("turnpilot.turn_abandoned", error=True, turned_deg=round(d.turned_deg, 1), angle_deg=round(float(m.angle_deg), 1),
+                   curvature=round(float(sm['modelV2'].action.desiredCurvature), 4), v=round(v_ego, 2), distance=round(rf.distance, 1),
+                   steer_deg=round(float(cs.steeringAngleDeg), 1))
+    return True
 
   def watch_lead(self, model, objects, raw) -> None:
     """This frame's close lead (close_lead) and whether the live scene corroborates it (lead_corroboration), held

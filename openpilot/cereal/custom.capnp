@@ -183,6 +183,8 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     # BUILD_FINDINGS (demo round 2, 2026-10-30): the stands and exits nothing else said
     signalUnseenTakeControl @17;    # held at a signal with no accepted light read for SIGNAL_UNSEEN_S (map_controls.py): held,
                                     # take control; never released by the timeout
+    turnAbandonedTakeControl @18;   # the model steering away from the route's turn in the junction, under half of it turned
+                                    # (turnpilotd.py: turn_abandoned): take control; no hold, the turn's caps stay
   }
   enum ControlAlert {
     none @0;

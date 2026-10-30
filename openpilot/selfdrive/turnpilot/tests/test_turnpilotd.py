@@ -21,7 +21,7 @@ from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP, POST_GO_PROFI
 from openpilot.selfdrive.turnpilot.turnpilotd import (CAR_UNKNOWN_REASON, DETECTOR_DEADLINE_S, DETECTOR_START_DEADLINE_S, NO_LONG_REASON,
                                                        GAS_DISENGAGE_REASON, GO_LINE_M, LEFT_NO_MOVE_S, NEAR_CONTROL_STAND_S, NO_MOVE_REASON, NO_MOVE_S,
                                                        LEAD_STAND_MAX_S, NO_MOVE_MAX_S, SIGNAL_STOPPED_REASON, STALL_MIN_DEG, STALL_PROMPT_S,
-                                                       STALLED_REASON,
+                                                       STALLED_REASON, TURN_ABANDON_CURV, TURN_ABANDON_S, TURN_ABANDONED_REASON,
                                                        STOPPED_HANDBACK_S, STOPPED_LEAD_M, STOPPED_NOTE, STOPPED_NOTE_S, STOPPED_REASON,
                                                        TURN_MISSED_REASON, WAITING_REASON, TurnPilot, long_control_for)
 from openpilot.selfdrive.turnpilot.handback import Handback
@@ -2178,6 +2178,68 @@ def test_a_lead_nothing_in_the_scene_shows_never_keeps_a_standing_car_silent():
   queue = ({'cls': 'car', 'x': 9., 'y': 0., 'vx': 0., 'vy': 0., 'inPath': True},)
   plans = stand(sim, 2. * STOPPED_HANDBACK_S, lead_prob=0.95, lead_x=10., objects=queue)
   assert all(p.controlPrompt == 'none' and p.reason != STOPPED_NOTE for p in plans)
+
+
+def into_a_right(sim, deg, junction=300., curvature=0.03):
+  """RIGHT_AT_A_CORNER's turn driven deg in, the model's curvature toward it (positive: right)."""
+  sim.model_kw = {'curvature': curvature}
+  while junction - sim.s > 3.:
+    sim.step(engaged=True)
+    assert sim.t < 120.
+  while sim.tp.desires.turned_deg < deg:
+    sim.step(engaged=True, yaw_rate=-0.4)
+    assert sim.t < 140.
+
+
+def test_a_turn_the_model_abandons_in_the_junction_hands_back_out_loud():
+  """BUILD_FINDINGS N1 (BeamNG S20 right_green): the model steered into the route's right turn (-97 deg at 13 s), then unwound
+  to +28 deg with 24 deg turned and turnRight still out, onto the far corner's sidewalk; in the smoke run it hit a fixed
+  object at 2.5 m/s. Nothing in TurnPilot noticed. A route turn in progress in the junction (past the hold line), turned
+  under half its angle, the model's desiredCurvature pointing away from the turn past TURN_ABANDON_CURV for TURN_ABANDON_S
+  while moving, hands back loudly (turnAbandonedTakeControl), logged; no steering, no new hold: the turn's caps stay.
+  It holds until the driver takes over."""
+  sim = Sim(RIGHT_AT_A_CORNER, cruise=8.)
+  into_a_right(sim, 24.)
+  sim.model_kw = {'curvature': -0.015}  # unwinding to the left
+  plans = [sim.step(engaged=True) for _ in range(int((TURN_ABANDON_S - 0.15) / DT_MDL))]
+  assert all(p.controlPrompt == 'none' for p in plans) and sim.v > 0.3
+  before = plans[-1]
+  plans = [sim.step(engaged=True) for _ in range(int(0.3 / DT_MDL))]
+  p = plans[-1]
+  assert p.controlPrompt == 'turnAbandonedTakeControl' and p.reason == TURN_ABANDONED_REASON == "Turn abandoned: take control"
+  assert not p.shouldStop and p.accelCap == NO_ACCEL_CAP and abs(p.speedCap - before.speedCap) < 1e-3  # the turn's caps, no hold
+  sim.model_kw = {'curvature': 0.03}  # the model back into the turn: said until the driver takes over
+  assert all(p.controlPrompt == 'turnAbandonedTakeControl' for p in [sim.step(engaged=True, yaw_rate=-0.4) for _ in range(20)])
+  assert sim.step(engaged=False, gas=True).controlPrompt == 'none'
+
+
+def test_a_turn_taken_or_a_brief_correction_never_reads_abandoned():
+  # a turn taken, its curvature toward it, then straightening (curvature away) past half its angle: the exit, not abandoned
+  sim = Sim(RIGHT_AT_A_CORNER, cruise=8.)
+  into_a_right(sim, 50.)
+  sim.model_kw = {'curvature': -0.02}
+  plans = [sim.step(engaged=True, yaw_rate=-0.2) for _ in range(int(2. / DT_MDL))]
+  assert all(p.controlPrompt == 'none' for p in plans)
+  # a correction away shorter than TURN_ABANDON_S, then back into the turn
+  sim = Sim(RIGHT_AT_A_CORNER, cruise=8.)
+  into_a_right(sim, 20.)
+  sim.model_kw = {'curvature': -0.02}
+  plans = [sim.step(engaged=True) for _ in range(int((TURN_ABANDON_S - 0.15) / DT_MDL))]
+  sim.model_kw = {'curvature': 0.03}
+  plans += [sim.step(engaged=True, yaw_rate=-0.4) for _ in range(int(3. / DT_MDL))]
+  assert all(p.controlPrompt == 'none' for p in plans)
+  # a dead band's worth away (the model's curvature noise on a straight exit): nothing
+  sim = Sim(RIGHT_AT_A_CORNER, cruise=8.)
+  into_a_right(sim, 20.)
+  sim.model_kw = {'curvature': -0.5 * TURN_ABANDON_CURV}
+  assert all(p.controlPrompt == 'none' for p in [sim.step(engaged=True) for _ in range(int(2. / DT_MDL))])
+  # on the approach, short of the hold line, the curvature away (the lane's own bend) is no abandoned turn
+  sim = Sim(RIGHT_AT_A_CORNER, cruise=8.)
+  sim.model_kw = {'curvature': -0.02}
+  plans = []
+  while 300. - sim.s > HOLD_LINE_M + 1.:
+    plans.append(sim.step(engaged=True))
+  assert sim.tp.desires.started and all(p.controlPrompt == 'none' for p in plans)
 
 
 def test_a_hard_brake_is_raised_only_for_a_confirmed_pedestrian():
