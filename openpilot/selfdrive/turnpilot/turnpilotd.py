@@ -130,7 +130,7 @@ import datetime
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from opendbc.car.structs import car
 from openpilot.cereal import custom, log, messaging
@@ -281,6 +281,12 @@ RELEASE_UNSIGNALIZED = False
 # follows them, never the no-move clock, and turnRelease never certifies alongside one
 STOP_GO_CAUSES = ('stopSign', 'rollUp', 'creep', 'clearBox')
 YAW20_M = 20.  # m of travel the approach yaw (go condition 3) is integrated over
+# a veto at the unprotected left's line is the car's at that line: its record (VetoedTurn.line) is never forgotten before the
+# car has driven this far from where the veto found it (TurnPilot.carry_veto), whatever the follower's nearest reading says.
+# More than a standing car's odometer creeps, and under the 4.3 m on which, the driver driving the left, navd moves on to the
+# next step at the earliest (NAVD_ADVANCE_M past a nearest reading UNCERTAIN_M short of the 9.3 m the car stands from the
+# junction, the most spread without junctionUncertain): the record is gone before the next left is taken up
+LINE_VETO_MOVED_M = 2.
 STOP_GO_HOLDS_PULSE = ('approach', 'stopped', 'rollUp', 'observe')  # the decider's states a turn's pulse waits for its go in
 
 
@@ -328,13 +334,15 @@ class VetoedTurn:
   junction is on turnpilotd's odometer (odo_m plus the follower's distance at the veto), the veto's reason, the id it is
   skipped under now, and whether its desire was out (its cap kept to its pass, skip_cap_id). line: a veto at the
   unprotected left's hold line or in its go while withdrawable (the intent's left_veto), the left's handback and the end
-  of the request for the left, never a skip; carried as that end. TurnPilot.carry_veto."""
+  of the request for the left, never a skip; carried as that end. veto_odo: the car's own place on the odometer at the
+  veto. TurnPilot.carry_veto."""
   maneuver: object
   junction_odo: float
   reason: str
   maneuver_id: int
   capped: bool
   line: bool = False
+  veto_odo: float = field(kw_only=True)
 
 
 class TurnPilot:
@@ -874,7 +882,7 @@ class TurnPilot:
         # too close to pulse again: the hold's go is never the vetoed turn
         self.skip.skip(act_on, rf.distance, rf.maneuver_id, v_ego, ts.skip)
         plan.tooFastToTurn = True
-        self.vetoed = VetoedTurn(act_on, self.odo_m + rf.distance, ts.skip, rf.maneuver_id, committed)
+        self.vetoed = VetoedTurn(act_on, self.odo_m + rf.distance, ts.skip, rf.maneuver_id, committed, veto_odo=self.odo_m)
         if sg_withdrawable:
           self.sg_veto = ts.skip  # the decider withdraws its go on it next frame (stop_go._going)
         if committed:
@@ -887,8 +895,9 @@ class TurnPilot:
     if ts.left_veto and desire_on is not None:
       # a veto at the left's line, or in its go while withdrawable, is the left's handback and ends the request for the left
       # (car_signals.py), never a skip (6.6's exception). It is the junction's too: carry_veto keeps that request ended for
-      # the same left there under a new id
-      self.vetoed = VetoedTurn(desire_on, self.odo_m + rf.distance, ts.left_veto, rf.maneuver_id, False, line=True)
+      # the same left there under a new id, for as long as the car is short of it (carry_veto)
+      self.vetoed = VetoedTurn(desire_on, self.odo_m + rf.distance, ts.left_veto, rf.maneuver_id, False, line=True,
+                               veto_odo=self.odo_m)
     signal_skip = self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id and \
       self.skip.reason in ('driverSignal', 'hazards', 'signalLost', 'sideUncertain')
     plan.turnSignal.skip = self.skip.reason if signal_skip else 'none'
@@ -989,11 +998,16 @@ class TurnPilot:
     intent update, so the car never relights the left the driver overruled, never prompts 'Signal Left' for it with our
     lamp put out, and a takeover never asks for it. It is for the left at the line the car stands at, so it is forgotten
     once the car is past that junction (the driver took over and drove it): a left of a new id after it, which without
-    junction data same_junction can't tell from it, would otherwise lose its lamp and prompt with nothing said."""
+    junction data same_junction can't tell from it, would otherwise lose its lamp and prompt with nothing said. Past it
+    takes both: beyond where the veto put the junction, and LINE_VETO_MOVED_M on from where the veto found the car. The
+    junction's place is the follower's nearest reading, which only runs down, so one reading off nearer while the car
+    stands at the line (a fix off at a standstill, under UNCERTAIN_M of spread) can put it at or behind the car; standing
+    where it was vetoed, the car is short of the junction whatever that reading says."""
     v = self.vetoed
     if v is None:
       return
-    if self.odo_m > v.junction_odo + SAME_TURN_M or (v.line and self.odo_m > v.junction_odo):
+    past_line = v.line and self.odo_m > v.junction_odo and self.odo_m > v.veto_odo + LINE_VETO_MOVED_M
+    if self.odo_m > v.junction_odo + SAME_TURN_M or past_line:
       self.vetoed = None
       return
     if upcoming is None or upcoming.kind not in (TURN, KEEP) or rf.maneuver_id == v.maneuver_id or \
