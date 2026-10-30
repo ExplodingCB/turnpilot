@@ -932,3 +932,29 @@ def test_the_other_turns_launch_never_says_too_fast_to_turn_for_the_routes(tmp_p
   assert go is not None and plans[go].stopGo.alternate and commit is not None
   assert not [k for k in range(go, len(plans)) if plans[k].tooFastToTurn and not plans[k].turnMissed]
   assert not [c for c in log.event.call_args_list if c.args[0] == 'turnpilot_turn_skipped']
+
+
+@pytest.mark.parametrize('route', ['left', 'right', 'straight'])
+@pytest.mark.parametrize('err_after_s', [0.1, 0.3, 1.0])
+def test_one_decider_error_after_the_commit_never_drops_the_other_turn(tmp_path, route, err_after_s):
+  # skeptic SG4c A: one stop_go.update exception after the commit returned a bare StopGoDecision (alt None, state off): DesireTiming
+  # got the route's maneuver for that frame (CLEAR_DESIRE, its turn's desire reset), the scene a new maneuver id for the other turn
+  # (its committed state lost), and the turn's desire never came back with the route's turn skipped (0 frames, against 26-44). A
+  # failed frame mid-turn carries the last frame's other turn and state on (logged, error: turnpilot.stop_go_carried): the desire
+  # stays out, never cleared, and the scene keeps the turn's id; nothing holds the car or brakes past -2.0
+  want = Desire.turnLeft if route == 'right' else Desire.turnRight
+  (tmp_path / 'base').mkdir()
+  (tmp_path / 'bad').mkdir()
+  base, _, bcommit, _, _ = other_turn_drive(tmp_path / 'base', route)
+  with __import__('unittest').mock.patch('openpilot.selfdrive.turnpilot.turnpilotd.cloudlog') as log:
+    plans, go, commit, raised, seen = other_turn_drive(tmp_path / 'bad', route, err_after_s)
+  assert raised is not None and plans[go].stopGo.alternate
+  ref = bcommit + round(err_after_s / DT_MDL)
+  base_n = sum(int(p.desire) == want for p in base[ref:ref + 200])
+  after = [int(p.desire) for p in plans[raised - 1:raised + 200]]
+  assert int(Desire.none) != after[0] and 255 not in after[:20], after[:20]
+  assert after.count(want) >= base_n - 2, (after.count(want), base_n)
+  assert plans[raised].stopGo.alternate and str(plans[raised].stopGo.state) == str(plans[raised - 1].stopGo.state)
+  assert not [k for k in range(raised, min(raised + 80, len(seen))) if seen[k][0] or seen[k][1]]
+  assert all(p.accelCap >= -2. - 1e-9 for p in plans)
+  assert [c for c in log.event.call_args_list if c.args[0] == 'turnpilot.stop_go_carried']

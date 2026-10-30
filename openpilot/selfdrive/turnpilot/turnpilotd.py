@@ -129,6 +129,7 @@ Alert priority (hooks.plan_events): handback, then fault (turnpilotUnavailable),
 change, then wrong lane. While TurnPilot isn't acting or is faulted, too fast to turn, wrong lane and lane change offers
 are never set here; the rest of the order is selfdrived's (hooks.plan_events, hooks.lane_change_events).
 """
+import dataclasses
 import datetime
 import math
 import os
@@ -298,6 +299,11 @@ RELEASE_UNSIGNALIZED = False
 STOP_GO_CAUSES = ('stopSign', 'rollUp', 'creep', 'clearBox')
 OWN_CAP_TOL = 0.05  # m/s a creep go's own cap may be undercut (its ramp near its end) before something else's counts as a hold
 YAW20_M = 20.  # m of travel the approach yaw (go condition 3) is integrated over
+# a stop_go.update that raises with the other turn under way (going, committed, inLane) carries its last decision on for up to
+# this many frames, logged (skeptic SG4c A: a bare decision for one frame dropped the turn's desire for good); past that, a
+# failing decider is as before: shadow, its go withdrawn
+STOP_GO_CARRY_FRAMES = 20
+STOP_GO_CARRY_STATES = ('going', 'committed', 'inLane')
 STOP_GO_HOLDS_PULSE = ('approach', 'stopped', 'rollUp', 'observe')  # the decider's states a turn's pulse waits for its go in
 
 
@@ -397,6 +403,8 @@ class TurnPilot:
     self.odo_m = 0.               # m driven since turnpilotd started (faults included): the decider's position after its latch
     self.yaw20: list = []         # (odometer, deg) of the car's heading change, the last YAW20_M
     self.sg_now: StopGoDecision | None = None  # this frame's decision, once update() has made it
+    self.sg_last: StopGoDecision | None = None  # the last frame's (stop_go_update), for a failed frame to carry on
+    self.sg_carried = 0  # failed frames in a row carried on from it
     self.sg_turned = 0.           # deg the car has turned since the decider's go
     self.alt_scene_id = ALT_SCENE_ID  # the scene's maneuver id for the ladder's other turn in hand (a new one per encounter)
     self.alt_was_on = False
@@ -1057,7 +1065,11 @@ class TurnPilot:
   def stop_go_update(self, sm, cs, model, v_ego: float, acting: bool, objects, rf) -> StopGoDecision:
     """This frame's stop-sign decision (stop_go.py) for the held stop sign (map_controls.held_control()) or the engaged one
     within STOP_SWEEP_M ahead. Not acting (a handback): as shadow. A failure is logged and is shadow too (the latch's 1 s
-    handback), its go withdrawn: never a go on an exception."""
+    handback), its go withdrawn: never a go on an exception. But with the ladder's other turn under way (going, committed,
+    inLane: the latch let go, the turn's desire out) the last frame's decision is carried on, dead-reckoned, for up to
+    STOP_GO_CARRY_FRAMES, said in the log (turnpilot.stop_go_carried, error) and in stopGo.fault: a bare decision there would
+    drop the turn's desire and the scene's hold on its maneuver mid-turn (skeptic SG4c A), and a committed turn is never
+    cancelled."""
     try:
       mc = self.map_controls
       ctl = mc.held_control()
@@ -1107,9 +1119,22 @@ class TurnPilot:
                 go_active=self.go_cert.cause, go_taken_over=self.go_cert.taken_over, go_end=self.go_cert.end,
                 mode=self.stop_sign_mode if acting else 'shadow', mode_known=self.stop_sign_known, approach_lanes=ours,
                 rightmost=model_lanes.measured and model_lanes.right_known and model_lanes.right == 0)
-      return self.stop_go.update(f)
+      d = self.stop_go.update(f)
+      self.sg_last, self.sg_carried = d, 0
+      return d
     except Exception:
       log_error("turnpilotd.stop_go_failed")
+      prev = self.sg_last
+      if prev is not None and prev.alt is not None and prev.state in STOP_GO_CARRY_STATES and self.sg_carried < STOP_GO_CARRY_FRAMES:
+        self.sg_carried += 1
+        carried = dataclasses.replace(prev, release=None, stops=[], creep=None, go_cause='none', withdraw='error', chime=False,
+                                      turn_missed=False, position_m=prev.position_m + max(v_ego, 0.) * DT_MDL, fault='error',
+                                      log={})
+        cloudlog.event("turnpilot.stop_go_carried", error=True, frames=self.sg_carried, state=prev.state,
+                       alt=str(prev.alt.get('maneuver', '')), position_m=round(carried.position_m, 2))
+        self.sg_last = carried
+        return carried
+      self.sg_last, self.sg_carried = None, 0
       return StopGoDecision(latch='shadow', withdraw='error')
 
   def set_sim(self, ok: bool) -> None:
