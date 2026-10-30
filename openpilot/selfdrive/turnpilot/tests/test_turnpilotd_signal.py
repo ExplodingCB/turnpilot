@@ -1027,6 +1027,7 @@ def nearer_reading_at_the_left_line(driver, nearer_m):
   at_the_line_never_silently_freezes_the_left). 1.5 s on, the driver overrules the car's left for 1 s. Returns (sim, state,
   the plans of the veto)."""
   from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import JUNCTION, LEFT_25, V_25, drive, left_sim
+  from openpilot.selfdrive.turnpilot.unprotected_left import HELD_MIN_M
   stream = [JUNCTION + 60. + k * 6. * V_25 for k in range(4)]
   t0 = [None]
 
@@ -1058,9 +1059,10 @@ def nearer_reading_at_the_left_line(driver, nearer_m):
   assert jumped['n'] == 1
   assert sim.tp.follower.distance < d_line - nearer_m + 0.5, (d_line, sim.tp.follower.distance)
   p = sim.trace[-1][2]
-  # a reading that puts the junction behind the car standing at its line (10 m) is the left's position fault (skeptic
-  # m-behaviour3 P2): handed back, held, still signalling; nearer readings that leave it ahead, the left still waits for its gap
-  waiting = ('undecided', 'position') if nearer_m > d_line else ('waitGap', '')
+  # a reading that puts the junction behind the car standing at its line (10 m), or too near for the go's first-motion
+  # re-check (5 m: under HELD_MIN_M, skeptic SIMFIX P2), is the left's position fault (skeptic m-behaviour3 P2): handed back,
+  # held, still signalling; one that leaves it room, the left still waits for its gap
+  waiting = ('undecided', 'position') if d_line - nearer_m < HELD_MIN_M else ('waitGap', '')
   assert (str(p.unprotectedLeft.state), p.unprotectedLeft.why if waiting[1] else '') == waiting and \
     p.turnSignal.side == LaneChange.left and p.shouldStop, (str(p.unprotectedLeft.state), p.unprotectedLeft.why, p.turnSignal.side, p.shouldStop)
   state['driver'] = driver
@@ -1090,8 +1092,9 @@ def left_line_veto_then_reroute(driver, reroute=True, nearer_m=0.):
   return sim, old_id, drive(sim, 40.)
 
 
-# a reading of the left 5 or 10 m nearer than the rest while the car stands at its line, before the veto: 10 m puts the
-# follower's distance (the nearest reading) behind the car standing 9.3 m short of the junction (verification of tp/blinker,
+# a reading of the left 5 or 10 m nearer than the rest while the car stands at its line, before the veto (both the left's
+# position fault: 5 m leaves the follower under HELD_MIN_M): 10 m puts the follower's distance (the nearest reading) behind
+# the car standing 9.3 m short of the junction (verification of tp/blinker,
 # N1: the line record forgotten on the next frame, the car still standing, so navd's reroute took up the overruled left)
 NEARER_M = [0., 5., 10.]
 

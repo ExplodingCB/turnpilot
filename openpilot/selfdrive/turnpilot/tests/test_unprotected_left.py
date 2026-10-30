@@ -7,7 +7,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.route_follower import LEFT
 from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M, VEL_TRUST_HITS
 from openpilot.selfdrive.turnpilot.tests.synthetic import scene
-from openpilot.selfdrive.turnpilot.unprotected_left import (BLOCKED_UNDECIDED_S, CLEAR_WINDOW_S, CREEP_MAX_M, CREEP_SHORT_M, CREEP_STALL_S,
+from openpilot.selfdrive.turnpilot.unprotected_left import (BLOCKED_UNDECIDED_S, CLEAR_WINDOW_S, CREEP_MAX_M, CREEP_SHORT_M, CREEP_STALL_S, HELD_MIN_M,
                                                            LIGHT_RED_MAX_S, LIGHT_UNKNOWN_S, PET_S, RAW_CONF,
                                                            ROAD_FRESH_S, SPEED_MARGIN, STALE_UNDECIDED_S, LeftInput, RawBox, RawFrame,
                                                            UnprotectedLeft, band_blockers, r_req, t_clear, t_req)
@@ -418,24 +418,39 @@ def test_a_commit_while_standing_held_before_any_go_is_a_fault_never_a_freeze():
   j.wait(1.)
   d = j.step(committed=True)
   assert d.state == 'undecided' and d.why == 'position' and d.prompt == 'leftUndecidedTakeControl' and not d.go
-  # after its go the car must have moved before anything commits it: at the go, a nearer reading (under ONCOMING_ENTRY_M)
-  # leaves its abort window open until it pulls away
+  # after its go the car must have moved before anything commits it: at the go, a scene commit leaves its abort window open
+  # until it pulls away
   j = Junction()
   j.wait(CLEAR_WINDOW_S + 0.2)
   assert any(x.go for x in j.decisions)
   j.held = False
-  d = j.step(distance=ONCOMING_ENTRY_M - 0.5, committed=True)
+  d = j.step(committed=True)
   assert d.state == 'go'
-  d = j.step(boxes=[raw(80., 3.6)], distance=ONCOMING_ENTRY_M - 0.5, committed=True)
-  # standing where it was held, it can always stay: a car in the band withdraws the go whatever the reading says
+  d = j.step(boxes=[raw(80., 3.6)], committed=True)
+  # standing where it was held, it can always stay: a car in the band withdraws the go
   assert d.state == 'waitGap' and d.alert == 'oncomingHolding' and d.stops and d.stops[0].should_stop
   j = Junction()
   j.wait(CLEAR_WINDOW_S + 0.2)
   j.held = False
-  d = j.step(v=0.5, distance=ONCOMING_ENTRY_M - 0.5, committed=True)  # its first motion: the re-check, then committed
+  d = j.step(v=0.5, distance=HOLD_D - 0.1, committed=True)  # its first motion: the re-check, then committed
   assert d.state == 'go'
-  d = j.step(v=0.6, distance=ONCOMING_ENTRY_M - 0.6, committed=True)
+  d = j.step(v=0.6, distance=HOLD_D - 0.2, committed=True)
   assert d.state == 'committed'
+  # a reading too near for the first-motion re-check (under HELD_MIN_M: skeptic SIMFIX P2), standing at its line or on the
+  # go before it moves, a scene commit with it or not: the position fault, the go withdrawn where it stands, held
+  for committed in (False, True):
+    j = Junction()
+    j.wait(1.)
+    d = j.step(distance=HELD_MIN_M - 0.1, committed=committed)
+    assert d.state == 'undecided' and d.why == 'position' and not d.go, committed
+    for v in (0., 0.5):  # the go's frame on, and its first motion
+      j = Junction()
+      j.wait(CLEAR_WINDOW_S + 0.2)
+      j.held = False
+      d = j.step(v=v, distance=ONCOMING_ENTRY_M - 0.5, committed=committed)
+      assert d.state == 'undecided' and d.why == 'position' and d.prompt == 'leftUndecidedTakeControl', (committed, v)
+      assert d.stops and d.stops[0].should_stop == (v < 0.3), (committed, v)
+      assert j.step(v=0., distance=ONCOMING_ENTRY_M - 0.5, committed=committed).state == 'undecided'
 
 
 def test_a_scene_commit_before_any_go_is_a_fault_moving_or_standing_and_only_the_drivers_release_is_a_commit():

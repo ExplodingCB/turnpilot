@@ -1403,11 +1403,9 @@ class TurnPilot:
     # and a new maneuver by the follower, which a turn whose desire isn't out doesn't hold): the car is held where its
     # junction isn't known. Said for as long as it lasts, never a silent hold (skeptic G4)
     stray = tc is not None and tc.held and not held
-    # ...nor at the line it holds the car at when the follower's nearest reading puts the junction at or behind the car (a fix
-    # off at a standstill under UNCERTAIN_M of spread): DesireTiming never starts a turn past its junction, so the left's go
-    # would put out no turnLeft and the car would cross the junction straight from its left-turn position, nothing said
-    # (skeptic m-behaviour3 P2: 10 m nearer, the follower at -0.75 m with the car 9.25 m short). The position fault, said, held
-    behind = held and rf.distance < 0.
+    # A reading that puts the junction at or behind the car held at its line (skeptic m-behaviour3 P2: 10 m nearer, the
+    # follower at -0.75 m with the car 9.25 m short, the go putting out no turnLeft), or too near for the go's first-motion
+    # re-check (skeptic SIMFIX P2), is the left's own position fault (unprotected_left.HELD_MIN_M), said, the car held
     scene = self.scene
     # DESIGN G4 go condition 5: never a go while another of TurnPilot's stops holds the car at or before the junction (a
     # signal's red, a stop sign), nor at a signal whose light isn't read green (unprotected_left.py: SIGNAL_NEEDS_GREEN)
@@ -1415,7 +1413,7 @@ class TurnPilot:
     inp = LeftInput(mode, rf.maneuver_id, upcoming.side, rf.distance, v_ego, held or stray, raw, objects, self.approach_yaw_deg,
                     upcoming.opposing_speed or None, upcoming.opposing_lanes or None, self.left_range_m,
                     scene_clear=scene.junction is None and not scene.carried,
-                    junction_uncertain=rf.junction_spread > UNCERTAIN_M or stray or behind,
+                    junction_uncertain=rf.junction_spread > UNCERTAIN_M or stray,
                     go_withdrawn=self.go_withdrawn, committed=rf.maneuver_id == scene.committed_id,
                     released=rf.maneuver_id == scene.released_id,
                     spread_m=rf.junction_spread, other_hold=stop_d is not None and stop_d <= rf.distance + PROTECT_PAST_M,

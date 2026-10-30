@@ -2,6 +2,8 @@
 route, model and scene of test_turnpilotd, raw road camera runs of the oncoming cars, a point-mass car following the plan."""
 import math
 
+import pytest
+
 from openpilot.cereal import log, messaging
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
@@ -11,7 +13,7 @@ from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of, nav_instr
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Sim
 from openpilot.selfdrive.turnpilot.turn_speed import POST_GO_PROFILES
 from openpilot.selfdrive.turnpilot.turnpilotd import GO_LINE_M, LEFT_NO_MOVE_S, TurnPilot, auto_left_for, left_range_for
-from openpilot.selfdrive.turnpilot.unprotected_left import (CLEAR_WINDOW_S, CREEP_STALL_S, LIGHT_UNKNOWN_S, ROAD_RANGE_M, STALE_UNDECIDED_S,
+from openpilot.selfdrive.turnpilot.unprotected_left import (CLEAR_WINDOW_S, CREEP_STALL_S, HELD_MIN_M, LIGHT_UNKNOWN_S, ROAD_RANGE_M, STALE_UNDECIDED_S,
                                                            r_req, t_req)
 
 Desire = log.Desire
@@ -444,8 +446,16 @@ def test_a_nearer_reading_while_held_at_the_line_never_silently_freezes_the_left
   # car forever ("waiting for a gap", no chime, 130 s past the stream's end). The left keeps judging and goes after it, and
   # its go is the turn: turnLeft goes out with it (skeptic m-behaviour3 P2: at 10 m the go put out no turnLeft and the car
   # drove straight across the junction, nothing said). A reading that puts the junction behind the car standing at its line
-  # (10 m: the follower at -0.75 m, the car 9.25 m short) is the position fault instead, said, the car held: never a go
+  # (10 m: the follower at -0.75 m, the car 9.25 m short) is the position fault instead, said, the car held: never a go. So
+  # is one that leaves the go's first-motion re-check no room (5.5 and 6 m: the follower under HELD_MIN_M, skeptic SIMFIX
+  # P2: a car appearing at first motion was never withdrawn for); 3 and 4 m still go, turnLeft with the go
   for jump in (5.5, 6.):
+    sim, plans, _ = jump_run(jump, 60.)
+    first = next(i for i, p in enumerate(plans) if str(p.controlPrompt) == 'leftUndecidedTakeControl')
+    assert plans[first].unprotectedLeft.why == 'position' and plans[first].reason == "Junction position unsure: take control"
+    assert all(str(p.controlPrompt) == 'leftUndecidedTakeControl' and p.shouldStop for p in plans[first:]), jump
+    assert not any(str(p.controlPrompt) == 'leftGo' or p.desire == Desire.turnLeft for p in plans) and sim.s < LINE + 1., jump
+  for jump in (3., 4.):
     sim, plans, last = jump_run(jump, 90.)
     states = [str(p.unprotectedLeft.state) for p in plans]
     go = next((i for i, p in enumerate(plans) if str(p.controlPrompt) == 'leftGo'), None)
@@ -507,6 +517,97 @@ def test_the_lefts_go_after_a_nearer_reading_turns_or_says_why_not():
     else:
       said = [p for p in after if str(p.controlPrompt) in TAKE_CONTROL_PROMPTS]
       assert said and all(p.shouldStop for p in after[after.index(said[0]):]) and sim.s < JUNCTION, nearer_m
+
+
+def first_motion_run(nearer_m, v_inject):
+  """LEFT_25 held at its line behind a 4-car stream 6 s apart; standing there, one navd reading puts the junction nearer_m
+  nearer (under UNCERTAIN_M of spread); once the stream has passed the left goes, and at its first motion (the car at
+  v_inject) a car appears 90 m up the oncoming lane at V_25. (sim, plans after the reading, the go's index or None,
+  where the car appeared at: its index or None)"""
+  stream = [JUNCTION + 60. + k * 6. * V_25 for k in range(4)]
+  t0, state = [None], {'car': None}
+
+  def cars(sim):
+    if t0[0] is None and JUNCTION - sim.s < 60.:
+      t0[0] = sim.t
+    dt = sim.t - t0[0] if t0[0] is not None else 0.
+    out = [(s - V_25 * dt, 3.6) for s in stream]
+    if state['car'] is not None:
+      out.append((state['car'] - V_25 * (sim.t - state['t']), 3.6))
+    return out
+  sim = left_sim(cars)
+  jumped = {'on': False, 'n': 0}
+
+  def nav(s, instr):
+    if jumped['on'] and jumped['n'] < 1 and instr.maneuverModifier == 'left':
+      jumped['n'] += 1
+      return nav_instruction(instr.maneuverDistance - nearer_m, "turn", "left", remaining=instr.distanceRemaining,
+                             junction=LEFT_25[0][3], ahead=[(LEFT_25[1][0] - s.s - nearer_m, "turn", "right", junction_of("right"))]), True
+    return instr, True
+  sim.nav_filter = nav
+  while not (sim.trace and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap' and sim.v < 0.05):
+    drive(sim, DT_MDL)
+    assert sim.t < 90.
+  jumped['on'] = True
+  plans, go, appeared = [], None, None
+  while sim.t < 130.:
+    plans += drive(sim, DT_MDL)
+    if go is None and plans[-1].desire == Desire.turnLeft:
+      go = len(plans) - 1
+    if go is not None and appeared is None and sim.v >= v_inject:
+      state['car'], state['t'], appeared = sim.s + 90., sim.t, len(plans) - 1
+    if appeared is not None and len(plans) - appeared > int(4.5 / DT_MDL):
+      break
+  return sim, plans, go, appeared
+
+
+@pytest.mark.parametrize("v_inject", [0.3, 0.8])
+@pytest.mark.parametrize("nearer_m", [0., 3., 4.5, 5.5, 6., 7., 8.])
+def test_a_nearer_reading_at_the_line_never_leaves_the_first_motion_recheck_without_room(nearer_m, v_inject):
+  """Skeptic SIMFIX P2 (633d8a3 partial, CRITIQUE REQUIRED 4; the same on 49359b2): standing at the left's line, a reading
+  5.3-9.2 m nearer left the follower 0.1-4 m out, the junction still ahead (no position fault) and the spread under
+  UNCERTAIN_M. The go's first-motion re-check withdraws only while the car can stop short of the oncoming lanes by the live
+  reading, false at first motion there, so a car appearing 90 m up the oncoming lane then was ignored and the car committed,
+  4.3-5.8 m past the junction at 4.2 m/s 4.5 s later. A reading under HELD_MIN_M is the position fault, the car held and
+  said, never a go; one that leaves the re-check room (0, 3, 4.5 m nearer) still goes, and its re-check withdraws it."""
+  sim, plans, go, appeared = first_motion_run(nearer_m, v_inject)
+  if JUNCTION - LINE - nearer_m < HELD_MIN_M:
+    assert go is None and not any(str(p.controlPrompt) == 'leftGo' for p in plans), f"{nearer_m} m nearer: it went"
+    first = next(i for i, p in enumerate(plans) if str(p.controlPrompt) in TAKE_CONTROL_PROMPTS)
+    assert str(plans[first].controlPrompt) == 'leftUndecidedTakeControl' and plans[first].unprotectedLeft.why == 'position'
+    assert plans[first].reason == "Junction position unsure: take control"
+    assert all(str(p.controlPrompt) == 'leftUndecidedTakeControl' and p.shouldStop for p in plans[first:])
+    assert sim.s < LINE + 1. and sim.v < 0.05
+    return
+  assert go is not None and appeared is not None, nearer_m
+  more = plans[appeared:]
+  assert any(str(p.controlAlert) == 'oncomingHolding' for p in more[:int(1.5 / DT_MDL)]), \
+    f"{nearer_m} m nearer: a car 90 m up the oncoming lane at the go's first motion never withdrew it"
+  assert max(s for s, _, _ in sim.trace[-len(more):]) < JUNCTION - ONCOMING_ENTRY_M, f"{nearer_m} m nearer: into the oncoming lanes"
+
+
+def test_a_go_whose_reading_jumps_nearer_before_it_moves_is_withdrawn_and_said():
+  # the same reading after the go, before the car has moved on it (the model's launch latency): the go is withdrawn where the
+  # car stands, said, held, never a first motion with no room to re-check
+  sim = left_sim(sim_cls=GoHeldSim)
+  jumped = {'on': False, 'n': 0}
+
+  def nav(s, instr):
+    if jumped['on'] and jumped['n'] < 1 and instr.maneuverModifier == 'left':
+      jumped['n'] += 1
+      return nav_instruction(instr.maneuverDistance - 7., "turn", "left", remaining=instr.distanceRemaining,
+                             junction=LEFT_25[0][3], ahead=[(LEFT_25[1][0] - s.s - 7., "turn", "right", junction_of("right"))]), True
+    return instr, True
+  sim.nav_filter = nav
+  plans = []
+  while not any(p.desire == Desire.turnLeft for p in plans[-1:]):
+    plans += drive(sim, DT_MDL)
+    assert sim.t < 60.
+  jumped['on'] = True
+  plans = drive(sim, 1.)
+  first = next((i for i, p in enumerate(plans) if str(p.controlPrompt) == 'leftUndecidedTakeControl'), None)
+  assert first is not None and plans[first].unprotectedLeft.why == 'position', sorted({str(p.unprotectedLeft.state) for p in plans})
+  assert all(p.shouldStop for p in plans[first + 1:]) and not sim.tp.go_cert.active and sim.s < LINE + 1.
 
 
 def test_a_nearer_reading_on_the_roll_up_to_the_line_is_said_never_a_silent_hold():
@@ -611,7 +712,7 @@ def test_a_go_after_a_nearer_reading_is_still_withdrawn_when_the_car_doesnt_move
   # the left goes only standing held at its line: after a nearer reading (the follower's distance under GO_LINE_M) its go is
   # still a go from the line, withdrawn and handed back when the model holds the car (LEFT_NO_MOVE_S), never taken for a go
   # in the junction left to the stall's handback
-  sim, plans, last = jump_run(6., 70., sim_cls=GoHeldSim)
+  sim, plans, last = jump_run(4., 70., sim_cls=GoHeldSim)
   go = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
   assert sim.distance() < GO_LINE_M and not sim.tp.go_in_junction
   after = plans[go:]

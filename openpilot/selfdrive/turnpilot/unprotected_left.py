@@ -149,6 +149,13 @@ MATCH_LATERAL_M = 1.       # and this across it: a car passing in the lane besid
 CREEP_MAX_M = 4.           # past the line
 CREEP_SHORT_M = 1.         # never nearer the oncoming lanes (ONCOMING_ENTRY_M) than this
 CREEP_DONE_M = 0.3         # crept to within this of its target: the full creep
+# standing for the left (held at its line, crept, or on its own hold after a withdrawn go) or gone and not yet moved, a reading
+# that puts the junction nearer than this is the position fault, said, the car held (skeptic SIMFIX P2, CRITIQUE REQUIRED 4):
+# the go's first-motion re-check withdraws only while the car can stop short of the oncoming lanes by the live reading, so a
+# reading 5.5-8 m nearer at the line (the follower 1-4 m out, the spread under UNCERTAIN_M) ignored a car coming into the band
+# at first motion and committed. Half the creep's margin: past where its full creep stands the car (CREEP_SHORT_M short of the
+# lanes, its stop's overshoot under half that), and room at first motion to stop from 0.85 m/s at STOP_DECEL
+HELD_MIN_M = ONCOMING_ENTRY_M + 0.5 * CREEP_SHORT_M
 BLOCKED_UNDECIDED_S = 15.  # the view still blocked this long after the full creep: a fault
 CREEP_STALL_S = 10.        # standing this long in a creep it hasn't made, nothing else holding the car (the model holding a
                            # standstill: G0's tapless stand): a fault, never a silent stand
@@ -536,7 +543,9 @@ class UnprotectedLeft:
     self.unsignalled_s = self.unsignalled_s + dt if no_signal else 0.
     if self.unsignalled_s >= LEFT_SIGNAL_WAIT_S - 1e-6:
       return self._undecided(out, 'unsignalled')
-    if inp.junction_uncertain:  # where the car is isn't known: before anything is judged from it (a roll-up included)
+    if inp.junction_uncertain or inp.distance < HELD_MIN_M:
+      # where the car is isn't known: before anything is judged from it (a roll-up included); or a reading puts the junction
+      # too near for the go's first-motion re-check to stop the car short of the oncoming lanes (HELD_MIN_M)
       return self._undecided(out, 'position')
     # held short of its line (the latch reaches LATCH_NEAR_M short of it), where the longer crossing puts R_req past the
     # range: rolled up to the line first (the latch's creep), where it is judged (BeamNG: held 16 m out, R_req 164 m)
@@ -643,6 +652,14 @@ class UnprotectedLeft:
     if inp.go_withdrawn and not inp.signal_veto:  # turnpilotd's: not moving, held and handed back there
       out.withdrawable = True
       return out
+    if not self.moved and (inp.junction_uncertain or inp.distance < HELD_MIN_M):
+      # not yet moved on the go, the junction's position unsure or a reading too near for the first-motion re-check
+      # (HELD_MIN_M): never on, withdrawn where the car stands (it can always stay) and handed back, held
+      cloudlog.event("turnpilot.left_go_withdrawn", error=True, why='position', first_motion=False, distance=round(inp.distance, 1),
+                     v=round(inp.v_ego, 2), spread=round(inp.spread_m, 1), r_req=round(out.r_req, 1))
+      self.went, self.moved, self.hold_here, self.clear_s = False, False, True, 0.
+      self.hold_reason, self.latch_d = UNDECIDED_REASON['position'], inp.distance
+      return self._undecided(out, 'position', inp.v_ego)
     first_motion = not self.moved and inp.v_ego >= 0.3
     self.moved = self.moved or first_motion
     # can't stop short of the oncoming lanes: on (committed_past_line commits it next). Not yet moved, it stands where it was
