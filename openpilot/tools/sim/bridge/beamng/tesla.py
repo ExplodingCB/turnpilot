@@ -67,7 +67,7 @@ def sim_car_signals_record() -> dict:
 
 
 def write_sim_car_signals(params) -> None:
-  """run_bridge.py --car-signals: the car signals TurnPilot's turns in the sim from this drive on."""
+  """The sim's default (bridge.car_signals_at_start, launch_openpilot.sh): the car signals TurnPilot's turns from this drive on."""
   params.put("TurnPilotCarSignalsVerified", sim_car_signals_record())
   params.put("TurnPilotCarSignals", "on")
 

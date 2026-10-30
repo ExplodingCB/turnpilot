@@ -105,7 +105,7 @@ On a Tesla, TurnPilot can work the car's own turn signal through `DAS_bodyContro
 | `TurnPilotCarSignalsCheckNow` | set by the phone | One-shot "Start check in Drive". Cleared at every ignition. |
 | `TurnPilotCarSignalsExterior` | set by the phone | Your answer to the outside-lamp question, for the pending check only. |
 
-In the BeamNG sim, `run_bridge.py --car-signals` writes `on` and a sim record that the comma accepts only with `SIMULATION=1`.
+In the BeamNG sim the car signals by default: `launch_openpilot.sh` and `run_bridge.py` write `on` and a sim record that the comma accepts only with `SIMULATION=1`. `run_bridge.py --no-car-signals` (with `TURNPILOT_CAR_SIGNALS=0` for `launch_openpilot.sh`) writes `off`.
 
 ## Install Valhalla for offline routing
 

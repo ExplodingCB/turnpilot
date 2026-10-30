@@ -13,6 +13,17 @@ from openpilot.tools.sim.bridge.beamng.tesla import SimulatedTesla, write_sim_ca
 from openpilot.tools.sim.bridge.beamng.world import BeamNGConfig, BeamNGState, BeamNGWorld
 
 MANUAL_STEER_DEG = 90.0  # steering wheel degrees for a full manual steer input
+
+
+def car_signals_at_start(params, on: bool) -> bool:
+  """The car's own turn signal for this drive, written before the car's first CAN so card's resolver reads it when it
+  fingerprints the car (SIMULATION=1: launch_openpilot.sh): on, TurnPilotCarSignals on and the sim verified record (the
+  sim's default, BeamNGConfig.car_signals); off (--no-car-signals), TurnPilotCarSignals off. True when the body is on."""
+  if on:
+    write_sim_car_signals(params)
+  else:
+    params.put("TurnPilotCarSignals", "off")
+  return read_mode(params) in ('on', 'check')
 STEER_NM_PER_UNIT = 12.5  # manual steer input as torsion bar torque; the port reads > 1 Nm as the driver steering
 SET_SPEED_STEP_KPH = 5.0
 DT = 0.01  # s, the loop period
@@ -25,8 +36,8 @@ class BeamNGBridge(SimulatorBridge):
   Queue commands (tools/sim/bridge/common.py control_cmd_gen, from the keyboard, the CLI or a scenario script):
   cruise_up engages (or raises the set speed by 5 km/h), cruise_down engages at the current speed (or lowers it),
   cruise_cancel cancels, plus upstream's steer_/throttle_/brake_/blinker_ commands, reset and quit; with the car's own
-  turn signal (car_signals: TurnPilotCarSignals on or check at the start, or --car-signals) blinker_ works the driver's
-  stalk in the car's body and hazard toggles its hazards.
+  turn signal (car_signals, the sim's default: TurnPilotCarSignals on with the sim verified record; --no-car-signals off)
+  blinker_ works the driver's stalk in the car's body and hazard toggles its hazards.
   `scenario` runs in the bridge process with the world after the first sensor data: scenario(bridge) -> None, called at
   100 Hz until it returns True (done)."""
 
@@ -83,10 +94,7 @@ class BeamNGBridge(SimulatorBridge):
   def _run(self, q: Queue):
     self.world = self.spawn_world(q)
     # before the car's first CAN, so card's resolver reads it when it fingerprints the car
-    params = Params()
-    if self.cfg.car_signals:
-      write_sim_car_signals(params)
-    self.car = SimulatedTesla(car_signals=read_mode(params) in ('on', 'check'))
+    self.car = SimulatedTesla(car_signals=car_signals_at_start(Params(), self.cfg.car_signals))
     self.sensors = BeamNGSensors()
     self.accel = AccelController()
     self.driver_accel = AccelController()

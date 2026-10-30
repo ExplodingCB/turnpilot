@@ -370,6 +370,24 @@ def test_car_signals_flag_writes_on_and_the_sim_record():
   assert resolver(params, simulation=False)(VIN_UNKNOWN, []) == CarSignalsConfig()
 
 
+def test_the_sim_runs_with_the_cars_own_turn_signal_on_unless_told_not_to():
+  """The sim's default (merging tp/blinker into tp/integrate): the bridge writes TurnPilotCarSignals on and the sim verified
+  record before the car's first CAN, so card's port signals TurnPilot's turns, the body model lights the game's indicator
+  and the autonomous left's gate runs on a signalled left (LEFT_GO_NEEDS_SIGNAL). --no-car-signals writes it off: today's
+  frames, the driver prompted."""
+  from openpilot.tools.sim.bridge.beamng.bridge import car_signals_at_start
+  from openpilot.tools.sim.bridge.beamng.run_bridge import config_from_args, parse_args
+  from openpilot.tools.sim.bridge.beamng.world import BeamNGConfig
+  assert BeamNGConfig().car_signals and parse_args([]).car_signals and config_from_args(parse_args([])).car_signals
+  assert not parse_args(['--no-car-signals']).car_signals and not config_from_args(parse_args(['--no-car-signals'])).car_signals
+  params = FakeParams()
+  assert car_signals_at_start(params, True)
+  assert params["TurnPilotCarSignals"] == "on" and params["TurnPilotCarSignalsVerified"] == sim_car_signals_record()
+  assert resolver(params, simulation=True)(VIN_UNKNOWN, []).mode == 'on'
+  assert not car_signals_at_start(params, False) and params["TurnPilotCarSignals"] == "off"
+  assert resolver(params, simulation=True)(VIN_UNKNOWN, []) == CarSignalsConfig()
+
+
 def test_game_lights_one_set_lights_per_change():
   """world.py's vehicle loop sends what GameLights.take() gives: beamngpy's Vehicle.set_lights message, on a change only."""
   lights = GameLights()

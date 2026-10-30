@@ -45,6 +45,14 @@ default = signals if os.path.exists(os.path.join(signals, 'controls_built')) els
 tiles = os.environ.get('TURNPILOT_TILES') or p.get('TurnPilotValhallaTiles') or default
 p.put('TurnPilotValhallaTiles', tiles)
 print(f'TurnPilotValhallaTiles: {tiles}')
+# the car's own turn signal (README, The car's own turn signal): on with the sim verified record before card fingerprints
+# the car, as the bridge writes at its start; TURNPILOT_CAR_SIGNALS=0 with the bridge's --no-car-signals for the driver's
+if os.environ.get('TURNPILOT_CAR_SIGNALS', '1') == '0':
+  p.put('TurnPilotCarSignals', 'off')
+else:
+  from openpilot.tools.sim.bridge.beamng.tesla import write_sim_car_signals
+  write_sim_car_signals(p)
+print(f\"TurnPilotCarSignals: {p.get('TurnPilotCarSignals')}\")
 "
 
 # after the manager clears TurnPilotSimLightOracle at its start (CLEAR_ON_MANAGER_START)

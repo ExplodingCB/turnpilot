@@ -50,9 +50,10 @@ class BeamNGConfig:
   capture: str = ""  # mp4 path for the chase view (capture.py)
   capture_fps: float = 10.0
   restore: bool = False  # on exit, undo the global game changes above (signals, HUD, particles, light): the game is shared
-  # run_bridge.py --car-signals: write TurnPilotCarSignals on and a sim verified record before the car's first CAN, so the
-  # car signals TurnPilot's turns itself (tesla.py car_signals; the bridge also takes it when the param is on or check)
-  car_signals: bool = False
+  # the car signals TurnPilot's turns itself, as a verified Tesla (tesla.py car_signals): TurnPilotCarSignals on and a sim
+  # verified record written before the car's first CAN (bridge.car_signals_at_start). On by default in the sim, so the game's
+  # indicator lights and the autonomous left goes on a signalled left; run_bridge.py --no-car-signals writes it off
+  car_signals: bool = True
 
 
 def load_scenario(bng, cfg: BeamNGConfig, log=print) -> tuple[Vehicle, float]:

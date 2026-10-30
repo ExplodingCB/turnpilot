@@ -72,11 +72,13 @@ Without a TTY, the bridge reads one command per line on stdin: `cruise_up` (enga
 
 ### The car's own turn signal
 
-`--car-signals` makes the sim car signal TurnPilot's turns and lane changes itself, as a verified Tesla does
-(`docs/turnpilot/INSTALL.md`, "Let the car signal its own turns"). It writes `TurnPilotCarSignals` on and a sim verified
-record before the car's first CAN; card takes a sim record only with `SIMULATION=1`, and reads it when it fingerprints
-the car, so restart openpilot along with the bridge. The bridge also turns the body on whenever `TurnPilotCarSignals` is
-on or check when it starts. Then:
+The sim car signals TurnPilot's turns and lane changes itself, as a verified Tesla does (`docs/turnpilot/INSTALL.md`,
+"Let the car signal its own turns"). This is the default: at every start the bridge writes `TurnPilotCarSignals` on and
+a sim verified record (`tesla.py`'s `sim_car_signals_record`) before the car's first CAN, and `launch_openpilot.sh`
+writes the same before the manager starts. card takes a sim record only with `SIMULATION=1`, and reads it when it
+fingerprints the car, so restart openpilot along with the bridge after changing it. `--no-car-signals` (with
+`TURNPILOT_CAR_SIGNALS=0` for `launch_openpilot.sh`) writes `TurnPilotCarSignals` off: every frame is the same as before
+the car's own signal, and the driver is prompted to signal each turn. With it on:
 
 - The car's body is opendbc's `BodyModel` (`opendbc/car/tesla/body_model.py`), the model the port's tests use. Its stock
   `DAS_bodyControls` goes out on bus 2 at 2 Hz, and UI_warning's lamps come from it.
@@ -86,8 +88,8 @@ on or check when it starts. Then:
 - `blinker_left` and `blinker_right` (keys `z` and `x`) work the driver's stalk in the body, so the car's CANCEL clears
   it as on the car. `hazard` (key `h`) toggles the hazards.
 - The game's indicator follows the body's lamps. The bridge never reads it back.
-
-Without the flag or the param, every frame is the same as before.
+- The autonomous left goes only with a lamp lit on its side (`LEFT_GO_NEEDS_SIGNAL`): here the car's own, so the left
+  gate's scenarios test the signalled left.
 
 ## Gate 1
 

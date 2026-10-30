@@ -47,9 +47,10 @@ def parse_args(add_args=None):
                  help="publish the game's light states ahead as turnpilotLights (light_oracle.py; SIM ONLY: turnpilotd takes them " +
                       "only with TURNPILOT_LIGHT_ORACLE=1 in launch_openpilot.sh)")
   p.add_argument('--light-latency', type=float, default=0.3, help='with --light-oracle, publish the lights this late, s')
-  p.add_argument('--car-signals', action='store_true',
-                 help="the car signals TurnPilot's turns itself: writes TurnPilotCarSignals on and a sim verified record " +
-                      "(SIM ONLY: card takes a sim record only with SIMULATION=1)")
+  p.add_argument('--car-signals', action=argparse.BooleanOptionalAction, default=d.car_signals,
+                 help="the car signals TurnPilot's turns itself (default on): writes TurnPilotCarSignals on and a sim verified " +
+                      "record (SIM ONLY: card takes a sim record only with SIMULATION=1); --no-car-signals writes it off, the " +
+                      "driver prompted")
   return p.parse_args(add_args)
 
 
