@@ -400,6 +400,7 @@ class TurnPilot:
     self.sg_turned = 0.           # deg the car has turned since the decider's go
     self.alt_scene_id = ALT_SCENE_ID  # the scene's maneuver id for the ladder's other turn in hand (a new one per encounter)
     self.alt_was_on = False
+    self.alt_route_id: int | None = None  # the route's maneuver the ladder's other turn was taken in place of (turn_skip's)
     self.last_holding = False     # the last plan's scene held the car (the decider's clearBox waits it out)
     self.params = None            # Params (main()): TurnPilotJunctionOverrides is written through it (signal_seen_override)
     self.override_failed_t = 0.   # s overrideWriteFailed has left to show
@@ -644,6 +645,16 @@ class TurnPilot:
     left_cmd = self.unprotected_left(turn, upcoming, rf, v_ego, acting, objects, raw, raw_far)
     # the stop-sign decider before map_update, so its release, the end of shouldStop and its go land in one plan
     sg = self.sg_now = self.stop_go_update(sm, cs, model, v_ego, acting, objects, rf)
+    # the stop-sign ladder's other turn in hand (stop_go: 7.1 rung 2, O12), or done in place of the route's turn here: the route's
+    # turn isn't the car's here, so turn_skip never judges it (skeptic SG4c A': its unprotected hold-line stop infeasible from
+    # the other turn's launch, its desire never out, it was skipped mid-junction, "Too Fast to Turn / Rerouting" over the go)
+    alt_on = sg.alt is not None and sg.state != 'off'
+    if alt_on and upcoming is not None and upcoming.kind == TURN and \
+       abs(rf.distance - (float(sg.alt['toNode']) - sg.position_m)) <= ALT_LANES_M:
+      self.alt_route_id = rf.maneuver_id  # the route turns at this junction: its turn is missed here once the other is taken
+    alt_replaced = alt_on or rf.maneuver_id == self.alt_route_id
+    if alt_replaced:
+      stop_infeasible = False
     mapd = self.map_update(sm, v_ego, cs.gasPressed, turn, left_cmd, release=sg.release, creep=sg.creep,
                            stop=StopCommand(sg.latch, sg.reason, sg.action))
     took_over = cs.gasPressed and not sm['carControl'].enabled  # the driver driving, never a go (module docstring)
@@ -665,7 +676,7 @@ class TurnPilot:
     # (unprotected_left: farOff), the car held, never a skip and a reroute from the line
     out_of_range = acting and self.auto_left == AUTO and unprotected_turn(upcoming, right_hand_traffic) and not engaged and \
       reach_at_line(upcoming.opposing_speed, upcoming.opposing_lanes or None) > self.left_reach_m(route=True)
-    skip = self.skip.update(upcoming, rf.distance, rf.maneuver_id, v_ego, desire_out, right_hand_traffic, lat_active,
+    skip = self.skip.update(None if alt_replaced else upcoming, rf.distance, rf.maneuver_id, v_ego, desire_out, right_hand_traffic, lat_active,
                             rf.ahead, rf.ahead_distance, stop_d=self.map_controls.stop_ahead(), stop_infeasible=stop_infeasible,
                             pulse_at_go=pulse_at_go, out_of_range=out_of_range)
     maneuver = None if skip.skipped else upcoming
@@ -687,7 +698,6 @@ class TurnPilot:
     # turn the car makes here: the scene's junction holds (a right's crosswalk, a left's oncoming hold, its road frame turned by
     # the car's yaw since the decider's go, its pulse) and the turn's speed cap are its, never the route's maneuver here (a route
     # left's oncoming hold through a right's launch; no oncoming hold for a left taken instead of a right). None going straight
-    alt_on = sg.alt is not None and sg.state != 'off'
     if alt_on:
       if not self.alt_was_on:
         self.alt_scene_id -= 1

@@ -8,6 +8,7 @@ from collections import deque
 import pytest
 
 from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.turnpilot import stop_go as sg_mod
 from openpilot.selfdrive.turnpilot import stop_rules as sr
 from openpilot.selfdrive.turnpilot.go_override import GO_ACCEL, GO_END_SPEED
 from openpilot.selfdrive.turnpilot.hooks import plan_accel
@@ -853,3 +854,81 @@ def test_a_left_taken_instead_of_the_routes_right_gets_the_scenes_oncoming_hold(
   # held short of the oncoming lanes (the node is 13 m past the stop point), on the speed cap: nothing below -2.0 here
   assert sim.v < 0.3 and sim.s - S_LINE < 13. - ONCOMING_ENTRY_M
   assert all(p.accelCap >= -2. - 1e-9 for p in plans)
+
+
+# --- skeptic SG4c (residual): the other turn's launch and a bad decider frame never touch the route's turn ---
+
+def other_turn_drive(tmp_path, route, err_after_s=None):
+  """The route's turn at the stop sign (route left: the left's exit blocked, the right taken; route right: its exit and straight
+  across blocked, the left taken; straight: the exit blocked, the right taken), driven through the other turn until the turn
+  is missed. err_after_s: one decider frame raises this long after its commit (None: none). Returns (plans, the go's frame,
+  the commit's frame, the bad frame, (junction hold reason, shouldStop) of the scene each frame)."""
+  if route == 'straight':
+    sim = StopSim(tmp_path)
+  else:
+    sim = StopSim(tmp_path, info_kw={'maneuver': route}, maneuvers=[(S_LINE + 13., 'turn', route),
+                                                                    (2000., 'turn', 'right' if route == 'left' else 'left')])
+  seen = []
+  orig = sim.tp.scene.update
+
+  def update(*a, **kw):
+    d = orig(*a, **kw)
+    j = sim.tp.scene.junction
+    seen.append((j.reason if j is not None else '', d.should_stop))
+    return d
+  sim.tp.scene.update = update
+  st = {'go': None, 'commit': None, 'raised': None}
+  sg_update = sim.tp.stop_go.update
+
+  def flaky(f):
+    if err_after_s is not None and st['commit'] is not None and st['raised'] is None and \
+       len(sim.trace) - st['commit'] >= round(err_after_s / DT_MDL):
+      st['raised'] = len(sim.trace)
+      raise RuntimeError("one bad frame")
+    return sg_update(f)
+  sim.tp.stop_go.update = flaky
+
+  def objects(s):
+    sg = s.tp.stop_go
+    if not (s.v < 0.5 and abs(S_LINE - s.s) < 6. and st['go'] is None):
+      return ()
+    if route == 'straight':
+      return ({'cls': 'car', 'x': 26., 'y': 0., 'vx': 0., 'vy': 0., 'inPath': True, 'camera': 'wide', 'view': 'full', 'tSeen': s.t_cam},)
+    if sg.token is None:
+      return ()
+    pos = sg.pos_ref + (s.tp.odo_m - sg.odo_ref)
+    if route == 'left':
+      return ({'trackId': 40, 'cls': 'car', 'x': sg._x(sg.edges.d_max, pos) + 2. * sr.LANE_W_MAX, 'y': sg_mod.BOX_LEFT_M + 3., 'vx': 0.,
+               'vy': 0., 'inPath': False, 'age': 200, 'camera': 'wide', 'view': 'full', 'tSeen': s.t_cam},)
+    return ({'trackId': 40, 'cls': 'car', 'x': sg._x(sg.edges.d_min, pos) + sr.LANE_W_MAX, 'y': -(sg_mod.BOX_RIGHT_M + 3.), 'vx': 0.,
+             'vy': 0., 'inPath': False, 'age': 200, 'camera': 'wide', 'view': 'full', 'tSeen': s.t_cam},
+            {'trackId': 42, 'cls': 'car', 'x': sg._x(sg._far_edge(), pos) + 3., 'y': 0., 'vx': 0., 'vy': 0., 'inPath': True,
+             'age': 200, 'camera': 'wide', 'view': 'full', 'tSeen': s.t_cam})
+  run_to_line(sim)
+  start = len(sim.trace)
+  turned = 0.
+  sign = 0.6 if route == 'right' else -0.6
+  while sim.t < 90. and not any(p.turnMissed for p in sim.plans()[start:]):
+    if st['go'] is None and str(sim.tp.stop_go.state) == 'going':
+      st['go'] = len(sim.trace)
+    if st['commit'] is None and str(sim.tp.stop_go.state) in ('committed', 'inLane'):
+      st['commit'] = len(sim.trace)
+    moving = sim.v > 0.5 and str(sim.trace[-1][2].stopGo.state) in ('committed', 'inLane')
+    yaw = sign if moving and turned < 80. else 0.
+    turned += abs(yaw) * DT_MDL * 57.3
+    sim.step(objects=objects(sim), yaw_rate=yaw)
+  return sim.plans(), st['go'], st['commit'], st['raised'], seen
+
+
+@pytest.mark.parametrize('route', ['left', 'right'])
+def test_the_other_turns_launch_never_says_too_fast_to_turn_for_the_routes(tmp_path, route):
+  # skeptic SG4c A': with the other turn taken where the route itself turns, turnpilotd still fed the route's turn to turn_skip
+  # (its unprotected hold-line stop infeasible from the moving car, its desire never out since DesireTiming carries the other
+  # turn) and skipped it during the launch: plan.tooFastToTurn on 120 frames (route left) through going, committed and inLane,
+  # so selfdrived said "Too Fast to Turn / Rerouting" over the decider's go and navd rerouted mid-junction. While the other
+  # turn is in hand the route's turn here is never judged: its own turn's encounter, then the planned turn missed (turnMissed)
+  with __import__('unittest').mock.patch('openpilot.selfdrive.turnpilot.turn_skip.cloudlog') as log:
+    plans, go, commit, _, _ = other_turn_drive(tmp_path, route)
+  assert go is not None and plans[go].stopGo.alternate and commit is not None
+  assert not [k for k in range(go, len(plans)) if plans[k].tooFastToTurn and not plans[k].turnMissed]
+  assert not [c for c in log.event.call_args_list if c.args[0] == 'turnpilot_turn_skipped']
