@@ -213,6 +213,39 @@ def test_a_shield_lost_from_its_view_is_dropped_after_a_cycle_gap_while_other_tr
     assert e is not None and e.shield == (t - 6.0 <= CYCLE_GAP_S + 1e-9), (round(t, 2), e.shield)
 
 
+def test_on_a_multi_lane_cross_approach_no_car_shields_and_its_first_range_is_the_nearest_lanes():
+  # skeptic SG3b q2b: assign() picks a cross lane by the track's ground x, so on a 2-lane approach a lane-1 car stopped at its
+  # line whose ground range read 1.3x long or more was put in lane 2 and became lane 2's shield (the unsafe way: lane 2 hidden
+  # behind the car said to cover it; 30 such rows at lines 6, 9 and 12 m), and its first-track range came from lane 2's sLaneMin.
+  # Until SG4b resolves the lane index, a side with more than one cross lane of an approach has no shield, and its first range is
+  # taken at the nearest lane's (the pessimistic end, 1.2)
+  import dataclasses
+  j = junction()
+  j.approaches = [dataclasses.replace(a, lanes_in=2, lanes_out=2) if a.role in ('left', 'right') else a for a in j.approaches]
+  lns = junction_lanes(j, 'straight', 1.9, lane_edge_m=4.0)
+  l1, l2 = (next(x for x in lns if (x.role, x.index) == ('left', i)) for i in (1, 2))
+  s_true = (l1.s_min + l1.s_max) / 2.
+  for line in (6., 9., 12.):
+    for past in (0., 1., 2.):
+      for k in (1.0, 1.3, 2.0):
+        ev = StopEvidence()
+        ev.set_junction(lns, sr.angle_bound(True), lines={'left': line, 'right': line, 'opposite': line})
+        d = line - past + 2.3 + l1.conflict_m
+        psi = math.atan2(d, s_true)
+        for i in range(31):
+          trk = SimpleNamespace(track_id=1, t_seen=0.2 * i, bearing_seen=math.degrees(psi), width_seen=1.8 * 904. / math.hypot(d, s_true),
+                                view='sideLeft', cls=2, hits=2 + i, x=np.array([k * s_true, k * d, 0., 0.]))
+          ev.observe([trk], d_stop=0.)
+          e = ev.evaluate()[1]
+        assert not e.shield, (line, past, k, e.index)
+        first = ev.first[1].range_m
+        near = min(ev.first_range(x, ev.hist[1][0]) for x in (l1,))
+        assert first <= near + 1e-6, (line, past, k, first, near)
+  # a single-lane approach's car at its line still shields
+  ln = lane('left')
+  assert drive(evidence(), 1, ln, braking(23.8, 8., 2.5), 6.0).shield
+
+
 def test_history_is_on_camera_time_and_restarts_when_our_car_moves():
   ln = lane('left')
   ev = evidence()

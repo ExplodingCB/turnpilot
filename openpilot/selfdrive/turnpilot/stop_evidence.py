@@ -27,7 +27,8 @@ control's stop point). From it, per track, for SG4a's and SG4b's decider and for
 - U2 (stop_rules.u2_state), stopped at its line (trusted speed under SHIELD_V with its front within its line region, 3 m
   before its stop point to 2 m past it), the shield (stop_rules.shield_ok: a motor vehicle so for SHIELD_STOP_S, seen on
   every cycle of its view, not moved SHIELD_MOVE_M, on a stopping approach with no mapped bike lane and no shoulder of
-  SHOULDER_PASS_M to pass it in: stop_rules.shield_lane_ok), and through at speed (a motor vehicle whose
+  SHOULDER_PASS_M to pass it in: stop_rules.shield_lane_ok, and of one cross lane: which of several a car is in isn't known
+  until SG4b, so none shields there and its first range is the nearest lane's), and through at speed (a motor vehicle whose
   front passed its line region (SHIELD_PAST_M past its line) at DOWNGRADE_V or more without dropping under it from
   DOWNGRADE_WINDOW_M before its line on: SG4b's downgrade,
   and a validation failure).
@@ -285,13 +286,18 @@ class StopEvidence:
   def need(self, ln: sr.Lane) -> float:
     return sr.reach_needed_allway(ln.limit) if ln.limit > 0. else 0.
 
+  def cross_lanes_of(self, ln: sr.Lane) -> list:
+    """The cross lanes of ln's approach (its role): more than one, and which a match is in isn't known from its bearing."""
+    return [x for x in self.lanes if is_cross(x) and x.role == ln.role] if is_cross(ln) else [ln]
+
   def first_range(self, ln: sr.Lane, s: Sample) -> float:
     """m down ln at the pessimistic distance end (1.2): sLaneMin where our car stood, the bearing toward the axis; on a
-    parallel lane the ground range's near end (module docstring)."""
+    parallel lane the ground range's near end (module docstring). On a cross approach of more than one lane, the nearest of
+    them (skeptic SG3b q2b: the lane a match is in comes from its ground x, which reads 1.5-2.5x long side on; SG4b's)."""
     if not is_cross(ln):
       return max((1. - OPP_BAND) * s.x - (ln.s_min + s.d_stop), 0.) - ln.conflict_m
     psi = min(max(abs(s.bearing) - self.bound, 0.), 89.5)
-    return (ln.s_min + s.d_stop) * math.tan(math.radians(psi)) - ln.conflict_m
+    return min((x.s_min + s.d_stop) * math.tan(math.radians(psi)) - x.conflict_m for x in self.cross_lanes_of(ln))
 
   def _note(self, tid: int, s: Sample, hits: int) -> None:
     """The validation record of a new match: its first track (the match that made it a track, MIN_HITS: two hits make a
@@ -392,7 +398,9 @@ class StopEvidence:
     window = [s for s in here if s.t >= last.t - sr.SHIELD_STOP_S - 1e-9]
     gaps = [b.t - a.t for a, b in zip(window, window[1:], strict=False)]
     seen_every = (self.newest_t is None or self.newest_t - last.t <= CYCLE_GAP_S) and all(g <= CYCLE_GAP_S + 1e-9 for g in gaps)
-    shield = ln.stopping and at_line and sr.shield_lane_ok(ln.approach) and \
+    # a cross approach of more than one lane: which lane the car is in isn't known (assign's ground x), so it shields none
+    # (skeptic SG3b q2b: a lane-1 car read in lane 2 shielded the lane it hides) until SG4b resolves the lane index
+    shield = ln.stopping and at_line and sr.shield_lane_ok(ln.approach) and len(self.cross_lanes_of(ln)) == 1 and \
       sr.shield_ok(last.cls, stopped_s, fit.v_hi, len([s for s in here if s.t >= last.t - sr.VEL_TRUST_S - 1e-9]), front_from_line,
                    seen_every, moved)
     through = self._through(st, ln, here, s_nom, line, last.cls, cross)
