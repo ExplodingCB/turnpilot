@@ -814,12 +814,6 @@ class TurnPilot:
     if self.override_failed_t > 0. and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS:
       plan.controlAlert = 'overrideWriteFailed'  # a signal seen or a downgrade at a stop sign not saved for navd: chimed (O16)
     self.override_failed_t = max(self.override_failed_t - DT_MDL, 0.)
-    # the route's stop signs (route_notice.py, STOP_SIGNS.md 3.4): at its start, and 300 m before each it couldn't avoid; said
-    # engaged or not (selfdrived's turnpilotRouteNotice), only where nothing else is, held back (not lost) behind another
-    notice, notice_text = self.notices.update(sm['navInstruction'], sm.updated['navInstruction'], sm.valid['navInstruction'], v_ego,
-                                              bool(sm['carControl'].enabled))
-    if notice != 'none' and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS:
-      plan.controlAlert, plan.routeNotice = notice, notice_text
     if decision.hard_brake:  # a confirmed track's hard stop outranks the map's alerts (scene_policy.py)
       plan.controlAlert = 'hardBrake'
     stalled = self.stalled_in_turn(sm, cs, v_ego, acting, decision, mapd)
@@ -832,6 +826,16 @@ class TurnPilot:
       plan.reason = plan.reason or STOPPED_NOTE
     elif stopped:
       plan.controlPrompt, plan.reason = 'carStoppedTakeControl', stopped
+    # the route's stop signs (route_notice.py, STOP_SIGNS.md 3.4): at its start, and 300 m before each it couldn't avoid; said
+    # engaged or not (selfdrived's turnpilotRouteNotice), only where the slot is free (no handback, no alert but a status line,
+    # no take-control prompt: hooks.plan_events would show those instead), and used up only on frames it is said, so held
+    # back (not lost) behind another. In shadow nothing is shown by selfdrived, and the plan carries it as before
+    free = handback == Handback.none and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS and \
+      str(plan.controlPrompt) not in TAKE_CONTROL_PROMPTS
+    notice, notice_text = self.notices.update(sm['navInstruction'], sm.updated['navInstruction'], sm.valid['navInstruction'], v_ego,
+                                              bool(sm['carControl'].enabled), free=free)
+    if notice != 'none':
+      plan.controlAlert, plan.routeNotice = notice, notice_text
     # an unprotected turn's hold line is at the nearest of navd's readings of its junction (route_follower.py): readings
     # that far apart, it may be well short of the line, said out loud rather than guessed (never over the infeasible stop)
     if isinstance(turn, tuple) and self.turn_committed and rf.junction_spread > UNCERTAIN_M and \

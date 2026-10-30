@@ -129,3 +129,39 @@ def test_a_reroute_while_driving_doesnt_say_the_route_start_again():
   for _ in range(round(20. / DT_MDL)):
     rn.update(None, False, True, 12., True)
   assert said(rn, round(8. / DT_MDL), nav(route=3, avoided=3, added=90.), v=12., engaged=True) == []
+
+
+def test_a_notice_held_back_behind_another_alert_is_said_in_full_once_free_and_one_for_a_stop_passed_meanwhile_is_dropped():
+  # turnpilotd puts a notice on the plan only where no other alert is up (free): the queue had popped and counted down whether
+  # or not it was shown, so a notice due behind another alert was used up unseen. Now its time runs only on frames it is said
+  rn = RouteNotices()
+  start = nav(avoided=2, added=60., status='unavoidable', controls=[(0, 'stop', 900., 'unavoidable')])
+  got = [rn.update(start[0], True, True, 0., False, free=False)[0]]
+  got += [rn.update(None, False, True, 0., False, free=False)[0] for _ in range(round(4. / DT_MDL))]
+  assert set(got) == {'none'}
+  seq = []
+  for k in range(round(3. * NOTICE_S / DT_MDL)):
+    free = not (round(1. / DT_MDL) <= k < round(3. / DT_MDL))  # another alert up for 2 s, 1 s into the first notice
+    kind = rn.update(None, False, True, 0., False, free=free)[0]
+    seq.append(kind if free else 'held')
+  shown = [k for k in seq if k != 'held']
+  first = shown.index('stopsNeedYou')
+  assert all(k == 'routeAvoidsStops' for k in shown[:first]) and abs(first * DT_MDL - NOTICE_S) <= DT_MDL + 1e-6
+  assert shown[first:first + round(NOTICE_S / DT_MDL)] == ['stopsNeedYou'] * round(NOTICE_S / DT_MDL)
+  # "Stop sign ahead needs you" due at 300 m while another alert is up: said once the slot is free, and dropped (never said)
+  # if the stop is passed first
+  for passed in (False, True):
+    rn = RouteNotices()
+    send(rn, nav(route=1, status='unavoidable'), 13., True)
+    out = []
+    for k in range(round(40. / DT_MDL)):
+      d = 320. - 13. * k * DT_MDL
+      ctl = [(0, 'stop', d, 'unavoidable', 77)] if d > -15. else []
+      msg, valid = nav(route=1, status='unavoidable', controls=ctl)
+      if k % 20 == 0:
+        b = msg.as_builder()
+        b.controlsStatus = 'ok'
+        msg = b.as_reader()
+      free = d < (-20. if passed else 200.)
+      out.append(rn.update(msg if k % 20 == 0 else None, k % 20 == 0, valid, 13., True, free=free)[0])
+    assert ('stopAheadNeedsYou' in out) == (not passed), passed

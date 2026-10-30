@@ -12,7 +12,11 @@ stands disengaged: never a reroute while driving, however long it was off the ro
   decision D5: the demo starts on a through street). The first one's street isn't on the bus, so it isn't said.
 Then, on any route, AHEAD_M before each stop or yield navd marks unavoidable (junctionInfo.certification), or at once where it
 is first seen closer: "Stop sign ahead needs you" (stopAheadNeedsYou, a chime), once per junction. At the line the decider
-hands it back right after the full stop (stop_go.py: 7.1)."""
+hands it back right after the full stop (stop_go.py: 7.1).
+
+Each is said only where the plan's alert slot is free (turnpilotd: nothing that outranks it is up), and used up only on the
+frames it is said: held back behind another alert, it and its remaining time wait for the slot, never lost. A stop-ahead
+notice for a stop passed (or rerouted off) while it waited is dropped, logged, never said late."""
 from dataclasses import dataclass, field
 
 from openpilot.common.realtime import DT_MDL
@@ -41,8 +45,9 @@ def plural(n: int, word: str) -> str:
 
 @dataclass
 class RouteNotices:
-  queue: list = field(default_factory=list)   # [(kind, text)] still to say
+  queue: list = field(default_factory=list)   # [(kind, text, junction or None)] still to say
   now: tuple = ('none', '')                    # (kind, text) being said
+  now_ident: object = None                     # ...the junction a stop-ahead one is for
   left_s: float = 0.
   route: int | None = None                     # navd's routeCount of the route last seen
   no_route_s: float = ROUTE_GAP_S              # s since the last valid route
@@ -53,21 +58,26 @@ class RouteNotices:
   def chime(kind: str) -> bool:
     return kind in CHIMES
 
-  def update(self, nav, updated: bool, valid: bool, v_ego: float, engaged: bool, dt: float = DT_MDL) -> tuple[str, str]:
+  def update(self, nav, updated: bool, valid: bool, v_ego: float, engaged: bool, dt: float = DT_MDL,
+             free: bool = True) -> tuple[str, str]:
     """(controlAlert kind, text) to say this frame, ('none', '') with none. nav: the latest navInstruction (None when none this
-    frame), updated: it arrived this frame, valid: its valid flag."""
+    frame), updated: it arrived this frame, valid: its valid flag; free: the plan's alert slot is free this frame, so what is
+    returned is said. Not free: nothing is used up (the notice being said and its remaining time wait) and ('none', '')."""
     if updated and nav is not None and valid:
       self._route(nav, v_ego, engaged)
       self._ahead(nav)
     else:
       self.no_route_s += dt  # no message this frame, or an invalid one (off the route): the gap counts on
+    if not free:
+      return ('none', '')
     if self.left_s > 0.:
       self.left_s = max(self.left_s - dt, 0.)
     if self.left_s <= 0.:
-      self.now = self.queue.pop(0) if self.queue else ('none', '')
-      if self.now[0] != 'none':
+      kind, text, self.now_ident = self.queue.pop(0) if self.queue else ('none', '', None)
+      self.now = (kind, text)
+      if kind != 'none':
         self.left_s = NOTICE_S
-        cloudlog.event("turnpilot.route_notice", kind=self.now[0], text=self.now[1])
+        cloudlog.event("turnpilot.route_notice", kind=kind, text=text)
     return self.now
 
   def _route(self, nav, v_ego: float, engaged: bool) -> None:
@@ -97,15 +107,27 @@ class RouteNotices:
     if out:
       cloudlog.event("turnpilot.route_start_notices", route=route, notices=[k for k, _ in out], avoided=n, unavoidable=m,
                      added_s=round(float(nav.avoidAddedS), 1), status=str(nav.avoidStatus))
-    self.queue = out + [q for q in self.queue if q[0] == 'stopAheadNeedsYou']
+    self.queue = [(k, t, None) for k, t in out] + [q for q in self.queue if q[0] == 'stopAheadNeedsYou']
 
   def _ahead(self, nav) -> None:
+    ahead = set()
     for c in nav.controls:
       if str(c.kind) not in STOP_KINDS or not c._has('junctionInfo') or str(c.junctionInfo.certification) != 'unavoidable':
         continue
       ident = int(c.junctionInfo.osmNodeId) or (int(nav.routeCount), int(c.id))
+      if float(c.distance) > 0.:
+        ahead.add(ident)
       if ident in self.ahead_said or not (0. < float(c.distance) <= AHEAD_M):
         continue
       self.ahead_said.add(ident)
       cloudlog.event("turnpilot.stop_ahead_needs_you", junction=str(ident), d=round(float(c.distance), 1))
-      self.queue.append(('stopAheadNeedsYou', "Stop sign ahead needs you"))  # after a route start's own, said first
+      self.queue.append(('stopAheadNeedsYou', "Stop sign ahead needs you", ident))  # after a route start's own, said first
+    if str(nav.controlsStatus) != 'ok':
+      return  # the controls not read: nothing is known passed
+    # one held back (behind another alert) for a stop now passed, or no longer on the route: dropped, never said late
+    for q in [q for q in self.queue if q[2] is not None and q[2] not in ahead]:
+      self.queue.remove(q)
+      cloudlog.event("turnpilot.route_notice_dropped", kind=q[0], junction=str(q[2]), why="passed")
+    if self.now_ident is not None and self.now_ident not in ahead:
+      cloudlog.event("turnpilot.route_notice_dropped", kind=self.now[0], junction=str(self.now_ident), why="passed")
+      self.now, self.now_ident, self.left_s = ('none', ''), None, 0.

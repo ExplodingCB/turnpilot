@@ -624,6 +624,25 @@ def test_the_route_start_and_pre_stop_notices_reach_the_plan_disengaged(tmp_path
   assert 'stopAheadNeedsYou' in seen
 
 
+def test_a_route_notice_behind_another_alert_is_said_once_that_one_is_done(tmp_path):
+  # 3.4: "Stop sign ahead needs you" falls due 300 m out while another alert of turnpilotd's is up (O16's
+  # overrideWriteFailed, 6 s from 330 m): held back, then said in full (NOTICE_S) once the slot is free; it had been used
+  # up behind the other alert and never said
+  from openpilot.selfdrive.turnpilot.route_notice import NOTICE_S
+  sim = StopSim(tmp_path, info_kw={'certification': 'unavoidable'})
+  sim.engaged, sim.v = True, 13.
+  seen, other = [], False
+  while sim.s < S_LINE - 20.:
+    if not other and S_LINE - sim.s < 330.:
+      sim.tp.override_failed_t = 6.
+      other = True
+    seen.append(str(sim.step().controlAlert))
+  assert other and 'overrideWriteFailed' in seen
+  first = seen.index('stopAheadNeedsYou')
+  assert first > max(k for k, a in enumerate(seen) if a == 'overrideWriteFailed')
+  assert abs(seen.count('stopAheadNeedsYou') * DT_MDL - NOTICE_S) <= DT_MDL + 1e-6
+
+
 def oracle_msg(cars=(), range_m=60.):
   """turnpilotLights from the sim's oracle: no lights, the cross traffic [(id, x, y, vx, vy, cls)] in the car frame."""
   from openpilot.cereal import messaging
