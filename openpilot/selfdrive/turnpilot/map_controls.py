@@ -19,9 +19,12 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   only TurnPilot turned off clears it. A reroute's same control takes the latch over under its own key. A held car gone
   more than DRIVE_OFF_M at more than COMMIT_SPEED is let go: the driver's, once the hold has handed back (driverWent), or
   under the driver's gas (drivenOff); otherwise, with no go at all (the plan not applied: shadow mode turned on), an
-  overrun. Handed back or under the gas, gone past the latch's reach (LATCH_PAST_M) at any speed is the driver's too: a
-  peek-creep past the line is never held again in the crossing lanes on a re-engage. The latch is never replayed down the
-  road. A car stopped further out (a queue) isn't latched: the MPC holds it behind the lead.
+  overrun. At a stop or an unprotected turn, moved past the latch's reach (LATCH_PAST_M) under the driver's gas at any
+  speed is the driver's too (driverWent handed back, else drivenOff): a peek-creep past the line is never held again in
+  the crossing lanes on a re-engage. Where the latch's stop point was moved on (a creep, a roll-up: the furthest asked
+  this hold) counts as TurnPilot's, never the driver's, and a handback with no driver input lets nothing go: the car is
+  held, the handback said. A signal's stop is the light's: a crawl under the gas releases nothing. The latch is never
+  replayed down the road. A car stopped further out (a queue) isn't latched: the MPC holds it behind the lead.
 - No gas go anywhere (Kellen, 2026-10-28; DESIGN phase 4, G1). Any gas press disengages (DisengageOnAccelerator, on by
   default): it is the driver taking over, never TurnPilot's go, and releases nothing. A hold TurnPilot has no rule to
   release ends in a loud handback, the car held while it lasts: a stop sign after STOP_SIGN_HANDBACK_S stopped
@@ -401,7 +404,9 @@ class ControlState:
   light: str = 'unknown'
   dwell_t: float = 0.
   moved_m: float = 0.
-  done: str = ''                # 'released', 'passed', 'overrun', 'dropped'
+  asked_m: float = 0.           # held: the furthest the latch's stop point was asked on this hold (a creep, a roll-up)
+  gas_moved_m: float = 0.       # held: m moved under the driver's gas this hold
+  done: str = ''              # 'released', 'passed', 'overrun', 'dropped'
   action: str = 'none'
   sign_runs: int = 0            # a stop sign's approach, from SIGN_LOOK_M: forward runs counted (the camera's signs read)...
   sign_hits: int = 0            # ...the stop-sign boxes in them...
@@ -788,6 +793,8 @@ class MapControlPolicy:
     st = c.state
     st.dwell_t += dt
     st.moved_m += v * dt
+    if gas_pressed:
+      st.gas_moved_m += v * dt
     what = description(c, self.turn_name)
     cause, prompt = None, None
     left = getattr(self, 'left', LeftCommand())
@@ -822,14 +829,22 @@ class MapControlPolicy:
         cause = 'green'
       reason = f"Red light (sim oracle){'' if c.junction else ' (crossing)'}" if st.light == 'red' else \
         f"Stopped at {what}: waiting for green"
-    # moved where it was asked (a creep, a roll-up) isn't driven off: only past that
+    # moved where it was asked (a creep, a roll-up) isn't driven off: only past that. The furthest asked this hold is the
+    # latch's own: an undecided left's command asks no creep and a decider's fault or shadow no roll-up, yet the car stands
+    # where it was moved (skeptic residual-check-1: read live, a 4 m creep then undecided was let go as driverWent)
     asked = left.creep_m if c.kind == UNPROTECTED and left.mode == 'auto' else \
       (getattr(self, '_creep', None) or (0., 0.))[0] if is_stop(c) and stop_cmd.latch == 'wait' else 0.
-    moved = st.moved_m - max(asked, 0.)
-    # handed back or under the driver's gas, past the latch's reach at any speed: a peek-creep at a walking pace is the driver
-    # going too (skeptic G1: held after a 1.45 m/s creep 3.6 m on, a re-engage stopped the car in the crossing lanes)
-    drivers = (prompt is not None or gas_pressed) and moved > LATCH_PAST_M
-    if cause is None and (drivers or (moved > DRIVE_OFF_M and v > COMMIT_SPEED)):
+    st.asked_m = max(st.asked_m, asked)
+    moved = st.moved_m - st.asked_m
+    # under the driver's gas past the latch's reach at any speed, at a stop or an unprotected turn: a peek-creep at a walking
+    # pace is the driver going (skeptic G1: held after a 1.45 m/s creep 3.6 m on, a re-engage stopped the car in the
+    # crossing lanes). Only the driver's gas counts, never a prompt being up (TurnPilot's own creep is no driver's), and
+    # never at a signal: its stop is the light's, which a crawl under the gas doesn't change (residual-check-1, d)
+    drivers = st.gas_moved_m > LATCH_PAST_M and (is_stop(c) or c.kind == UNPROTECTED)
+    if cause is None and drivers:
+      # handed back: theirs, said already (driverWent); else lifting must not stop the car in the junction (drivenOff)
+      cause = 'driverWent' if prompt is not None else 'drivenOff'
+    elif cause is None and moved > DRIVE_OFF_M and v > COMMIT_SPEED:
       # handed back, the driver took over and went: theirs, said already. Driven off under the driver's foot: lifting must
       # not stop the car in the junction. Or gone with no go at all, the plan not applied (shadow mode turned on): the
       # latch must not stop the car wherever the plan applies again
@@ -983,6 +998,7 @@ class MapControlPolicy:
     if v < LATCH_SPEED and -LATCH_PAST_M < c.d < LATCH_NEAR_M and not gas_pressed and self.held is None:
       self.held, c.held = c.key, True
       st.dwell_t, st.moved_m, st.infeasible = 0., 0., False
+      st.asked_m, st.gas_moved_m = 0., 0.
       cloudlog.event("turnpilot.map_stop_held", kind=c.kind, key=list(c.key), d=round(c.d, 1), light=st.light)
       if c.kind == 'stop' and getattr(self, '_signs', None) is not None:
         self._sign_evidence(c)

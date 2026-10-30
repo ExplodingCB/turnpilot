@@ -903,6 +903,60 @@ def test_driven_slowly_past_a_held_stop_under_the_gas_is_driven_off():
   assert not dec.should_stop and car.policy.held is None
 
 
+def test_a_hold_turnpilot_moved_on_and_then_handed_back_is_never_let_go_with_no_driver_input():
+  # skeptic residual-check-1 (058df13): _held read what was asked of the latch (the left's creep, the decider's roll-up) from
+  # the current frame's command, which on an undecided left frame (creep_m 0) or a decider fault (latch not 'wait') is 0, and
+  # took a prompt being up as the driver's: so a left that crept 4 m for a view and then went undecided, or a stop the
+  # decider rolled up 4.9 m and then faulted or went shadow, was let go as driverWent on the first handback frame, prompt
+  # 'none', and the model drove the car on (to 12.8 and 5 m/s). The largest creep asked this hold is the latch's own, and
+  # only the driver's gas moves the car as the driver's: held, the handback said, every frame
+  car = left_car()
+  held_left(car, left_cmd(reason="Waiting for a gap"))
+  line = car.s
+  run_left(car, 12., left_cmd(creep_m=4., reason="Creeping for a view"))
+  assert 3.7 < car.s - line < 4.3 and car.v < 0.3
+  rows = [car.policy_step(left_cmd(take_control=True, reason="View of oncoming traffic blocked: take control"))
+          for _ in range(int(10. / DT_MDL))]
+  assert all(held(out, dec) and out.prompt == 'leftUndecidedTakeControl' for out, dec, _ in rows)
+  assert car.policy.held is not None and car.s - line < 4.4 and car.v < 0.3
+  # the driver then takes over under the gas and goes: theirs (driverWent), no overrun
+  run_left(car, 3., left_cmd(take_control=True), gas=True)
+  assert car.policy.turn.state.done == 'released' and car.policy._alert == 'none'
+  # the decider's roll-up from a queue latch, then its fault, or a shadow handback (no command)
+  for stop in (StopCommand('fault', 'Camera not seeing cross traffic: take control'), None):
+    car = Car([(150., 'stop')], v=5.)
+    car.lead_stop = 146.5
+    car.run_until(held, stop=StopCommand('wait'))
+    target = car.policy.held_control().d
+    assert target > 3.
+    car.lead_stop = None
+    car.run(8., stop=StopCommand('wait', '', 'creeping'), creep=(target, 3.0))
+    assert abs(car.s - 150.) < 0.5 and car.v < 0.3
+    rows = [car.step(stop=stop) for _ in range(int(10. / DT_MDL))]
+    assert all(held(out, dec) for out, dec, _ in rows[int(STOP_SIGN_HANDBACK_S / DT_MDL) + 1:]), stop
+    assert all(out.prompt == 'stopSignTakeControl' for out, _, _ in rows[int(STOP_SIGN_HANDBACK_S / DT_MDL) + 1:]), stop
+    assert car.policy.held is not None and abs(car.s - 150.) < 0.5 and car.v < 0.3, stop
+
+
+def test_a_gas_nudge_past_a_red_and_a_re_engage_still_stops_for_the_red():
+  # skeptic residual-check-1 (058df13, d): a red held at its line, the driver nudges 2.5 m at 0.8 m/s under the gas and
+  # re-engages under the red: let go as drivenOff, the car ran the red at 9.8 m/s. A signal's stop is never the driver's to
+  # release by a crawl: only a steady green, or driving off past DRIVE_OFF_M faster than COMMIT_SPEED
+  def red(car):
+    return lights('red', 150. - car.s)
+  car = Car([(150., 'signal')])
+  car.run_until(held, lights=red)
+  car.run(2., lights=red)
+  s0 = car.s
+  while car.s < s0 + 2.5:
+    car.step(gas=True, accel=0.4 if car.v < 0.8 else 0., lights=red)
+  rows = [car.step(lights=red) for _ in range(int(6. / DT_MDL))]
+  assert car.policy.held is not None and rows[-1][1].should_stop and car.v < 0.3 and car.s < s0 + 3.5
+  # the green lets it go, as before
+  car.run_until(lambda out, dec: not dec.should_stop, max_s=3., lights=lambda car: lights('green', 150. - car.s))
+  assert car.policy.held is None
+
+
 def test_an_unprotected_left_hands_back_at_its_hold_line_and_no_gas_goes():
   car = left_car()
   out, dec = car.run_until(held)

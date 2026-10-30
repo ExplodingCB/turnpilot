@@ -373,6 +373,33 @@ def test_a_creep_for_a_view_the_car_never_makes_is_never_silent():
   assert not any(p.desire == Desire.turnLeft for p in plans)
 
 
+def test_a_creep_for_a_view_the_car_makes_then_undecided_keeps_the_car_held_and_said():
+  # skeptic residual-check-1 (058df13): the same blocked view with the car moving as asked (the plain Sim, where HeldSim's
+  # moved_m stays 0): it crept 3.8 m past its line, stayed blocked and went undecided 'blocked', and the latch was let go
+  # on the first handback frame as the driver's with no driver input (shouldStop on 0 of 384 frames, the take-control
+  # gone after 104 frames, the car 164 m past the junction at 13 m/s). Held short of the oncoming lanes, said throughout
+  sim = Sim(LEFT_25)
+  sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps = 'auto', TEST_RANGE_M, False
+
+  def objects(sim):
+    return ({'cls': 'car', 'x': JUNCTION + 6. - sim.s, 'y': 3.6, 'vx': 0., 'vy': 0., 'age': 40, 'trackId': 7,
+             'conf': 0.8, 'camera': 'road'},)
+  frame = [0]
+
+  def raw(sim):
+    frame[0] += 1
+    return None if frame[0] % 2 else RawFrame([raw_box(JUNCTION + 6. - sim.s, 3.6)], 'road', sim.t)
+  sim.raw = raw
+  plans = [sim.step(objects(sim), engaged=True) for _ in range(int(70. / DT_MDL))]
+  states = [str(p.unprotectedLeft.state) for p in plans]
+  und = states.index('undecided')
+  assert 'creep' in states[:und] and sim.trace[und][0] - LINE > 2.  # it crept past the latch's reach first
+  after = plans[und:]
+  assert all(str(p.controlPrompt) == 'leftUndecidedTakeControl' and p.shouldStop for p in after)
+  assert max(s for s, _, _ in sim.trace[und:]) < JUNCTION - ONCOMING_ENTRY_M and sim.v < 0.3
+  assert not any(p.desire == Desire.turnLeft for p in plans)
+
+
 def jump_run(jump_m, seconds, n_cars=12, sim_cls=Sim):
   """LEFT_25 held at its line through a stream of n_cars oncoming cars 3 s apart (no gap of T_req), the first 60 m past
   the junction as the car nears it; once the car stands waiting, one navd reading puts the junction jump_m nearer (GPS
