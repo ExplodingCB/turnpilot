@@ -131,6 +131,16 @@ python -m openpilot.tools.sim.bridge.beamng.scenarios.score result.json
 python -m openpilot.tools.sim.bridge.beamng.scenarios.score --scenario route_demo ~/.commatpsim/media/0/realdata/<route>--*/rlog.zst
 ```
 
+TurnPilot's cloudlog events in a run's rlogs, the reasons behind what it did (`turnpilot.go_not_certified` with its why,
+`turnpilot.hard_brake`, `turnpilot_turn_skipped`, ...), each with its run and t since that run's engagement when given a run
+dir with its result.json and rlogs under it (`events.py`). TurnPilot names its events both `turnpilot.<name>` and
+`turnpilot_<name>` (the skip, the missed turn, the lane mismatch); `events.is_turnpilot_event` matches both, which any
+other tool reading them should use:
+
+```sh
+python -m openpilot.tools.sim.bridge.beamng.scenarios.events <run dir> --match go_
+```
+
 ## Demo videos
 
 ```sh
