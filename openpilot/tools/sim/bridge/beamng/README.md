@@ -261,6 +261,15 @@ python -m openpilot.tools.sim.bridge.beamng.run_bridge --signals --light-oracle
 the drive, stopping it at the end. `--signals` without `--light-oracle` leaves the lights running with nothing reading
 them: every signal is held for the driver's go, and the sim driver taps only on a ground-truth green, so it never does.
 
+The oracle starts with the bridge, before the level has loaded, and the game has no signals until then: it reads their
+directions again every 2 s for up to `light_oracle.STARTUP_TIMEOUT_S` (180 s), then exits non-zero having published
+nothing (the run's log and the bridge's warning say so). The scenario runner waits up to `run.ORACLE_WAIT_S` (30 s) from
+each run's teleport for its first lights before the destination goes out, and ends the run 'error' without them, or once
+they are `run.ORACLE_STALE_S` (3 s) old mid-run, and the invocation with it: a run asked for with the oracle never
+drives with every light unknown. `route_drive.py` has no such check. The oracle lists a light from 15 m past its stop
+line (`PAST_M`; a negative distance) to 200 m before it, nearest first either side: a car standing just past the line
+keeps its light, as a camera sees the far-side head.
+
 turnpilotd takes the oracle only with `SIMULATION=1` and `TurnPilotSimLightOracle` (which the launch sets, and which
 clears on every manager start); otherwise it rejects it out loud and holds. The scenario runner and `route_drive.py` tap
 the gas where a driver gives the go (`driver.GasTaps`, each tap logged with its reason and how long the car had stood):

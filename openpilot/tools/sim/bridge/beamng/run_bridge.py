@@ -64,6 +64,9 @@ def light_oracle(args):
   try:
     yield oracle
   finally:
+    if oracle is not None and oracle.poll() is not None:  # it ended during the drive: light_oracle.EXIT_NOT_READY, a crash
+      print(f"warning: the light oracle exited ({oracle.returncode}) during the drive: every light unknown since; its log says why",
+            flush=True)
     if oracle is not None:
       oracle.terminate()
       try:

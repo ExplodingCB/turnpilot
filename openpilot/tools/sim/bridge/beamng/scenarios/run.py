@@ -90,6 +90,12 @@ DROP_PARAM = 'TurnPilotSimDropDetectionsS'
 # so the disengagement completes and engaging again is refused while it lasts
 DROP_S = 20.
 LIGHTS_FRESH_S = 1.  # a row's lights: the light oracle's turnpilotLights this fresh (driver.LIGHTS_FRESH_S)
+# --light-oracle: the oracle is a process of its own (run_bridge.light_oracle), which reads the game's signals once the level
+# has loaded (light_oracle.STARTUP_TIMEOUT_S) and publishes at 4 Hz. A run waits this long from its teleport for its lights
+# before the destination goes out, and ends 'error' without them, or once they are ORACLE_STALE_S old: a run asked for with
+# the oracle never drives with every light unknown (BeamNG ctl_ped_in_path 2026-10-30, the oracle dead before the level loaded)
+ORACLE_WAIT_S = 30.
+ORACLE_STALE_S = 3.
 ACTOR_FIELDS = ["wall_s", "x", "y", "z", "heading"]
 
 
@@ -129,10 +135,11 @@ class Runner:
 
   def __init__(self, plan: Plan, runs: int, out_dir: str, web_url: str, token: str, host: str, port: int, signal_tap: bool = True,
                params=None, end_after_handback: float = 0., gas_press_at: float | None = None,
-               drop_detections_at: float | None = None, expect=None):
+               drop_detections_at: float | None = None, expect=None, light_oracle: bool = False):
     """params: Params, for TurnPilot's reset between runs (TP_RESET_S) and the detection drop; None leaves TurnPilot be.
     end_after_handback, gas_press_at, drop_detections_at: the demo's options (module docstring; a negative time: the
-    scenario's fault_at_s); expect: in place of the plan's expectations (each option adds its own)."""
+    scenario's fault_at_s); expect: in place of the plan's expectations (each option adds its own); light_oracle: the bridge
+    runs --light-oracle, whose lights each run waits for and ends 'error' without (ORACLE_WAIT_S, ORACLE_STALE_S)."""
     if plan.road is None:
       raise ValueError(f"scenario {plan.name} has no road model: its runs could not be checked for the oncoming lane")
     if drop_detections_at is not None and params is None:
@@ -154,6 +161,7 @@ class Runner:
     self.signals_running: bool | None = None  # the bridge runs --signals (from its config, at the first run)
     self.plan, self.runs, self.out_dir, self.web_url, self.token = plan, runs, out_dir, web_url, token
     self.signal_tap = signal_tap
+    self.light_oracle = light_oracle
     self.params = params
     self.tp_off_t: float | None = None  # when this run turned TurnPilot off (TP_RESET_S)
     self.host, self.port = host, port
@@ -201,6 +209,10 @@ class Runner:
       self.end_run(b, 'error', "the scenario director stopped (is the game reachable?)")
       self.finish(b)
       return True
+    if (why := self.oracle_down(now)) is not None:  # the next run would have no oracle either
+      self.end_run(b, 'error', why)
+      self.finish(b)
+      return True
     if self.phase == 'next':
       if self.run_idx + 1 >= self.runs:
         self.finish(b)
@@ -208,7 +220,7 @@ class Runner:
       self.start_run(b)
     elif self.phase == 'settle':
       lights_done = self.setup_lights is None or self.setup_lights.done()
-      if now - self.t0 > max(SETTLE_S, TP_RESET_S) and self.setup.done() and lights_done:
+      if now - self.t0 > max(SETTLE_S, TP_RESET_S) and self.setup.done() and lights_done and self.oracle_up(now):
         if self.tp_off_t is not None:  # TurnPilot back on, a fresh one, before the destination goes out (TP_RESET_S)
           self.params.put_bool('TurnPilotEnabled', True)
           self.tp_off_t = None
@@ -258,6 +270,21 @@ class Runner:
       if end is not None:
         self.end_run(b, end)
     return False
+
+  def oracle_up(self, now: float) -> bool:
+    """The light oracle's lights are fresh, or it isn't asked for."""
+    sm = self.sm
+    return not self.light_oracle or (bool(sm.seen.get('turnpilotLights')) and now - sm.recv_time['turnpilotLights'] <= ORACLE_STALE_S)
+
+  def oracle_down(self, now: float) -> str | None:
+    """Why the run can't go on without the light oracle it asked for: none of its lights ORACLE_WAIT_S into the run's
+    settle, or none for ORACLE_STALE_S since (module docstring); None while they come, or with no oracle asked for."""
+    if self.oracle_up(now) or self.phase in ('next', 'done') or (self.phase == 'settle' and now - self.t0 <= ORACLE_WAIT_S):
+      return None
+    if not self.sm.seen.get('turnpilotLights'):
+      return f"--light-oracle: no turnpilotLights from the light oracle {now - self.t0:.0f} s into the run (did it exit? its log says why)"
+    return f"--light-oracle: the light oracle's last turnpilotLights is {now - self.sm.recv_time['turnpilotLights']:.1f} s old " + \
+           "(it stopped publishing)"
 
   def web_send(self, now: float, method: str, body: dict | None = None):
     """The destination call to turnpilot_web, on the director's thread; web_retry repeats it while it is refused."""
@@ -606,7 +633,8 @@ def main():
     q: Queue = Queue()
     bridge = BeamNGBridge(cfg, scenario=Runner(plan, args.runs, run_dir, args.web.rstrip('/'), token, bargs.host, bargs.port,
                                                signal_tap=args.signal_tap == 'on', params=params, end_after_handback=args.end_after_handback,
-                                               gas_press_at=args.gas_press_at, drop_detections_at=args.drop_detections_at, expect=args.expect))
+                                               gas_press_at=args.gas_press_at, drop_detections_at=args.drop_detections_at, expect=args.expect,
+                                               light_oracle=bargs.light_oracle))
     with light_oracle(bargs):
       drive(bridge, q, ui, bargs)
   finally:
