@@ -532,6 +532,41 @@ def test_a_yield_at_the_junction_protects_the_left_and_a_stop_far_upstream_leave
   assert out.shown.kind == UNPROTECTED and 0. <= 242. - car.s < 3.
 
 
+def test_a_yield_that_wont_stop_the_car_never_protects_the_left():
+  # a crossSuspect yield the sidecar says is the cross road's (crossGoverned) is dropped (_yield: done 'dropped'), so it stops
+  # nothing and the left across our oncoming traffic is the unprotected left's: held at its hold line. protected() had
+  # counted any yield there, dropped or not (and _turn_control reads it before _yield has run), so the left was never held
+  # and passed at 13.4 m/s. A yield taken rolling (yieldRolling) is no protection either: nobody would watch the oncoming
+  from types import SimpleNamespace
+  from openpilot.selfdrive.turnpilot.map_controls import YIELD_ROLLING, YIELD_STOP, ControlState, protected
+  car = left_car([(250. - 11., 'yield', False, True, True, {'status': 'ok', 'crossGoverned': True})])
+  out, dec = car.run_until(held, max_s=40.)
+  assert out.shown.kind == UNPROTECTED and 0. <= 250. - HOLD_LINE_M - car.s < 3.
+  assert all(cmd >= MAP_DECEL_MAX - 1e-6 for *_, cmd, _, _ in car.rows)
+  # not crossGoverned it is ours: a stop at its line protects the left, as before
+  car = left_car([(250. - 11., 'yield', False, True, True, {'status': 'ok'})])
+  car.run_until(held)
+  assert car.policy.held_control().state.mode == YIELD_STOP and car.policy.turn is None
+
+  def y(mode='stop', done='', cross=False):
+    return SimpleNamespace(kind='yield', d=10., cross_suspect=cross, junction_info={'crossGoverned': cross},
+                           state=ControlState(mode=mode, done=done))
+  assert protected([y()], 12.) and protected([y(YIELD_STOP)], 12.) and protected([y(YIELD_STOP, 'released')], 12.)
+  assert not protected([y(YIELD_ROLLING)], 12.) and not protected([y(done='dropped')], 12.) and not protected([y(cross=True)], 12.)
+  assert not protected([y(done='passed')], 12.)
+  # ours, its rolling test passing (none does this week: dormant): undecided it protects without latching, so once it is
+  # taken rolling at its commit point the left's own stop is made from there, or said infeasible, never rolled through
+  car = left_car([(250. - 11., 'yield')])
+  rows = []
+  for _ in range(int(30. / DT_MDL)):
+    rows.append(car.step(yields=rolling_ok))
+    if car.v < 0.05:
+      break
+  assert car.policy.turn is not None and car.s < 250. and car.v < 0.05
+  assert any(o.alert == 'cannotStopComfortably' for o, _, _ in rows) or 0. <= 250. - HOLD_LINE_M - car.s < 3.
+  assert all(cmd >= MAP_DECEL_MAX - 1e-6 for _, _, cmd in rows)
+
+
 def test_unprotected_latch_is_position_free_and_says_so_through_a_fault():
   car = left_car()
   car.run_until(held)

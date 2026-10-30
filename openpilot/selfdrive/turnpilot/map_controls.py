@@ -247,12 +247,42 @@ def unprotected_turn(maneuver, right_hand_traffic: bool = True) -> bool:
     maneuver.opposing != 'none'
 
 
+def cross_road_yield(c) -> bool:
+  """A crossSuspect yield the sidecar confirms governs a crossing approach (crossGoverned): the cross road's, not ours, so it
+  stops nothing (_yield drops it: STOP_SIGNS.md 2.7)."""
+  return c.kind == 'yield' and bool(getattr(c, 'cross_suspect', False)) and \
+    bool((getattr(c, 'junction_info', None) or {}).get('crossGoverned'))
+
+
+def protecting(c) -> str:
+  """How control c stops the car at its junction (protected()): 'stop' a stop sign (a signal too, with SIGNAL_PROTECTS_LEFT) or
+  a yield that became one (yieldStop), whose cross traffic the stop-sign decider watches, not only the oncoming the unprotected
+  left would; 'pending' a yield of ours not yet decided (it becomes a stop unless certified rolling at its commit point:
+  STOP_SIGNS.md 2.7); '' one that won't stop the car: taken rolling (yieldRolling, nobody watching the oncoming), passed or
+  dropped, or the cross road's (cross_road_yield: read here before _yield has dropped it, a new control has no state yet)."""
+  if c.kind == 'stop' or (c.kind == 'signal' and SIGNAL_PROTECTS_LEFT):
+    return 'stop'
+  if c.kind != 'yield' or cross_road_yield(c):
+    return ''
+  st = getattr(c, 'state', None)
+  if st is None:
+    return 'pending'
+  if st.mode == YIELD_STOP:
+    return 'stop'
+  return '' if st.mode == YIELD_ROLLING or st.done else 'pending'
+
+
+def protection(controls, distance: float) -> str:
+  """The strongest protecting() of the controls of the junction distance m ahead (PROTECT_BEFORE_M before it to PROTECT_PAST_M
+  past it): 'stop', 'pending' or ''."""
+  near = {protecting(c) for c in controls if distance - PROTECT_BEFORE_M <= c.d <= distance + PROTECT_PAST_M}
+  return 'stop' if 'stop' in near else 'pending' if 'pending' in near else ''
+
+
 def protected(controls, distance: float) -> bool:
-  """A stop sign of the junction distance m ahead stops the car there already (a signal too, with SIGNAL_PROTECTS_LEFT), and so
-  does a yield (it becomes a stop, yieldStop, unless certified rolling: STOP_SIGNS.md 2.7), whose cross traffic the stop-sign
-  decider watches, not only the oncoming the unprotected left would."""
-  kinds = ('stop', 'yield', 'signal') if SIGNAL_PROTECTS_LEFT else ('stop', 'yield')
-  return any(c.kind in kinds and distance - PROTECT_BEFORE_M <= c.d <= distance + PROTECT_PAST_M for c in controls)
+  """A control of the junction distance m ahead stops the car there already, or will unless its yield is certified rolling
+  (protection())."""
+  return protection(controls, distance) != ''
 
 
 @dataclass
@@ -377,7 +407,7 @@ class MapControlPolicy:
     self._turn_floor: float | None = None  # m, dead-reckoned: its stop point read behind where the car can stop at the floor
     self._turn_raw = 0.  # m to its stop point as last read, before that floor
     self.turn_name = 'left'
-    self._protected_id: int | None = None  # the maneuver a stop sign or signal of its junction protected: it stays so
+    self._protected_id: int | None = None  # the maneuver a stop sign, signal or yieldStop of its junction protected: it stays so
     self._off_cap: float | None = None  # m/s: the off-route cap while the stops ahead are unknown (module docstring)
     self._camera_would: dict = {}  # signal key -> what the camera would have it do, as last logged
     self._camera_unmapped: tuple = ()  # the unmapped camera states last logged
@@ -480,11 +510,14 @@ class MapControlPolicy:
       if tc is not None:
         tc.d -= v * dt
       return tc
-    if turn is not None and protected(controls, turn[1]):
+    guard = protection(controls, turn[1]) if turn is not None else ''
+    if guard == 'stop':
       # once protected, protected for good: a signal mapped well before a wide junction drops out of the controls 15 m
-      # behind the car (control_tracker.DROP_PAST_M), still short of the hold line: never a second stop for the same go
+      # behind the car (control_tracker.DROP_PAST_M), still short of the hold line: never a second stop for the same go.
+      # A yield latches only once it is a stop (yieldStop): one taken rolling leaves the left unprotected, its hold made
+      # from there or said infeasible (cannotStopComfortably), never rolled through with nobody watching the oncoming
       self._protected_id = int(turn[0])
-    want = turn is not None and int(turn[0]) != self._protected_id
+    want = turn is not None and int(turn[0]) != self._protected_id and guard != 'pending'
     key = (UNPROTECTED_ROUTE, int(turn[0])) if turn is not None else None
     if tc is not None and (not want or tc.key != key):
       if tc.engaged and not (tc.state is not None and tc.state.done):
