@@ -463,6 +463,27 @@ def test_a_red_at_the_junction_never_gets_a_go():
   assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
 
 
+def test_a_red_at_a_junction_with_no_mapped_signal_never_gets_a_go():
+  # skeptic G4 (residual): map_controls.turn_light returned 'none' where no signal is mapped, before reading any light, so an
+  # oracle red 12 m short of the junction (OSM missing the signal; on the car the camera's reader) with the band empty (the
+  # oncoming road stopped at its own red) had leftGo at 31.8 s and the car committed through the red. Now it waits at its line
+  sim = Sim(LEFT_25)
+  sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps = 'auto', TEST_RANGE_M, False
+  sim.tp.oracle_ok = True
+
+  def lights(sim):
+    msg = messaging.new_message('turnpilotLights')
+    msg.turnpilotLights.source = 'simOracle'
+    msg.turnpilotLights.lights = [{'state': 'red', 'distance': JUNCTION - 12. - sim.s, 'instance': 'trafficLight 1'}]
+    return msg.as_reader().turnpilotLights
+  sim.lights = lights
+  sim.raw = road_runs()
+  plans = run_objects(sim, 60.)
+  assert not any(str(p.controlPrompt) == 'leftGo' or p.desire == Desire.turnLeft for p in plans)
+  assert not any(str(p.unprotectedLeft.state) in ('go', 'committed') for p in plans)
+  assert sim.s < LINE + 1. and str(plans[-1].unprotectedLeft.state) == 'waitGap'
+
+
 def test_after_the_red_the_go_waits_for_a_fresh_window_and_the_exit_crosswalk():
   # skeptic G4 (blocker 2): a walker came into the exit crosswalk at 40 s, late in the red; at the green the car drove off on
   # the stale go and committed at 47.4 s with the walker still in it. Now: no go before the green, none while the walker is

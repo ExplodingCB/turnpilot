@@ -48,11 +48,14 @@ up to the line first (ROLL_UP_M; undecided only after ROLL_UP_STALL_S standing i
 The window (CLEAR_WINDOW_S) counts only road camera runs, from the hold (hold, then judge: never carried from the approach):
 a run gap over ROAD_FRESH_S, the scene's holds, an exit crosswalk or view not clear, another of TurnPilot's stops holding the
 car at or before the junction (a signal's red, a stop sign: other_hold), or its junction's signal not read green, start it
-over (DESIGN G4 go condition 5; skeptic G4). At a signal (map_controls.turn_light: every source, the camera's in shadow too,
-since keeping the car where it stands never brakes it) the go needs a green (SIGNAL_NEEDS_GREEN): the left doesn't check the
-cross traffic, and a model that ran the red leaves the car at its line in the junction with the oncoming lanes empty at their
-own red. No read for LIGHT_UNKNOWN_S, a red past LIGHT_RED_MAX_S, or the light changing from the green it waited on (the car
-in the junction as it does, which it can't finish the turn from) are faults.
+over (DESIGN G4 go condition 5; skeptic G4). A red or yellow any source reads at the junction (map_controls.turn_light: the
+camera's in shadow too, since keeping the car where it stands never brakes it) keeps it waiting, a signal mapped there or not;
+at a signal the go needs a green (SIGNAL_NEEDS_GREEN): the left doesn't check the cross traffic, and a model that ran the red
+leaves the car at its line in the junction with the oncoming lanes empty at their own red. A green the camera's shadow reader
+alone reads lets this go release TurnPilot's latch only: plannerd's lift needs an accepted source's green (turnpilotd.certify_go,
+map_controls.release_light), so the model's own red-light hold stays and a shadow green never removes a stop (the light net may
+only add one). No read for LIGHT_UNKNOWN_S, a red past LIGHT_RED_MAX_S, or the light changing from the green it waited on (the
+car in the junction as it does, which it can't finish the turn from) are faults.
 
 The view is blocked by an occluder: a velocity-trusted vehicle track standing still in the junction (the opposing
 left-turner, a parked truck) whose box hides the oncoming lanes beyond it out to R_req. Its own box isn't traffic (it
@@ -147,9 +150,10 @@ BOX_X_BEFORE_M, BOX_X_AFTER_M = ONCOMING_PAST_M, 8.  # the junction box a vehicl
 BOX_Y_RIGHT_M, BOX_Y_LEFT_M = 12., 18.               # ...from this far to the other side to this far to the turn side
 
 # DESIGN G4 go condition 5 (skeptic G4 blocker 2): at a signal (map_controls.turn_light) the go needs its light read green by
-# some source, the camera's in shadow too (keeping the car where it stands never brakes it): a model that ran the red leaves
-# the car at its line in the junction, the oncoming lanes empty at their own red, the cross traffic going, which nothing here
-# checks. False: only a red or yellow read keeps it waiting (unknown goes on the band alone)
+# some source, the camera's in shadow too: a model that ran the red leaves the car at its line in the junction, the oncoming
+# lanes empty at their own red, the cross traffic going, which nothing here checks. A camera green only releases TurnPilot's
+# own latch (plannerd's lift needs an accepted green: turnpilotd.certify_go). False: only a red or yellow read keeps it waiting
+# (unknown goes on the band alone)
 SIGNAL_NEEDS_GREEN = True
 LIGHT_UNKNOWN_S = 8.       # s at its line at a signal with no read of its light: can't tell red from green, a fault
 LIGHT_RED_MAX_S = 150.     # s at its line under a red: longer than a cycle (a red read that never ends), a fault

@@ -16,7 +16,7 @@ from openpilot.selfdrive.turnpilot.tests.synthetic import model_v2
 from openpilot.selfdrive.turnpilot.tests.test_go_override import WARM_S, new_planner, planner_sm
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, WALKER, FakeParams, Sim, go_from_a_red, go_from_the_hold,
                                                                  junction_of, oracle_lights, stand, stop_at, walker_stops_the_car)
-from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import JUNCTION, V_25, drive, left_sim
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import JUNCTION, LEFT_25, TEST_RANGE_M, V_25, drive, left_sim, road_runs, run_objects
 from openpilot.selfdrive.turnpilot.turnpilotd import (GO_OVERRIDE_DEFAULT, LEFT_LAUNCH_SPEED, LEFT_LIFT_ROOM_M, NO_MOVE_REASON, NO_MOVE_S,
                                                        RELEASE_UNSIGNALIZED, STALL_PROMPT_S, go_override_for)
 from openpilot.selfdrive.turnpilot.unprotected_left import LINE_D
@@ -576,3 +576,69 @@ def test_a_release_of_a_turn_across_the_oncoming_road_is_never_certified():
   sim.tp.certify_go(sim.sm, sim.sm['carState'], True, [], None, SceneDecision(), False, LINE_D,
                     dataclasses.replace(upcoming, opposing='none'), True)
   assert sim.tp.go_cert.cause == 'turnRelease'
+
+
+# --- skeptic G5 (residual): the unprotected left's lift, at a signal, on an accepted green only ---
+
+def left_at_a_signal(controls, lights, model_fn=holding, seconds=40.):
+  """LEFT_25 on the car's config: no accepted light source (the oracle off), the left's range set, an empty band (the oncoming
+  road stopped at its own red), plannerd in the loop from the car's stand at its line with model_fn's model (holding for the
+  red). Returns (sim, plans, the car's s at the stand)."""
+  sim = Sim(LEFT_25, controls=controls)
+  sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps = 'auto', TEST_RANGE_M, False
+  sim.tp.oracle_ok = False
+  sim.lights = lights
+  sim.raw = road_runs()
+  plans, s_hold = [], None
+  for _ in range(round(seconds / DT_MDL)):
+    plans += run_objects(sim, DT_MDL)
+    if s_hold is None and sim.v < 0.05 and str(plans[-1].unprotectedLeft.state) == 'waitGap':
+      attach_planner(sim, model_fn)
+      s_hold = sim.s
+  assert s_hold is not None
+  return sim, plans, s_hold
+
+
+def test_a_signalized_lefts_go_on_the_cameras_shadow_green_is_never_lifted():
+  """Skeptic G5 (residual): at a mapped signal the left goes on any source's green (turn_light), the camera's shadow reader's
+  too, and certify_go checked the light only for turnRelease, so a shadow green certified unprotectedLeft and plannerd lifted
+  the model's red-light hold: 60 frames lifted, the car rolled 3.01 m past its line at up to 1.5 m/s, then the handback; with
+  a model that drives on once nudged it crossed the junction on the model's red, nothing said. The light net may only add a
+  stop: the lift needs a green from an accepted source (release_light), so here the left's go only lets TurnPilot's own latch
+  go, the model's hold stays, and the no-move handback comes with the car held."""
+  for model_fn in (holding, launching):
+    sim, plans, s_hold = left_at_a_signal([(JUNCTION - 8.5, 'signal')], camera_reads('green', s_head=JUNCTION + 8.), model_fn)
+    assert any(str(p.unprotectedLeft.state) == 'go' for p in plans)  # the left's own go (its latch), on the shadow green
+    assert not any(lifted for _, _, lifted in sim.planned) and all(go(p)[0] == 'none' for p in plans)
+    assert sim.s - s_hold < 0.1 and sim.s < JUNCTION - ONCOMING_ENTRY_M
+    assert any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+
+
+def test_a_left_with_the_cameras_red_at_an_unmapped_signal_is_never_gone_nor_lifted():
+  """Skeptic G5 (residual, REQUIRED in the same change): no signal mapped, the camera's shadow reader reading the junction's
+  red: the left went (turn_light 'none' before any light was read) and the lift rolled the car 3.01 m on the model's red. A red
+  from any source at the junction keeps the left waiting and the lift off, mapped signal or not."""
+  sim, plans, s_hold = left_at_a_signal([], camera_reads('red', s_head=JUNCTION + 8.))
+  assert not any(str(p.unprotectedLeft.state) in ('go', 'committed') for p in plans)
+  assert not any(lifted for _, _, lifted in sim.planned) and all(go(p)[0] == 'none' for p in plans)
+  assert sim.s - s_hold < 0.1 and str(plans[-1].unprotectedLeft.state) == 'waitGap'
+
+
+def test_the_lefts_lift_stays_on_an_accepted_green_or_where_no_signal_is():
+  """The lift is unchanged where the light is an accepted source's green (the sim's oracle) or there is no signal at all."""
+  for unsignalized in (True, False):
+    sim = left_sim()
+    if not unsignalized:
+      sim = Sim(LEFT_25, controls=[(JUNCTION - 8.5, 'signal')])
+      sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps = 'auto', TEST_RANGE_M, False
+      sim.tp.oracle_ok, sim.lights = True, oracle_lights('green', JUNCTION - 8.5)
+      sim.raw = road_runs()
+    while not (sim.trace and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
+      drive(sim, DT_MDL)
+      assert sim.t < 60.
+    attach_planner(sim, holding)
+    plans = []
+    while not any(go(p)[0] != 'none' for p in plans[-1:]):
+      plans += drive(sim, DT_MDL)
+      assert sim.t < 90.
+    assert go(plans[-1])[0] == 'unprotectedLeft'

@@ -1012,6 +1012,30 @@ def test_the_turn_light_is_the_signal_at_the_lefts_junction_from_any_source():
   assert car.policy.turn_light(7, 250. - car.s) == 'unknown'
 
 
+def test_a_red_or_yellow_at_a_junction_with_no_mapped_signal_is_read_for_the_left_and_any_release():
+  # skeptic G4/G5 (residual): turn_light and release_light returned 'none' wherever no signal was mapped at the junction,
+  # before reading any light, so a red the camera (or the sim's oracle) read at an unmapped signal let the left go and
+  # plannerd lift the car through it. A red or yellow from any source from PROTECT_BEFORE_M before the junction to
+  # CAMERA_ASSOC_PAST_M past it counts, mapped or not; a green there is no signal TurnPilot knows of ('none', as before)
+  car = left_car()
+  car.run(1.)
+  d = 250. - car.s
+  for state in ('red', 'yellow'):
+    car.run(0.1, lights=Lights(None, 'none', camera=CameraLights([(state, 250. - 10. - car.s)], shadow=True)))
+    d = 250. - car.s
+    assert car.policy.turn_light(7, d) == state and car.policy.release_light(d) == state
+    car.run(0.1, lights=lambda car, state=state: lights(state, 250. + 15. - car.s))
+    d = 250. - car.s
+    assert car.policy.turn_light(7, d) == state and car.policy.release_light(d) == state
+  car.run(0.1, lights=Lights(None, 'none', camera=CameraLights([('green', 250. - 10. - car.s)], shadow=True)))
+  d = 250. - car.s
+  assert car.policy.turn_light(7, d) == 'none' and car.policy.release_light(d) == 'none'
+  # outside the junction's window (the next junction's light): not this junction's
+  car.run(0.1, lights=Lights(None, 'none', camera=CameraLights([('red', 250. + 60. - car.s)], shadow=True)))
+  d = 250. - car.s
+  assert car.policy.turn_light(7, d) == 'none' and car.policy.release_light(d) == 'none'
+
+
 # --- the stop-sign decider's latch (STOP_SIGNS.md v3 SG4a: stop_go.py through turnpilotd) ---
 
 def stand_at(car, line):

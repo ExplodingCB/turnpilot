@@ -37,7 +37,8 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   roll-up to its stop point (the map curve, up to its cap), shouldStop false, held again within CREEP_AT_M.
 - A signal adds nothing (Kellen, 2026-10-28: through greens without slowing; DESIGN phase 4, G1): no stop, no cap, no
   prompt, unless an accepted light source reads red or yellow for it (the autonomous left standing at its line is the one
-  exception: it goes only on a green read, turn_light). The driving model's own braking is the car's
+  exception: it goes only on a green read, turn_light, and never on a red or yellow any source reads at its junction, mapped
+  signal or not). The driving model's own braking is the car's
   red-light handling; the map signal is only where a light is looked for. On the car this week no light source is
   accepted (the camera's reader ships in shadow), so a mapped signal never slows the car; in the sim the light oracle
   stands in for it, so a sim red still stops. A red is a stop on the MAP_STOP_DECEL curve, seeded where it is first read
@@ -53,7 +54,9 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   on every change (turnpilot.camera_light_shadow; turnpilot.camera_light_unmapped for a red or yellow with no mapped
   signal: no synthetic control, CRITIQUE cut), and nothing it reads reaches a stop, a cap, a prompt or a release: the one
   thing it gates is the autonomous left's go (turn_light, its red too: keeping the car standing where it is never brakes
-  it), which at a signal needs a green read from some source (unprotected_left.SIGNAL_NEEDS_GREEN). Its
+  it), which at a signal needs a green read from some source (unprotected_left.SIGNAL_NEEDS_GREEN). That go only lets
+  TurnPilot's own latch go: plannerd's lift, which overrides the model's hold, needs a green from an accepted source
+  (release_light; turnpilotd.certify_go), so a camera green never removes the model's red-light stop. Its
   reader turned off for the drive is said once (lightSourceRejected, "Camera light reader off for this drive"), on its
   own hold and only where no other alert is said, so it never mutes a take-control, overrun or yellow alert. Add-only
   needs both keys, modeld's message not shadow and turnpilotd's own TurnPilotCameraLights addOnly: then a camera red
@@ -435,41 +438,59 @@ class MapControlPolicy:
     tc = self.turn
     return tc is not None and tc.key == (UNPROTECTED_ROUTE, int(maneuver_id)) and tc.engaged
 
-  def turn_light(self, maneuver_id: int, distance: float) -> str:
-    """The light of the signal at the junction of the unprotected turn maneuver_id, distance m ahead, for the autonomous
-    left's go (unprotected_left.py: DESIGN G4 go condition 5): 'none' with no signal there (one from PROTECT_BEFORE_M
-    before it to PROTECT_PAST_M past it, once seen the junction's for good: it drops out 15 m behind the car), 'unknown'
-    with navd's controls failing or unsupported (whether there is one isn't known); else what
-    every source reads around the junction (PROTECT_BEFORE_M before it to CAMERA_ASSOC_PAST_M past it), the camera's in
-    shadow too: it only ever keeps the car where it stands, never brakes it. Red over yellow over green; 'unknown' with no
-    read. The last update's lights."""
-    if any(c.kind == 'signal' and distance - PROTECT_BEFORE_M <= c.d <= distance + PROTECT_PAST_M for c in self.tracker.controls.values()):
-      self._signal_turn_id = maneuver_id
-    if self._signal_turn_id != maneuver_id:
-      # navd's controls failing or unsupported: a signal there isn't known not to be (no junction data is never clear)
-      return 'unknown' if self.tracker.route and self.tracker.status not in ('ok', 'none') else 'none'
-    lo, hi = distance - PROTECT_BEFORE_M, distance + CAMERA_ASSOC_PAST_M
-    lights = self._lights
-    states = {st for st, d in (lights.lights or []) if lo <= d <= hi}
-    if lights.camera is not None:
-      states |= {st for st, d in lights.camera.heads if lo <= d <= hi}
-    return next((st for st in ('red', 'yellow', 'green') if st in states), 'unknown')
-
-  def release_light(self, distance: float) -> str:
-    """The light of the route's junction distance m ahead for a go TurnPilot's own hold let go of (turnpilotd: turnRelease,
-    skeptic G5): 'none' with no signal there (PROTECT_BEFORE_M before it to PROTECT_PAST_M past it) and navd's controls ok,
-    'unknown' with them anything else (whether there is one isn't known). At a signal, around it as turn_light reads: a red
-    or a yellow from any source, the camera's in shadow too (here it only ever keeps a go off); a green only from an accepted
-    source, never the camera's (G2 is shadow: a phantom green would lift the car into a red); else 'unknown'. Latches
-    nothing (turn_light's latch is the unprotected left's). The last update's lights."""
-    if not any(c.kind == 'signal' and distance - PROTECT_BEFORE_M <= c.d <= distance + PROTECT_PAST_M
-               for c in self.tracker.controls.values()):
-      return 'none' if self.tracker.status == 'ok' else 'unknown'
+  def junction_lights(self, distance: float) -> tuple[set, set]:
+    """(the accepted sources' states, the camera's) read around the junction distance m ahead (PROTECT_BEFORE_M before it to
+    CAMERA_ASSOC_PAST_M past it), mapped signal or not. The last update's lights."""
     lo, hi = distance - PROTECT_BEFORE_M, distance + CAMERA_ASSOC_PAST_M
     lights = self._lights
     accepted = {st for st, d in (lights.lights or []) if lo <= d <= hi}
     camera = {st for st, d in lights.camera.heads if lo <= d <= hi} if lights.camera is not None else set()
-    return next((st for st in ('red', 'yellow') if st in accepted | camera), 'green' if 'green' in accepted else 'unknown')
+    return accepted, camera
+
+  def signal_known(self, maneuver_id: int, distance: float) -> bool:
+    """A signal is mapped at the junction distance m ahead (PROTECT_BEFORE_M before it to PROTECT_PAST_M past it), or was seen
+    there for the unprotected turn maneuver_id (turn_light's latch: it drops out of the controls 15 m behind the car)."""
+    return self._signal_turn_id == maneuver_id or \
+      any(c.kind == 'signal' and distance - PROTECT_BEFORE_M <= c.d <= distance + PROTECT_PAST_M for c in self.tracker.controls.values())
+
+  def turn_light(self, maneuver_id: int, distance: float) -> str:
+    """The light of the signal at the junction of the unprotected turn maneuver_id, distance m ahead, for the autonomous
+    left's go (unprotected_left.py: DESIGN G4 go condition 5). A red or yellow from any source around the junction
+    (junction_lights: the camera's in shadow too, which only ever keeps the car standing where it is) is that, whether a
+    signal is mapped there or not (skeptic G4: OSM missing a signal let the left go into a red its own reader saw). Else
+    'none' with no signal there (one from PROTECT_BEFORE_M before it to PROTECT_PAST_M past it, once seen the junction's for
+    good: it drops out 15 m behind the car), 'unknown' with navd's controls failing or unsupported (whether there is one isn't
+    known); at a signal, green from any source, the camera's included, or 'unknown' with no read. A camera green here lets
+    the left release TurnPilot's own latch only: the model's own red-light hold stays, since plannerd's lift for the left's go
+    needs an accepted green (release_light, turnpilotd.certify_go). The last update's lights."""
+    if any(c.kind == 'signal' and distance - PROTECT_BEFORE_M <= c.d <= distance + PROTECT_PAST_M for c in self.tracker.controls.values()):
+      self._signal_turn_id = maneuver_id
+    accepted, camera = self.junction_lights(distance)
+    states = accepted | camera
+    stop = next((st for st in ('red', 'yellow') if st in states), None)
+    if stop is not None:
+      return stop
+    if self._signal_turn_id != maneuver_id:
+      # navd's controls failing or unsupported: a signal there isn't known not to be (no junction data is never clear)
+      return 'unknown' if self.tracker.route and self.tracker.status not in ('ok', 'none') else 'none'
+    return 'green' if 'green' in states else 'unknown'
+
+  def release_light(self, distance: float) -> str:
+    """The light of the route's junction distance m ahead for a go plannerd lifts (turnpilotd: turnRelease, skeptic G5; the
+    autonomous left's unprotectedLeft, skeptic G5 residual). A red or a yellow from any source around it (junction_lights), the
+    camera's in shadow too (here it only ever keeps a go off), mapped signal or not; else 'none' with no signal there
+    (PROTECT_BEFORE_M before it to PROTECT_PAST_M past it) and navd's controls ok, 'unknown' with them anything else (whether
+    there is one isn't known); at a signal a green only from an accepted source, never the camera's (G2 is shadow: a phantom
+    green would lift the car into a red; the light net may only add a stop), else 'unknown'. Latches nothing (turn_light's
+    latch is the unprotected left's). The last update's lights."""
+    accepted, camera = self.junction_lights(distance)
+    stop = next((st for st in ('red', 'yellow') if st in accepted | camera), None)
+    if stop is not None:
+      return stop
+    if not any(c.kind == 'signal' and distance - PROTECT_BEFORE_M <= c.d <= distance + PROTECT_PAST_M
+               for c in self.tracker.controls.values()):
+      return 'none' if self.tracker.status == 'ok' else 'unknown'
+    return 'green' if 'green' in accepted else 'unknown'
 
   def held_control(self) -> TrackedControl | None:
     """The control the latch holds the car at, or None: the stop-sign decider's (turnpilotd), keyed on its state object, which
