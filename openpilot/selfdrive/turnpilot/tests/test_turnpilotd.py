@@ -20,7 +20,8 @@ from openpilot.selfdrive.turnpilot.route_follower import Maneuver, classify
 from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP, POST_GO_PROFILES, V_TURN_MIN
 from openpilot.selfdrive.turnpilot.turnpilotd import (CAR_UNKNOWN_REASON, DETECTOR_DEADLINE_S, DETECTOR_START_DEADLINE_S, NO_LONG_REASON,
                                                        GAS_DISENGAGE_REASON, GO_LINE_M, LEFT_NO_MOVE_S, NEAR_CONTROL_STAND_S, NO_MOVE_REASON, NO_MOVE_S,
-                                                       SIGNAL_STOPPED_REASON, STALL_MIN_DEG, STALL_PROMPT_S, STALLED_REASON,
+                                                       LEAD_STAND_MAX_S, NO_MOVE_MAX_S, SIGNAL_STOPPED_REASON, STALL_MIN_DEG, STALL_PROMPT_S,
+                                                       STALLED_REASON,
                                                        STOPPED_HANDBACK_S, STOPPED_LEAD_M, STOPPED_NOTE, STOPPED_NOTE_S, STOPPED_REASON,
                                                        TURN_MISSED_REASON, WAITING_REASON, TurnPilot, long_control_for)
 from openpilot.selfdrive.turnpilot.handback import Handback
@@ -1893,8 +1894,10 @@ def test_stood_engaged_with_nothing_holding_it_hands_back_and_never_goes():
     sim.v = 0.
     plans.append(sim.step(engaged=False))
   assert all(p.controlPrompt == 'none' for p in plans)
-  assert all(p.controlPrompt == 'none' for p in stand(sim, STOPPED_HANDBACK_S + 1., lead_prob=0.9, lead_x=7.))  # queued
-  assert all(p.controlPrompt == 'none' for p in stand(sim, STOPPED_HANDBACK_S + 1., lead_prob=0.6, lead_x=STOPPED_LEAD_M - 1.))
+  # queued: a lead the live scene shows (a vehicle track in the path at it; BUILD_FINDINGS D2: one it doesn't holds nothing)
+  for prob, x in ((0.9, 7.), (0.6, STOPPED_LEAD_M - 1.)):
+    queue = ({'cls': 'car', 'x': x, 'y': 0., 'vx': 0., 'vy': 0., 'inPath': True},)
+    assert all(p.controlPrompt == 'none' for p in stand(sim, STOPPED_HANDBACK_S + 1., lead_prob=prob, lead_x=x, objects=queue))
 
 
 def test_stood_at_a_mapped_signal_the_model_wont_leave_hands_back_after_the_long_stand():
@@ -2041,11 +2044,21 @@ def test_stalled_in_the_junction_after_the_go_hands_back_and_never_goes():
   assert all(p.controlPrompt == 'none' for p in stand(sim, STALL_PROMPT_S - 0.2))
   assert stand(sim, 0.4)[-1].controlPrompt == 'stalledTakeControl'
 
-  # not with a lead close ahead, nor under 20 deg into the turn (the model may still be waiting to start it)
+  # a lead close ahead that the live scene corroborates (a vehicle track in the path near it) holds the car, for
+  # LEAD_STAND_MAX_S at most; one nothing in the scene shows (BUILD_FINDINGS D2: a mailbox, a phantom) holds nothing
   sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
   into_the_turn(sim, 45.)
   sim.model_kw = {'lead_prob': 0.9, 'lead_x': STOPPED_LEAD_M - 5.}
-  assert all(p.controlPrompt == 'none' for p in stand(sim, STALL_PROMPT_S + 1.))
+  plans = stand(sim, STALL_PROMPT_S + 0.2)
+  assert plans[-1].controlPrompt == 'stalledTakeControl'
+  sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
+  into_the_turn(sim, 45.)
+  sim.model_kw = {'lead_prob': 0.9, 'lead_x': STOPPED_LEAD_M - 5.}
+  from openpilot.selfdrive.turnpilot.scene.tracker import RawBox, RawFrame
+  sim.raw = lambda s: RawFrame([RawBox('wide', 'car', 0.8, 0., (-12., 12.), None, None)], 'wide', s.t)  # a lead's bumper, unranged
+  assert all(p.controlPrompt == 'none' for p in stand(sim, LEAD_STAND_MAX_S - 0.2))
+  assert stand(sim, 0.4)[-1].controlPrompt == 'stalledTakeControl'
+  # nor under 20 deg into the turn (the model may still be waiting to start it)
   sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
   into_the_turn(sim, 10.)
   assert all(p.controlPrompt == 'none' for p in stand(sim, STALL_PROMPT_S + 1.))
@@ -2081,6 +2094,90 @@ def test_a_shallow_turn_taken_from_a_stop_is_not_called_missed():
     assert yawed >= angle and not any(p.turnMissed for p in plans), angle
   plans, _ = run(15., False)  # straight on past it: missed
   assert any(p.turnMissed for p in plans)
+
+
+RIGHT_AT_A_CORNER = [(300., "turn", "right", junction_of("right")), (1500., "turn", "left", T_LEFT)]
+
+
+def model_stands_in_the_turn(sim, deg, junction=300., side=-1):
+  """Drives the route's turn at junction (its desire out from the approach, no TurnPilot hold) and turns the car deg into it,
+  then the model stands the car there (stand()): a model stop partway round, whoever stopped it."""
+  while junction - sim.s > 3.:
+    sim.step(engaged=True)
+    assert sim.t < 120.
+  while sim.tp.desires.turned_deg < deg:
+    sim.step(engaged=True, yaw_rate=0.4 * side)
+    assert sim.t < 140.
+  assert sim.tp.go_id is None and sim.tp.turn_committed
+
+
+def test_a_model_stand_partway_round_a_turn_hands_back_whoever_stopped_the_car():
+  """BUILD_FINDINGS D2 (BeamNG S20 right_green, S03): the model stopped the car partway round the route's right turn with
+  no TurnPilot hold (S20: 24 deg in, on the corner's sidewalk, a mailbox 5 m ahead read as a lead at p 0.99; S03: 47 deg
+  in, after a walker's hold that only capped the speed), and nothing was said for 103 s (S20) or 60 s (S03): the stall's
+  handback needed a go of TurnPilot's (go_id) and any model lead under 15 m exempted the stand. A stand of STALL_PROMPT_S
+  STALL_MIN_DEG to STALL_MAX_DEG into a route turn in progress now hands back (stalledTakeControl), whoever stopped the
+  car, and a lead the live scene doesn't corroborate holds nothing. Never a hold or a push: no shouldStop, no lower cap."""
+  for deg, lead, objects in ((24., (0.99, 5.), ()),  # S20: the mailbox
+                             (47., (0.2, 25.), ({'cls': 'pedestrian', 'x': 20., 'y': 0.2, 'vx': 0., 'vy': 0., 'inPath': True},))):  # S03
+    sim = Sim(RIGHT_AT_A_CORNER, cruise=8.)
+    model_stands_in_the_turn(sim, deg)
+    plans = stand(sim, STALL_PROMPT_S - 0.2, lead_prob=lead[0], lead_x=lead[1], objects=objects)
+    assert all(p.controlPrompt == 'none' for p in plans), deg
+    p = stand(sim, 0.4, lead_prob=lead[0], lead_x=lead[1], objects=objects)[-1]
+    assert p.controlPrompt == 'stalledTakeControl' and p.reason == STALLED_REASON, deg
+    assert not any(q.shouldStop for q in plans + [p]) and p.accelCap == NO_ACCEL_CAP, deg
+  # under STALL_MIN_DEG with no go of TurnPilot's (a stop at the line with the turn's desire out: a red the map doesn't
+  # know): not the stall's; the empty-road handback's (STOPPED_NOTE_S, STOPPED_HANDBACK_S) as before
+  sim = Sim(RIGHT_AT_A_CORNER, cruise=8.)
+  model_stands_in_the_turn(sim, 10.)
+  assert all(p.controlPrompt != 'stalledTakeControl' for p in stand(sim, STALL_PROMPT_S + 2.))
+
+
+def test_a_lead_the_scene_corroborates_holds_a_stand_in_a_turn_only_so_long():
+  """BUILD_FINDINGS D2 (2): a model lead within STOPPED_LEAD_M exempts a stand from the handbacks only while the live scene
+  corroborates it (a vehicle track in the path within LEAD_CORROBORATE_M of its x, or a vehicle box of the detector's
+  straight ahead, ranged near it or unranged: a lead's bumper under the hood), held LEAD_SEEN_HOLD_S between runs; in a turn
+  for LEAD_STAND_MAX_S at most, then the stall's handback. A pedestrian, or a vehicle off the path, corroborates nothing."""
+  from openpilot.selfdrive.turnpilot.scene.tracker import RawBox, RawFrame
+  car = {'cls': 'car', 'x': 6., 'y': 0.3, 'vx': 0., 'vy': 0., 'inPath': True}
+  unranged = RawFrame([RawBox('wide', 'truck', 0.7, 1., (-14., 16.), None, None)], 'wide', 0.)
+  ranged = RawFrame([RawBox('road', 'car', 0.7, 0., (-8., 8.), (6.5, 0.), 6., ())], 'road', 0.)
+  for objects, raw in (((car,), None), ((), unranged), ((), ranged)):
+    sim = Sim(RIGHT_AT_A_CORNER, cruise=8.)
+    model_stands_in_the_turn(sim, 30.)
+    frame = [0]
+    sim.raw = (lambda s, raw=raw, frame=frame: raw if (frame.__setitem__(0, frame[0] + 1) or frame[0] % 2) else None) if raw else None
+    plans = stand(sim, LEAD_STAND_MAX_S - 0.2, lead_prob=0.95, lead_x=6., objects=objects)
+    assert all(p.controlPrompt == 'none' for p in plans), (objects, raw)
+    assert stand(sim, 0.4, lead_prob=0.95, lead_x=6., objects=objects)[-1].controlPrompt == 'stalledTakeControl', (objects, raw)
+  person = RawFrame([RawBox('road', 'pedestrian', 0.8, 0., (-3., 3.), None, None)], 'road', 0.)  # not a vehicle
+  aside = RawFrame([RawBox('road', 'car', 0.8, 30., (25., 35.), None, None)], 'road', 0.)       # not at the lead's bearing
+  for objects, raw in ((({'cls': 'car', 'x': 6., 'y': 6., 'vx': 0., 'vy': 0., 'inPath': False},), None),  # off the path
+                       (({'cls': 'car', 'x': 14., 'y': 0., 'vx': 0., 'vy': 0., 'inPath': True},), None),  # past the lead's x
+                       ((), person), ((), aside)):
+    sim = Sim(RIGHT_AT_A_CORNER, cruise=8.)
+    model_stands_in_the_turn(sim, 30.)
+    sim.raw = (lambda s, raw=raw: raw) if raw else None
+    p = stand(sim, STALL_PROMPT_S + 0.2, lead_prob=0.95, lead_x=6., objects=objects)[-1]
+    assert p.controlPrompt == 'stalledTakeControl', (objects, raw)
+
+
+def test_a_lead_nothing_in_the_scene_shows_never_keeps_a_standing_car_silent():
+  """BUILD_FINDINGS D2 (2): stopped_unheld skipped any stand with a model lead within STOPPED_LEAD_M, so a phantom (BeamNG
+  S14, S18: p 0.9-0.99 at 10-15 m on empty road) or a mailbox kept the car standing with no note and no handback. Off any
+  turn, an uncorroborated lead holds nothing (STOPPED_NOTE_S, STOPPED_HANDBACK_S); a corroborated one (a queue) still
+  holds the car as long as it is there."""
+  sim = Sim([(2000., 'turn', 'left', T_LEFT)])
+  sim.run(1.)
+  plans = stand(sim, STOPPED_HANDBACK_S + 0.2, lead_prob=0.95, lead_x=10.)
+  assert plans[int(STOPPED_NOTE_S / DT_MDL) + 2].reason == STOPPED_NOTE
+  assert plans[-1].controlPrompt == 'carStoppedTakeControl'
+  sim = Sim([(2000., 'turn', 'left', T_LEFT)])
+  sim.run(1.)
+  queue = ({'cls': 'car', 'x': 9., 'y': 0., 'vx': 0., 'vy': 0., 'inPath': True},)
+  plans = stand(sim, 2. * STOPPED_HANDBACK_S, lead_prob=0.95, lead_x=10., objects=queue)
+  assert all(p.controlPrompt == 'none' and p.reason != STOPPED_NOTE for p in plans)
 
 
 def test_a_hard_brake_is_raised_only_for_a_confirmed_pedestrian():
@@ -2353,11 +2450,32 @@ def test_no_move_handback_not_for_a_car_that_pulls_away_late_or_waits_behind_a_l
   assert sim.v > 0.3 and all(p.controlPrompt == 'none' and not p.shouldStop for p in plans)
   # stopped again once moving, under 20 deg in (the stall's range): not this handback
   assert all(p.controlPrompt != 'cantStartTakeControl' for p in stand(sim, 4.))
-  # a lead close ahead holds the car: the go's clock waits for it
+  # a lead close ahead the live scene corroborates (a vehicle track in the path near it) holds the car: the go's clock waits
+  # for it, NO_MOVE_MAX_S at most from the go (BUILD_FINDINGS D1, D2)
   sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
   go_from_the_hold(sim)
-  assert all(p.controlPrompt == 'none' for p in stand(sim, NO_MOVE_S + 2., lead_prob=0.9, lead_x=STOPPED_LEAD_M - 5.))
+  queue = ({'cls': 'car', 'x': STOPPED_LEAD_M - 5., 'y': 0., 'vx': 0., 'vy': 0., 'inPath': True},)
+  assert all(p.controlPrompt == 'none' for p in stand(sim, NO_MOVE_S + 2., lead_prob=0.9, lead_x=STOPPED_LEAD_M - 5., objects=queue))
   assert stand(sim, NO_MOVE_S + 0.2)[-1].controlPrompt == 'cantStartTakeControl'
+  sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
+  go_from_the_hold(sim)
+  plans = stand(sim, NO_MOVE_MAX_S + 0.2, lead_prob=0.9, lead_x=STOPPED_LEAD_M - 5., objects=queue)
+  first = next(i for i, p in enumerate(plans) if p.controlPrompt == 'cantStartTakeControl')
+  assert NO_MOVE_MAX_S - 0.2 <= first * DT_MDL <= NO_MOVE_MAX_S + 0.1, first * DT_MDL
+
+
+def test_a_go_ended_by_a_lead_nothing_in_the_scene_shows_hands_back_at_the_no_move_limit():
+  """BUILD_FINDINGS D1 (BeamNG S14, S18): the moment the go's turn pulse went out at a green the model reported a lead 10-17 m
+  dead ahead on empty road (p 0.90-0.99, no detector box), which ends the certified go, as it must; but the no-move clock
+  counted only while no model lead was close, so the handback waited for the phantom to drift past 15 m, and one that stayed
+  would have left the car standing at a green with no prompt. A lead the live scene doesn't corroborate stops nothing on the
+  clock: withdrawn and handed back at NO_MOVE_S, the lead and its corroboration logged; never a go through it."""
+  sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
+  go_from_the_hold(sim)
+  plans = stand(sim, NO_MOVE_S - 0.2, lead_prob=0.95, lead_x=11.)
+  assert all(p.controlPrompt == 'none' and str(p.goCertified.cause) == 'none' for p in plans)
+  p = stand(sim, 0.4, lead_prob=0.95, lead_x=11.)[-1]
+  assert p.controlPrompt == 'cantStartTakeControl' and p.shouldStop
 
 
 def test_an_unprotected_turns_go_is_withdrawn_after_a_shorter_no_move():

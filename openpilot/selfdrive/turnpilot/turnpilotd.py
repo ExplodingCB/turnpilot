@@ -54,10 +54,12 @@ A turn the car pulls away into from a standstill (a hold's go, the turn's pulse 
 was taken about half the time (2026-10-28). Past its junction (the follower's pass) having turned under MISSED_TURN_DEG,
 its desire not cleared at the turn's angle (a turn under 20 deg clears under MISSED_TURN_DEG, and that one was taken),
 it was missed: turnMissed for MISSED_HOLD_S, which selfdrived chimes as a skip ("Turn Missed", "Rerouting") and on which
-navd reroutes at once. Nothing brakes for it. Standing more than STALL_PROMPT_S after the go, STALL_MIN_DEG to
-STALL_MAX_DEG into the turn (from its start, for a go that came in the junction), with no hold of TurnPilot's and no lead
-within STOPPED_LEAD_M, it stalled in the junction: handed back loudly (controlPrompt stalledTakeControl, STALLED_REASON),
-never held there, and TurnPilot never goes itself.
+navd reroutes at once. Nothing brakes for it. Standing more than STALL_PROMPT_S in any route turn in progress (its desire
+out and not done), STALL_MIN_DEG to STALL_MAX_DEG into it (from its start, after a go of TurnPilot's that came in the
+junction), whoever stopped the car (TurnPilot's go, or the model on its own: BUILD_FINDINGS D2), with no hold of TurnPilot's
+and no lead within STOPPED_LEAD_M that the live scene corroborates (watch_lead: a vehicle track or box at it; one it
+corroborates holds the car LEAD_STAND_MAX_S at most), it stalled in the junction: handed back loudly (controlPrompt
+stalledTakeControl, STALLED_REASON), never held there, and TurnPilot never goes itself.
 From the go such a turn is driven under its post-go profile (turn_speed.py: PostGo; DESIGN phase 4 section 3): accel and
 speed capped by the heading it has turned, DesireTiming.turned_deg at the go and the car's yaw after, until 60 deg or
 POST_GO_MAX_M on, and dropped at the pass of a turn missed straight on. TurnPilotPostGoProfile names the profile
@@ -66,11 +68,12 @@ across the oncoming road) takes TurnPilotLeftGoProfile's (left: 1.5 m/s^2, 4.3 m
 A go from the hold line (go_at_line: the car GO_LINE_M or more before the maneuver point, the scene not committed to the
 junction nor released into it) the car hasn't pulled away on (STANDSTILL_SPEED) within NO_MOVE_S (TurnPilotNoMoveS, up to
 NO_MOVE_MAX_S, for the sweep), LEFT_NO_MOVE_S for an unprotected turn (CRITIQUE
-REQUIRED 4: its gap runs out while it stands), counting only while nothing else holds it (no TurnPilot hold, no close lead,
-no pedal), is the model holding the car: TurnPilot withdraws the go before the car moves, holding it standing (shouldStop,
-a 0 speed cap: braking at -2.0 at most, from under 0.3 m/s; no turn pulse), and hands back loudly (controlPrompt
-cantStartTakeControl, NO_MOVE_REASON) until the driver takes over (openpilot disengaged: any gas press); a scene hold
-that comes and goes meanwhile (a walker crossing) is no new go. The turn isn't cancelled: its desire state stays, and the
+REQUIRED 4: its gap runs out while it stands), counting only while nothing else holds it (no TurnPilot hold, no close lead
+the scene corroborates, NO_MOVE_MAX_S from the go at most behind one, no pedal), is the model holding the car: TurnPilot
+withdraws the go before the car moves, holding it standing (shouldStop, a 0 speed cap: braking at -2.0 at most, from
+under 0.3 m/s; no turn pulse), and hands back loudly (controlPrompt cantStartTakeControl, NO_MOVE_REASON) until the
+driver takes over (openpilot disengaged: any gas press); a scene hold that comes and goes meanwhile (a walker crossing)
+is no new go. The turn isn't cancelled: its desire state stays, and the
 driver drives it. A go in the junction (a walker's hold released partway round) is never withdrawn: stopping there is worse
 than finishing the turn, so TurnPilot never holds the car in it; it keeps the post-go caps, which only lower speed, and the
 stall's handback without a hold.
@@ -112,7 +115,8 @@ go is lifted only from LEFT_LIFT_ROOM_M or more short of the oncoming lanes (its
 them only by a launch (left_launch): short of LEFT_LAUNCH_SPEED with LEFT_LAUNCH_ROOM_M left to stop short of them, it is
 withdrawn and handed back, never a coast across them on the lift's speed.
 Standing engaged with nothing of TurnPilot's holding the car (no shouldStop, no cap biting), no lead from the model within
-STOPPED_LEAD_M (one further on doesn't hold a standing car), gas and brake off, the model stopped on its own: said on the
+STOPPED_LEAD_M that the live scene corroborates (one further on doesn't hold a standing car, nor one nothing in the scene
+shows: a phantom, a mailbox), gas and brake off, the model stopped on its own: said on the
 status line after STOPPED_NOTE_S (STOPPED_NOTE), and handed back loudly (controlPrompt carStoppedTakeControl) after
 STOPPED_HANDBACK_S, or NEAR_CONTROL_STAND_S with a map control within STOPPED_CONTROL_M (CRITIQUE REQUIRED 6: a model
 stall at a mapped signal TurnPilot doesn't hold for is never silent, and a red the map doesn't know, the car first in
@@ -171,8 +175,8 @@ from openpilot.selfdrive.turnpilot.junction_watch import JunctionWatch, detector
 from openpilot.selfdrive.turnpilot import visibility_table
 from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
 from openpilot.common.time_helpers import system_time_valid
-from openpilot.selfdrive.turnpilot.scene_policy import (HOLD_LINE_M, NO_ACCEL_CAP, ONCOMING_ENTRY_M, PATH_HALF_WIDTH_M, STOP_DECEL, ScenePolicy,
-                                                         far_side_turn, in_path)
+from openpilot.selfdrive.turnpilot.scene_policy import (HOLD_LINE_M, NO_ACCEL_CAP, ONCOMING_ENTRY_M, PATH_HALF_WIDTH_M, STOP_DECEL, VEHICLES,
+                                                         ScenePolicy, far_side_turn, in_path)
 from openpilot.selfdrive.turnpilot.turn_skip import SkipState, TurnSkip, can_make_turn
 from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
 from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, LINE_D, OFF, ROAD_RANGE_M, LeftInput, UnprotectedLeft,
@@ -259,6 +263,18 @@ STALL_PROMPT_S = 3.    # standing this long after the go, STALL_MIN_DEG to STALL
 STALL_MIN_DEG = 20.    # handed back (the stop line it left is within STOPPED_CONTROL_M, so the empty-road handback
 STALL_MAX_DEG = 80.    # comes only after the long stand; the sweep's stalls stood 20 s at 46-78 deg)
 STALLED_REASON = "Stalled in the turn: take control"
+# a model lead (close_lead) holds a standing car only as far as the live scene corroborates it (BUILD_FINDINGS D1, D2: a phantom
+# 10-17 m dead ahead on empty road the moment a turn's pulse went out, a mailbox on a corner read at p 0.99, each kept a car
+# standing silently): a vehicle track in the path within LEAD_CORROBORATE_M of the lead's x, or a vehicle box of a detector run
+# at it (ranged within LEAD_CORROBORATE_M of its x across the lead's place, or unranged with its bearing within
+# LEAD_BEARING_TOL_DEG of the lead's: a lead's bumper under the hood ranges nothing), held LEAD_SEEN_HOLD_S between runs (10 Hz,
+# the wide camera's turns included). A lead nothing corroborates exempts no stand; a corroborated one keeps a stand in a turn
+# LEAD_STAND_MAX_S at most (stalled_in_turn), a go's stand NO_MOVE_MAX_S from the go (no_move), and a stand off any turn as long
+# as it is there (stopped_unheld: a queue). Never a go through it: the go's own lead check (go_blocked) is close_lead's
+LEAD_CORROBORATE_M = 3.
+LEAD_BEARING_TOL_DEG = 3.
+LEAD_SEEN_HOLD_S = 1.
+LEAD_STAND_MAX_S = 20.
 # not at STANDSTILL_SPEED this long after TurnPilot's go, nothing else holding the car: the model is holding it (DESIGN phase 4
 # section 2-3; G0, 2026-10-28: 14 of 24 tapless goes stood 20 s). Withdrawn and handed back; an unprotected turn's sooner
 NO_MOVE_S = 2.
@@ -348,6 +364,33 @@ def close_lead(model) -> bool:
   """modelV2 has a lead within STOPPED_LEAD_M: what holds a standing car (one further on doesn't)."""
   return len(model.leadsV3) > 0 and model.leadsV3[0].prob > STOPPED_LEAD_PROB and len(model.leadsV3[0].x) > 0 and \
     model.leadsV3[0].x[0] < STOPPED_LEAD_M
+
+
+def lead_corroboration(model, objects, raw) -> str:
+  """What in the live scene shows modelV2's lead, '' if nothing (LEAD_CORROBORATE_M): a vehicle track in the path near its x
+  (scene_policy.in_path), or a vehicle box of this frame's detector run (scene.tracker.RawFrame) at it, ranged near its x
+  across its place, or unranged, its bearings spanning the lead's. A pedestrian, or a vehicle off the path or past it, isn't."""
+  lead = model.leadsV3[0]
+  x = float(lead.x[0])
+  y = -float(lead.y[0]) if len(lead.y) else 0.  # modelV2's y is right, the scene's left
+  for obj in objects:
+    if str(obj.cls) in VEHICLES and abs(obj.x - x) <= LEAD_CORROBORATE_M and in_path(obj):
+      return f"track {obj.trackId} {obj.cls} at {obj.x:.1f} m"
+  bearing = math.degrees(math.atan2(y, max(x, 0.1)))
+  for b in (raw.boxes if raw is not None else ()):
+    if str(b.cls) not in VEHICLES:
+      continue
+    if b.xy is None:
+      if min(b.span_deg) - LEAD_BEARING_TOL_DEG <= bearing <= max(b.span_deg) + LEAD_BEARING_TOL_DEG:
+        return f"{b.camera} box {b.cls} unranged"
+      continue
+    if abs(b.xy[0] - x) > LEAD_CORROBORATE_M:
+      continue
+    rng = math.hypot(*b.xy)
+    lats = sorted(rng * math.sin(math.radians(e)) for e in b.span_deg)
+    if lats[0] < y + PATH_HALF_WIDTH_M and lats[-1] > y - PATH_HALF_WIDTH_M:
+      return f"{b.camera} box {b.cls} at {b.xy[0]:.1f} m"
+  return ''
 
 
 class ErrorLog:
@@ -487,7 +530,12 @@ class TurnPilot:
     self.go_cert.withdraw('reset')  # a disabled plan carries no go
     self.decider_turn_id: int | None = None  # the route's turn whose stop sign the decider acted for last frame (update())
     self.stopped_s = 0.            # standing engaged with nothing holding the car (carStoppedTakeControl)
-    self.stall_s = 0.              # standing in the turn after its go, nothing holding the car (stalledTakeControl)
+    self.stall_s = 0.              # standing in a route turn, nothing holding the car (stalledTakeControl)
+    self.stall_stand_s = 0.        # ...standing there, a corroborated lead or not (LEAD_STAND_MAX_S)
+    self.stall_said = False        # ...handed back for it (its log once)
+    self.lead_seen_s = float('inf')  # since the live scene last corroborated modelV2's close lead (watch_lead)
+    self.lead_why = ''             # ...what did
+    self.lead_held = False         # this frame: a close lead the scene corroborates, within LEAD_SEEN_HOLD_S (watch_lead)
     self.missed_t = 0.             # turnMissed is held while this counts down
     self.notices = RouteNotices()  # the route's stop signs said at its start and 300 m before each it couldn't avoid (3.4)
     if not keep_turn:
@@ -512,6 +560,7 @@ class TurnPilot:
       self.post_go: PostGo | None = None  # ...and driven under its post-go profile (start_post_go)
       self.no_move_limit = NO_MOVE_S       # ...withdrawn if the car hasn't moved this long after it (no_move)
       self.go_wait_s: float | None = None  # s stood since TurnPilot's go, nothing else holding the car; None: moved, or no go
+      self.go_lead_s = 0.                  # ...and behind a corroborated lead (NO_MOVE_MAX_S with go_wait_s)
       self.go_withdrawn = False            # the go withdrawn: the car held standing, handed back (cantStartTakeControl)
       self.go_in_junction = False          # the go came with the car in the junction (go_at_line): never withdrawn
       self.go_lifted = False               # ...certified for plannerd's lift (certify_go)
@@ -665,6 +714,7 @@ class TurnPilot:
 
     handback = self.handback(available, sm.updated['modelV2'], sm['carControl'].enabled)
     plan.handback = handback
+    self.watch_lead(model, objects, raw)
     acting = self.detector_seen and handback == Handback.none
     lat_active = sm['carControl'].latActive
     if self.acting and not acting and lat_active:
@@ -865,6 +915,7 @@ class TurnPilot:
     elif self.release_go and mapd.released_stopped and not decider_go and sm['carControl'].enabled and not took_over:
       # any other go of TurnPilot's from a standstill (a map control let go, a straight road's too): the no-move clock (gap B)
       self.go_wait_s, self.go_withdrawn, self.go_moved, self.go_lifted, self.go_in_junction = 0., False, False, False, False
+      self.go_lead_s = 0.
       self.no_move_limit, self.go_cert_id = self.no_move_s, None
       cloudlog.event("turnpilot.post_go", profile='none', unprotected=False, turned_deg=0., distance=round(rf.distance, 1), at_line=True)
     if self.post_go is not None and not turn_go:
@@ -1599,6 +1650,7 @@ class TurnPilot:
     at_line = self.go_at_line(distance)
     self.no_move_limit, self.go_withdrawn = (LEFT_NO_MOVE_S if left else self.no_move_s), False
     self.go_wait_s = 0. if at_line else None  # in the junction: never withdrawn, the stall's handback covers it
+    self.go_lead_s = 0.
     self.go_moved = False
     # the left's go from its line followed into the oncoming lanes only by a launch (left_launch)
     self.left_launch_armed = left and at_line and distance - ONCOMING_ENTRY_M >= LEFT_LIFT_ROOM_M
@@ -1711,11 +1763,15 @@ class TurnPilot:
       return False
     window_out = self.go_lifted and mine and gc.end == 'window'  # its lift's 3 s out, the model never taking over
     if moving:
-      self.go_moved, self.go_wait_s = True, 0.  # rolling on the lift: the stand's clock starts over
-    elif acting and not decision.should_stop and not decision.holding and not close_lead(sm['modelV2']) and \
-       not cs.gasPressed and not cs.brakePressed:
-      self.go_wait_s += DT_MDL
-    if not window_out and self.go_wait_s < self.no_move_limit - 1e-6:
+      self.go_moved, self.go_wait_s, self.go_lead_s = True, 0., 0.  # rolling on the lift: the stand's clock starts over
+    elif acting and not decision.should_stop and not decision.holding and not cs.gasPressed and not cs.brakePressed:
+      # a lead the live scene corroborates holds the car, NO_MOVE_MAX_S at most; one it doesn't holds nothing (watch_lead:
+      # BUILD_FINDINGS D1, the phantom at a green that ended the go)
+      if self.lead_held:
+        self.go_lead_s += DT_MDL
+      else:
+        self.go_wait_s += DT_MDL
+    if not window_out and self.go_wait_s < self.no_move_limit - 1e-6 and self.go_wait_s + self.go_lead_s < NO_MOVE_MAX_S - 1e-6:
       return False
     mid, turned = self.follower.maneuver_id, self.desires.turned_deg
     if self.go_moved and (mid in (self.scene.committed_id, self.scene.released_id) or turned >= STALL_MIN_DEG):
@@ -1724,7 +1780,8 @@ class TurnPilot:
       self.go_in_junction, self.go_wait_s = True, None  # never held in the junction: the stall's handback, no hold
       return False
     cloudlog.event("turnpilot.go_not_moving", error=True, stood_s=round(self.go_wait_s, 1), limit_s=self.no_move_limit,
-                   turned_deg=round(turned, 1), lifted=self.go_lifted, moved=self.go_moved, window_out=window_out, v=round(v_ego, 2))
+                   turned_deg=round(turned, 1), lifted=self.go_lifted, moved=self.go_moved, window_out=window_out, v=round(v_ego, 2),
+                   lead_s=round(self.go_lead_s, 1), **self.lead_log(sm['modelV2']))
     self.go_withdrawn, self.go_wait_s = True, None
     return True
 
@@ -1751,29 +1808,57 @@ class TurnPilot:
     return True
 
   def stalled_in_turn(self, sm, cs, v_ego: float, acting: bool, decision, mapd) -> bool:
-    """The car has stood STALL_PROMPT_S in the turn a hold let go of, with nothing holding it (module docstring): hand
-    back. The stop line it left is close behind it, so stopped_unheld would wait NEAR_CONTROL_STAND_S. From STALL_MIN_DEG
-    into the turn, or from its start if the go came in the junction (go_in_junction: never withdrawn, never silent) or the
-    car stands in it now (not go_at_line: a go from the line it crept on from into the cross street's lanes, skeptic G3,
-    89.95 s silent at 5.5 deg)."""
+    """The car has stood STALL_PROMPT_S in a route turn in progress (its desire out, not done: turn_committed, which stays
+    set while DesireTiming stops pulsing a standing car), with nothing holding it: hand back (module docstring), whoever
+    stopped the car (BUILD_FINDINGS D2: the model stopping partway round with no hold, or after a hold that only capped the
+    speed, stood silently for 60-103 s). STALL_MIN_DEG to STALL_MAX_DEG into the turn; or, after TurnPilot's go for it, from
+    its start if the go came in the junction (go_in_junction: never withdrawn, never silent) or the car stands in it now (not
+    go_at_line: a go from the line it crept on from into the cross street's lanes, skeptic G3, 89.95 s silent at 5.5 deg).
+    Under STALL_MIN_DEG with no go of TurnPilot's the car may stand at the line (a red the map doesn't know): stopped_unheld's.
+    The stop line it left is close behind it, so stopped_unheld would wait NEAR_CONTROL_STAND_S. A model lead holds it only
+    as far as the scene corroborates it, LEAD_STAND_MAX_S at most (watch_lead)."""
     d, rf = self.desires, self.follower
-    in_turn = self.go_id is not None and self.go_id == d.maneuver_id == rf.maneuver_id and \
-      (self.go_in_junction or not self.go_at_line(rf.distance) or STALL_MIN_DEG <= d.turned_deg) and d.turned_deg <= STALL_MAX_DEG
-    stalled = acting and in_turn and sm['carControl'].enabled and v_ego < STANDSTILL_SPEED and not decision.should_stop and \
+    went = self.go_id is not None and self.go_id == rf.maneuver_id
+    in_turn = self.turn_committed and d.turned_deg <= STALL_MAX_DEG and \
+      ((went and (self.go_in_junction or not self.go_at_line(rf.distance))) or STALL_MIN_DEG <= d.turned_deg)
+    standing = acting and in_turn and sm['carControl'].enabled and v_ego < STANDSTILL_SPEED and not decision.should_stop and \
       not self.go_withdrawn and \
-      not decision.holding and not close_lead(sm['modelV2']) and not cs.gasPressed and not cs.brakePressed and \
-      mapd.prompt not in TAKE_CONTROL_PROMPTS
-    was = self.stall_s > STALL_PROMPT_S
-    self.stall_s = self.stall_s + DT_MDL if stalled else 0.
-    now = self.stall_s > STALL_PROMPT_S
-    if now and not was:
-      cloudlog.event("turnpilot.stalled_in_turn", error=True, stood_s=round(self.stall_s, 1), turned_deg=round(d.turned_deg, 1))
+      not decision.holding and not cs.gasPressed and not cs.brakePressed and mapd.prompt not in TAKE_CONTROL_PROMPTS
+    self.stall_stand_s = self.stall_stand_s + DT_MDL if standing else 0.
+    lead_keeps = self.lead_held and self.stall_stand_s < LEAD_STAND_MAX_S - 1e-6
+    self.stall_s = self.stall_s + DT_MDL if standing and not lead_keeps else 0.
+    now = standing and (self.stall_s > STALL_PROMPT_S or self.stall_stand_s >= LEAD_STAND_MAX_S - 1e-6)
+    if now and not self.stall_said:
+      cloudlog.event("turnpilot.stalled_in_turn", error=True, stood_s=round(self.stall_stand_s, 1), turned_deg=round(d.turned_deg, 1),
+                     go=went, distance=round(rf.distance, 1), **self.lead_log(sm['modelV2']))
+    self.stall_said = now
     return now
+
+  def watch_lead(self, model, objects, raw) -> None:
+    """This frame's close lead (close_lead) and whether the live scene corroborates it (lead_corroboration), held
+    LEAD_SEEN_HOLD_S between detector runs: lead_held, what the stand handbacks let hold the car (module constants)."""
+    close = close_lead(model)
+    why = lead_corroboration(model, objects, raw) if close else ''
+    if why:
+      self.lead_seen_s, self.lead_why = 0., why
+    elif close:
+      self.lead_seen_s += DT_MDL
+    else:
+      self.lead_seen_s, self.lead_why = float('inf'), ''
+    self.lead_held = close and self.lead_seen_s <= LEAD_SEEN_HOLD_S + 1e-6
+
+  def lead_log(self, model) -> dict:
+    """modelV2's lead and its corroboration, for a stand handback's log line."""
+    if not close_lead(model):
+      return {'lead': False}
+    lead = model.leadsV3[0]
+    return {'lead': True, 'lead_x': round(float(lead.x[0]), 1), 'lead_prob': round(float(lead.prob), 2), 'lead_held': self.lead_held,
+            'corroborated': self.lead_why if self.lead_held else ''}
 
   def stopped_unheld(self, sm, cs, v_ego: float, acting: bool, decision, mapd) -> str:
     """The car standing engaged with nothing holding it (module docstring): '' while it isn't, or not for long; STOPPED_NOTE
     after STOPPED_NOTE_S; the handback's reason after STOPPED_HANDBACK_S, NEAR_CONTROL_STAND_S near a map control."""
-    lead = close_lead(sm['modelV2'])
+    lead = self.lead_held  # a lead the scene corroborates (a queue); one it doesn't holds nothing (watch_lead)
     near = [c for c in list(self.map_controls.tracker.controls.values()) + [self.map_controls.turn]
             if c is not None and abs(c.d) < STOPPED_CONTROL_M]
     unheld = acting and sm['carControl'].enabled and v_ego < STANDSTILL_SPEED and not decision.should_stop and \
@@ -1786,7 +1871,7 @@ class TurnPilot:
       return STOPPED_NOTE if self.stopped_s >= STOPPED_NOTE_S - 1e-6 else ''
     if not was:
       cloudlog.event("turnpilot.stopped_unheld", error=True, stood_s=round(self.stopped_s, 1), reason=decision.reason,
-                     near=[c.kind for c in near])
+                     near=[c.kind for c in near], **self.lead_log(sm['modelV2']))
     return SIGNAL_STOPPED_REASON if any(c.kind == 'signal' for c in near) else STOPPED_REASON
 
   def map_update(self, sm, v_ego: float, gas_pressed: bool, turn=None, left: LeftCommand | None = None, release=None, creep=None,
