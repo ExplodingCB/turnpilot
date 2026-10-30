@@ -194,6 +194,7 @@ class Facts:
   chestnut_present: list = field(default_factory=list)
   chestnut: list = field(default_factory=list)
   events: list = field(default_factory=list)                        # (t, name)
+  events_t: list = field(default_factory=list)                      # every onroadEvents message's t, an empty one too
   calib: list = field(default_factory=list)
   sensors: Counter = field(default_factory=Counter)
   detections: list = field(default_factory=list)
@@ -264,6 +265,7 @@ class Facts:
     self.chestnut.append(ChestnutRow(t, c.supplyVoltage, c.supplyFault, c.pcieLtssm, c.tempC, c.gpuUsagePercent))
 
   def _onroadEvents(self, t, events) -> None:
+    self.events_t.append(t)  # selfdrived sends the whole list every second while onroad: empty is a healthy car's
     for e in events:
       try:
         self.events.append((t, str(e.name)))
@@ -847,10 +849,13 @@ def check_health(f: Facts) -> Line:
   bad = [r for r in on if not r[1]]
   errors = max((r[2] for r in on), default=0)
   names = Counter(n for _, n in f.events)
+  read = sum(t >= tt for t in f.events_t)  # onroadEvents after the tesla time: what "none of the events" rests on
   bits = [f"canErrorCounter max {errors}"]
   if before:
     bits.append(f"canValid false on {len(before)} frames before the tesla time (startup)")
-  problems, fixes = [], []
+  problems, fixes, missing = [], [], []
+  if not on:
+    missing.append(f"no carState after the tesla time ({len(f.car_state)} before it), so canValid can't be judged")
   if bad:
     problems.append(f"canValid false on {len(bad)} of {len(on)} carState after the tesla time, first at {secs(f, bad[0][0]):.2f} s")
     fixes.append("check the harness, then turn the car off and on")
@@ -864,12 +869,21 @@ def check_health(f: Facts) -> Line:
       fixes += [{"canError": "check the harness", "carUnrecognized": "see the car and EPS lines",
                  "invalidLkasSetting": "turn Autosteer off in the Tesla's Autopilot settings (TACC only)",
                  "calibrationIncomplete": "see the calibration line"}[n] for n in found]
+    elif not read:
+      before_tt = f", {len(f.events_t)} before it" if f.events_t else ""
+      missing.append(f"no onroadEvents after the tesla time{before_tt} (selfdrived sends them every second onroad), " +
+                     f"so {', '.join(HEALTH_EVENTS)} can't be read")
     other = {n: c for n, c in names.most_common(6) if n not in HEALTH_EVENTS}
     if other:
       bits.append(f"other events {other}")
   if problems:
-    return Line(name, NO_GO, "; ".join(problems) + "; " + ", ".join(bits), "; ".join(fixes))
-  return Line(name, GO, f"canValid true on all {len(on)} carState after the tesla time, none of {', '.join(HEALTH_EVENTS)}; " + ", ".join(bits))
+    return Line(name, NO_GO, "; ".join(problems + missing) + "; " + ", ".join(bits), "; ".join(fixes))
+  if missing:
+    return Line(name, UNKNOWN, "; ".join(missing) + "; " + ", ".join(bits))
+  valid = f"canValid true on all {len(on)} carState after the tesla time"
+  if f.sunnypilot:
+    return Line(name, GO, f"{valid}; " + ", ".join(bits))
+  return Line(name, GO, f"{valid}, none of {', '.join(HEALTH_EVENTS)} in {read} onroadEvents after it; " + ", ".join(bits))
 
 
 def noted(p: Param) -> Line:
