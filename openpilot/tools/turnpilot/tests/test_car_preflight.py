@@ -1,8 +1,8 @@
 """car_preflight (CHASE_CAR.md, "Preflight tool spec") on synthetic logs built with cereal's messaging: a good car and Chase's
 startup, an unknown EPS string, a 2-bit car, longitudinal off, a refusal after the tesla time, a panda that never reaches
 tesla, no 0x3E9, a zero VIN, the big model down, the detector at its real cadence, slow and stopped, calibration
-incomplete, a param this build's library lacks, a qlog and a sunnypilot log. Each case states the exact status of the lines it is about and the exit status, live (the device's Params,
-faked) and from an rlog written to disk."""
+incomplete, a param this build's library lacks, a qlog and a sunnypilot log. Each case states the exact status of the lines
+it is about and the exit status, live (the device's Params, faked) and from an rlog written to disk."""
 import ast
 import json
 import sys

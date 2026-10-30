@@ -68,7 +68,11 @@ SENT = {DAS_CONTROL, DAS_BODY_CONTROLS}
 MIN_CAN_HZ = 10.          # can slower than this is decimated (a qlog), not a full log (100 Hz)
 MIN_ABSENT_S = 5.         # s of can carrying DI_speed after the tesla time before a missing message counts as absent
 LONG_BACK_FRAC = 0.9      # openpilot's 0x2B9 that must come back on src 128 for the panda to be honouring them
-DETECTOR_GO_HZ, DETECTOR_MIN_HZ = 18., 10.
+MODEL_HZ = 20.            # ModelConstants.MODEL_RUN_FREQ, kept equal by a test
+DETECTOR_RUN_EVERY = 2    # modeld_detector.RUN_EVERY, kept equal by a test: the full pass on every 2nd model frame
+DETECTOR_HZ = MODEL_HZ / DETECTOR_RUN_EVERY  # 10 Hz parked or driving; only a stop sweep's side views add messages between
+DETECTOR_GO_HZ = 0.9 * DETECTOR_HZ   # a run room() puts off waits one frame, so a few in the window stay GO
+DETECTOR_MIN_HZ = 0.5 * DETECTOR_HZ  # under it, room() refuses most runs (its forced-run floor is 1.25 Hz): NO-GO
 DETECTOR_DEADLINE_S = 1.5  # turnpilotd.DETECTOR_DEADLINE_S, kept equal by a test
 LOADING_TAIL_S = 2.       # a bigModelLoading this close to the window's end: still loading
 CAMERA_SENSOR = "os04c10"  # preflight.py's CAR_CAMERA, the 1344x760 sensor the detector pkl is built for
@@ -801,12 +805,14 @@ def check_detector(f: Facts, pv: ParamView) -> Line:
     if handbacks:
       bits.append(f"handbacks {dict(handbacks)}")
   detail = ", ".join(bits)
+  cadence = f"it runs at {DETECTOR_HZ:g} Hz, one run in {DETECTOR_RUN_EVERY} model frames at {MODEL_HZ:g} Hz"
   if hz < DETECTOR_MIN_HZ or gap > DETECTOR_DEADLINE_S:
-    return Line(name, NO_GO, f"{detail}: under {DETECTOR_MIN_HZ:.0f} Hz or a gap over {DETECTOR_DEADLINE_S} s (turnpilotd's deadline)",
+    return Line(name, NO_GO, f"{detail}: under {DETECTOR_MIN_HZ:g} Hz or a gap over {DETECTOR_DEADLINE_S} s (turnpilotd's deadline); {cadence}",
                 "restart the car; if it repeats, check the chestnut and modeld's log")
   if hz < DETECTOR_GO_HZ:
-    return Line(name, WARN, f"{detail}: under {DETECTOR_GO_HZ:.0f} Hz")
-  return Line(name, GO, detail)
+    return Line(name, WARN, f"{detail}: under {DETECTOR_GO_HZ:g} Hz, so runs are being put off (no room in the step) or model frames dropped; {cadence}",
+                "read the big model line's frameDropPerc and modeld's log: the driving model or the detector is running slow")
+  return Line(name, GO, f"{detail}; {cadence}")
 
 
 def check_faults(f: Facts) -> Line:
