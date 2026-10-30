@@ -470,6 +470,35 @@ def test_health_events(tmp_path):
   assert statuses(lines)["car health"] == NO_GO and "Autosteer" in line(lines, "car health").fix
 
 
+def live_from(tmp_path, msgs):
+  return cpf.check_live(END_T, params=FakeParams(tmp_path, {**GOOD_PARAMS, **git_params(TURNPILOT)}), messages=msgs)
+
+
+def test_health_needs_its_evidence(tmp_path):
+  """car health is GO only on carState after the tesla time and onroadEvents to read the events from: a missing fact is
+  UNKNOWN, never GO (CHASE_CAR.md, Output). selfdrived sends onroadEvents every second while onroad, empty on a healthy car
+  (selfdrived.py:574-579), and an empty one is evidence."""
+  tesla_ns = (OFFSET_S + TESLA_T) * 1e9
+  good = drive()
+  assert all(len(m.onroadEvents) == 0 for m in good if m.which() == "onroadEvents" and m.logMonoTime >= tesla_ns)
+  assert statuses(live_from(tmp_path, good))["car health"] == GO
+
+  early = live_from(tmp_path, [m for m in good if not (m.which() == "carState" and m.logMonoTime >= tesla_ns)])
+  assert statuses(early)["car health"] == UNKNOWN and "no carState after the tesla time" in line(early, "car health").detail
+  assert cpf.exit_code(early) == 2
+
+  for title, msgs in (("none", [m for m in good if m.which() != "onroadEvents"]),
+                      ("only before the tesla time", [m for m in good if not (m.which() == "onroadEvents" and m.logMonoTime >= tesla_ns)])):
+    quiet = live_from(tmp_path, msgs)
+    assert statuses(quiet)["car health"] == UNKNOWN, (title, line(quiet, "car health"))
+    assert "no onroadEvents" in line(quiet, "car health").detail and "none of" not in line(quiet, "car health").detail
+    assert cpf.exit_code(quiet) == 2, title
+
+  dropped = drive(can_valid_drop=True)
+  bad = live_from(tmp_path, [m for m in dropped if m.which() != "onroadEvents"])  # a fault seen still wins over the events unread
+  assert statuses(bad)["car health"] == NO_GO and "canValid false" in line(bad, "car health").detail
+
+
 # ----------------------------------------------------------------------------------------------------- the turn signal
 
 def test_no_body_controls(tmp_path):
@@ -650,7 +679,11 @@ def test_sunnypilot_log(tmp_path):
                "driver's blinker", "calibration", "road camera", "big model", "car health"]:
     assert s[name] == GO, (name, line(lines, name))
   assert "not judged" in line(lines, "car health").detail and "canError" in line(lines, "car health").detail
+  assert "none of" not in line(lines, "car health").detail  # it read no events, so it claims none absent
   assert cpf.exit_code(lines) == 0
+  quiet = cpf.check_route([str(write(tmp_path, [m for m in drive(git=SUNNYPILOT, params=SUNNYPILOT_PARAMS, source="fixed", flags=0)
+                                                if m.which() != "onroadEvents"], "quiet_rlog.zst"))])
+  assert statuses(quiet)["car health"] == GO  # its events aren't judged, so canValid alone decides
   down = run_route(tmp_path, git=SUNNYPILOT, params=SUNNYPILOT_PARAMS, source="fixed", flags=0, big="false")  # Chase's route
   assert statuses(down)["big model"] == NO_GO and cpf.exit_code(down) == 1
 
