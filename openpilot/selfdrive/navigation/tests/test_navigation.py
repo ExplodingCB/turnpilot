@@ -1160,6 +1160,9 @@ class TestStopAvoidance(unittest.TestCase):
     self.assertEqual(self.engine.controls, [])
     ni = self.instruction()
     self.assertEqual((str(ni.avoidStatus), ni.avoidedControls), ('clean', 2))
+    # and the time it added, for the route-start announcement (STOP_SIGNS.md 3.4, SG4c)
+    self.engine.avoid_added_s = 240.
+    self.assertAlmostEqual(self.instruction().avoidAddedS, 240.)
 
   def test_N9_the_exclusion_takes_valhallas_own_heading_at_the_point(self):
     a, b = self.stop(1, 60.), self.stop(2, 150.)
@@ -1221,7 +1224,10 @@ class TestStopAvoidance(unittest.TestCase):
     router = self.start([first, own, last])
     self.assertEqual(router.reroute_calls, [])
     self.assertEqual([c.certification for c in (first, own, last)], ['unavoidable'] * 3)
-    self.assertEqual(str(self.instruction().avoidStatus), 'unavoidable')
+    ni = self.instruction()
+    self.assertEqual(str(ni.avoidStatus), 'unavoidable')
+    # the whole route's count and the first on the origin street (its first edge), for the route-start announcement (SG4c)
+    self.assertEqual((ni.unavoidableControls, ni.firstUnavoidableOnOrigin), (3, True))
 
   def test_N10_a_point_already_in_the_set_on_the_cars_own_edge_is_not_sent(self):
     a, b = self.stop(1, 60.), self.stop(2, 150.)

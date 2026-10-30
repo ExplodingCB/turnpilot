@@ -458,6 +458,13 @@ class RouteEngine:
     # and what the stop-sign avoidance did for this route (routing/avoid.py)
     msg.navInstruction.avoidStatus = self.avoid_status if self.route is not None else 'none'
     msg.navInstruction.avoidedControls = min(self.avoided, 65535) if self.route is not None else 0
+    msg.navInstruction.avoidAddedS = float(max(self.avoid_added_s, 0.)) if self.route is not None else 0.
+    # the whole route's stops the avoidance couldn't route around, and whether the first is on its first edge (route start's
+    # "M stop signs on this route need you", "First stop needs you": STOP_SIGNS.md 3.4)
+    stuck = sorted((c for c in (self.controls or []) if c.kind in ('stop', 'yield') and getattr(c, 'certification', '') == 'unavoidable'),
+                   key=lambda c: c.route_m) if self.route is not None else []
+    msg.navInstruction.unavoidableControls = min(len(stuck), 65535)
+    msg.navInstruction.firstUnavoidableOnOrigin = bool(stuck) and bool(getattr(stuck[0], 'first_edge', False))
 
     # TurnPilot: a job while there is a route is a reroute for the same destination (a new one clears the route), as when
     # the car left the corridor and a new one downloads for minutes. The car is off this route meanwhile: its distances

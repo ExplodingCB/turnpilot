@@ -209,6 +209,14 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     # STOP_SIGNS.md v3 SG4c
     otherTurn @17;              # the stop-sign ladder's other turn (7.1 rung 2, O12): the route's maneuver can't be taken here,
                                 # another that certifies is ("Turning right instead", stopGo.maneuver), and navd reroutes after it
+    # STOP_SIGNS.md v3 SG4c, 3.4: what the driver hears about the route's stop signs, said engaged or not (turnpilotRouteNotice),
+    # the text in turnpilotPlan.routeNotice
+    routeAvoidsStops @18;       # at route start: the route avoids N stop signs, the time it added (shown, no chime)
+    routeDetour @19;            # ...the same past DETOUR_WARN (the larger of +50% and +5 min): with a chime
+    stopsNeedYou @20;           # ...M stop signs on the route couldn't be avoided and need the driver (a chime)
+    firstStopNeedsYou @21;      # ...the first of them is on the origin street, said before engagement (a chime)
+    stopRoutingFailed @22;      # ...the avoidance failed (avoidStatus failed): stops may need the driver (a chime)
+    stopAheadNeedsYou @23;      # 300 m before a stop the route couldn't avoid, or at once if closer (a chime)
   }
   mapControl @24 :MapControlStatus;
   controlPrompt @25 :ControlPrompt;
@@ -370,6 +378,8 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     alternate @23 :Bool;
   }
   stopGo @34 :StopGoStatus;
+  # STOP_SIGNS.md v3 SG4c, 3.4: the route-start or pre-stop announcement's text while controlAlert is one of them
+  routeNotice @35 :Text;
 }
 
 struct TurnpilotDetections @0xaedffd8f31e7b55d {

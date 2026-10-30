@@ -140,6 +140,7 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     turnpilotNoDetector @113;       # TurnPilot: the detector never started (no pkl, a failed load), hand back to the driver
     turnpilotControlPrompt @114;    # TurnPilot map stop control: turnpilotPlan.controlPrompt (stop sign / signal go)
     turnpilotControlAlert @115;     # TurnPilot map stop control: turnpilotPlan.controlAlert
+    turnpilotRouteNotice @116;      # TurnPilot stop signs on the route (STOP_SIGNS.md 3.4): said engaged or not (turnpilotPlan.routeNotice)
 
     # TurnPilot: a planned lane change is coming (chime, countdown), and one was aborted before it started
     turnpilotLaneChangeLeft @110;
@@ -2500,6 +2501,14 @@ struct NavInstruction {
   # avoidance loop routed around (excluded and rerouted, turnpilot/routing/certify.py), and how the loop ended
   avoidedControls @27 :UInt16;
   avoidStatus @28 :AvoidStatus;
+  # TurnPilot (stop signs, SG4c; STOP_SIGNS.md 3.4): s the route the avoidance loop kept takes over the first one it found (the
+  # time avoidance added, said at route start with a chime past DETOUR_WARN); 0 with no avoidance
+  avoidAddedS @29 :Float32;
+  # TurnPilot (stop signs, SG4c; STOP_SIGNS.md 3.4): the stop and yield controls on the whole kept route the avoidance couldn't
+  # route around (certification unavoidable; controls carries only those near the car), and whether the first of them is on
+  # the route's first edge (the origin street: "First stop needs you" before engagement)
+  unavoidableControls @30 :UInt16;
+  firstUnavoidableOnOrigin @31 :Bool;
 
   enum Opposing {
     unknown @0;  # no intersection data for the junction (or a navd from before the field)

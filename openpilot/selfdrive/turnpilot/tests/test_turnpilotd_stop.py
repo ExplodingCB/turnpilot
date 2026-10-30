@@ -598,3 +598,27 @@ def test_the_ladders_other_turn_pulses_its_own_turn_at_the_go_never_the_routes_a
   assert Desire.turnLeft not in desires and Desire.turnRight in desires[go:go + 3] and Desire.turnRight not in desires[:go]
   assert any(p.turnMissed for p in plans[go:]) and not any(p.turnMissed for p in plans[:go])
   assert all(p.accelCap >= -2. - 1e-9 for p in plans)
+
+
+def test_the_route_start_and_pre_stop_notices_reach_the_plan_disengaged(tmp_path):
+  # STOP_SIGNS.md 3.4 (route_notice.py): navd's avoidance said at route start with openpilot not engaged, the text on the
+  # plan; 300 m before the stop the route couldn't avoid, "Stop sign ahead needs you"
+  sim = StopSim(tmp_path, info_kw={'certification': 'unavoidable'})
+  sim.engaged = False
+
+  def nav(s, instr):
+    b = instr.as_builder()
+    b.avoidStatus, b.avoidedControls, b.avoidAddedS, b.unavoidableControls = 'unavoidable', 2, 120., 1
+    return b.as_reader(), True
+  sim.nav_filter = nav
+  sim.v = 0.
+  for _ in range(round(8. / DT_MDL)):
+    sim.step()
+  notices = [(str(p.controlAlert), p.routeNotice) for p in sim.plans() if str(p.controlAlert) in ('routeAvoidsStops', 'stopsNeedYou')]
+  assert ('routeAvoidsStops', "Route avoids 2 stop signs (+2 min)") in notices
+  assert ('stopsNeedYou', "1 stop sign on this route needs you") in notices
+  sim.engaged, sim.v = True, 13.
+  seen = []
+  while sim.s < S_LINE - 20.:
+    seen.append(str(sim.step().controlAlert))
+  assert 'stopAheadNeedsYou' in seen

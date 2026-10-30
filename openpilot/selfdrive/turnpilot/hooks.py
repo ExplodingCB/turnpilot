@@ -66,6 +66,9 @@ RETIRED_PROMPTS = ('stopSignGo', 'signalGo', 'unprotectedTurnGo', 'carStoppedGo'
 RETIRED_ALERTS = ('goingOnRed',)
 CONTROL_ALERT_EVENTS = ('stopOverrun', 'proceedingOnYellow', 'junctionUncertain')  # below the prompt, above a lane change
 CONTROL_STATUS_ALERTS = ('mapControlsUnavailable', 'lightSourceRejected', 'farViewOff', 'sideCamerasOff')  # last of all, a status line
+# the route's stop signs (route_notice.py, STOP_SIGNS.md 3.4): said engaged or not (turnpilotRouteNotice, a permanent alert), the
+# text in turnpilotPlan.routeNotice; all but routeAvoidsStops with a chime
+ROUTE_NOTICES = ('routeAvoidsStops', 'routeDetour', 'stopsNeedYou', 'firstStopNeedsYou', 'stopRoutingFailed', 'stopAheadNeedsYou')
 
 
 def control_outranks_lane_change(plan) -> bool:
@@ -119,6 +122,8 @@ def plan_events(sm, now: float | None = None) -> list[str]:
     return ['turnpilotControlPrompt']
   if alert in CONTROL_ALERT_FIRST:
     return ['turnpilotControlAlert']
+  if alert in ROUTE_NOTICES:
+    return ['turnpilotRouteNotice']
   if plan.tooFastToTurn or plan.turnMissed:
     return ['turnpilotTooFastToTurn']
   if str(plan.controlPrompt) != 'none':

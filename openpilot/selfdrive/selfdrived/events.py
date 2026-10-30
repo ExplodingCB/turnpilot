@@ -323,6 +323,10 @@ CONTROL_ALERT_TITLE = {'cannotStopComfortably': "Take Control", 'stopOverrun': "
                        'hardBrake': "Braking Hard", 'oncomingHolding': "Oncoming: Holding", 'farViewOff': "Far View Off",
                        'sideCamerasOff': "Side Cameras Off", 'crossTrafficAfterCommit': "Cross Traffic", 'cameraPaused': "Camera Paused",
                        'stalledInJunction': "Stalled in Junction", 'overrideWriteFailed': "Junction Not Saved"}
+# the route's stop signs (route_notice.py, STOP_SIGNS.md 3.4), said engaged or not: the text is turnpilotPlan.routeNotice
+ROUTE_NOTICE_TITLE = {'routeAvoidsStops': "Route Avoids Stop Signs", 'routeDetour': "Long Detour Around Stop Signs",
+                      'stopsNeedYou': "Stop Signs Need You", 'firstStopNeedsYou': "First Stop Needs You",
+                      'stopRoutingFailed': "Stop-Sign Routing Failed", 'stopAheadNeedsYou': "Stop Sign Ahead Needs You"}
 # the stop-sign ladder's other turn (stop_go.py: 7.1 rung 2, O12), named by the turn it took (turnpilotPlan.stopGo.maneuver)
 OTHER_TURN_TITLE = {'right': "Turning Right Instead", 'left': "Turning Left Instead", 'straight': "Going Straight Instead"}
 TURNPILOT_CONTROL_ALERT_S = 3.  # an overrun, a yellow or a red go is held up this long
@@ -372,6 +376,17 @@ def turnpilot_control_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.S
                  AlertSize.mid, Priority.LOW, VisualAlert.none, AudibleAlert.prompt, TURNPILOT_CONTROL_ALERT_S)
   return Alert(CONTROL_ALERT_TITLE.get(kind, "TurnPilot"), CONTROL_ALERT_TEXT.get(kind, ''), AlertStatus.userPrompt, AlertSize.mid,
                Priority.LOW, VisualAlert.none, AudibleAlert.prompt, TURNPILOT_CONTROL_ALERT_S)
+
+
+def turnpilot_route_notice_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int,
+                                 personality) -> Alert:
+  """The route's stop signs (turnpilotPlan.controlAlert, one of hooks.ROUTE_NOTICES): at route start and 300 m before a stop
+  the route couldn't avoid, said engaged or not (an ET.PERMANENT alert), with a chime but for the plain count of stops avoided."""
+  from openpilot.selfdrive.turnpilot.route_notice import CHIMES
+  plan = fresh_plan(sm)
+  kind = str(plan.controlAlert) if plan is not None else 'none'
+  return Alert(ROUTE_NOTICE_TITLE.get(kind, "Stop Signs"), plan.routeNotice if plan is not None else '', AlertStatus.userPrompt,
+               AlertSize.mid, Priority.LOW, VisualAlert.none, AudibleAlert.prompt if kind in CHIMES else AudibleAlert.none, .2)
 
 
 def startup_master_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
@@ -803,6 +818,10 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
 
   EventName.turnpilotControlAlert: {  # engaged only: while the driver drives, passing a stop line is theirs to judge
     ET.WARNING: turnpilot_control_alert,
+  },
+
+  EventName.turnpilotRouteNotice: {  # engaged or not: "First stop needs you" is said before engagement (STOP_SIGNS.md 3.4, D5)
+    ET.PERMANENT: turnpilot_route_notice_alert,
   },
 
   EventName.laneChange: {

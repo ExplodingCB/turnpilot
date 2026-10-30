@@ -330,3 +330,30 @@ def test_the_stop_sign_ladders_other_turn_is_appended_and_said_with_a_chime_nami
     assert a.alert_text_1 == title and a.alert_text_2 == CONTROL_ALERT_TEXT['otherTurn'] and a.audible_alert == AudibleAlert.prompt
   assert 'otherTurn' in CONTROL_ALERT_FIRST and 'otherTurn' not in TAKE_CONTROL_PROMPTS
   assert plan_events(FakeSM(plan(controlAlert='otherTurn'))) == ['turnpilotControlAlert']
+
+
+def test_the_routes_stop_sign_notices_are_appended_and_said_engaged_or_not():
+  # STOP_SIGNS.md v3 SG4c, 3.4: ControlAlert @18-@23 after otherTurn @17, the text in TurnpilotPlan.routeNotice @35 after stopGo @34,
+  # NavInstruction.avoidAddedS @29, unavoidableControls @30, firstUnavoidableOnOrigin @31 after avoidStatus @28, and the event
+  # turnpilotRouteNotice @116 after turnpilotControlAlert @115: a permanent alert (shown disengaged too: "First stop needs you"
+  # comes before engagement), a chime for all but the plain count of stops avoided
+  from openpilot.cereal import custom, log
+  from openpilot.selfdrive.turnpilot.hooks import ROUTE_NOTICES, plan_events
+  tp = custom.TurnpilotPlan
+  assert [tp.ControlAlert.schema.enumerants[k] for k in ROUTE_NOTICES] == list(range(18, 24))
+  assert tp.schema.fields['routeNotice'].proto.ordinal.explicit == 35
+  ni = log.NavInstruction.schema.fields
+  assert [ni[f].proto.ordinal.explicit for f in ('avoidAddedS', 'unavoidableControls', 'firstUnavoidableOnOrigin')] == [29, 30, 31]
+  assert EventName.turnpilotRouteNotice == 116
+  for kind, title, chime in (('routeAvoidsStops', "Route Avoids Stop Signs", False), ('routeDetour', "Long Detour Around Stop Signs", True),
+                             ('stopsNeedYou', "Stop Signs Need You", True), ('firstStopNeedsYou', "First Stop Needs You", True),
+                             ('stopRoutingFailed', "Stop-Sign Routing Failed", True), ('stopAheadNeedsYou', "Stop Sign Ahead Needs You", True)):
+    msg = messaging.new_message('turnpilotPlan')
+    msg.turnpilotPlan.controlAlert, msg.turnpilotPlan.routeNotice = kind, 'the text'
+    sm = FakeSM(msg.as_reader().turnpilotPlan)
+    events = Events()
+    events.add(EventName.turnpilotRouteNotice)
+    a, = events.create_alerts([ET.PERMANENT], [car.CarParams.new_message(), car.CarState.new_message(), sm, False, 0, 0])
+    assert a.alert_text_1 == title and a.alert_text_2 == 'the text', kind
+    assert a.audible_alert == (AudibleAlert.prompt if chime else AudibleAlert.none), kind
+    assert plan_events(sm) == ['turnpilotRouteNotice'], kind
