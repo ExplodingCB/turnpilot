@@ -170,6 +170,20 @@ class TestMapControlStatus:
     assert status_text(plan(state='holding', mapControl={'kind': 'stop', 'action': 'infeasible'}), True) == \
       ('Cannot stop gently', 'take control')
 
+  def test_the_stop_sign_deciders_wait_creep_go_and_band_are_said_on_the_device(self):
+    # STOP_SIGNS.md v3 SG4c: the decider's states by their reason, whatever the plan's own state (its go and band aren't holds)
+    wait = plan(state='holding', shouldStop=True, reason="Waiting: can't see far enough from the right (occluder)",
+                mapControl={'kind': 'stop', 'action': 'waitingCross'})
+    assert status_text(wait, True) == ('View blocked', "can't see far enough from the right")
+    creep = plan(state='holding', reason='Creeping for view', mapControl={'kind': 'stop', 'action': 'creeping'})
+    assert status_text(creep, True) == ('Creeping for view', '')
+    going = plan(state='following', reason='Going', mapControl={'kind': 'stop', 'action': 'going'})
+    assert status_text(going, True) == ('Going', '')
+    band = plan(state='turning', reason='', mapControl={'kind': 'stop', 'action': 'committed'}, desire=log.Desire.turnLeft)
+    assert status_text(band, True) == ('Committed', '')
+    stall = plan(state='following', reason='Stalled in junction', mapControl={'kind': 'stop', 'action': 'committed'})
+    assert status_text(stall, True) == ('Stalled in junction', '')
+
   def test_car_stopped_with_nothing_holding_it_is_said_on_the_device(self):
     # the model standing the car with nothing of TurnPilot's holding it: said on the device's status line well before
     # the handback (turnpilotd's STOPPED_NOTE), never a blank line for a minute

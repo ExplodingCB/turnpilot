@@ -1448,6 +1448,7 @@ def test_O4_stalled_in_a_lane_takes_two_clear_box_goes_then_h5(tmp_path):
   out = w.run(20.)
   boxes = [d for d in out if d.go_cause == 'clearBox']
   assert k and len(boxes) == 2 and any(d.alert == 'stalledInJunction' for d in out)
+  assert all(d.reason == "Stalled in junction" for d in boxes)  # said on the status line (control_text, SG4c)
   assert out[-1].fault == 'H5' and out[-1].prompt == 'stopSignTakeControl'
 
 

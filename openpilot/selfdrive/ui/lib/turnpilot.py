@@ -1,6 +1,6 @@
 """What TurnPilot shows, from turnpilotPlan and carState. No raylib here: soundd uses it for the prompt's chime."""
 from openpilot.cereal import custom, log
-from openpilot.selfdrive.turnpilot.control_text import STOPPED_NOTE, controls_problem, hold_text, is_map_reason
+from openpilot.selfdrive.turnpilot.control_text import DECIDER_ACTIONS, STOPPED_NOTE, controls_problem, hold_text, is_map_reason
 
 State = custom.TurnpilotPlan.State
 Desire = log.Desire
@@ -43,7 +43,11 @@ def status_text(plan, engaged: bool) -> tuple[str, str]:
   if plan is None or not (engaged or plan.shadow):
     return '', ''
   detail = ''
-  if plan.state == State.turning:
+  mc = plan.mapControl
+  if str(mc.action) in DECIDER_ACTIONS and str(mc.kind) in ('stop', 'yield'):
+    # the stop-sign decider's wait, creep, go and band (stop_go.py): by its reason, whatever the plan's state
+    title, detail = hold_text(str(mc.kind), str(mc.action), reason=plan.reason)
+  elif plan.state == State.turning:
     modifier = plan.maneuverModifier
     side = 'left' if 'left' in modifier else 'right' if 'right' in modifier else ''
     title = DESIRE_TEXT.get(plan.desire) or (f'Turning {side}' if side else 'Turning')
@@ -51,8 +55,7 @@ def status_text(plan, engaged: bool) -> tuple[str, str]:
     side = next((str(s) for s in (plan.laneChange, plan.signalPrompt) if str(s) != 'none'), '')
     title = f'Lane change {side}' if side else 'Lane change'
   elif plan.state == State.holding:
-    mc = plan.mapControl
-    held = hold_text(str(mc.kind), str(mc.action), str(mc.lightState), str(mc.lightSource))
+    held = hold_text(str(mc.kind), str(mc.action), str(mc.lightState), str(mc.lightSource), plan.reason)
     if held is not None:  # stopped at a stop sign or signal: and another hold in force with it (a pedestrian) is the detail
       title, detail = held[0], held[1] if is_map_reason(plan.reason) or not plan.reason else plan.reason
     else:

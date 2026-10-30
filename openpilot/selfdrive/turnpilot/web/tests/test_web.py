@@ -970,6 +970,15 @@ class TestMapHoldStatus(OpenpilotTestCase):
                     "map": {"kind": "none", "action": "none", "light": "unknown", "source": "none", "status": "unsupported"}}
     tp = status.format_status(snap, None, True, False, now=101.)["turnpilot"]
     assert (tp["label"], tp["reason"]) == ("Following route", "Map stops/signals: unsupported")
+    # the stop-sign decider's wait and go by their reason (STOP_SIGNS.md v3 SG4c)
+    snap["plan"] = {"state": "holding", "reason": "Waiting: signal at junction", "shadow": False,
+                    "map": {"kind": "stop", "action": "waitingCross", "light": "unknown", "source": "none", "status": "ok"}}
+    tp = status.format_status(snap, None, True, False, now=101.)["turnpilot"]
+    assert (tp["label"], tp["reason"]) == ("Signal at junction", "")
+    snap["plan"] = {"state": "following", "reason": "Going", "shadow": False,
+                    "map": {"kind": "stop", "action": "going", "light": "unknown", "source": "none", "status": "ok"}}
+    tp = status.format_status(snap, None, True, False, now=101.)["turnpilot"]
+    assert (tp["label"], tp["reason"]) == ("Going", "")
     # an old snapshot without map fields still reads
     snap["plan"] = {"state": "holding", "reason": "pedestrian in path", "shadow": False}
     assert status.format_status(snap, None, True, False, now=101.)["turnpilot"]["label"] == "Holding"

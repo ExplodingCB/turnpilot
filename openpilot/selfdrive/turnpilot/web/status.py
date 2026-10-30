@@ -4,7 +4,7 @@ import time
 
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.navigation.helpers import latest_gps_source
-from openpilot.selfdrive.turnpilot.control_text import hold_text, is_map_reason
+from openpilot.selfdrive.turnpilot.control_text import DECIDER_ACTIONS, hold_text, is_map_reason
 
 SERVICES = ["deviceState", "navInstruction", "turnpilotPlan", "gpsLocation", "gpsLocationExternal"]
 SNAPSHOT_PERIOD = 0.5  # s between snapshots; the page polls every 2 s, so 2 Hz is plenty
@@ -89,8 +89,11 @@ def format_status(snap: dict | None, destination, enabled: bool, metric: bool, n
   label = STATE_LABELS.get(plan["state"], plan["state"]) if plan else STATE_LABELS["offline"]
   reason = plan["reason"] if plan else offline_reason(fresh, snap["onroad"], enabled)
   m = (plan or {}).get("map")
-  held = hold_text(m["kind"], m["action"], m["light"], m["source"]) if m and plan["state"] == "holding" else None
-  if held is not None:  # stopped at a stop sign or signal ("Stopped at stop sign", "take control"), or another hold with it
+  decider = bool(m) and m["action"] in DECIDER_ACTIONS and m["kind"] in ("stop", "yield")  # the stop-sign decider's (stop_go.py)
+  held = hold_text(m["kind"], m["action"], m["light"], m["source"], reason or "") if m and (plan["state"] == "holding" or decider) else None
+  if held is not None and decider:  # its wait, creep, go and band by its reason, whatever the plan's state
+    label, reason = held
+  elif held is not None:  # stopped at a stop sign or signal ("Stopped at stop sign", "take control"), or another hold with it
     label, reason = held[0], held[1] if is_map_reason(reason) or not reason else reason
   return {
     "reading": fresh,

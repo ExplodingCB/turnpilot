@@ -564,6 +564,38 @@ def test_unprotected_turn_texts():
   assert is_map_reason("Stop sign: take control to proceed")
 
 
+@pytest.mark.parametrize('action, reason, want', [
+  ('waitingCross', 'Waiting: a car from the left not stopping', ('Waiting for cross traffic', 'a car from the left not stopping')),
+  ('waitingCross', 'Waiting for cross traffic', ('Waiting for cross traffic', '')),
+  ('waitingCross', 'Waiting: signal at junction', ('Signal at junction', '')),
+  ('waitingCross', "Waiting: can't see far enough from the right (sunAhead)", ('Sun glare', "can't see far enough from the right")),
+  ('waitingCross', "Waiting: can't see far enough from the left (occluder)", ('View blocked', "can't see far enough from the left")),
+  ('creeping', 'Creeping for view', ('Creeping for view', '')),
+  ('creeping', 'Rolling up to the stop sign', ('Rolling up to stop sign', '')),
+  ('creeping', 'Waiting: taking our turn: creeping forward', ('Taking our turn', '')),
+  ('going', 'Going', ('Going', '')),
+  ('committed', '', ('Committed', '')),
+  ('committed', 'Stalled in junction', ('Stalled in junction', '')),
+  ('awaitingDriver', 'Stop sign: signal at junction: take control', ('Signal at junction', 'take control')),
+  ('awaitingDriver', "Stop sign: can't see far enough from the right (lowSun): take control", ('Sun glare', 'take control')),
+  ('awaitingDriver', "Stop sign: can't see far enough from the right (occluder): take control", ('View blocked', 'take control')),
+  ('awaitingDriver', 'Stop sign: this stop needs you: take control', ('Stopped at stop sign', 'take control')),
+])
+def test_hold_text_says_every_stop_sign_ledger_reason(action, reason, want):
+  # STOP_SIGNS.md v3 SG4c, 4.6: every held state of the stop-sign decider says what it is on the device and the phone: its
+  # wait, its creeps, its go, the band, a stall in the junction, and the ladder's ends by their reason
+  from openpilot.selfdrive.turnpilot.control_text import hold_text, is_map_reason
+  assert hold_text('stop', action, reason=reason) == want
+  assert reason == '' or is_map_reason(reason)
+
+
+def test_hold_text_for_a_yield_that_became_a_stop():
+  from openpilot.selfdrive.turnpilot.control_text import hold_text
+  assert hold_text('yield', 'held') == ('Stopped at yield', '')
+  assert hold_text('yield', 'awaitingDriver', reason='Yield: take control to proceed') == ('Stopped at yield', 'take control')
+  assert hold_text('yield', 'waitingCross', reason='Waiting for cross traffic') == ('Waiting for cross traffic', '')
+
+
 # --- found in review: the car never left stuck, never let go of a light by a nudge, never re-held where it isn't ---
 
 @pytest.mark.parametrize("v_creep,past", [(1.5, 3.), (1.9, 6.), (1.0, 12.)])

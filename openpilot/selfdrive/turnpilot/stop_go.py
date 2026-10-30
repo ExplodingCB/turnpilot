@@ -198,6 +198,7 @@ STOP_SIGN_REASON = "Stop sign: take control to proceed"  # map_controls' handbac
 UNAVOIDABLE = 'unavoidable'
 ROUTE_KNOWN_REASON = "this stop needs you"
 VIEW_CREEP_REASON = "Creeping for view"
+STALLED_REASON = "Stalled in junction"
 ALT_REASON = {'right': "Turning right instead", 'left': "Turning left instead", 'straight': "Going straight instead"}
 # go conditions the same for every maneuver at the junction (the other-turn rung reads them from this frame's own evaluation)
 SHARED_HOLDS = ('signal', 'yaw', 'camera', 'stale', 'calibration', 'box', 'near', 'nearRaw', 'hide', 'lead', 'front', 'turn',
@@ -1008,6 +1009,8 @@ class StopGo:
     standing = f.v_ego < STAND_V
     free = not f.tp_holding and (f.lead_m is None or f.lead_m > LEAD_GO_M)
     self.stall_s = self.stall_s + f.dt if standing and free else 0.
+    if self.stall_s >= STALL_BOX_S - 1e-6:
+      d.reason = STALLED_REASON  # said on the status line (control_text) while it lasts
     if self.stall_s >= STALL_BOX_S - 1e-6 and f.go_active == 'none':
       if self.clear_boxes >= CLEAR_BOX_GOES:
         self._fault('H5', f, d, "stalled in the junction after its clearBox goes")
