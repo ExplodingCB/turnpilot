@@ -779,6 +779,20 @@ def test_C2_a_two_way_the_route_could_not_avoid_hands_back_h3_right_after_the_fu
   assert all(d.go_cause == 'none' for d in out)
 
 
+@pytest.mark.parametrize('certifies', [False, True])
+def test_C2_a_control_the_route_marked_unavoidable_hands_back_right_after_the_full_stop_whatever_the_line_reads(tmp_path, certifies):
+  # 7.1: a control navd's avoidance couldn't route around (routing/avoid.py marks it 'unavoidable', announced at route start
+  # and 300 m before) skips the ladder's rungs 1 and 2: H3 "this stop needs you" right after the 1 s full stop, whether the line
+  # reads it uncertifiable (a two-way) or would certify it (an all-way whose route-time light check failed): the driver was told
+  w = World(tmp_path, j=junction() if certifies else two_way(), entries=None if certifies else [])
+  out = w.run(4., route_cert='unavoidable')
+  h3 = next((k for k, d in enumerate(out) if d.fault == 'H3'), None)
+  assert h3 is not None and (h3 + 1) * DT_MDL <= 1.0 + 2 * DT_MDL + 1e-6, [(d.state, d.reason) for d in out[::10]]
+  assert out[h3].reason == "Stop sign: this stop needs you: take control" and out[h3].prompt == 'stopSignTakeControl'
+  assert all(d.go_cause == 'none' and d.release is None and d.creep is None for d in out)
+  assert all(s.accel_cap >= -2.0 - 1e-9 for d in out for s in d.stops)
+
+
 @pytest.mark.parametrize('stops_not', ['left', 'right', 'opposite'])
 @pytest.mark.parametrize('maneuver', ['straight', 'left', 'right'])
 def test_C3_a_three_way_stop_at_a_four_leg_junction_takes_no_maneuver_its_set_touches_the_unstopped_approach(tmp_path, stops_not,

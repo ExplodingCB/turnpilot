@@ -27,8 +27,10 @@ decider computes would_go only (logged once a stop). Acting:
   4.6). All of them for CLEAR_S is the go: map_controls' latch let go (release, cause 'clear', no span release past it), G5's
   go (go_cause stopSign) and the stopGo chime. Waiting is silent (waitingForCross, its reason) with an info chime at
   WAIT_INFO_S and every WAIT_INFO_S after while dynamic; a static wait has STATIC_WAIT_S, then the ladder, which in this group
-  is H3 (its creep and other-turn rungs are SG4c's); a junction the route already found uncertifiable is H3 right after the
-  full stop (7.1). The deadlock (4.5 step 5, V9, V10): an earlier arrival that holds its turn DEADLOCK_S with nothing in the
+  is H3 (its creep and other-turn rungs are SG4c's); a control the route couldn't avoid (junctionInfo.certification
+  unavoidable: announced at route start and 300 m before) is H3 "this stop needs you" right after the full stop whatever the
+  line reads, and one the route found uncertifiable (avoidance off) is H3 there once the line can't certify it either (7.1).
+  The deadlock (4.5 step 5, V9, V10): an earlier arrival that holds its turn DEADLOCK_S with nothing in the
   junction moving gets one signalling creep of DEADLOCK_CREEP_M on the latch's creep path (DEADLOCK_CREEP_V, a G5 go with
   cause creep, never closer than GO_ROOM_M to the closest plausible edge, never while creep_blocked: V12, V13), then the
   order is waived and every other go condition still holds for CLEAR_S; it moving before our commit stops us short and we
@@ -179,6 +181,9 @@ WAITING = ('stopped', 'rollUp', 'observe')
 IDLE = ('off', 'approach', 'done')  # an encounter another stop control ahead may take over (StopGo.takes)
 
 STOP_SIGN_REASON = "Stop sign: take control to proceed"  # map_controls' handback (H6), kept as it was
+# junctionInfo.certification of a stop the route couldn't avoid (routing/avoid.py): announced, then handed back at the full stop
+UNAVOIDABLE = 'unavoidable'
+ROUTE_KNOWN_REASON = "this stop needs you"
 REASONS = {
   'H1': "Cross-traffic camera unavailable: take control",
   'H2': "Stop sign position uncertain: take control",
@@ -766,6 +771,11 @@ class StopGo:
       self._arrive()
       self.state, self.clear_s = 'observe', 0.
       d.prompt, d.action, d.reason = 'waitingForCross', 'waitingCross', "Stopped at stop sign: looking for cross traffic"
+      if acting and f.route_cert == UNAVOIDABLE:
+        # 7.1: a control navd's avoidance couldn't route around (routing/avoid.py), announced at route start and 300 m before
+        # ("Stop sign ahead needs you"), skips the ladder's rungs: the handback right after the 1 s full stop, whatever the
+        # line reads (the driver was told this stop needs them)
+        self._fault('H3', f, d, ROUTE_KNOWN_REASON)
 
   def _rollup(self, f, d, ctl, pos, acting, why) -> None:
     d.latch, d.detector_view, d.action, d.reason = 'wait', 'stopSweep', 'creeping', "Rolling up to the stop sign"
@@ -1647,7 +1657,7 @@ class StopGo:
     self.static_s += f.dt
     route_known = f.route_cert == 'uncertifiable' and top.key.startswith('cert:')
     if acting and (route_known or self.static_s >= STATIC_WAIT_S - 1e-6):
-      self._fault('H3', f, d, "this stop needs you" if route_known else top.reason)
+      self._fault('H3', f, d, ROUTE_KNOWN_REASON if route_known else top.reason)
 
   # -------------------------------------------------------------------------------------------------- withdraw and abort
 
