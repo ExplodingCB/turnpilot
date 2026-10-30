@@ -67,6 +67,10 @@ tree_line() {
   GIT_OPTIONAL_LOCKS=0 git -C "$1" log -1 --format="%h %s" 2>/dev/null | cut -c1-90 || echo "(not a git checkout)"
 }
 tree_branch() { GIT_OPTIONAL_LOCKS=0 git -C "$1" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?"; }
+# Before the two moves of swap and rollback: a dropped connection (SIGHUP, or SIGPIPE on the next write) must not stop the
+# shell between them, which would leave no /data/openpilot. mv inherits the ignored signals. Nothing is printed between the
+# moves; a write to a closed connection then just fails.
+ignore_hangup() { trap '' HUP PIPE TERM; }
 
 case "$act" in
 probe)
@@ -144,12 +148,13 @@ swap)
   require_offroad "$root"
   [ -d "$incoming" ] || die "no $incoming"
   [ -e "$prev" ] && die "$prev already exists"
+  ignore_hangup
   if [ -e "$root/openpilot" ]; then
     mv "$root/openpilot" "$prev" || die "could not rename $root/openpilot; nothing changed"
-    say "renamed $root/openpilot to $prev"
   fi
   if mv "$incoming" "$root/openpilot"; then
     sync
+    [ -d "$prev" ] && say "renamed $root/openpilot to $prev"
     say "moved $incoming to $root/openpilot"
   elif [ -d "$prev" ] && mv "$prev" "$root/openpilot"; then
     die "could not move $incoming into place; put $prev back as $root/openpilot, so nothing changed"
@@ -177,12 +182,13 @@ rollback)
   [ -e "$newprev" ] && die "$newprev already exists"
   say "now:  $root/openpilot is $(tree_branch "$root/openpilot") $(tree_line "$root/openpilot")"
   say "back: ${target##*/} is $(tree_branch "$target") $(tree_line "$target")"
+  ignore_hangup
   if [ -e "$root/openpilot" ]; then
     mv "$root/openpilot" "$newprev" || die "could not rename $root/openpilot; nothing changed"
-    say "renamed $root/openpilot to $newprev"
   fi
   if mv "$target" "$root/openpilot"; then
     sync
+    [ -d "$newprev" ] && say "renamed $root/openpilot to $newprev"
     say "moved $target to $root/openpilot"
   elif mv "$newprev" "$root/openpilot"; then
     die "could not move $target into place; put $newprev back, so nothing changed"
@@ -493,6 +499,12 @@ class Comma:
     info(f"free space: {gb(int(state.get('avail_kb') or 0) * 1024)}; DisableUpdates={state.get('DisableUpdates') or 'unset'}")
     return state
 
+  def state_unknown(self, what: str, rc: int, read_with: str, renamed_to: str) -> str:
+    return (f"the ssh connection ended during the {what} (exit {rc}), so the comma's state is unknown: {self.root}/openpilot " +
+            "may be either tree, or missing. Don't reboot the comma or start the car until you know. Read its state, " +
+            f"changing nothing, with: {sys.argv[0]} {self.host} {read_with}. If it shows {self.root}/openpilot absent, put " +
+            f"the tree back with: ssh {self.host} mv {renamed_to} {self.root}/openpilot.")
+
   def require_offroad(self, state: dict) -> None:
     if state.get("onroad") != "offroad":
       raise Refused(f"the comma is {state.get('onroad')} (IsOffroad={state.get('IsOffroad') or 'unset'}, " +
@@ -602,6 +614,10 @@ def deploy(args, comma: Comma, stamp: str) -> int:
     step(f"swapping it in (rename {comma.root}/openpilot to {prev}, then {incoming} to {comma.root}/openpilot)")
     rc, out = comma.run("swap", comma.root, incoming, prev)
     if rc != 0:
+      if rc != 3:  # not the comma's own FAILED line: ssh ended, and the comma's side may have done both moves, one, or none
+        raise Failed(comma.state_unknown("swap", rc, "--dry-run", prev) +
+                     f" If it shows TurnPilot in {comma.root}/openpilot, DisableUpdates was not set: set it before rebooting, " +
+                     f"with: ssh {comma.host} \"printf 1 > {comma.root}/params/d/DisableUpdates\"")
       if "MISSING" in out:
         raise Failed(f"the swap failed half way: {comma.root}/openpilot is missing. Run: ssh {comma.host} mv {prev} " +
                      f"{comma.root}/openpilot")
@@ -638,6 +654,8 @@ def rollback(args, comma: Comma, stamp: str) -> int:
   step(f"rolling back: {target} into {comma.root}/openpilot, the current tree to {newprev}")
   rc, out = comma.run("rollback", comma.root, target, newprev)
   if rc != 0:
+    if rc != 3:
+      raise Failed(comma.state_unknown("rollback", rc, "--rollback --dry-run", newprev))
     if "MISSING" in out:
       raise Failed(f"the rollback failed half way: {comma.root}/openpilot is missing. Run: ssh {comma.host} mv {newprev} " +
                    f"{comma.root}/openpilot")
