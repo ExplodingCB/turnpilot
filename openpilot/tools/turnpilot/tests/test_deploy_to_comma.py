@@ -9,6 +9,7 @@ TP_DEPLOY_REAL=1 adds one run of the real commit (this checkout's HEAD, ~1 GB) t
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -68,8 +69,9 @@ sys.exit(subprocess.call(["bash", "-c", sys.argv[1]], stdout=w, stderr=w))' "$cm
 fi
 bash -c "$cmd"
 rc=$?
-if [ -n "${FAKE_COMMA_ONROAD_AFTER_RECEIVE:-}" ] && [ "$action" = receive ]; then
-  printf 0 > "$FAKE_COMMA_ONROAD_AFTER_RECEIVE"
+# FAKE_COMMA_AFTER=<action>:<shell>: something happens on the comma right after that action (it goes onroad, ...)
+if [ -n "${FAKE_COMMA_AFTER:-}" ] && [ "$action" = "${FAKE_COMMA_AFTER%%:*}" ]; then
+  bash -c "${FAKE_COMMA_AFTER#*:}"
 fi
 exit $rc
 '''
@@ -81,7 +83,11 @@ else
   exec /bin/df "$@"
 fi
 '''
-SUDO_SHIM = '#!/usr/bin/env bash\necho "sudo $*" >> "$FAKE_COMMA_LOG"\nexit 1\n'
+SUDO_SHIM = r'''#!/usr/bin/env bash
+echo "sudo $*" >> "$FAKE_COMMA_LOG"
+if [ "$*" = reboot ]; then echo REBOOT >> "$FAKE_COMMA_LOG"; exit 0; fi
+exit 1
+'''
 MV_SHIM = r'''#!/usr/bin/env bash
 /bin/mv "$@"
 rc=$?
@@ -256,6 +262,14 @@ def prevs(root):
   return sorted(p.name for p in root.glob('openpilot.prev-*'))
 
 
+def went_onroad(action: str, root: Path) -> str:
+  return f'{action}:printf 0 > {shlex.quote(str(root / "params/d/IsOffroad"))}'
+
+
+def rebooted(env) -> bool:
+  return 'REBOOT' in Path(env['FAKE_COMMA_LOG']).read_text()
+
+
 def test_fresh_deploy_over_sunnypilot(source, comma):
   src, _, second, panda1 = source
   root, env = comma
@@ -341,7 +355,7 @@ def test_refuses_when_it_goes_onroad_during_the_copy(source, comma):
   src, *_ = source
   root, env = comma
   sunny = tree_of(root, 'openpilot')
-  r = deploy(src, root, env, extra_env={'FAKE_COMMA_ONROAD_AFTER_RECEIVE': str(root / 'params/d/IsOffroad')})
+  r = deploy(src, root, env, extra_env={'FAKE_COMMA_AFTER': went_onroad('receive', root)})
   assert r.returncode != 0
   assert 'onroad' in r.stdout and 'Both trees are intact' in r.stdout
   assert tree_of(root, 'openpilot') == sunny
@@ -419,6 +433,85 @@ def test_ssh_drop_during_rollback(source, comma, drop):
   assert_state_unknown(r, env, drop)
 
 
+def not_rebooted_warning(r):
+  assert 'NOT REBOOTED' in r.stdout and "Don't start the car until the comma has rebooted" in r.stdout, r.stdout
+  assert '--reboot' in r.stdout
+
+
+def test_reboot_checks_offroad_again(source, comma):
+  """The car went onroad between the swap and the yes: the comma doesn't reboot, and the script says the car must not be
+  started until it has (the old fork still runs, and would start its onroad processes out of TurnPilot's unbuilt tree)."""
+  src, _, second, _ = source
+  root, env = comma
+  r = deploy(src, root, env, answer='y', extra_env={'FAKE_COMMA_AFTER': went_onroad('set_param', root)})
+  assert r.returncode == 1, r.stdout
+  assert not rebooted(env)
+  assert 'onroad' in r.stdout
+  not_rebooted_warning(r)
+  assert g(root / 'openpilot', 'rev-parse', 'HEAD', env=os.environ) == second
+  assert (root / 'params/d/DisableUpdates').read_text() == '1'
+
+
+def test_declined_reboot_then_reboot(source, comma):
+  """Answering no prints loudly that the car must not be started before the comma reboots, and --reboot reboots it later,
+  checking first that it is offroad, that TurnPilot's DisableUpdates is still 1, and that /data/openpilot is a tree."""
+  src, *_ = source
+  root, env = comma
+  r = deploy(src, root, env, answer='n')
+  assert r.returncode == 0, r.stdout
+  not_rebooted_warning(r)
+  assert not rebooted(env)
+
+  (root / 'params/d/IsOffroad').write_text('0')
+  r = deploy(src, root, env, '--reboot')
+  assert r.returncode == 2 and 'onroad' in r.stdout and not rebooted(env), r.stdout
+  (root / 'params/d/IsOffroad').write_text('1')
+  (root / 'params/d/DisableUpdates').write_text('0')
+  r = deploy(src, root, env, '--reboot')
+  assert r.returncode == 2 and 'DisableUpdates' in r.stdout and not rebooted(env), r.stdout
+  (root / 'params/d/DisableUpdates').write_text('1')
+  r = deploy(src, root, env, '--reboot')
+  assert r.returncode == 0 and rebooted(env), r.stdout
+
+
+def test_reboot_refuses_without_a_tree(comma, tmp_path):
+  root, env = comma
+  (root / 'openpilot').rename(root / 'openpilot.prev-20261031-080000')
+  r = deploy(tmp_path, root, env, '--reboot')
+  assert r.returncode == 2 and 'missing' in r.stdout and not rebooted(env), r.stdout
+
+
+@pytest.mark.parametrize('staged', [False, True], ids=['overlay', 'overlay-and-update'])
+def test_reboot_refused_once_an_updater_overlays_turnpilot(source, comma, staged):
+  """Between the swap and the reboot, the old fork's running updater can set up its overlay over the new tree (it touches
+  /data/openpilot/.overlay_init) and then stage origin/turnpilot from GitHub, which the next boot would install over the
+  deployed build. With .overlay_init there the comma doesn't reboot; removing it, as the message says, lets --reboot go."""
+  src, *_ = source
+  root, env = comma
+  hook = f'touch {shlex.quote(str(root / "openpilot/.overlay_init"))}'
+  if staged:
+    fin = root / 'safe_staging/finalized'
+    hook += f' && mkdir -p {shlex.quote(str(fin))} && touch {shlex.quote(str(fin / ".overlay_consistent"))}'
+  r = deploy(src, root, env, answer='y', extra_env={'FAKE_COMMA_AFTER': 'set_param:' + hook})
+  assert r.returncode == 1, r.stdout
+  assert not rebooted(env)
+  assert '.overlay_init' in r.stdout and ('would install' in r.stdout) == staged
+  not_rebooted_warning(r)
+  (root / 'openpilot/.overlay_init').unlink()
+  r = deploy(src, root, env, '--reboot')
+  assert r.returncode == 0 and rebooted(env), r.stdout
+
+
+def test_an_update_sunnypilot_staged_does_not_block_the_reboot(source, comma):
+  """sunnypilot's updater finalizes on every pass, so /data/safe_staging/finalized/.overlay_consistent is often there. The
+  launcher installs it only into a tree with .overlay_init, which the deployed tree hasn't got, so the reboot goes."""
+  src, *_ = source
+  root, env = comma
+  put(root, 'safe_staging/finalized/.overlay_consistent', b'')
+  r = deploy(src, root, env, answer='y')
+  assert r.returncode == 0 and rebooted(env), r.stdout
+
+
 def test_rollback(source, comma):
   src, _, second, panda1 = source
   root, env = comma
@@ -432,8 +525,9 @@ def test_rollback(source, comma):
   assert tree_of(root, 'openpilot') == turnpilot
 
   (root / 'params/d/IsOffroad').write_text('1')
-  r = deploy(src, root, env, '--rollback', '--stamp', '20261031-100000')
+  r = deploy(src, root, env, '--rollback', '--stamp', '20261031-100000', answer='y')
   assert r.returncode == 0, r.stdout
+  assert rebooted(env)  # sunnypilot's own .overlay_init is its updater's business, not a reason to refuse
   assert tree_of(root, 'openpilot') == sunny
   assert prevs(root) == ['openpilot.prev-20261031-100000']
   check_deployed(root / 'openpilot.prev-20261031-100000', second, panda1)
@@ -442,6 +536,7 @@ def test_rollback(source, comma):
   # a second rollback swaps TurnPilot back
   r = deploy(src, root, env, '--rollback', '--stamp', '20261031-110000')
   assert r.returncode == 0, r.stdout
+  not_rebooted_warning(r)
   check_deployed(root / 'openpilot', second, panda1)
   assert tree_of(root, 'openpilot.prev-20261031-110000') == sunny
 
