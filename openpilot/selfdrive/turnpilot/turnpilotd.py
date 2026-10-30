@@ -1022,8 +1022,9 @@ class TurnPilot:
     from openpilot.selfdrive.turnpilot.routing.junctions import approach_key
     ways = sorted({int(a.way_id) for a in (j.approaches if j is not None else []) if a.way_id})
     node = int(j.osm_node_id) if j is not None else 0
-    evidence = {'source': 'stopGo signal head', 'wallTime': self.wall_clock(), 'ways': ways}
-    entries = [{'approach': approach_key(node, w, fwd), 'kind': 'signalSeen', 'evidence': evidence} for w in ways for fwd in (True, False)]
+    keys = [approach_key(node, w, fwd) for w in ways for fwd in (True, False)]
+    evidence = {'source': 'stopGo signal head', 'wallTime': self.wall_clock(), 'ways': ways, 'written': keys}  # one event (route_audit)
+    entries = [{'approach': k, 'kind': 'signalSeen', 'evidence': evidence} for k in keys]
     self.write_overrides('signalSeen', node, entries if node else [], "the junction's node or ways unknown")
 
   def downgrade_override(self, j, approach, evidence: dict) -> None:

@@ -259,6 +259,28 @@ def test_overrides_are_listed_with_their_evidence_and_cleared_after_looking(tmp_
   assert route_audit.clear_override_param(p, '5:6:f') and json.loads(p.value) == []
 
 
+def test_a_downgrade_turnpilotd_wrote_is_listed_as_one_event_with_its_evidence_and_cleared_whole(tmp_path, capsys):
+  """SG4b: turnpilotd writes an approach downgraded on site (a car through its line at speed) under both directions of its
+  way, each naming the keys written together; route_audit lists the event once, its evidence read out (the vehicle, its
+  side, its speeds, when, where, the log event), and --clear of either key clears the event, said."""
+  ev = {'kind': 'no', 'trackId': 41, 'cls': 'car', 'role': 'left', 'wayId': 11, 'bearing': 270., 'speedMs': 8.2,
+        'minSpeedMs': 7.9, 'thresholdMs': 5., 'windowM': 20., 'heading': 'unmeasured', 'cameraTimeS': 1234.5, 'view': 'sideLeft',
+        'osmNodeId': 4242, 'log': 'turnpilot.stop_go_downgrade', 'source': 'stopGo downgrade', 'wallTime': 1793300000.,
+        'written': ['4242:11:f', '4242:11:b']}
+  path = tmp_path / 'overrides.json'
+  path.write_text(json.dumps([{'approach': k, 'kind': 'no', 'evidence': ev} for k in ev['written']] +
+                             [{'approach': '901:12:b', 'kind': 'signalSeen', 'evidence': None}]))
+  assert route_audit.main(['--overrides', str(path), '--list-overrides']) == 0
+  out = capsys.readouterr().out
+  assert out.count('a car through the left approach') == 1 and '8.2 m/s' in out and '7.9 m/s' in out
+  assert '4242:11:f' in out and '4242:11:b' in out and 'track 41' in out and '2026-10-29' in out and 'heading unmeasured' in out
+  assert 'turnpilot.stop_go_downgrade' in out and '--clear 4242:11:f' in out
+  assert route_audit.main(['--overrides', str(path), '--clear', '4242:11:b']) == 0
+  said = capsys.readouterr().out
+  assert '4242:11:f' in said and '4242:11:b' in said
+  assert [o['approach'] for o in json.loads(path.read_text())] == ['901:12:b']
+
+
 def test_the_time_avoidance_added(tmp_path):
   """The audit runs navd's avoidance loop (routing/avoid.py) on the trip and says what it did and the time it added."""
   from openpilot.selfdrive.turnpilot.routing.tests.test_route_controls import survey

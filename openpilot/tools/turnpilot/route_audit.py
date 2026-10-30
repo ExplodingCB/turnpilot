@@ -50,7 +50,11 @@ and the TurnPilotJunctionOverrides entries with their evidence.
                                                                            reach, per arriving approach, with its caps
   python -m openpilot.tools.turnpilot.route_audit --overrides FILE --list-overrides | --clear APPROACH
                                                   (--params in place of --overrides on the car: the param itself)
---clear removes one override after Kellen has looked at its evidence (decision D11); an approach not there is said.
+--clear removes one override after Kellen has looked at its evidence (decision D11), with the keys written together for the
+same event (turnpilotd names both directions of a downgraded approach's way, every way of a junction a signal head was seen
+at: one left behind would still fail the junction); an approach not there is said. --list-overrides shows each event once,
+a downgrade on site read out: the vehicle, the side it came from, its speed through its line and the least it read in the
+20 m before, the track, the time and the log event (turnpilot.stop_go_downgrade) to find it by.
 """
 import argparse
 import json
@@ -411,10 +415,41 @@ def lines(report: Report) -> list[str]:
   return out
 
 
+def override_event(key: str, o: dict) -> tuple:
+  """The keys written together with key for one event (its evidence's written: turnpilotd names both directions of a
+  way, or every way of a junction, at once), key alone for an entry that doesn't say."""
+  ev = o.get('evidence')
+  written = ev.get('written') if isinstance(ev, dict) else None
+  return tuple(written) if isinstance(written, list) and key in written else (key,)
+
+
+def evidence_text(kind: str, ev) -> str:
+  """An override's evidence read out: a downgrade on site (stop_go.py: the vehicle, its side, its speeds, the heading clause,
+  the track, when, where and the log event to find it by), a signal head; anything else as it is."""
+  if not isinstance(ev, dict) or 'source' not in ev:
+    return f"evidence {ev!r}"
+  when = datetime.fromtimestamp(float(ev['wallTime']), tz=UTC).strftime('%Y-%m-%d %H:%M:%SZ') \
+    if isinstance(ev.get('wallTime'), (int, float)) else 'time unknown'
+  if kind == 'no' and 'speedMs' in ev:
+    return ' '.join([f"a {ev.get('cls', 'vehicle')} through the {ev.get('role', '?')} approach's line at {float(ev['speedMs']):.1f} m/s,",
+                     f"no slower than {float(ev.get('minSpeedMs', 0.)):.1f} m/s over the {float(ev.get('windowM', 0.)):.0f} m before it",
+                     f"(threshold {float(ev.get('thresholdMs', 0.)):.1f} m/s, heading {ev.get('heading', 'unmeasured')}); track",
+                     f"{ev.get('trackId')} on {ev.get('view', '?')}, {when}, junction {ev.get('osmNodeId')} way {ev.get('wayId')},",
+                     f"{ev.get('log', 'no log event')} at camera time {ev.get('cameraTimeS')} s ({ev['source']})"])
+  return f"{ev['source']}, {when}, ways {ev.get('ways')}" if 'ways' in ev else f"{ev['source']}, {when}: {ev!r}"
+
+
 def override_lines(overrides: dict) -> list[str]:
+  """Every override with its evidence, one event (the keys written together) once (decision D11)."""
   out = [f"TurnPilotJunctionOverrides: {len(overrides)}"]
+  done = set()
   for key, o in overrides.items():
-    out.append(f"  {key} {o['kind']}: evidence {o.get('evidence')!r}  (route_audit --clear {key} once looked at)")
+    if key in done:
+      continue
+    keys = [k for k in override_event(key, o) if k in overrides] or [key]
+    done.update(keys)
+    clear = f"route_audit --clear {keys[0]} once looked at" + (f", which clears {', '.join(keys[1:])} with it" if len(keys) > 1 else '')
+    out.append(f"  {' '.join(keys)} {o['kind']}: {evidence_text(o['kind'], o.get('evidence'))}  ({clear})")
   return out
 
 
@@ -467,25 +502,33 @@ def check_survey(path: Path, visibility=None) -> int:
   return 1 if loaded.errors else 0
 
 
-def clear_override_file(path: Path, key: str) -> bool:
-  """Remove approach key from a file holding a TurnPilotJunctionOverrides value; False (nothing written) if not there."""
+def cleared_with(items: list, key: str) -> set:
+  """The keys --clear key removes: key and those written with it for the same event (override_event), since one left
+  behind still fails the junction (certify: any approach overridden)."""
+  o = next((x for x in items if x.get('approach') == key), None)
+  return set(override_event(key, o)) | {key} if o is not None else set()
+
+
+def clear_override_file(path: Path, key: str) -> list[str]:
+  """Remove approach key, with those written with it, from a file holding a TurnPilotJunctionOverrides value: the keys
+  removed ([]: not there, nothing written)."""
   items = json.loads(Path(path).read_text() or '[]')
-  kept = [o for o in items if o.get('approach') != key]
-  if len(kept) == len(items):
-    return False
-  Path(path).write_text(json.dumps(kept))
-  return True
+  gone = cleared_with(items, key)
+  if not gone:
+    return []
+  Path(path).write_text(json.dumps([o for o in items if o.get('approach') not in gone]))
+  return [o['approach'] for o in items if o.get('approach') in gone]
 
 
-def clear_override_param(params, key: str) -> bool:
+def clear_override_param(params, key: str) -> list[str]:
   """The same on the car's TurnPilotJunctionOverrides param (a STRING key navd parses, json.dumps of the list)."""
   raw = params.get(junctions.OVERRIDES_PARAM)
   items = json.loads(raw.decode() if isinstance(raw, bytes) else raw or '[]')
-  kept = [o for o in items if o.get('approach') != key]
-  if len(kept) == len(items):
-    return False
-  params.put(junctions.OVERRIDES_PARAM, json.dumps(kept))
-  return True
+  gone = cleared_with(items, key)
+  if not gone:
+    return []
+  params.put(junctions.OVERRIDES_PARAM, json.dumps([o for o in items if o.get('approach') not in gone]))
+  return [o['approach'] for o in items if o.get('approach') in gone]
 
 
 def main(argv=None):
@@ -522,7 +565,7 @@ def main(argv=None):
     if not done:
       print(f"{args.clear} is not in {where}: nothing cleared", file=sys.stderr)
       return 1
-    print(f"cleared {args.clear} from {where}")
+    print(f"cleared {' and '.join(done)} from {where}" + (" (written together for one event)" if len(done) > 1 else ''))
     return 0
   if args.list_overrides:
     if args.params:
