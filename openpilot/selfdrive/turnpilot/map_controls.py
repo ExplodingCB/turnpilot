@@ -20,13 +20,16 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   more than DRIVE_OFF_M at more than COMMIT_SPEED is let go: the driver's, once the hold has handed back (driverWent), or
   under the driver's gas (drivenOff); otherwise, with no go at all (the plan not applied: shadow mode turned on), an
   overrun. At a stop or an unprotected turn, the car past its stop point and past the furthest TurnPilot asked of the
-  latch (a creep, a roll-up) by the latch's reach (LATCH_PAST_M), the driver's gas having moved it, at any speed, is the
-  driver's too (driverWent handed back, else drivenOff): a peek-creep past the line is never held again in the crossing
+  latch (a creep, a roll-up) by the latch's reach (LATCH_PAST_M) of the driver's own metres, at any speed, is the driver's
+  too (driverWent handed back, else drivenOff under their gas, movedOff with none: an idle creep with the brake let off;
+  owner decision (i), 2026-10-30: any movement TurnPilot didn't ask for). The driver's metres are those the car moves with
+  openpilot disengaged or under the gas (update()'s engaged); with it engaged the plan is TurnPilot's, so the latch's own
+  stop carrying a car re-engaged rolling is never theirs. A peek-creep past the line is never held again in the crossing
   lanes on a re-engage. At an unprotected turn so is the car on past both by less, once a hold could no longer stand it
   short of the oncoming lanes (from its speed at REENGAGE_DECEL, to ONCOMING_ENTRY_M before the junction as latched): after
   the left's full creep the reach lies inside them. Short of either nothing is let go (owner decision (a), 2026-10-30): a gas nudge inside a roll-up or
-  a creep is TurnPilot's metres, a handback with no driver input lets nothing go (the car is held, the handback said), and
-  a re-engage short of the line goes back to the full check. The autonomous left's own hold after a withdrawn go
+  a creep is TurnPilot's metres, a handback the car doesn't move from lets nothing go (the car is held, the handback said),
+  and a re-engage short of the line goes back to the full check. The autonomous left's own hold after a withdrawn go
   (unprotected_left: hold_here, the latch already let go by the go) has the same rule there, its crossing said here
   (update()'s left, LeftCommand.crossed: Driven). A stop's or an unprotected turn's line crossed with no go
   (let go so, or overrun) is never silent (owner decision (b)): its take-control (DRIVEN_PROMPT) stays up, engaged or not,
@@ -451,6 +454,7 @@ class ControlState:
   moved_m: float = 0.
   asked_m: float = 0.           # held: the furthest the latch's stop point was asked on this hold (a creep, a roll-up)
   gas_moved_m: float = 0.       # held: m moved under the driver's gas this hold
+  driver_m: float = 0.          # held: m moved with openpilot disengaged or under the gas this hold (the driver's)
   done: str = ''              # 'released', 'passed', 'overrun', 'dropped'
   cause: str = ''               # released: why (gap, clear, green, or the car's motion: CROSSED_CAUSES)
   action: str = 'none'
@@ -701,7 +705,7 @@ class MapControlPolicy:
   def update(self, nav, updated: bool, valid: bool, v_ego: float, gas_pressed: bool, lights: Lights = NO_LIGHTS,
              dt: float = DT_MDL, turn=None, left: LeftCommand | None = None, release: tuple | None = None,
              creep: tuple | None = None, stop: StopCommand | None = None, signs: tuple | None = None,
-             yields: dict | None = None) -> MapDecision:
+             yields: dict | None = None, engaged: bool | None = None) -> MapDecision:
     """nav: the latest navInstruction, updated: it arrived this frame, valid: its valid flag; carState's vEgo and
     gasPressed; lights: light_input()'s; turn: (maneuver id, m to its junction, 'left' or 'right') of the route's
     unprotected_turn() the car is taking, or None; left: the unprotected left's command for its latch (None: off); release:
@@ -709,7 +713,10 @@ class MapControlPolicy:
     m/s cap) for a held stop sign's stop point (the decider's roll-up); stop: the decider's StopCommand for a held stop sign
     (None: shadow, as before); signs: (this tick's forward runs, their stop-sign boxes [(bearing, elevation, conf)]) for row
     C11's evidence, None with the camera's signs not read; yields: {a yield's key: (its rolling test passes now, m before its
-    stop point to its rolling commit point)} (STOP_SIGNS.md 2.7), a yield not in it failing (no yield certifies this week)."""
+    stop point to its rolling commit point)} (STOP_SIGNS.md 2.7), a yield not in it failing (no yield certifies this week);
+    engaged: openpilot engaged (carControl.enabled), the plan applied: a held car's metres then are TurnPilot's unless under
+    the gas (None, not known: every metre is the driver's)."""
+    self._engaged = engaged
     self._yields = yields or {}
     self.left = left if left is not None else LeftCommand()
     self.stop_cmd = stop if stop is not None else StopCommand()
@@ -884,6 +891,8 @@ class MapControlPolicy:
     st.moved_m += v * dt
     if gas_pressed:
       st.gas_moved_m += v * dt
+    if gas_pressed or not getattr(self, '_engaged', None):
+      st.driver_m += v * dt
     what = description(c, self.turn_name)
     cause, prompt = None, None
     left = getattr(self, 'left', LeftCommand())
@@ -937,22 +946,27 @@ class MapControlPolicy:
     # and re-engaged the car ran the stop sign silently). Short of them the latch holds: a re-engage there goes back to the
     # full check (the decider's observe, its clear window, its certified go; a shadow stop's handback), never straight on
     past = st.moved_m - max(c.d, st.asked_m)
+    # ...of the driver's own metres (disengaged or under the gas): the latch's stop carrying a car re-engaged rolling is its own
+    drv = min(past, st.driver_m)
     stop_like = is_stop(c) or c.kind == UNPROTECTED
-    # past both by the latch's reach at any speed, the driver's gas having moved the car this hold, at a stop or an
-    # unprotected turn: a peek-creep at a walking pace is the driver going (skeptic G1: held after a 1.45 m/s creep 3.6 m on,
-    # a re-engage stopped the car in the crossing lanes; a gas nudge then a roll on past is theirs too, never a hold in the
-    # lanes). Only the driver's gas counts, never a prompt being up (TurnPilot's own creep is no driver's), and never at a
-    # signal: its stop is the light's, which a crawl under the gas doesn't change (residual-check-1, d)
+    # past both by the latch's reach at any speed, at a stop or an unprotected turn: a peek-creep at a walking pace is the
+    # driver going (skeptic G1: held after a 1.45 m/s creep 3.6 m on, a re-engage stopped the car in the crossing lanes; a
+    # gas nudge then a roll on past is theirs too, never a hold in the lanes), and so is an idle creep with no gas, the brake
+    # let off (owner decision (i), 2026-10-30: any movement past the stop point TurnPilot didn't ask for is the driver's; srm:
+    # held again 3-8 m past the line on the re-engage). Never a prompt being up alone (the car must have moved), never
+    # TurnPilot's own metres (asked_m), and never at a signal: its stop is the light's, which a crawl doesn't change
+    # (residual-check-1, d)
     # at an unprotected turn, short of the reach too once a hold could no longer stand the car short of the oncoming lanes
     # (ONCOMING_ENTRY_M before its junction, HOLD_LINE_M + MAP_MARGIN_M past the stop point as latched; a hold taken up by a
     # re-engage carries a rolling car on v^2/(2 REENGAGE_DECEL)): the left's full creep stands the car CREEP_SHORT_M short of
     # them, where the reach (LATCH_PAST_M past it) is 1 m inside them (the invariant: never a TurnPilot hold there)
-    lanes = c.kind == UNPROTECTED and past > 0. and \
+    lanes = c.kind == UNPROTECTED and drv > 0. and \
       st.moved_m + v * v / (2. * REENGAGE_DECEL) > c.d + HOLD_LINE_M + MAP_MARGIN_M - ONCOMING_ENTRY_M
-    drivers = stop_like and st.gas_moved_m > 0. and (past > LATCH_PAST_M or lanes)
+    drivers = stop_like and (drv > LATCH_PAST_M or lanes)
     if cause is None and drivers:
-      # handed back: theirs, said already (driverWent); else lifting must not stop the car in the junction (drivenOff)
-      cause = 'driverWent' if prompt is not None else 'drivenOff'
+      # handed back: theirs, said already (driverWent); else lifting must not stop the car in the junction (drivenOff), nor
+      # a re-engage after a roll with no gas (movedOff): said either way (Driven)
+      cause = 'driverWent' if prompt is not None else 'drivenOff' if st.gas_moved_m > 0. else 'movedOff'
     elif cause is None and moved > DRIVE_OFF_M and v > COMMIT_SPEED and (past > 0. or not stop_like):
       # handed back, the driver took over and went: theirs, said already. Driven off under the driver's foot: lifting must
       # not stop the car in the junction. Or gone with no go at all, the plan not applied (shadow mode turned on): the
@@ -1112,7 +1126,7 @@ class MapControlPolicy:
     if v < LATCH_SPEED and -LATCH_PAST_M < c.d < LATCH_NEAR_M and not gas_pressed and self.held is None:
       self.held, c.held = c.key, True
       st.dwell_t, st.moved_m, st.infeasible, st.unseen_t = 0., 0., False, 0.
-      st.asked_m, st.gas_moved_m = 0., 0.
+      st.asked_m, st.gas_moved_m, st.driver_m = 0., 0., 0.
       cloudlog.event("turnpilot.map_stop_held", kind=c.kind, key=list(c.key), d=round(c.d, 1), light=st.light)
       if c.kind == 'stop' and getattr(self, '_signs', None) is not None:
         self._sign_evidence(c)

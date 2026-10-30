@@ -2116,7 +2116,7 @@ class TurnPilot:
       signs = (len(forward), [s for raw in forward for s in getattr(raw, 'signs', ())])
     self.map_now = self.map_controls.update(sm['navInstruction'], sm.updated['navInstruction'], sm.valid['navInstruction'], v_ego,
                                             gas_pressed, lights, DT_MDL, turn=turn, left=left, release=release, creep=creep, stop=stop,
-                                            signs=signs)
+                                            signs=signs, engaged=bool(sm['carControl'].enabled))
     return self.map_now
 
   def camera_lights(self, sm, data):

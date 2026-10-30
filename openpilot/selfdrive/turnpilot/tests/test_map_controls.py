@@ -44,9 +44,11 @@ class Car:
 
   def step(self, gas=False, lights=NO_LIGHTS, accel=None, **kw):
     """lights: Lights, or a function of the car giving them; kw: the stop-sign decider's for MapControlPolicy.update (release,
-    creep, stop), each a value or a function of the car."""
+    creep, stop), each a value or a function of the car. openpilot is engaged (the plan applied) unless the driver's gas or
+    accel (the plan not applied) says otherwise."""
     lights = lights(self) if callable(lights) else lights
     kw = {k: (v(self) if callable(v) else v) for k, v in kw.items()}
+    kw.setdefault('engaged', not gas and accel is None)
     due = self.frame % 20 == 0
     self.frame += 1
     turn = None if self.turn is None else (self.turn[1], self.turn[0] - self.s, self.turn[2])
@@ -998,7 +1000,7 @@ def test_a_hold_turnpilot_moved_on_and_then_handed_back_is_never_let_go_with_no_
   # took a prompt being up as the driver's: so a left that crept 4 m for a view and then went undecided, or a stop the
   # decider rolled up 4.9 m and then faulted or went shadow, was let go as driverWent on the first handback frame, prompt
   # 'none', and the model drove the car on (to 12.8 and 5 m/s). The largest creep asked this hold is the latch's own, and
-  # only the driver's gas moves the car as the driver's: held, the handback said, every frame
+  # only the driver's own movement is the driver's (owner decision (i): the car standing, none): held, the handback said
   car = left_car()
   held_left(car, left_cmd(reason="Waiting for a gap"))
   line = car.s
@@ -1168,7 +1170,8 @@ def policy_step(self, left, gas=False):
   due = self.frame % 20 == 0
   self.frame += 1
   turn = None if self.turn is None else (self.turn[1], self.turn[0] - self.s, self.turn[2])
-  out = self.policy.update(self.nav() if due else None, due, self.nav_valid, self.v, gas, NO_LIGHTS, DT_MDL, turn=turn, left=left)
+  out = self.policy.update(self.nav() if due else None, due, self.nav_valid, self.v, gas, NO_LIGHTS, DT_MDL, turn=turn, left=left,
+                           engaged=not gas)
   dec = decide(out.stops, self.v)
   dec.accel_cap = self.scene.ramp(dec.accel_cap, DT_MDL)
   cmd = min(plan_accel(dec.accel_cap, dec.speed_cap, self.v), (self.cruise - self.v) / 2., 1.5)
@@ -1608,3 +1611,66 @@ def test_a_nudge_on_from_the_lefts_full_creep_is_never_held_in_the_oncoming_lane
     assert all(out.prompt == 'unprotectedTurnTakeControl' for out, _, _ in rows)
   else:
     assert car.policy.held is not None and car.policy.driven is None and car.v < 0.05 and junction - car.s > ONCOMING_ENTRY_M
+
+
+def idle_creep(car, line, past, **kw):
+  """openpilot disengaged (the plan not applied) and the brake let off: the car idles on at 1.2 m/s with no gas to past m
+  beyond line, then is engaged again (the plan applied, the model driving on). (the rows of the re-engage, the causes of
+  the crossings said)"""
+  causes = set()
+  while car.s < line + past:
+    car.step(accel=0.5 if car.v < 1.2 else 0., **kw)
+    causes |= {car.policy.driven.cause} if car.policy.driven is not None else set()
+  n = len(car.rows)
+  for _ in range(int(10. / DT_MDL)):
+    car.step(**kw)
+    causes |= {car.policy.driven.cause} if car.policy.driven is not None else set()
+  return car.rows[n:], causes
+
+
+@pytest.mark.parametrize("past", [3., 5., 8.])
+def test_an_idle_creep_past_a_held_line_with_no_gas_is_the_drivers_never_held_in_the_crossing_lanes(past):
+  """Owner decision (i), 2026-10-30, Kellen's delegate (srm test_srm_idle_creep_reengage, left open at e93750b): held and
+  handed back, or waiting, the driver disengages on the brake and lets the car idle on with no gas past the line, then
+  re-engages: only gas metres counted as the driver's, so the latch held the car again where it stood, 3-8 m past a stop
+  sign's line or a left's hold line, in the crossing or the oncoming lanes. Any movement past the stop point and what
+  TurnPilot asked of the latch is the driver's for (a) and (b): let go past the latch's reach (or, at an unprotected turn,
+  where a hold could no longer stand the car short of the oncoming lanes), driverWent handed back, else movedOff, never
+  held in the junction on the re-engage, its crossing said until the car is DRIVEN_THROUGH_M past the line."""
+  from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M
+  cases = [('stop shadow', lambda: Car([(150., 'stop')]), 150., {}, 'stopSignTakeControl', 'driverWent'),
+           ('stop waiting', lambda: Car([(150., 'stop')]), 150., {'stop': StopCommand('wait')}, 'stopSignTakeControl', 'movedOff')]
+  line = 250. - HOLD_LINE_M - 1.
+  for name, cmd, cause in (('left off', left_cmd('off'), 'driverWent'),
+                           ('left undecided', left_cmd(take_control=True, reason="View of oncoming traffic blocked: take control"),
+                            'driverWent'),
+                           ('left waiting', left_cmd(reason="Waiting for a gap"), 'movedOff')):
+    cases.append((name, left_car, line, {'left': cmd}, 'unprotectedTurnTakeControl', cause))
+  for name, make, at, kw, prompt, cause in cases:
+    car = make()
+    car.run_until(held, **kw)
+    car.run(1.5, **kw)
+    rows, causes = idle_creep(car, at, past, **kw)
+    assert car.policy.held is None, f"{name}: still latched {car.s - at:.2f} m past its line on the re-engage"
+    assert causes == {cause}, (name, causes)
+    assert not any(r[4].should_stop for r in rows), name
+    if 'left' in name:
+      assert not any(r[2] < 0.05 and 250. - r[1] < ONCOMING_ENTRY_M for r in rows), name
+    dr = [r[5] for r in car.rows if r[5].driven]
+    assert dr and car.policy.driven is None and car.s > at + DRIVEN_THROUGH_M + 1., name  # said, and done once through
+    inside = [r[5] for r in rows if r[1] < at + DRIVEN_THROUGH_M - 0.5]
+    assert inside and all(out.prompt == prompt and out.driven for out in inside), (name, sorted({out.prompt for out in inside}))
+    assert all(r[5].prompt == 'none' for r in rows if r[1] > at + DRIVEN_THROUGH_M + 0.5), name
+
+
+def test_an_idle_creep_short_of_the_latchs_reach_stays_held_for_the_full_check():
+  # owner decision (c): rolled on with no gas less than LATCH_PAST_M past the line, the latch is TurnPilot's still: the
+  # re-engage holds the car where it stands, handed back as before, never driven on unchecked
+  car = Car([(150., 'stop')])
+  car.run_until(held)
+  car.run(1.5)
+  while car.s < 150. + 1.5:
+    car.step(accel=0.5 if car.v < 1.2 else 0.)
+  out, dec, _ = car.run(5.)
+  assert held(out, dec) and out.prompt == 'stopSignTakeControl' and car.v < 0.05 and car.s < 150. + 2.5
+  assert car.policy.driven is None
