@@ -11,8 +11,10 @@ curve brings a junction turn down to the 4.3 m/s gate 1's model chose by itself 
 model planned the turn but held 7 m/s, it gave the turn up or stopped at the corner. The planner turns the cap into
 an accel with a 1 s time constant, so the car trails the curve; the curve leads the car by 2 s.
 A keep (a slight turn at a junction) is capped only from town speeds: above KEEP_CAP_SPEED_MAX it is a road bearing
-off, and the cap would brake the car at 2 m/s^2 from highway speed for a bend it takes as it is. Ramps and forks are
-never capped. Only junction maneuvers are capped at all: a road that bends is the model's (route_follower.py), and a
+off, and the cap would brake the car at 2 m/s^2 from highway speed for a bend it takes as it is. But one the route's
+bearings put at a junction (geometry: a branch meets it there) at KEEP_CORNER_MIN_DEG or more is a corner at any speed
+(BUILD_FINDINGS D5: S19's reroute slight left was taken at 19 m/s, the bend after it asking 3.8 m/s^2 of lateral
+accel). Ramps and forks are never capped. Only junction maneuvers are capped at all: a road that bends is the model's (route_follower.py), and a
 turn the car is too fast for is skipped, cap and all (turn_skip.py).
 
 The post-go profile (DESIGN phase 4 section 3, G3): a turn a TurnPilot hold lets go of at a standstill (turnpilotd's go)
@@ -47,7 +49,8 @@ A_LAT_MAX = 2.0         # m/s^2 through the corner
 A_DECEL = 1.5           # m/s^2 braking curve into the corner
 V_TURN_MIN = 6.9        # m/s (25 km/h), gate 1's speed at the pulse
 V_TURN_MAX = 15.0
-KEEP_CAP_SPEED_MAX = 15.0  # m/s: a keep is capped only below this
+KEEP_CAP_SPEED_MAX = 15.0  # m/s: a keep is capped only below this...
+KEEP_CORNER_MIN_DEG = 20.  # ...or at any speed at a junction (its bearings, a branch) this sharp or more
 LAG_S = 2.0             # s the curve leads the car
 V_CORNER = 4.3          # m/s a junction turn slows to by CORNER_M before the junction (gate 1's model, by itself)
 CORNER_M = 15.
@@ -72,7 +75,8 @@ def turn_target_speed(angle_deg: float, curb_side: bool) -> float:
 
 def turn_speed_cap(maneuver, distance: float, v_ego: float, right_hand_traffic: bool = True) -> float:
   """Speed cap for now, from the next maneuver (RouteFollower.upcoming) and the distance to it."""
-  town_keep = maneuver is not None and maneuver.kind == KEEP and not maneuver.ramp and v_ego < KEEP_CAP_SPEED_MAX
+  town_keep = maneuver is not None and maneuver.kind == KEEP and not maneuver.ramp and \
+    (v_ego < KEEP_CAP_SPEED_MAX or (maneuver.geometry and maneuver.angle_deg >= KEEP_CORNER_MIN_DEG))
   if maneuver is None or not (maneuver.kind == TURN or town_keep):
     return NO_SPEED_CAP  # ramps and forks: braking on the main road is wrong, and the model follows the ramp's curve
   curb_side = (maneuver.side == LEFT) != right_hand_traffic

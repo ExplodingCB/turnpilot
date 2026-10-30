@@ -46,6 +46,24 @@ def test_no_cap_where_the_highway_bends():
   assert turn_speed_cap(maneuver("turn", "right"), 100., 30.) < 15.
 
 
+def test_a_slight_turn_at_a_junction_is_capped_at_any_speed():
+  """BUILD_FINDINGS D5: a keep at a junction (its bearings, so a branch: make_maneuver makes a branchless one a bend) of
+  KEEP_CORNER_MIN_DEG or more gets its corner cap at any speed, not only under KEEP_CAP_SPEED_MAX. Under that angle, without
+  junction data (the modifier's nominal angle), or a ramp or fork (braking on the main road for its exit) it is as before."""
+  def keep(mtype, modifier, angle, geometry=True):
+    kind, side = classify(mtype, modifier)
+    return Maneuver(kind, side, mtype, modifier, angle, geometry=geometry)
+  j = keep("turn", "slight right", 22.)  # S23's DR677_1
+  assert math.isclose(turn_speed_cap(j, 20., 19.), turn_target_speed(22., curb_side=True))
+  assert math.isclose(turn_speed_cap(j, 20., 30.), turn_speed_cap(j, 20., 14.))
+  assert turn_speed_cap(keep("turn", "slight left", 20.), 20., 25.) < 12.
+  assert turn_speed_cap(j, 400., 25.) > 25.  # far out it doesn't bite: the same braking curve as a town keep's
+  assert turn_speed_cap(keep("turn", "slight left", 14.), 20., 19.) == NO_SPEED_CAP  # S19's reroute: under 20 deg
+  assert turn_speed_cap(keep("turn", "slight right", 45., geometry=False), 20., 19.) == NO_SPEED_CAP
+  assert turn_speed_cap(keep("off ramp", "slight right", 25.), 20., 25.) == NO_SPEED_CAP
+  assert turn_speed_cap(keep("fork", "slight left", 30.), 20., 25.) == NO_SPEED_CAP
+
+
 def test_braking_curve():
   m = maneuver("turn", "right")
   assert math.isclose(turn_speed_cap(m, 100. + TURN_DESIRE_LEAD_M, 0.), math.sqrt(V_TURN_MIN ** 2 + 2 * 1.5 * 100.))
