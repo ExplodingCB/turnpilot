@@ -49,6 +49,7 @@ def left_sim(cars=lambda sim: (), runs=True, sim_cls=Sim):
   sim = sim_cls(LEFT_25)
   sim.tp.auto_left, sim.tp.left_range_m = 'auto', TEST_RANGE_M
   sim.go_taps = False
+  sim.answers_prompt = True  # the driver signals the left when prompted: it goes only with a lamp lit (car_signals.py)
   sim.raw = road_runs(cars) if runs else None
   return sim
 
@@ -205,6 +206,7 @@ def test_a_left_past_the_proven_range_is_never_taken_from_its_line():
   # 45 mph mapped: R_req past the road camera's range: skipped at route time (below), never a go from its line
   sim = Sim([(JUNCTION, "turn", "left", (0., 270., 2, 'present', 20.1, 1, STRAIGHT_M)), (1500., "turn", "right", junction_of("right"))])
   sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps, sim.raw = 'auto', TEST_RANGE_M, False, road_runs()
+  sim.answers_prompt = True
   assert r_req(20.1, t_req(HOLD_LINE_M + 1., 1), HOLD_LINE_M + 1.) > TEST_RANGE_M
   plans = drive(sim, 60.)
   assert not any(p.desire == Desire.turnLeft for p in plans if p.maneuverDistance > 0.)
@@ -234,6 +236,7 @@ def test_a_left_the_detector_cant_see_far_enough_for_is_skipped_at_route_time():
   for junction in ((0., 270., 2, 'present', 20.1, 1, STRAIGHT_M), (0., 270., 2, 'present', 0., 0, STRAIGHT_M)):  # 45 mph, unknown (45)
     sim = Sim([(600., "turn", "left", junction), (2000., "turn", "right", junction_of("right"))])
     sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps, sim.raw = 'auto', TEST_RANGE_M, False, road_runs()
+    sim.answers_prompt = True
     plans, reasons = [], set()
     while sim.s < 650.:
       plans += drive(sim, DT_MDL, yaw=False)
@@ -247,6 +250,7 @@ def test_a_left_the_detector_cant_see_far_enough_for_is_skipped_at_route_time():
   # within range (TurnPilotLeftRangeM measured further): taken
   sim = Sim([(600., "turn", "left", (0., 270., 2, 'present', 20.1, 1, STRAIGHT_M)), (2000., "turn", "right", junction_of("right"))])
   sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps, sim.raw = 'auto', 300., False, road_runs()
+  sim.answers_prompt = True
   plans = drive(sim, 5.)
   assert not any(p.tooFastToTurn for p in plans)
   # off: the line's handback, as G1's, never skipped for range
@@ -354,6 +358,7 @@ def test_a_creep_for_a_view_the_car_never_makes_is_never_silent():
   # model holding it): 270 s in 'creep' with only the visual creepingForView. Now a loud handback, the car held
   sim = HeldSim(LEFT_25)
   sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps = 'auto', TEST_RANGE_M, False
+  sim.answers_prompt = True
 
   def objects(sim):
     return ({'cls': 'car', 'x': JUNCTION + 6. - sim.s, 'y': 3.6, 'vx': 0., 'vy': 0., 'age': 40, 'trackId': 7,
@@ -568,6 +573,7 @@ def signal_sim(red_until=None, oracle=True, line=JUNCTION - 8.5):
   (None: always), green after; oracle False: no light source at all. An empty band."""
   sim = Sim(LEFT_25, controls=[(line, 'signal')])
   sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps = 'auto', TEST_RANGE_M, False
+  sim.answers_prompt = True
   sim.tp.oracle_ok = oracle
 
   def lights(sim):
@@ -679,6 +685,7 @@ def test_an_unmeasured_detector_range_attempts_no_left_blind():
   sim = Sim(LEFT_25)
   assert sim.tp.left_range_m == ROAD_RANGE_M
   sim.tp.auto_left, sim.go_taps, sim.raw = 'auto', False, road_runs()
+  sim.answers_prompt = True
   plans, reasons = [], set()
   for _ in range(int(40. / DT_MDL)):
     plans += drive(sim, DT_MDL, yaw=False)
@@ -712,6 +719,7 @@ def far_sim(cars=lambda sim: (), status='read', far_range=FAR_RANGE_M):
   sim = Sim(LEFT_45)
   sim.tp.auto_left, sim.tp.left_range_m, sim.tp.left_far_range_m = 'auto', TEST_RANGE_M, far_range
   sim.go_taps = False
+  sim.answers_prompt = True  # the driver signals the left when prompted: it goes only with a lamp lit (car_signals.py)
   sim.raw, sim.raw_far = road_runs(cars), far_runs(cars)
   sim.far_status = status if callable(status) else (lambda sim: status)
   return sim

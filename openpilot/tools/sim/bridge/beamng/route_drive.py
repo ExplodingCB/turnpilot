@@ -227,7 +227,8 @@ class RouteDrive:
     res = {"run": self.run + 1, "route": self.route.name, "end": reason, "wall_start": self.wall0, "mono_start": self.t0,
            "mono_end": self.t_end, "duration_s": round(t, 1), "distance_m": round(self.dist, 1),
            "engaged_at_s": getattr(self, "engage_t", None), "legs_reached": self.legs_done, "legs": len(self.route.legs),
-           "disengagements": self.disengagements, "stop_confirmations": self.taps.log, "lane_change_prompts_signalled": b.driver.signals, "web": self.web,
+           "disengagements": self.disengagements, "stop_confirmations": self.taps.log, "lane_change_prompts_signalled": b.driver.signals,
+           "turn_prompts_signalled": b.driver.turn_signals, "web": self.web,
            "traffic": self.traffic, "speed_kph": self.speed_kph, "path": self.rows,
            "pose_fields": ["wall_s", "t_s", "x", "y", "z", "qx", "qy", "qz", "qw"], "poses": self.poses}
     self.results.append(res)

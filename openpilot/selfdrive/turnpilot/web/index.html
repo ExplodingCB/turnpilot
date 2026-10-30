@@ -100,6 +100,21 @@ code { display: block; word-break: break-all; margin: 4px 0 12px; padding: 8px; 
   </form>
 </details>
 
+<details id="carsignals">
+  <summary>Car turn signal</summary>
+  <div class="note">On a verified Tesla the car works its own turn signal for TurnPilot's turns and lane changes. Off, you signal,
+    and TurnPilot asks you at each turn. The check blinks the lamps in Park (or, with Start in Drive, stopped with the brake held):
+    watch the front, side and rear lamps from outside, or film them.</div>
+  <div id="csstate"></div>
+  <div class="row" id="csmodes"></div>
+  <button class="go" type="button" id="csdrive" hidden>Start check in Drive</button>
+  <div id="csexterior" hidden>
+    <p><b>Did the front, side and rear lamps flash on each side, only on the side asked?</b></p>
+    <button class="go" type="button" id="csyes">Yes, they flashed</button>
+    <button class="stop" type="button" id="csno">No</button>
+  </div>
+</details>
+
 <details>
   <summary>Shortcut setup</summary>
   <div class="note">Use these in the Send to TurnPilot shortcut. Keep the token private.</div>
@@ -358,6 +373,39 @@ $("mapsave").onclick = function () {
   });
 };
 
+async function loadCarSignals() {
+  var d = await api("/api/car-signals");
+  var lines = ["Mode: " + d.mode];
+  lines.push(d.verified ? "Verified for " + d.verified_vin : "Not verified");
+  if (d.check) {
+    lines.push("Last check: " + (d.check.pass ? "passed" : "failed") + (d.check.step ? " (" + d.check.step + ")" : "") +
+               (d.check.why ? ": " + d.check.why : "") + (d.check.exterior ? ", outside lamps " + d.check.exterior : ""));
+  }
+  $("csstate").textContent = lines.join(". ");
+  var modes = $("csmodes");
+  modes.replaceChildren();
+  ["off", "check", "on"].forEach(function (m) {
+    var b = el("button", m === d.mode ? "go" : "", m === "check" ? "Check at next start" : m === "on" ? "On" : "Off");
+    b.type = "button";
+    b.onclick = function () { act(async function () { await api("/api/car-signals", "POST", { mode: m }); await loadCarSignals(); }); };
+    modes.appendChild(b);
+  });
+  $("csdrive").hidden = !(d.check === null || d.mode !== "on");
+  var pending = d.check && d.check.pass && d.check.exterior === "pending";
+  $("csexterior").hidden = !pending;
+  $("csyes").onclick = function () { answer("yes", d.check.checkId); };
+  $("csno").onclick = function () { answer("no", d.check.checkId); };
+  return d;
+}
+
+function answer(verdict, checkId) {
+  act(async function () { await api("/api/car-signals", "POST", { exterior: verdict, checkId: checkId }); await loadCarSignals(); });
+}
+
+$("csdrive").onclick = function () {
+  act(async function () { await api("/api/car-signals", "POST", { startInDrive: true }); await loadCarSignals(); });
+};
+
 function line(dl, label, value) {
   if (!value) return;
   dl.appendChild(el("dt", "", label));
@@ -409,6 +457,7 @@ async function start() {
   if (!paired) return;
   act(loadPlaces);
   act(loadMapSettings);
+  act(loadCarSignals);
   act(async function () {
     var p = await api("/api/pairing");
     $("endpoint").textContent = p.endpoint;

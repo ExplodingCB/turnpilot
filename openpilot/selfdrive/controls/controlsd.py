@@ -21,6 +21,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
+from openpilot.selfdrive.turnpilot.car_signals import car_blinkers
 
 State = log.SelfdriveState.OpenpilotState
 LaneChangeState = log.LaneChangeState
@@ -40,7 +41,9 @@ class Controls:
 
     self.sm = messaging.SubMaster(['lateralDelay', 'vehicleParameters', 'lateralTorqueParameters', 'modelV2', 'selfdriveState',
                                    'extrinsicsCalibration', 'deviceMotion', 'longitudinalPlan', 'lateralManeuverPlan', 'carState', 'carOutput',
-                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance'], poll='selfdriveState')
+                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance', 'turnpilotPlan'], poll='selfdriveState',
+                                  ignore_alive=['turnpilotPlan'], ignore_avg_freq=['turnpilotPlan'],
+                                  ignore_valid=['turnpilotPlan'])  # TurnPilot off: none
     self.pm = messaging.PubMaster(['carControl', 'controlsState'])
 
     self.steer_limited_by_safety = False
@@ -104,10 +107,8 @@ class Controls:
     actuators = CC.actuators
     actuators.longControlState = self.LoC.long_control_state
 
-    # Enable blinkers while lane changing
-    if model_v2.meta.laneChangeState != LaneChangeState.off:
-      CC.leftBlinker = model_v2.meta.laneChangeDirection == LaneChangeDirection.left
-      CC.rightBlinker = model_v2.meta.laneChangeDirection == LaneChangeDirection.right
+    # Enable blinkers while lane changing, or TurnPilot's turn signal on a car that works its own (car_signals.py)
+    CC.leftBlinker, CC.rightBlinker = car_blinkers(self.CP, CC.enabled, model_v2, self.sm)
 
     if not CC.latActive:
       self.LaC.reset()

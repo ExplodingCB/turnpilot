@@ -23,8 +23,8 @@ from openpilot.selfdrive.selfdrived.helpers import ExcessiveActuationCheck
 from openpilot.selfdrive.selfdrived.state import StateMachine
 from openpilot.selfdrive.selfdrived.alertmanager import AlertManager, set_offroad_alert
 from openpilot.selfdrive.turnpilot.handback import HandbackEvents
-from openpilot.selfdrive.turnpilot.hooks import (LaneChangeEvents, StaleHoldEvents, fresh_plan, hides_stock_lane_change, limits_plan,
-                                               plan_events, shown_plan)
+from openpilot.selfdrive.turnpilot.hooks import (CAR_SIGNAL_EVENTS, LaneChangeEvents, StaleHoldEvents, fresh_plan, hides_stock_lane_change,
+                                               limits_plan, plan_events, shown_plan)
 
 from openpilot.common.version import get_build_metadata
 from openpilot.common.hardware import HARDWARE
@@ -326,6 +326,10 @@ class SelfdriveD:
     # (shown_plan: a disabled plan carries a handback's or turning off's abort; the alert priority is in hooks.plan_events)
     turnpilot_names = self.turnpilot_events.update(shown_plan(self.sm), DT_CTRL)
     for name in turnpilot_names:
+      self.events.add(getattr(EventName, name))
+    # TurnPilot's turn signal: who signals, the car or the driver, said (hooks.CarSignalEvents)
+    signal_flags = int(self.CP.flags) if self.CP.brand == 'tesla' else 0
+    for name in CAR_SIGNAL_EVENTS.update(shown_plan(self.sm), CS.carSignal, signal_flags, DT_CTRL):
       self.events.add(getattr(EventName, name))
     if self.sm['modelV2'].meta.laneChangeState == LaneChangeState.preLaneChange:
       direction = self.sm['modelV2'].meta.laneChangeDirection

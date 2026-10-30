@@ -70,6 +70,25 @@ Without a TTY, the bridge reads one command per line on stdin: `cruise_up` (enga
 `quit`. At the end of stdin (`< /dev/null`, `nohup`, a closed pipe) it keeps running until `quit`, Ctrl-C, SIGTERM or
 `--duration`, as with `--no-keyboard`. With a TTY, the keys are upstream's (`tools/sim/README.md`).
 
+### The car's own turn signal
+
+`--car-signals` makes the sim car signal TurnPilot's turns and lane changes itself, as a verified Tesla does
+(`docs/turnpilot/INSTALL.md`, "Let the car signal its own turns"). It writes `TurnPilotCarSignals` on and a sim verified
+record before the car's first CAN; card takes a sim record only with `SIMULATION=1`, and reads it when it fingerprints
+the car, so restart openpilot along with the bridge. The bridge also turns the body on whenever `TurnPilotCarSignals` is
+on or check when it starts. Then:
+
+- The car's body is opendbc's `BodyModel` (`opendbc/car/tesla/body_model.py`), the model the port's tests use. Its stock
+  `DAS_bodyControls` goes out on bus 2 at 2 Hz, and UI_warning's lamps come from it.
+- openpilot's 0x3E9 reaches the body only through a stand-in for the panda: LEFT and RIGHT while cruise is engaged, a
+  CANCEL within 3 s of one, and ownership of the message for 750 ms after the last frame. The exact panda rules are
+  tested through libsafety, not here.
+- `blinker_left` and `blinker_right` (keys `z` and `x`) work the driver's stalk in the body, so the car's CANCEL clears
+  it as on the car. `hazard` (key `h`) toggles the hazards.
+- The game's indicator follows the body's lamps. The bridge never reads it back.
+
+Without the flag or the param, every frame is the same as before.
+
 ## Gate 1
 
 `gate1.py` checks whether one desire pulse makes the driving model take a 90-degree junction. It spawns the car on the

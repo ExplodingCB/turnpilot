@@ -355,6 +355,24 @@ def test_C5_a_yield_whose_rolling_test_passes_through_its_commit_point_caps_the_
   assert car.s > 160.
 
 
+def test_a_stop_sign_brings_the_car_to_rest_and_a_yield_or_the_off_route_cap_never_does():
+  """A stop in force says where it brings the car to rest (decision.rest_d), braking toward it as well as held at it; a
+  yield's cap or the off-route cap is a speed, never a rest (turnpilotd keys a veto on a stop, never on a cap)."""
+  car = Car([(150., 'stop')])
+  out, dec = car.run_until(lambda out, dec: out.stops and dec.holding and car.v > 3.)
+  assert not dec.should_stop and dec.rest_d is not None and abs(dec.rest_d - (150. - car.s)) < 2.
+  out, dec = car.run_until(held)
+  assert dec.rest_d == 0.
+  car = Car([(150., 'yield')])
+  rests = [car.step()[1].rest_d for _ in range(int(20. / DT_MDL))]
+  assert all(r is None for r in rests)
+  car = Car([(400., 'signal')])
+  car.run(2.)
+  car.nav_valid, car.off_route, car.off_status = False, [], 'failed'
+  out, dec, _ = car.run(8.)
+  assert OFF_ROUTE_REASON in [s.reason for s in out.stops] and dec.holding and dec.rest_d is None
+
+
 def test_C5_a_yield_whose_rolling_test_fails_is_a_stop_yieldstop_at_its_line_on_the_map_curve_latched_under_the_decider():
   # 2.7, row C5 (mc): this week no yield's rolling test passes (no survey: 64-84 m of cross lane needed): the approach is the
   # map-stop curve to a full stop at the yield line (-1.5, floor -2.0), it becomes a stop (yieldStop) at its rolling commit

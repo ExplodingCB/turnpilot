@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 
 import openpilot.cereal.messaging as messaging
+import pytest
 from openpilot.cereal import custom, log
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
@@ -196,6 +197,8 @@ class Drive:
     self.lc_t = self.t = 0.
     self.offset = 0.  # the car's lateral offset from its lane's centre, positive left
     self.requests, self.prompts, self.offers, self.aborts, self.decisions = [], [], [], [], []
+    self.car_kw = {}  # the car's own signal (car_signals.py): lit_m, lead_m, car_block, signals_failed
+    self.car_lamp = False  # with car_kw: the car's lamp lights with the offer's warning, and lit_m counts from it
 
   def step(self, m, distance, objects=(), blinker=None, blindspot=None, maneuver_id=0, inputs_valid=True, stop_d=None):
     line_ys, probs, edges, stds = road(self.lanes_left, self.lanes_right)
@@ -209,7 +212,11 @@ class Drive:
       (self._lc_seen[-self.lag] if len(self._lc_seen) >= self.lag else LaneChangeState.off)
     d = self.lp.update(m, distance, lanes, lc_state, self.v, left_blinker, right_blinker, objects,
                        self.driver_signals, True, DT_MDL, self.paint(self.lanes_left, self.lanes_right) if self.paint else (),
-                       blindspot == LaneChange.left, blindspot == LaneChange.right, maneuver_id, inputs_valid, stop_d=stop_d)
+                       blindspot == LaneChange.left, blindspot == LaneChange.right, maneuver_id, inputs_valid, stop_d=stop_d,
+                       **self.car_kw)
+    if self.car_lamp:
+      lit = self.car_kw.get('lit_m', 0.) + self.v * DT_MDL if self.lp.signal_side != LaneChange.none else 0.
+      self.car_kw['lit_m'] = lit
     prev = self.decisions[-1] if self.decisions else None
     if d.lane_change != LaneChange.none and (prev is None or prev.lane_change == LaneChange.none):
       self.requests.append((d.lane_change, distance, self.t))
@@ -879,3 +886,72 @@ def test_an_offer_made_with_room_before_the_stop_is_never_called_unreachable_on_
   assert drive.offers and drive.lp.changes == 1, (drive.offers, drive.aborts)
   assert not [a for a, _ in drive.aborts if a == 'tooSlow']
   assert not any(d.unreachable for d in drive.decisions)
+
+
+# ---------------------------------------------------------------------------------------- the car's own signal (car_signals.py)
+
+def car_drive(v=15., lead=91.44):
+  drive = Drive(lanes_left=0, lanes_right=1, v=v)
+  drive.car_kw = {'lit_m': 0., 'lead_m': lead}
+  drive.car_lamp = True
+  return drive
+
+
+def test_car_signal_waits_for_the_legal_lead():
+  # the car's lamp goes on with the warning; the request waits, past the countdown, until it has led by 300 ft
+  drive = car_drive()
+  m = maneuver("turn", "right", TWO_LANES_RIGHT_TURN)
+  drive.run(m, 400., 20.)
+  assert drive.requests and not drive.aborts
+  (_, _, t_offer), (_, _, t_req) = drive.offers[0], drive.requests[0]
+  assert t_req - t_offer >= 91.44 / drive.v - 2 * DT_MDL and t_req - t_offer > LC_WARN_S
+  assert all(p == LaneChange.none for p in drive.prompts)  # never prompts
+
+
+def test_car_signal_short_window_is_too_late():
+  drive = car_drive(v=12.)
+  m = maneuver("turn", "right", TWO_LANES_RIGHT_TURN)
+  drive.run(m, 140., 12.)
+  assert not drive.requests and [a for a, _ in drive.aborts][:1] in (['tooLate'], [])
+
+
+def test_car_signal_failed_mid_offer_prompts_the_driver():
+  drive = car_drive()
+  m = maneuver("turn", "right", TWO_LANES_RIGHT_TURN)
+  distance = drive.run(m, 300., 2.)
+  assert drive.offers and drive.prompts[-1] == LaneChange.none
+  drive.car_lamp = False
+  drive.car_kw = {'lit_m': 0., 'lead_m': 91.44, 'signals_failed': True}
+  distance = drive.run(m, distance, LC_WARN_S)
+  assert drive.lp.phase == Phase.WAIT and drive.prompts[-1] == LaneChange.right
+  drive.run(m, distance, 3., blinker=LaneChange.right)
+  assert drive.requests
+
+
+def test_driver_offer_keeps_the_driver_path_when_ready():
+  drive = Drive(lanes_left=0, lanes_right=1, driver_signals=True)
+  m = maneuver("turn", "right", TWO_LANES_RIGHT_TURN)
+  distance = drive.run(m, 300., LC_WARN_S + 1.)
+  assert drive.lp.phase == Phase.WAIT
+  drive.driver_signals = False  # the car's signal turns ready mid-WAIT: this offer stays the driver's
+  drive.car_kw = {'lit_m': 999., 'lead_m': 91.44}
+  drive.run(m, distance, 1.)
+  assert drive.lp.phase == Phase.WAIT and drive.prompts[-1] == LaneChange.right and not drive.requests
+
+
+def test_car_block_aborts_no_signal():
+  # the driver's lamp the other way, or hazards, while the car signals the change: the driver declines it
+  drive = car_drive()
+  m = maneuver("turn", "right", TWO_LANES_RIGHT_TURN)
+  distance = drive.run(m, 300., 1.5)
+  assert drive.lp.phase == Phase.WARN
+  drive.car_kw = {**drive.car_kw, 'car_block': True}
+  drive.run(m, distance, 1.)
+  assert [a for a, _ in drive.aborts] == ['noSignal'] and not drive.requests
+
+
+def test_offer_room_uses_the_lead():
+  from openpilot.selfdrive.turnpilot.lane_planner import LC_OFFER_ROOM_S, offer_room_s
+  assert offer_room_s(11.2, None) == LC_OFFER_ROOM_S
+  assert offer_room_s(11.2, 91.44) == pytest.approx(91.44 / 11.2 + 1.5)  # 25 mph: 9.7 s
+  assert offer_room_s(40., 91.44) == pytest.approx(LC_WARN_S + 1.5)  # fast enough that the warning is longer

@@ -2,12 +2,14 @@ import time
 from collections.abc import Callable
 from multiprocessing import Queue
 
+from openpilot.common.params import Params
 from openpilot.common.realtime import Ratekeeper
+from openpilot.selfdrive.turnpilot.car_signals import read_mode
 from openpilot.tools.sim.bridge.common import QueueMessageType, SimulatorBridge
 from openpilot.tools.sim.bridge.beamng.control import AccelController
 from openpilot.tools.sim.bridge.beamng.driver import PromptedDriver
 from openpilot.tools.sim.bridge.beamng.sensors import BeamNGSensors
-from openpilot.tools.sim.bridge.beamng.tesla import SimulatedTesla
+from openpilot.tools.sim.bridge.beamng.tesla import SimulatedTesla, write_sim_car_signals
 from openpilot.tools.sim.bridge.beamng.world import BeamNGConfig, BeamNGState, BeamNGWorld
 
 MANUAL_STEER_DEG = 90.0  # steering wheel degrees for a full manual steer input
@@ -22,7 +24,9 @@ class BeamNGBridge(SimulatorBridge):
 
   Queue commands (tools/sim/bridge/common.py control_cmd_gen, from the keyboard, the CLI or a scenario script):
   cruise_up engages (or raises the set speed by 5 km/h), cruise_down engages at the current speed (or lowers it),
-  cruise_cancel cancels, plus upstream's steer_/throttle_/brake_/blinker_ commands, reset and quit.
+  cruise_cancel cancels, plus upstream's steer_/throttle_/brake_/blinker_ commands, reset and quit; with the car's own
+  turn signal (car_signals: TurnPilotCarSignals on or check at the start, or --car-signals) blinker_ works the driver's
+  stalk in the car's body and hazard toggles its hazards.
   `scenario` runs in the bridge process with the world after the first sensor data: scenario(bridge) -> None, called at
   100 Hz until it returns True (done)."""
 
@@ -61,9 +65,14 @@ class BeamNGBridge(SimulatorBridge):
       self.manual[1] = float(m[1])
     elif m[0] == "brake":
       self.manual[2] = float(m[1])
+    elif m[0] == "blinker" and car.body is not None:  # the driver's stalk in the body: a CANCEL clears it, as on the car
+      if m[1] in ("left", "right"):
+        car.toggle_stalk(m[1])
     elif m[0] == "blinker":  # the stalk latches: the same side again turns it off
       want = {"left": (True, False), "right": (False, True)}.get(m[1], (False, False))
       self.blinker = (False, False) if want == self.blinker else want
+    elif m[0] == "hazard" and car.body is not None:
+      car.toggle_hazards()
     elif m[0] == "ignition":
       state.ignition = not state.ignition
     elif m[0] == "reset":
@@ -73,7 +82,11 @@ class BeamNGBridge(SimulatorBridge):
 
   def _run(self, q: Queue):
     self.world = self.spawn_world(q)
-    self.car = SimulatedTesla()
+    # before the car's first CAN, so card's resolver reads it when it fingerprints the car
+    params = Params()
+    if self.cfg.car_signals:
+      write_sim_car_signals(params)
+    self.car = SimulatedTesla(car_signals=read_mode(params) in ('on', 'check'))
     self.sensors = BeamNGSensors()
     self.accel = AccelController()
     self.driver_accel = AccelController()
@@ -104,10 +117,16 @@ class BeamNGBridge(SimulatorBridge):
       state.user_gas, state.user_brake = gas, brake
       state.user_torque_nm = -steer_in * STEER_NM_PER_UNIT
       nav_left, nav_right = self.driver.update()
-      state.left_blinker, state.right_blinker = self.blinker[0] or nav_left, self.blinker[1] or nav_right
+      if self.car.body is not None:
+        self.car.driver_hold((nav_left, nav_right))
+        state.left_blinker, state.right_blinker = self.car.stalk
+      else:
+        state.left_blinker, state.right_blinker = self.blinker[0] or nav_left, self.blinker[1] or nav_right
 
       self.sensors.update(state, self.world)
       self.car.update(state)
+      if self.car.body is not None:
+        self.world.game_lights.set(self.car.lights)
 
       # what the Model 3's EPS and drive inverter would do with openpilot's DAS_steeringControl and DAS_control
       if self.car.lat_active() and steer_in == 0.0:

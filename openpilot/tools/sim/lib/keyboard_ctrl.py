@@ -29,6 +29,8 @@ KEYBOARD_HELP = """
   |  i   | Toggle Ignition       |
   |  q   | Exit all              |
   | wasd | Control manually      |
+  | z  x | Blinker left / right  |
+  |  h   | Hazards (BeamNG, with the car's own turn signal) |
 """
 
 
@@ -78,6 +80,8 @@ def keyboard_poll_thread(q: 'Queue[QueueMessage]'):
       q.put(control_cmd_gen("blinker_left"))
     elif c == 'x':
       q.put(control_cmd_gen("blinker_right"))
+    elif c == 'h':
+      q.put(control_cmd_gen("hazard"))
     elif c == 'i':
       q.put(control_cmd_gen("ignition"))
     elif c == 'r':

@@ -528,7 +528,7 @@ class MapControlPolicy:
 
   def held_stops(self) -> list:
     """The latch alone, for a faulted plan whose map update failed: a held car stays held."""
-    return [Stop(HOLD_ACCEL, 0., True, "Stopped at a map stop", 0.)] if self.held is not None else []
+    return [Stop(HOLD_ACCEL, 0., True, "Stopped at a map stop", 0., rest=True)] if self.held is not None else []
 
   def _transient(self, alert: str) -> None:
     self._alert, self._alert_t = alert, ABORT_HOLD_S
@@ -880,9 +880,9 @@ class MapControlPolicy:
     if creep > CREEP_AT_M:
       # on slowly to where it is asked: still the latch's (position-free), never past its target; a roll-up on the map curve
       ramp = curve(v, creep) if creep_v > CREEP_SPEED else math.sqrt(2. * MAP_STOP_DECEL * max(creep - CREEP_AT_M, 0.))
-      out.stops.append(Stop(accel, min(creep_v, ramp), False, reason, creep))
+      out.stops.append(Stop(accel, min(creep_v, ramp), False, reason, creep, rest=True))
       return
-    out.stops.append(Stop(HOLD_ACCEL, 0., True, reason, 0.))
+    out.stops.append(Stop(HOLD_ACCEL, 0., True, reason, 0., rest=True))
 
   def _stop_reason(self, c) -> str:
     return YIELD_STOP_REASON if c.kind == 'yield' else STOP_SIGN_REASON
@@ -1005,7 +1005,7 @@ class MapControlPolicy:
       self._held(c, controls, v, gas_pressed, 0., out, prompts)
       return False
     st.action = 'infeasible' if st.infeasible else 'braking' if (st.cap < v + 0.5 or accel < NO_ACCEL_CAP) else 'approaching'
-    out.stops.append(Stop(accel, st.cap, False, reason, c.d))
+    out.stops.append(Stop(accel, st.cap, False, reason, c.d, rest=True))
     return st.infeasible
 
   def _sign_evidence(self, c) -> None:

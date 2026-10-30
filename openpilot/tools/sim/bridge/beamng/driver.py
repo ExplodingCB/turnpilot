@@ -3,7 +3,11 @@
 stalk stays on until the change is made, then cancels as the wheel straightens, or goes off if the prompt does.
 The prompt comes with the warning (turnpilotPlan.laneChangeCountdown); the driver waits for the countdown to run out
 before working the stalk, as a driver who lets it run would, so the countdown runs in the sim. A blinker during the
-countdown is the go-ahead early (lane_planner.py), which would skip it."""
+countdown is the go-ahead early (lane_planner.py), which would skip it.
+
+A turn while the car's own signal isn't ready prompts "Signal Left/Right" (turnpilotPlan.turnSignal.prompt, DESIGN
+phase4/blinker 6.5): the driver works that side's stalk and holds it until the turn is over (turnSignal.side moves on), as
+the wheel's return cancels it, though the prompt goes as soon as the lamp is lit."""
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import custom, log
 from openpilot.selfdrive.turnpilot.hooks import PLAN_MAX_AGE_S
@@ -19,6 +23,8 @@ class PromptedDriver:
     self.side = LaneChange.none
     self.started = False
     self.signals = 0  # prompts answered, for the logs
+    self.turn_side = LaneChange.none
+    self.turn_signals = 0  # turn prompts answered
 
   def update(self) -> tuple[bool, bool]:
     """(left, right) blinker the driver holds now."""
@@ -34,7 +40,16 @@ class PromptedDriver:
       self.started = True
     elif self.started or prompt != self.side:
       self.side = LaneChange.none
-    return self.side == LaneChange.left, self.side == LaneChange.right
+
+    alive = self.sm.alive['turnpilotPlan']
+    turn = plan.turnSignal
+    if not alive or turn.side != self.turn_side:
+      self.turn_side = LaneChange.none  # the turn is over (or skipped, or another): the stalk goes back
+    if alive and self.turn_side == LaneChange.none and turn.prompt != LaneChange.none and turn.prompt == turn.side:
+      self.turn_side = turn.prompt
+      self.turn_signals += 1
+    side = self.side if self.side != LaneChange.none else self.turn_side
+    return side == LaneChange.left, side == LaneChange.right
 
 
 TAP_GAS, TAP_S = 0.25, 1.0  # the driver's go: this much gas for this long, an override (DisengageOnAccelerator off)

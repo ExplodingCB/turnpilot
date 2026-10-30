@@ -19,7 +19,7 @@ from beamngpy.sensors import AdvancedIMU, Electrics
 from openpilot.tools.sim.bridge.beamng import frame, scenario
 from openpilot.tools.sim.bridge.beamng.cameras import MOUNT, CameraRig
 from openpilot.tools.sim.bridge.beamng.pose import Pose, after_last_jump
-from openpilot.tools.sim.bridge.beamng.tesla import GEAR_D, GEAR_N, GEAR_P, GEAR_R
+from openpilot.tools.sim.bridge.beamng.tesla import GEAR_D, GEAR_N, GEAR_P, GEAR_R, GameLights
 from openpilot.tools.sim.lib.common import SimulatorState, World, vec3
 
 TESLA_STEER_RATIO = 12.0  # opendbc's Model 3; the game car is presented with this ratio, so paramsd needs no seeding
@@ -50,6 +50,9 @@ class BeamNGConfig:
   capture: str = ""  # mp4 path for the chase view (capture.py)
   capture_fps: float = 10.0
   restore: bool = False  # on exit, undo the global game changes above (signals, HUD, particles, light): the game is shared
+  # run_bridge.py --car-signals: write TurnPilotCarSignals on and a sim verified record before the car's first CAN, so the
+  # car signals TurnPilot's turns itself (tesla.py car_signals; the bridge also takes it when the param is on or check)
+  car_signals: bool = False
 
 
 def load_scenario(bng, cfg: BeamNGConfig, log=print) -> tuple[Vehicle, float]:
@@ -107,6 +110,7 @@ class BeamNGWorld(World):
     self.vlock = threading.Lock()
     self.threads: list[threading.Thread] = []
     self.ctrl = (0.0, 0.0, 1.0)  # BeamNG steering input (-1..1, right positive), throttle, brake
+    self.game_lights = GameLights()  # the indicator, following the car's body (tesla.py car_signals)
     self.pose: Pose | None = None
     self.el: dict | None = None
     self.vehicle_rate = 0.0
@@ -159,12 +163,17 @@ class BeamNGWorld(World):
         with self.vlock:
           conn = self.ego.connection
           rc = conn.send(ctrl)
+          lights = self.game_lights.take()
+          rl = conn.send(lights) if lights is not None else None
           re = conn.send(req)
           rc.ack("Controlled")
+          if rl is not None:
+            rl.ack("LightsSet")
           el = self.electrics.decode_response(re.recv("SensorData")["data"]["electrics"])
       except Exception as e:
         if self.stop.is_set():
           break
+        self.game_lights.failed()
         self.log(f"vehicle link error: {e!r}")
         time.sleep(0.5)
         continue

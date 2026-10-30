@@ -20,6 +20,7 @@ from pathlib import Path
 
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.turnpilot.car_signals import MODES as CAR_SIGNAL_MODES, read_mode
 from openpilot.selfdrive.turnpilot.maps import coverage as coverage_cache
 from openpilot.selfdrive.turnpilot.maps.client import MapError, cert_fingerprint, check_cert, check_key, missing_config, normalize_host
 from openpilot.selfdrive.turnpilot.maps.coverage import CoverageCache, CoverageRefresher, check_trip
@@ -192,6 +193,45 @@ class App:
       result = {"coverage_ok": False, "coverage_error": e.message}
     return {**self.map_settings(), **result}
 
+  def car_signals(self) -> dict:
+    """TurnPilot's turn signal settings for the page (car_signals.py, DESIGN phase4/blinker 7.8): the mode, the last
+    lamp check (step, result, why, its id and whether the outside lamps were confirmed), and the verified record's VIN."""
+    with self.store.lock:
+      params = self.store.params
+      mode = read_mode(params)
+      check = params.get("TurnPilotCarSignalsCheck")
+      record = params.get("TurnPilotCarSignalsVerified")
+    last = None
+    if check:
+      last = {k: check.get(k) for k in ("pass", "step", "why", "checkId", "exterior", "when")}
+      last["gear"] = (check.get("record") or {}).get("gear")
+    return {"mode": mode, "check": last, "verified": bool(record), "verified_vin": (record or {}).get("vin")}
+
+  def set_car_signals(self, body) -> dict:
+    """One of: {"mode": off|check|on}; {"startInDrive": true} (TurnPilotCarSignalsCheckNow, honoured only on a check
+    ignition with the car stopped in D and the brake held); {"exterior": yes|no, "checkId": ...}, the answer to "did the
+    lamps flash outside?", only for the pending check's id. The page never writes a record: card's resolver does."""
+    with self.store.lock:
+      params = self.store.params
+      if "mode" in body:
+        mode = body.get("mode")
+        if mode not in CAR_SIGNAL_MODES:
+          raise ApiError(400, "mode must be off, check or on")
+        params.put("TurnPilotCarSignals", mode, block=True)
+      elif body.get("startInDrive") is True:
+        params.put_bool("TurnPilotCarSignalsCheckNow", True, block=True)
+      elif "exterior" in body:
+        verdict = body.get("exterior")
+        if verdict not in ("yes", "no"):
+          raise ApiError(400, "exterior must be yes or no")
+        check = params.get("TurnPilotCarSignalsCheck") or {}
+        if not check.get("pass") or check.get("exterior") != "pending" or body.get("checkId") != check.get("checkId"):
+          raise ApiError(409, "No pending check with that id: run the check again")
+        params.put("TurnPilotCarSignalsExterior", f"{verdict}:{check['checkId']}", block=True)
+      else:
+        raise ApiError(400, "send mode, startInDrive or exterior")
+    return self.car_signals()
+
   def coverage_body(self) -> dict:
     coverage, error = self.cached_coverage()
     if coverage is None:
@@ -318,6 +358,10 @@ class Handler(BaseHTTPRequestHandler):
       return app.map_settings()
     if method == "POST" and path == "/api/map":
       return {"ok": True, **app.set_map_settings(self.body())}
+    if method == "GET" and path == "/api/car-signals":
+      return app.car_signals()
+    if method == "POST" and path == "/api/car-signals":
+      return {"ok": True, **app.set_car_signals(self.body())}
     if method == "POST" and path == "/api/favorites":
       body = self.body()
       return {"ok": True, **store.add_favorite(number(body.get("latitude")), number(body.get("longitude")), body.get("name"))}

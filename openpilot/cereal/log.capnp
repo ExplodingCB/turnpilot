@@ -141,6 +141,7 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     turnpilotControlPrompt @114;    # TurnPilot map stop control: turnpilotPlan.controlPrompt (stop sign / signal go)
     turnpilotControlAlert @115;     # TurnPilot map stop control: turnpilotPlan.controlAlert
     turnpilotRouteNotice @116;      # TurnPilot stop signs on the route (STOP_SIGNS.md 3.4): said engaged or not (turnpilotPlan.routeNotice)
+    turnpilotCarSignal @117;        # TurnPilot's turn signal: turnpilotPlan.turnSignal (tp/blinker's, after tp/integrate's @116)
 
     # TurnPilot: a planned lane change is coming (chime, countdown), and one was aborted before it started
     turnpilotLaneChangeLeft @110;

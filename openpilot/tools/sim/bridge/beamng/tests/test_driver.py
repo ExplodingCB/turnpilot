@@ -23,10 +23,22 @@ class FakeSM(dict):
     msg.turnpilotPlan.laneChangeCountdown = countdown
     self['turnpilotPlan'] = msg.as_reader().turnpilotPlan
 
+  def turn(self, prompt, side):
+    """turnpilotPlan.turnSignal: the turn's side, and the prompt to signal it while the car's own signal isn't ready."""
+    msg = messaging.new_message('turnpilotPlan')
+    msg.turnpilotPlan.turnSignal.prompt, msg.turnpilotPlan.turnSignal.side = prompt, side
+    self['turnpilotPlan'] = msg.as_reader().turnpilotPlan
 
-def test_stalk_waits_for_the_countdown():
+
+def new_driver():
   driver = PromptedDriver.__new__(PromptedDriver)
   driver.sm, driver.side, driver.started, driver.signals = FakeSM(), LaneChange.none, False, 0
+  driver.turn_side, driver.turn_signals = LaneChange.none, 0
+  return driver
+
+
+def test_stalk_waits_for_the_countdown():
+  driver = new_driver()
   for countdown in (3., 2., 0.5):  # the warning: prompted, but the countdown is still running
     driver.sm.plan(LaneChange.left, countdown)
     assert driver.update() == (False, False)
@@ -39,6 +51,24 @@ def test_stalk_waits_for_the_countdown():
   assert driver.update() == (True, False)
   driver.sm['modelV2'] = messaging.new_message('modelV2').as_reader().modelV2  # the change is done
   driver.sm.plan(LaneChange.none, 0.)
+  assert driver.update() == (False, False)
+
+
+def test_stalk_answers_the_turn_prompt_and_holds_it_through_the_turn():
+  """turnSignal.prompt ("Signal Left") is answered with that side's stalk, held until the turn is over (the wheel's
+  return), though the prompt goes as soon as the lamp is lit."""
+  driver = new_driver()
+  driver.sm.turn(LaneChange.none, LaneChange.left)  # armed, the car's signal ready: no prompt, no stalk
+  assert driver.update() == (False, False)
+  driver.sm.turn(LaneChange.left, LaneChange.left)
+  assert driver.update() == (True, False) and driver.turn_signals == 1
+  driver.sm.turn(LaneChange.none, LaneChange.left)  # the lamp is lit: the prompt goes, the stalk stays
+  assert driver.update() == (True, False)
+  driver.sm.turn(LaneChange.none, LaneChange.none)  # the turn is done
+  assert driver.update() == (False, False) and driver.turn_signals == 1
+  driver.sm.turn(LaneChange.right, LaneChange.right)
+  assert driver.update() == (False, True) and driver.turn_signals == 2
+  driver.sm.alive['turnpilotPlan'] = False  # turnpilotd gone: the driver lets go
   assert driver.update() == (False, False)
 
 
