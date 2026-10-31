@@ -21,7 +21,7 @@ T_IDXS = ModelConstants.T_IDXS
 def test_schema_carries_the_certified_go_and_the_lift():
   # appended only: TurnpilotPlan @32 after unprotectedLeft @31, LongitudinalPlan @41-@42 after accelBoost @40
   causes = list(custom.TurnpilotPlan.GoCertified.Cause.schema.enumerants)
-  assert causes == ['none', 'turnRelease', 'unprotectedLeft', 'stopSign', 'rollUp', 'creep', 'clearBox']
+  assert causes == ['none', 'turnRelease', 'unprotectedLeft', 'stopSign', 'rollUp', 'creep', 'clearBox', 'unstick']  # unstick: S2's 4.5
   fields = custom.TurnpilotPlan.schema.fields
   assert fields['goCertified'].proto.ordinal.explicit == 32
   assert list(custom.TurnpilotPlan.GoCertified.schema.fields) == ['cause', 'id', 't']

@@ -58,7 +58,7 @@ TAKEOVER_FROM_S = 1.
 TAKEOVER_T_S = 2.
 TAKEOVER_S = 0.3
 TAKEOVER_SAMPLES = np.linspace(TAKEOVER_FROM_S, TAKEOVER_T_S, 5)
-CAUSES = ('turnRelease', 'unprotectedLeft', 'stopSign', 'rollUp', 'creep', 'clearBox')  # TurnpilotPlan.GoCertified.Cause
+CAUSES = ('turnRelease', 'unprotectedLeft', 'stopSign', 'rollUp', 'creep', 'clearBox', 'unstick')  # TurnpilotPlan.GoCertified.Cause
 
 
 def model_takes_over(model) -> bool:

@@ -414,6 +414,12 @@ RELEASE_UNSIGNALIZED = False
 # live and reading no head of any colour, no detector stop-sign box in a forward run for SIGN_CLEAR_S (and the camera's signs
 # read at all). A red or yellow from any source still blocks, a mapped signal still needs an accepted green
 SIGN_CLEAR_S = 5.
+# TurnPilotAlwaysDrive, section 4.5 (the owner's yes): a model stop off any hold (stopped_unheld's stand) gets one lift of its own
+# cause (unstick) from UNSTICK_S, only where release_light reads 'none' (controls ok), unsignalized_why reads nothing, nothing
+# is in the path and no model lead within GO_CLEAR_M (go_blocked), and no far-side turn or the left is near; said with a chime
+# (unstickLift), inside the release's RELEASE_LIFT_M, no second try until the model drives on (unstick_done)
+UNSTICK_S = 10.
+UNSTICK_REASON = "Nothing ahead is holding the car: going on"
 # the stop-sign decider's go causes (stop_go.py, go_override.CAUSES): its own watchdog (the gate, G5's window, GO_RETRIES, H5)
 # follows them, never the no-move clock, and turnRelease never certifies alongside one
 STOP_GO_CAUSES = ('stopSign', 'rollUp', 'creep', 'clearBox')
@@ -686,6 +692,9 @@ class TurnPilot:
     self.stall_why = ''            # ...why none may go now, as last logged
     self.stall_alert_t = 0.        # ...s left of its stallLift alert
     self.unsig_why = ''            # under the switch, why a release where no signal is mapped isn't lifted, as last logged
+    self.unstick_done = False      # under the switch, section 4.5's lift went for this release: no second try (stopped_unheld)
+    self.unstick_id: int | None = None  # ...as this go (GoCertifier.id)
+    self.unstick_alert_t = 0.      # ...s left of its unstickLift alert
     self.people_runs: dict = {}    # (camera, view) -> [s old, the person boxes] of each camera's last detector run
     self.abandon_s = 0.            # the model steering away from the route's turn in the junction (turn_abandoned)
     self.wrong_s = 0.              # s of reads of a yellow line on the car's right (wrong_side)
@@ -1330,6 +1339,9 @@ class TurnPilot:
     stalled = self.stalled_in_turn(sm, cs, v_ego, acting, decision, mapd, objects=objects, raw=raw, available=available,
                                    took_over=took_over, right_hand_traffic=right_hand_traffic)
     stopped = self.stopped_unheld(sm, cs, v_ego, acting, decision, mapd, objects=objects, raw=raw)
+    if self.always_drive_on and stopped and self.stopped_s >= UNSTICK_S - 1e-6 and not self.stopped_said and not stalled and \
+       not self.turn_committed:  # a stand with a turn's desire out is the turn's (its stall, LEFT-21's person veto), never this
+      self.unstick(sm, cs, v_ego, decision, objects, raw, available, took_over, right_hand_traffic)
     abandoned = self.turn_abandoned(sm, cs, v_ego, acting)
     wrong_side = self.wrong_side(sm, cs, v_ego, acting, paint, right_hand_traffic)
     if withdrawn or self.cant_start_unheld:  # the switch's has no hold: the model drives on under it (no_move)
@@ -1349,6 +1361,9 @@ class TurnPilot:
         plan.controlAlert = 'carStoppedNote'
     elif stopped:
       plan.controlPrompt, plan.reason = 'carStoppedTakeControl', stopped
+    if self.unstick_alert_t > 0. and str(plan.controlPrompt) == 'none' and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS:
+      plan.controlAlert, plan.reason = 'unstickLift', UNSTICK_REASON  # section 4.5's lift: said with a chime
+    self.unstick_alert_t = max(self.unstick_alert_t - DT_MDL, 0.)
     if self.green_alert_t > 0. and str(plan.controlPrompt) == 'none' and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS:
       plan.controlAlert, plan.reason = 'lightGreenNotMoving', LIGHT_GREEN_REASON  # the model not going at a camera green: said
     self.green_alert_t = max(self.green_alert_t - DT_MDL, 0.)
@@ -2032,9 +2047,9 @@ class TurnPilot:
     if not self.always_drive_on:
       return
     if (self.rel_takeover_held and v_ego >= STANDSTILL_SPEED) or not sm['carControl'].enabled or cs.gasPressed:
-      self.rel_lift_m, self.rel_goes = 0., 0
+      self.rel_lift_m, self.rel_goes, self.unstick_done = 0., 0, False
     gc = self.go_cert
-    if gc.active and ((gc.cause == 'turnRelease' and gc.id == self.go_cert_id) or gc.id == self.stall_lift_id):
+    if gc.active and ((gc.cause == 'turnRelease' and gc.id == self.go_cert_id) or gc.id in (self.stall_lift_id, self.unstick_id)):
       self.rel_lift_m += v_ego * DT_MDL
       if self.rel_lift_m >= RELEASE_LIFT_M - 1e-6:
         cloudlog.event("turnpilot.release_budget", go_id=gc.id, lifted_m=round(self.rel_lift_m, 2), goes=self.rel_goes)
@@ -2115,6 +2130,8 @@ class TurnPilot:
       why = self.release_blocked(distance, gc.cause)
     if not why and gc.id == self.stall_lift_id:
       why = self.stall_veto(sm['modelV2'], objects)
+    if not why and gc.id == self.unstick_id:
+      why = self.unstick_veto()
     if why:
       if why == 'inPath':
         cloudlog.event("turnpilot.go_path_blocked", go_id=gc.id, blocker=path_blocker(objects, raw))
@@ -2320,6 +2337,27 @@ class TurnPilot:
     if self.map_controls.release_light(self.follower.distance) in ('red', 'yellow'):
       return 'light'
     return 'person' if self.person_near_turn(objects, model) else ''
+
+  def unstick(self, sm, cs, v_ego: float, decision, objects, raw, available: bool, took_over: bool, right_hand_traffic: bool) -> None:
+    """Section 4.5's lift under the switch (module constants): once per release, a model stop off any hold standing UNSTICK_S,
+    nothing refusing it."""
+    gc = self.go_cert
+    if self.unstick_done or gc.active or not self.go_override or v_ego >= STANDSTILL_SPEED:
+      return
+    m, rf = self.follower.upcoming, self.follower
+    far_turn = m is not None and far_side_turn(m, right_hand_traffic) and rf.distance < STOPPED_CONTROL_M
+    if self.go_blocked(sm, cs, available, objects, raw, decision, took_over) or far_turn or \
+       (self.left_now is not None and self.left_now.state != 'off') or self.unstick_veto() or \
+       self.rel_lift_m > RELEASE_LIFT_M - RELIFT_MIN_M:
+      return
+    if gc.start('unstick', relift=True, stood_s=round(self.stopped_s, 1), lifted_m=round(self.rel_lift_m, 2)):
+      self.unstick_done, self.unstick_id, self.unstick_alert_t = True, gc.id, ABORT_HOLD_S
+
+  def unstick_veto(self) -> str:
+    """What bars section 4.5's lift, or withdraws one out, '' if nothing: the car's place not read as no signal with navd's
+    controls ok (release_light 'none'), or unsignalized_why."""
+    light = self.map_controls.release_light(0.)
+    return f"light {light}" if light != 'none' else self.unsignalized_why(0.)
 
   def watch_people(self, *runs) -> None:
     """The person boxes of each camera's last detector run (PEOPLE), PERSON_RUN_HOLD_S at most (person_near_turn)."""

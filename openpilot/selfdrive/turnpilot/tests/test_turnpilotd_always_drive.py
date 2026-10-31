@@ -24,7 +24,7 @@ from openpilot.selfdrive.turnpilot.unprotected_left import LIGHT_RED_MAX_S
 from openpilot.selfdrive.turnpilot.turnpilotd import (LEAD_STAND_MAX_S, LIGHT_GREEN_REASON, LIGHT_WAIT_NOTE, NEAR_CONTROL_STAND_S, NO_MOVE_MAX_S,
                                                       NO_MOVE_REASON, NO_MOVE_S, QUEUE_STILL_MAX_S, RELEASE_GOES, RELEASE_LIFT_M, STALLED_REASON,
                                                       STALL_LIFTS, STALL_LIFT_GAP_S, STALL_LIFT_REASON, STALL_PROMPT_S, STALL_REPULSE_S,
-                                                      STANDSTILL_SPEED, STOPPED_NOTE, STOPPED_NOTE_S, TurnPilot)
+                                                      STANDSTILL_SPEED, STOPPED_HANDBACK_S, STOPPED_NOTE, STOPPED_NOTE_S, TurnPilot, UNSTICK_S)
 
 Desire = log.Desire
 
@@ -612,3 +612,53 @@ def test_a_release_where_no_signal_is_mapped_is_lifted_only_under_section_4_5s_c
   assert certified_causes(released_where_no_signal_is(True, lights=None)) == set()  # the reader not live: no head can't be known
   assert certified_causes(released_where_no_signal_is(True, signs=True)) == set()
   assert certified_causes(released_where_no_signal_is(True, controls=[(315., 'yield')])) == set()
+
+
+# --- section 4.5 (owner's yes, under the switch): the unstick lift on a model stop off any hold ---
+
+def stood_off_any_hold(on: bool, seconds: float, status='ok', lights=NO_HEADS, signs=False, controls=(), **kw):
+  """The model stands the car on a straight with nothing of TurnPilot's holding it (a model stop off any hold), navd's controls
+  status status, the camera's reads lights, a stop-sign box in every road run with signs. Returns the plans of the stand."""
+  sim = Sim(STRAIGHT, controls=list(controls), controls_status=status)
+  sim.tp.always_drive = on
+  sim.lights = lights
+  sim.raw = lambda s: RawFrame([], 'road', s.t, signs=((0., 2., 0.8),) if signs else ())
+  sim.run(1.)
+  return sim, stand(sim, seconds, **kw)
+
+
+def unstick_spans(plans):
+  ids = [int(q.goCertified.id) for q in plans if str(q.goCertified.cause) == 'unstick']
+  return sorted(set(ids))
+
+
+def test_a_model_stop_off_any_hold_gets_one_unstick_lift_at_10_s_under_section_4_5s_conditions():
+  """ALWAYS_DRIVE.md section 4.5 (the owner's yes): under the switch one lift per stand at UNSTICK_S, a GoCertified cause of its
+  own (unstick), said with a chime, only where release_light reads 'none' (controls ok), no map control within 30 m, the
+  camera's shadow reader reads no head of any colour, no detector stop-sign box, nothing in the path and no model lead within
+  GO_CLEAR_M; no second try; the stand's 60 s handback as before. Switch off: never."""
+  sim, plans = stood_off_any_hold(True, STOPPED_HANDBACK_S + 1.)
+  ids = unstick_spans(plans)
+  assert len(ids) == 1, ids
+  first = next(i for i, q in enumerate(plans) if str(q.goCertified.cause) == 'unstick')
+  assert abs(first * DT_MDL - UNSTICK_S) <= 0.15, first * DT_MDL
+  assert any(str(q.controlAlert) == 'unstickLift' for q in plans[first - 2:first + 2])
+  assert plans[-1].controlPrompt == 'carStoppedTakeControl' and not any(q.shouldStop for q in plans)
+  for kw in ({'on': False}, {'status': 'partial'}, {'lights': camera_heads(('unknown', 60.))}, {'lights': None}, {'signs': True},
+             {'controls': [(25., 'yield')]}, {'lead_prob': 0.9, 'lead_x': GO_CLEAR_M - 5.}):
+    args = {'on': True, **kw}
+    _, plans = stood_off_any_hold(args.pop('on'), UNSTICK_S + 4., **args)
+    assert not unstick_spans(plans), kw
+
+
+def test_a_stand_in_a_turn_never_gets_the_unstick_lift():
+  """Section 4.5's lift is for a model stop off any hold, never a stand with the route's turn desire out: a stall partway round
+  is LEFT-21's (its person veto), and its handback isn't lifted under at UNSTICK_S."""
+  sim = stalled_right(True, 45., controls_status='ok')
+  sim.lights = NO_HEADS
+  sim.raw = lambda s: RawFrame([], 'road', s.t)
+  x, y = car_frame(sim, sim.tp.follower.distance + 3., -12.)
+  person = [{'cls': 'pedestrian', 'x': x, 'y': y, 'vx': 0., 'vy': 0., 'inPath': False, 'age': 1}]
+  plans = stand(sim, UNSTICK_S + 5., objects=person)
+  assert not unstick_spans(plans) and not lifts_of(plans)
+  assert any(q.controlPrompt == 'stalledTakeControl' for q in plans)

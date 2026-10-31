@@ -66,7 +66,7 @@ SILENT_PROMPTS = ('none', 'yieldAhead', 'waitingForGap', 'creepingForView', 'wai
 RETIRED_PROMPTS = ('stopSignGo', 'signalGo', 'unprotectedTurnGo', 'carStoppedGo')
 RETIRED_ALERTS = ('goingOnRed',)
 CONTROL_ALERT_EVENTS = ('stopOverrun', 'proceedingOnYellow', 'junctionUncertain', 'carStoppedNote',  # below the prompt, above a lane change
-                        'lightGreenNotMoving')
+                        'lightGreenNotMoving', 'unstickLift')
 CONTROL_STATUS_ALERTS = ('mapControlsUnavailable', 'lightSourceRejected', 'farViewOff', 'sideCamerasOff')  # last of all, a status line
 # the route's stop signs (route_notice.py, STOP_SIGNS.md 3.4): said engaged or not (turnpilotRouteNotice, a permanent alert), the
 # text in turnpilotPlan.routeNotice; all but routeAvoidsStops with a chime
@@ -186,6 +186,7 @@ CONTROL_ALERT_TEXT = {
   'stopAheadNeedsYou': 'Stop sign ahead needs you',
   'carStoppedNote': 'Nothing ahead is holding the car',  # the stopped note's chime (turnpilotd.py), before its handback
   'lightGreenNotMoving': 'Light green: car not moving',  # under TurnPilotAlwaysDrive, a steady camera green the model doesn't go on
+  'unstickLift': 'Nothing ahead is holding the car: going on',  # under TurnPilotAlwaysDrive, section 4.5's lift
 }
 
 

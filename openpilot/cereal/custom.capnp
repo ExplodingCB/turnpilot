@@ -234,6 +234,9 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     # reader reading a steady green and the model not going (turnpilotd.py stopped_unheld): "Light green: car not moving", a chime,
     # once a green; never a lift
     lightGreenNotMoving @26;
+    # ALWAYS_DRIVE.md section 4.5 (TurnPilotAlwaysDrive): the unstick lift for a model stop off any hold (turnpilotd.py
+    # stopped_unheld): "Nothing ahead is holding the car: going on", a chime
+    unstickLift @27;
   }
   mapControl @24 :MapControlStatus;
   controlPrompt @25 :ControlPrompt;
@@ -319,6 +322,7 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
       rollUp @4;           # rolling up to the stop line after a queue
       creep @5;            # one creep step
       clearBox @6;         # stalled past the in-lane point after the commit
+      unstick @7;          # ALWAYS_DRIVE.md section 4.5 (TurnPilotAlwaysDrive): a model stop off any hold, nothing seen to stop for
     }
     cause @0 :Cause;
     id @1 :UInt32;     # a new one for every go (never repeated in a drive): plannerd gives each go its own window
