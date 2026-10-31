@@ -127,6 +127,7 @@ from openpilot.selfdrive.turnpilot.map_controls import CREEP_AT_M, CREEP_SPEED, 
 from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
 from openpilot.selfdrive.turnpilot.routing import certify as ce
 from openpilot.selfdrive.turnpilot.routing.junctions import survey_approach
+from openpilot.selfdrive.turnpilot.scene.tracker import PATH_X, predicted_path
 from openpilot.selfdrive.turnpilot.scene_policy import ENTER_T_S, PATH_HALF_WIDTH_M, STOP_SPEED, ScenePolicy, Stop, b_only, stop
 from openpilot.selfdrive.turnpilot.stop_evidence import APPROACH_V, DOWNGRADE_V, DOWNGRADE_WINDOW_M, MOVE_TOL_M, StopEvidence, class_name, \
   junction_lanes
@@ -302,9 +303,9 @@ RAIL_GAP_M = 1.0                # m short of the vehicle's ground point (its nea
 RAIL_MARGIN_S = 1.0             # s: a vehicle clearing our corridor this long before we would reach it passes ahead of us
 RAIL_HALF_LEN_M = CAR_LEN_M / 2.  # m either side of a crossing vehicle's ground point along its motion its body reaches
 RAIL_ENTER_S = ENTER_T_S        # s: a vehicle entering our corridor within this is in our path (scene_policy's for a walker)
+STRAIGHT_PATH = (np.array([0., PATH_X]), np.zeros(2))  # predicted_path's straight ahead, before the model gives a path
 RAIL_RELEASE_S = 1.0            # s a rail's vehicle must have been out of our corridor and not coming back into it (by its
 #                                 measured motion, never its vy) before the rail lets go
-RAIL_RESET_DEG = 15.            # deg of turned_deg in one frame no car turns: turnpilotd's yaw since the go reset (0), not a turn
 
 
 @dataclass
@@ -344,6 +345,7 @@ class Frame:
   yaw20_deg: float = 0.          # the car's heading change over its last 20 m (its yaw off its approach)
   approach_yaw_deg: float = 0.   # its yaw into the route's turn since the turn's desire (the union rule)
   turned_deg: float = 0.         # its yaw since the decider's go (the crossing cycle's end)
+  heading_deg: float = 0.        # its yaw (left +) since turnpilotd started, never reset: the in-path rail's ground frame
   steer_deg: float = 0.
   desire_out: bool = False       # a turn desire has gone out for the maneuver at this control
   model_v2: Any = None
@@ -597,8 +599,12 @@ class StopGo:
     self.rail_ev = ScenePolicy()
     self.rail_pose = (0., 0., 0.)
     self.rail_odo: float | None = None
-    self.rail_turned = 0.
+    self.rail_heading: float | None = None
     self.rail_tracks: dict[int, RailTrack] = {}
+    # our path ahead in our frame now (x, y left), the model's (predicted_path), and the last one the model gave in the
+    # ground frame, carried for the frames it gives none (standing mid-turn): the rail's corridor is about it
+    self.rail_path: tuple = STRAIGHT_PATH
+    self.rail_path_g: tuple | None = None
 
   def _take(self, ctl, f: Frame) -> None:
     """A new encounter with control ctl (held, or engaged ahead)."""
@@ -720,20 +726,20 @@ class StopGo:
   def _rail_feed(self, f: Frame) -> None:
     """The in-path rail's evidence, on every vision frame of the encounter (from the approach, so a vehicle seen before the
     commit has its hits and its window there): scene_policy's TrackEvidence for every motor vehicle and cyclist
-    (ScenePolicy.update_evidence on the decider's clock: _rail_confirmed), our ground pose (the odometer along the heading
-    turned_deg gives; turnpilotd's yaw since the go reset to 0 taken as no turn), and each vehicle's matches (its age rising, at a
-    new ground point: never one match held over the frames between the detector's runs, or the sim oracle's 4 Hz sample
-    held) in the ground frame, with the motion they show (_rail_motion)."""
-    dturn = f.turned_deg - self.rail_turned
-    self.rail_turned = f.turned_deg
-    if abs(dturn) > RAIL_RESET_DEG:
-      dturn = 0.
+    (ScenePolicy.update_evidence on the decider's clock: _rail_confirmed), our ground pose (the odometer along heading_deg,
+    turnpilotd's yaw integral, never reset: turned_deg's reset to 0 as a go is withdrawn mid-turn would read as a turn back),
+    our path ahead (_rail_path_now), and each vehicle's matches (its age rising, at a new ground point: never one match held
+    over the frames between the detector's runs, or the sim oracle's 4 Hz sample held) in the ground frame, with the motion
+    they show (_rail_motion)."""
+    dturn = 0. if self.rail_heading is None else f.heading_deg - self.rail_heading
+    self.rail_heading = f.heading_deg
     px, py, h = self.rail_pose
     ds = 0. if self.rail_odo is None else max(f.odo_m - self.rail_odo, 0.)
     self.rail_odo = f.odo_m
     h1 = h + math.radians(dturn)
     px, py = px + ds * math.cos((h + h1) / 2.), py + ds * math.sin((h + h1) / 2.)
     self.rail_pose = (px, py, h1)
+    self._rail_path_now(f)
     objs = [o for o in f.objects or () if class_name(o.cls) in MOTOR + CYCLISTS]
     self.rail_ev.t = self.t
     self.rail_ev.update_evidence([o for o in objs if hasattr(o, 'age')])  # one without hits is never a confirmed track
@@ -758,6 +764,31 @@ class StopGo:
       if tid not in present:
         r.fresh = False
     self.rail_tracks = {tid: r for tid, r in self.rail_tracks.items() if tid in self.rail_ev.tracks}  # KEEP_EVIDENCE_S, as its evidence
+
+  def _rail_path_now(self, f: Frame) -> None:
+    """Our path ahead in our frame now (rail_path): the model's (predicted_path), kept in the ground frame (rail_path_g) for
+    the frames it gives none (standing, it plans nothing ahead) and brought into our frame then; straight ahead before it has
+    given one. The rail's corridor follows it: mid-turn, a car waiting at the opposite line comes into the straight ahead
+    for 1-7 m of a left turn's arc (R 8-15 m) while the path curves away from it."""
+    X, Y, H = self.rail_pose
+    c, s = math.cos(H), math.sin(H)
+    px, py = predicted_path(f.model_v2) if f.model_v2 is not None else STRAIGHT_PATH
+    if len(px) > 2 or np.any(py):  # the model's own, not predicted_path's straight ahead
+      self.rail_path, self.rail_path_g = (px, py), (X + px * c - py * s, Y + px * s + py * c)
+      return
+    if self.rail_path_g is None:
+      self.rail_path = STRAIGHT_PATH
+      return
+    gx, gy = self.rail_path_g
+    ex, ey = (gx - X) * c + (gy - Y) * s, -(gx - X) * s + (gy - Y) * c
+    rising = ex > np.maximum.accumulate(np.r_[-np.inf, ex[:-1]])  # np.interp needs increasing x
+    ex, ey = ex[rising], ey[rising]
+    self.rail_path = (ex, ey) if len(ex) >= 2 else STRAIGHT_PATH
+
+  def _off_path(self, o) -> float:
+    """m its ground point is left of our path ahead at its range (rail_path; beyond the path's ends, its end's y)."""
+    px, py = self.rail_path
+    return float(o.y) - float(np.interp(float(o.x), px, py))
 
   def _rail_motion(self, r: RailTrack, o, odo: float) -> None:
     """A vehicle's motion over its matches since RAIL_HIST_S (at least RAIL_MOVE_S of them), in our current frame: its ground
@@ -815,7 +846,7 @@ class StopGo:
     it. One moving on ahead of us along our path (its vx over MOVING_V and, once measured, its ground point too, faster than
     across) is a lead, the model's. inf: never."""
     r = self.rail_tracks.get(o.trackId)
-    y, vy = float(o.y), float(o.vy)
+    y, vy = self._off_path(o), float(o.vy)  # off our path ahead (straight ahead but mid-turn)
     if float(o.vx) > MOVING_V:
       if r is not None and r.along is not None and r.lat is not None:
         lead = r.along > MOVING_V and r.along > abs(r.lat)

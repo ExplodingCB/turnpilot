@@ -677,6 +677,7 @@ class TurnPilot:
     self.sg_last: StopGoDecision | None = None  # the last frame's (stop_go_update), for a failed frame to carry on
     self.sg_carried = 0  # failed frames in a row carried on from it
     self.sg_turned = 0.           # deg the car has turned since the decider's go
+    self.sg_heading = 0.          # deg the car has turned since turnpilotd started, never reset (the decider's in-path rail)
     self.alt_scene_id = ALT_SCENE_ID  # the scene's maneuver id for the ladder's other turn in hand (a new one per encounter)
     self.alt_was_on = False
     self.alt_route_id: int | None = None  # the route's maneuver the ladder's other turn was taken in place of (turn_skip's)
@@ -1898,6 +1899,7 @@ class TurnPilot:
         self.yaw20.pop(0)
     going = self.sg_now is not None and self.sg_now.state in ('going', 'committed', 'inLane')
     self.sg_turned = self.sg_turned + dyaw if going else 0.
+    self.sg_heading += dyaw
 
   def stop_go_update(self, sm, cs, model, v_ego: float, acting: bool, objects, rf) -> StopGoDecision:
     """This frame's stop-sign decision (stop_go.py) for the held stop sign (map_controls.held_control()) or the engaged one
@@ -1960,6 +1962,7 @@ class TurnPilot:
                 surveys=self.survey_source(), wall_t=self.decider_clock(), side_status=side_status, lenses=lenses,
                 position_spread=src.fix_spread if src is not None else 0., v_ego=v_ego, a_ego=float(cs.aEgo), odo_m=self.odo_m,
                 yaw20_deg=sum(y for _, y in self.yaw20), approach_yaw_deg=self.approach_yaw_deg, turned_deg=self.sg_turned,
+                heading_deg=self.sg_heading,
                 steer_deg=float(cs.steeringAngleDeg), desire_out=d.maneuver_id == alt_id and d.started and d.side != 0 and not d.done,
                 model_v2=model, lead_m=lead_m, t_abort=sr.t_abort(self.cp_delay, vis.actuator_delay_s if vis is not None else None),
                 enabled=bool(sm['carControl'].enabled), right_blindspot=bool(cs.rightBlindspot), tp_holding=self.last_holding,

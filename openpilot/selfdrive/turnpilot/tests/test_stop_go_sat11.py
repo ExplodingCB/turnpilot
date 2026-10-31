@@ -809,7 +809,7 @@ CAMERA_FIXTURE = Path(__file__).parent / 'sat11_camera_rail.json'
 
 def rail_on_log(clip, armed=lambda fr: 0.3 < fr['v'] < 8., standing_x=None):
   """The decider's in-path rail (StopGo._rail_feed every frame, _rail_pick on the frames armed(frame) says) on a logged clip's
-  camera scene objects (tests/sat11_camera_rail.json), along the logged trajectory: the odometer from vEgo, turned_deg from the
+  camera scene objects (tests/sat11_camera_rail.json), along the logged trajectory: the odometer from vEgo, heading_deg from the
   model's yaw rate. standing_x: that track's x made a standing car's (its median ground x less the odometer, the logged range
   noise taken out; its y as logged). Returns ([(t, trackId, crossing)] of each pick, the decider)."""
   frames = json.loads(CAMERA_FIXTURE.read_text())['clips'][clip]['frames']
@@ -830,7 +830,7 @@ def rail_on_log(clip, armed=lambda fr: 0.3 < fr['v'] < 8., standing_x=None):
     objs = tuple(SimpleNamespace(trackId=o[0], cls=o[1], x=gx - odo if o[0] == standing_x else o[2], y=o[3], vx=o[4], vy=o[5], age=o[6], conf=o[7],
                                  missedRuns=o[8], inPath=False) for o in fr['objs'])
     dec.t += dt
-    f = sg.Frame(objects=objs, v_ego=v, a_ego=fr['a'], odo_m=odo, turned_deg=turned, dt=dt)
+    f = sg.Frame(objects=objs, v_ego=v, a_ego=fr['a'], odo_m=odo, heading_deg=turned, dt=dt)
     dec._rail_feed(f)
     if not armed(fr):
       dec.rail_count = {}
@@ -885,3 +885,92 @@ def test_far_tracks_range_noise_never_latches_one_crossing(monkeypatch, clip):
   monkeypatch.setattr(sg.StopGo, '_rail_motion', spy)
   picks, dec = rail_on_log(clip)
   assert not picks and not latched
+
+
+# ------------------------------------------------------------------ the rail in a turn (open loop, consistent geometry)
+
+LEFT_R, LEFT_LEAD = 10., 1.  # m: a left turn's arc from the stop point, after this much straight
+
+
+def left_pose(sp):
+  """(x, y left, heading rad) sp m along a left turn from the stop point (LEFT_LEAD straight, then LEFT_R's arc to 90 deg)."""
+  if sp <= LEFT_LEAD:
+    return sp, 0., 0.
+  a = min((sp - LEFT_LEAD) / LEFT_R, math.pi / 2.)
+  beyond = max(sp - LEFT_LEAD - LEFT_R * math.pi / 2., 0.)  # on along the cross road
+  return LEFT_LEAD + LEFT_R * math.sin(a), LEFT_R * (1. - math.cos(a)) + beyond, a
+
+
+def to_ego(pose, wx, wy):
+  x0, y0, h = pose
+  dx, dy = wx - x0, wy - y0
+  return dx * math.cos(h) + dy * math.sin(h), -dx * math.sin(h) + dy * math.cos(h)
+
+
+def turn_drive(phases, cars, model=True):
+  """The decider's rail fed open loop along a left turn (left_pose): phases [(seconds, accel m/s^2, going)] from standing at the
+  stop point (speed floored at 0), turned_deg as turnpilotd keeps it (summed while going, 0 otherwise), heading_deg never
+  reset; with model, a modelV2 whose path is the turn's arc ahead (its y to the right), or none at all (the model's path
+  unknown: predicted_path's straight ahead) at standstill as the model gives no path ahead then; cars {trackId: (wx, wy)}
+  standing, a detector update every other frame (held between). Returns (decider, [(t, picked trackId or None, {tid: crossing})])."""
+  dec = sg.StopGo()
+  v = sp = turned = t = 0.
+  out, k = [], 0
+  held = {}
+  for seconds, acc, going in phases:
+    for _ in range(round(seconds / DT_MDL)):
+      h0 = left_pose(sp)[2]
+      v = max(v + acc * DT_MDL, 0.)
+      sp += v * DT_MDL
+      pose = left_pose(sp)
+      turned = turned + math.degrees(pose[2] - h0) if going else 0.
+      t += DT_MDL
+      if k % 2 == 0:
+        held = {tid: to_ego(pose, wx, wy) for tid, (wx, wy) in cars.items()}
+      objs = tuple(SimpleNamespace(trackId=tid, cls='car', x=x, y=y, vx=0., vy=0., age=30 + k // 2, conf=0.9, missedRuns=0, inPath=False)
+                   for tid, (x, y) in held.items())
+      m = None
+      if model and v > 0.3:
+        ahead = [to_ego(pose, *left_pose(sp + d)[:2]) for d in np.linspace(0., 30., 31)]
+        m = SimpleNamespace(position=SimpleNamespace(x=[a[0] for a in ahead], y=[-a[1] for a in ahead]))
+      elif model:
+        m = SimpleNamespace(position=SimpleNamespace(x=[0.] * 31, y=[0.] * 31))  # standing: nothing planned ahead
+      dec.t += DT_MDL
+      f = sg.Frame(objects=objs, v_ego=v, a_ego=acc, odo_m=sp, turned_deg=turned, heading_deg=math.degrees(pose[2]), model_v2=m)
+      dec._rail_feed(f)
+      best, _ = dec._rail_pick(f)
+      out.append((t, best[1].trackId if best is not None else None, {tid: r.crossing for tid, r in dec.rail_tracks.items()}))
+      k += 1
+  return dec, out
+
+
+OPPOSITE_WAITING_AT = (16., 2.8)  # m from our stop point: a car waiting at the opposite approach's line, in its lane
+
+
+def test_a_go_withdrawn_mid_turn_never_reads_our_yaw_back_as_the_waiting_car_crossing():
+  # our left turn's go withdrawn some 6 deg into the turn, the car brought to a stand, then the go again and the turn: turnpilotd
+  # zeroes turned_deg at the withdrawal (summed only while going), which on the rail's ground frame read as a turn back of
+  # that much, the car waiting at the opposite line 16 m out then seeming to come 1-2 m toward our axis while we stood. The
+  # ground frame is heading_deg's, never reset: the waiting car is never latched crossing
+  phases = [(1., 0., False), (1.6, 1.5, True), (1.2, -2.2, False), (2., 0., False), (6., 1.5, True)]
+  dec, out = turn_drive(phases, {66: OPPOSITE_WAITING_AT})
+  turned_at_withdrawal = math.degrees(left_pose(0.5 * 1.5 * 1.6 ** 2)[2])
+  assert 3. < turned_at_withdrawal < 10.
+  assert not any(c.get(66) for _, _, c in out)
+
+
+def test_mid_left_turn_the_rail_s_corridor_is_our_path_never_the_straight_ahead():
+  # a left turn from the stop point with the car waiting at the opposite line: mid-turn it is straight ahead of us for some
+  # metres of the arc while our path (the model's) curves away from it, so it is never the rail's; a car standing in our path
+  # on the arc ahead (the exit lane we turn into) is, and still once we stand short of it with the model planning nothing ahead
+  # (the path kept from the last frame it gave one)
+  phases = [(1., 0., False), (5., 1.2, True)]
+  dec, out = turn_drive(phases, {66: OPPOSITE_WAITING_AT})
+  ego = [to_ego(left_pose(sp), *OPPOSITE_WAITING_AT) for sp in np.linspace(0., 15., 61)]
+  assert any(0. < x - SETBACK <= sg.RAIL_AHEAD_M and abs(y) <= PATH_HALF_WIDTH_M for x, y in ego)  # straight ahead for a while
+  assert not any(p == 66 for _, p, _ in out)
+  in_path = left_pose(13.)[:2]
+  dec, out = turn_drive([(1., 0., False), (2.5, 1.2, True), (2.5, -1.5, True), (2., 0., True)], {66: OPPOSITE_WAITING_AT, 67: in_path})
+  picks = [p for _, p, _ in out]
+  assert 67 in picks and 66 not in picks
+  assert picks[-1] == 67  # standing short of it, the model planning nothing: the path kept
