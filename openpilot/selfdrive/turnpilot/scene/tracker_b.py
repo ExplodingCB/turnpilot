@@ -103,9 +103,11 @@ class TrackerB:
     self.stop_ids: set[int] = set()   # B-only objects that asked for a stop this period
     self.logged_ids: set[int] = set()  # ...and ever (turnpilot.tracker_b_stop, once each)
 
-  def step(self, runs, far, calibration, car_state, model_v2, tracker_a, scene, now: float | None = None) -> list[BObject]:
+  def step(self, runs, far, calibration, car_state, model_v2, tracker_a, scene, now: float | None = None,
+           yaw_rate: float | None = None) -> list[BObject]:
     """The frame's runs (tracker A's, as A took them) and far run (detector_run's) into tracker B, in camera-time order around a
-    new far run, then its B-only objects against tracker A's published scene (none while that is unavailable)."""
+    new far run, then its B-only objects against tracker A's published scene (none while that is unavailable). now, yaw_rate: as
+    SceneTracker.update's (turnpilotd passes neither, as for tracker A)."""
     t0 = time.monotonic()
     trk = self.tracker
     trk.coast_s = tracker_a.coast_s
@@ -114,13 +116,13 @@ class TrackerB:
     runs = list(runs)
     if new_far:
       t_far = run.timestampEof
-      trk.update_runs([d for d in runs if d.timestampEof <= t_far], calibration, car_state, model_v2, now)
-      trk.update_tiles(far, calibration, car_state, model_v2, now)
+      trk.update_runs([d for d in runs if d.timestampEof <= t_far], calibration, car_state, model_v2, now, yaw_rate)
+      trk.update_tiles(far, calibration, car_state, model_v2, now, yaw_rate)
       later = [d for d in runs if d.timestampEof > t_far]
       if later:
-        trk.update_runs(later, calibration, car_state, model_v2, now)
+        trk.update_runs(later, calibration, car_state, model_v2, now, yaw_rate)
     else:
-      trk.update_runs(runs, calibration, car_state, model_v2, now)
+      trk.update_runs(runs, calibration, car_state, model_v2, now, yaw_rate)
     self.objects = []
     if scene.available:
       msg = messaging.new_message('turnpilotScene')
