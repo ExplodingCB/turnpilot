@@ -273,6 +273,24 @@ def test_certifier_ends_on_the_takeover_or_the_speed_and_withdraws():
   assert gc.end == 'inPath'
 
 
+def test_a_relifts_speed_end_is_not_the_model_following_it():
+  """ALWAYS_DRIVE.md ST-13: a release's later go (relift) is followed only on the takeover predicate, never on GO_END_SPEED
+  alone (a second lift from 1.5 m/s could reach 3 m/s with the model never taking over); a first go's speed end is as before."""
+  gc = GoCertifier()
+  gc.start('turnRelease', relift=True)
+  assert gc.relift
+  gc.update(model(**HOLDING), GO_END_SPEED, DT_MDL)
+  assert not gc.active and gc.end == 'speed' and not gc.taken_over
+  gc.start('turnRelease', relift=True)
+  for _ in range(round(TAKEOVER_S / DT_MDL)):
+    gc.update(model(**GOING), 0.5, DT_MDL)
+  assert not gc.active and gc.end == 'takeover' and gc.taken_over
+  gc.start('clearBox')  # not a re-lift: as before
+  assert not gc.relift
+  gc.update(model(**HOLDING), GO_END_SPEED, DT_MDL)
+  assert gc.end == 'speed' and gc.taken_over
+
+
 def test_certifier_fills_the_plan_only_while_its_go_is_out():
   gc = GoCertifier()
   msg = messaging.new_message('turnpilotPlan')

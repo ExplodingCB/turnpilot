@@ -166,31 +166,34 @@ class GoCertifier:
   """turnpilotd's side: the go in hand, one at a time, each a new id with its own GO_WINDOW_S, filled into every plan while
   it is out (turnpilotPlan.goCertified). It ends as the lift does on its own (GO_WINDOW_S; GO_END_SPEED or the takeover
   predicate, which is the go followed: taken_over), or when turnpilotd withdraws it (withdraw: its reason). A go asked for
-  while another is out is refused: the next starts only after the previous one ended."""
+  while another is out is refused: the next starts only after the previous one ended. A release's later go (relift,
+  ALWAYS_DRIVE.md ST-13: certified from a standstill after its first) is followed only on the takeover predicate: its speed
+  end isn't the model following it."""
   def __init__(self):
     self.id = 0                # the last go's id; never repeated while turnpilotd runs
     self.cause = 'none'        # the go out, 'none' with none
     self.t = 0.                # s since it
-    self.taken_over = False    # the last go ended on the model taking over (or GO_END_SPEED): followed
+    self.taken_over = False    # the last go ended on the model taking over (or GO_END_SPEED, but for a relift): followed
     self.end = ''              # why the last go ended
+    self.relift = False        # the go in hand (or the last) is a release's later go (start's relift)
     self.takeover = Takeover()
 
   @property
   def active(self) -> bool:
     return self.cause != 'none'
 
-  def start(self, cause: str, **evidence) -> bool:
+  def start(self, cause: str, relift: bool = False, **evidence) -> bool:
     """A certified go (cause: CAUSES) from now, or False while one is out. A cause the schema hasn't: ValueError (turnpilotd's
-    fault path, out loud), never a go."""
+    fault path, out loud), never a go. relift: a release's later go, whose GO_END_SPEED end isn't followed."""
     if cause not in CAUSES:
       raise ValueError(f"no such go cause: {cause!r}")
     if self.active:
       cloudlog.event("turnpilot.go_refused", cause=cause, out=self.cause, go_id=self.id, t=round(self.t, 2))
       return False
     self.id += 1
-    self.cause, self.t, self.taken_over, self.end = cause, 0., False, ''
+    self.cause, self.t, self.taken_over, self.end, self.relift = cause, 0., False, '', relift
     self.takeover.reset()
-    cloudlog.event("turnpilot.go_certified", cause=cause, go_id=self.id, **evidence)
+    cloudlog.event("turnpilot.go_certified", cause=cause, go_id=self.id, relift=relift, **evidence)
     return True
 
   def _end(self, reason: str, followed: bool = False) -> None:
@@ -205,7 +208,7 @@ class GoCertifier:
     if self.takeover.update(model, dt):
       self._end('takeover', followed=True)
     elif v_ego >= GO_END_SPEED:
-      self._end('speed', followed=True)
+      self._end('speed', followed=not self.relift)
     elif self.t >= GO_WINDOW_S - 1e-6:
       self._end('window')
 
