@@ -16,7 +16,10 @@ neither paint nor road, and neither is a sample without paint whose two sides di
 on one road surface (STEP_REL): a shadow edge along a line darkens the paint below the sunlit road, and if that counted
 as road, a solid line under a hedge's shadow would read broken. Yellow on concrete can be darker than the concrete, so a
 narrow dip in U (the NV12 UV plane) below the road on both sides is paint too, and yellow; so is luma paint with a
-smaller dip in U (worn yellow). Luma paint with U near the road's and V not above it is white.
+smaller dip in U (worn yellow). Either needs the paint's chromaticity, (U - 128) / (Y - 16) and (V - 128) / (Y - 16), off
+the road's beside it (YELLOW_CU_MAX, YELLOW_CV_MIN): in low or warm sun white paint takes the light's tint and, being
+bright, dips in U as far as worn yellow does, but a neutral surface keeps the light's chromaticity whatever its brightness.
+Luma paint with U near the road's and V not above it is white.
 
 Per frame a line has paint at some share of its samples, in marks: painted runs with less than GAP_MIN_M of road between
 them, so a worn dash makes one mark. Over WINDOW_S that share, the longest mark and the
@@ -37,6 +40,14 @@ read it 0 times. The misses that matter: on concrete freeways a light slab joint
 their gaps, so they read solid, which only costs a lane change; a solid line with most of its paint gone in random
 stretches looks broken and can read broken white (synthesized in test_lane_paint.py); and one route is not every road. So
 the lane planner also needs the model to see a lane beyond the line, and the driver confirms each change (lane_planner.py).
+
+The chromaticity test (YELLOW_CU_MAX, YELLOW_CV_MIN) is from comma's public comma four routes with video, 2026-10-30: a
+Model 3 in California (79d0f04c82980004/00000003), a car in a European city (49d0fc1df3e7320b/00000002), one in Australia
+(5afee5161ea1dcde/00000003) and the demo route, 1.35 h moving. The ego right line, never yellow on those drives, read
+yellow at 0.5 or more on 11.6% of 45119 moving 10 Hz reads without it and on 0.2% with it, and turnpilotd's wrong-side
+guard, replayed on them, fired 9 times in the 41 min of right-hand traffic without it (white bike-lane and edge lines in
+low sun read yellow) and once with it. 2022 reads of lines labelled yellow read yellow 86% and 84% of the time; none read
+white but a white gore line inside a labelled span.
 
 Only the road (narrow) camera, a pinhole, is read; 8 m is the nearest ground clear of a comma four's view of the hood.
 """
@@ -69,6 +80,13 @@ WORN_YELLOW_DU = -4.                  # luma paint with U this far below the roa
                                       # demo route: -4 to -10; white paint there: -2 to 0)
 WHITE_DU = -4.                        # luma paint with U at or above this at its peak,
 WHITE_DV_MAX = 3.                     # and V not more than this above the road's (yellow's V is above it), is white
+# Yellow is a colour, not a tint: under low or warm sun white paint takes the light's tint, and being bright its U falls
+# below the grey road's by as much as worn yellow's (comma four, a Model 3 in California afternoon sun: white lines -4 to
+# -7, read yellow on 57% of samples). A neutral surface keeps the light's chromaticity, (U - 128) / (Y - 16), whatever its
+# brightness, so a yellow vote also needs the paint's chromaticity off the road's by these, at the U dip:
+YELLOW_CU_MAX = -0.06                 # U ratio at or below the road's minus this (white in warm sun: median -0.025,
+                                      # yellow centre lines -0.13; demo route freeway edge -0.17)
+YELLOW_CV_MIN = 0.03                  # and V ratio at or above the road's plus this (white +0.01, yellow +0.10)
 YELLOW_SHARE = 0.3                    # yellow takes this share of the painted samples (yellow is the cautious answer),
 WHITE_SHARE, WHITE_MAX_YELLOW = 0.7, 0.1  # white this share, with no more than this share yellow
 COLOR_MIN_PAINT = 20                  # painted samples in the window before a color is read
@@ -183,9 +201,16 @@ def sample_lines(nv12: np.ndarray, stride: int, y_height: int, lens: Lens, rpy_c
   wide = bright & (above.sum(axis=2) * PROFILE_STEP_M > WIDTH_MAX_M)
   # chroma: a dip in U below the road on both sides, V not dipping with it; smaller with luma paint (worn yellow)
   dip_idx = _SEARCH[np.argmin(chroma_u[..., _SEARCH], axis=2)]
-  dip = _at(chroma_u, dip_idx) - np.minimum(*_median_flanks(chroma_u, dip_idx))
-  dv = _at(chroma_v, dip_idx) - 0.5 * np.add(*_median_flanks(chroma_v, dip_idx))
-  yellow = ((dip <= YELLOW_DU) | (bright & ~wide & (dip <= WORN_YELLOW_DU))) & (dv >= YELLOW_DV_MIN)
+  u_road, v_road, y_road = (_median_flanks(c, dip_idx) for c in (chroma_u, chroma_v, luma))
+  u_dip, v_dip = _at(chroma_u, dip_idx), _at(chroma_v, dip_idx)
+  dip = u_dip - np.minimum(*u_road)
+  dv = v_dip - 0.5 * np.add(*v_road)
+  # chromaticity at the U dip, where the yellow vote is found, against the road's beside it (YELLOW_CU_MAX, YELLOW_CV_MIN)
+  y_paint, y_flank = np.maximum(_at(luma, dip_idx) - 16, 1), np.maximum(0.5 * np.add(*y_road) - 16, 1)
+  cu = (u_dip - 128) / y_paint - (0.5 * np.add(*u_road) - 128) / y_flank
+  cv = (v_dip - 128) / y_paint - (0.5 * np.add(*v_road) - 128) / y_flank
+  yellow = ((dip <= YELLOW_DU) | (bright & ~wide & (dip <= WORN_YELLOW_DU))) & (dv >= YELLOW_DV_MIN) & \
+    (cu <= YELLOW_CU_MAX) & (cv >= YELLOW_CV_MIN)
   du_peak = _at(chroma_u, peak_idx) - 0.5 * np.add(*_median_flanks(chroma_u, peak_idx))
   dv_peak = _at(chroma_v, peak_idx) - 0.5 * np.add(*_median_flanks(chroma_v, peak_idx))
   white = bright & ~wide & ~yellow & (du_peak >= WHITE_DU) & (dv_peak <= WHITE_DV_MAX)
