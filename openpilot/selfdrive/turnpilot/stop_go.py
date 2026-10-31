@@ -76,7 +76,16 @@ gate that fails before the first go is the 1 s handback saying which ("Stop sign
 it, a held fault (H9), never shadow (C14). ALWAYS_DRIVE's amendments V1-V10 hold under vision alone (each marked V<n> below);
 the other four modes are as they were (tests/test_stop_go_modes_golden.py). The go's line is said on VISION_ANNOUNCE_S of
 acting, engaged frames in a row before it: re-engaged (or acting again) with the window already run, the line comes first and
-the go VISION_ANNOUNCE_S after it, never on the re-engaged frame.
+the go VISION_ANNOUNCE_S after it, never on the re-engaged frame. SAT-11, under vision alone: every vehicle standing at the go is
+watched for its start (_watch_starts: its ground point and speed toward our path, our own motion taken out), its start before
+the commit withdrawing the go and after it a threat in the band; and from the commit point on, a confirmed vehicle in our path
+corridor ahead (in it, or entering it within RAIL_ENTER_S and still there when we reach it) is the in-path rail (_rail): the
+car stopped short of it, as hard as it needs, "Car crossing" said loudly (carCrossing), in a cross lane too, since a car is
+entering our own path; V8's carrying on is for the cross cars that aren't. A stand it leaves is the stall's clearBox lifts.
+The rail judges a vehicle by its measured motion, never its vy alone (skeptic round 1: a car waiting at the opposite line and
+one parked at the exit kerb, their vy reading toward us, stood the car hard in the junction): only one whose ground point came
+toward our axis over its matches, beyond the camera's drift on a standing car we pass, has its body across our corridor
+(_rail_motion, _corridor), and the hard tier is scene_policy's TrackEvidence.confirmed, steadiness included.
 
 Faults (7.1), each stopSignTakeControl with its reason, the car held (by the latch, or by the decider's own stop once the latch
 has let go): H1 a needed view without a run for DET_FAULT_S (held: cameraPaused for FAULT_GRACE_S first; moving before commit,
@@ -108,6 +117,8 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+import numpy as np
+
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.turnpilot import stop_rules as sr
@@ -116,8 +127,10 @@ from openpilot.selfdrive.turnpilot.map_controls import CREEP_AT_M, CREEP_SPEED, 
 from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
 from openpilot.selfdrive.turnpilot.routing import certify as ce
 from openpilot.selfdrive.turnpilot.routing.junctions import survey_approach
-from openpilot.selfdrive.turnpilot.scene_policy import PATH_HALF_WIDTH_M, STOP_SPEED, Stop, stop
-from openpilot.selfdrive.turnpilot.stop_evidence import APPROACH_V, DOWNGRADE_V, DOWNGRADE_WINDOW_M, StopEvidence, class_name, junction_lanes
+from openpilot.selfdrive.turnpilot.scene.tracker import PATH_X, predicted_path
+from openpilot.selfdrive.turnpilot.scene_policy import ENTER_T_S, PATH_HALF_WIDTH_M, STOP_SPEED, ScenePolicy, Stop, b_only, stop
+from openpilot.selfdrive.turnpilot.stop_evidence import APPROACH_V, DOWNGRADE_V, DOWNGRADE_WINDOW_M, MOVE_TOL_M, StopEvidence, class_name, \
+  junction_lanes
 from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP
 
 MODES = ce.MODES                # off, shadow, trial, auto, vision (TurnPilotStopSignGo)
@@ -252,6 +265,60 @@ GOING_REASON = "Going"
 NO_LIFT_REASON = "signal at the junction: the car's own go"  # V7
 VISION_GATE_TEXT = {'table': "no visibility file", 'sideViews': "side cameras off", 'H8': "map data unavailable",
                     'lens': "camera lens mismatch"}
+# SAT-11 (SAT_VALIDATION row 11, BeamNG at 263065a, stop_allway_out_of_turn under vision): a car standing 4.4 m back of its
+# assumed line read U2 'far' at the go, which _known_moved judged only by its go-time distance less its go-time speed (0.08
+# m/s) carried on: its start 0.5 s after our go withdrew nothing, the band skipped it as still, and the cars touched. Under
+# vision every vehicle standing at the go is watched for its start (_watch_starts), from the tracker's ground point and ground
+# speed (ego motion and our yaw since the go taken out), never its fit's trust, which our own motion restarts
+START_M = 0.3                   # m a standing vehicle's ground point must come toward our path (across ours for a cross lane,
+START_RANGE_FRAC = 0.02         # along it for a parallel one), plus this share of its range at the go (mono ranging's noise)...
+START_V = 0.8                   # m/s, ...or its ground speed toward our path over this (run 11's camera track read 0.4 standing)...
+START_FRAMES = 2                # ...on this many frames in a row: it has started (the go withdrawn; in the band, a threat)
+START_REF_S = 1.0               # s of its matches standing where the car stood at the go its reference ground point is the median of
+# the in-path rail (SAT-11 item 2), under vision from the commit point on: a vehicle confirmed in our path corridor ahead
+CROSSING_REASON = "Car crossing"
+RAIL_HITS = 3                   # detector matches in a row (its age rising) a vehicle's conflict must hold: never a phantom's one
+#                                 or two, and never one match held over the frames between the detector's runs
+RAIL_AHEAD_M = 15.              # m ahead of the bumper the rail looks: scene_policy's NEAR_PATH_M, its close-in corridor
+# a vehicle is crossing (its body across its motion, RAIL_HALF_LEN_M either side of its ground point) only once its ground point
+# has come toward our axis, our own motion and yaw taken out, over RAIL_MOVE_S to RAIL_HIST_S of its matches (the median of the
+# window's first two against its last three) by RAIL_MOVE_M plus START_RANGE_FRAC of its range, and, while its bearing opened
+# by RAIL_OPEN_DEG or more over the window (we are passing it), plus RAIL_DRIFT_FRAC of the metres we drove over it, on
+# RAIL_MOVE_HITS matches in a row; latched for the track (it stays across our corridor when it stops). Never from the
+# tracker's vy: skeptic round 1's probes fired the rail hard in the junction for a car waiting at the opposite line (vy -0.1
+# v_ego, 2.6 m left) and one parked at the exit kerb (vy noise sd 0.6), and the logged camera read a car standing 5 m left at
+# y 3.0-4.6, vy -0.36 to -1.31 as we passed (X_left_g30_h10_r150 track 6). The drift allowance is the logged camera's: over
+# the 181 sim rlog segments its ground point of a standing car came toward our axis by up to 1.22 m over 0.5 s (4.28 m
+# driven) and 1.57 m over 1.0 s (8.37 m driven), never more than 0.25 of the metres driven plus 0.15 m, and always with its
+# bearing opening (1.45 deg or more over 0.5 s; within RAIL_AHEAD_M a standing car whose bearing opened 1 deg or less came
+# 0.012 m at most); run 11's and X_out_of_turn_r2's crossing cars came 1.0-2.6 m over 0.5 s, their bearings closing 0.7-28 deg
+RAIL_MOVE_S = 0.3               # s of matches the window spans at least...
+RAIL_HIST_S = 1.0               # ...and at most (the oldest match within this)
+RAIL_MOVE_M = 0.6               # m toward our axis over it: 3 sd of a 0.3 m sd ground point's medians, none in 200 x 30 s standing
+RAIL_OPEN_DEG = 0.5             # deg its bearing opened over the window, from which we are passing it...
+RAIL_DRIFT_FRAC = 0.25          # ...and this share of the metres we drove over it is added (the camera's drift on a car we pass)
+RAIL_MOVE_HITS = 3              # ...on this many matches in a row
+RAIL_LATCH_EXTRA_M = 5.         # m beyond RAIL_AHEAD_M the motion is tested: its window ready as it comes into the rail's look
+RAIL_GAP_M = 1.0                # m short of the vehicle's ground point (its near side) the rail stops the car
+RAIL_MARGIN_S = 1.0             # s: a vehicle clearing our corridor this long before we would reach it passes ahead of us
+RAIL_HALF_LEN_M = CAR_LEN_M / 2.  # m either side of a crossing vehicle's ground point along its motion its body reaches
+RAIL_ENTER_S = ENTER_T_S        # s: a vehicle entering our corridor within this is in our path (scene_policy's for a walker)
+STRAIGHT_PATH = (np.array([0., PATH_X]), np.zeros(2))  # predicted_path's straight ahead, before the model gives a path
+RAIL_RELEASE_S = 1.0            # s a rail's vehicle must have been out of our corridor and not coming back into it (by its
+#                                 measured motion, never its vy) before the rail lets go
+
+
+@dataclass
+class RailTrack:
+  """The in-path rail's record of one vehicle (StopGo._rail_feed): its matches in the ground frame and the motion they show."""
+  age: int = -1                                # its hits at its last match
+  fresh: bool = False                          # matched on this frame (its age rose)
+  hist: deque = field(default_factory=deque)   # (t, odo, gx, gy, |bearing| deg, x) of its matches within RAIL_HIST_S
+  run: int = 0                                 # matches in a row its ground point came toward our axis by the need
+  crossing: bool = False                       # latched: it moved across toward our path (its body across our corridor)
+  xy: tuple | None = None                      # (x, y) of its last match, as published
+  lat: float | None = None                     # m/s its ground point moves across our axis (left +), None before RAIL_MOVE_S
+  along: float | None = None                   # m/s it moves along our axis (ahead +), ground speed
 
 
 @dataclass
@@ -278,6 +345,7 @@ class Frame:
   yaw20_deg: float = 0.          # the car's heading change over its last 20 m (its yaw off its approach)
   approach_yaw_deg: float = 0.   # its yaw into the route's turn since the turn's desire (the union rule)
   turned_deg: float = 0.         # its yaw since the decider's go (the crossing cycle's end)
+  heading_deg: float = 0.        # its yaw (left +) since turnpilotd started, never reset: the in-path rail's ground frame
   steer_deg: float = 0.
   desire_out: bool = False       # a turn desire has gone out for the maneuver at this control
   model_v2: Any = None
@@ -523,6 +591,23 @@ class StopGo:
     self.rollup_odo: float | None = None  # V3: the odometer at the roll-ups' count's start
     self.takeover_fails = 0         # V3: goes withdrawn because the model didn't take over (GO_RETRIES bounds these alone)
     self.box_next = STALL_BOX_S     # V4: s of the stand at which the next clearBox may go
+    # SAT-11: the in-path rail (_rail): trackId: frames its conflict has held in a row; the vehicle it holds for, since when
+    # its conflict last held; whether it held this encounter (a stand past the commit point is then the stall's, not V26's)
+    self.rail_count: dict[int, int] = {}
+    self.rail_on: dict | None = None
+    self.rail_held = False
+    # ...and its evidence, fed on every vision frame of the encounter (_rail_feed): scene_policy's TrackEvidence (confirmed:
+    # its hits, steady, still matched) for the hard tier, our ground pose (x, y, heading from the odometer and turned_deg),
+    # and each vehicle's matches in the ground frame (RailTrack)
+    self.rail_ev = ScenePolicy()
+    self.rail_pose = (0., 0., 0.)
+    self.rail_odo: float | None = None
+    self.rail_heading: float | None = None
+    self.rail_tracks: dict[int, RailTrack] = {}
+    # our path ahead in our frame now (x, y left), the model's (predicted_path), and the last one the model gave in the
+    # ground frame, carried for the frames it gives none (standing mid-turn): the rail's corridor is about it
+    self.rail_path: tuple = STRAIGHT_PATH
+    self.rail_path_g: tuple | None = None
 
   def _take(self, ctl, f: Frame) -> None:
     """A new encounter with control ctl (held, or engaged ahead)."""
@@ -607,11 +692,15 @@ class StopGo:
     pos = self._position(f, ctl, ahead)
     d.position_m = pos
     self._feed(f, pos)
+    if self.vision:
+      self._rail_feed(f)  # SAT-11: the in-path rail's evidence, every frame of the encounter
     if self.state == 'off':
       self.state = 'stopped' if ctl is not None else 'approach'
     if self.state == 'approach' and ctl is not None:
       self.state, self.dwell_s = 'stopped', 0.
     self._driver(f, d, ctl)
+    if self.vision and self.go is not None and self.state in ('going', 'committed', 'inLane'):
+      self._watch_starts(f)  # SAT-11: once a frame, before the launch's re-check and the band's threat test read it
     if self.state == 'approach':
       self._approach(f, d, pos, acting)
     elif self.state == 'stopped':
@@ -628,8 +717,246 @@ class StopGo:
       self._inlane(f, d, pos)
     elif self.state == 'ladder':
       self._ladder(f, d, ctl)
+    if self.vision and acting and self.state in ('committed', 'inLane'):
+      self._rail(f, d, d.position_m)
+    elif self.rail_on is not None or self.rail_count:
+      self.rail_on, self.rail_count = None, {}
     self._finish(f, d, acting, why)
     return d
+
+  # ---------------------------------------------------------------------------------------------------- the in-path rail
+
+  def _rail_feed(self, f: Frame) -> None:
+    """The in-path rail's evidence, on every vision frame of the encounter (from the approach, so a vehicle seen before the
+    commit has its hits and its window there): scene_policy's TrackEvidence for every motor vehicle and cyclist
+    (ScenePolicy.update_evidence on the decider's clock: _rail_confirmed), our ground pose (the odometer along heading_deg,
+    turnpilotd's yaw integral, never reset: turned_deg's reset to 0 as a go is withdrawn mid-turn would read as a turn back),
+    our path ahead (_rail_path_now), and each vehicle's matches (its age rising, at a new ground point: never one match held
+    over the frames between the detector's runs, or the sim oracle's 4 Hz sample held) in the ground frame, with the motion
+    they show (_rail_motion)."""
+    dturn = 0. if self.rail_heading is None else f.heading_deg - self.rail_heading
+    self.rail_heading = f.heading_deg
+    px, py, h = self.rail_pose
+    ds = 0. if self.rail_odo is None else max(f.odo_m - self.rail_odo, 0.)
+    self.rail_odo = f.odo_m
+    h1 = h + math.radians(dturn)
+    px, py = px + ds * math.cos((h + h1) / 2.), py + ds * math.sin((h + h1) / 2.)
+    self.rail_pose = (px, py, h1)
+    self._rail_path_now(f)
+    objs = [o for o in f.objects or () if class_name(o.cls) in MOTOR + CYCLISTS]
+    self.rail_ev.t = self.t
+    self.rail_ev.update_evidence([o for o in objs if hasattr(o, 'age')])  # one without hits is never a confirmed track
+    c, s = math.cos(h1), math.sin(h1)
+    present = set()
+    for o in objs:
+      present.add(o.trackId)
+      age = int(getattr(o, 'age', 0) or 0)
+      r = self.rail_tracks.get(o.trackId)
+      if r is None or age < r.age:
+        r = self.rail_tracks[o.trackId] = RailTrack()  # new, or a restarted tracker's id
+      r.fresh, r.age = age > r.age, max(age, r.age)
+      x, y = float(o.x), float(o.y)
+      if not r.fresh or (x, y) == r.xy:
+        continue
+      r.xy = (x, y)
+      r.hist.append((self.t, f.odo_m, px + x * c - y * s, py + x * s + y * c, math.degrees(math.atan2(abs(y), max(x, 0.1))), x))
+      while r.hist[0][0] < self.t - RAIL_HIST_S - 1e-6:
+        r.hist.popleft()
+      self._rail_motion(r, o, f.odo_m)
+    for tid, r in self.rail_tracks.items():
+      if tid not in present:
+        r.fresh = False
+    self.rail_tracks = {tid: r for tid, r in self.rail_tracks.items() if tid in self.rail_ev.tracks}  # KEEP_EVIDENCE_S, as its evidence
+
+  def _rail_path_now(self, f: Frame) -> None:
+    """Our path ahead in our frame now (rail_path): the model's (predicted_path), kept in the ground frame (rail_path_g) for
+    the frames it gives none (standing, it plans nothing ahead) and brought into our frame then; straight ahead before it has
+    given one. The rail's corridor follows it: mid-turn, a car waiting at the opposite line comes into the straight ahead
+    for 1-7 m of a left turn's arc (R 8-15 m) while the path curves away from it."""
+    X, Y, H = self.rail_pose
+    c, s = math.cos(H), math.sin(H)
+    px, py = predicted_path(f.model_v2) if f.model_v2 is not None else STRAIGHT_PATH
+    if len(px) > 2 or np.any(py):  # the model's own, not predicted_path's straight ahead
+      self.rail_path, self.rail_path_g = (px, py), (X + px * c - py * s, Y + px * s + py * c)
+      return
+    if self.rail_path_g is None:
+      self.rail_path = STRAIGHT_PATH
+      return
+    gx, gy = self.rail_path_g
+    ex, ey = (gx - X) * c + (gy - Y) * s, -(gx - X) * s + (gy - Y) * c
+    rising = ex > np.maximum.accumulate(np.r_[-np.inf, ex[:-1]])  # np.interp needs increasing x
+    ex, ey = ex[rising], ey[rising]
+    self.rail_path = (ex, ey) if len(ex) >= 2 else STRAIGHT_PATH
+
+  def _off_path(self, o) -> float:
+    """m its ground point is left of our path ahead at its range (rail_path; beyond the path's ends, its end's y)."""
+    px, py = self.rail_path
+    return float(o.y) - float(np.interp(float(o.x), px, py))
+
+  def _rail_motion(self, r: RailTrack, o, odo: float) -> None:
+    """A vehicle's motion over its matches since RAIL_HIST_S (at least RAIL_MOVE_S of them), in our current frame: its ground
+    point's speed across our axis and along it (the median of the window's first two matches against its last three), and
+    whether it came toward our axis by the need (RAIL_MOVE_M, plus RAIL_DRIFT_FRAC of the metres we drove over the window,
+    plus START_RANGE_FRAC of its range): on RAIL_MOVE_HITS matches in a row it is crossing, latched for the track (a car that
+    crossed toward us and stopped is still across our corridor)."""
+    hist = list(r.hist)
+    if len(hist) < 3 or hist[-1][0] - hist[0][0] < RAIL_MOVE_S - 1e-6:
+      r.lat = r.along = None
+      r.run = 0
+      return
+    px, py, h = self.rail_pose
+    c, s = math.cos(h), math.sin(h)
+    ref, now = hist[:2], hist[-min(3, len(hist) - 2):]
+    def ego(qs):
+      xs = [(q[2] - px) * c + (q[3] - py) * s for q in qs]
+      ys = [-(q[2] - px) * s + (q[3] - py) * c for q in qs]
+      return float(np.median(xs)), float(np.median(ys)), float(np.median([q[0] for q in qs])), float(np.median([q[4] for q in qs]))
+    (xr, yr, tr, br), (xn, yn, tn, bn) = ego(ref), ego(now)
+    dt = max(tn - tr, DT_MDL)
+    r.lat, r.along = (yn - yr) / dt, (xn - xr) / dt
+    toward = -math.copysign(1., yr) * (yn - yr)
+    # the camera's drift toward our axis on a standing car comes as we pass it, its bearing opening: a car coming into our path
+    # holds its bearing (a collision course) or closes it (crossing ahead of us), and is judged on the noise allowance alone
+    driven = max(odo - hist[0][1], 0.) if bn - br >= RAIL_OPEN_DEG else 0.
+    need = RAIL_MOVE_M + RAIL_DRIFT_FRAC * driven + START_RANGE_FRAC * math.hypot(float(o.x), float(o.y))
+    # tested only on a window all within the rail's look and RAIL_LATCH_EXTRA_M beyond it (far out, a mono track's ground point
+    # is range noise: oncoming cars 40-70 m off read 4-18 m/s across, a new track's range settling from 76 m to 21 m read its
+    # lateral 16.5 -> 6.9 m), and only moving across more than along (a car coming on along a lane isn't crossing ours,
+    # whatever its range noise does to its lateral)
+    near = all(q[5] - self.setback <= RAIL_AHEAD_M + RAIL_LATCH_EXTRA_M for q in hist)
+    r.run = r.run + 1 if near and abs(r.lat) >= abs(r.along) and toward >= need else 0
+    if r.run >= RAIL_MOVE_HITS and not r.crossing:
+      r.crossing = True
+      cloudlog.event("turnpilot.stop_go_rail_crossing", key=list(self.key) if self.key is not None else None, state=self.state,
+                     track=int(o.trackId), cls=class_name(o.cls), x=round(float(o.x), 2), y=round(float(o.y), 2),
+                     toward=round(toward, 2), need=round(need, 2), lat=round(r.lat, 2), driven=round(odo - hist[0][1], 2),
+                     opened=round(bn - br, 2))
+
+  def _rail_confirmed(self, o) -> bool:
+    """A track the rail may stop hard for: scene_policy's TrackEvidence.confirmed (its hits, CONFIRM_HITS at CONFIRM_CONF or
+    CONFIRM_STEADY_HITS at any, earned with CONFIRM_RECENT_HITS of them in CONFIRM_WINDOW_S; steady so on this frame, and the
+    detector still matching it, HARD_MISSED_RUNS), on the decider's own evidence (_rail_feed: the sim oracle's objects too).
+    Never tracker B's (b_only)."""
+    ev = self.rail_ev.tracks.get(o.trackId)
+    return ev is not None and ev.confirmed and not b_only(o)
+
+  def _corridor(self, o, moving: bool = False) -> tuple[float, float]:
+    """(s it enters our path corridor, s it leaves it) from now, by its measured motion (_rail_motion), never its vy alone: a
+    vehicle latched crossing (or, with moving, on a match whose motion test passed: _rail_pick's count of the matches that
+    latch it) has its body RAIL_HALF_LEN_M either side of its ground point, so it is in the corridor (PATH_HALF_WIDTH_M either
+    side of our axis) while that body overlaps it, entering it at the faster of its measured speed across our axis and its vy
+    where the two agree, and leaving it at the slower; anything else is in it while its ground point is, and never entering
+    it. One moving on ahead of us along our path (its vx over MOVING_V and, once measured, its ground point too, faster than
+    across) is a lead, the model's. inf: never."""
+    r = self.rail_tracks.get(o.trackId)
+    y, vy = self._off_path(o), float(o.vy)  # off our path ahead (straight ahead but mid-turn)
+    if float(o.vx) > MOVING_V:
+      if r is not None and r.along is not None and r.lat is not None:
+        lead = r.along > MOVING_V and r.along > abs(r.lat)
+      else:
+        lead = r is None or not r.crossing
+      if lead:
+        return math.inf, math.inf
+    # its body across our corridor while it isn't now moving along our axis (a car that crossed, then turned into a lane of our
+    # road, is along it again)
+    along_now = r is not None and r.along is not None and abs(r.along) > MOVING_V and abs(r.along) > abs(r.lat or 0.)
+    if r is None or along_now or not (r.crossing or (moving and r.run > 0)):
+      return (0., math.inf) if abs(y) <= PATH_HALF_WIDTH_M else (math.inf, math.inf)
+    w = PATH_HALF_WIDTH_M + RAIL_HALF_LEN_M
+    lat = r.lat if r.lat is not None and abs(r.lat) > MOVING_V else 0.
+    fast, slow = (math.copysign(max(abs(lat), abs(vy)), lat), math.copysign(min(abs(lat), abs(vy)), lat)) if lat * vy > 0. else (lat, lat)
+    t_exit = (math.copysign(w, slow) - y) / slow if abs(slow) > MOVING_V else math.inf
+    if abs(y) <= w:
+      return 0., t_exit
+    return ((abs(y) - w) / abs(fast), t_exit) if lat and y * lat < 0. else (math.inf, math.inf)
+
+  @staticmethod
+  def _conflict(corridor: tuple[float, float], t_reach: float, t_pass: float) -> bool:
+    """In our corridor now or entering it within RAIL_ENTER_S, before our rear is past it (and RAIL_MARGIN_S); still in it when
+    we reach it (less RAIL_MARGIN_S)."""
+    t_enter, t_exit = corridor
+    return t_enter <= min(RAIL_ENTER_S, t_pass + RAIL_MARGIN_S) and t_exit >= t_reach - RAIL_MARGIN_S
+
+  @staticmethod
+  def _t_at(dist: float, v: float, a: float) -> float:
+    """s our car takes to cover dist m from v at a (m/s^2, 0 or more), at 0.1 m/s at least."""
+    if a > 1e-3:
+      return (-v + math.sqrt(v * v + 2. * a * max(dist, 0.))) / a
+    return max(dist, 0.) / max(v, 0.1)
+
+  def _rail_pick(self, f: Frame):
+    """(gap, object) of the nearest vehicle in conflict with our path this frame, (_rail's test) on RAIL_HITS detector matches
+    in a row, or None; the counts kept (rail_count), and the held vehicle's (gap, object) wherever it is now (rail_on's track,
+    while the tracker publishes it) as the second of the pair."""
+    v, a = max(f.v_ego, 0.), max(f.a_ego, 0.)
+    best, seen, held = None, set(), None
+    for o in f.objects or ():
+      if class_name(o.cls) not in MOTOR + CYCLISTS:
+        continue
+      gap = float(o.x) - self.setback
+      if self.rail_on is not None and o.trackId == self.rail_on['track']:
+        held = (gap, o)  # the vehicle it holds for, wherever it is now (at the bumper too), while the tracker publishes it
+      if not self._rail_confirmed(o) or not 0. < gap <= RAIL_AHEAD_M:
+        continue
+      t_reach, t_pass = self._t_at(gap, v, a), self._t_at(gap + CAR_LEN_M + 2. * RAIL_GAP_M, v, a)
+      # counted on the matches that latch it crossing too (moving): the rail goes on the match the latch does, never before
+      if self._conflict(self._corridor(o, moving=True), t_reach, t_pass):
+        seen.add(o.trackId)
+        r = self.rail_tracks.get(o.trackId)
+        n = self.rail_count[o.trackId] = self.rail_count.get(o.trackId, 0) + (1 if r is not None and r.fresh else 0)
+        if n >= RAIL_HITS and self._conflict(self._corridor(o), t_reach, t_pass) and (best is None or gap < best[0]):
+          best = (gap, o)
+    self.rail_count = {k: n for k, n in self.rail_count.items() if k in seen}
+    return best, held
+
+  def _rail(self, f: Frame, d: StopGoDecision, pos: float) -> None:
+    """SAT-11 item 2, under vision from the commit point on (committed, inLane): a motor vehicle or cyclist in our path
+    corridor ahead of the bumper (within RAIL_AHEAD_M), or entering it within RAIL_ENTER_S (scene_policy's ENTER_T_S) before our
+    rear is past it, and still in it when we reach it (RAIL_MARGIN_S either way: one clearing it before we arrive passes ahead
+    of us; one further off is V8's, said and carried on), by its measured motion (_corridor: only a vehicle seen moving across
+    toward our path has its body across our corridor, and nothing outside it is entering it on its vy), a confirmed track
+    (_rail_confirmed: scene_policy's TrackEvidence) on RAIL_HITS detector matches in a row, is the in-path rail: a stop
+    RAIL_GAP_M short of it (scene_policy.stop: as hard as it needs while the track stays confirmed, the hard tier raising
+    hardBrake; the comfortable curve once it doesn't), and "Car crossing" said loudly (carCrossing) while it holds. It may
+    stop the car in a cross lane: a car is entering our own path (V8's carrying on is for cross cars that aren't). Held until
+    the vehicle has been out of our corridor and not coming back into it within RAIL_MARGIN_S (its measured motion again,
+    never its vy) for RAIL_RELEASE_S; a stand it leaves past the commit point is the stall's (_vision_stall: the lanes left to
+    cross tested before any lift), never V26's un-commit."""
+    v = max(f.v_ego, 0.)
+    best, held = self._rail_pick(f)
+    if best is not None and (self.rail_on is None or best[1].trackId != self.rail_on['track']):
+      gap, o = best
+      if self.rail_on is None:
+        rt = self.rail_tracks.get(o.trackId)
+        cloudlog.event("turnpilot.stop_go_rail", error=True, key=list(self.key), state=self.state, pos=round(pos, 2), v=round(v, 2),
+                       track=int(o.trackId), cls=class_name(o.cls), gap=round(gap, 2), y=round(float(o.y), 2), vy=round(float(o.vy), 2),
+                       crossing=bool(rt is not None and rt.crossing), lat=round(rt.lat, 2) if rt is not None and rt.lat is not None else None,
+                       hits=int(getattr(o, 'age', 0) or 0), conf=round(float(getattr(o, 'conf', 0.) or 0.), 3))
+      self.rail_on = {'track': o.trackId, 'gap': gap, 'clear_s': 0., 'obj': o}
+      held = best
+    if self.rail_on is None:
+      return
+    r = self.rail_on
+    if held is not None:
+      gap, o = held
+      t_enter, _ = self._corridor(o)
+      r.update(gap=gap, obj=o, clear_s=r['clear_s'] + f.dt if t_enter > RAIL_MARGIN_S else 0.)  # out, and not coming back in
+    else:
+      r.update(gap=r['gap'] - v * f.dt, clear_s=r['clear_s'] + f.dt)  # unmatched: dead-reckoned, and its clock running
+    if r['clear_s'] >= RAIL_RELEASE_S - 1e-6:
+      cloudlog.event("turnpilot.stop_go_rail_released", key=list(self.key), state=self.state, pos=round(pos, 2), track=int(r['track']))
+      self.rail_on = None
+      return
+    self.rail_held = True
+    o = r['obj']
+    ev = {'track_id': int(o.trackId), 'cls': class_name(o.cls), 'hits': int(getattr(o, 'age', 0) or 0),
+          'conf': round(float(getattr(o, 'conf', 0.) or 0.), 3), 'x': round(float(o.x), 2), 'y': round(float(o.y), 2),
+          'vx': round(float(o.vx), 2), 'vy': round(float(o.vy), 2), 'in_path': True}
+    # the hard tier only while its track is confirmed on this frame (published, steady, matched): scene_policy's own rule
+    confirmed = held is not None and self._rail_confirmed(held[1])
+    d.stops.append(stop(v, max(r['gap'] - RAIL_GAP_M, 0.), CROSSING_REASON, confirmed=confirmed, evidence=ev))
+    d.reason = CROSSING_REASON
+    self._show_alert('carCrossing')
 
   def _driver(self, f: Frame, d: StopGoDecision, ctl) -> None:
     """The driver taking over (openpilot disengaged: a pedal, O6 and O7). During the launch the encounter is theirs at once; a
@@ -1202,6 +1529,16 @@ class StopGo:
       cloudlog.event("turnpilot.stop_go_in_lane", key=list(self.key), pos=round(pos, 2), v=round(f.v_ego, 2))
       self._inlane(f, d, pos)
       return
+    if self.vision and self.rail_held and standing and self.aborting is None:
+      # SAT-11: a stand past the commit point the in-path rail made is the stall's (V4's clearBox lifts once nothing of
+      # TurnPilot's holds the car, the lanes left to cross tested first; H5 at VISION_STALL_H5_S), never V26's un-commit: no go
+      # from there has GO_ROOM_M, and the car may be standing in a cross lane
+      free = not f.tp_holding and self.rail_on is None and (f.lead_m is None or f.lead_m > LEAD_GO_M)
+      self.stall_s = self.stall_s + f.dt if free else 0.
+      if self.stall_s >= STALL_BOX_S - 1e-6:
+        d.reason = STALLED_REASON
+      self._vision_stall(f, d, pos, standing, self._threat(f, pos))
+      return
     self.uncommit_s = self.uncommit_s + f.dt if standing else 0.
     if self.uncommit_s >= UNCOMMIT_STOP_S - 1e-6:
       # a full stop in the band un-commits (V26): observe from here, the rank kept, a fresh go only after CLEAR_S, never clearBox
@@ -1242,7 +1579,7 @@ class StopGo:
     if threat:
       self._after_commit(threat)  # never braked for: stopping in a lane is worse than going on (V8)
     standing = f.v_ego < STAND_V
-    free = not f.tp_holding and (f.lead_m is None or f.lead_m > LEAD_GO_M)
+    free = not f.tp_holding and self.rail_on is None and (f.lead_m is None or f.lead_m > LEAD_GO_M)  # the rail's stand isn't a stall
     self.stall_s = self.stall_s + f.dt if standing and free else 0.
     if self.stall_s >= STALL_BOX_S - 1e-6:
       d.reason = STALLED_REASON  # said on the status line (control_text) while it lasts
@@ -1532,7 +1869,51 @@ class StopGo:
       if trk is not None:
         out[tid] = {'role': e.role, 'index': e.index, 'shield': e.shield, 'u2': e.u2, 'x': float(trk.x[0]), 'y': float(trk.x[1]),
                     'odo': f.odo_m, 'span': getattr(trk, 'span_seen', None), 'd_lo': e.d_lo, 'v_hi': e.v_hi, 't': self.t}
+        if self.vision:
+          # SAT-11: standing at the go (its speed trusted under SHIELD_V), wherever it stands: watched for its start from its
+          # reference ground point (the median of its matches here over START_REF_S, a single match's noise left out)
+          here = [s for s in self.evidence.hist.get(tid, ()) if abs(s.d_stop - self.evidence.d_stop) <= MOVE_TOL_M and
+                  s.t >= e.t - START_REF_S - 1e-9]
+          gx = float(np.median([s.x for s in here])) if here else float(trk.x[0])
+          gy = float(np.median([s.y for s in here])) if here else float(trk.x[1])
+          out[tid].update(stood=e.v_trusted and e.v_hi < sr.SHIELD_V, gx=gx, gy=gy, cross=e.role in ('left', 'right'),
+                          run=0, started=False)
     return out
+
+  def _watch_starts(self, f: Frame) -> None:
+    """SAT-11, under vision from the go on: each vehicle known standing at the go (_known_tracks) has started once, on
+    START_FRAMES frames in a row, its ground point (the tracker's, put back in the go's frame: our odometer and our yaw since
+    the go taken out) has come START_M plus START_RANGE_FRAC of its range toward our path (across it from a cross lane, along
+    it from a parallel one), or its ground speed toward our path is over START_V. Latched for the encounter's go: a start
+    before the commit withdraws the go (_lane_holds' outOfTurn), after it the band's threat test reads it moving."""
+    known = self.go['tracks'] if self.go is not None else {}
+    by_id = {t.track_id: t for t in f.tracks or () if getattr(t, 'x', None) is not None}
+    th = math.radians(f.turned_deg)
+    c, s = math.cos(th), math.sin(th)
+    for tid, k in known.items():
+      if not k.get('stood') or k['started']:
+        continue
+      trk = by_id.get(tid)
+      if trk is None:
+        continue  # coasting, unmatched: the count waits for it
+      moved = f.odo_m - k['odo']
+      xn, yn = float(trk.x[0]), float(trk.x[1])
+      vxn, vyn = (float(trk.x[2]), float(trk.x[3])) if len(trk.x) > 3 else (0., 0.)
+      # the go's frame: our car moved `moved` m along a heading that turned th, the turn taken as gradual
+      xg = moved * math.cos(th / 2.) + xn * c - yn * s
+      yg = moved * math.sin(th / 2.) + xn * s + yn * c
+      vxg, vyg = vxn * c - vyn * s, vxn * s + vyn * c
+      if k['cross']:
+        toward, v_toward = abs(k['gy']) - abs(yg), -math.copysign(1., k['gy']) * vyg
+      else:
+        toward, v_toward = k['gx'] - xg, -vxg
+      need = START_M + START_RANGE_FRAC * math.hypot(k['gx'], k['gy'])
+      k['run'] = k['run'] + 1 if toward >= need or v_toward >= START_V else 0
+      if k['run'] >= START_FRAMES:
+        k['started'] = True
+        cloudlog.event("turnpilot.stop_go_start_seen", key=list(self.key), track=int(tid), role=k['role'], state=self.state,
+                       toward=round(toward, 2), need=round(need, 2), v_toward=round(v_toward, 2), moved=round(moved, 2),
+                       go_t=round(self.t - self.go['t'], 2))
 
   def _still(self, f: Frame) -> dict:
     """The tracks known at the go that haven't moved since (_known_moved): the go stands on them as it found them."""
@@ -1555,9 +1936,18 @@ class StopGo:
     """A track known at the go, during the launch (its bearings from a moving car aren't comparable, so stop_evidence restarts
     its trust): one stopped at its line moved once the tracker's ground motion (ego-compensated) since the go passes
     SHIELD_MOVE_M or its ground speed SHIELD_V, each with the ranging's allowance; one that was far stays so only while its
-    go-time distance less its go-time speed carried on still lets it stop at A_U2; anything else is moving."""
+    go-time distance less its go-time speed carried on still lets it stop at A_U2; anything else is moving. Under vision one
+    standing at the go has moved once _watch_starts saw it start, and a far one standing has moved only then."""
     trk = next((t for t in f.tracks or () if t.track_id == tid), None)
+    # SAT-11, under vision: one standing at the go has moved once it has started (_watch_starts: its ground point and speed,
+    # ego motion and our yaw taken out), at its line or not. A 'far' one standing back of its line is judged by that alone,
+    # never by its go-time speed carried on, which for a standing car never runs out (run 11: 0.08 m/s at 16.7 m)
+    stood = self.vision and k.get('stood', False)
+    if stood and k['started']:
+      return True
     if k['u2'] == 'far':
+      if stood:
+        return False
       d_lo = k['d_lo'] - k['v_hi'] * (self.t - k['t'])
       room = d_lo - sr.U2_LINE_M
       return room <= 0. or k['v_hi'] ** 2 / (2. * room) > sr.A_U2

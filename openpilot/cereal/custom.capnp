@@ -251,6 +251,10 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     # ALWAYS_DRIVE.md MC-03 (TurnPilotAlwaysDrive): mapControlsUnavailable's line with no sound, once its status has been said
     # (map_controls.py): its later onsets, after an alert covered it, are silent
     mapControlsUnavailableSilent @29;
+    # SAT-11 (TurnPilotStopSignGo=vision, stop_go.py _rail): from the stop sign's commit point on, a confirmed vehicle in the
+    # car's path corridor ahead: the car stopped short of it, "Car crossing", loud while it holds (hardBrake's sound), in a
+    # cross lane too since a car is entering the car's own path
+    carCrossing @30;
   }
   mapControl @24 :MapControlStatus;
   controlPrompt @25 :ControlPrompt;
