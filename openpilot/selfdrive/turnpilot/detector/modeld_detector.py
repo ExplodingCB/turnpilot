@@ -12,8 +12,11 @@ while the full pass looks through the wide camera (a turn, a curve, their WIDE_H
 between reads it on that road frame, behind the far crop's boxes, where the step has room (read_odd_paint), and the next
 wide run's message carries it (lanePaintStatus read): the wrong-side guard's paint on a turn's approach and exit (PF-03).
 On comma's public comma four routes (lane_paint.py's, 37 turns), the guard's line was read on none of the moving approach,
-turn and exit steps before and on 27%, 13% and 37% of them so, with no wrong-side fire added in any; without lane_paint's
-chromaticity test it added two, in a turn and an exit.
+turn and exit steps before and on 27%, 13% and 37% of them so (21%, 15% and 21% of the 24 in right-hand traffic, where the
+guard runs), with no wrong-side fire added in any; without lane_paint's chromaticity test it added two, in a turn and an
+exit. The far crop's boxes mask only its window, so the replay also read the same frames behind a full road pass's boxes
+on the frame before (which the car doesn't have in a turn): the far side's ego line read broken white (the far-side
+keep's evidence) on 304 of 4591 right-hand-traffic wide steps against 302 so, never where that read yellow.
 It costs about 1.5-2 ms on a Mac and has its own budget: a read slower than PAINT_BUDGET_S (median) turns the paint off
 for the drive, loudly, and the detector, which the pedestrian holds need, keeps running.
 
