@@ -516,6 +516,66 @@ def test_vision_v9_a_corner_occluder_starts_the_creep_for_a_view_after_2_s(tmp_p
   assert all(s.accel_cap >= -2. - 1e-9 for d in out for s in d.stops)
 
 
+# --------------------------------------------------------------------------------------- after the commit: band and lane
+
+@pytest.mark.parametrize('mph', [20, 35])
+@pytest.mark.parametrize('stage', ['committed', 'inLane'])
+def test_vision_a_car_coming_after_the_commit_aborts_in_the_band_and_past_the_in_lane_point_is_said_never_braked_for(tmp_path, stage, mph):
+  # 2.6's in-band abort and V8's in-lane rule under vision, at 25 mph and the long look's 35: a car rolling at the far lane from
+  # 14 m at 8 m/s, first seen on the frame the go reaches the stage. In the band, with room to stop short of its midpoint, it
+  # is the capped abort (bandAbort) and never only said; past the in-lane point it is said (crossTrafficAfterCommit) and never
+  # braked for. test_stop_go's V8 test passes on either outcome, so the band abort turned off under vision (mutant M39) passed
+  w = vdrive(tmp_path, mph, lag_s=0.2)
+  out, k = [], None
+  for _ in range(round(16. / DT_MDL)):
+    d = w.step()
+    out.append(d)
+    if k is None and d.state == stage:
+      k = len(out) - 1
+      w.tracks = vcars((9, 'right', rolling(w.t_cam - 100., d0=14., v0=8.)))
+  assert k is not None and out[k].mode == 'vision' and out[k].acting
+  after = out[k:]
+  aborts = [d for d in after if d.withdraw == 'bandAbort']
+  said = [d for d in after if d.alert == 'crossTrafficAfterCommit']
+  if stage == 'committed':
+    assert aborts and not said, [(d.state, d.withdraw, d.alert) for d in after[:5]]
+    assert all(s.accel_cap >= -2. - 1e-9 for d in after for s in d.stops) and any(d.stops for d in after)
+    # at rest short of the band's midpoint, never in the cross lane: un-committed there, looking again
+    assert max(d.position_m for d in after) <= sr.band_midpoint(w.sg.edges) - sr.M_EDGE + 1e-6
+    assert any(d.state == 'observe' for d in after) and not any(d.state in ('inLane', 'done') for d in after)
+  else:
+    assert said and not aborts and not any(d.withdraw for d in after)
+    assert all(not d.stops for d in after) and any(d.state == 'done' for d in after)
+
+
+def test_vision_stalled_in_a_lane_with_a_car_coming_in_one_left_to_cross_gets_no_clearbox_until_it_has_passed(tmp_path):
+  # V4's lifts past the in-lane point under vision: a lift into a lane whose traffic fails the object tests never comes. The
+  # model stands the car in the junction; a car rolls at it down the far lane from 40 m at 4 m/s. Each STALL_BOX_S try while
+  # it comes is refused naming it, the car and the stall are said, nothing holds or brakes the car there, and the first
+  # clearBox is the next try once the car is no longer a threat
+  w = vdrive(tmp_path, 20)
+  k = 0
+  while w.step().state != 'inLane':
+    k += 1
+    assert k < 600
+  w.behaviour = lambda w: 'holds'
+  w.v, w.queue = 0., type(w.queue)([0.] * len(w.queue))
+  w.tracks = vcars((9, 'right', rolling(w.t_cam - 100., d0=40., v0=4.)))
+  events = []
+  real = sg.cloudlog.event
+  sg.cloudlog.event = lambda name, **kw: (events.append((name, w.sg.t, kw)), real(name, **kw))
+  try:
+    out = w.run(25.)
+  finally:
+    sg.cloudlog.event = real
+  refused = [t for name, t, kw in events if name == 'turnpilot.stop_go_clear_box_no' and kw['threat']]
+  boxes = [t for name, t, kw in events if name == 'turnpilot.stop_go_clear_box']
+  assert len(refused) >= 3 and boxes, (refused, boxes)
+  assert boxes[0] > refused[-1] and boxes[0] - refused[-1] <= sg.STALL_BOX_S + 0.11
+  assert any(d.alert == 'crossTrafficAfterCommit' for d in out) and any(d.alert == 'stalledInJunction' for d in out)
+  assert all(not d.stops for d in out) and not any(d.fault for d in out)
+
+
 # ----------------------------------------------------------------------------------------------- the property, the log
 
 def test_vision_every_decider_stop_is_minus_2_or_gentler_and_every_held_frame_says_why(tmp_path):
