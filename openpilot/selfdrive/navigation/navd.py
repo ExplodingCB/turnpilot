@@ -12,7 +12,7 @@ from openpilot.common.realtime import Ratekeeper
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.time_helpers import system_time_valid
 from openpilot.selfdrive.navigation.helpers import latest_gps_source
-from openpilot.selfdrive.navigation.route import along_path, local_meters
+from openpilot.selfdrive.navigation.route import ROUTE_TURNS_STEP_M, along_path, local_meters, route_turns
 from openpilot.selfdrive.turnpilot.routing.controls import haversine
 from openpilot.selfdrive.turnpilot.routing.guidance import (CONTROLS_AHEAD_M, CONTROLS_BEHIND_M, MAX_CONTROLS, control_msg, fill_controls,
                                                             fill_guidance)
@@ -520,6 +520,9 @@ class RouteEngine:
     msg.navInstruction.maneuverDistance = distance_to_maneuver_along_geometry
     set_banner(msg.navInstruction, banner_step['bannerInstructions'], distance_to_maneuver_along_geometry)
     fill_guidance(msg.navInstruction, self.route, self.step_idx, distance_to_maneuver_along_geometry, self.opposing)
+    # TurnPilot (off-route turn, F3): the route's own shape around the car, so a bend the road makes is no off-route turn
+    turns, msg.navInstruction.routeTurnsStart = route_turns(self.route_geometry, self.step_idx, along_geometry)
+    msg.navInstruction.routeTurns, msg.navInstruction.routeTurnsStep = turns, ROUTE_TURNS_STEP_M
     # TurnPilot: the controls in maneuverDistance's frame, the steps' distances and then along this step's geometry
     car_along = sum(s['distance'] for s in self.route[:self.step_idx]) + along_geometry
     fill_controls(msg.navInstruction, self.controls, self.controls_status, car_along)

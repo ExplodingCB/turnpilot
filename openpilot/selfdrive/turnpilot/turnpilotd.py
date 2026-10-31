@@ -368,6 +368,14 @@ OFF_ROUTE_TURN_DEG = 45.
 OFF_ROUTE_TURN_M = 30.
 OFF_ROUTE_NEAR_M = 40.
 OFF_ROUTE_BEND_MARGIN_DEG = 10.
+# the route's own shape (navInstruction.routeTurns, navd's route_turns): a heading change the road makes with no maneuver (an
+# S-bend, a street turning 90 deg with no junction) is no off-route turn when the route turns that way, within the margin,
+# over some OFF_ROUTE_SHAPE_WINDOW_M of it from OFF_ROUTE_TURN_M + OFF_ROUTE_SHAPE_BEHIND_M behind the car's place on it to
+# OFF_ROUTE_SHAPE_AHEAD_M ahead (the place dead-reckoned from navd's 1 Hz fix, which lags the car: its latency, and the
+# shape is of where the fix was). No shape (a navd before it, an invalid message): the step's bend alone, as before
+OFF_ROUTE_SHAPE_BEHIND_M = 5.
+OFF_ROUTE_SHAPE_AHEAD_M = 20.
+OFF_ROUTE_SHAPE_WINDOW_M = OFF_ROUTE_TURN_M + 10.
 OFF_ROUTE_TURN_REASON = "Off route: take control"
 LEAD_CORROBORATE_M = 3.
 LEAD_BEARING_TOL_DEG = 3.
@@ -788,6 +796,7 @@ class TurnPilot:
     self.wrong_unread_s = 0.       # ...since the last read of that line
     self.wrong_side_on = False     # ...handed back for it, until the driver takes over
     self.or_win: list = []         # (odometer, deg) of the car's heading change off the route's maneuvers (off_route_turn)
+    self.or_shape: tuple = ()      # navInstruction's (routeTurns, routeTurnsStart, routeTurnsStep, odometer at receipt), or ()
     self.or_near_odo = -1e9        # odometer where a route maneuver or a turn desire last was near
     self.or_id, self.or_after, self.or_prev_after = None, None, None  # the maneuver, its bearing out, the last one's
     self.or_on = False             # handed back for an off-route turn, until the driver takes over
@@ -2804,6 +2813,10 @@ class TurnPilot:
     changed OFF_ROUTE_TURN_DEG within OFF_ROUTE_TURN_M of travel away from any route maneuver, held until the driver takes over
     (openpilot disengaged). Nothing here steers or brakes."""
     enabled = sm['carControl'].enabled
+    if sm.updated['navInstruction']:
+      ni = sm['navInstruction']
+      ok = sm.valid['navInstruction'] and len(ni.routeTurns) and ni.routeTurnsStep > 0.
+      self.or_shape = (list(ni.routeTurns), float(ni.routeTurnsStart), float(ni.routeTurnsStep), self.odo_m) if ok else ()
     if self.or_on:
       self.or_on = enabled
       return self.or_on
@@ -2828,10 +2841,34 @@ class TurnPilot:
     bend = turn_angle(self.or_prev_after, bearings[0]) if bearings is not None and self.or_prev_after is not None else 0.
     if bend * right > 0. and abs(bend) >= OFF_ROUTE_TURN_DEG - OFF_ROUTE_BEND_MARGIN_DEG:
       return False  # the route bends that way in this step
+    shape = self.route_shape_turn(right)
+    if shape is not None and abs(shape) >= OFF_ROUTE_TURN_DEG - OFF_ROUTE_BEND_MARGIN_DEG:
+      return False  # the road itself turns that way here
     self.or_on, self.or_win = True, []
     cloudlog.event("turnpilot.off_route_turn", error=True, v=round(v_ego, 2), turned_deg=round(right, 1), bend_deg=round(bend, 1),
-                   distance=round(rf.distance, 1), maneuver_id=rf.maneuver_id)
+                   shape_deg=None if shape is None else round(shape, 1), distance=round(rf.distance, 1), maneuver_id=rf.maneuver_id)
     return True
+
+  def route_shape_turn(self, right: float) -> float | None:
+    """The route's largest heading change right's way (deg, its sign; 0 none that way) over any OFF_ROUTE_SHAPE_WINDOW_M of it
+    around the car's window (OFF_ROUTE_SHAPE_*), from navd's routeTurns dead-reckoned by the odometer; None with no shape."""
+    if not self.or_shape:
+      return None
+    turns, start, step, odo = self.or_shape
+    car = self.odo_m - odo  # m along the route from the fix's place
+    lo, hi = car - OFF_ROUTE_TURN_M - OFF_ROUTE_SHAPE_BEHIND_M, car + OFF_ROUTE_SHAPE_AHEAD_M
+    heading = [0.]
+    for t in turns:
+      heading.append(heading[-1] + t)
+    edges = [(start + i * step, h) for i, h in enumerate(heading) if lo - 1e-6 <= start + i * step <= hi + 1e-6]
+    sign = 1. if right > 0. else -1.
+    best = 0.
+    for i, (a, ha) in enumerate(edges):
+      for b, hb in edges[i + 1:]:
+        if b - a > OFF_ROUTE_SHAPE_WINDOW_M + 1e-6:
+          break
+        best = max(best, sign * (hb - ha))
+    return sign * best
 
   def watch_lead(self, model, objects, raw) -> None:
     """This frame's close lead (close_lead) and whether the live scene corroborates it (lead_corroboration), held

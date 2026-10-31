@@ -1,6 +1,7 @@
 """Synthetic cereal messages for TurnPilot's tests."""
 import openpilot.cereal.messaging as messaging
 from openpilot.selfdrive.modeld.constants import ModelConstants
+from openpilot.selfdrive.navigation.route import ROUTE_TURNS_STEP_M, route_turns as route_turns_of
 
 LANE_WIDTH = 3.6
 
@@ -13,7 +14,8 @@ def set_lanes(builder, field, lanes):
 
 
 def nav_instruction(distance, mtype="turn", modifier="left", remaining=None, lanes=(), valid=True, junction=None,
-                    through=None, route_count=0, ahead=(), controls=(), controls_status=None, off_route=(), off_route_status=None):
+                    through=None, route_count=0, ahead=(), controls=(), controls_status=None, off_route=(), off_route_status=None,
+                    route_turns=None):
   """A navInstruction reader. lanes: ((directions, active), ...) left to right. junction: (bearing_before,
   bearing_after, branches[, opposing[, opposing speed m/s[, opposing lanes[, opposing straight m]]]]) from Valhalla, or None for a
   route without intersection data; opposing is NavInstruction.Opposing's name, unknown when left out; its speed, lanes and
@@ -21,7 +23,8 @@ def nav_instruction(distance, mtype="turn", modifier="left", remaining=None, lan
   route_count: navd's routeCount. ahead: the maneuvers after this one for allManeuvers, [(distance, type, modifier[,
   junction]), ...]; allManeuvers starts with this one, as navd's does. controls: map stop controls, [(id, kind, distance[,
   line_mapped, junction, cross_suspect[, junctionInfo dict]]), ...]; controls_status: navd's controlsStatus ('ok' when there are controls).
-  off_route, off_route_status: offRouteControls as controls, and offRouteControlsStatus ('ok' when there are controls)."""
+  off_route, off_route_status: offRouteControls as controls, and offRouteControlsStatus ('ok' when there are controls).
+  route_turns: (routeTurns, routeTurnsStart, routeTurnsStep), the route's shape around the car, or None for none."""
   msg = messaging.new_message('navInstruction', valid=valid)
   ni = msg.navInstruction
   ni.routeCount = route_count
@@ -68,6 +71,8 @@ def nav_instruction(distance, mtype="turn", modifier="left", remaining=None, lan
       c.junctionInfo = fields[6]
   if off_route_status is not None or off_route:
     ni.offRouteControlsStatus = off_route_status or 'ok'
+  if route_turns is not None:
+    ni.routeTurns, ni.routeTurnsStart, ni.routeTurnsStep = route_turns
   return msg.as_reader().navInstruction
 
 
@@ -85,8 +90,11 @@ class FakeNavd:
   through: {step: (lanes, s)}, an intersection the route goes straight through at s with those lanes.
   route_count: navd's routeCount for this route. controls: [(s, kind[, line_mapped, junction, cross_suspect]), ...] stop
   points along the route, sent with ids in route order, -15 m to 400 m ahead and at most 8, nearest first, as navd does;
-  controls_status: navd's controlsStatus."""
-  def __init__(self, maneuvers, lanes=None, period=20, through=None, route_count=0, controls=(), controls_status=None):
+  controls_status: navd's controlsStatus. shape: the route's (longitude, latitude) polyline from s = 0, for routeTurns as
+  navd's route_turns makes them at the car's place lag m back (navd's 1 Hz fix behind the car); None: no shape."""
+  def __init__(self, maneuvers, lanes=None, period=20, through=None, route_count=0, controls=(), controls_status=None,
+               shape=None, lag=0.):
+    self.shape, self.lag = shape, lag
     self.maneuvers = sorted(maneuvers, key=lambda m: m[0])
     self.controls = sorted(controls, key=lambda c: c[0])
     self.controls_status = controls_status
@@ -112,9 +120,12 @@ class FakeNavd:
       through = (through[0], through[1] - s) if through[1] > s else None
     ahead = [(m[0] - s,) + tuple(m[1:]) for m in self.maneuvers[self.step + 1:]]
     controls = [(i, c[1], c[0] - s) + tuple(c[2:]) for i, c in enumerate(self.controls) if -15. < c[0] - s < 400.][:8]
+    route_turns = None
+    if self.shape is not None:
+      route_turns = route_turns_of([self.shape], 0, max(s - self.lag, 0.)) + (ROUTE_TURNS_STEP_M,)
     return nav_instruction(pos - s, mtype, modifier, remaining=self.maneuvers[-1][0] - s, lanes=self.lanes.get(self.step, ()),
                            junction=junction, through=through, route_count=self.route_count, ahead=ahead, controls=controls,
-                           controls_status=self.controls_status)
+                           controls_status=self.controls_status, route_turns=route_turns)
 
 
 def road(lanes_left, lanes_right, line_prob=0.9, edge_std=0.3, lane_width=LANE_WIDTH, shoulder=0.5):

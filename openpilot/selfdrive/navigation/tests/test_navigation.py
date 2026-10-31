@@ -21,7 +21,7 @@ from openpilot.selfdrive.turnpilot.routing import certify
 from openpilot.selfdrive.navigation.navd import RECOMPUTE_HOLD, REROUTE_COUNTER_MIN, ROUTE_RESEND_PERIOD, RouteEngine, set_banner
 from openpilot.selfdrive.navigation.pmtiles import PMTiles, decode_directory, tile_id
 from openpilot.selfdrive.navigation.renderer import MAJOR, MEDIUM, MINOR, SIZE, STREET, TRACK, MapRenderer, draw_segments, mercator, project, stroke_widths
-from openpilot.selfdrive.navigation.route import RouteTracker
+from openpilot.selfdrive.navigation.route import METERS_PER_DEGREE, ROUTE_TURNS_AHEAD_M, ROUTE_TURNS_BEHIND_M, ROUTE_TURNS_STEP_M, RouteTracker, route_turns
 from openpilot.selfdrive.navigation.tiles import RemoteTiles
 from openpilot.selfdrive.navigation.vector_tile import decode_lines, decode_roads
 from openpilot.selfdrive.turnpilot.maps.client import MapError
@@ -367,6 +367,33 @@ class TestRouteEngine(unittest.TestCase):
     self.engine.last_position = (0.001, 0)  # at the maneuver
     self.engine.send_instruction()
     self.assertAlmostEqual(self.last_message('navInstruction').navInstruction.maneuverDistance, 0, delta=0.01)
+
+  def test_the_routes_shape_around_the_car(self):
+    # TurnPilot (off-route turn, F3): the route's heading change per bin around the car's matched place, on every valid message
+    self.load_route()
+    self.engine.last_position = (0.0004, 0)  # 44.5 m along the first step, the route straight east
+    self.engine.send_instruction()
+    ni = self.last_message('navInstruction').navInstruction
+    self.assertEqual((ni.routeTurnsStart, ni.routeTurnsStep), (-40., ROUTE_TURNS_STEP_M))  # clipped at the route's start
+    self.assertEqual(len(ni.routeTurns), 8 + int(ROUTE_TURNS_AHEAD_M / ROUTE_TURNS_STEP_M))
+    self.assertTrue(all(abs(t) < 1e-6 for t in ni.routeTurns))
+
+  def test_route_turns_find_a_bend_with_no_maneuver(self):
+    # two steps, the first ending at a street that turns right 90 deg 100 m in, the second's first point repeating it
+    m = 1 / METERS_PER_DEGREE
+    first = [[0, 0], [0, 50 * m], [0, 100 * m]]
+    second = [[0, 100 * m], [50 * m, 100 * m], [200 * m, 100 * m]]
+    turns, start = route_turns([first, second], 0, 80.)
+    self.assertEqual(start, -ROUTE_TURNS_BEHIND_M)
+    self.assertEqual(len(turns), int((ROUTE_TURNS_BEHIND_M + ROUTE_TURNS_AHEAD_M) / ROUTE_TURNS_STEP_M))
+    corner = [i for i, t in enumerate(turns) if abs(t) > 1e-3]
+    self.assertEqual(len(corner), 1)
+    self.assertAlmostEqual(turns[corner[0]], 90., delta=0.1)  # + right
+    self.assertAlmostEqual(start + corner[0] * ROUTE_TURNS_STEP_M, 20., delta=ROUTE_TURNS_STEP_M)  # 20 m ahead of the car
+    turns, start = route_turns([first, second], 1, 30.)  # on the second step, past the bend: 30 m behind the car
+    corner = [i for i, t in enumerate(turns) if abs(t) > 1e-3]
+    self.assertAlmostEqual(start + corner[0] * ROUTE_TURNS_STEP_M, -30., delta=ROUTE_TURNS_STEP_M)
+    self.assertEqual(route_turns([[[0, 0], [0, 0]]], 0, 0.), ([], 0.))
 
   def test_controls_in_the_maneuver_distance_frame(self):
     from openpilot.selfdrive.turnpilot.routing.controls import Control

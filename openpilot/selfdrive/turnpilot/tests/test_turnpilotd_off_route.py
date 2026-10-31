@@ -2,9 +2,11 @@
 desire and the model turned right on its own into the oncoming lane and a roadside object)."""
 import math
 
+import numpy as np
 import pytest
 
 from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.navigation.route import METERS_PER_DEGREE
 from openpilot.selfdrive.turnpilot.turnpilotd import OFF_ROUTE_TURN_DEG, OFF_ROUTE_TURN_M, OFF_ROUTE_TURN_REASON
 from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Sim
@@ -54,3 +56,87 @@ def test_a_bend_the_route_makes_that_way_in_its_step_is_no_off_route_turn(bend, 
   sim.v = V
   plans = turn_at(sim, 200., deg, until=280.)
   assert any(p.controlPrompt == 'offRouteTakeControl' for p in plans) == fires
+
+
+# the route's own shape (navInstruction.routeTurns): the road bending with no maneuver is no off-route turn
+R = 30.  # m: a suburban street's tight bend
+
+
+def arcs(*legs):
+  """A route's bearing (deg, unwrapped, + right) at s from legs [(s0, deg, radius), ...]: straight on, then each bend of deg
+  at radius from its s0."""
+  def bearing(s):
+    b = 0.
+    for s0, deg, radius in legs:
+      length = math.radians(abs(deg)) * radius
+      b += math.copysign(min(max(s - s0, 0.), length) / radius, deg) * 180. / math.pi
+    return b
+  return bearing
+
+
+def polyline(bearing_of, length, step=2.):
+  """The route's (longitude, latitude) polyline from bearing_of, s = 0 to length, at the equator."""
+  pts, x, y, s = [(0., 0.)], 0., 0., 0.
+  while s < length:
+    b = math.radians(bearing_of(s + step / 2))
+    x, y, s = x + step * math.sin(b), y + step * math.cos(b), s + step
+    pts.append((x / METERS_PER_DEGREE, y / METERS_PER_DEGREE))
+  return np.array(pts)
+
+
+def drive(sim, bearing_of, until, extra=lambda s: 0.):
+  """The car follows the road bearing_of (its yaw rate the road's curvature at its speed), plus extra(s) deg of its own."""
+  plans = []
+  while sim.s < until:
+    h = 0.5
+    deg_per_m = (bearing_of(sim.s + h) + extra(sim.s + h) - bearing_of(sim.s - h) - extra(sim.s - h)) / (2 * h)
+    plans.append(sim.step(engaged=True, yaw_rate=-math.radians(deg_per_m) * sim.v))
+  return plans
+
+
+def fired(plans):
+  return [i for i, p in enumerate(plans) if p.controlPrompt == 'offRouteTakeControl']
+
+
+ROADS = {
+  's_bend': arcs((200., -90., R), (200. + math.pi / 2 * R, 90., R)),
+  'street_bend': arcs((200., 90., R)),
+  'gentle_curve': arcs((150., 90., 300.)),
+}
+
+
+@pytest.mark.parametrize("v", [8., 15.])
+@pytest.mark.parametrize("road", sorted(ROADS))
+def test_a_bend_the_road_makes_with_no_maneuver_never_fires(road, v):
+  bearing = ROADS[road]
+  sim = Sim([(2000., "turn", "left")], cruise=v, shape=polyline(bearing, 2100.), lag=0.5 * v)
+  sim.v = v
+  assert not fired(drive(sim, bearing, 800.))
+
+
+def test_without_the_routes_shape_the_s_bend_is_judged_as_before():
+  # navd's message without routeTurns (a navd before it): only the step's bend, which an S-bend nets to nothing
+  sim = Sim([(2000., "turn", "left")], cruise=8.)
+  sim.v = 8.
+  assert fired(drive(sim, ROADS['s_bend'], 400.))
+
+
+def test_a_lane_change_on_a_straight_route_never_fires():
+  straight = arcs()
+  sim = Sim([(2000., "turn", "left")], cruise=13., shape=polyline(straight, 2100.), lag=6.)
+  sim.v = 13.
+  change = arcs((200., 8., 60.), (200. + math.radians(8.) * 60., -8., 60.))  # one lane right over about 17 m
+  assert not fired(drive(sim, straight, 400., extra=change))
+
+
+@pytest.mark.parametrize("lag", [0., 7.])
+def test_row_1_the_model_turning_off_a_straight_route_still_fires_at_the_same_point(lag):
+  def row_1(shape):
+    sim = Sim([(400., "turn", "right", junction_of("right")), (2000., "turn", "left")], cruise=V,
+              shape=polyline(arcs(), 2100.) if shape else None, lag=lag)
+    sim.v = V
+    while sim.s < 80.:
+      sim.step(engaged=True)
+    return fired(turn_at(sim, 100., 90.))
+  with_shape, without = row_1(True), row_1(False)
+  assert with_shape and with_shape[0] == without[0]
