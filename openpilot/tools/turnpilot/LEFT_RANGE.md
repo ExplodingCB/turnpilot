@@ -11,7 +11,18 @@ Neither tool writes a param. Kellen runs the `--set` line on the comma, parked, 
 
 The left goes when no road camera box (a vehicle at confidence 0.35 or more in the oncoming band) with a nearest plausible range (`near_m`) inside R_req has appeared for `CLEAR_WINDOW_S` (2.5 s). Route time attempts a left only when R_req fits under `TurnPilotLeftRangeM`, or past it under `TurnPilotLeftFarRangeM` while the far crop reads. So the range is safe only if every oncoming car inside it is boxed, with no gap long enough for the window to fill.
 
-`left_range.py` counts a car as confirmed from the farthest `near_m` after which it never went `CLEAR_WINDOW_S / 3` (0.83 s) without a box. CRITIQUE REQUIRED 2 sets that ratio: the window must be at least 3 times the longest dropout. A stretch with no road run (the full pass on the wide camera, an uncalibrated spell, the detector stopped) counts as no box, so unknown is never a clear road.
+`left_range.py` counts a car as confirmed from the farthest `near_m` after which it never went `CLEAR_WINDOW_S / 3` (0.83 s) without a box at the left. CRITIQUE REQUIRED 2 sets that ratio: the window must be at least 3 times the longest dropout. A stretch with no road run (the full pass on the wide camera, an uncalibrated spell, the detector stopped) counts as no box, so unknown is never a clear road.
+
+The drive is not the left, so a gap on the drive counts as the longer of two stretches it would become at the left:
+
+- The same missed runs. On the drive the full pass is on the road camera every run. Held at the line (`roadAndWide`), only 2 runs in 3 (`WIDE_EVERY`) are, so the same misses take 1.5 times as long.
+- The same stretch of road. On the drive an oncoming car closes at its own speed plus Chase's car's. At the line it closes at its own speed only, so it stays in each stretch longer: (its speed + ours) / its speed.
+
+The drive time allowed is therefore 0.56 s at most, about 4 missed runs in a row. It drops to 0.50 s with Chase's car at 20 mph and oncoming traffic at 30 mph, and to 0.42 s with both at 25 mph. The slower Chase's car goes, the less the second rule costs. The far crop's chain uses the same rule, although the far crop's runs aren't thinned at the left. That is the safe side.
+
+A box counts for a car only where the car's own motion puts it. The chain's range must fit the seed's speed and ours from the seed, and from the car's last box. It is never re-centred on a hit, so the box of something closing at another rate (a parked car, a lead) drifts out. Any other band box within twice those gates of where the car would be ends the chain as `ambiguous`, and so does the one box there when it falls outside them. Something else could be taken for the car there, so the tool gives no credit past that point. The cost is that close traffic shortens the chain. For the road camera's 150 m (ground), oncoming cars need to be about 2 s apart. For the far crop's 300-350 m, they need to be about 4-5 s apart. Cars parked by the oncoming lanes, and a lead in our lane near an oncoming car's range, end chains too.
+
+Two limits remain. First, a box of another object first seen inside a car's gate on the run the car's own box goes can still carry the chain until their motions part by the gate's width (2 m plus 15% of range), a second or more. For example, a stopped car that comes into view as the car passing it leaves. Second, a chain runs only back from its seed (10-80 m), so gaps between the seed and the car aren't checked.
 
 The recommendation is the shortest confirmed range among at least 59 oncoming cars, rounded down to 10 m. With 59 cars the shortest is a one-sided 95% lower confidence bound on the 5th percentile (Wilks), which matches DESIGN section 6's 95% recall rule. It also means every sampled car was confirmed by that range. `--allow-misses` takes Wilks' k-th shortest instead, which lets the k-1 shortest fall short; it is off by default because it loosens the rule, and it lists the cars it lets through.
 
@@ -34,8 +45,9 @@ The measurement comes from checklist step 17, the shadow drive. To give it enoug
 
 - Keep TurnPilot enabled in shadow mode and `TurnPilotFarCrop` on, so both passes run and are logged.
 - Finish calibration first (step 16). Runs before calibration can't be ranged.
-- Drive straight two-way roads with steady oncoming traffic. On curves the full pass moves to the wide camera and the chain breaks.
-- Plan for at least 60 oncoming cars that come within 80 m in the oncoming lanes. How long that takes depends on the road; the report says how many it found.
+- Drive straight two-way roads with steady oncoming traffic, where oncoming cars come singly, a few seconds apart, and no cars are parked along the oncoming side. On curves the full pass moves to the wide camera and the chain breaks. Cars close together end their chains early (`ambiguous`), and the shortest car sets the range.
+- Drive no faster than traffic needs. The faster Chase's car goes past an oncoming car, the shorter the gap in its boxes that is allowed.
+- Plan for at least 60 oncoming cars that come within 80 m in the oncoming lanes. That can take more than one drive. Each drive can go in one run: the tool splits the logs into drives wherever log time goes back (a reboot) or jumps more than 5 s (another route), and measures each drive on its own time base. The report says how many cars it found.
 
 After the drive, parked, copy every segment of the route off the comma and run the tool on the Mac from this worktree:
 
@@ -47,11 +59,11 @@ PYTHONPATH=$PWD:$HOME/Projects/turnpilot/.claude/worktrees/tp-blinker/opendbc_re
   ~/Projects/turnpilot/.venv/bin/python -B -m openpilot.tools.turnpilot.left_range ~/chase_routes/
 ```
 
-The tool reads every rlog under the directories it is given, in segment order. It prints the drive's run counts, the number of oncoming cars sampled, the shortest five with why each one's confirmation ended, and a recommendation or the reason there is none. It reads no location service, so it prints no position. It refuses a sunnypilot log, since sunnypilot's own messages sit on `turnpilotDetections`' slot.
+The tool reads every rlog under the directories it is given, in segment order. Several routes can sit in one directory, or each in its own. Each continuous stretch of log is measured as a drive of its own, and its cars' lines say `drive N`. A track id that turnpilotd's tracker hands out again (after a restart, or on another route) is never taken for the earlier car. Any drive that can't be used (a sunnypilot log, no carState, no camera) refuses the whole run. It prints the run counts, the number of oncoming cars sampled, how their chains ended, the shortest five with why each one's confirmation ended, and a recommendation or the reason there is none. It reads no location service, so it prints no position. It refuses a sunnypilot log, since sunnypilot's own messages sit on `turnpilotDetections`' slot.
 
 Exit status 0 means a road range is recommended, 2 means none (too few cars, nothing calibrated), and 1 means the log can't be used.
 
-Each sample line gives its reason. `unboxed` means runs went on and none boxed the car, which is either the detector's reach or a car that pulled in from a side street. `noRuns` and `uncalibrated` are stretches with no usable road run. `ambiguous` means two boxes sat where the car could be, so the tool gave no credit. Look at the short ones before deciding: a car from a driveway caps the range as hard as a real miss.
+Each sample line gives its reason. `unboxed` means runs went on and none boxed the car, which is either the detector's reach or a car that pulled in from a side street. `noRuns` and `uncalibrated` are stretches with no usable road run. `ambiguous` means another box sat where the car could be, or its one box there didn't fit its motion, so the tool gave no credit. Many `ambiguous` lines mean the traffic was too close together. Look at the short ones before deciding: a car from a driveway caps the range as hard as a real miss.
 
 If a range is recommended and Kellen decides to use it, the report ends with the command to run on the comma, parked in P, for example:
 
