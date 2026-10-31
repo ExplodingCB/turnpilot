@@ -94,9 +94,11 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   decider certifies it as mapped; at its hold its approach's class-11 shadow evidence is logged (update()'s signs: the
   forward runs counted from SIGN_LOOK_M, their stop-sign boxes, the best conf; turnpilot.map_stop_signs), and SIGN_UNSEEN_RUNS
   or more with none is said as unseen (turnpilot.map_stop_unseen) for the replay gate. Nothing here acts on a sign.
-- A yield caps the speed to YIELD_SPEED at its line, never stops the car, and goes once passed. One whose
-  road outranks every crossing one (crossSuspect: likely mapped for the cross road) is dropped and logged. Such a stop
-  sign still stops, and says the approach is unverified.
+- A yield caps the speed to YIELD_SPEED at its line and goes once passed, but only while its rolling test passes
+  (_yield, STOP_SIGNS.md 2.7, row C5); one whose test fails becomes a full stop at its line (yieldStop), the stop-sign
+  decider's like any stop sign, and its handback says "Yield" (YIELD_STOP_REASON; YD-01). One whose road outranks every
+  crossing one (crossSuspect: likely mapped for the cross road) is dropped and logged. Such a stop sign still stops, and
+  says the approach is unverified.
 - The driver's gas before a stop sign is an override; when it comes off past the line moving faster than COMMIT_SPEED,
   or past where the latch reaches (LATCH_PAST_M) at any speed, the stop is dropped (stopOverrun), else the curve resumes
   from there (re-seeded, checked for feasibility). Past the line beyond the latch's reach with no release, at any speed,

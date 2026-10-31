@@ -97,7 +97,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.turnpilot import stop_rules as sr
 from openpilot.selfdrive.turnpilot.go_override import GO_WINDOW_S, Takeover
-from openpilot.selfdrive.turnpilot.map_controls import CREEP_AT_M, CREEP_SPEED, CROSSED_CAUSES, is_stop
+from openpilot.selfdrive.turnpilot.map_controls import CREEP_AT_M, CREEP_SPEED, CROSSED_CAUSES, YIELD_STOP_REASON, is_stop
 from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
 from openpilot.selfdrive.turnpilot.routing import certify as ce
 from openpilot.selfdrive.turnpilot.routing.junctions import survey_approach
@@ -2218,7 +2218,7 @@ class StopGo:
       d.release, d.go_cause, d.stops, d.creep, d.withdraw = None, 'none', [], None, ''
       if self.state in WAITING:
         d.latch, d.prompt, d.action = 'shadow', 'none', 'held'
-        d.reason = REASONS.get(why, STOP_SIGN_REASON)
+        d.reason = yield_words(REASONS.get(why, STOP_SIGN_REASON), f.control)
         d.fault = why[:2]
     d.log = {'state': self.state, 'mode': d.mode, 'why': why, 'clear_s': round(self.clear_s, 2), 'rank': self.rank,
              'retries': self.retries, 'pos': round(d.position_m, 2), 'reason': d.reason, 'would_go': d.would_go}
@@ -2238,3 +2238,9 @@ def raw_known(desc: str, spans: list) -> bool:
   except (IndexError, ValueError):
     return False
   return any(min(span) - RAW_KNOWN_DEG <= bearing <= max(span) + RAW_KNOWN_DEG for span in spans)
+
+
+def yield_words(reason: str, control) -> str:
+  """ALWAYS_DRIVE.md YD-01: at a yield that became a stop (yieldStop) the shadow handback says "Yield" (map_controls'
+  YIELD_STOP_REASON), never "Stop sign"; any other reason as it is."""
+  return YIELD_STOP_REASON if reason == STOP_SIGN_REASON and getattr(control, 'kind', 'stop') == 'yield' else reason

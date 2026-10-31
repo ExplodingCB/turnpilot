@@ -2368,6 +2368,21 @@ def test_C5_a_yield_that_became_a_stop_is_the_deciders_as_any_stop_sign_its_go_a
   assert all(d.state == 'off' and d.go_cause == 'none' for d in out)
 
 
+def test_YD01_a_yield_that_became_a_stop_hands_back_saying_yield(tmp_path):
+  """ALWAYS_DRIVE.md YD-01 (unconditional, the words): a yield whose rolling test fails becomes a full stop at its line
+  (yieldStop), and the decider's 1 s shadow handback there said "Stop sign: take control to proceed". It says "Yield: take
+  control to proceed" (map_controls.YIELD_STOP_REASON); a stop sign's words are as before."""
+  from openpilot.selfdrive.turnpilot.map_controls import YIELD_STOP_REASON
+  w = World(tmp_path, mode='shadow')
+  w.state.mode = 'yieldStop'
+  w.control.kind = 'yield'
+  held = [d for d in w.run(4.) if d.state in sg.WAITING]
+  assert held and all(d.latch == 'shadow' and d.reason == YIELD_STOP_REASON for d in held)
+  w = World(tmp_path, mode='shadow')
+  held = [d for d in w.run(4.) if d.state in sg.WAITING]
+  assert held and all(d.latch == 'shadow' and d.reason == sg.STOP_SIGN_REASON for d in held)
+
+
 def test_ladder_rung_2_never_takes_another_turn_on_a_frame_whose_shared_conditions_werent_read(tmp_path, monkeypatch):
   # go_holds returns early on a certification failure (and a position fault, a downgrade) before the box, the views, the yaw,
   # the front zone and the turn are read; the other turn's probe takes those from this frame's own evaluation, so on such a
