@@ -600,6 +600,7 @@ class StopGo:
     self.rail_count: dict[int, int] = {}
     self.rail_on: dict | None = None
     self.rail_held = False
+    self.band_held = False          # the re-run's R2: a band abort stood the car with no room for a go: that stand is the stall's
     # ...and its evidence, fed on every vision frame of the encounter (_rail_feed): scene_policy's TrackEvidence (confirmed:
     # its hits, steady, still matched) for the hard tier, our ground pose (x, y, heading from the odometer and turned_deg),
     # and each vehicle's matches in the ground frame (RailTrack)
@@ -1354,7 +1355,7 @@ class StopGo:
         d.reason = f"Stopping short: {self.aborting['why']}"
         return
       self.aborting = None
-      room, need = self.edges.d_min - pos, sr.go_room_m(f.t_abort, right=f.maneuver == 'right')
+      room, need = self.edges.d_min - pos, self._go_room(f)
       if acting and room < need - 1e-6:
         # a withdrawn go come to rest with no room for another (2.6): H5, never a wait from where no go can start
         self._fault('H5', f, d, f"no room for another go: {room:.2f} m to the closest edge, {need:.2f} needed")
@@ -1418,7 +1419,7 @@ class StopGo:
       # its line, said from the re-engage)
       return
     room = self.edges.d_min - pos
-    need = sr.go_room_m(f.t_abort, right=f.maneuver == 'right')
+    need = self._go_room(f)
     if room < need - 1e-6:
       self._fault('H5', f, d, f"no room for a go: {room:.2f} m to the closest edge, {need:.2f} needed")
       return
@@ -1443,7 +1444,7 @@ class StopGo:
     self.said_t = None
     d.stops = []
     d.speed_cap = sr.STOP_GO_V_MAX
-    d.withdrawable = True  # standing where it was held, GO_ROOM_M or more short of dEdgeMin
+    d.withdrawable = True  # standing where it was held, GO_ROOM_M (vision: go_room_vision_m) or more short of dEdgeMin
     cloudlog.event("turnpilot.stop_go_go", key=list(self.key), pos=round(pos, 2), room=round(room, 2), retries=self.retries,
                    rank=self.rank, lanes=[(x.role, x.index, round(x.r_seen, 1), round(x.r_req, 1), x.shielded) for x in self.last_lanes],
                    vision=self.vision, need_s=need_s, noLift=self.no_lift, longLook=[r for r, _ in self.long_look],
@@ -1533,10 +1534,21 @@ class StopGo:
       cloudlog.event("turnpilot.stop_go_in_lane", key=list(self.key), pos=round(pos, 2), v=round(f.v_ego, 2))
       self._inlane(f, d, pos)
       return
-    if self.vision and self.rail_held and standing and self.aborting is None:
-      # SAT-11: a stand past the commit point the in-path rail made is the stall's (V4's clearBox lifts once nothing of
-      # TurnPilot's holds the car, the lanes left to cross tested first; H5 at VISION_STALL_H5_S), never V26's un-commit: no go
-      # from there has GO_ROOM_M, and the car may be standing in a cross lane
+    if self.vision and standing and self.aborting is not None and self.edges.d_min - pos < self._go_room(f) - 1e-6:
+      # the re-run's R2 (stop_allway_out_of_turn): the band abort stands the car past dEdgeMin (it ends short of the band
+      # midpoint), where no go has GO_ROOM_M, so V26's un-commit could only look again and hand back on the go (H5). Under
+      # vision that stand is the stall's, as the rail's is: held by the abort's stop while the lanes left to cross don't pass
+      # their object tests, then let go, the clearBox lifts once nothing of TurnPilot's holds the car
+      threat = self._threat(f, pos)
+      if threat:
+        d.reason = "Waiting: " + threat
+        return
+      cloudlog.event("turnpilot.stop_go_band_stand", key=list(self.key), pos=round(pos, 2), why=self.aborting['why'])
+      self.aborting, self.band_held = None, True
+    if self.vision and (self.rail_held or self.band_held) and standing and self.aborting is None:
+      # SAT-11: a stand past the commit point the in-path rail made (or the band abort, with no room for a go) is the stall's
+      # (V4's clearBox lifts once nothing of TurnPilot's holds the car, the lanes left to cross tested first; H5 at
+      # VISION_STALL_H5_S), never V26's un-commit: no go from there has GO_ROOM_M, and the car may be standing in a cross lane
       free = not f.tp_holding and self.rail_on is None and (f.lead_m is None or f.lead_m > LEAD_GO_M)
       self.stall_s = self.stall_s + f.dt if free else 0.
       if self.stall_s >= STALL_BOX_S - 1e-6:
@@ -2799,6 +2811,12 @@ class StopGo:
     n = self.takeover_fails if self.vision else self.retries
     if n > GO_RETRIES:
       self._fault('H5', f, d, f"the go was withdrawn {n} times ({why})")
+
+  def _go_room(self, f: Frame) -> float:
+    """m to dEdgeMin a go needs from a stand: GO_ROOM_M, under vision the shorter nudge's (stop_rules.go_room_vision_m, the
+    re-run's R7: a stand 1.01 m past the line handed back on an empty junction)."""
+    right = f.maneuver == 'right'
+    return sr.go_room_vision_m(f.t_abort, right=right) if self.vision else sr.go_room_m(f.t_abort, right=right)
 
   def _abort_stop(self, f: Frame, pos: float) -> Stop:
     return capped_abort(f.v_ego, self.aborting['to'] - pos, f"Stopping short: {self.aborting['why']}")

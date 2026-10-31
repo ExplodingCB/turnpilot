@@ -251,16 +251,13 @@ def test_the_out_of_turn_start_withdraws_the_go_before_commit_then_the_window_ag
   if where != 'back':
     return
   room = w.sg.edges.d_min - geo[nxt - 1 if nxt else -1][0]
-  if after_s <= 0.5:
-    # started early enough that the abort leaves GO_ROOM_M (run 11's 0.5 s): the window again from the withdrawal, the next
-    # go only once the car has crossed our path, and we cross after it, never a handback
-    assert nxt is not None and (nxt - wd) * DT_MDL >= sr.VISION_CLEAR_S - 1e-6 and room >= sr.go_room_m(w.kw['t_abort']) - 1e-6
-    assert geo[nxt][1] < -CAR_HALF_LEN_M
-    assert any(d.state == 'done' for d in out[nxt:]) and not any(d.fault for d in out)
-  else:
-    # later, the abort ends with less than GO_ROOM_M to dEdgeMin: no go from there (2.6), the loud handback (H5), held
-    assert nxt is None and out[-1].fault == 'H5' and out[-1].prompt == 'stopSignTakeControl'
-    assert all(w.cmds[k][1] < 0.05 for k in range(len(out) - 20, len(out)))
+  # started early enough that the abort leaves GO_ROOM_M (run 11's 0.5 s), or later with less (0.8 s: 2.0 m) but vision's go
+  # room (go_room_vision_m, the re-run's R7: at 6ba8582 this one handed back, H5): the window again from the withdrawal, the
+  # next go only once the car has crossed our path, and we cross after it, never a handback
+  assert room >= (sr.go_room_m(w.kw['t_abort']) if after_s <= 0.5 else sr.go_room_vision_m(w.kw['t_abort'])) - 1e-6, room
+  assert nxt is not None and (nxt - wd) * DT_MDL >= sr.VISION_CLEAR_S - 1e-6
+  assert geo[nxt][1] < -CAR_HALF_LEN_M
+  assert any(d.state == 'done' for d in out[nxt:]) and not any(d.fault for d in out)
 
 
 @pytest.mark.parametrize('where', ['back', 'line'])
@@ -278,6 +275,31 @@ def test_a_car_entering_our_path_after_the_commit_stops_us_short_of_it_saying_ca
   # at rest before it reached our path, short of where its lane crosses our axis
   meet = next(n for n, (_, cd) in enumerate(geo) if cd <= CAR_HALF_LEN_M + CAR_HALF_W)
   assert w.cmds[meet][1] < 0.3 and geo[meet][0] < lane_axis_m(w, 'left') - CAR_HALF_W
+
+
+@pytest.mark.parametrize('where', ['back', 'line'])
+def test_the_band_abort_s_stand_crosses_once_the_car_has_gone_never_a_handback(tmp_path, where):
+  # the re-run at 6ba8582 (R2, stop_allway_out_of_turn): the car from the left started 0.15 s after our commit (1.05 m, 1.41
+  # m/s), the band abort stood us 3.84 m past the stop point, 0.54 m past dEdgeMin; it crossed ahead (6.59 m nearest), then
+  # V26's un-commit looked again, said "Going" and handed back on the go (H5: "no room for a go: -0.54 m to the closest edge,
+  # 2.48 needed"). A band abort stands the car past the point a go needs GO_ROOM_M from, so under vision that stand is the
+  # stall's, as the rail's is: held while the car still comes, then the clearBox lifts with the lanes left to cross tested
+  # first, and across after it, never a handback, never touching it, never a stop under -2.0
+  w = world(tmp_path, where)
+  d_fn, holder = start(standing_d(where))
+  out, geo = drive_with(w, d_fn, holder, lambda d: d.state == 'committed', 40.)
+  ab = next((k for k, d in enumerate(out) if d.withdraw == 'bandAbort'), None)
+  assert ab is not None, [(d.state, d.withdraw, d.alert) for d in out[::10]]
+  stand = next(k for k in range(ab, len(out)) if w.cmds[k][1] < sg.STAND_V)
+  assert w.sg.edges.d_min - geo[stand][0] < sr.go_room_m(w.kw['t_abort'])  # no go from here could have GO_ROOM_M
+  assert not any(d.fault for d in out), [(k * DT_MDL, d.fault, d.reason) for k, d in enumerate(out) if d.fault][:3]
+  assert not any(touching(p, cd, lane_axis_m(w, 'left')) for p, cd in geo)
+  assert all(s.accel_cap >= -2. - 1e-9 for d in out for s in d.stops)
+  done = next((k for k, d in enumerate(out) if d.state == 'done'), None)
+  assert done is not None and done > stand, [(round(k * DT_MDL, 2), d.state, d.reason) for k, d in enumerate(out)][stand::20]
+  # it moved on only once the car had crossed our path
+  moved = next(k for k in range(stand, len(out)) if geo[k][0] > geo[stand][0] + 0.2)
+  assert geo[moved][1] < -CAR_HALF_LEN_M
 
 
 def crossing_y(kind, t):

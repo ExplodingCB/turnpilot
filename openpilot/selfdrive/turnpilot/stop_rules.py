@@ -66,6 +66,7 @@ TAKEOVER_MARGIN_M = 0.3
 GO_NUDGE_M = 1.0          # m of nudge in GO_ROOM_M
 GO_ROOM_RIGHT_M = 0.5     # m more for a right, whose swing reaches the far lane
 GO_ROOM_V = 1.0           # m/s the nudge reaches
+VISION_NUDGE_M = 0.5      # m, under vision the shortest nudge a go may start with ahead of its gate point (go_room_vision_m)
 
 # TurnPilotStopSignGo=vision (tp/vision-go; owner decision 2026-10-30 18:20, "vision based go"): the go from what the camera
 # sees live, no survey, validation stamp, camera fields or launch stamp
@@ -664,6 +665,16 @@ def go_room_m(t_abort_s: float, right: bool = False, a_launch: float = A_LAUNCH_
   accelerating at a_launch (the G5 nudge's A_LAUNCH_PLAN; pass the measured launch where it is larger), M_EDGE and the
   takeover margin (2.6), and GO_ROOM_RIGHT_M more for a right."""
   return GO_NUDGE_M + abort_distance(GO_ROOM_V, t_abort_s, a_launch) + M_EDGE + TAKEOVER_MARGIN_M + (GO_ROOM_RIGHT_M if right else 0.)
+
+
+def go_room_vision_m(t_abort_s: float, right: bool = False, a_launch: float = A_LAUNCH_PLAN) -> float:
+  """m to the closest plausible edge a go needs under vision (the re-run's R7): go_room_m's terms with the nudge cut to
+  VISION_NUDGE_M at a_launch, the abort from the speed it reaches there. A stand past the stop point (the bridge's low-speed
+  overshoot stood R7's car 1.01 m past its line, 2.29 m from dEdgeMin, 2.48 needed) still goes: the launch's gate point, judged
+  every frame from the car's own speed and acceleration, comes sooner, and a model that hasn't taken over by then has the go
+  withdrawn short of dEdgeMin as ever. The takeover takes far less: R2's came 0.65 s into the lift, at 0.74 m/s."""
+  v = math.sqrt(2. * a_launch * VISION_NUDGE_M)
+  return VISION_NUDGE_M + abort_distance(v, t_abort_s, a_launch) + M_EDGE + TAKEOVER_MARGIN_M + (GO_ROOM_RIGHT_M if right else 0.)
 
 
 def gate_reached(moved_m: float, v: float, t_abort_s: float, edges: Edges, a_now: float) -> bool:
