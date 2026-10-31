@@ -360,10 +360,11 @@ WRONG_SIDE_REASON = "Wrong side of the road: take control"
 # (ahead or just passed) or with a turn desire of TurnPilot's out, is handed back (offRouteTakeControl, OFF_ROUTE_TURN_REASON)
 # until the driver takes over: no braking, no steering. A bend the route itself makes that way in the step (the last
 # maneuver's bearing out to the next one's bearing in, OFF_ROUTE_BEND_MARGIN_DEG short of the threshold) explains it: no
-# handback. On 110 real Tesla and comma four segments (68.9 km, every heading event of OFF_ROUTE_TURN_DEG taken as its route's
-# maneuver) and 286 BeamNG logs with their routes (the gate's and the validation's turns) it fired on none; on row 1 it fires
-# 3.7 s after the pull-away, about 2.3 s before the car was on the wrong side
-OFF_ROUTE_TURN_DEG = 35.
+# handback. Checked offline on the logs on this Mac: 286 BeamNG logs with their routes (the gate's and the validation's turns,
+# 17 km) fire on none but row 1; the real Tesla and comma four routes (49 km engaged, segments joined, 36 junction turns taken
+# as their routes' maneuvers) fired once at 35 deg (a turn's exit 46 m past it), none at 45. On row 1 it fires 16 m after the
+# pull-away, about 1.5 s before the car was on the wrong side and 3 s before the impact
+OFF_ROUTE_TURN_DEG = 45.
 OFF_ROUTE_TURN_M = 30.
 OFF_ROUTE_NEAR_M = 40.
 OFF_ROUTE_BEND_MARGIN_DEG = 10.

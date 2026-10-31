@@ -47,7 +47,7 @@ def test_the_routes_own_turn_and_a_lane_change_sized_yaw_never_fire():
   assert not any(p.controlPrompt == 'offRouteTakeControl' for p in plans)
 
 
-@pytest.mark.parametrize("bend, deg, fires", [(0., 45., True), (60., 45., False), (60., -45., True)])
+@pytest.mark.parametrize("bend, deg, fires", [(0., 60., True), (60., 60., False), (60., -60., True)])
 def test_a_bend_the_route_makes_that_way_in_its_step_is_no_off_route_turn(bend, deg, fires):
   # the step from a straight-on junction at 100 m (bearing out 0) to a right at 400 m whose bearing in is the bend's
   sim = Sim([(100., "continue", "straight", (0., 0., 2)), (400., "turn", "right", (bend, (bend + 90.) % 360., 2))], cruise=V)
