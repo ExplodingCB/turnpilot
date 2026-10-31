@@ -26,7 +26,9 @@ Nor does a turn's first pulse go out late: gate 1's model took a turn from a pul
 pulse at or past the junction turns the car into the curb or the oncoming lanes. A turn whose desire hasn't gone out by
 MIN_FIRST_PULSE_M (between those two) while openpilot is steering is skipped as above, reason tooLate: one that comes up
 that close (navd moves past a bend or a straight-on step only 10 m beyond it), or one openpilot engages for that late.
-With openpilot not steering no desire goes out at all, and the driver turning there isn't skipped under them. A pulse
+With openpilot not steering no desire goes out at all, and the driver turning there isn't skipped under them; under
+TurnPilotAlwaysDrive neither is a turn too fast (tooFast, unprotectedStop: ALWAYS_DRIVE.md R4b), its count starting once
+openpilot steers, so a re-engage inside its stopping distance from a speed it can be made at drives it. A pulse
 again for a turn whose desire did go out (on the entry, re-engaging, pulling away) isn't a first pulse.
 A turn just past a bend or a straight-on step (route_follower.py: RouteFollower.ahead) becomes the maneuver only once
 the car is NAVD_ADVANCE_M past that step, at whatever distance it then has: one under MIN_FIRST_PULSE_M away already is
@@ -137,6 +139,11 @@ class TurnSkip:
       self._infeasible = 0
       return SkipState(False, True)
     if desire_out:  # committed: never skipped now, only no new pulse
+      return SkipState(False, False)
+    if self.always_drive and not lat_active:
+      # TurnPilotAlwaysDrive (ALWAYS_DRIVE.md R4b): latched only while openpilot steers, as tooLate is; the driver's own
+      # approach withholds the pulse, never skips the turn under them, and the count starts on the live speed once it steers
+      self._infeasible = 0
       return SkipState(False, False)
     self._infeasible += 1
     if self._infeasible >= SKIP_CONFIRM_FRAMES:

@@ -268,3 +268,59 @@ def test_a_turn_whose_first_pulse_is_its_go_is_never_too_late():
     assert not state.skipped, d
   # without it, as before
   assert TurnSkip().update(left, MIN_FIRST_PULSE_M - 1., 1, 3., False).skipped
+
+
+@pytest.mark.parametrize("stop_infeasible", [False, True], ids=["tooFast", "unprotectedStop"])
+def test_too_fast_latches_only_while_openpilot_steers_under_always_drive(stop_infeasible):
+  """ALWAYS_DRIVE.md R4b (S3), under TurnPilotAlwaysDrive: tooFast (and its unprotectedStop, on the same count) latches only
+  while openpilot steers, as tooLate already does. The gate's tooFast skips were 14 of 15 at the spawn, before engagement:
+  a car driven by hand inside a turn's stopping distance had the turn skipped for good under it. Disengaged, the check still
+  withholds the pulse (feasible_now false); once openpilot steers it runs on the live speed and skips as before."""
+  m = maneuver_from_instruction(nav_instruction(30., "turn", "left", junction=junction_of("left")))
+
+  def frames(skip, n, v, lat_active, mid=1):
+    return [skip.update(m, 30., mid, v, False, lat_active=lat_active, stop_infeasible=stop_infeasible) for _ in range(n)]
+
+  # switch on, openpilot not steering: never skipped however long, and no pulse may start
+  skip = TurnSkip()
+  skip.always_drive = True
+  states = frames(skip, 5 * SKIP_CONFIRM_FRAMES, 15., lat_active=False)
+  assert not any(s.skipped for s in states) and not any(s.feasible_now for s in states) and not skip.skipped
+  # engaged at a speed it can make the turn from: feasible, nothing skipped (the hand-driven frames left no count behind)
+  if not stop_infeasible:
+    assert all(s.feasible_now and not s.skipped for s in frames(skip, SKIP_CONFIRM_FRAMES, 4., lat_active=True))
+  # engaged still too fast: the confirming frames from the engagement on, then skipped as before
+  states = frames(skip, SKIP_CONFIRM_FRAMES, 15., lat_active=True)
+  assert not any(s.skipped for s in states[:-1]) and states[-1].skipped
+  assert skip.reason == ('unprotectedStop' if stop_infeasible else 'tooFast')
+  # switch off: today's latch, openpilot steering or not
+  skip = TurnSkip()
+  states = frames(skip, SKIP_CONFIRM_FRAMES, 15., lat_active=False)
+  assert states[-1].skipped and skip.reason == ('unprotectedStop' if stop_infeasible else 'tooFast')
+  # and the switch on with openpilot steering skips exactly as it does off
+  on, off = TurnSkip(), TurnSkip()
+  on.always_drive = True
+  assert [s.skipped for s in frames(on, 2 * SKIP_CONFIRM_FRAMES, 15., True)] == \
+    [s.skipped for s in frames(off, 2 * SKIP_CONFIRM_FRAMES, 15., True)]
+
+
+def test_a_turn_engaged_for_inside_its_stopping_distance_is_driven_under_always_drive():
+  """R4b closed loop: the driver drives a car at 15 m/s toward a left 60 m ahead, too fast to make it from there, openpilot
+  not steering, and brakes by hand to 5 m/s, engaging about 30 m out. Switch on, the turn isn't skipped under the driver,
+  and once openpilot steers it is driven (its desire goes); switch off, it was skipped for good before the driver braked."""
+  for always_drive, want_skip in ((False, True), (True, False)):
+    sim = Sim([left_at(60.), left_at(900.)], cruise=15.)
+    sim.tp.always_drive = always_drive
+    sim.v = 15.
+    sim.accel = lambda sim, plan: -3.5 if sim.v > 5. else 0.  # the driver's brake, the plan not applied
+    plans = []
+    while sim.v > 5.:  # by hand: openpilot not steering
+      plans.append(sim.step(lat_active=False))
+    assert 25. < 60. - sim.s < 40.
+    assert any(p.tooFastToTurn for p in plans) == want_skip, always_drive
+    assert not any(p.desire == Desire.turnLeft for p in plans)
+    sim.accel = None
+    while sim.s < 55.:
+      plans.append(sim.step(engaged=True))
+    assert any(p.tooFastToTurn for p in plans) == want_skip, always_drive
+    assert any(p.desire == Desire.turnLeft for p in plans) == (not want_skip), always_drive
