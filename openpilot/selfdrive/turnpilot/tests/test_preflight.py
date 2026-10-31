@@ -269,3 +269,27 @@ def test_car_path_imports():
       elif top != "openpilot" and top not in sys.stdlib_module_names and top not in allowed:
         problems.append(where)
   assert not problems, "\n".join(problems)
+
+
+def test_stop_sign_go(tmp_path):
+  side = tmp_path / 'side.pkl'
+  side.write_bytes(b'x' * 4096)
+  pointer = tmp_path / 'pointer.pkl'
+  pointer.write_text("version https://git-lfs.github.com/spec/v1\n")
+  c = preflight.check_stop_sign_go('vision', True, True, False, side)
+  assert c.status == INFO and c.detail.startswith("vision: goes by itself at stop signs and yields") and '25 mph' in c.detail
+  assert 'Look both ways' in c.detail
+  for pkl in (pointer, tmp_path / 'missing.pkl'):
+    c = preflight.check_stop_sign_go('vision', True, True, False, pkl)
+    assert c.status == WARN and 'side views' in c.detail and 'hands back' in c.detail and c.fix
+  c = preflight.check_stop_sign_go('vision', True, False, False, side)
+  assert c.status == WARN and 'TurnPilotAvoidStops' in c.detail and c.fix
+  for mode in ('off', 'shadow'):
+    c = preflight.check_stop_sign_go(mode, True, True, False, side)
+    assert c.status == INFO and 'every stop sign and yield hands back after 1 s' in c.detail
+  for mode in ('auto', 'trial'):
+    assert preflight.check_stop_sign_go(mode, True, True, False, side).status == WARN
+    assert 'acts as shadow' in preflight.check_stop_sign_go(mode, True, True, False, side).detail
+    assert preflight.check_stop_sign_go(mode, True, True, True, side).status == INFO
+  c = preflight.check_stop_sign_go('shadow', False, True, False, side)
+  assert c.status == WARN and 'unknown' in c.detail

@@ -1,0 +1,979 @@
+{
+ "certify": {
+  "auto:allway": [
+   "certifiable",
+   "none",
+   "",
+   [
+    "day"
+   ],
+   true,
+   [
+    [
+     "left",
+     1,
+     "cross",
+     45.383,
+     48.0,
+     true
+    ],
+    [
+     "right",
+     1,
+     "cross",
+     45.383,
+     48.0,
+     true
+    ],
+    [
+     "opposite",
+     1,
+     "leftTurners",
+     45.383,
+     80.0,
+     true
+    ]
+   ]
+  ],
+  "auto:divided": [
+   "uncertifiable",
+   "geometry",
+   "a divided cross road",
+   [],
+   false,
+   []
+  ],
+  "auto:left": [
+   "certifiable",
+   "none",
+   "",
+   [
+    "day"
+   ],
+   true,
+   [
+    [
+     "left",
+     1,
+     "cross",
+     45.383,
+     48.0,
+     true
+    ],
+    [
+     "right",
+     1,
+     "cross",
+     45.383,
+     48.0,
+     true
+    ],
+    [
+     "opposite",
+     1,
+     "leftTurners",
+     45.383,
+     80.0,
+     true
+    ],
+    [
+     "opposite",
+     1,
+     "straightRight",
+     45.383,
+     80.0,
+     true
+    ]
+   ]
+  ],
+  "auto:mph35": [
+   "uncertifiable",
+   "reach",
+   "left lane 1 cross: 48.0 of 77.0 m; right lane 1 cross: 48.0 of 77.0 m",
+   [
+    "day"
+   ],
+   true,
+   [
+    [
+     "left",
+     1,
+     "cross",
+     76.954,
+     48.0,
+     true
+    ],
+    [
+     "right",
+     1,
+     "cross",
+     76.954,
+     48.0,
+     true
+    ],
+    [
+     "opposite",
+     1,
+     "leftTurners",
+     76.954,
+     80.0,
+     true
+    ]
+   ]
+  ],
+  "auto:night": [
+   "uncertifiable",
+   "light",
+   "night at ETA -5 min",
+   [],
+   false,
+   []
+  ],
+  "auto:noClock": [
+   "uncertifiable",
+   "light",
+   "the clock isn't set (no GPS time yet): the sun can't be placed",
+   [],
+   false,
+   []
+  ],
+  "auto:noLaunch": [
+   "uncertifiable",
+   "noLaunch",
+   "no passing launchVerified stamp (step S4a)",
+   [],
+   false,
+   []
+  ],
+  "auto:noTable": [
+   "uncertifiable",
+   "noTable",
+   "no visibility file",
+   [],
+   false,
+   []
+  ],
+  "auto:right": [
+   "uncertifiable",
+   "reach",
+   "right lane 1 swing: 33.0 of 45.4 m",
+   [
+    "day"
+   ],
+   true,
+   [
+    [
+     "left",
+     1,
+     "cross",
+     45.383,
+     48.0,
+     true
+    ],
+    [
+     "right",
+     1,
+     "cross",
+     45.383,
+     48.0,
+     true
+    ],
+    [
+     "right",
+     1,
+     "swing",
+     45.383,
+     33.0,
+     true
+    ],
+    [
+     "opposite",
+     1,
+     "leftTurners",
+     45.383,
+     80.0,
+     true
+    ]
+   ]
+  ],
+  "auto:shipped": [
+   "uncertifiable",
+   "noTable",
+   "visibility.json has no cameraSetbackM, lateralOffsetM, heightM, lens, mask, darkThreshold (step S1)",
+   [],
+   false,
+   []
+  ],
+  "auto:sideOff": [
+   "uncertifiable",
+   "reach",
+   "left lane 1 cross: 7.8 of 45.4 m; right lane 1 cross: 10.2 of 45.4 m (side views off: the full pass only)",
+   [
+    "day"
+   ],
+   true,
+   [
+    [
+     "left",
+     1,
+     "cross",
+     45.383,
+     7.75,
+     true
+    ],
+    [
+     "right",
+     1,
+     "cross",
+     45.383,
+     10.25,
+     true
+    ],
+    [
+     "opposite",
+     1,
+     "leftTurners",
+     45.383,
+     100.0,
+     true
+    ]
+   ]
+  ],
+  "auto:twoway": [
+   "uncertifiable",
+   "notSurveyed",
+   "the left approach is no, not surveyed as stopping",
+   [],
+   false,
+   []
+  ],
+  "auto:unknown": [
+   "uncertifiable",
+   "reach",
+   "right lane 1 swing: 33.0 of 45.4 m",
+   [
+    "day"
+   ],
+   true,
+   [
+    [
+     "left",
+     1,
+     "cross",
+     45.383,
+     48.0,
+     true
+    ],
+    [
+     "right",
+     1,
+     "cross",
+     45.383,
+     48.0,
+     true
+    ],
+    [
+     "right",
+     1,
+     "swing",
+     45.383,
+     33.0,
+     true
+    ],
+    [
+     "opposite",
+     1,
+     "leftTurners",
+     45.383,
+     80.0,
+     true
+    ],
+    [
+     "opposite",
+     1,
+     "straightRight",
+     45.383,
+     80.0,
+     true
+    ]
+   ]
+  ],
+  "auto:unsurveyed": [
+   "uncertifiable",
+   "notSurveyed",
+   "no counting survey of the junction (decision D10)",
+   [],
+   false,
+   []
+  ],
+  "off:allway": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is off",
+   [],
+   false,
+   []
+  ],
+  "off:divided": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is off",
+   [],
+   false,
+   []
+  ],
+  "off:left": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is off",
+   [],
+   false,
+   []
+  ],
+  "off:mph35": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is off",
+   [],
+   false,
+   []
+  ],
+  "off:night": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is off",
+   [],
+   false,
+   []
+  ],
+  "off:noClock": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is off",
+   [],
+   false,
+   []
+  ],
+  "off:noLaunch": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is off",
+   [],
+   false,
+   []
+  ],
+  "off:noTable": [
+   "uncertifiable",
+   "noTable",
+   "no visibility file",
+   [],
+   false,
+   []
+  ],
+  "off:right": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is off",
+   [],
+   false,
+   []
+  ],
+  "off:shipped": [
+   "uncertifiable",
+   "noTable",
+   "visibility.json has no cameraSetbackM, lateralOffsetM, heightM, lens, mask, darkThreshold (step S1)",
+   [],
+   false,
+   []
+  ],
+  "off:sideOff": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is off",
+   [],
+   false,
+   []
+  ],
+  "off:twoway": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is off",
+   [],
+   false,
+   []
+  ],
+  "off:unknown": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is off",
+   [],
+   false,
+   []
+  ],
+  "off:unsurveyed": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is off",
+   [],
+   false,
+   []
+  ],
+  "shadow:allway": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is shadow",
+   [],
+   false,
+   []
+  ],
+  "shadow:divided": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is shadow",
+   [],
+   false,
+   []
+  ],
+  "shadow:left": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is shadow",
+   [],
+   false,
+   []
+  ],
+  "shadow:mph35": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is shadow",
+   [],
+   false,
+   []
+  ],
+  "shadow:night": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is shadow",
+   [],
+   false,
+   []
+  ],
+  "shadow:noClock": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is shadow",
+   [],
+   false,
+   []
+  ],
+  "shadow:noLaunch": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is shadow",
+   [],
+   false,
+   []
+  ],
+  "shadow:noTable": [
+   "uncertifiable",
+   "noTable",
+   "no visibility file",
+   [],
+   false,
+   []
+  ],
+  "shadow:right": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is shadow",
+   [],
+   false,
+   []
+  ],
+  "shadow:shipped": [
+   "uncertifiable",
+   "noTable",
+   "visibility.json has no cameraSetbackM, lateralOffsetM, heightM, lens, mask, darkThreshold (step S1)",
+   [],
+   false,
+   []
+  ],
+  "shadow:sideOff": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is shadow",
+   [],
+   false,
+   []
+  ],
+  "shadow:twoway": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is shadow",
+   [],
+   false,
+   []
+  ],
+  "shadow:unknown": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is shadow",
+   [],
+   false,
+   []
+  ],
+  "shadow:unsurveyed": [
+   "uncertifiable",
+   "modeOff",
+   "TurnPilotStopSignGo is shadow",
+   [],
+   false,
+   []
+  ],
+  "trial:allway": [
+   "certifiable",
+   "none",
+   "",
+   [
+    "day"
+   ],
+   true,
+   [
+    [
+     "left",
+     1,
+     "cross",
+     45.383,
+     48.0,
+     true
+    ],
+    [
+     "right",
+     1,
+     "cross",
+     45.383,
+     48.0,
+     true
+    ],
+    [
+     "opposite",
+     1,
+     "leftTurners",
+     45.383,
+     80.0,
+     true
+    ]
+   ]
+  ],
+  "trial:divided": [
+   "uncertifiable",
+   "geometry",
+   "a divided cross road",
+   [],
+   false,
+   []
+  ],
+  "trial:left": [
+   "certifiable",
+   "none",
+   "",
+   [
+    "day"
+   ],
+   true,
+   [
+    [
+     "left",
+     1,
+     "cross",
+     45.383,
+     48.0,
+     true
+    ],
+    [
+     "right",
+     1,
+     "cross",
+     45.383,
+     48.0,
+     true
+    ],
+    [
+     "opposite",
+     1,
+     "leftTurners",
+     45.383,
+     80.0,
+     true
+    ],
+    [
+     "opposite",
+     1,
+     "straightRight",
+     45.383,
+     80.0,
+     true
+    ]
+   ]
+  ],
+  "trial:mph35": [
+   "uncertifiable",
+   "reach",
+   "left lane 1 cross: 48.0 of 77.0 m; right lane 1 cross: 48.0 of 77.0 m",
+   [
+    "day"
+   ],
+   true,
+   [
+    [
+     "left",
+     1,
+     "cross",
+     76.954,
+     48.0,
+     true
+    ],
+    [
+     "right",
+     1,
+     "cross",
+     76.954,
+     48.0,
+     true
+    ],
+    [
+     "opposite",
+     1,
+     "leftTurners",
+     76.954,
+     80.0,
+     true
+    ]
+   ]
+  ],
+  "trial:night": [
+   "uncertifiable",
+   "light",
+   "night at ETA -5 min",
+   [],
+   false,
+   []
+  ],
+  "trial:noClock": [
+   "uncertifiable",
+   "light",
+   "the clock isn't set (no GPS time yet): the sun can't be placed",
+   [],
+   false,
+   []
+  ],
+  "trial:noLaunch": [
+   "certifiable",
+   "none",
+   "",
+   [
+    "day"
+   ],
+   true,
+   [
+    [
+     "left",
+     1,
+     "cross",
+     45.383,
+     48.0,
+     true
+    ],
+    [
+     "right",
+     1,
+     "cross",
+     45.383,
+     48.0,
+     true
+    ],
+    [
+     "opposite",
+     1,
+     "leftTurners",
+     45.383,
+     80.0,
+     true
+    ]
+   ]
+  ],
+  "trial:noTable": [
+   "uncertifiable",
+   "noTable",
+   "no visibility file",
+   [],
+   false,
+   []
+  ],
+  "trial:right": [
+   "uncertifiable",
+   "reach",
+   "right lane 1 swing: 33.0 of 45.4 m",
+   [
+    "day"
+   ],
+   true,
+   [
+    [
+     "left",
+     1,
+     "cross",
+     45.383,
+     48.0,
+     true
+    ],
+    [
+     "right",
+     1,
+     "cross",
+     45.383,
+     48.0,
+     true
+    ],
+    [
+     "right",
+     1,
+     "swing",
+     45.383,
+     33.0,
+     true
+    ],
+    [
+     "opposite",
+     1,
+     "leftTurners",
+     45.383,
+     80.0,
+     true
+    ]
+   ]
+  ],
+  "trial:shipped": [
+   "uncertifiable",
+   "noTable",
+   "visibility.json has no cameraSetbackM, lateralOffsetM, heightM, lens, mask, darkThreshold (step S1)",
+   [],
+   false,
+   []
+  ],
+  "trial:sideOff": [
+   "uncertifiable",
+   "reach",
+   "left lane 1 cross: 7.8 of 45.4 m; right lane 1 cross: 10.2 of 45.4 m (side views off: the full pass only)",
+   [
+    "day"
+   ],
+   true,
+   [
+    [
+     "left",
+     1,
+     "cross",
+     45.383,
+     7.75,
+     true
+    ],
+    [
+     "right",
+     1,
+     "cross",
+     45.383,
+     10.25,
+     true
+    ],
+    [
+     "opposite",
+     1,
+     "leftTurners",
+     45.383,
+     100.0,
+     true
+    ]
+   ]
+  ],
+  "trial:twoway": [
+   "uncertifiable",
+   "notSurveyed",
+   "the left approach is no, not surveyed as stopping",
+   [],
+   false,
+   []
+  ],
+  "trial:unknown": [
+   "uncertifiable",
+   "reach",
+   "right lane 1 swing: 33.0 of 45.4 m",
+   [
+    "day"
+   ],
+   true,
+   [
+    [
+     "left",
+     1,
+     "cross",
+     45.383,
+     48.0,
+     true
+    ],
+    [
+     "right",
+     1,
+     "cross",
+     45.383,
+     48.0,
+     true
+    ],
+    [
+     "right",
+     1,
+     "swing",
+     45.383,
+     33.0,
+     true
+    ],
+    [
+     "opposite",
+     1,
+     "leftTurners",
+     45.383,
+     80.0,
+     true
+    ],
+    [
+     "opposite",
+     1,
+     "straightRight",
+     45.383,
+     80.0,
+     true
+    ]
+   ]
+  ],
+  "trial:unsurveyed": [
+   "uncertifiable",
+   "notSurveyed",
+   "no counting survey of the junction (decision D10)",
+   [],
+   false,
+   []
+  ]
+ },
+ "trace:C1_V25_waiting_car:auto": {
+  "frames": 782,
+  "sha256": "1c2642e0fb4115e78ce7537bcdc33d78bf96124fa5994a04f2ca3b26aa45e0ce"
+ },
+ "trace:C1_V25_waiting_car:off": {
+  "frames": 782,
+  "sha256": "009a88f7649a10911a5fb0ffabc1ad64e37286bd197e783fb741a4bd5018e164"
+ },
+ "trace:C1_V25_waiting_car:shadow": {
+  "frames": 782,
+  "sha256": "d58b1d5ea51ecbe2405fa30e59b219cd32f1630c292bc93b722cbb12255ff9e8"
+ },
+ "trace:C1_V25_waiting_car:trial": {
+  "frames": 782,
+  "sha256": "4e538288fc7a98c7560d32bd5c57231c930ba85cbded191b636d4c7e20834e20"
+ },
+ "trace:C1_empty:auto": {
+  "frames": 662,
+  "sha256": "a3c6c2f413f3cc91bbd9b5aec9ec3b9c7a690bc274d83a735f85dcdce30428e0"
+ },
+ "trace:C1_empty:off": {
+  "frames": 662,
+  "sha256": "e59ccdf7720255664f2195acd4a78d5a09ec19151699dc88de65bf53fcde0510"
+ },
+ "trace:C1_empty:shadow": {
+  "frames": 662,
+  "sha256": "773b75263b68e88af23c4cdf97003e5ff54cdffacf2fbd880ddac814889cae14"
+ },
+ "trace:C1_empty:trial": {
+  "frames": 662,
+  "sha256": "2bdbd2b34a15f4294a10fbb2697d86f6e0290efda64ca11509ec0415df50f739"
+ },
+ "trace:O11_no_camera:auto": {
+  "frames": 462,
+  "sha256": "5f42348e3787e2997f4ac9d497baa49264d0e9f37d5f213c7e8145f1995996fa"
+ },
+ "trace:O11_no_camera:off": {
+  "frames": 462,
+  "sha256": "8a571b07eb956efb2dbe2dd6ff34cd75c056a108f7436ce79bced89b2718ed0c"
+ },
+ "trace:O11_no_camera:shadow": {
+  "frames": 462,
+  "sha256": "3475f361f1ded4e1aeec0209d21218599e123c2126952b5a470b60bb2b2c1f7e"
+ },
+ "trace:O11_no_camera:trial": {
+  "frames": 462,
+  "sha256": "53bf5a5dfa19a5f751c6ae0b83989d51c3bf1c6788088a818d271658046377ca"
+ },
+ "trace:O17_withdrawn_at_speed:auto": {
+  "frames": 577,
+  "sha256": "c866d6246968bc0851b2478fc8aa2ae05b4b7d10bfee109b73abe44ad3c253c9"
+ },
+ "trace:O17_withdrawn_at_speed:off": {
+  "frames": 757,
+  "sha256": "54e73420f32d46eef3000b87e45c899d9393cf9449b1a2aaf9ad02314e341b48"
+ },
+ "trace:O17_withdrawn_at_speed:shadow": {
+  "frames": 757,
+  "sha256": "6f916c0356edeb837d078286eca54ee9fdc0535bfa3aef13de5cd4d86554af47"
+ },
+ "trace:O17_withdrawn_at_speed:trial": {
+  "frames": 577,
+  "sha256": "ed6619e9333ca1907d3217de249042a9bb85f37f70bc7039b9e17dd31041cd71"
+ },
+ "trace:O2_roll_up:auto": {
+  "frames": 972,
+  "sha256": "997c61058fb47a15cfbcb9d71a666d560146834aeb7bbbc0f78c440b4f0dfa97"
+ },
+ "trace:O2_roll_up:off": {
+  "frames": 972,
+  "sha256": "0ad9619376e37f9da03188e38014553c3b5e4b3c3a51bd36b92e78737b7ff8fa"
+ },
+ "trace:O2_roll_up:shadow": {
+  "frames": 972,
+  "sha256": "d99dfd4340f64574cf0c076669859c26754451796048b3bbfc79ae3779fa6ac2"
+ },
+ "trace:O2_roll_up:trial": {
+  "frames": 972,
+  "sha256": "d03a1e8fd3cde4da0adb98677e4e5555cf1bed7196bcdd0ec2222aab7d7eeda2"
+ },
+ "trace:V3_downgrade:auto": {
+  "frames": 782,
+  "sha256": "ae52165f1f3cc03a236918a4fb2391c490a751f51c4acfafe82833e80e688837"
+ },
+ "trace:V3_downgrade:off": {
+  "frames": 782,
+  "sha256": "803beb22adb30b209621cd84a186064d87c6b35062f8a1aff314069ad212304b"
+ },
+ "trace:V3_downgrade:shadow": {
+  "frames": 782,
+  "sha256": "e9412cf5a613966d0fed751d04e32391538e359804ad5ffe0ccc6579976c1a85"
+ },
+ "trace:V3_downgrade:trial": {
+  "frames": 782,
+  "sha256": "2c7cb23e76cce7f8cbb89ed15ba84f1b01cca5c7436d5217a2cff9e6754f8e41"
+ },
+ "trace:V9_V10_deadlock:auto": {
+  "frames": 782,
+  "sha256": "3a95f026d851eed296337530972dff47811f450f5e3a147f651de4f9bc019d5a"
+ },
+ "trace:V9_V10_deadlock:off": {
+  "frames": 782,
+  "sha256": "ae3995eaf713765fa3770437230e96ba64d37bd6e9c4a868c368a80c01e0c70c"
+ },
+ "trace:V9_V10_deadlock:shadow": {
+  "frames": 782,
+  "sha256": "d6c6c5f5226f76e3979419c17b4024540741a032e9451bcae8db0c970e06f522"
+ },
+ "trace:V9_V10_deadlock:trial": {
+  "frames": 782,
+  "sha256": "6bdb8d2f01ff6c3c05b4f1ee1f020ec85c0608fc8cf0008df3e6950a1f44f940"
+ }
+}

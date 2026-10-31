@@ -2835,7 +2835,7 @@ class TurnPilot:
     the decider's shadow on a handback; the side views there for the drive; their maps valid (a calibration move, transient).
     On every plan, a disabled one's too, so navd never reads a message's defaults."""
     g = plan.stopGo
-    g.mode = self.stop_sign_mode if self.stop_sign_known and self.stop_sign_mode in ('off', 'shadow', 'trial', 'auto') else 'shadow'
+    g.mode = self.stop_sign_mode if self.stop_sign_known and self.stop_sign_mode in ('off', 'shadow', 'trial', 'auto', 'vision') else 'shadow'
     g.sideViewsLive, g.mapsValid = side_views_live(self.side_status), self.side_status != 'mapsStale'
 
   def plan_inner(self, sm, scene, enabled: bool, shadow: bool, *args, long_control: bool | None, disengage_on_accel: bool = True,
@@ -3109,7 +3109,7 @@ def camera_signs_read(params) -> bool:
 
 
 def stop_sign_mode_for(params) -> tuple[str, bool]:
-  """TurnPilotStopSignGo (off, shadow, trial, auto; stop_go.MODE_DEFAULT unset) and whether this build knows it: a value it
+  """TurnPilotStopSignGo (off, shadow, trial, auto, vision; stop_go.MODE_DEFAULT unset) and whether this build knows it: a value it
   doesn't know, or a build whose params predate the key, acts as shadow, said out loud (STOP_SIGNS.md row O16, H6)."""
   try:
     value = params.get("TurnPilotStopSignGo")
@@ -3118,7 +3118,7 @@ def stop_sign_mode_for(params) -> tuple[str, bool]:
     return 'shadow', False
   mode, known = mode_for(value)
   if not known:
-    log_error(f"turnpilotd: TurnPilotStopSignGo {value!r} is no mode (off, shadow, trial, auto), acting as shadow")
+    log_error(f"turnpilotd: TurnPilotStopSignGo {value!r} is no mode (off, shadow, trial, auto, vision), acting as shadow")
   return mode, known
 
 

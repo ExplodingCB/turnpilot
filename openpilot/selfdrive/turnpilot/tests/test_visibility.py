@@ -545,3 +545,64 @@ def test_the_watch_hands_the_trackers_receipt_age_to_the_live_visibility():
                             last_now=5.7)
   tp.observe_runs(tracker)
   assert tp.watch.live.view_t['road'] == T and not tp.watch.live.fresh_key('road')
+
+
+# ------------------------------------------------------------------------------------------------- TurnPilotStopSignGo=vision
+
+def vision_setup():
+  """The shipped file (PV1 tables, camera fields and mask null) and Saturday's unsurveyed junction: its lanes as vision builds
+  them (stopping False), on the unsurveyed edge band."""
+  from openpilot.selfdrive.turnpilot.routing import certify as ce
+  from openpilot.selfdrive.turnpilot.routing.tests.test_certify import vision_junction
+  j = vision_junction()
+  return vt.load(vt.SHIPPED), ce.vision_lanes(j, 'straight', SETBACK), sr.edge_band(13., ce.cross_lanes(j), None)
+
+
+def vision_report(lv, yaw=1., **kw):
+  vis, lns, edges = vision_setup()
+  return lv.lanes(lns, 0., vis, rot_deg=sr.angle_bound(False, yaw), edges=edges, vision=True, **kw)
+
+
+@pytest.mark.parametrize('yaw, near', [(1., 38.8), (2., 35.0), (3., 32.0)])
+def test_vision_walks_the_shipped_file_without_a_mask_on_the_optimistic_row(yaw, near):
+  rep = vision_report(live(), yaw)
+  left, right, opp = lane_of(rep, 'left'), lane_of(rep, 'right'), lane_of(rep, 'opposite')
+  assert left.reach_m == pytest.approx(near, abs=0.3) and left.why == 'frameEdge'
+  assert right.reach_m == pytest.approx(38.8, abs=0.3) and right.why == 'range'  # the side bin's 44 m at sLaneMax
+  assert opp.reach_m > 100. and not left.stopping
+  # the need stays the two-way requirement (blockers() reads it: a raw box anywhere seen down a lane blocks it)
+  assert left.need_m == pytest.approx(sr.reach_needed_two_way(25 * sr.MPH, 13.), abs=0.1)
+
+
+def test_without_vision_the_shipped_file_still_sees_nothing():
+  vis, lns, edges = vision_setup()
+  rep = live().lanes(lns, 0., vis, rot_deg=ROT, edges=edges)
+  assert all(x.reach_m == 0. and x.why == 'noMask' for x in rep.lanes)
+
+
+def test_vision_a_sector_not_ok_the_sun_ahead_and_low_sun_still_zero_the_walk():
+  base = lane_of(vision_report(live()), 'left').reach_m
+  bad = lane_of(vision_report(live(bad=72.)), 'left')
+  assert bad.why == 'sector' and bad.reach_m < base - 5.
+  sun = lane_of(vision_report(live(), lighting='sunAhead'), 'left')
+  assert sun.why == 'sunAhead' and sun.reach_m < 20.
+  low = lane_of(vision_report(live(), low_sun_sides=('left',)), 'left')
+  assert low.why == 'lowSun' and low.reach_m < 15.
+  assert all(x.reach_m == 0. for x in vision_report(live(), lighting='night').lanes)  # night has no table
+
+
+def test_vision_a_stale_side_view_and_a_scene_gone_see_nothing_past_the_full_pass():
+  rep = vision_report(live(views=('road', 'full', 'sideRight')))
+  left = lane_of(rep, 'left')
+  assert left.why == 'noView' and left.reach_m < 15.
+  lv = live()
+  lv.set_available(False)
+  assert all(x.reach_m == 0. and x.why == 'noView' for x in vision_report(lv).lanes)
+
+
+def test_vision_a_car_standing_down_the_near_lane_caps_it_behind_itself():
+  vis, lns, edges = vision_setup()
+  near = next(x for x in lns if x.role == 'left')
+  rep = vision_report(live(), tracks=[trk(5, 12., near)])
+  left = lane_of(rep, 'left')
+  assert left.why == 'occluder' and left.reach_m < 12.

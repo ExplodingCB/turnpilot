@@ -365,3 +365,49 @@ def test_a_head_on_car_at_a_small_bearing_stays_opposite_and_a_bearing_no_listed
   ev = evidence([x for x in lanes() if x.role != 'left'])
   ev.observe([ground_scaled(4, 0., 20., lane('left'), 2.0, 2)], d_stop=0.)
   assert ev.assign(ev.hist[4][-1]) is None and 4 not in ev.records
+
+
+# ------------------------------------------------------------------------------------------------- TurnPilotStopSignGo=vision
+
+def vision_evidence(tier='mapStrong', control='stop', vision_shield=True, **approach):
+  """Vision's lanes (stopping False whatever the tier) at a junction whose left approach is tier/control, with the vision
+  shield as asked."""
+  from dataclasses import replace
+  j = junction(tier=tier)
+  for a in j.approaches:
+    a.control = control
+    for k, v in approach.items():
+      setattr(a, k, v)
+  lns = [replace(ln, stopping=False) for ln in junction_lanes(j, 'straight', 1.9)]
+  ev = StopEvidence()
+  ev.set_junction(lns, sr.angle_bound(False), lines={'left': 9., 'right': 9., 'opposite': 9.}, vision_shield=vision_shield)
+  return ev, next(ln for ln in lns if ln.role == 'left')
+
+
+@pytest.mark.parametrize('tier, control', [('mapStrong', 'stop'), ('mapWeak', 'stop'), ('no', 'stop'), ('mapStrong', 'none')])
+def test_vision_a_car_at_its_line_on_a_stop_mapped_single_lane_approach_shields_it(tier, control):
+  ev, ln = vision_evidence(tier, control)
+  e = drive(ev, 1, ln, braking(23.8, 8., 2.5), 6.0)
+  assert e.stopped_at_line and e.shield
+
+
+@pytest.mark.parametrize('tier, control', [('no', 'none'), ('unknown', 'none'), ('no', 'yield')])
+def test_vision_never_shields_on_an_approach_the_map_doesnt_say_stops(tier, control):
+  ev, ln = vision_evidence(tier, control)
+  e = drive(ev, 1, ln, braking(23.8, 8., 2.5), 6.0)
+  assert e.stopped_at_line and not e.shield  # still an earlier arrival or a later one by its stop, an occluder by its box
+
+
+@pytest.mark.parametrize('approach', [{'bike_lane': True}, {'shoulder_m': 2.0}, {'lanes_in': 2, 'lanes_out': 2}])
+def test_vision_never_shields_past_a_bike_lane_a_shoulder_or_on_a_multi_lane_approach(approach):
+  ev, ln = vision_evidence(**approach)
+  e = drive(ev, 1, ln, braking(23.8, 8., 2.5), 6.0)
+  assert not e.shield
+
+
+def test_vision_shield_off_by_default_leaves_non_stopping_lanes_unshielded():
+  ev, ln = vision_evidence(vision_shield=False)
+  assert not drive(ev, 1, ln, braking(23.8, 8., 2.5), 6.0).shield
+  ev = StopEvidence()
+  ev.set_junction(lanes(), sr.angle_bound(True), lines={'left': 9.})
+  assert ev.vision_shield is False and drive(ev, 1, lane('left'), braking(23.8, 8., 2.5), 6.0).shield  # surveyed: as before

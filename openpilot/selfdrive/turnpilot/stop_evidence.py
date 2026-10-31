@@ -223,6 +223,7 @@ class StopEvidence:
     self.lanes: list[sr.Lane] = []
     self.bound = 0.
     self.lines: dict[str, float] = {}
+    self.vision_shield = False
     self.reset()
 
   def reset(self) -> None:
@@ -235,10 +236,14 @@ class StopEvidence:
     self.newest_t: float | None = None
     self.d_stop = 0.
 
-  def set_junction(self, lanes: list[sr.Lane], bound_deg: float, lines: dict | None = None) -> None:
+  def set_junction(self, lanes: list[sr.Lane], bound_deg: float, lines: dict | None = None, vision_shield: bool = False) -> None:
     """lanes: the held control's conflicting lanes seen from its stop point (junction_lanes); bound_deg: ANGLE_BOUND;
-    lines: m from where each role's lanes cross our path to that approach's stop point (DEFAULT_LINE_M when not given)."""
+    lines: m from where each role's lanes cross our path to that approach's stop point (DEFAULT_LINE_M when not given);
+    vision_shield (TurnPilotStopSignGo=vision, whose lanes are all built not stopping): a vehicle standing at its line shields
+    its lane on an approach the map says stops (stop_rules.stop_mapped), never on one it doesn't (a car standing down a
+    two-way's through road is likelier parked at the curb than stopped in the lane), the shield's other rules as ever."""
     self.lanes, self.bound, self.lines = list(lanes), float(bound_deg), dict(lines or {})
+    self.vision_shield = bool(vision_shield)
 
   # ------------------------------------------------------------------------------------------------------------ input
 
@@ -400,7 +405,8 @@ class StopEvidence:
     seen_every = (self.newest_t is None or self.newest_t - last.t <= CYCLE_GAP_S) and all(g <= CYCLE_GAP_S + 1e-9 for g in gaps)
     # a cross approach of more than one lane: which lane the car is in isn't known (assign's ground x), so it shields none
     # (skeptic SG3b q2b: a lane-1 car read in lane 2 shielded the lane it hides) until SG4b resolves the lane index
-    shield = ln.stopping and at_line and sr.shield_lane_ok(ln.approach) and len(self.cross_lanes_of(ln)) == 1 and \
+    stops = ln.stopping or (self.vision_shield and sr.stop_mapped(ln.approach))
+    shield = stops and at_line and sr.shield_lane_ok(ln.approach) and len(self.cross_lanes_of(ln)) == 1 and \
       sr.shield_ok(last.cls, stopped_s, fit.v_hi, len([s for s in here if s.t >= last.t - sr.VEL_TRUST_S - 1e-9]), front_from_line,
                    seen_every, moved)
     through = self._through(st, ln, here, s_nom, line, last.cls, cross)
