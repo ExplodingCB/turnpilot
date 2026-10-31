@@ -103,6 +103,13 @@ RUN_EVERY = 2              # at most every 2nd model frame (10 Hz)
 STEP_BUDGET_S = 0.045      # driving model + detector must finish within this of the 50 ms cycle (the rest takes ~1 ms)
 WIDE_CURVATURE = 0.01      # 1/m (a 100 m radius): at or above this, look through the wide camera
 WIDE_HOLD_S = 2.0          # and keep looking through it this long after the turn ends
+# at a standstill and a crawl the full pass looks through the wide camera (SAT_VALIDATION rows 6 and X3: standing, the road
+# camera's pass lost a walker 2.8 m ahead, below its view, and a release lifted the car past her), but for one run in
+# WIDE_SLOW_ROAD_EVERY on the road camera, whose runs alone read the lights and the lane paint (turnpilotd ages a camera light
+# read out at CAMERA_STALE_S, 1 s: the shadow red's veto, the unsignalized release's live reader). One model, one frame size:
+# the same run's cost, inside room(). The far crop's odd steps on the road frame are unchanged
+WIDE_SLOW_V = 3.0          # m/s
+WIDE_SLOW_ROAD_EVERY = 3
 TURN_DESIRES = (log.Desire.turnLeft, log.Desire.turnRight)
 # turnpilotPlan.detectorView (DESIGN phase 4 G4, CRITIQUE REQUIRED 3): road is the road camera only, overriding a turn's wide
 # hold (an unprotected left from its go to its commit); roadAndWide the road camera with the wide one run in WIDE_EVERY (held
@@ -519,6 +526,7 @@ class ModeldDetector:
   lights: CameraLightReader | None = None  # None: no road camera, or failed (lights_failed)
   lights_failed = False
   view_runs = 0                   # runs under the roadAndWide view, for its one wide run in WIDE_EVERY
+  slow_runs = 0                   # runs at or under WIDE_SLOW_V in auto, for its one road run in WIDE_SLOW_ROAD_EVERY
   far: FarCrop | None = None      # the far crop (None: no road camera, no far pkl, or it failed to load)
   far_on = FAR_CROP_DEFAULT       # TurnPilotFarCrop, set by DetectorHost
   side: SideViews | None = None   # the side views (None: no wide camera, no side pkl, or it failed to load)
@@ -559,9 +567,10 @@ class ModeldDetector:
     self.side = load_side(model_state, cam_w, cam_h, cameras['wide'], bus) if 'wide' in cameras else None
 
 
-  def choose_camera(self, desired_curvature: float, desire: int, now: float, view: str = 'auto') -> str:
-    """The camera for this run: the wide one in a turn or on a curve and WIDE_HOLD_S after, else the road one; the plan's
-    view (WIDE_EVERY, the sweeps) overrides that. A device with one camera runs it."""
+  def choose_camera(self, desired_curvature: float, desire: int, now: float, view: str = 'auto', v_ego: float | None = None) -> str:
+    """The camera for this run: the wide one in a turn or on a curve and WIDE_HOLD_S after, and at or under WIDE_SLOW_V
+    (v_ego, None unknown) but for one run in WIDE_SLOW_ROAD_EVERY, else the road one; the plan's view (WIDE_EVERY, the
+    sweeps) overrides that. A device with one camera runs it."""
     if abs(desired_curvature) >= WIDE_CURVATURE or desire in TURN_DESIRES:
       self.wide_until = now + WIDE_HOLD_S
     if view == 'stopSweep':  # held: the full wide pass and the road camera alternating, the wide first
@@ -574,8 +583,15 @@ class ModeldDetector:
     elif view == 'roadAndWide':
       self.view_runs = (self.view_runs + 1) % WIDE_EVERY
       want = 'wide' if self.view_runs == 0 else 'road'
+    elif now < self.wide_until:
+      want = 'wide'
+    elif v_ego is not None and v_ego <= WIDE_SLOW_V:
+      want = 'road' if self.slow_runs == WIDE_SLOW_ROAD_EVERY - 1 else 'wide'
+      self.slow_runs = (self.slow_runs + 1) % WIDE_SLOW_ROAD_EVERY
     else:
-      want = 'wide' if now < self.wide_until else 'road'
+      want = 'road'
+    if view != 'auto' or now < self.wide_until or v_ego is None or v_ego > WIDE_SLOW_V:
+      self.slow_runs = 0
     return want if want in self.frames else next(iter(self.frames))
 
   def room(self, model_execution_time: float) -> bool:
@@ -629,7 +645,7 @@ class ModeldDetector:
     if time.monotonic() < self.retry_at or not self.room(model_execution_time):
       return
     try:
-      cam = self.choose_camera(desired_curvature, desire, time.monotonic(), view)
+      cam = self.choose_camera(desired_curvature, desire, time.monotonic(), view, v_ego)
       t0 = time.perf_counter()
       raw = self.run(input_frame=self.frames[cam]).numpy()
       dt = time.perf_counter() - t0
