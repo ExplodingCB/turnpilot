@@ -511,6 +511,7 @@ class ControlState:
   light: str = 'unknown'
   unseen_t: float = 0.          # held at a signal: s since an accepted light was last read for it (SIGNAL_UNSEEN_S)
   past_red: bool = False        # a signal's stop crept past its line slower than COMMIT_SPEED: stopped where it is (RED_PAST_REASON)
+  crossed_v: float = -1.        # a signal's line crossed with nothing to stop for: the speed it was, else -1 (signal_went)
   dwell_t: float = 0.
   moved_m: float = 0.
   asked_m: float = 0.           # held: the furthest the latch's stop point was asked on this hold (a creep, a roll-up)
@@ -646,6 +647,14 @@ class MapControlPolicy:
                for c in self.tracker.controls.values()):
       return 'none' if self.tracker.status == 'ok' else 'unknown'
     return 'green' if 'green' in accepted else 'unknown'
+
+  def signal_went(self, distance: float) -> bool:
+    """The car went through the signal of the junction distance m ahead (PROTECT_BEFORE_M before it to PROTECT_PAST_M past
+    it): committed on its yellow (SIGNAL_COMMITTED: a later red never reverses a commit), or over its line faster than
+    COMMIT_SPEED with nothing to stop for (crossed_v; a red crept over it, or a go from standing on it, is no go). turnpilotd:
+    a later red never takes back the turn's desire."""
+    return any(c.kind == 'signal' and c.state is not None and distance - PROTECT_BEFORE_M <= c.d <= distance + PROTECT_PAST_M and
+               (c.state.mode == SIGNAL_COMMITTED or c.state.crossed_v > COMMIT_SPEED) for c in self.tracker.controls.values())
 
   def held_control(self) -> TrackedControl | None:
     """The control the latch holds the car at, or None: the stop-sign decider's (turnpilotd), keyed on its state object, which
@@ -1187,6 +1196,8 @@ class MapControlPolicy:
       self._signal_mode(c, v)
       if st.mode != SIGNAL_STOP:  # nothing to stop for: no stop, no cap, no prompt (module docstring)
         st.action = 'proceedingOnYellow' if st.mode == SIGNAL_COMMITTED else 'none'
+        if c.d < 0. and st.crossed_v < 0.:
+          st.crossed_v = v
         if c.d < -OVERRUN_PAST_M:
           st.done = 'passed'
         return False

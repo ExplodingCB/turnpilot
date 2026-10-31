@@ -1229,8 +1229,10 @@ class TurnPilot:
     # from any source (release_light: the oracle's, a mapped signal's, the camera's in shadow too, as it vetoes lifts) holds
     # the desire at none, standing as moving, until the car is TURN_STARTED_DEG into the turn (a turn under way is never
     # taken back). DesireTiming keeps its pulse's timing, so the turn isn't judged too late, and the green's go pulses a fresh
-    # edge as after any hold
-    red_here = self.map_controls.release_light(d_dist) == 'red'
+    # edge as after any hold. Only short of the line: a car that went (its yellow committed, its signal's line crossed faster
+    # than COMMIT_SPEED, the scene committed to or the driver released into the junction) finishes the turn on a later red
+    went = self.map_controls.signal_went(d_dist) or d_id in (self.scene.committed_id, self.scene.released_id)
+    red_here = not went and self.map_controls.release_light(d_dist) == 'red'
     desire = self.desires.update(d_on, d_dist, d_id, d_passed, v_ego, cs.steeringAngleDeg,
                                  not keep_why[LEFT], not keep_why[RIGHT], DT_MDL, default_yaw_rate(cs, model),
                                  lat_active=lat_active, replaced=d_replaced,

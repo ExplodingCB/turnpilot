@@ -74,3 +74,36 @@ def test_the_cameras_shadow_red_alone_holds_the_turn_desire_until_it_reads_green
   state['s'] = 'green'
   later = [sim.step(engaged=True) for _ in range(int(1.5 / DT_MDL))]
   assert any(p.desire == Desire.turnRight for p in later)
+
+
+@pytest.mark.parametrize("source", ['oracle', 'camera'])
+def test_a_red_after_the_car_crossed_its_line_on_green_never_takes_back_the_turn(source):
+  # the car crossed its line on the green at 4 m/s and is 5 deg into the right when the light turns red, 3 m past the line:
+  # the turn under way in the junction is finished as on the green, its desire never dropped to none (the model would
+  # plan straight on through the red)
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_go import RIGHT_AT_A_SIGNAL, camera_reads
+
+  def drive(later):
+    sim = Sim(RIGHT_AT_A_SIGNAL, controls=[(S_SIGNAL, 'signal')], cruise=4.)
+    sim.go_taps = False
+    sim.tp.oracle_ok = True
+    state = {'s': 'green'}
+    sim.lights = (lambda sim: oracle_lights(state['s'], S_SIGNAL)(sim)) if source == 'oracle' else \
+      (lambda sim: camera_reads(state['s'])(sim))
+    sim.accel = lambda sim, plan: (4. - sim.v) / 0.5
+    while sim.s < S_SIGNAL + 3.:
+      sim.step(engaged=True)
+    while sim.tp.desires.turned_deg < 5.:
+      sim.step(engaged=True, yaw_rate=-0.3)
+    state['s'] = later
+    plans = []
+    while sim.tp.desires.turned_deg < 20.:
+      plans.append(sim.step(engaged=True, yaw_rate=-0.3))
+      assert len(plans) < 200
+    return [p.desire for p in plans], [p.shouldStop for p in plans]
+
+  red, red_stops = drive('red')
+  green, _ = drive('green')
+  assert Desire.turnRight in green
+  assert red == green, "a turn under way taken back on a red"
+  assert not any(red_stops)
