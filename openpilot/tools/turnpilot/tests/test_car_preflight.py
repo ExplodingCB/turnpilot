@@ -50,7 +50,7 @@ GOOD_PARAMS = {
   "TurnPilotEnabled": True, "NavigationEnabled": True, "AlphaLongitudinalEnabled": True, "DisengageOnAccelerator": True,
   "TurnPilotCarSignals": "off", "TurnPilotCameraLights": "shadow", "TurnPilotCameraStopSigns": "shadow",
   "TurnPilotStopSignGo": "vision", "TurnPilotAvoidStops": True, "TurnPilotCurbPedCap": True, "TurnPilotLeftRangeM": 0.,
-  "TurnPilotShadowMode": False, "DisableUpdates": True, "TurnPilotAutoLeft": "auto", "TurnPilotAlwaysDrive": True,
+  "TurnPilotShadowMode": False, "DisableUpdates": False, "TurnPilotAutoLeft": "auto", "TurnPilotAlwaysDrive": True,
   "TurnPilotMapHost": "maps.turnpilot.test", "TurnPilotMapKey": "not-a-real-key", "TurnPilotMapCert": "not-a-real-cert",
   "IsReleaseBranch": False,
 }
@@ -713,7 +713,7 @@ def test_param_missing_from_the_library(tmp_path):
 
 def test_param_wrong_or_default(tmp_path):
   params = GOOD_PARAMS | {"TurnPilotStopSignGo": "auto", "TurnPilotValhallaTiles": "/data/tiles", "TurnPilotShadowMode": True,
-                          "DisableUpdates": False}
+                          "DisableUpdates": True}
   lines = run_live(tmp_path, params=params)
   s = statuses(lines)
   assert s["TurnPilotStopSignGo"] == NO_GO and "auto, Saturday needs vision" in line(lines, "TurnPilotStopSignGo").detail
@@ -721,7 +721,8 @@ def test_param_wrong_or_default(tmp_path):
   assert s["TurnPilotValhallaTiles"] == NO_GO
   assert s["TurnPilotShadowMode"] == WARN and "nothing acts" in line(lines, "TurnPilotShadowMode").detail
   assert "TurnPilotShadowMode=0" in line(lines, "TurnPilotShadowMode").fix
-  assert s["DisableUpdates"] == WARN
+  assert s["DisableUpdates"] == WARN and "no fix pushed" in line(lines, "DisableUpdates").detail
+  assert "DisableUpdates=0" in line(lines, "DisableUpdates").fix
   assert cpf.exit_code(lines) == 1
 
 
@@ -738,6 +739,7 @@ def test_the_saturday_values_are_the_defaults(tmp_path):
   for key in ("TurnPilotShadowMode", "DisableUpdates", "TurnPilotAlwaysDrive"):
     assert s[key] == INFO and "(default)" in line(lines, key).detail, line(lines, key)
   assert "live" in line(lines, "TurnPilotShadowMode").detail
+  assert line(lines, "DisableUpdates").detail.startswith("0 (default): updates on")
 
 
 def test_stop_sign_go_off_is_saturdays_fallback_warned(tmp_path):

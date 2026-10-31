@@ -44,7 +44,7 @@ SATURDAY = {
   'NavigationEnabled': ('BOOL', '1', True),
   'AlphaLongitudinalEnabled': ('BOOL', '1', True),
   'DisengageOnAccelerator': ('BOOL', '1', True),
-  'DisableUpdates': ('BOOL', '1', True),
+  'DisableUpdates': ('BOOL', '0', False),             # on: a fix pushed to the turnpilot branch reaches the car (11:50)
 }
 # no default: routes come from the map server, not local tiles, and the map key is the one secret, never in this public repo
 UNSET = ('TurnPilotValhallaTiles', 'TurnPilotMapKey')

@@ -102,7 +102,7 @@ With `--map-key` the script also writes the map server's API key from the Mac's 
 2. It builds the tree in a temporary directory from the Mac's own clones: the commit on branch `turnpilot`, tracking `origin/turnpilot` (origin is `https://github.com/kaileh57/turnpilot.git`, which nothing fetches while `DisableUpdates` is 1), depth 1. Each submodule is at its gitlink, from `.git/modules/<name>`. A submodule commit missing there comes from the public URL in `.gitmodules`; the opendbc commit is on the Mac. Every git-lfs file (the driving models, the fonts, the AGNOS updater) is its real bytes, checked against its sha256. No build output from the Mac goes, because the tree comes from git objects, not from a working copy.
 3. It copies the tree to `/data/openpilot.tp-incoming-<stamp>`, then checks it on the comma: every file's sha256 against the Mac's manifest, the file count, the symlinks, `HEAD`, the branch and its upstream, and each submodule's commit. It runs the same git commands as `is_dirty()` in `openpilot/common/version.py`, which also makes git-lfs hash the model files once, so the first boot doesn't. The tree's own git config sets git-lfs's clean filter (`filter.lfs.clean`, `filter.lfs.required`), so this check and the device's `is_dirty()` don't depend on how AGNOS configures git for user `comma`. It sets no smudge filter, so checkouts keep whatever AGNOS gives them.
 4. It checks again that the comma is offroad, renames `/data/openpilot` to `/data/openpilot.prev-<stamp>`, and moves the new tree to `/data/openpilot`. The comma does both moves even if the SSH connection drops between them.
-5. It sets `DisableUpdates` to 1, so the updater doesn't try GitHub, and asks before it reboots the comma. Before the reboot, the comma checks again that it is offroad, that `DisableUpdates` is 1, and that `/data/openpilot/.overlay_init` doesn't exist. Sunnypilot's updater keeps running until the reboot, and it creates that file when it sets up its overlay over the new tree. With the file there, the next boot would install any update the updater stages from GitHub over the deployed build.
+5. It sets `DisableUpdates` to 1, so the updater doesn't try GitHub, and asks before it reboots the comma. This differs from the installer path, where updates stay on (the default, 0) so a pushed fix can reach the car; whether the script should leave them on too is Kellen's call, and until then set `DisableUpdates=0` after a Mac deploy to get updates ("Update" below). Before the reboot, the comma checks again that it is offroad, that `DisableUpdates` is 1, and that `/data/openpilot/.overlay_init` doesn't exist. Sunnypilot's updater keeps running until the reboot, and it creates that file when it sets up its overlay over the new tree. With the file there, the next boot would install any update the updater stages from GitHub over the deployed build.
 
 If a step fails, the script stops and says which state the comma is in: as it was, with both trees intact (the old one still in `/data/openpilot`, the new one beside it), or unknown. The state is unknown when the SSH connection ends during the swap or the rollback. Then don't reboot the comma or start the car until `--dry-run` has shown what `/data/openpilot` holds. The message gives the commands that put a missing tree back and that set `DisableUpdates`. A leftover `openpilot.tp-incoming-*` directory is listed on the next run with the command that removes it.
 
@@ -383,13 +383,14 @@ The comma pulls from the `turnpilot` branch of `github.com/kaileh57/openpilot`, 
 2. Open **Settings > Software** and tap **check for update**. If it offers **download update**, tap that. When the download finishes, **install now** appears (the car must be off). The comma restarts and recompiles, which takes several minutes.
 3. Run preflight.
 
-This fork sets `DisableUpdates` to 1 by default, so no update lands on a test day, and **check for update** finds nothing until you turn updates back on:
+Updates are on, as in stock openpilot (`DisableUpdates` 0, the default since SATURDAY_PARAMS.md's 11:50 change), so a fix pushed to the `turnpilot` branch reaches the comma through **Settings > Software** with no SSH. The updater applies a downloaded update at the next boot, and the comma boots every time the car wakes. To keep a build fixed for a test day, turn updates off over SSH and back on afterwards:
 
 ```
+python3 -m openpilot.selfdrive.turnpilot.preflight --set DisableUpdates=1
 python3 -m openpilot.selfdrive.turnpilot.preflight --set DisableUpdates=0
 ```
 
-The updater applies a downloaded update at the next boot, and the comma boots every time the car wakes. Set it back to 1 afterwards. The files in `/data/turnpilot` (pyvalhalla and the maps) stay through updates, but not through an uninstall.
+A comma installed with the Mac script ("Install from the Mac") has `DisableUpdates` 1, which that script sets, so **check for update** finds nothing there until it is set to 0. The files in `/data/turnpilot` (pyvalhalla and the maps) stay through updates, but not through an uninstall.
 
 ## When something fails
 

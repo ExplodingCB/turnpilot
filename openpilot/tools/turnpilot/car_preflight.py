@@ -942,9 +942,9 @@ def noted(p: Param) -> Line:
   if key == "TurnPilotShadowMode":  # Saturday runs live from the first drive: 0, the default
     return Line(key, INFO, f"{text}: TurnPilot is live, it takes turns, changes lanes and brakes") if not v else \
       Line(key, WARN, f"{text}: TurnPilot computes and nothing acts", f"{PREFLIGHT_SET} TurnPilotShadowMode=0 to drive live")
-  if key == "DisableUpdates":
-    return Line(key, INFO, f"{text}: no update can land mid-test") if v else \
-      Line(key, WARN, f"{text}: the updater can fetch another build on a test day", f"{PREFLIGHT_SET} DisableUpdates=1")
+  if key == "DisableUpdates":  # updates on, the default: a fix pushed to the turnpilot branch reaches the car (11:50)
+    return Line(key, INFO, f"{text}: updates on, a fix pushed to the turnpilot branch reaches the car through Settings > Software") \
+      if not v else Line(key, WARN, f"{text}: no fix pushed to the turnpilot branch can reach the car", f"{PREFLIGHT_SET} DisableUpdates=0")
   if key == "TurnPilotLeftFarRangeM":
     return Line(key, INFO, f"{text}: the far crop adds no reach") if not v else \
       Line(key, WARN, f"{text} m: it must come from a measurement on this car", f"{PREFLIGHT_SET} TurnPilotLeftFarRangeM=0 until it is measured")

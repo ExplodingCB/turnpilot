@@ -31,7 +31,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"DisableDriverCameraIR", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, BOOL}},
     {"DisableLogging", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, BOOL}},
     {"DisablePowerDown", {PERSISTENT, BOOL}},
-    {"DisableUpdates", {PERSISTENT, BOOL, "1"}},  // TurnPilot: no update lands mid-test (SATURDAY_PARAMS.md)
+    {"DisableUpdates", {PERSISTENT, BOOL, "0"}},  // TurnPilot: updates on, so a fix pushed to turnpilot reaches the car (SATURDAY_PARAMS.md, 11:50)
     {"DisengageOnAccelerator", {PERSISTENT, BOOL, "1"}},
     {"DongleId", {PERSISTENT, STRING}},
     {"DoReboot", {CLEAR_ON_MANAGER_START, BOOL}},
