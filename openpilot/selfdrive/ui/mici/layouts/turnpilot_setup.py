@@ -36,6 +36,7 @@ ICON = {
   'phone': ("icons_mici/settings/device/phone.png", 85, 64),
   'key': ("icons_mici/settings/developer/ssh.png", 56, 64),
   'engine': ("icons_mici/settings/software.png", 64, 64),
+  'signals': ("icons_mici/turn_intent_left.png", 90, 36),
   'done': ("icons_mici/offroad_alerts/green_wheel.png", 64, 64),
   'error': ("icons_mici/setup/warning.png", 64, 58),
 }
@@ -50,6 +51,9 @@ def setup_needed(params) -> bool:
   """Whether setup opens by itself at boot: not finished, and not a developer's local tiles (the sim), which need no
   map server and no phone."""
   return not params.get_bool(ss.SETUP_DONE) and not (params.get('TurnPilotValhallaTiles') or '').strip()
+
+
+DONE_LINES_MAX = 5
 
 
 def done_lines(params) -> list[str]:
@@ -261,16 +265,126 @@ class EngineStep(SetupStep):
     ui_state.params.put_bool(ss.RETRY_PARAM, True)  # turnpilot_web's installer takes it within LOOP_S
 
 
+class SignalsStep(SetupStep):
+  """Optional and skipped by default: the car works its own turn signal after car_signals.py's check in Park. It only
+  writes TurnPilotCarSignalsVinless and TurnPilotCarSignals; the check itself is card's, at the next ignition, and the
+  outside lamps are answered on the phone. Never offered in Drive."""
+  STEP = 'signals'
+
+  def __init__(self, next_callback, later_callback):
+    super().__init__("car turn signals", [
+      "TurnPilot can work the car's own turn signal, after a check in Park.",
+      "Skip it, and the comma asks you to tap the stalk at each turn.",
+    ], next_callback, later_callback, next_text="skip")
+    self._header.set_value("optional: scroll\nto continue")
+    self._phase = 'choose'
+    self._started_when = None
+    self._check_btn = BigPillButton("check\nsignals")
+    self._check_btn.set_click_callback(self._start)
+    self._steps = [GreyBigButton("", t) for t in (
+      "1. Park in P with room on both sides.",
+      "2. Turn the car off and on. Keep your hands off the stalk.",
+      "3. Step out and watch each side's lamps blink.",
+      "4. Then answer on the phone: did they flash?",
+    )]
+    self._cancel = BigPillButton("stop check")
+    self._cancel.set_click_callback(self._fail)
+    self._try = GreyBigButton("", "Now try the wipers, the headlights, the high beams and both stalk signals.")
+    self._works = BigPillButton("they all\nwork", green=True)
+    self._works.set_click_callback(self._on_works)
+    self._broken = BigPillButton("something's\nwrong")
+    self._broken.set_click_callback(self._fail)
+    self._cycle = GreyBigButton("", "Turn the car off and on once more. Then the car signals its own turns.")
+    self._failed = GreyBigButton("", "The check didn't pass, so car signals are off. The comma asks you to tap the stalk.")
+    self._done_next = BigPillButton("next", green=True)
+    self._done_next.set_click_callback(next_callback)
+    self.build()
+    self._show_phase()
+
+  def _extra_widgets(self):
+    return []
+
+  def widgets(self):
+    return [self._header, *self._sentences, *self._steps, self._try, self._cycle, self._failed, self._status, self._next,
+            self._check_btn, self._works, self._broken, self._done_next, self._cancel, *([self._later] if self._later else [])]
+
+  def _in_drive(self) -> bool:
+    return ui_state.started and str(ui_state.sm['carState'].gearShifter) != 'park'
+
+  def _start(self):
+    if self._in_drive():
+      return
+    check = ui_state.params.get('TurnPilotCarSignalsCheck')
+    self._started_when = check.get('when') if isinstance(check, dict) else None
+    ss.start_signal_check(ui_state.params)
+    self._set_phase('checking')
+
+  def _fail(self):
+    ss.signals_off(ui_state.params)
+    self._set_phase('failed')
+
+  def _on_works(self):
+    ss.signals_on(ui_state.params)
+    self._set_phase('cycle')
+
+  def _set_phase(self, phase: str):
+    self._phase = phase
+    self._show_phase()
+    self._scroller.scroll_panel.set_offset(0.0)
+
+  HEADER = {'choose': "optional: scroll\nto continue", 'checking': "the check, in Park", 'confirm': "the lamps flashed",
+            'cycle': "car signals on", 'failed': "car signals off"}
+
+  def _show_phase(self):
+    p = self._phase
+    self._header.set_value(self.HEADER[p])
+    for w in self._sentences:
+      w.set_visible(p == 'choose')
+    self._next.set_visible(p == 'choose')
+    self._check_btn.set_visible(p == 'choose')
+    self._check_btn.set_enabled(lambda: self.enabled and not self._in_drive())
+    for w in self._steps:
+      w.set_visible(p == 'checking')
+    self._cancel.set_visible(p == 'checking')
+    self._try.set_visible(p == 'confirm')
+    self._works.set_visible(p == 'confirm')
+    self._broken.set_visible(p == 'confirm')
+    self._cycle.set_visible(p == 'cycle')
+    self._failed.set_visible(p == 'failed')
+    self._done_next.set_visible(p in ('cycle', 'failed'))
+    self._waiting.set_visible(False)
+    self._retry.set_visible(False)
+
+  def refresh(self):
+    self._was_good = True  # nothing here grows the pill: skip is there from the start
+    if self._phase == 'checking':
+      state = ss.signal_check_state(ui_state.params, self._started_when)
+      if state == 'failed':
+        self._fail()
+      elif state == 'confirmed':
+        self._set_phase('confirm')
+      else:
+        self._status.set_text("waiting for the check" if state == 'waiting' else "answer on the phone")
+        self._status.set_value("turn the car off\nand on, in P" if state == 'waiting' else "did both sides'\nlamps flash?")
+        self._status.set_icon(None)
+    self._status.set_visible(self._phase == 'checking')
+    self._show_phase()
+
+
 class DoneStep(SetupStep):
   STEP = 'done'
 
   def __init__(self, done_callback):
-    super().__init__("ready to drive", done_lines(ui_state.params), done_callback, None, next_text="done")
+    lines = done_lines(ui_state.params)  # one card per line; the stalk's line comes and goes with the car signal check
+    super().__init__("ready to drive", lines + [""] * (DONE_LINES_MAX - len(lines)), done_callback, None, next_text="done")
     self.build()
 
   def show_event(self):
-    for card, line in zip(self._sentences, done_lines(ui_state.params), strict=False):
-      card.set_value(line)
+    lines = done_lines(ui_state.params)
+    for i, card in enumerate(self._sentences):  # built with the most lines (car signals off); fewer with them on
+      card.set_visible(i < len(lines))
+      if i < len(lines):
+        card.set_value(lines[i])
     super().show_event()
 
 
@@ -287,6 +401,7 @@ class TurnPilotSetupWindow(Widget):
       PhoneStep(lambda: self._advance(2), self.later),
       KeyStep(lambda: self._advance(3), self.later),
       EngineStep(lambda: self._advance(4), self.later, installed),
+      SignalsStep(lambda: self._advance(5), self.later),
       DoneStep(self._on_done),
     ]
     for step in self._steps:

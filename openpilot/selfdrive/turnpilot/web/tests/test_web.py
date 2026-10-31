@@ -1077,3 +1077,11 @@ class TestMapDefaultsOnTheWeb(WebTestCase):
     script = page.split("<script>")[1]
     assert 'api("/api/map", "POST", { key: key })' in script  # the key alone: the address and certificate are the comma's
     assert "Key works." in script and "Not saved: " in script
+
+
+class TestCarSignalsPage(WebTestCase):
+  def test_the_drive_check_is_for_developers_and_the_lamp_question_opens_itself(self):
+    script = server.INDEX.read_text().split("<script>")[1]
+    assert '$("csdrive").hidden = !devMode ||' in script  # the guided setup runs the check in Park only
+    assert 'get("dev") === "1"' in script
+    assert '$("carsignals").open = true' in script and "loadCarSignals().catch" in script

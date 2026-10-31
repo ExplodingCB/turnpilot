@@ -59,6 +59,8 @@ class TestSteps(SetupParams):
     self.params.put('TurnPilotMapKey', 'k' * 32)
     self.params.put(STATUS_PARAM, {'ok': True, 'regions': REGIONS, 'at': NOW})
     assert ss.STEPS[ss.first_unfinished(self.params, NOW, False)] == 'engine'
+    assert ss.STEPS[ss.first_unfinished(self.params, NOW, True)] == 'signals'  # optional, but offered once
+    self.params.put(ss.SETUP_STEP, ss.STEPS.index('signals') + 1)  # skipped
     assert ss.STEPS[ss.first_unfinished(self.params, NOW, True)] == 'done'
 
   def test_phone_connected_live_then_paired(self):
@@ -275,3 +277,47 @@ class TestMapDefaults(OpenpilotTestCase):
     params.put('TurnPilotMapHost', 'https://maps.example.test')
     assert ensure_map_defaults(params) == []
     assert params.get('TurnPilotMapHost') == 'https://maps.example.test'
+
+
+class TestSignalCheck(SetupParams):
+  """The optional turn signal check: only TurnPilotCarSignalsVinless and TurnPilotCarSignals are written, car_signals.py
+  runs the check, and the phone answers for the outside lamps."""
+
+  def check(self, **kw):
+    self.params.put('TurnPilotCarSignalsCheck', {'pass': True, 'checkId': 'abcd1234', 'exterior': 'pending', 'when': '2026-10-31T11:00', **kw})
+
+  def test_start_opts_in_then_checks(self):
+    ss.start_signal_check(self.params)
+    assert self.params.get_bool('TurnPilotCarSignalsVinless') and self.params.get('TurnPilotCarSignals') == 'check'
+
+  def test_states(self):
+    assert ss.signal_check_state(self.params, None) == 'waiting'
+    self.check(when='old')
+    assert ss.signal_check_state(self.params, 'old') == 'waiting'  # the check from before this one
+    self.check()
+    assert ss.signal_check_state(self.params, 'old') == 'answer'
+    self.params.put('TurnPilotCarSignalsExterior', 'yes:abcd1234')
+    assert ss.signal_check_state(self.params, 'old') == 'confirmed'
+    self.params.put('TurnPilotCarSignalsExterior', 'yes:another')  # an answer to another check
+    assert ss.signal_check_state(self.params, 'old') == 'answer'
+    self.params.put('TurnPilotCarSignalsExterior', 'no:abcd1234')
+    assert ss.signal_check_state(self.params, 'old') == 'failed'
+    self.params.remove('TurnPilotCarSignalsExterior')
+    self.check(exterior='confirmed')  # car_signals.promote ran at the next ignition
+    assert ss.signal_check_state(self.params, 'old') == 'confirmed'
+    self.check(exterior='refused')
+    assert ss.signal_check_state(self.params, 'old') == 'failed'
+    self.params.put('TurnPilotCarSignalsCheck', {'pass': False, 'why': 'no lamp', 'when': 'new'})
+    assert ss.signal_check_state(self.params, 'old') == 'failed'
+
+  def test_failure_sets_both_off_and_the_done_screen_asks_for_the_stalk(self):
+    ss.start_signal_check(self.params)
+    ss.signals_off(self.params)
+    assert self.params.get('TurnPilotCarSignals') == 'off' and not self.params.get_bool('TurnPilotCarSignalsVinless')
+    ss.signals_on(self.params)
+    assert self.params.get('TurnPilotCarSignals') == 'on'
+
+  def test_signals_never_hold_up_readiness(self):
+    self.ready()
+    self.params.put(ss.SETUP_STEP, 3)
+    assert ss.readiness_line(self.params, NOW, True) == ''

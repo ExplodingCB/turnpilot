@@ -5,14 +5,15 @@ Plain params in, words out, so the comma screen (ui/mici/layouts/turnpilot_setup
 
 The steps, in order: intro, phone (the phone opened the TurnPilot page with the pairing token: TurnPilotPhoneSeen,
 written by the web server), key (the map server answered the saved key: TurnPilotMapCoverageStatus ok), engine (the
-map engine, pyvalhalla, is installed: navd routes each drive's corridor with it, so driving needs it), done.
+map engine, pyvalhalla, is installed: navd routes each drive's corridor with it, so driving needs it), signals (the
+car's own turn signal, optional and skipped by default: car_signals.py's check mode, run in Park), done.
 """
 from dataclasses import dataclass
 
 from openpilot.selfdrive.turnpilot.maps.coverage import STATUS_PARAM as COVERAGE_STATUS
 from openpilot.selfdrive.turnpilot.maps.geofence import join_names, place_name
 
-STEPS = ('intro', 'phone', 'key', 'engine', 'done')
+STEPS = ('intro', 'phone', 'key', 'engine', 'signals', 'done')
 SETUP_DONE = 'TurnPilotSetupDone'
 SETUP_STEP = 'TurnPilotSetupStep'  # the furthest step the driver moved past, so a reboot resumes there or earlier
 PHONE_SEEN = 'TurnPilotPhoneSeen'  # epoch s of the last request the phone made with the pairing token
@@ -85,6 +86,8 @@ def engine_state(params, installed: bool) -> StepState:
 def step_good(step: str, params, now: float, installed: bool) -> bool:
   if step == 'intro':
     return (params.get(SETUP_STEP) or 0) >= 1 or bool(params.get_bool(SETUP_DONE))
+  if step == 'signals':  # optional: done once the driver moved past it, skipped or checked
+    return (params.get(SETUP_STEP) or 0) >= STEPS.index('signals') + 1 or bool(params.get_bool(SETUP_DONE))
   if step == 'phone':
     return phone_state(params, now).state == GOOD
   if step == 'key':
@@ -119,3 +122,39 @@ def readiness_line(params, now: float, installed: bool) -> str:
   if not params.get_bool(SETUP_DONE):
     return "Finish setup: open settings, turnpilot, run setup again."
   return ''
+
+
+# the turn signal check (car_signals.py's check mode, as CHASE_CAR_CHECKLIST.md 15a-15j runs it by hand)
+
+def signal_check_state(params, started_when) -> str:
+  """Where the guided check is, from the params car_signals.py and the phone write. started_when is the 'when' of the
+  check record there was before this check began (None if none), so an older check is never this one's.
+  'waiting' (no new check yet), 'answer' (passed, the phone asks about the outside lamps), 'confirmed', or 'failed'."""
+  check = params.get('TurnPilotCarSignalsCheck')
+  if not isinstance(check, dict) or check.get('when') == started_when:
+    return 'waiting'
+  if not check.get('pass') or check.get('exterior') == 'refused':
+    return 'failed'
+  answer = str(params.get('TurnPilotCarSignalsExterior') or '')
+  verdict, _, check_id = answer.partition(':')
+  if check.get('exterior') == 'confirmed' or (verdict == 'yes' and check_id == check.get('checkId')):
+    return 'confirmed'
+  if verdict == 'no' and check_id == check.get('checkId'):
+    return 'failed'
+  return 'answer'
+
+
+def start_signal_check(params):
+  """The opt-in for a Tesla's all-zero VIN first, then the check at the next ignition (car_signals.resolver)."""
+  params.put_bool('TurnPilotCarSignalsVinless', True, block=True)
+  params.put('TurnPilotCarSignals', 'check', block=True)
+
+
+def signals_off(params):
+  """Any failure: both back to off, and the car asks for the stalk at each turn."""
+  params.put('TurnPilotCarSignals', 'off', block=True)
+  params.put_bool('TurnPilotCarSignalsVinless', False, block=True)
+
+
+def signals_on(params):
+  params.put('TurnPilotCarSignals', 'on', block=True)

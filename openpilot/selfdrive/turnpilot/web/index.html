@@ -144,7 +144,8 @@ code { display: block; word-break: break-all; margin: 4px 0 12px; padding: 8px; 
 // The page holds no secrets and loads without a token. The token comes from the link the QR code opens, or from the
 // phone's storage after that. The link's copy is stored only once the comma accepts it, so a bad link can't replace a good token.
 var urlToken = new URLSearchParams(location.search).get("t");
-var token = urlToken, paired = true, timer;
+var token = urlToken, paired = true, timer, ticks = 0;
+var devMode = new URLSearchParams(location.search).get("dev") === "1";
 try { if (!token) token = localStorage.getItem("tp_token"); } catch (e) {}
 
 function $(id) { return document.getElementById(id); }
@@ -445,9 +446,14 @@ async function loadCarSignals() {
     b.onclick = function () { act(async function () { await api("/api/car-signals", "POST", { mode: m }); await loadCarSignals(); }); };
     modes.appendChild(b);
   });
-  $("csdrive").hidden = !(d.check === null || d.mode !== "on");
+  // the check in Drive is a developer's: the guided setup only ever runs it in Park, so the button needs ?dev=1
+  $("csdrive").hidden = !devMode || !(d.check === null || d.mode !== "on");
   var pending = d.check && d.check.pass && d.check.exterior === "pending";
   $("csexterior").hidden = !pending;
+  if (pending && !$("carsignals").open) {  // the comma's setup says "answer on the phone": open the question
+    $("carsignals").open = true;
+    $("csexterior").scrollIntoView({ behavior: "smooth", block: "center" });
+  }
   $("csyes").onclick = function () { answer("yes", d.check.checkId); };
   $("csno").onclick = function () { answer("no", d.check.checkId); };
   return d;
@@ -518,7 +524,11 @@ async function start() {
     $("endpoint").textContent = p.endpoint;
     $("token").textContent = p.token;
   });
-  timer = setInterval(function () { if (!document.hidden) poll(); }, 2000);
+  timer = setInterval(function () {
+    if (document.hidden) return;
+    poll();
+    if (++ticks % 3 === 0) loadCarSignals().catch(function () {});  // the lamp check's question appears without a reload
+  }, 2000);
   document.addEventListener("visibilitychange", function () { if (paired && !document.hidden) poll(); });
 }
 start();

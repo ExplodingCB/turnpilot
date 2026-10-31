@@ -60,10 +60,13 @@ class TestSetupWiring(OpenpilotTestCase):
     params.put("TurnPilotCarSignals", "on")
     lines = done_lines(params)
     assert lines[3].startswith("TurnPilot starts watch only") and len(lines) == 4
+    from openpilot.selfdrive.ui.mici.layouts.turnpilot_setup import DONE_LINES_MAX
+    params.put("TurnPilotCarSignals", "off")
+    assert len(done_lines(params)) == DONE_LINES_MAX  # the done screen has a card for every line it can show
 
   def test_steps_match_the_state_module(self):
     from openpilot.selfdrive.turnpilot.setup_state import STEPS
     from openpilot.selfdrive.ui.mici.layouts import turnpilot_setup as ts
-    classes = [ts.IntroStep, ts.PhoneStep, ts.KeyStep, ts.EngineStep, ts.DoneStep]
+    classes = [ts.IntroStep, ts.PhoneStep, ts.KeyStep, ts.EngineStep, ts.SignalsStep, ts.DoneStep]
     assert [c.STEP for c in classes] == list(STEPS)
     assert all(c.STEP in ts.ICON for c in classes)
