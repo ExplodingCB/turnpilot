@@ -254,7 +254,7 @@ def test_collect_runs():
 
 # Everything the car path imports has to exist on the comma: the stdlib, the dependencies in pyproject.toml, and the submodules.
 # These files are Mac tools (compiling the detector, exporting YOLO26, replaying an rlog) and never run on the device.
-DEV_TOOLS = {"detector/compile_detector.py", "detector/replay_route.py", "models/export_yolo26.py"}
+DEV_TOOLS = {"detector/compile_detector.py", "detector/replay_route.py", "detector/replay_native.py", "models/export_yolo26.py"}
 SUBMODULE_PACKAGES = {"opendbc", "msgq", "panda", "rednose", "teleoprtc", "tinygrad", "tinygrad_repo"}
 
 
