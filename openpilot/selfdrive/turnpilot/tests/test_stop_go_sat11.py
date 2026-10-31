@@ -280,6 +280,31 @@ def test_a_car_entering_our_path_after_the_commit_stops_us_short_of_it_saying_ca
   assert w.cmds[meet][1] < 0.3 and geo[meet][0] < lane_axis_m(w, 'left') - CAR_HALF_W
 
 
+@pytest.mark.parametrize('where', ['back', 'line'])
+def test_the_band_abort_s_stand_crosses_once_the_car_has_gone_never_a_handback(tmp_path, where):
+  # the re-run at 6ba8582 (R2, stop_allway_out_of_turn): the car from the left started 0.15 s after our commit (1.05 m, 1.41
+  # m/s), the band abort stood us 3.84 m past the stop point, 0.54 m past dEdgeMin; it crossed ahead (6.59 m nearest), then
+  # V26's un-commit looked again, said "Going" and handed back on the go (H5: "no room for a go: -0.54 m to the closest edge,
+  # 2.48 needed"). A band abort stands the car past the point a go needs GO_ROOM_M from, so under vision that stand is the
+  # stall's, as the rail's is: held while the car still comes, then the clearBox lifts with the lanes left to cross tested
+  # first, and across after it, never a handback, never touching it, never a stop under -2.0
+  w = world(tmp_path, where)
+  d_fn, holder = start(standing_d(where))
+  out, geo = drive_with(w, d_fn, holder, lambda d: d.state == 'committed', 40.)
+  ab = next((k for k, d in enumerate(out) if d.withdraw == 'bandAbort'), None)
+  assert ab is not None, [(d.state, d.withdraw, d.alert) for d in out[::10]]
+  stand = next(k for k in range(ab, len(out)) if w.cmds[k][1] < sg.STAND_V)
+  assert w.sg.edges.d_min - geo[stand][0] < sr.go_room_m(w.kw['t_abort'])  # no go from here could have GO_ROOM_M
+  assert not any(d.fault for d in out), [(k * DT_MDL, d.fault, d.reason) for k, d in enumerate(out) if d.fault][:3]
+  assert not any(touching(p, cd, lane_axis_m(w, 'left')) for p, cd in geo)
+  assert all(s.accel_cap >= -2. - 1e-9 for d in out for s in d.stops)
+  done = next((k for k, d in enumerate(out) if d.state == 'done'), None)
+  assert done is not None and done > stand, [(round(k * DT_MDL, 2), d.state, d.reason) for k, d in enumerate(out)][stand::20]
+  # it moved on only once the car had crossed our path
+  moved = next(k for k in range(stand, len(out)) if geo[k][0] > geo[stand][0] + 0.2)
+  assert geo[moved][1] < -CAR_HALF_LEN_M
+
+
 def crossing_y(kind, t):
   """(y left of our axis, vy) of the rail tests' scene car t s after the go reaches the stage: 5 m left then, at 2.5 m/s across
   our path, on its way since earlier (t < 0: further out on its line) ('crossing'), or the same but standing across our lane
