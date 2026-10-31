@@ -251,16 +251,13 @@ def test_the_out_of_turn_start_withdraws_the_go_before_commit_then_the_window_ag
   if where != 'back':
     return
   room = w.sg.edges.d_min - geo[nxt - 1 if nxt else -1][0]
-  if after_s <= 0.5:
-    # started early enough that the abort leaves GO_ROOM_M (run 11's 0.5 s): the window again from the withdrawal, the next
-    # go only once the car has crossed our path, and we cross after it, never a handback
-    assert nxt is not None and (nxt - wd) * DT_MDL >= sr.VISION_CLEAR_S - 1e-6 and room >= sr.go_room_m(w.kw['t_abort']) - 1e-6
-    assert geo[nxt][1] < -CAR_HALF_LEN_M
-    assert any(d.state == 'done' for d in out[nxt:]) and not any(d.fault for d in out)
-  else:
-    # later, the abort ends with less than GO_ROOM_M to dEdgeMin: no go from there (2.6), the loud handback (H5), held
-    assert nxt is None and out[-1].fault == 'H5' and out[-1].prompt == 'stopSignTakeControl'
-    assert all(w.cmds[k][1] < 0.05 for k in range(len(out) - 20, len(out)))
+  # started early enough that the abort leaves GO_ROOM_M (run 11's 0.5 s), or later with less (0.8 s: 2.0 m) but vision's go
+  # room (go_room_vision_m, the re-run's R7: at 6ba8582 this one handed back, H5): the window again from the withdrawal, the
+  # next go only once the car has crossed our path, and we cross after it, never a handback
+  assert room >= (sr.go_room_m(w.kw['t_abort']) if after_s <= 0.5 else sr.go_room_vision_m(w.kw['t_abort'])) - 1e-6, room
+  assert nxt is not None and (nxt - wd) * DT_MDL >= sr.VISION_CLEAR_S - 1e-6
+  assert geo[nxt][1] < -CAR_HALF_LEN_M
+  assert any(d.state == 'done' for d in out[nxt:]) and not any(d.fault for d in out)
 
 
 @pytest.mark.parametrize('where', ['back', 'line'])
