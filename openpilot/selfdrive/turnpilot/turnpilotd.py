@@ -136,6 +136,14 @@ STOPPED_HANDBACK_S, or NEAR_CONTROL_STAND_S with a map control within STOPPED_CO
 stall at a mapped signal TurnPilot doesn't hold for is never silent, and a red the map doesn't know, the car first in
 line, isn't handed back before it can turn green). TurnPilot never goes itself; the driver taking over (a gas press
 disengages) starts the wait over.
+A person TurnPilot saw who may still be in front (WARGAME_FIXES WF-13, BeamNG SAT validation row 6; scene_policy.person_front: a
+pedestrian track TurnPilot stopped for, or a confirmed one, lost within PERSON_FRONT_X_M ahead in or near the path with the car
+at 2 m/s or slower): the scene's stop holds the car standing, or brings it to rest on the comfortable curve, and "Person may be
+in front" is the status line from that frame. Every go of TurnPilot's is barred on it (go_blocked: 'personFront', so S2's
+releases and relifts, the unstick and clearBox lifts and the stop-sign decider's certified go; the decider's own go through its
+front zone, the left's through its scene_clear). It ends on the driver (openpilot disengaged, or the gas) or once she is seen
+again and seen walking clear of the corridor, then nothing person-like in front 2 s; PERSON_FRONT_MAX_S on it is handed back
+loudly (personFrontTakeControl, PERSON_FRONT_REASON) with the car still held. TurnPilotAlwaysDrive changes none of it.
 A lane change a map stop leaves no room for, before it or after its go, with the map's lane list placing the car in a lane
 the maneuver doesn't leave from (lane_planner.py: unreachable), skips the maneuver as too fast to turn does: said
 (turnpilotTooFastToTurn, "Can't Reach Turn Lane" by laneChangeWait unreachable) and rerouted, unless its desire went out.
@@ -195,7 +203,7 @@ from openpilot.common.time_helpers import system_time_valid
 from openpilot.selfdrive.turnpilot.scene_policy import (CROSSWALK_REASON, CROSSWALK_X_AFTER_M, CROSSWALK_X_BEFORE_M, CROSSWALK_Y_FAR_M, CROSSWALK_Y_NEAR_M,
                                                          CURB_PED_CAP_DEFAULT, CURB_PED_EDGE_M, CURB_PED_X_M, HOLD_LINE_M, NO_ACCEL_CAP,
                                                          ONCOMING_ENTRY_M, PATH_HALF_WIDTH_M, PERSON_FRONT_BUMPER_M, PERSON_FRONT_HALF_M,
-                                                         PERSON_FRONT_X_M, STOP_DECEL, VEHICLES, ScenePolicy, far_side_turn, in_path,
+                                                         PERSON_FRONT_NOTE, PERSON_FRONT_X_M, STOP_DECEL, VEHICLES, ScenePolicy, far_side_turn, in_path,
                                                          velocity_trusted)
 from openpilot.selfdrive.turnpilot.turn_skip import SkipState, TurnSkip, can_make_turn
 from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
@@ -453,6 +461,11 @@ PED_NOTE_S = 10.
 PED_WAITING_NOTE = "Waiting for pedestrian"
 PED_WAITING_REASON = "Pedestrian waiting: take control"
 UNSTICK_REASON = "Nothing ahead is holding the car: going on"
+# a person TurnPilot saw who may still be in front (WARGAME_FIXES WF-13; BeamNG SAT validation row 6; scene_policy.person_front):
+# its hold and its status line are the scene's, every go of TurnPilot's is barred on it (go_blocked: 'personFront'; the left's
+# scene_clear, the decider's front zone), and nobody seen leaving it this long it hands back loudly with the car still held
+PERSON_FRONT_MAX_S = 30.
+PERSON_FRONT_REASON = "Person may be in front: take control"
 # the stop-sign decider's go causes (stop_go.py, go_override.CAUSES): its own watchdog (the gate, G5's window, GO_RETRIES, H5)
 # follows them, never the no-move clock, and turnRelease never certifies alongside one
 STOP_GO_CAUSES = ('stopSign', 'rollUp', 'creep', 'clearBox')
@@ -753,6 +766,7 @@ class TurnPilot:
     self.ped_said = False          # ...its note chimed
     self.ped_handed = False        # ...handed back, held, while the hold stands the car
     self.ped_alert_t = 0.          # ...s left of its pedestrianWaiting alert
+    self.person_handed = False     # the person-may-be-in-front latch handed back (WF-13: person_front_handback)
     self.people_runs: dict = {}    # (camera, view) -> [s old, the person boxes] of each camera's last detector run
     self.abandon_s = 0.            # the model steering away from the route's turn in the junction (turn_abandoned)
     self.wrong_s = 0.              # s of reads of a yellow line on the car's right (wrong_side)
@@ -1431,7 +1445,10 @@ class TurnPilot:
     if self.straight_cleared:  # R8b's fire: the turn's desire out of the model's queue from this very plan on
       plan.desire = self.last_desire = CLEAR_DESIRE
     wrong_side = self.wrong_side(sm, cs, v_ego, acting, paint, right_hand_traffic)
-    if withdrawn or self.cant_start_unheld:  # the switch's has no hold: the model drives on under it (no_move)
+    person_front = self.scene.person_front
+    if self.person_front_handback(acting, person_front):  # WF-13: held by it PERSON_FRONT_MAX_S, nobody seen leaving
+      plan.controlPrompt, plan.reason = 'personFrontTakeControl', PERSON_FRONT_REASON
+    elif withdrawn or self.cant_start_unheld:  # the switch's has no hold: the model drives on under it (no_move)
       plan.controlPrompt, plan.reason = 'cantStartTakeControl', NO_MOVE_REASON
     elif ped_handed:  # the crosswalk hold's standoff (SC-02): held, take control
       plan.controlPrompt, plan.reason = 'pedestrianWaitingTakeControl', PED_WAITING_REASON
@@ -1464,6 +1481,8 @@ class TurnPilot:
     if self.stall_alert_t > 0. and str(plan.controlPrompt) == 'none' and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS:
       plan.controlAlert, plan.reason = 'stallLift', STALL_LIFT_REASON  # a stall's lift (LEFT-21): said with a chime
     self.stall_alert_t = max(self.stall_alert_t - DT_MDL, 0.)
+    if person_front is not None and str(plan.controlPrompt) not in TAKE_CONTROL_PROMPTS:
+      plan.reason = PERSON_FRONT_NOTE  # WF-13: the status line's from the frame it is set, until it ends or hands back
     # the route's stop signs (route_notice.py, STOP_SIGNS.md 3.4): at its start, and 300 m before each it couldn't avoid; said
     # engaged or not (selfdrived's turnpilotRouteNotice), only where the slot is free (no handback, no alert but a status line,
     # no take-control prompt: hooks.plan_events would show those instead), and used up only on frames it is said, so held
@@ -2603,6 +2622,16 @@ class TurnPilot:
       self.ped_handed = True
       cloudlog.event("turnpilot.crosswalk_standoff", error=True, held_s=round(self.ped_hold_s, 1), **(j.evidence or {}))
     return self.ped_handed
+
+  def person_front_handback(self, acting: bool, pf) -> bool:
+    """The person-may-be-in-front latch (scene_policy.person_front, WARGAME_FIXES WF-13) set PERSON_FRONT_MAX_S: handed back loudly
+    (personFrontTakeControl, PERSON_FRONT_REASON), the car still held by it, until the driver or her clearance ends it; logged once."""
+    on = acting and pf is not None and self.scene.t - pf.t >= PERSON_FRONT_MAX_S - 1e-6
+    if on and not self.person_handed:
+      cloudlog.event("turnpilot.person_front_handback", error=True, held_s=round(self.scene.t - pf.t, 1), seen_leaving=pf.left,
+                     **pf.evidence)
+    self.person_handed = on
+    return on
 
   def people_in_front(self, model) -> bool:
     """A person box of each camera's last detector run (watch_people) in front of the car: up to PERSON_FRONT_X_M ahead, its bottom

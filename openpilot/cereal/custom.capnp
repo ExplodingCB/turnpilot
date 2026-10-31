@@ -192,6 +192,9 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     # ALWAYS_DRIVE.md SC-02: the right-turn crosswalk hold standing STAND_UNDECIDED_S on walkers who all stand (turnpilotd.py:
     # crosswalk_standoff): "Pedestrian waiting: take control", the car held, never a go past them
     pedestrianWaitingTakeControl @20;
+    # WARGAME_FIXES WF-13: a person TurnPilot saw lost in front of the car (scene_policy.person_front) and nobody seen leaving
+    # for PERSON_FRONT_MAX_S (turnpilotd.py: person_front_handback): "Person may be in front: take control", the car held
+    personFrontTakeControl @21;
   }
   enum ControlAlert {
     none @0;

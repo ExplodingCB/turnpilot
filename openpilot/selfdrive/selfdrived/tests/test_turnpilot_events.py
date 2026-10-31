@@ -520,3 +520,17 @@ def test_the_map_stops_status_line_has_a_silent_twin():
   quiet, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='mapControlsUnavailableSilent', reason='Map stops/signals: partial')))
   assert (quiet.alert_text_1, quiet.alert_text_2) == (loud.alert_text_1, loud.alert_text_2)
   assert loud.audible_alert == AudibleAlert.prompt and quiet.audible_alert == AudibleAlert.none
+
+
+def test_a_person_who_may_be_in_front_is_a_loud_handback():
+  # WARGAME_FIXES WF-13: a person TurnPilot saw lost in front of the car, nobody seen leaving for 30 s (turnpilotd.py:
+  # person_front_handback): take control with the handback's chime, the reason line as its title; appended after
+  # pedestrianWaitingTakeControl @20
+  from openpilot.cereal import custom
+  from openpilot.selfdrive.turnpilot.hooks import CONTROL_PROMPT_TEXT, TAKE_CONTROL_PROMPTS
+  assert custom.TurnpilotPlan.ControlPrompt.schema.enumerants['personFrontTakeControl'] == 21
+  assert 'personFrontTakeControl' in TAKE_CONTROL_PROMPTS
+  a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt='personFrontTakeControl',
+                                                            reason="Person may be in front: take control")))
+  assert a.alert_text_1 == "Person may be in front: take control" and a.alert_text_2 == CONTROL_PROMPT_TEXT['personFrontTakeControl']
+  assert a.audible_alert == AudibleAlert.tpHandback and a.visual_alert == VisualAlert.steerRequired

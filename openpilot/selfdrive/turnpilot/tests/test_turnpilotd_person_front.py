@@ -274,6 +274,7 @@ def test_the_autonomous_left_never_goes_while_it_is_set():
   assert len(gos) == 1 and gos[0] < lost, gos
   assert all(v < 0.05 for _, v, _ in sim.trace[lost + 20:]) and all(p.shouldStop for p in plans[lost + 1:])
   assert all(p.reason == NOTE for p in plans[lost + 1:lost + round(29. / DT_MDL)])
+  assert any(str(p.controlPrompt) == PROMPT for p in plans[lost:])
   assert not any(c.args[0].scene_clear for c in update.call_args_list[lost + 2:] if c.args[0].mode != 'off')
 
 
