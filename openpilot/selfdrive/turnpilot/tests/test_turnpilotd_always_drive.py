@@ -12,7 +12,8 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.turnpilot.go_override import GO_CLEAR_M, GO_END_SPEED, TAKEOVER_S
 from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.scene.tracker import RawFrame
-from openpilot.selfdrive.turnpilot.scene_policy import NO_ACCEL_CAP, SceneDecision
+from openpilot.selfdrive.turnpilot.scene_policy import (CROSSWALK_X_AFTER_M, CROSSWALK_X_BEFORE_M, CROSSWALK_Y_FAR_M, CROSSWALK_Y_NEAR_M,
+                                                         NO_ACCEL_CAP, SceneDecision)
 from openpilot.selfdrive.turnpilot.stop_go import Frame
 from openpilot.selfdrive.turnpilot.tests.test_camera_lights import detections
 from openpilot.selfdrive.turnpilot.tests.test_go_override import WARM_S
@@ -24,8 +25,8 @@ from openpilot.selfdrive.turnpilot.unprotected_left import LIGHT_RED_MAX_S, STAN
 from openpilot.selfdrive.turnpilot.turnpilotd import (LEAD_STAND_MAX_S, LIGHT_GREEN_REASON, LIGHT_WAIT_NOTE, NEAR_CONTROL_STAND_S, NO_MOVE_MAX_S,
                                                       NO_MOVE_REASON, NO_MOVE_S, PED_NOTE_S, PED_WAITING_NOTE, PED_WAITING_REASON, QUEUE_STILL_MAX_S,
                                                       RELEASE_GOES, RELEASE_LIFT_M, STALLED_REASON, STALL_LIFTS, STALL_LIFT_GAP_S, STALL_LIFT_REASON,
-                                                      STALL_PROMPT_S, STALL_REPULSE_S, STANDSTILL_SPEED, STOPPED_HANDBACK_S, STOPPED_NOTE,
-                                                      STOPPED_NOTE_S, TurnPilot, UNSTICK_S)
+                                                      STALL_MIN_DEG, STALL_PROMPT_S, STALL_REPULSE_S, STANDSTILL_SPEED, STOPPED_HANDBACK_S,
+                                                      STOPPED_NOTE, STOPPED_NOTE_S, TurnPilot, UNSTICK_S)
 
 Desire = log.Desire
 
@@ -102,6 +103,8 @@ def test_a_release_the_model_doesnt_follow_is_never_held_and_hands_back_loudly_a
   sim, p = released(True)
   assert go_id_of(p) is not None
   plans = stand(sim, NO_MOVE_MAX_S + 1.)
+  # the model holding, the lifts never moving the car: a go at its window's end every RELIFT_GAP_S, RELEASE_GOES in all
+  assert len({go_id_of(q) for q in [p] + plans} - {None}) == RELEASE_GOES
   first = next(i for i, q in enumerate(plans) if q.controlPrompt == 'cantStartTakeControl')
   assert abs((first + 1) * DT_MDL - NO_MOVE_MAX_S) <= 2 * DT_MDL + 1e-6, first * DT_MDL
   assert plans[first].reason == NO_MOVE_REASON and all(q.controlPrompt == 'cantStartTakeControl' for q in plans[first:])
@@ -427,12 +430,22 @@ def test_a_person_near_the_turn_bars_the_stalls_lift():
     m.position.x = xs
     m.position.y = [0.02 * x * x for x in xs]  # modelV2's y is right: curving right, 8 m right of the axis 20 m on
     return m.as_reader()
-  person = {'cls': 'pedestrian', 'x': 20., 'y': -4., 'vx': 0., 'vy': 0., 'inPath': False}  # 4 m left of the path there
+  person = {'cls': 'pedestrian', 'x': 20., 'y': -12., 'vx': 0., 'vy': 0., 'inPath': False}  # 4 m right of the path there
   plans = run(objects=[person], model=curved, deg=30.)
   assert not lifts_of(plans)
   assert any(q.controlPrompt == 'stalledTakeControl' for q in plans)
   plans = run(objects=[dict(person, y=4.)], model=curved, deg=30.)  # 12 m off the path, out of the zone: lifted
   assert lifts_of(plans)
+  sim = stalled_right(True, 30.)
+  assert not in_zone(sim, 20., -12.) and not in_zone(sim, 20., 4.), "the path's veto alone, never the zone's"
+
+
+def in_zone(sim, x, y):
+  """The car's (x, y left) is in the right's crosswalk zone in the road's frame (scene_policy's CROSSWALK_*)."""
+  a = math.radians(sim.tp.approach_yaw_deg) * -1
+  c, s = math.cos(a), math.sin(a)
+  xr, yr, d = x * c - y * s, x * s + y * c, sim.tp.follower.distance
+  return d - CROSSWALK_X_BEFORE_M < xr < d + CROSSWALK_X_AFTER_M and CROSSWALK_Y_NEAR_M < -yr < CROSSWALK_Y_FAR_M
 
 
 def test_a_person_coming_near_the_turn_mid_lift_withdraws_it():
@@ -719,3 +732,18 @@ def test_a_walker_moving_in_the_crosswalk_is_waited_through_without_a_handback(o
   sim = held_at_the_corner(on, pacing)
   plans = hold_for(sim, STAND_UNDECIDED_S + 20.)
   assert not any(q.controlPrompt in TAKE_CONTROL_PROMPTS for q in plans) and all(q.shouldStop for q in plans)
+
+
+def test_a_stand_at_a_turns_line_with_its_desire_out_never_gets_the_unstick_lift():
+  """Section 4.5's lift is never for a stand with the route's turn desire out, short of the turn too (a model stop at a right's
+  line, no hold: an unmapped red, a walker the detector doesn't score): the turn's own rules have it."""
+  sim = Sim(RIGHT_AT_A_CORNER, cruise=8., controls_status='ok')
+  sim.tp.always_drive = True
+  sim.lights = NO_HEADS
+  sim.raw = lambda s: RawFrame([], 'road', s.t)
+  while 300. - sim.s > 12.:
+    sim.step(engaged=True)
+    assert sim.t < 120.
+  assert sim.tp.turn_committed and sim.tp.desires.turned_deg < STALL_MIN_DEG
+  plans = stand(sim, UNSTICK_S + 5.)
+  assert not unstick_spans(plans)
