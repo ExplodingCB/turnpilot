@@ -11,7 +11,7 @@ from openpilot.cereal import custom, log
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, CLEAR_DESIRE, SPEED_CAP_ACCEL_MIN, TAKE_CONTROL_PROMPTS, lane_change_events, plan_accel
 from openpilot.selfdrive.turnpilot.lane_planner import LANE_UNKNOWN_REASON, LC_WARN_S, lane_change_window
-from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN, LinePaint
+from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN, LinePaint, fill_lane_paint
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, NO_ACCEL_CAP, ONCOMING_TTA_S, PED_STOP_GAP_M
 from openpilot.selfdrive.turnpilot.tests.synthetic import FakeNavd, car_control, car_state, junction_of, model_v2, nav_instruction, scene
 from openpilot.selfdrive.turnpilot.desire_timing import TURN_DESIRE_LEAD_M
@@ -25,7 +25,7 @@ from openpilot.selfdrive.turnpilot.turnpilotd import (CAR_UNKNOWN_REASON, DETECT
                                                        STALLED_REASON, TURN_ABANDON_CURV, TURN_ABANDON_S, TURN_ABANDONED_REASON,
                                                        WRONG_SIDE_MIN_SPEED, WRONG_SIDE_REASON, WRONG_SIDE_S, yellow_on_the_right,
                                                        STOPPED_CONTROL_M, STOPPED_HANDBACK_S, STOPPED_LEAD_M, STOPPED_NOTE, STOPPED_NOTE_S, STOPPED_REASON,
-                                                       TURN_MISSED_REASON, WAITING_REASON, TurnPilot, long_control_for)
+                                                       TURN_MISSED_REASON, WAITING_REASON, TurnPilot, long_control_for, plan_paint)
 from openpilot.selfdrive.turnpilot.handback import Handback
 from openpilot.selfdrive.turnpilot.scene.tracker import STALE_S
 
@@ -419,6 +419,68 @@ def test_lane_not_confirmed_is_said_not_changed():
   sim.run(25.)
   assert any(plan.laneChange == LaneChange.left for _, _, plan in sim.trace)
   assert all(plan.laneMismatch == custom.TurnpilotPlan.LaneMismatch.none for _, _, plan in sim.trace)
+
+
+@pytest.mark.parametrize("always_drive", [False, True])
+def test_cant_confirm_lane_chimes_once_a_maneuver_under_the_switch(always_drive):
+  """R12 (ALWAYS_DRIVE.md S4): under TurnPilotAlwaysDrive 'Can't Confirm Lane' keeps one chime per maneuver: the first onset of
+  laneUnknown for a maneuver id goes out as it is (its chime) for as long as it lasts, every later onset for that maneuver as
+  laneUnknownQuiet (the same line, no sound), and the next maneuver's first onset chimes again, under the line or not. Every
+  other mismatch passes as it is. Off the switch every onset as today."""
+  tp = TurnPilot()
+  tp.always_drive = always_drive
+  LM = custom.TurnpilotPlan.LaneMismatch
+  U, N, Q, W = LM.laneUnknown, LM.none, LM.laneUnknownQuiet, LM.wrongLaneForTurn
+  seq = [(U, 3)] * 5 + [(N, 3)] * 4 + [(U, 3)] * 5 + [(W, 3)] * 2 + [(U, 3)] * 3 + [(U, 4)] * 3 + [(N, 4)] + [(U, 4)] * 2 + \
+    [(N, None)] + [(U, None)] * 2 + [(N, None)] + [(U, None)]
+  out = [tp.unknown_sound(m, i) for m, i in seq]
+  if not always_drive:
+    assert out == [m for m, _ in seq]
+  else:
+    assert out == [U] * 5 + [N] * 4 + [Q] * 5 + [W] * 2 + [Q] * 3 + [U] * 3 + [N] + [Q] * 2 + [N] + [U] * 2 + [N] + [Q]
+  tp.shadow = True  # the switch does nothing in shadow mode
+  assert [tp.unknown_sound(m, i) for m, i in [(N, 7), (U, 7), (N, 7), (U, 7)]] == [N, U, N, U]
+  # closed loop: the lane the planner can't place, said with its chime on the drive's one onset
+  sim = Sim([(500., "turn", "left"), (2000., "turn", "right")], cruise=15., nav_lanes={0: THREE_LANES_LEFT_TURN}, model_lanes=(1, 0),
+            paint=(UNKNOWN, BW, BW, UNKNOWN))
+  sim.tp.always_drive = always_drive
+  sim.model_kw = {'shoulder': 4.}
+  sim.run(25.)
+  said = [str(plan.laneMismatch) for _, _, plan in sim.trace if plan.laneMismatch != N]
+  assert said and set(said) == {"laneUnknown"}
+
+
+@pytest.mark.parametrize("always_drive", [False, True])
+def test_a_blind_spot_under_an_offer_is_waited_out_and_its_release_said_again(always_drive):
+  """LC-01 closed loop: a two-lane right turn, the car one lane left of the turn's lane; a car sits in its right blind spot from
+  1 s into the offer for 6 s. Under TurnPilotAlwaysDrive: one offer, never an abort, no request while it lasts (laneChangeHold
+  blindspot), then LC_HOLD_CLEAR_S clear, the release said again (laneChangeHold clear, the chime) with its LC_RELEASE_S
+  countdown, and only then the request. Off: the 'blindspot' abort and a fresh offer after the cooldown, as today."""
+  from openpilot.selfdrive.turnpilot.lane_planner import LC_HOLD_CLEAR_S, LC_RELEASE_S
+  sim = Sim([(500., 'turn', 'right'), (2000., 'turn', 'left')], cruise=15., nav_lanes={0: TWO_LANES_RIGHT_TURN}, model_lanes=(0, 1),
+            paint=BROKEN_WHITE_RIGHT)
+  sim.tp.always_drive = always_drive
+  offered = []
+
+  def blindspot(sim):
+    if not offered and sim.trace and sim.trace[-1][2].laneChangeOffer == LaneChange.right:
+      offered.append(sim.t)
+    return False, bool(offered) and offered[0] + 1. <= sim.t < offered[0] + 7.
+  sim.blindspot = blindspot
+  sim.run(26.)
+  plans = [(t * DT_MDL, p) for t, (_, _, p) in enumerate(sim.trace)]
+  offers = rising(sim.trace, 'laneChangeOffer', LaneChange.right)
+  aborts = {str(p.laneChangeAbort) for _, p in plans} - {'none'}
+  if not always_drive:
+    assert aborts == {'blindspot'} and len(offers) == 2 and all(str(p.laneChangeHold) == 'none' for _, p in plans)
+    return
+  assert not aborts and len(offers) == 1
+  first_request = next(t for t, p in plans if p.laneChange == LaneChange.right)
+  assert first_request == pytest.approx(offered[0] + 7. + LC_HOLD_CLEAR_S + LC_RELEASE_S, abs=2 * DT_MDL)
+  holds = [str(p.laneChangeHold) for t, p in plans if offered[0] + 1.1 < t < first_request]
+  assert holds[:5] == ['blindspot'] * 5 and holds[-5:] == ['clear'] * 5 and set(holds) == {'blindspot', 'clear'}
+  assert all(p.laneChangeOffer == LaneChange.right and p.state == State.laneChange for t, p in plans if offered[0] < t < first_request)
+
 
 def test_shadow_computes_the_same_plan():
   def oncoming(sim):
@@ -3204,6 +3266,40 @@ def test_a_turn_whose_lane_change_never_went_is_skipped_out_loud_never_turned_fr
   sim.run(40.)
   plans, first = skipped_for_its_lane(sim, 300.)
   assert not any(p.laneChangeOffer != LaneChange.none for p in plans)
+
+
+def detections_paint(status, filled=None):
+  """turnpilotDetections as modeld sends it: lanePaint filled with these four (none when None), and its lanePaintStatus."""
+  msg = messaging.new_message('turnpilotDetections')
+  if filled is not None:
+    fill_lane_paint(msg.turnpilotDetections.init('lanePaint', 4), filled)
+  msg.turnpilotDetections.lanePaintStatus = status
+  return msg.as_reader().turnpilotDetections
+
+
+@pytest.mark.parametrize("status, filled", [('noModel', [UNKNOWN] * 4), ('wideCamera', None), ('sweep', None), ('disabled', None)])
+def test_a_curb_side_change_on_less_than_paint_never_goes_on_paint_nobody_read(status, filled):
+  """ad-s4's block on 4.10, through turnpilotd's paint (plan_paint): under TurnPilotAlwaysDrive, a right turn with no lane list
+  and a lane the model counts to the right. The curb line the reader read as unknown (lanePaintStatus read) is 4.10's less
+  than paint: the change is offered and requested, and with no DesireHelper here it never goes, so at the window's end LC-03
+  skips the turn, the car placed by that lane. The same four unknowns from a message the reader never read (a road camera
+  frame with no modelV2 for it, filled; the wide camera, a stop sweep, the paint off for the drive: none, which
+  lane_paint_from_msg makes four unknowns of) are no paint read: never offered (lineNotBroken), and past the window's end
+  nothing placed the car, so nothing is skipped, as off the switch."""
+  def drive(det, on=True):
+    sim = Sim([(400., 'turn', 'right'), (2000., 'turn', 'left')], cruise=15., model_lanes=(0, 1), paint=plan_paint(det, True))
+    sim.tp.always_drive = on
+    sim.run(24.)  # past the window's end, the car slowed for the turn
+    return [p for _, _, p in sim.trace]
+  read = drive(detections_paint('read', [UNKNOWN, LinePaint('solid', 'yellow', 0.875, 0.9375), UNKNOWN, UNKNOWN]))
+  assert any(p.laneChangeOffer == LaneChange.right for p in read) and any(p.laneChange == LaneChange.right for p in read)
+  assert any(p.tooFastToTurn for p in read)
+  for on in (True, False):
+    unread = drive(detections_paint(status, filled), on)
+    assert not any(p.laneChangeOffer != LaneChange.none or p.laneChange != LaneChange.none for p in unread), on
+    waits = {str(p.laneChangeWait) for p in unread}
+    assert 'lineNotBroken' in waits and 'pastWindow' in waits and waits <= {'beforeWindow', 'lineNotBroken', 'tooSlow', 'pastWindow'}, on
+    assert not any(p.tooFastToTurn for p in unread), on  # LC-03 judged at the window's end: nothing placed the car
 
 
 def test_a_turn_whose_desire_went_out_is_never_skipped_for_its_lane():

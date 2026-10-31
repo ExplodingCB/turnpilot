@@ -8,6 +8,7 @@ import pytest
 from opendbc.car.structs import car
 from openpilot.cereal import custom, messaging
 from openpilot.selfdrive.turnpilot import turnpilotd
+from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN, LinePaint, fill_lane_paint
 from openpilot.selfdrive.turnpilot.tests.synthetic import car_control, car_state, model_v2, nav_instruction
 from openpilot.system.manager.process_config import managed_processes
 
@@ -398,3 +399,61 @@ def test_a_sweep_coasts_the_trackers_tracks_longer_and_the_watch_sees_every_run(
     run_main(frames=4, tracker=tracker)
   assert coasts == [MAX_COAST_S, MAX_COAST_S, SWEEP_COAST_S, SWEEP_COAST_S]
   assert observed == [[('road', 1.0, None, None)]] * 4
+
+
+# confidences and coverages a Float32 carries exactly
+READ_PAINT = [LinePaint('solid', 'yellow', 0.875, 0.9375), LinePaint('broken', 'white', 0.875, 0.25), UNKNOWN, LinePaint('none', 'unknown', 0.75, 0.)]
+LanePaintStatus = custom.TurnpilotDetections.LanePaintStatus
+
+
+@pytest.mark.parametrize("status, paint", [
+  ('read', READ_PAINT),
+  ('noModel', [UNKNOWN] * 4),  # LanePaintReader.read on a road camera frame it couldn't read: four unknowns, filled
+  ('wideCamera', None), ('sweep', None), ('disabled', None),  # nothing filled: lane_paint_from_msg makes four unknowns of it
+  ('unset', None), ('unset', [UNKNOWN] * 4),  # a log from before the field
+])
+def test_only_paint_the_reader_read_goes_to_the_plan(status, paint):
+  """ad-s4's block on 4.10: the lane paint turnpilotd hands the plan is the reader's only when this message's lanePaintStatus
+  is read. A run on the wide camera, a stop sweep, the paint off for the drive (a budget overrun, an exception) and a road
+  frame the reader had no modelV2 for all come as LinePaints of kind and colour unknown (or none at all), which a line
+  read unknown looks like too: the status alone tells them apart. Unread paint is (), as with the scene unavailable, so a
+  curb-side change on less than paint (4.10) never goes on paint nobody read. Off the switch () and four unknowns plan
+  the same (no line read broken white, none read yellow or solid)."""
+  msg = messaging.new_message('turnpilotDetections')
+  if paint is not None:
+    fill_lane_paint(msg.turnpilotDetections.init('lanePaint', 4), paint)
+  msg.turnpilotDetections.lanePaintStatus = status
+  det = msg.as_reader().turnpilotDetections
+  tracker = mock.MagicMock()
+  tracker.raw_new, tracker.raw_far_new = False, False
+  tracker.fill_scene.side_effect = lambda s: setattr(s, 'available', True)  # the scene fresh: only the status decides
+  got = []
+
+  def plan(self, *a, **k):
+    got.append((a[1].available, a[6]))  # (scene available, the paint)
+    return messaging.new_message('turnpilotPlan')
+  orig = LoopSM.__init__
+
+  def init(self, *a, **k):
+    orig(self, *a, **k)
+    self.data['turnpilotDetections'], self.seen['turnpilotDetections'] = det, True
+  with mock.patch.object(LoopSM, '__init__', init), mock.patch.object(turnpilotd.TurnPilot, 'plan', plan):
+    _, _, errors = run_main(frames=3, tracker=tracker)
+  assert not errors and len(got) == 3
+  assert all(available for available, _ in got)
+  assert all(p == (tuple(READ_PAINT) if status == 'read' else ()) for _, p in got), got[0][1]
+
+
+def test_paint_is_none_read_with_the_scene_unavailable_or_before_the_first_message():
+  """plan_paint's other guards: the reader's read paint goes to the plan only while the scene is fresh (its detections are,
+  so the paint is too), and nothing before the first turnpilotDetections; with four lines the reader read, never fewer."""
+  msg = messaging.new_message('turnpilotDetections')
+  fill_lane_paint(msg.turnpilotDetections.init('lanePaint', 4), READ_PAINT)
+  msg.turnpilotDetections.lanePaintStatus = 'read'
+  det = msg.as_reader().turnpilotDetections
+  assert turnpilotd.plan_paint(det, True) == tuple(READ_PAINT)
+  assert turnpilotd.plan_paint(det, False) == () and turnpilotd.plan_paint(None, True) == ()
+  short = messaging.new_message('turnpilotDetections')
+  fill_lane_paint(short.turnpilotDetections.init('lanePaint', 2), READ_PAINT[:2])
+  short.turnpilotDetections.lanePaintStatus = 'read'
+  assert turnpilotd.plan_paint(short.as_reader().turnpilotDetections, True) == ()

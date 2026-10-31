@@ -282,9 +282,16 @@ def hides_stock_lane_change(names, direction) -> bool:
 
 
 def lane_change_text(plan, side: str) -> str:
-  """The coming lane change's alert line: the countdown, then the prompt to signal, then waiting for the blind spot."""
+  """The coming lane change's alert line: the countdown, then the prompt to signal, then waiting for the blind spot. Under
+  TurnPilotAlwaysDrive a change held for the blind spot says so (selfdrived gives it no sound), and its release says it is clear,
+  with its countdown (LC-01, laneChangeHold)."""
   if plan is None:
     return f'Lane Change {side.capitalize()}'
+  hold = str(plan.laneChangeHold)
+  if hold == 'blindspot':
+    return f'Changing Lanes {side.capitalize()} Once Clear'
+  if hold == 'clear':
+    return f'Clear: Lane Change {side.capitalize()} in {math.ceil(plan.laneChangeCountdown)}'
   if plan.laneChangeCountdown > 0.:
     return f'Lane Change {side.capitalize()} in {math.ceil(plan.laneChangeCountdown)}'
   if str(plan.laneChange) == side:

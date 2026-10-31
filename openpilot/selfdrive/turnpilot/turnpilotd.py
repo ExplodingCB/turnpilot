@@ -2,9 +2,10 @@
 """turnpilotd: turns the active route and the scene into desire pulses, lane-change requests and longitudinal limits.
 
 modeld takes the plan's desire and lane change, plannerd its accel and speed caps (see hooks.py). The lane paint the
-detector reads comes in with its detections, and is used only while those are fresh (the scene is available); none read
-is unknown paint, and no lane change. The lane planner plans lane changes only with TurnPilotLanePaintActive set; without
-it a second planner publishes what it would have asked for in laneChangePaintRule, so drives can be scored. In shadow mode
+detector reads comes in with its detections, and is used only while those are fresh (the scene is available) and the
+message's lanePaintStatus is read (plan_paint); none read is unknown paint, and no lane change. The lane planner plans
+lane changes only with TurnPilotLanePaintActive set; without it a second planner publishes what it would have asked for
+in laneChangePaintRule, so drives can be scored. In shadow mode
 (TurnPilotShadowMode) everything is computed and published with shadow=True, and nothing acts on it.
 It runs onroad only while TurnPilotEnabled. The manager doesn't restart a process that died, and a dead one
 soft-disables openpilot for the rest of the drive (processNotRunning), so an exception in the plan or the scene is
@@ -805,6 +806,8 @@ class TurnPilot:
     self.paint_rule_lanes = LanePlanner(paint_rule=True)  # what the lane planner would ask for, while it's turned off
     self.mismatch = LaneMismatch.none
     self._mismatch_candidate, self._mismatch_frames = LaneMismatch.none, 0
+    self._unknown_onset = self._unknown_heard = None  # (maneuver id,): laneUnknown's onset under way, the last one said (R12)
+    self._unknown_quiet = False
     self.acting = False
     self.last_desire = Desire.none
     self.hand_always_drive()  # the components made afresh here have the switch at once, mid-frame too (a fault's reset)
@@ -901,6 +904,20 @@ class TurnPilot:
                        through_distance=round(rf.through_distance, 1))
       self.mismatch = found
     return self.mismatch
+
+  def unknown_sound(self, mismatch, maneuver_id) -> int:
+    """The plan's laneMismatch from _lane_mismatch's (R12, ALWAYS_DRIVE.md step S4): under the switch 'Can't Confirm Lane' chimes
+    once a maneuver, its first onset of laneUnknown for a maneuver id published as it is (selfdrived's chime) for as long as it
+    lasts, every later onset for that maneuver as laneUnknownQuiet (the same line, no sound), the next maneuver's chiming again;
+    it is the one sound saying the car may turn from a lane it can't place, so never silent for a maneuver. Off it, or in
+    shadow mode, every onset as today; every other mismatch as it is."""
+    if mismatch != LaneMismatch.laneUnknown:
+      self._unknown_onset = None
+      return mismatch
+    if self._unknown_onset != (maneuver_id,):  # an onset, or the next maneuver under the line
+      self._unknown_quiet = self.always_drive_on and self._unknown_heard == (maneuver_id,)
+      self._unknown_onset = self._unknown_heard = (maneuver_id,)
+    return LaneMismatch.laneUnknownQuiet if self._unknown_quiet else mismatch
 
   def stop(self, reason: str) -> None:
     """TurnPilot goes disabled (turned off, or a fault: reason turnedOff or fault) and resets: an offered lane change is
@@ -1215,6 +1232,7 @@ class TurnPilot:
     plan.laneChange, plan.signalPrompt, lane_reason = lc.lane_change, lc.prompt, lc.reason
     plan.laneChangeOffer, plan.laneChangeCountdown, plan.laneChangeAbort = lc.offer, lc.countdown, lc.abort
     plan.laneChangeWait, plan.laneChangeWant = lc.wait, max(min(lc.want, 127), -128)
+    plan.laneChangeHold = lc.hold  # held for the blind spot, or its release (LC-01, under the switch)
     committed = self.desires.maneuver_id == rf.maneuver_id and self.desires.started  # this frame's desire included
     if (lc.unreachable or lc.blocked) and act_on is not None and not committed and not self.skip.skipped:
       # a map stop leaves no room to get into the maneuver's lane before it nor after its go, or the change it needs hadn't
@@ -1228,7 +1246,7 @@ class TurnPilot:
       if acting else LaneMismatch.none  # handback outranks it, and with the maneuver dropped it would misread the lane
     if found == LaneMismatch.none and acting and self.lanes.lane_unknown:
       found = LaneMismatch.laneUnknown  # no change from a lane it can't place: said instead
-    plan.laneMismatch = self._lane_mismatch(found)
+    plan.laneMismatch = self.unknown_sound(self._lane_mismatch(found), rf.maneuver_id)
     plan.accelCap = decision.accel_cap
     # past a bend or a straight-on step, the turn after it is slowed for already (route_follower.py: ahead), and still
     # once the step is dead-reckoned past, until navd moves on to the turn
@@ -3212,6 +3230,20 @@ class DetectionDrain:
     return sorted(out, key=lambda d: d.timestampEof)
 
 
+def plan_paint(det, scene_available: bool) -> tuple:
+  """The lane paint for the plan from the latest turnpilotDetections (None before the first): its four lines only while the
+  scene is available and this message's lanePaintStatus is read, else () (none read: unknown paint, no lane change). A
+  LinePaint can't tell a line read unknown from one nobody read: a run on the wide camera, a stop sweep, the paint off for
+  the drive (a budget overrun, an exception) and a road camera frame with no modelV2 for it all come as four unknowns
+  (lane_paint_from_msg) or none, and only the status says which. A curb-side change on less than paint (ALWAYS_DRIVE.md
+  4.10, lane_planner.curb_lane_unpainted) goes only on paint the reader read; every other rule plans () and four unknowns
+  the same."""
+  if det is None or not scene_available or det.lanePaintStatus != custom.TurnpilotDetections.LanePaintStatus.read or \
+     len(det.lanePaint) != 4:
+    return ()
+  return lane_paint_from_msg(det.lanePaint)
+
+
 def main():
   params = Params()
   pm = messaging.PubMaster(['turnpilotPlan', 'turnpilotScene'])
@@ -3285,7 +3317,7 @@ def main():
     pm.send('turnpilotScene', scene_msg)
 
     scene = scene_msg.as_reader().turnpilotScene
-    paint = lane_paint_from_msg(sm['turnpilotDetections'].lanePaint) if scene.available and sm.seen['turnpilotDetections'] else ()
+    paint = plan_paint(sm['turnpilotDetections'] if sm.seen['turnpilotDetections'] else None, scene.available)
     # the lane planner takes this frame's checks (an offered change aborts at once); the plan's valid has a grace
     valid = sm.all_checks(['carState', 'modelV2'])
     # this frame's run for the unprotected left: its road camera run when one came (the left reads only the road's), else
