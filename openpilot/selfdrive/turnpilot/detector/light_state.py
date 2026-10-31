@@ -15,8 +15,13 @@ Gated boxes are counted, never published. A box past the gates is a head, and it
 - noColor: the lit lamp's saturated pixels don't agree on red, yellow or green. Unknown.
 - positionMismatch: the colour isn't the one its lamp shows (red top, yellow middle, green bottom). Unknown.
 - arrow: the lit lamp's pixels aren't mirror-symmetric left to right about their own centre, as a ball is and a turn
-  arrow is not. Unknown: a red left arrow is never a red for the through lane, a green arrow never a permission. This is
-  a proxy at these sizes; the replay measures it.
+  arrow is not. A green arrow is unknown: it is never a permission. A yellow arrow is unknown too: a flashing yellow
+  arrow is a permissive left, and blocking on it would stall the autonomous left in the phase it is built for. A red
+  arrow keeps its colour (reason arrow): it never permits a go, so the autonomous left's go (map_controls.turn_light)
+  and every lift (release_light) at its junction see it as a red; a green ball beside a red left arrow is not a left's
+  green. The camera's reds never brake the car (shadow), so this only ever keeps a go off. This is a proxy at these
+  sizes: on the comma demo route it caught 24-78% of two red left arrows' reads, and called 10 reads of a red ball, 30
+  of a yellow ball and 25 of a green ball arrows, so a red arrow must never turn unknown on it alone.
 A head's state is its vote: VOTE_N of its last VOTE_M reads (a frame it wasn't seen in counts as unknown), which also
 rides out LED flicker. A head governs the car's lane when its bearing lies within GOVERN_BEARING_DEG of the lane's (the
 driving model's path at the head's distance), and the governing state is what all governing heads with a state agree
@@ -181,8 +186,9 @@ def read_head(nv12: np.ndarray, stride: int, y_height: int, lens: Lens, rpy_cali
     return out
   if not symmetric(mask):
     out.reason = 'arrow'
-    return out
-  out.state = color
+    if color != 'red':
+      return out  # a green arrow is never a permission; a yellow one may be a flashing yellow arrow's permissive left
+  out.state = color  # a red arrow keeps its colour (module docstring)
   return out
 
 

@@ -78,19 +78,30 @@ class TestReadHead(OpenpilotTestCase):
   def test_blown_out_lamp_without_colour_is_unknown(self):
     assert read([head(0, 'white')])[0].state == 'unknown'
 
-  def test_left_arrow_is_unknown(self):
-    frame, _ = scene([])
+  @staticmethod
+  def left_arrow(color, lamp):
+    """A head with a left arrow lit in lamp (0 top, 2 bottom): a head on the left, the shaft to the right."""
     img = np.zeros((H, W, 3), np.uint8)
     img[:] = (90, 110, 140)
     x0, y0, w, h = 640, 150, 30, 90
     img[y0:y0 + h, x0:x0 + w] = (25, 25, 25)
-    # a red left arrow in the top lamp: a head on the left, the shaft to the right
-    tip_x, cy = x0 + 4, y0 + 15
+    tip_x, cy = x0 + 4, y0 + 15 + 30 * lamp
     for dy in range(-9, 10):
-      img[cy + dy, tip_x + abs(dy): tip_x + abs(dy) + 3] = COLORS['red']
-    img[cy - 2:cy + 3, tip_x:x0 + w - 4] = COLORS['red']
+      img[cy + dy, tip_x + abs(dy): tip_x + abs(dy) + 3] = COLORS[color]
+    img[cy - 2:cy + 3, tip_x:x0 + w - 4] = COLORS[color]
     box = np.array([x0, y0, x0 + w, y0 + h, 0.6, 9], np.float32)
-    r = read_head(nv12(img), STRIDE, Y_HEIGHT, LENS, LEVEL, 1.22, box)
+    return read_head(nv12(img), STRIDE, Y_HEIGHT, LENS, LEVEL, 1.22, box)
+
+  def test_red_left_arrow_keeps_its_colour(self):
+    # never a go for any lane: a red arrow reads red (reason arrow), so turn_light and release_light block on it
+    r = self.left_arrow('red', 0)
+    assert (r.state, r.reason) == ('red', 'arrow'), r
+
+  def test_green_and_yellow_left_arrows_are_unknown(self):
+    # a green arrow is never a permission; a yellow one may be a flashing yellow arrow's permissive left
+    r = self.left_arrow('green', 2)
+    assert (r.state, r.reason) == ('unknown', 'arrow'), r
+    r = self.left_arrow('yellow', 1)
     assert (r.state, r.reason) == ('unknown', 'arrow'), r
 
   def test_gates_before_the_colour_read(self):
