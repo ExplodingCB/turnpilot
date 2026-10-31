@@ -329,6 +329,26 @@ def seed_box(runs: list[Run], times: list[float], o):
   return None
 
 
+def merge(samples: list[Sample]) -> list[Sample]:
+  """One car's tracks (the tracker lost it and started again) as one sample: chains through a shared box, directly or
+  through others, are one car, and it keeps the shortest road range and the shortest far range, each with its own chain's
+  reason, so a count of n is n cars and no car reads longer than its shortest reading. In time order."""
+  groups: list[list[Sample]] = []
+  for s in samples:
+    shares = [any(s.boxes & m.boxes for m in g) for g in groups]
+    joined = [m for g, sh in zip(groups, shares, strict=True) if sh for m in g]
+    groups = [g for g, sh in zip(groups, shares, strict=True) if not sh] + [[s] + joined]
+  out = []
+  for g in groups:
+    road = min(g, key=lambda m: m.road_m)
+    far = min(g, key=lambda m: m.far_m)
+    one = Sample(road.track_id, road.cls, min(m.t for m in g), road.speed, road.road_m, road.road_why, road.road_gap_s,
+                 road.road_ground_m, far.far_m, far.far_why, far.far_gap_s, far.far_ground_m,
+                 frozenset().union(*(m.boxes for m in g)))
+    out.append(one)
+  return sorted(out, key=lambda s: s.t)
+
+
 def pick(key: str, values: list[tuple[float, Sample]], allow_misses: bool, cap: float = LEFT_RANGE_MAX_M) -> Pick:
   """The recommendation over (confirmed range, sample) pairs (module docstring)."""
   n = len(values)
@@ -389,12 +409,7 @@ def measure(drive: Drive, allow_misses: bool = False) -> Result:
     s.boxes = frozenset(used | used_far)
     res.samples.append(s)
   res.facts['seeds_without_box'] = missing
-  # one car's two tracks (the tracker lost it and started again): chains through the same boxes are one car, its shorter
-  merged: list[Sample] = []
-  for s in sorted(res.samples, key=lambda s: (s.road_m, s.far_m)):
-    if not any(s.boxes & m.boxes for m in merged):
-      merged.append(s)
-  res.samples = sorted(merged, key=lambda s: s.t)
+  res.samples = merge(res.samples)
   if res.facts['calibrated'] == 0:
     res.road.why = res.far.why = "no calibrated road run in the logs: nothing can be ranged"
     return res
