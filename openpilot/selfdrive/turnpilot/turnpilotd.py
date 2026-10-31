@@ -1010,8 +1010,12 @@ class TurnPilot:
     # turn's pulse is long forgotten, so it goes again in this very plan, the one that lets the car go: held, the desire
     # was dropped to none, so it is a fresh edge (desire_timing.py). BeamNG: let go a frame before its pulse, the car drove
     # straight across the junction
-    self.release_go = self.was_stopping and not decision.should_stop and v_ego < STANDSTILL_SPEED
-    self.was_stopping = decision.should_stop
+    # Under the switch a hold that only caps the speed counts once the car has come to rest under it (ALWAYS_DRIVE.md ST-08),
+    # and its go is the frame the cap lets go
+    stood = decision.should_stop or (self.always_drive_on and decision.holding and v_ego < STANDSTILL_SPEED)
+    held_now = decision.should_stop or (self.always_drive_on and decision.holding)
+    self.release_go = self.was_stopping and not held_now and v_ego < STANDSTILL_SPEED
+    self.was_stopping = stood or (self.was_stopping and held_now)
     # the certified go out, a frame on (its window, the model's takeover), and withdrawn the frame what it rests on goes
     self.go_cert.update(model, v_ego, DT_MDL)
     self.watch_release(sm, cs, v_ego, model)

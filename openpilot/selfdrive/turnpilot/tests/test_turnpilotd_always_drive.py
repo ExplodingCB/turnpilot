@@ -5,16 +5,20 @@ from unittest import mock
 
 import pytest
 
+from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.go_override import GO_CLEAR_M, GO_END_SPEED, TAKEOVER_S
 from openpilot.selfdrive.turnpilot.scene.tracker import RawFrame
+from openpilot.selfdrive.turnpilot.scene_policy import NO_ACCEL_CAP, SceneDecision
 from openpilot.selfdrive.turnpilot.stop_go import Frame
 from openpilot.selfdrive.turnpilot.tests.test_go_override import WARM_S
-from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, T_LEFT, Sim, go_from_a_red, oracle_lights, stand, stop_at,
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, RIGHT_AT_A_CORNER, T_LEFT, Sim, go_from_a_red, oracle_lights, stand, stop_at,
                                                               walker_stops_the_car)
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_go import attach_planner, holding, raw_person
 from openpilot.selfdrive.turnpilot.turnpilotd import (NO_MOVE_MAX_S, NO_MOVE_REASON, NO_MOVE_S, RELEASE_GOES, RELEASE_LIFT_M, STANDSTILL_SPEED,
                                                        STOPPED_NOTE, TurnPilot)
+
+Desire = log.Desire
 
 
 def parts(tp: TurnPilot) -> dict:
@@ -279,3 +283,31 @@ def test_a_scene_hold_let_go_on_a_straight_starts_the_release_clock():
     assert not any(q.shouldStop for q in plans), on
     assert any(q.controlPrompt == 'cantStartTakeControl' for q in plans) is on
     assert all(str(q.goCertified.cause) == 'none' for q in plans)
+
+
+# --- ST-08: a cap-only hold the car came to rest under ---
+
+def test_a_cap_only_hold_the_car_came_to_rest_under_is_a_go_when_it_drops():
+  """ALWAYS_DRIVE.md ST-08: a TurnPilot hold that only caps the speed (decision.holding, no shouldStop) with the car come to
+  rest under it counts as a hold under the switch: its drop is TurnPilot's go (release_go: the turn's pulse again, go_id),
+  keyed on the cap dropping, not the frame after the car stands. With the switch off nothing goes, as today."""
+  for on in (True, False):
+    sim = Sim(RIGHT_AT_A_CORNER, cruise=8.)
+    sim.tp.always_drive = on
+    while 300. - sim.s > 12.:
+      sim.step(engaged=True)
+      assert sim.t < 120.
+    assert sim.tp.desires.started
+    real = sim.tp.scene.update
+    cap = {'on': True}
+
+    def update(*a, real=real, cap=cap, **kw):
+      d = real(*a, **kw)
+      return SceneDecision(NO_ACCEL_CAP, 0.2, False, True, "pedestrian in crosswalk") if cap['on'] else d
+    with mock.patch.object(sim.tp.scene, 'update', side_effect=update):
+      held = stand(sim, 2.)
+      assert all(not q.shouldStop for q in held) and sim.tp.go_id is None, on
+      cap['on'] = False
+      q = stand(sim, DT_MDL)[0]
+    assert (sim.tp.go_id == sim.tp.follower.maneuver_id) is on, on
+    assert (q.desire == Desire.turnRight) is on, on
