@@ -2450,7 +2450,8 @@ class TurnPilot:
                   right_hand_traffic: bool) -> bool:
     """Under the switch, a stall in a curb-side route turn (ALWAYS_DRIVE.md LEFT-21; module constants): its fresh pulse at
     STALL_REPULSE_S, and from STALL_PROMPT_S its clearBox lifts while one may go (stall_refused), the handback (now) waiting on
-    them; once none may, now as it was. counting: the stall clock runs this frame."""
+    them; once none may, now as it was. counting: the stall clock runs this frame. A turn R8b's fire cleared (straight_fired:
+    the model drove it straight, its desire done) has no turn to finish: its stand is S3's stall handback at STALL_PROMPT_S."""
     rf, gc = self.follower, self.go_cert
     mid = rf.maneuver_id
     if self.stall_mid != mid or not sm['carControl'].enabled:  # another turn, or the driver: a stall of its own
@@ -2459,8 +2460,10 @@ class TurnPilot:
     if not mine and self.stall_lift_id is not None:
       self.stall_gap_s += DT_MDL
     m = rf.upcoming
-    if m is None or m.kind != TURN or far_side_turn(m, right_hand_traffic) or self.decider_turn_id == mid:
-      return now  # a far-side turn's stall is the handback's alone (ST-10); a stop-sign turn's, the decider's (its clearBox)
+    if m is None or m.kind != TURN or far_side_turn(m, right_hand_traffic) or self.decider_turn_id == mid or self.straight_fired:
+      # a far-side turn's stall is the handback's alone (ST-10); a stop-sign turn's, the decider's (its clearBox); a turn
+      # R8b's fire cleared, S3's stall handback (no turn to finish)
+      return now
     if counting and self.stall_s >= STALL_REPULSE_S - 1e-6 and not self.stall_pulsed:
       self.stall_pulsed = True
       if self.desires.stall_pulse():

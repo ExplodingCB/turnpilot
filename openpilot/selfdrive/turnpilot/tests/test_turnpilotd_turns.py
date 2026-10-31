@@ -100,6 +100,26 @@ def test_a_stand_in_the_junction_after_r8bs_fire_is_the_stall_handback_at_3_s(al
   assert not any(p.desire in (Desire.turnRight, Desire.turnLeft) for p in st)  # the turn R8b cleared is never pulsed again
 
 
+@pytest.mark.parametrize("past", [1., 3.2, 8.])
+def test_a_stand_after_r8bs_fire_gets_none_of_left_21s_finish(past):
+  """tp/ad-s2 and tp/ad-s3 merged: S3 made a stand after R8b's fire the stall's (model_turn takes straight_fired), and S2's
+  stall under the switch runs finish_turn (LEFT-21) for any curb-side route turn. A right R8b cleared was driven straight, so
+  there is no turn to finish: no fresh pulse, no clearBox lift said "Stalled: finishing the turn", no carStoppedNote between
+  lifts, only S3's stalledTakeControl at STALL_PROMPT_S. On the merge without the fix it got a lift at 3.0 s and 9.0 s and
+  the note at 5 s. TurnPilotGoOverride is on, so the lift is not refused for the param."""
+  sim = right_sim(True)
+  assert sim.tp.go_override
+  into_a_right(sim, 7.)
+  plans = drive(sim, sim.s + 0.05, curvature=-0.0092)
+  while sim.tp.follower.distance > -past:
+    plans += drive(sim, sim.s + 0.05, curvature=-0.0092)
+  assert sim.tp.straight_fired and not sim.tp.turn_committed
+  st = stand(sim, STALL_PROMPT_S + 9.)
+  assert not any(p.controlAlert in ('stallLift', 'carStoppedNote') for p in st)
+  assert not any(str(p.goCertified.cause) == 'clearBox' for p in st) and sim.tp.stall_lifts == 0 and not sim.tp.stall_pulsed
+  assert {str(p.controlPrompt) for p in st[int(round((STALL_PROMPT_S + 0.1) / DT_MDL)):]} == {'stalledTakeControl'}
+
+
 @pytest.mark.parametrize("always_drive", [False, True])
 def test_a_committed_right_driven_dead_straight_is_missed_at_the_pass_and_its_pulse_cleared(always_drive):
   """R8b's dead-straight half, unconditional: a committed right the model drives dead straight, under TURN_ABANDON_CURV away
