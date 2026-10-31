@@ -230,6 +230,10 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     # ALWAYS_DRIVE.md LEFT-21 (TurnPilotAlwaysDrive): a clearBox lift for a stand partway round a curb-side turn, nothing ahead
     # and nobody near its path (turnpilotd.py stalled_in_turn): "Stalled: finishing the turn", a chime, at each lift
     stallLift @25;
+    # ALWAYS_DRIVE.md ST-07 (stops) (TurnPilotAlwaysDrive): standing at a mapped signal, nothing in the path, the camera's shadow
+    # reader reading a steady green and the model not going (turnpilotd.py stopped_unheld): "Light green: car not moving", a chime,
+    # once a green; never a lift
+    lightGreenNotMoving @26;
   }
   mapControl @24 :MapControlStatus;
   controlPrompt @25 :ControlPrompt;

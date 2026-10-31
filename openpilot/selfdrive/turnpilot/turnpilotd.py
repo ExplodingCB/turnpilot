@@ -193,7 +193,7 @@ from openpilot.selfdrive.turnpilot.scene_policy import (CROSSWALK_X_AFTER_M, CRO
                                                          in_path, velocity_trusted)
 from openpilot.selfdrive.turnpilot.turn_skip import SkipState, TurnSkip, can_make_turn
 from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
-from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, DRIVEN, LINE_D, OFF, ROAD_RANGE_M,
+from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, DRIVEN, LIGHT_RED_MAX_S, LINE_D, OFF, ROAD_RANGE_M,
                                                            ROUTE_REACH_MARGIN_M, LeftInput, UnprotectedLeft, left_mode_for,
                                                            reach_at_line)
 
@@ -255,6 +255,14 @@ STOPPED_LEAD_M = 15.  # ...and it holds the car only this close: openpilot stand
                       # lead it is queued for, and closes up to one further on (route_demo: a ~0.6 lead at 21-28 m, 470 s)
 STOPPED_REASON = "Car stopped: take control"
 SIGNAL_STOPPED_REASON = "Stopped at the signal: take control"
+# TurnPilotAlwaysDrive (ALWAYS_DRIVE.md ST-07 (stops), ST-01 (stalls)): at a mapped signal the model owns the light, so a stand
+# there is said as waiting at it (LIGHT_WAIT_NOTE, the status line alone); while the camera's shadow reader reads red there the
+# NEAR_CONTROL_STAND_S handback waits, never past LIGHT_RED_MAX_S from the stand's start (a red read that outlasts a cycle is a
+# misread or a stuck model); a camera green read LIGHT_GREEN_STEADY_S, none of red or yellow, with the model still standing and
+# nothing in the path is said once a green with a chime (lightGreenNotMoving, LIGHT_GREEN_REASON). Never a lift (section 4.4)
+LIGHT_WAIT_NOTE = "Waiting at the light"
+LIGHT_GREEN_REASON = "Light green: car not moving"
+LIGHT_GREEN_STEADY_S = 2.
 # a turn released from a standstill (a hold's go: BeamNG 2026-10-28, taken about half the time) is checked, never trusted:
 MISSED_TURN_DEG = 15.  # past its junction (the follower's pass) turned less than this, it was missed: said and rerouted
 MISSED_HOLD_S = 3.     # turnMissed is held this long, for the alert and for navd (1 Hz) to see it
@@ -655,6 +663,10 @@ class TurnPilot:
     self.decider_turn_id: int | None = None  # the route's turn whose stop sign the decider acted for last frame (update())
     self.stopped_s = 0.            # standing engaged with nothing holding the car (carStoppedTakeControl)
     self.stopped_signal = False    # ...within STOPPED_CONTROL_M of a mapped signal (stopped_unheld): the note doesn't chime
+    self.stopped_said = False      # ...handed back for it: until the stand ends
+    self.green_s = 0.              # ...under the switch, s the camera has read that signal steady green (LIGHT_GREEN_STEADY_S)
+    self.green_said = False        # ...said for this green
+    self.green_alert_t = 0.        # ...s left of its lightGreenNotMoving alert
     self.stall_s = 0.              # standing in a route turn, nothing holding the car (stalledTakeControl)
     self.stall_stand_s = 0.        # ...standing there, a corroborated lead or not (LEAD_STAND_MAX_S)
     self.stall_said = False        # ...handed back for it (its log once)
@@ -1304,7 +1316,7 @@ class TurnPilot:
       plan.controlAlert = 'hardBrake'
     stalled = self.stalled_in_turn(sm, cs, v_ego, acting, decision, mapd, objects=objects, raw=raw, available=available,
                                    took_over=took_over, right_hand_traffic=right_hand_traffic)
-    stopped = self.stopped_unheld(sm, cs, v_ego, acting, decision, mapd)
+    stopped = self.stopped_unheld(sm, cs, v_ego, acting, decision, mapd, objects=objects, raw=raw)
     abandoned = self.turn_abandoned(sm, cs, v_ego, acting)
     wrong_side = self.wrong_side(sm, cs, v_ego, acting, paint, right_hand_traffic)
     if withdrawn or self.cant_start_unheld:  # the switch's has no hold: the model drives on under it (no_move)
@@ -1315,8 +1327,8 @@ class TurnPilot:
       plan.controlPrompt, plan.reason = 'wrongSideTakeControl', WRONG_SIDE_REASON
     elif stalled:
       plan.controlPrompt, plan.reason = 'stalledTakeControl', STALLED_REASON
-    elif stopped == STOPPED_NOTE:
-      plan.reason = plan.reason or STOPPED_NOTE
+    elif stopped in (STOPPED_NOTE, LIGHT_WAIT_NOTE):
+      plan.reason = plan.reason or stopped
       # PF-14: the note's info chime, once a stand (stopped_s starts over with it); never within STOPPED_CONTROL_M of a mapped
       # signal, where the model stands first in line at every red (ALWAYS_DRIVE.md ST-07 (stops)): the status line alone there
       if self.stopped_s < STOPPED_NOTE_S + ABORT_HOLD_S - 1e-6 and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS and \
@@ -1324,6 +1336,9 @@ class TurnPilot:
         plan.controlAlert = 'carStoppedNote'
     elif stopped:
       plan.controlPrompt, plan.reason = 'carStoppedTakeControl', stopped
+    if self.green_alert_t > 0. and str(plan.controlPrompt) == 'none' and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS:
+      plan.controlAlert, plan.reason = 'lightGreenNotMoving', LIGHT_GREEN_REASON  # the model not going at a camera green: said
+    self.green_alert_t = max(self.green_alert_t - DT_MDL, 0.)
     if self.stall_alert_t > 0. and str(plan.controlPrompt) == 'none' and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS:
       plan.controlAlert, plan.reason = 'stallLift', STALL_LIFT_REASON  # a stall's lift (LEFT-21): said with a chime
     self.stall_alert_t = max(self.stall_alert_t - DT_MDL, 0.)
@@ -2388,9 +2403,11 @@ class TurnPilot:
     return {'lead': True, 'lead_x': round(float(lead.x[0]), 1), 'lead_prob': round(float(lead.prob), 2), 'lead_held': self.lead_held,
             'corroborated': self.lead_why if self.lead_held else ''}
 
-  def stopped_unheld(self, sm, cs, v_ego: float, acting: bool, decision, mapd) -> str:
+  def stopped_unheld(self, sm, cs, v_ego: float, acting: bool, decision, mapd, objects=(), raw=None) -> str:
     """The car standing engaged with nothing holding it (module docstring): '' while it isn't, or not for long; STOPPED_NOTE
-    after STOPPED_NOTE_S; the handback's reason after STOPPED_HANDBACK_S, NEAR_CONTROL_STAND_S near a map control."""
+    after STOPPED_NOTE_S (LIGHT_WAIT_NOTE at a mapped signal under the switch); the handback's reason after STOPPED_HANDBACK_S,
+    NEAR_CONTROL_STAND_S near a map control (under the switch at a signal the camera reads red, LIGHT_RED_MAX_S at most), and
+    on until the stand ends."""
     lead = self.lead_held  # a lead the scene corroborates (a queue); one it doesn't holds nothing (watch_lead)
     near = [c for c in list(self.map_controls.tracker.controls.values()) + [self.map_controls.turn]
             if c is not None and abs(c.d) < STOPPED_CONTROL_M]
@@ -2399,10 +2416,23 @@ class TurnPilot:
       not decision.holding and not lead and not cs.gasPressed and not cs.brakePressed and not map_handback(mapd)
     limit = NEAR_CONTROL_STAND_S if near else STOPPED_HANDBACK_S
     self.stopped_signal = any(c.kind == 'signal' for c in near)
-    was = self.stopped_s >= limit - 1e-6
+    light_wait = self.always_drive_on and self.stopped_signal  # the model owns the light (ALWAYS_DRIVE.md ST-07 (stops))
+    camera = self.map_controls.junction_lights(min(c.d for c in near if c.kind == 'signal'))[1] if light_wait else set()
+    if 'red' in camera:
+      limit = LIGHT_RED_MAX_S  # the camera explains the stand, a cycle at most; it never brakes the car
     self.stopped_s = self.stopped_s + DT_MDL if unheld else 0.
-    if self.stopped_s < limit - 1e-6:
-      return STOPPED_NOTE if self.stopped_s >= STOPPED_NOTE_S - 1e-6 else ''
+    green = light_wait and unheld and camera == {'green'} and not path_blocker(objects, raw)
+    self.green_s = self.green_s + DT_MDL if green else 0.
+    if not (light_wait and unheld and 'green' in camera):
+      self.green_said = False  # another green, or another stand: said again
+    if self.green_s >= LIGHT_GREEN_STEADY_S - 1e-6 and not self.green_said:
+      self.green_said, self.green_alert_t = True, ABORT_HOLD_S
+      cloudlog.event("turnpilot.light_green_not_moving", stood_s=round(self.stopped_s, 1), **self.lead_log(sm['modelV2']))
+    was = self.stopped_said
+    self.stopped_said = unheld and (self.stopped_said or self.stopped_s >= limit - 1e-6)
+    if not self.stopped_said:
+      note = LIGHT_WAIT_NOTE if light_wait else STOPPED_NOTE
+      return note if self.stopped_s >= STOPPED_NOTE_S - 1e-6 else ''
     if not was:
       cloudlog.event("turnpilot.stopped_unheld", error=True, stood_s=round(self.stopped_s, 1), reason=decision.reason,
                      near=[c.kind for c in near], **self.lead_log(sm['modelV2']))

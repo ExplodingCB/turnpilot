@@ -6,7 +6,7 @@ from unittest import mock
 
 import pytest
 
-from openpilot.cereal import log
+from openpilot.cereal import log, messaging
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.turnpilot.go_override import GO_CLEAR_M, GO_END_SPEED, TAKEOVER_S
@@ -14,14 +14,17 @@ from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.scene.tracker import RawFrame
 from openpilot.selfdrive.turnpilot.scene_policy import NO_ACCEL_CAP, SceneDecision
 from openpilot.selfdrive.turnpilot.stop_go import Frame
+from openpilot.selfdrive.turnpilot.tests.test_camera_lights import detections
 from openpilot.selfdrive.turnpilot.tests.test_go_override import WARM_S
 from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of, model_v2
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, RIGHT_AT_A_CORNER, T_LEFT, Sim, go_from_a_red,
                                                                  model_stands_in_the_turn, oracle_lights, stand, stop_at, walker_stops_the_car)
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_go import attach_planner, holding, raw_person
-from openpilot.selfdrive.turnpilot.turnpilotd import (LEAD_STAND_MAX_S, NO_MOVE_MAX_S, QUEUE_STILL_MAX_S, NO_MOVE_REASON, NO_MOVE_S, RELEASE_GOES,
-                                                      RELEASE_LIFT_M, STALL_LIFT_GAP_S, STALL_LIFT_REASON, STALL_LIFTS, STALL_PROMPT_S,
-                                                      STALL_REPULSE_S, STALLED_REASON, STANDSTILL_SPEED, STOPPED_NOTE, TurnPilot)
+from openpilot.selfdrive.turnpilot.unprotected_left import LIGHT_RED_MAX_S
+from openpilot.selfdrive.turnpilot.turnpilotd import (LEAD_STAND_MAX_S, LIGHT_GREEN_REASON, LIGHT_WAIT_NOTE, NEAR_CONTROL_STAND_S, NO_MOVE_MAX_S,
+                                                      NO_MOVE_REASON, NO_MOVE_S, QUEUE_STILL_MAX_S, RELEASE_GOES, RELEASE_LIFT_M, STALLED_REASON,
+                                                      STALL_LIFTS, STALL_LIFT_GAP_S, STALL_LIFT_REASON, STALL_PROMPT_S, STALL_REPULSE_S,
+                                                      STANDSTILL_SPEED, STOPPED_NOTE, STOPPED_NOTE_S, TurnPilot)
 
 Desire = log.Desire
 
@@ -488,3 +491,67 @@ def test_a_queue_in_a_turn_behind_a_moving_lead_has_no_bound_and_a_still_one_han
   plans = queued(sim, LEAD_STAND_MAX_S + 2., moves_every=5.)
   first = next(i for i, q in enumerate(plans) if q.controlPrompt == 'stalledTakeControl')
   assert abs(first * DT_MDL - LEAD_STAND_MAX_S) < 0.2
+
+
+# --- ST-07 (stops), ST-01 (stalls) at a signal: the model owns the light ---
+
+STAND_T0 = 0.2  # s: at_a_signal's sim.run(0.2), the sim's t when the stand starts
+
+
+def at_a_signal(on: bool, camera=None):
+  """Standing 20 m short of a mapped signal (no accepted light source: the car's case), the model holding the car; the camera's
+  shadow reader reading camera(sim) (a state, or None for no head) at the signal's far-side head every other frame."""
+  sim = Sim(STRAIGHT, controls=[(20., 'signal')])
+  sim.tp.always_drive = on
+  none = messaging.new_message('turnpilotLights').as_reader().turnpilotLights
+
+  def lights(sim):
+    state = camera(sim) if camera is not None else None
+    if state is not None and int(round(sim.t / DT_MDL)) % 2 == 0:
+      sim.sm.put('turnpilotDetections', detections(state, 45. - sim.s))
+    return none
+  sim.lights = lights
+  sim.run(STAND_T0)
+  return sim
+
+
+def test_a_stand_at_a_signal_is_waiting_at_the_light_and_a_camera_red_holds_its_handback_to_150_s():
+  """ALWAYS_DRIVE.md ST-07 (stops): under the switch within STOPPED_CONTROL_M of a mapped signal the 5 s note reads 'Waiting at
+  the light' (no chime, as it already is); while the camera's shadow reader reads red there the NEAR_CONTROL_STAND_S handback
+  waits, never past LIGHT_RED_MAX_S from the stand's start; with no red read it comes at NEAR_CONTROL_STAND_S. It never brakes
+  for the read. Switch off: the note and the 90 s handback as today, red or not."""
+  sim = at_a_signal(True, camera=lambda sim: 'red')
+  plans = stand(sim, LIGHT_RED_MAX_S + 1.)
+  assert plans[round((STOPPED_NOTE_S + 0.5) / DT_MDL)].reason == LIGHT_WAIT_NOTE
+  assert not any(str(q.controlAlert) == 'carStoppedNote' for q in plans)
+  first = next(i for i, q in enumerate(plans) if q.controlPrompt == 'carStoppedTakeControl')
+  assert abs(first * DT_MDL - LIGHT_RED_MAX_S) < 0.2, first * DT_MDL
+  assert not any(q.shouldStop for q in plans)
+  sim = at_a_signal(True)
+  plans = stand(sim, NEAR_CONTROL_STAND_S + 1.)
+  first = next(i for i, q in enumerate(plans) if q.controlPrompt == 'carStoppedTakeControl')
+  assert abs(first * DT_MDL - NEAR_CONTROL_STAND_S) < 0.2
+  sim = at_a_signal(False, camera=lambda sim: 'red')
+  plans = stand(sim, NEAR_CONTROL_STAND_S + 1.)
+  assert plans[round((STOPPED_NOTE_S + 0.5) / DT_MDL)].reason == STOPPED_NOTE
+  first = next(i for i, q in enumerate(plans) if q.controlPrompt == 'carStoppedTakeControl')
+  assert abs(first * DT_MDL - NEAR_CONTROL_STAND_S) < 0.2
+
+
+def test_a_steady_camera_green_the_model_doesnt_go_on_chimes():
+  """ALWAYS_DRIVE.md ST-07 (stops): under the switch, standing at the signal with nothing in the path, once the camera reads a
+  steady green and the model still stands: a chime and 'Light green: car not moving' within 5 s, once for that green; no lift.
+  Switch off: nothing said."""
+  t_green = 30.
+
+  def camera(sim):
+    return 'red' if sim.t - STAND_T0 < t_green else 'green'
+  for on in (True, False):
+    sim = at_a_signal(on, camera=camera)
+    plans = stand(sim, t_green + 10.)
+    said = [i for i, q in enumerate(plans) if str(q.controlAlert) == 'lightGreenNotMoving']
+    assert bool(said) is on, on
+    if on:
+      assert t_green <= said[0] * DT_MDL <= t_green + 5. and plans[said[0]].reason == LIGHT_GREEN_REASON
+      assert said == list(range(said[0], said[0] + len(said))) and len(said) * DT_MDL <= 3.1  # one chime, held a moment
+    assert all(str(q.goCertified.cause) == 'none' for q in plans)

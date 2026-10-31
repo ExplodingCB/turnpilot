@@ -352,7 +352,8 @@ CONTROL_ALERT_TITLE = {'cannotStopComfortably': "Take Control", 'stopOverrun': "
                        'hardBrake': "Braking Hard", 'oncomingHolding': "Oncoming: Holding", 'farViewOff': "Far View Off",
                        'sideCamerasOff': "Side Cameras Off", 'crossTrafficAfterCommit': "Cross Traffic", 'cameraPaused': "Camera Paused",
                        'stalledInJunction': "Stalled in Junction", 'overrideWriteFailed': "Junction Not Saved",
-                       'carStoppedNote': "Car Stopped", 'stallLift': "Stalled: Finishing the Turn"}
+                       'carStoppedNote': "Car Stopped", 'stallLift': "Stalled: Finishing the Turn",
+                       'lightGreenNotMoving': "Light Green: Car Not Moving"}
 # the route's stop signs (route_notice.py, STOP_SIGNS.md 3.4), said engaged or not: the text is turnpilotPlan.routeNotice
 ROUTE_NOTICE_TITLE = {'routeAvoidsStops': "Route Avoids Stop Signs", 'routeDetour': "Long Detour Around Stop Signs",
                       'stopsNeedYou': "Stop Signs Need You", 'firstStopNeedsYou': "First Stop Needs You",
