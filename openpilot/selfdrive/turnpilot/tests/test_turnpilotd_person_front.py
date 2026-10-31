@@ -311,3 +311,31 @@ def test_a_raw_person_box_in_front_keeps_it_set(box, held):
   sim.raw = raw
   plans = seen_back_walking_out(sim)
   assert all(p.shouldStop for p in plans) is held, [p.shouldStop for p in plans][-40:]
+
+
+@pytest.mark.parametrize('always_drive', [True, False])
+def test_an_unconfirmed_blip_in_front_while_held_at_a_red_holds_nothing_past_the_green(always_drive):
+  """B2 (skeptic round 1, blip_at_a_red): held at a red, a 2-hit person blip 6 m ahead in the path (a reflection: conf 0.8,
+  never confirmed), coasting 0.5 s and gone, then the green. Its stop never brought the car to rest (the red had), so it is no
+  person TurnPilot stopped for: no latch, and the release is today's (the switch on: turnRelease). At ed9e31d the latch held the
+  car through the green to the 30 s personFrontTakeControl."""
+  sim = Sim(STRAIGHT, controls=[(SIGNAL_S, 'signal')])
+  sim.tp.always_drive, sim.go_taps, sim.tp.oracle_ok = always_drive, False, True
+  light = {'state': 'red'}
+  sim.lights = lambda sim: oracle_lights(light['state'], SIGNAL_S)(sim)
+  while not (sim.v < 0.05 and sim.s > SIGNAL_S - 50.):
+    sim.step(engaged=True)
+    assert sim.t < 60.
+  for _ in range(20):
+    sim.step(engaged=True)
+  blip = Walker(track_id=50, age=1)
+  for _ in range(4):
+    sim.step(blip.seen(6., 0.2), engaged=True)
+  for _ in range(round(0.5 / DT_MDL)):
+    sim.step(blip.coasting(6., 0.2, 0., 0.), engaged=True)
+  light['state'] = 'green'
+  plans = [sim.step(engaged=True) for _ in range(round(35. / DT_MDL))]
+  assert all(p.reason != NOTE and str(p.controlPrompt) != PROMPT for p in plans)
+  if always_drive:
+    assert certified(plans)[:1] == ['turnRelease']
+  assert sim.tp.scene.person_front is None and sim.v > 0.3

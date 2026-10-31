@@ -81,23 +81,25 @@ track's other stops brake on the curve too, but the lagged speed cap can ask up 
 replay tick of one), carried so through a stale scene. The pedestrian velocity trust (trusted_velocity) reads it as it reads the
 scene's.
 
-A person who may be in front (WARGAME_FIXES WF-13; BeamNG SAT validation row 6, ped_step_out-20261031-084546 at 263065a: the
-car stood 2.9 m short of a walker for her confirmed track, the track coasted CLOSE_HOLD_S on no hits and ended with her still
+A person who may be in front (WARGAME_FIXES WF-13; BeamNG SAT validation row 6, ped_step_out-20261031-084546 at 263065a: the car
+stood 2.9 m short of a walker for her confirmed track, the track coasted CLOSE_HOLD_S on no hits and ended with her still
 standing below the bonnet line, and TurnPilot's straight release drove the car past her 0.93 m off her centre). A pedestrian
-track TurnPilot stopped for (a pedestrian stop for it in force with the car at rest: TrackEvidence.stood) or that earned
-confirmation, whose last new hit was in front of the car (in_front: up to PERSON_FRONT_X_M ahead, the tracker's close hold's
-reach, in the path's corridor, or ahead of the bumper within PERSON_FRONT_MARGIN_M of it, straight ahead or the model's path), and that ends (no
-longer published: lost, coasted out, aged out) with the car at PERSON_FRONT_SPEED or slower and the driver not driving, sets
-ScenePolicy.person_front. While it is set a stop holds the car standing, or brings it to rest on the comfortable curve (soft:
-never more than STOP_DECEL; the track was confirmed or had stopped the car, so no phantom's), first among the stops so its
-reason, PERSON_FRONT_NOTE, is the decision's; turnpilotd bars every go of its own on it and hands back after its bound. It
-ends only on the driver (update's driver: openpilot disengaged or the gas pressed) or once a pedestrian track first seen since
-it was set (or the lost one back) has had a new hit in front of the car and then one clear of the corridor by the margin
-(clear_of_path: a coast drifting out is no hit, someone already tracked elsewhere when it was set is someone else), and after
-that nothing person-like (a person or cyclist track in front of the car, or a raw person box near: update's raw_people,
-turnpilotd's) for PERSON_FRONT_CLEAR_S on live frames. No scene, or raw boxes not known (raw_people None, a fault's update),
-runs no clock: no evidence is never a reason to release. A track that ends further out or off the corridor, or a walker seen
-walking clear before her track ends, sets none, and the stops are as before.
+track TurnPilot stopped for (TrackEvidence.stood, stood_for: a pedestrian stop for it braked the car while it moved and brought
+it to rest, in force all along; one in force only while something else stood the car, a red or a stop sign, is no stop of
+TurnPilot's for it, so a 2-hit reflection seen at a red sets nothing) or that earned confirmation, whose last new hit was in
+front of the car (in_front: up to PERSON_FRONT_X_M ahead, the tracker's close hold's reach, in the path's corridor, or ahead of
+the bumper within PERSON_FRONT_MARGIN_M of it, straight ahead or the model's path), and that ends (no longer published: lost,
+coasted out, aged out) with the car at PERSON_FRONT_SPEED or slower and the driver not driving, sets ScenePolicy.person_front.
+While it is set a stop holds the car standing, or brings it to rest on the comfortable curve (soft: never more than STOP_DECEL;
+the track was confirmed or its stop had brought the car to rest, so no phantom's), first among the stops so its reason,
+PERSON_FRONT_NOTE, is the decision's; turnpilotd bars every go of its own on it and hands back after its bound. It ends only on
+the driver (update's driver: openpilot disengaged or the gas pressed) or once a pedestrian track first seen since it was set (or
+the lost one back) has had a new hit in front of the car and then one clear of the corridor by the margin (clear_of_path: a
+coast drifting out is no hit, someone already tracked elsewhere when it was set is someone else), and after that nothing
+person-like (a person or cyclist track in front of the car, or a raw person box near: update's raw_people, turnpilotd's) for
+PERSON_FRONT_CLEAR_S on live frames. No scene, or raw boxes not known (raw_people None, a fault's update), runs no clock: no
+evidence is never a reason to release. A track that ends further out or off the corridor, or a walker seen walking clear before
+her track ends, sets none, and the stops are as before.
 """
 import math
 from collections import deque
@@ -533,7 +535,8 @@ class TrackEvidence:
   hit_y: float = 0.                             # m left at its last new hit (the person-may-be-in-front latch)...
   hit_t: float = -math.inf                      # ...ScenePolicy.t of it
   hit_front: bool = False                       # ...in front of the car then (in_front)
-  stood: bool = False                           # a pedestrian stop for it held the car at rest: TurnPilot stopped for it
+  braking: bool = False                         # a pedestrian stop for it braked the moving car, in force since (stood_for)
+  stood: bool = False                           # ...and brought it to rest: TurnPilot stopped for it
 
 
 @dataclass
@@ -616,10 +619,7 @@ class ScenePolicy:
         if ev.hit_t == self.t:
           ev.hit_front = in_front(float(obj.x), float(obj.y), bool(obj.inPath), path)
       peds = pedestrian_stops(objects, v_ego, lambda obj: self.tracks[obj.trackId].confirmed)
-      if v_ego < STOP_SPEED:  # standing under a pedestrian's stop: TurnPilot stopped for them
-        for s in peds:
-          if s.rest and s.evidence is not None and s.evidence['track_id'] in self.tracks:
-            self.tracks[s.evidence['track_id']].stood = True
+      self.stood_for(objects, peds, v_ego)
       junction = junction_stops(objects, maneuver, distance, v_ego, right_hand_traffic, lambda obj: self.tracks[obj.trackId].walker,
                                 lambda obj: self.tracks[obj.trackId].confirmed and self.tracks[obj.trackId].leaving >= CROSSWALK_LEAVING_FRAMES,
                                 lambda obj: self.tracks[obj.trackId].confirmed, heading_deg)
@@ -664,6 +664,21 @@ class ScenePolicy:
     decision.accel_cap = self.ramp(decision.accel_cap, dt)
     self.hard_brake(decision, stops, v_ego)
     return decision
+
+  def stood_for(self, objects, peds: list[Stop], v_ego: float) -> None:
+    """TrackEvidence.stood (module docstring): the track's pedestrian stop braked the car while it moved (its speed cap under
+    v_ego at STOP_SPEED or faster), stayed in force on every live frame since, and the car is now at rest under it. A stop for it
+    in force only while something else stands the car (a red, a stop sign: skeptic round 1's B2, a 2-hit reflection seen at a
+    red) is no stop TurnPilot made for it."""
+    resting = {s.evidence['track_id']: s for s in peds if s.rest and s.evidence is not None}
+    for obj in objects:
+      ev, s = self.tracks[obj.trackId], resting.get(int(obj.trackId))
+      if s is None:
+        ev.braking = False
+      elif v_ego >= STOP_SPEED:
+        ev.braking = ev.braking or s.speed_cap < v_ego
+      elif ev.braking:
+        ev.stood = True
 
   def front_update(self, objects, v_ego: float, path, driver: bool, raw_people: bool | None, dt: float) -> list[Stop]:
     """The person-may-be-in-front latch this frame (module docstring): ended by the driver, set by a track it watches ending,

@@ -1220,7 +1220,7 @@ def test_a_track_ending_further_out_off_the_corridor_unconfirmed_and_unstopped_f
   weak = Person(age=1, conf=0.5)
   assert ended(lambda: weak.seen(4., -2.0), seconds=0.3) is None       # unconfirmed and no stop for it
   weak = Person(age=1, conf=0.5)
-  assert ended(lambda: weak.seen(4., -0.5), seconds=0.3) is not None   # unconfirmed, but it stood the car: TurnPilot stopped for it
+  assert ended(lambda: weak.seen(4., -0.5), seconds=0.3) is None       # unconfirmed, the car already standing: no stop of TurnPilot's for it
   her, ys = Person(), iter([RUN6_HIT[1] - 0.06 * k for k in range(200)])
   assert ended(lambda: her.seen(RUN6_HIT[0], next(ys))) is None        # seen walking out to 3.5 m right, then lost
 
@@ -1247,3 +1247,27 @@ def test_a_kerb_side_walker_passed_at_a_crawl_and_lost_by_the_front_corner_sets_
       s += 1.5 * DT_MDL
     sp.update([], True, None, 1000., 1.5)
     assert (sp.person_front is not None) is latched, lost_at
+
+
+def test_an_unconfirmed_track_sets_it_only_if_its_stop_brought_the_car_to_rest():
+  """B2 (skeptic round 1, blip_at_a_red): stood is TurnPilot's stop for the track bringing the car to rest, not any stop for it
+  in force while something else stands the car. A 2-hit blip 6 m ahead in the path, seen with the car standing (held at a
+  red), then gone: nothing set (at ed9e31d set, the car held through the green to the 30 s handback). The same kind of
+  unconfirmed track seen with the car rolling at 1 m/s, its stop braking the car to rest, then gone: set."""
+  from openpilot.selfdrive.turnpilot.scene_policy import CONFIRM_STEADY_HITS
+  sp, blip = ScenePolicy(), Person(track_id=50, age=1, conf=0.8)
+  front_frames(sp, 4 * DT_MDL, lambda k: [blip.seen(6., 0.2)])
+  front_frames(sp, 0.5, lambda k: [blip.coasting(6., 0.2)])
+  ds = front_frames(sp, 3.)
+  assert sp.person_front is None and not any(d.holding for d in ds)
+  sp, weak, v, s, k = ScenePolicy(), Person(age=1, conf=0.5), 1.0, 0., 0
+  while v > 0.:  # matched on every other detector run, at conf 0.5: never confirmed
+    sc = scene([weak.seen(5.5 - s, -0.5) if k % 2 == 0 else weak.coasting(5.5 - s, -0.5)])
+    d = sp.update(sc.objects, True, None, 1000., v, raw_people=False)
+    assert d.reason == "pedestrian in path"
+    a = plan_accel(d.accel_cap, d.speed_cap, v)
+    v = max(v + max(min(a if not d.should_stop else min(a, -1.), 0.), -3.5) * DT_MDL, 0.)
+    s, k = s + v * DT_MDL, k + 1
+  assert weak.age < CONFIRM_STEADY_HITS and not sp.tracks[1].earned and sp.tracks[1].stood
+  front_frames(sp, 1.)
+  assert sp.person_front is not None and not sp.person_front.evidence['earned']
