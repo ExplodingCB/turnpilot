@@ -2515,6 +2515,14 @@ struct NavInstruction {
   # probed by locate at OPPOSING_STRAIGHT_STEP_M steps), 0 when not known: the left's band assumes a straight opposing road
   # over R_req, so a left whose R_req is past it is never attempted (turnpilotd), undecided at its line (unprotected_left)
   maneuverOpposingStraightM @32 :Float32;
+  # TurnPilot (off-route turn, F3): the route's own shape around the car, for a heading change the road makes with no maneuver
+  # (an S-bend, a street that turns 90 deg with no junction). routeTurns: the route polyline's heading change (deg, + right) over
+  # each routeTurnsStep m of it, the first starting routeTurnsStart m (<= 0) from the car's matched place, from ROUTE_TURNS_BEHIND_M
+  # behind to ROUTE_TURNS_AHEAD_M ahead (navd: route_turns), clipped at the route's ends. Empty: no shape (a navd before it,
+  # or an invalid message): turnpilotd judges an off-route turn without it
+  routeTurns @33 :List(Float32);
+  routeTurnsStart @34 :Float32;
+  routeTurnsStep @35 :Float32;
 
   enum Opposing {
     unknown @0;  # no intersection data for the junction (or a navd from before the field)

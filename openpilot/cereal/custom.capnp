@@ -195,6 +195,9 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     # WARGAME_FIXES WF-13: a person TurnPilot saw lost in front of the car (scene_policy.person_front) and nobody seen leaving
     # for PERSON_FRONT_MAX_S (turnpilotd.py: person_front_handback): "Person may be in front: take control", the car held
     personFrontTakeControl @21;
+    # SAT_VALIDATION row 1: the car's heading turning OFF_ROUTE_TURN_DEG within OFF_ROUTE_TURN_M away from any route maneuver,
+    # no turn desire out (turnpilotd.py: off_route_turn): the model turned off the route, take control; no hold, no steering
+    offRouteTakeControl @22;
   }
   enum ControlAlert {
     none @0;

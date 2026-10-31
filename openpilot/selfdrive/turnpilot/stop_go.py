@@ -255,7 +255,11 @@ DYNAMIC, STATIC, FAULT = 'dynamic', 'static', 'fault'
 
 # vision (module docstring): ALWAYS_DRIVE's amendments, under vision alone
 VISION_YAW_GO_DEG = 8.          # V8: deg of yaw off the approach still straight enough for a go (the walk's rotation bound takes it in)
-VISION_STEER_GO_DEG = 30.       # V8: deg of steering wheel angle
+# V8, under vision the car is straight on its approach by its heading (yaw20_deg against the approach it drove in on, within
+# VISION_YAW_GO_DEG), never by the wheel: SAT_VALIDATION row 8 (stop_allway_empty) stood heading within 1.2 deg of the approach
+# with the wheel at 30.1 deg (the model's curvature in the last metres of the stop), and a 30 deg wheel bound held every go.
+# The wheel is a sanity bound only (a car wound past it is mid-manoeuvre, whatever its heading says)
+VISION_STEER_SANITY_DEG = 90.
 VISION_STALL_H5_S = 30.         # V4: s standing in the junction past the in-lane point, no lift taken over, before H5 (no hold)
 VISION_BOX_LIFT_M = 2.25        # V4: m all of a stand's clearBox lifts may move the car, until the model's takeover predicate
 VISION_ROLLUP_PROGRESS_M = 1.0  # V3: m a roll-up's goes must move the car for their count to start over (progress)
@@ -1711,8 +1715,8 @@ class StopGo:
       holds.append(Hold('signal', "signal at junction", STATIC))
     self.no_lift = self.vision and self.signal_seen
     # 3 straight on its approach, no turn desire before our first go (our own go's pulse is that go's: after a withdrawn go the
-    # yaw and the wheel say whether it curled the car); V8: wider under vision
-    yaw_go, steer_go = (VISION_YAW_GO_DEG, VISION_STEER_GO_DEG) if self.vision else (YAW_GO_DEG, STEER_GO_DEG)
+    # yaw and the wheel say whether it curled the car); V8: under vision the heading decides, the wheel a sanity bound
+    yaw_go, steer_go = (VISION_YAW_GO_DEG, VISION_STEER_SANITY_DEG) if self.vision else (YAW_GO_DEG, STEER_GO_DEG)
     if not launch and (abs(f.yaw20_deg) > yaw_go or abs(f.steer_deg) > steer_go or (f.desire_out and not self.went)):
       holds.append(Hold('yaw', "the car isn't straight on its approach", STATIC))
     # 2 the views the maneuver needs, fresh on camera time (the side views while the speed gate runs them); E7, E8
@@ -2660,7 +2664,7 @@ class StopGo:
       b = self._binding()
     if b is None or f.control is None or (not look and (not holds or any(not h.key.startswith('reach:') for h in holds))):
       return False
-    yaw_go, steer_go = (VISION_YAW_GO_DEG, VISION_STEER_GO_DEG) if self.vision else (YAW_GO_DEG, STEER_GO_DEG)
+    yaw_go, steer_go = (VISION_YAW_GO_DEG, VISION_STEER_SANITY_DEG) if self.vision else (YAW_GO_DEG, STEER_GO_DEG)
     if abs(f.yaw20_deg) > yaw_go or abs(f.steer_deg) > steer_go or (f.desire_out and not self.went):
       return False
     need = sr.go_room_m(f.t_abort, right=f.maneuver == 'right')

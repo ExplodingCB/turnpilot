@@ -62,7 +62,7 @@ LOUD_ALERTS = ('hardBrake', 'carCrossing')
 TAKE_CONTROL_PROMPTS = ('stopSignTakeControl', 'unprotectedTurnTakeControl', 'carStoppedTakeControl', 'stalledTakeControl',
                         'cantStartTakeControl', 'leftUndecidedTakeControl', 'signalUnseenTakeControl',
                         'turnAbandonedTakeControl', 'wrongSideTakeControl', 'pedestrianWaitingTakeControl',
-                        'personFrontTakeControl')
+                        'personFrontTakeControl', 'offRouteTakeControl')
 # shown, never heard: the unprotected left waiting at its line or creeping for a view, and a stop sign waiting for cross traffic,
 # are ordinary (no intervention); the stop sign's wait chimes once a WAIT_INFO_S (turnpilotPlan.stopGo.chime: stop_go.py)
 SILENT_PROMPTS = ('none', 'yieldAhead', 'waitingForGap', 'creepingForView', 'waitingForCross')
@@ -183,6 +183,7 @@ CONTROL_PROMPT_TEXT = {
   'wrongSideTakeControl': 'Yellow line on the right: the car is left of the centre line',
   'pedestrianWaitingTakeControl': 'A pedestrian has stood at the crosswalk 45 s',
   'personFrontTakeControl': 'A person was lost from view close in front of the car',
+  'offRouteTakeControl': 'The car turned off the route on its own',
 }
 CONTROL_ALERT_TEXT = {
   'cannotStopComfortably': 'Cannot stop gently for the stop/signal',

@@ -61,8 +61,9 @@ class FakeSM:
 
 class Sim:
   def __init__(self, maneuvers, cruise=13., nav_lanes=None, model_lanes=(0, 0), shadow=False, driver_signals=False, paint=(),
-               paint_rule=True, long_control=True, controls=(), controls_status=None, disengage_on_accel=True):
-    self.navd, self.tp, self.sm = FakeNavd(maneuvers, nav_lanes, controls=controls, controls_status=controls_status), TurnPilot(), FakeSM()
+               paint_rule=True, long_control=True, controls=(), controls_status=None, disengage_on_accel=True, shape=None, lag=0.):
+    self.navd = FakeNavd(maneuvers, nav_lanes, controls=controls, controls_status=controls_status, shape=shape, lag=lag)
+    self.tp, self.sm = TurnPilot(), FakeSM()
     # the hold line's handback at an unprotected left (G1's), for the tests here; the autonomous left (TurnPilotAutoLeft auto,
     # the default) is test_turnpilotd_left's
     self.tp.auto_left = 'off'

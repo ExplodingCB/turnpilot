@@ -132,6 +132,30 @@ class TestModeldDetector(OpenpilotTestCase):
     # a device with one camera runs it, whatever the view
     assert make_detector({'wide': 0}).choose_camera(0.0, log.Desire.none, 0.0, 'road') == 'wide'
 
+  def test_at_a_standstill_and_a_crawl_the_full_pass_keeps_the_wide_camera(self):
+    # SAT_VALIDATION rows 6 and X3: at a standstill the full pass went to the road camera and a walker standing 2.8 m ahead,
+    # below its view, was lost. At or under WIDE_SLOW_V the wide camera is the full pass's, but for one run in
+    # WIDE_SLOW_ROAD_EVERY on the road camera (its light and lane paint reads, which turnpilotd ages out at CAMERA_STALE_S);
+    # at speed the choice is as before; an unknown speed is as before
+    from openpilot.selfdrive.turnpilot.detector.modeld_detector import WIDE_SLOW_ROAD_EVERY, WIDE_SLOW_V
+    from openpilot.selfdrive.turnpilot.map_controls import CAMERA_STALE_S
+    assert WIDE_SLOW_V >= 3. - 1e-6 and WIDE_SLOW_ROAD_EVERY >= 3
+    for v in (0., 1.5, WIDE_SLOW_V):
+      det = make_detector()
+      picks = [det.choose_camera(0.0, log.Desire.none, 0.1 * k, v_ego=v) for k in range(3 * WIDE_SLOW_ROAD_EVERY)]
+      assert picks[0] == 'wide' and picks.count('road') == 3 and picks.count('wide') == 3 * (WIDE_SLOW_ROAD_EVERY - 1), v
+      assert WIDE_SLOW_ROAD_EVERY * RUN_EVERY * 0.05 < CAMERA_STALE_S  # the camera's light read never ages out between
+    det = make_detector()
+    assert [det.choose_camera(0.0, log.Desire.none, 0.1 * k, v_ego=WIDE_SLOW_V + 0.5) for k in range(6)] == ['road'] * 6
+    assert det.choose_camera(-0.02, log.Desire.none, 1.0, v_ego=10.) == 'wide'  # a curve at speed: as before
+    det = make_detector()
+    assert [det.choose_camera(0.0, log.Desire.none, 0.1 * k) for k in range(3)] == ['road'] * 3
+    assert det.choose_camera(0.0, log.Desire.none, 1.0, 'road', v_ego=0.) == 'road'  # the plan's view still decides
+    det, pm = make_detector(), PM()
+    for k in range(2 * RUN_EVERY):
+      det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(100 + k), Meta(200 + k)], v_ego=0.)
+    assert [str(td.camera) for td in pm.sent] == ['wide', 'wide']
+
   def test_step_takes_the_view(self):
     det, pm = make_detector(), PM()
     for k in range(3 * RUN_EVERY):
@@ -482,9 +506,11 @@ class TestStopSweep(OpenpilotTestCase):
     det, pm = side_detector(), SweepPM()
     sweep_steps(det, pm, 8, view='stopSweepGo')
     assert pm.runs == CROSSING * 2
-    # out of the sweep, as before: no side view, the road camera straight
+    # out of the sweep, as before: no side view; standing, the full pass's wide camera (WIDE_SLOW_V), at speed the road camera
     sweep_steps(det, pm, 4, view='auto', start=100)
-    assert pm.runs[8:] == [('road', 'full')] * 2 and len(det.side.run.calls) == 4
+    assert pm.runs[8:] == [('wide', 'full')] * 2 and len(det.side.run.calls) == 4
+    sweep_steps(det, pm, 4, view='auto', start=200, v_ego=10.)
+    assert pm.runs[10:] == [('road', 'full')] * 2 and len(det.side.run.calls) == 4
 
   def test_E10_side_boxes_go_back_to_fisheye_pixels_on_the_wide_camera_without_the_dash(self):
     det, pm = side_detector(), SweepPM()

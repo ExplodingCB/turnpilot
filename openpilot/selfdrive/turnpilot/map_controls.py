@@ -186,6 +186,12 @@ YIELD_COMMIT_MAX_M = 15.      # m: never decided further out (the rolling test i
 YIELD_STOP_REASON = "Yield: take control to proceed"
 RELEASE_SPAN_M = 30.          # releasing a control releases those this far past it
 OVERRUN_PAST_M = 2.           # m past the line, moving faster than COMMIT_SPEED with no release: an overrun
+# a red (or a stop decided on a yellow) the car crosses no faster than COMMIT_SPEED is never dropped as an overrun (SAT_VALIDATION
+# row 14, red_right_g62: BeamNG's light brake below 3 m/s crept the car 2 m over a red's line, the red was dropped and the turn
+# went on red; Kellen: "it should always stop on red"): the car stops where it is on the map curve's MAP_STOP_DECEL and is held
+# there, waiting for a steady green as at the line, saying so. Faster than COMMIT_SPEED past the line it is in the junction:
+# the overrun as before, never a stop there
+RED_PAST_REASON = "Waiting at the light"
 DRIVE_OFF_M = 2.              # m a held car moved under the driver's gas: driven off
 LIGHT_ASSOC_M = 25.           # a light belongs to the signal control whose stop point is this close to its own
 LIGHT_STALE_S = 0.6           # s: an older light message is stale (unknown)
@@ -504,6 +510,8 @@ class ControlState:
   green_t: float = 0.
   light: str = 'unknown'
   unseen_t: float = 0.          # held at a signal: s since an accepted light was last read for it (SIGNAL_UNSEEN_S)
+  past_red: bool = False        # a signal's stop crept past its line slower than COMMIT_SPEED: stopped where it is (RED_PAST_REASON)
+  crossed_v: float = -1.        # a signal's line crossed with nothing to stop for: the speed it was, else -1 (signal_went)
   dwell_t: float = 0.
   moved_m: float = 0.
   asked_m: float = 0.           # held: the furthest the latch's stop point was asked on this hold (a creep, a roll-up)
@@ -639,6 +647,14 @@ class MapControlPolicy:
                for c in self.tracker.controls.values()):
       return 'none' if self.tracker.status == 'ok' else 'unknown'
     return 'green' if 'green' in accepted else 'unknown'
+
+  def signal_went(self, distance: float) -> bool:
+    """The car went through the signal of the junction distance m ahead (PROTECT_BEFORE_M before it to PROTECT_PAST_M past
+    it): committed on its yellow (SIGNAL_COMMITTED: a later red never reverses a commit), or over its line faster than
+    COMMIT_SPEED with nothing to stop for (crossed_v; a red crept over it, or a go from standing on it, is no go). turnpilotd:
+    a later red never takes back the turn's desire."""
+    return any(c.kind == 'signal' and c.state is not None and distance - PROTECT_BEFORE_M <= c.d <= distance + PROTECT_PAST_M and
+               (c.state.mode == SIGNAL_COMMITTED or c.state.crossed_v > COMMIT_SPEED) for c in self.tracker.controls.values())
 
   def held_control(self) -> TrackedControl | None:
     """The control the latch holds the car at, or None: the stop-sign decider's (turnpilotd), keyed on its state object, which
@@ -1018,8 +1034,8 @@ class MapControlPolicy:
     else:
       if st.green_t >= GREEN_STEADY_S - 1e-9:
         cause = 'green'
-      reason = f"Red light (sim oracle){'' if c.junction else ' (crossing)'}" if st.light == 'red' else \
-        f"Stopped at {what}: waiting for green"
+      reason = RED_PAST_REASON if st.past_red else \
+        f"Red light (sim oracle){'' if c.junction else ' (crossing)'}" if st.light == 'red' else f"Stopped at {what}: waiting for green"
       # no accepted light read for it this long: handed back, held (never released by the timeout); read again, TurnPilot's
       st.unseen_t = st.unseen_t + dt if st.light not in ('red', 'yellow', 'green') else 0.
       if st.unseen_t >= SIGNAL_UNSEEN_S - 1e-9:
@@ -1180,6 +1196,8 @@ class MapControlPolicy:
       self._signal_mode(c, v)
       if st.mode != SIGNAL_STOP:  # nothing to stop for: no stop, no cap, no prompt (module docstring)
         st.action = 'proceedingOnYellow' if st.mode == SIGNAL_COMMITTED else 'none'
+        if c.d < 0. and st.crossed_v < 0.:
+          st.crossed_v = v
         if c.d < -OVERRUN_PAST_M:
           st.done = 'passed'
         return False
@@ -1216,6 +1234,22 @@ class MapControlPolicy:
         st.cap = curve(v, c.d)
         self._check(c, v, 'gasLifted')
 
+    if c.kind == 'signal' and c.d < 0. and not gas_pressed and v <= COMMIT_SPEED:
+      # a red crept over its line (RED_PAST_REASON): never dropped, the car stopped where it is and held for a steady green
+      if not st.past_red:
+        cloudlog.event("turnpilot.map_red_past_line", error=True, key=list(c.key), d=round(c.d, 1), v=round(v, 2), light=st.light)
+      st.past_red = True
+      if v < LATCH_SPEED and self.held is None:
+        self.held, c.held = c.key, True
+        st.dwell_t, st.moved_m, st.infeasible, st.unseen_t = 0., 0., False, 0.
+        st.asked_m, st.gas_moved_m, st.driver_m, st.driver_past_m = 0., 0., 0., 0.
+        st.drivers_frame = False
+        cloudlog.event("turnpilot.map_stop_held", kind=c.kind, key=list(c.key), d=round(c.d, 1), light=st.light, pastLine=True)
+        self._held(c, controls, v, gas_pressed, 0., out, prompts)
+        return False
+      st.action, st.cap = 'braking', 0.
+      out.stops.append(Stop(-MAP_STOP_DECEL, 0., False, RED_PAST_REASON, c.d, rest=True))
+      return False
     if c.d < -OVERRUN_PAST_M and not gas_pressed:
       # past the line and not held, however slow: never a stop in the junction with no hold and no go to release it
       st.action = 'overrun'
@@ -1259,7 +1293,7 @@ class MapControlPolicy:
   def _signal_go(self, c) -> None:
     """A signal back to nothing to stop for (a steady green): its curve gone, re-seeded if it stops the car again."""
     st = c.state
-    st.mode, st.yellow, st.infeasible, st.cap = SIGNAL_GO, False, False, NO_SPEED_CAP
+    st.mode, st.yellow, st.infeasible, st.cap, st.past_red = SIGNAL_GO, False, False, NO_SPEED_CAP, False
     c.engaged = False
 
   def _signal_mode(self, c, v: float) -> None:
