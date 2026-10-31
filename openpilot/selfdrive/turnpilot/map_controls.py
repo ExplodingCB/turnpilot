@@ -516,6 +516,7 @@ class MapControlPolicy:
   def __init__(self, yellow_decel: float = YELLOW_DECEL):
     self.tracker = ControlTracker()
     self.yellow_decel = yellow_decel
+    self.always_drive = False  # TurnPilotAlwaysDrive, handed over every frame (turnpilotd.hand_always_drive; ALWAYS_DRIVE.md section 1)
     self.held: tuple[int, int] | None = None  # the latched control's key
     self.prev_gas = False
     self._alert, self._alert_t = 'none', 0.

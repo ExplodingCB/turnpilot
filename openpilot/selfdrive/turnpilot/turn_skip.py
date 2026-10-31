@@ -81,6 +81,7 @@ class SkipState:
 class TurnSkip:
   def __init__(self):
     self.maneuver_id = -1
+    self.always_drive = False  # TurnPilotAlwaysDrive, handed over every frame (turnpilotd.hand_always_drive; ALWAYS_DRIVE.md section 1)
     self.skipped = False
     self.reason = ''  # why it was skipped
     self._infeasible = 0

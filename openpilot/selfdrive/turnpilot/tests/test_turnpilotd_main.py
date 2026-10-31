@@ -327,6 +327,42 @@ def test_main_reads_the_go_override(value, on):
   assert made[0].go_override is on
 
 
+@pytest.mark.parametrize("value,on", [(None, False), (True, True), (False, False), ('1', True), ('0', False), (b'1', True),
+                                      (b'0', False), (' 1\n', True)])
+def test_main_reads_the_always_drive_switch(value, on):
+  """TurnPilotAlwaysDrive (ALWAYS_DRIVE.md section 1), read once a second beside TurnPilotGoOverride: unset is off, today's
+  behaviour; "1" is on."""
+  made, real = [], turnpilotd.TurnPilot
+  def make():
+    made.append(real())
+    return made[-1]
+  with mock.patch.object(turnpilotd, 'TurnPilot', side_effect=make):
+    run_main(frames=3, TurnPilotAlwaysDrive=value)
+  assert made[0].always_drive is on
+  assert turnpilotd.always_drive_for(FakeParams()) is False
+
+
+def test_always_drive_unknown_to_the_build_reads_off_and_says_so():
+  """A build whose params library doesn't know TurnPilotAlwaysDrive yet (common/ not rebuilt after the merge): off, and
+  logged, never an exception out of the param refresh."""
+  class Old(FakeParams):
+    def get(self, key):
+      if key == 'TurnPilotAlwaysDrive':
+        raise turnpilotd.UnknownKeyName(key)
+      return super().get(key)
+  with mock.patch.object(turnpilotd, 'log_error') as log_error:
+    assert turnpilotd.always_drive_for(Old(TurnPilotAlwaysDrive=b'1')) is False
+  assert log_error.call_count == 1 and 'TurnPilotAlwaysDrive' in log_error.call_args.args[0]
+  assert 'unknown' in log_error.call_args.args[0] and 'off' in log_error.call_args.args[0]
+
+
+def test_always_drive_is_a_persistent_bool_off_by_default():
+  import re
+  from pathlib import Path
+  header = (Path(__file__).parents[3] / 'common' / 'params_keys.h').read_text()
+  assert re.search(r'\{"TurnPilotAlwaysDrive", \{PERSISTENT, BOOL, "0"\}\}', header)
+
+
 @pytest.mark.parametrize("value,on", [(None, True), (True, True), (False, False), ('0', False), (b'1', True)])
 def test_main_reads_the_curb_pedestrian_cap(value, on):
   """TurnPilotCurbPedCap (scene_policy.py: the curb-pedestrian speed cap; owner decision, BUILD_FINDINGS D3-real option 2),

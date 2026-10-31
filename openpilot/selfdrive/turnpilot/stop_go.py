@@ -267,6 +267,7 @@ class Frame:
   mode_known: bool = True        # the build's params know TurnPilotStopSignGo, and its value is a mode
   approach_lanes: int = 0        # our approach's lanes toward the junction (navd's lane guidance for a turn here), 0 unknown
   rightmost: bool = False        # the car is in the rightmost lane (the model sees no lane to its right)
+  always_drive: bool = False     # TurnPilotAlwaysDrive, never in shadow (turnpilotd.always_drive_on; ALWAYS_DRIVE.md section 1)
   dt: float = DT_MDL
 
 

@@ -462,6 +462,7 @@ def stands_still(obj) -> bool:
 class UnprotectedLeft:
   def __init__(self):
     self.maneuver_id: int | None = None
+    self.always_drive = False  # TurnPilotAlwaysDrive, handed over every frame (turnpilotd.hand_always_drive; ALWAYS_DRIVE.md section 1)
     self._reset()
 
   def _reset(self):

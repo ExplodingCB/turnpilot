@@ -567,6 +567,7 @@ class LaneDecision(NamedTuple):
 class LanePlanner:
   def __init__(self, paint_rule: bool = True):
     self.paint_rule = paint_rule      # TurnPilotLanePaintActive: plan lane changes at all
+    self.always_drive = False         # TurnPilotAlwaysDrive, handed over every frame (turnpilotd.hand_always_drive; ALWAYS_DRIVE.md section 1)
     self.phase = Phase.IDLE
     self.offer = LaneChange.none      # the change warned of
     self.countdown = 0.

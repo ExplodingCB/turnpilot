@@ -340,6 +340,11 @@ LANE_PENDING_WAITS = ('beforeWindow', 'confirming', 'cooldown', 'blindspot', 'ca
 # TurnPilotGoOverride (main()): TurnPilot's go from a standstill certified for plannerd's bounded lift (go_override.py; DESIGN
 # phase 4 decision 1, G5). On by default: the autonomous left and the stop sign's go depend on it (Kellen, 2026-10-28)
 GO_OVERRIDE_DEFAULT = True
+# TurnPilotAlwaysDrive (main(); ALWAYS_DRIVE.md section 1): TurnPilot drives on where it is only unsure (a NERVOUS handback,
+# skip, wait or slow-down) and hands back where it messed up. Off by default: with it off every behaviour is today's. Handed
+# every frame to the lane planner, the unprotected left, the map controls, the turn skip and the stop-sign decider's Frame
+# (hand_always_drive), never in shadow mode; steps S2 to S5 act on it there
+ALWAYS_DRIVE_DEFAULT = False
 LEFT_GO_STATES = ('go', 'committed')  # the unprotected left's states its certified go stays out in
 # the unprotected left's go is followed into the oncoming lanes only by a launch: its clear time (unprotected_left.t_req) is
 # for its 1.5 m/s^2 launch, and a model that 'takes over' at the speed the lift gave it (0.8 m/s) would coast 10 s across
@@ -575,6 +580,8 @@ class TurnPilot:
     self.last_holding = False     # the last plan's scene held the car (the decider's clearBox waits it out)
     self.params = None            # Params (main()): TurnPilotJunctionOverrides is written through it (signal_seen_override)
     self.override_failed_t = 0.   # s overrideWriteFailed has left to show
+    self.always_drive = ALWAYS_DRIVE_DEFAULT  # TurnPilotAlwaysDrive (main())
+    self.shadow = False           # the last plan's shadow mode: the switch does nothing in it (always_drive_on)
     self.reset()
 
   def reset(self, detector: bool = True, keep_turn: bool = False):
@@ -662,6 +669,18 @@ class TurnPilot:
     self._mismatch_candidate, self._mismatch_frames = LaneMismatch.none, 0
     self.acting = False
     self.last_desire = Desire.none
+    self.hand_always_drive()  # the components made afresh here have the switch at once, mid-frame too (a fault's reset)
+
+  @property
+  def always_drive_on(self) -> bool:
+    """TurnPilotAlwaysDrive as the components act on it: the param, and never in shadow mode (ALWAYS_DRIVE.md section 1)."""
+    return self.always_drive and not self.shadow
+
+  def hand_always_drive(self) -> None:
+    """The switch to every component that acts on it (always_drive_on); the stop-sign decider has it in its Frame."""
+    on = self.always_drive_on
+    for part in (self.lanes, self.paint_rule_lanes, self.left, self.map_controls, self.skip):
+      part.always_drive = on
 
   @property
   def turn_committed(self) -> bool:
@@ -1628,7 +1647,7 @@ class TurnPilot:
                 go_active=self.go_cert.cause, go_taken_over=self.go_cert.taken_over, go_end=self.go_cert.end,
                 mode=self.stop_sign_mode if acting else 'shadow', mode_known=self.stop_sign_known, approach_lanes=ours,
                 rightmost=model_lanes.measured and model_lanes.right_known and model_lanes.right == 0, signal_veto=self.sg_veto,
-                skip_union=skip_union)
+                skip_union=skip_union, always_drive=self.always_drive_on)
       self.sg_veto = ''  # read once: the go it vetoed is withdrawn on it
       d = self.stop_go.update(f)
       self.sg_last, self.sg_carried = d, 0
@@ -2191,6 +2210,8 @@ class TurnPilot:
   def plan(self, sm, scene, enabled: bool, shadow: bool, *args, long_control: bool | None, disengage_on_accel: bool = True,
            **kwargs):
     """The plan (plan_inner()), every one of them carrying navd's runtime inputs (fill_runtime)."""
+    self.shadow = shadow
+    self.hand_always_drive()
     msg = self.plan_inner(sm, scene, enabled, shadow, *args, long_control=long_control, disengage_on_accel=disengage_on_accel,
                           **kwargs)
     self.fill_runtime(msg.turnpilotPlan)
@@ -2426,6 +2447,22 @@ def go_override_for(params) -> bool:
   return bool(value)
 
 
+def always_drive_for(params) -> bool:
+  """TurnPilotAlwaysDrive (ALWAYS_DRIVE.md section 1): ALWAYS_DRIVE_DEFAULT (off, today's behaviour) if unset, or unknown to
+  this build's params (said); on only for a 1."""
+  try:
+    value = params.get("TurnPilotAlwaysDrive")
+  except UnknownKeyName:
+    log_error("turnpilotd: TurnPilotAlwaysDrive unknown to this build's params, off; run scons")
+    return ALWAYS_DRIVE_DEFAULT
+  if value is None:
+    return ALWAYS_DRIVE_DEFAULT
+  if isinstance(value, (bytes, str)):
+    value = value.decode() if isinstance(value, bytes) else value
+    return value.strip() == '1'
+  return bool(value)
+
+
 def curb_ped_cap_for(params) -> bool:
   """TurnPilotCurbPedCap: the scene's curb-pedestrian speed cap (scene_policy.py; owner decision, BUILD_FINDINGS D3-real
   option 2); CURB_PED_CAP_DEFAULT (on) if unset or unknown to this build's params (said)."""
@@ -2618,6 +2655,7 @@ def main():
       tp.left_range_m = left_range_for(params)
       tp.left_far_range_m = left_far_range_for(params)
       tp.go_override = go_override_for(params)
+      tp.always_drive = always_drive_for(params)
       tp.curb_ped_cap = curb_ped_cap_for(params)
       tp.stop_sign_mode, tp.stop_sign_known = stop_sign_mode_for(params)
       tp.camera_signs = camera_signs_read(params)
