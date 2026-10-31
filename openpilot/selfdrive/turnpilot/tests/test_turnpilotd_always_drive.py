@@ -10,7 +10,8 @@ from openpilot.selfdrive.turnpilot.go_override import GO_CLEAR_M, GO_END_SPEED, 
 from openpilot.selfdrive.turnpilot.scene.tracker import RawFrame
 from openpilot.selfdrive.turnpilot.stop_go import Frame
 from openpilot.selfdrive.turnpilot.tests.test_go_override import WARM_S
-from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import LEFT_AT_A_RED, Sim, go_from_a_red, oracle_lights, stand, stop_at
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, T_LEFT, Sim, go_from_a_red, oracle_lights, stand, stop_at,
+                                                              walker_stops_the_car)
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_go import attach_planner, holding, raw_person
 from openpilot.selfdrive.turnpilot.turnpilotd import (NO_MOVE_MAX_S, NO_MOVE_REASON, NO_MOVE_S, RELEASE_GOES, RELEASE_LIFT_M, STANDSTILL_SPEED,
                                                        STOPPED_NOTE, TurnPilot)
@@ -226,3 +227,55 @@ def test_a_relifts_speed_end_keeps_the_no_move_clock():
   sim.step(engaged=True)
   assert sim.tp.go_cert.end == 'speed' and not sim.tp.go_cert.taken_over
   assert sim.tp.go_wait_s is not None
+
+
+# --- ST-12 (ST-09 (stops)): a straight release ---
+
+STRAIGHT = [(2000., 'turn', 'left', T_LEFT)]  # nothing to turn at for 2 km
+
+
+def straight_green(on: bool):
+  """A mapped signal 290 m on along a straight, read red by the sim's oracle, then green: the map latch lets go with the car
+  standing, no turn near. Returns (sim, the plan that let go)."""
+  sim = Sim(STRAIGHT, controls=[(290., 'signal')])
+  sim.tp.always_drive, sim.go_taps, sim.tp.oracle_ok = on, False, True
+  light = {'state': 'red'}
+  sim.lights = lambda sim: oracle_lights(light['state'], 290.)(sim)
+  stop_at(sim, 290.)
+  stand(sim, 1.)
+  light['state'] = 'green'
+  while sim.trace[-1][2].shouldStop:
+    sim.step(engaged=True)
+    assert sim.t < 80.
+  return sim, sim.trace[-1][2]
+
+
+def test_a_straight_release_certifies_like_a_turns_and_falls_to_the_release_rules():
+  """ALWAYS_DRIVE.md ST-12: under the switch a map hold let go on a straight at an accepted green gets turn_go's certified
+  lift (turnRelease through release_blocked and go_blocked, judged at the signal it stood at, not the route's next turn) and
+  ST-04's rules: no hold, relifts, the no-hold handback at NO_MOVE_MAX_S. With the switch off: no lift, the 2 s hold."""
+  sim, p = straight_green(True)
+  assert str(p.goCertified.cause) == 'turnRelease'
+  plans = stand(sim, 1.)
+  assert all(str(q.goCertified.cause) == 'turnRelease' for q in plans), "kept: the junction it stands at is green"
+  plans += stand(sim, NO_MOVE_MAX_S + 1.)
+  assert not any(q.shouldStop for q in plans) and any(q.controlPrompt == 'cantStartTakeControl' for q in plans)
+  sim, p = straight_green(False)
+  assert str(p.goCertified.cause) == 'none'
+  plans = stand(sim, NO_MOVE_S + 0.3)
+  assert plans[-1].controlPrompt == 'cantStartTakeControl' and plans[-1].shouldStop
+
+
+def test_a_scene_hold_let_go_on_a_straight_starts_the_release_clock():
+  """ALWAYS_DRIVE.md ST-12: a walker's hold in the path on a straight, let go standing, starts the no-move clock under the
+  switch (no lift: no signal there, RELEASE_UNSIGNALIZED off), the no-hold handback at NO_MOVE_MAX_S; with the switch off
+  it starts none and the empty-road handback comes at STOPPED_HANDBACK_S, as today."""
+  for on in (True, False):
+    sim = Sim(STRAIGHT)
+    sim.tp.always_drive = on
+    sim.run(2.)
+    walker_stops_the_car(sim)
+    plans = stand(sim, NO_MOVE_MAX_S + 1.)
+    assert not any(q.shouldStop for q in plans), on
+    assert any(q.controlPrompt == 'cantStartTakeControl' for q in plans) is on
+    assert all(str(q.goCertified.cause) == 'none' for q in plans)

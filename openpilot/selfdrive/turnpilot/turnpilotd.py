@@ -677,6 +677,7 @@ class TurnPilot:
       self.go_moved = False                # ...and the car has rolled since (no_move)
       self.left_launch_armed = False       # ...an unprotected left's, checked for its launch until its commit (left_launch)
       self.go_left = False                 # ...is the unprotected left's: it keeps its own hold (LEFT-06), never a release's rules
+      self.go_straight = False             # ...is a straight release's (no turn): judged at the junction it stands at
       self.rel_lift_m = 0.                 # under the switch, the release's lifts' metres by odometer (RELEASE_LIFT_M)...
       self.rel_goes = 0                    # ...its certified goes (RELEASE_GOES)...
       self.rel_gap_s = 0.                  # ...and s since its last go ended, or since TurnPilot's go (RELIFT_GAP_S)
@@ -1014,7 +1015,7 @@ class TurnPilot:
     # the certified go out, a frame on (its window, the model's takeover), and withdrawn the frame what it rests on goes
     self.go_cert.update(model, v_ego, DT_MDL)
     self.watch_release(sm, cs, v_ego, model)
-    self.withdraw_go(sm, cs, acting, available, objects, raw, decision, took_over, rf.distance)
+    self.withdraw_go(sm, cs, acting, available, objects, raw, decision, took_over, self.release_distance(rf.distance))
     if sg.withdraw and self.go_cert.active and self.go_cert.cause in STOP_GO_CAUSES:
       self.go_cert.withdraw(f"stopGo {sg.withdraw}")
     decider_go = sg.go_cause != 'none' or sg.release is not None
@@ -1023,7 +1024,8 @@ class TurnPilot:
     withdrawn = self.no_move(sm, cs, v_ego, acting, decision) or self.left_launch(sm, rf, v_ego)
     if withdrawn:
       self.go_cert.withdraw('noMove')
-    self.relift(sm, cs, v_ego, acting, available, objects, raw, decision, took_over, rf.distance, upcoming, right_hand_traffic)
+    self.relift(sm, cs, v_ego, acting, available, objects, raw, decision, took_over, self.release_distance(rf.distance),
+                None if self.go_straight else upcoming, right_hand_traffic)
     self.release_go = self.release_go and not withdrawn  # handed back: a hold that comes and goes is no new go
 
     lanes = model_lanes_from_msg(model)
@@ -1059,12 +1061,18 @@ class TurnPilot:
           self.go_wait_s = None  # the stop-sign decider's go: its own watchdog (the gate, G5's window, its retries, H5)
         else:
           self.certify_go(sm, cs, available, objects, raw, decision, took_over, rf.distance, upcoming, right_hand_traffic)
-    elif self.release_go and mapd.released_stopped and not decider_go and sm['carControl'].enabled and not took_over:
-      # any other go of TurnPilot's from a standstill (a map control let go, a straight road's too): the no-move clock (gap B)
+    elif self.release_go and not decider_go and sm['carControl'].enabled and not took_over and \
+         (mapd.released_stopped or (self.always_drive_on and (self.left_now is None or self.left_now.state == 'off'))):
+      # any other go of TurnPilot's from a standstill (a map control let go, a straight road's too): the no-move clock (gap B).
+      # Under the switch a scene hold let go on a straight too, and certified as a turn's go is, at the junction it stands at
+      # (ALWAYS_DRIVE.md ST-12: release_distance)
       self.go_wait_s, self.go_withdrawn, self.go_moved, self.go_lifted, self.go_in_junction = 0., False, False, False, False
-      self.go_lead_s, self.go_left, self.rel_gap_s = 0., False, 0.
+      self.go_lead_s, self.go_left, self.rel_gap_s, self.go_straight = 0., False, 0., True
       self.no_move_limit, self.go_cert_id = self.no_move_s, None
       cloudlog.event("turnpilot.post_go", profile='none', unprotected=False, turned_deg=0., distance=round(rf.distance, 1), at_line=True)
+      if self.always_drive_on:
+        self.certify_go(sm, cs, available, objects, raw, decision, took_over, self.release_distance(rf.distance), None,
+                        right_hand_traffic)
     if self.post_go is not None and not turn_go:
       self.post_go.update(v_ego, default_yaw_rate(cs, model), DT_MDL)
     if held and desire not in (Desire.none, CLEAR_DESIRE) and desire != self.last_desire:
@@ -1876,7 +1884,7 @@ class TurnPilot:
     at_line = self.go_at_line(distance)
     self.no_move_limit, self.go_withdrawn = (LEFT_NO_MOVE_S if left else self.no_move_s), False
     self.go_wait_s = 0. if at_line else None  # in the junction: never withdrawn, the stall's handback covers it
-    self.go_lead_s, self.go_left, self.rel_gap_s = 0., left, 0.
+    self.go_lead_s, self.go_left, self.rel_gap_s, self.go_straight = 0., left, 0., False
     self.go_moved = False
     # the left's go from its line followed into the oncoming lanes only by a launch (left_launch)
     self.left_launch_armed = left and at_line and distance - ONCOMING_ENTRY_M >= LEFT_LIFT_ROOM_M
@@ -1940,6 +1948,14 @@ class TurnPilot:
     if not why:
       why = self.release_blocked(distance, cause)
     return why
+
+  def release_distance(self, distance: float) -> float:
+    """m to the junction a go of TurnPilot's is judged at (release_blocked): the route's, distance; a straight release's
+    (go_straight), the nearest map control ahead within STOPPED_CONTROL_M, where it stands, or the car's place without one."""
+    if not self.go_straight:
+      return distance
+    ds = [c.d for c in self.map_controls.tracker.controls.values() if -LATCH_PAST_M <= c.d < STOPPED_CONTROL_M]
+    return min(ds) if ds else 0.
 
   def watch_release(self, sm, cs, v_ego: float, model) -> None:
     """Under the switch, the release's bounds (RELEASE_LIFT_M; ALWAYS_DRIVE.md ST-13): its lifted metres by odometer while
