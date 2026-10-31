@@ -129,6 +129,20 @@ Do this at home on Wi-Fi, with the comma powered for the whole first boot. The c
 
 When the comma shows the road view, the install is done.
 
+## TurnPilot setup on the comma screen
+
+After the stock terms and training, the comma opens TurnPilot setup by itself. It is built from the same cards and buttons as the stock screens: swipe left and right through each step, and tap the green pill to move on. A step that is still waiting shows a dimmed pill, and a step that fails says what to do and shows `retry`. Nothing needs SSH, a laptop or this document.
+
+1. **what is turnpilot?** One sentence, then `next`. This turns TurnPilot and navigation on, and fills in the map server's address and certificate (`maps/defaults.py`, the server at 136.113.85.41 and its public certificate). Only the API key is left, and it never goes in the repo.
+2. **pair your phone.** Scan the QR code with the phone camera. The phone must be on the comma's Wi-Fi, or the comma on the phone's hotspot. The step turns good when the phone opens the page with its token (`TurnPilotPhoneSeen`).
+3. **add the map key.** On the phone page, paste the key Kellen sent into **Map key** and tap **Save key**. The page says whether the key works. The comma's card turns good once the map server answers the saved key, and shows the mapped area.
+4. **map engine.** The comma installs pyvalhalla by itself, in the background, from the first boot with TurnPilot on, as soon as it is online (the next section). The card shows the progress, or why it failed and `retry`.
+5. **ready to drive.** Drive straight above 15 mph for a few minutes so the camera calibrates, engage with the cruise stalk, and enter a destination on the phone. TurnPilot starts live, or in watch only if that is on.
+
+Setup opens again on every boot until `done` is tapped (`TurnPilotSetupDone`), at the first step that isn't finished. `set up later` closes it until the next boot. Until TurnPilot is ready, the home screen shows one stock offroad alert, "TurnPilot is not ready to drive", with what is missing and where to fix it. It goes away when nothing is missing. **Settings > turnpilot** has `pair phone`, `watch only`, `always drive`, `stop-sign go` (vision or off), `far pedestrians`, the map engine's state, and `run setup again`.
+
+Setup stays up while the car is parked with the ignition on, and closes when the car moves. It never opens on a developer's local tiles (`TurnPilotValhallaTiles` set, as in the sim).
+
 ## Turn on SSH
 
 1. Open **Settings > Developer** and turn on **enable SSH**.
@@ -212,7 +226,11 @@ python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotStopSignGo=vis
 
 ## Install Valhalla for offline routing
 
-The system Python on the comma is read-only, so pyvalhalla goes into `/data/turnpilot/pyvalhalla`, which survives updates. The comma needs internet once for the 35 MB wheel, from home Wi-Fi or the hotspot:
+Driving needs pyvalhalla even with the map server: navd routes each drive's corridor with it on the comma. The system Python on the comma is read-only, so pyvalhalla goes into `/data/turnpilot/pyvalhalla`, which survives updates.
+
+`turnpilot_web` installs it by itself (`valhalla_install.py`): once a boot while it is missing and the comma is online, again every 30 s while offline, and again when you tap `retry` in setup or in **Settings > turnpilot > map engine**. It runs at the lowest CPU priority and never holds up boot or a drive. It uses the same wheel and sha256 as the script below, and preflight's `pyvalhalla` line shows how it is going.
+
+To install it by hand instead, the comma needs internet once for the 35 MB wheel, from home Wi-Fi or the hotspot:
 
 ```
 bash tools/turnpilot/install_valhalla_device.sh
@@ -224,7 +242,7 @@ The script checks the wheel's sha256, unpacks it, and imports it as a test. It n
 
 TurnPilot routes only inside its mapped areas, around Indianapolis and Seattle. There is no Mapbox and no fallback.
 
-1. Open the phone app, then **Map server**. Enter the address, the API key and the server's certificate (PEM), and tap **Save and check**. The comma fetches the mapped area at once, so the comma must be online. It then refreshes it every 6 hours while online and keeps it in `/data/turnpilot/maps/coverage.json`.
+1. The comma already has the map server's address and certificate. Open the phone app and paste the API key in **Map key**, then tap **Save key**. To use another server, open **Map server**, enter the address, the API key and the server's certificate (PEM) together, and tap **Save and check**. The comma fetches the mapped area at once, so the comma must be online. It then refreshes it every 6 hours while online and keeps it in `/data/turnpilot/maps/coverage.json`.
 2. The **Mapped area** section draws the areas, the car and the destination. A destination outside them is refused with "Outside TurnPilot's mapped area". Until the comma has fetched the mapped area once, every destination is refused.
 3. When a destination is set, navd downloads that drive's map (a corridor of tiles around the route, 20-50 MB) from the server, checks every file's SHA-256, and unpacks it under `/data/turnpilot/maps/corridors/`. The phone shows "Downloading map for this drive…" and then "Ready". Reroutes run on the comma with no internet. The last 3 corridors are kept.
 4. Any failure means no route, with the reason on the phone and on the comma's onroad screen ("No route"): server unreachable, wrong key, certificate mismatch, a corridor that fails its check, or the server refusing the drive.
