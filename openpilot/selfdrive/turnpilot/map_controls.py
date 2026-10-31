@@ -1,9 +1,12 @@
 """Map stop control: stop signs, yields and traffic signals on the route (navInstruction.controls), turned into stops.
 
-The driving model doesn't stop for them (BeamNG, 2026-10-27: 0 of 31 reds, full stops at 2 of 8 stop signs), so
-TurnPilot does, from the map. Each control becomes a scene_policy.Stop, composed with the pedestrian, oncoming and turn
-limits by ScenePolicy (its reason, holding and the accel cap's jerk ramp). It runs every frame, whatever the route's
-maneuver is: a skipped turn or a straight-through junction keeps its stop.
+TurnPilot stops for them from the map. For stop signs the evidence is sim only: in BeamNG (2026-10-27) the driving model
+came to a full stop at 2 of 8. It stopped at 0 of 31 reds there too, a count that says nothing about real roads: BeamNG
+renders a red lamp salmon (hue 18-20 deg, saturation 0.31-0.33, against 349-354 deg and 0.67-0.83 for real comma four red
+heads), and the fork's own light reader read no colour on any of 184 BeamNG light boxes (lights r2, 2026-10-30). The big
+model's red behaviour on real roads is unmeasured until Saturday's log. Each control becomes a scene_policy.Stop, composed
+with the pedestrian, oncoming and turn limits by ScenePolicy (its reason, holding and the accel cap's jerk ramp). It runs
+every frame, whatever the route's maneuver is: a skipped turn or a straight-through junction keeps its stop.
 
 The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
 - The approach: a control engages within engage_distance (braking at MAP_STOP_DECEL from v, a second's lag, a margin).

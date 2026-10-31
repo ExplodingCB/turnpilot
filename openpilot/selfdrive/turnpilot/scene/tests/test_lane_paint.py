@@ -317,3 +317,27 @@ class TestAdversarialFootage(OpenpilotTestCase):
       paint = clf.update(k * DT, frame, STRIDE, Y_HEIGHT, RPY, True, lines_xyz(ys), list(XING_POST[1]))
     assert (paint[1].kind, paint[1].color) == ('solid', 'yellow') and paint[1].confidence >= 0.3, paint
     assert change_blocker(LEFT, model_lanes(*XING_POST), paint) == 'lineNotBroken'
+
+  def test_white_paint_in_warm_sun_is_not_yellow(self):
+    # comma's public comma four route 79d0f04c82980004/00000003--fb0b5d9cfc (a Model 3, California afternoon sun), segment 15:
+    # the solid white bike-lane line on the car's right, median of 30608 painted samples: asphalt Y 76, U 126, V 130, the
+    # paint Y 125 with its U 4 below the road's and V 3 above, the light's tint on a neutral surface. Without the
+    # chromaticity test it read yellow (worn yellow's U dip) and a replay raised wrongSideTakeControl 18 times in that minute.
+    # Segment 1's double yellow in the same light (U 12 below, V 9 above) still reads yellow
+    from openpilot.selfdrive.turnpilot.turnpilotd import yellow_on_the_right
+    warm_road, warm_white, warm_yellow = (76., 126., 130.), (125., 122., 133.), (108., 114., 139.)
+    paint = drive([double(warm_yellow), dashed(warm_white), solid(warm_white), None], road=warm_road)
+    assert kinds(paint)[0] == ('solid', 'yellow') and paint[0].confidence >= 0.5, paint
+    assert paint[1].color != 'yellow' and paint[2].color != 'yellow' and paint[2].kind == 'solid', paint
+    assert not yellow_on_the_right(paint, list(LINE_YS), [0.9] * 4, [-7., 3.5], [0.5, 0.5])[0]
+    # a worn double yellow in neutral light (the demo route's: U 4-10 below the road) still reads yellow
+    paint = drive([double((120., 121., 134.)), dashed(WHITE), solid(WHITE), None])
+    assert kinds(paint)[0] == ('solid', 'yellow'), paint
+
+  def test_a_tint_without_yellows_chromaticity_reads_neither_colour(self):
+    # the same public route, segment 17, the sun ahead: its double yellow centre line washed out to a U dip of 4 below the
+    # road at a bright peak, which yellow's chromaticity test refuses. It must read colour-unknown, never white: white would
+    # let the lane planner treat a centre line as a lane line
+    paint = drive([None, solid((200., 124., 129.)), dashed(WHITE), None])
+    assert paint[1].color == 'unknown' and paint[1].kind == 'solid', paint
+    assert kinds(paint)[2] == ('broken', 'white'), paint

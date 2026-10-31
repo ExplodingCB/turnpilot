@@ -103,6 +103,9 @@ farStatus says it reads (watch_far), at route time too; turnpilotPlan.farCropBea
 the left is in hand (unprotected_left.far_aim), else straight ahead. The far crop going off for the drive (farStatus
 disabled) is said once (controlAlert farViewOff, a status line) and logged; a left needing it then hands back (farOff).
 Its class-9 heads are logged in shadow only (turnpilot.far_light_shadow), never acted on.
+With TurnPilotFarPeds on (off by default), main() runs tracker B beside tracker A (scene/tracker_b.py): the same runs, and the
+far crop's people starting tracks of its own. Its pedestrians tracker A doesn't hold reach the scene policy alone, as objects
+that never confirm: a "pedestrian in path" stop on the comfortable curve at most. turnpilotScene and everything else here are A's.
 Its go is TurnPilot's like any hold's: the left's post-go profile and LEFT_NO_MOVE_S below.
 TurnPilot's go from a standstill (any of the above: a turn its hold let go of, at the line or in the junction, or the left's)
 is certified for plannerd's bounded lift (go_override.py; DESIGN phase 4 decision 1, G5) under TurnPilotGoOverride (on by
@@ -183,6 +186,7 @@ from openpilot.selfdrive.turnpilot.route_notice import RouteNotices
 from openpilot.selfdrive.turnpilot.scene.lane_paint import lane_paint_from_msg
 from openpilot.selfdrive.turnpilot.scene.tracker import (MAX_COAST_S, STALE_S, SWEEP_COAST_S, RawFrame, SceneTracker, default_yaw_rate,
                                                           predicted_path)
+from openpilot.selfdrive.turnpilot.scene.tracker_b import TrackerB
 from openpilot.selfdrive.turnpilot.visibility import OracleLive
 from openpilot.selfdrive.turnpilot.junction_watch import JunctionWatch, detector_view, junction_from_info, sweep_control, sweep_wanted
 from openpilot.selfdrive.turnpilot import visibility_table
@@ -938,11 +942,12 @@ class TurnPilot:
       plan.laneChangeAbort = self.stop_abort
 
   def update(self, sm, scene, enabled: bool, shadow: bool, driver_signals: bool | None = None, right_hand_traffic: bool = True, paint=(),
-             paint_rule: bool = True, inputs_valid: bool = True, raw=None, raw_far=None):
+             paint_rule: bool = True, inputs_valid: bool = True, raw=None, raw_far=None, extra_objects=()):
     """A turnpilotPlan message from sm's carState, navInstruction and modelV2, a TurnpilotScene, and the lane paint of
     modelV2's four lane lines (empty when unknown). paint_rule: TurnPilotLanePaintActive; inputs_valid: carState and
     modelV2 pass their checks; raw: the detector run that arrived this frame (scene.tracker.RawFrame), or None; raw_far:
-    the far crop's run that arrived this frame (view far), or None.
+    the far crop's run that arrived this frame (view far), or None; extra_objects: tracker B's b_only pedestrians (main():
+    TurnPilotFarPeds, scene/tracker_b.py), for the scene policy alone (ScenePolicy.update): everything else reads the scene's.
     driver_signals: None (main) takes it from the turn signal's status, the driver signalling unless the car's own signal
     is ready (car_signals.py); a bool forces it, False then being the openpilot-signals path with no lamp lead gate."""
     self.handback_now = self.scene_now = self.map_now = self.left_now = self.sg_now = None
@@ -1132,7 +1137,7 @@ class TurnPilot:
     self.scene.curb_cap = self.curb_ped_cap
     decision = self.scene_now = self.scene.update(objects, available, scene_m, scene_d, v_ego, right_hand_traffic, scene_id,
                                                  took_over, extra_stops=mapd.stops + left_stops + sg.stops, heading_deg=scene_yaw,
-                                                 path=predicted_path(model))
+                                                 path=predicted_path(model), extra_objects=extra_objects if available else ())
     self.last_holding = decision.holding
     # a TurnPilot stop in force brings the car to rest at or short of the junction (shouldStop at its end: a walker's
     # hold, a red, a stop sign), braking toward it on the speed cap's curve (shouldStop false until about standstill) or
@@ -3096,6 +3101,11 @@ def curb_ped_cap_for(params) -> bool:
   return bool(value)
 
 
+def far_peds_for(params) -> bool:
+  """TurnPilotFarPeds: tracker B (scene/tracker_b.py) beside tracker A; off if unset or unknown to this build's params (said)."""
+  return read_bool(params, "TurnPilotFarPeds", False)
+
+
 def camera_signs_read(params) -> bool:
   """TurnPilotCameraStopSigns isn't off: modeld decodes the class-11 boxes of every forward run (detector/modeld_detector.py
   camera_stop_signs_mode: off reads none; shadow, the default, or anything else, or a build that doesn't know the key, reads
@@ -3257,6 +3267,8 @@ def main():
   rk = Ratekeeper(1. / DT_MDL, print_delay_threshold=None)
   tp = TurnPilot()
   tracker = None
+  tracker_b: TrackerB | None = None  # TurnPilotFarPeds: tracker B beside tracker A (scene/tracker_b.py)
+  far_peds = b_failed = False        # ...b_failed: B raised, dropped for the drive
   enabled = shadow = paint_rule = False
   driver_signals = None  # from the turn signal's status, every frame (car_signals.py)
   right_hand_traffic, disengage_on_accel = True, True
@@ -3288,6 +3300,7 @@ def main():
       tp.go_override = go_override_for(params)
       tp.always_drive = always_drive_for(params)
       tp.curb_ped_cap = curb_ped_cap_for(params)
+      far_peds = far_peds_for(params)
       tp.stop_sign_mode, tp.stop_sign_known = stop_sign_mode_for(params)
       tp.camera_signs = camera_signs_read(params)
       tp.params = params
@@ -3297,6 +3310,7 @@ def main():
         tp.big_model_failed(enabled)
 
     scene_msg = messaging.new_message('turnpilotScene')
+    runs, far = [], None
     try:
       runs = drain.runs()  # every frame, the tracker or not, so nothing piles up
       for r in runs:  # the side views' lens, for the stop-sign decider's mismatch check (stop_go.py: H4)
@@ -3309,7 +3323,8 @@ def main():
         tracker.coast_s = SWEEP_COAST_S if tp.sweeping else MAX_COAST_S
         tracker.update_runs(runs, sm['extrinsicsCalibration'], sm['carState'], sm['modelV2'])
         tp.observe_runs(tracker)
-        tracker.update_far(detector_run(sm, 'turnpilotFarDetections'), sm['extrinsicsCalibration'])
+        far = detector_run(sm, 'turnpilotFarDetections')
+        tracker.update_far(far, sm['extrinsicsCalibration'])
         tracker.fill_scene(scene_msg.turnpilotScene)
     except Exception:
       log_error("turnpilotd.scene_failed")
@@ -3317,6 +3332,20 @@ def main():
     pm.send('turnpilotScene', scene_msg)
 
     scene = scene_msg.as_reader().turnpilotScene
+    # tracker B (TurnPilotFarPeds): the same runs and the far run, after A; its B-only people go to the scene policy alone. Built
+    # with A and dropped with it; one that raises is said once and dropped for the drive, A carrying on
+    extra = []
+    if far_peds and tracker is not None and not b_failed:
+      try:
+        if tracker_b is None:
+          device_type = str(sm['deviceState'].deviceType)
+          tracker_b = TrackerB(SceneTracker(DEVICE_CAMERAS[(device_type, str(sm['narrowRoadCameraState'].sensor))], device_type))
+        extra = tracker_b.step(runs, far, sm['extrinsicsCalibration'], sm['carState'], sm['modelV2'], tracker, scene)
+      except Exception:
+        log_error("turnpilotd.tracker_b_failed")
+        tracker_b, b_failed, extra = None, True, []
+    else:
+      tracker_b = None
     paint = plan_paint(sm['turnpilotDetections'] if sm.seen['turnpilotDetections'] else None, scene.available)
     # the lane planner takes this frame's checks (an offered change aborts at once); the plan's valid has a grace
     valid = sm.all_checks(['carState', 'modelV2'])
@@ -3327,7 +3356,13 @@ def main():
       raw = tracker.raw_by_view.get('road') if 'road' in tracker.new_views else tracker.raw if tracker.raw_new else None
     raw_far = tracker.raw_far if tracker is not None and tracker.raw_far_new else None  # ...and the far crop's
     msg = tp.plan(sm, scene, enabled, shadow, driver_signals, right_hand_traffic, paint, paint_rule, valid, long_control=long_control,
-                  disengage_on_accel=disengage_on_accel, raw=raw, raw_far=raw_far)
+                  disengage_on_accel=disengage_on_accel, raw=raw, raw_far=raw_far, extra_objects=extra)
+    if tracker_b is not None:
+      try:  # the B-only people the plan stopped for, counted and logged (turnpilot.tracker_b, turnpilot.tracker_b_stop)
+        tracker_b.after_plan(tp.scene.carried if tp.scene_now is not None else (), max(float(sm['carState'].vEgo), 0.))
+      except Exception:
+        log_error("turnpilotd.tracker_b_failed")
+        tracker_b, b_failed = None, True
     invalid_frames = 0 if valid else invalid_frames + 1
     msg.valid = invalid_frames < PLAN_INPUT_GRACE_FRAMES
     pm.send('turnpilotPlan', msg)

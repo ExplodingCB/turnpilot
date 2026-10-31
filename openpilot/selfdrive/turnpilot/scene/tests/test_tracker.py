@@ -6,11 +6,11 @@ from openpilot.cereal import messaging
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.selfdrive.turnpilot.detector.decoder import CAR, PERSON, fill_detections
-from openpilot.selfdrive.turnpilot.scene.ranging import calib_from_view
+from openpilot.selfdrive.turnpilot.scene.ranging import calib_from_view, camera_height, ground_point
 from openpilot.selfdrive.turnpilot.scene import tracker as tracker_module
 from openpilot.selfdrive.turnpilot.scene.tracker import (CLASS_GROUP, CLOSE_HOLD_MIN_HITS, CLOSE_HOLD_S, GROUND_GATE_FRAC, GROUND_GATE_M,
-                                                         HIGH_CONF, IOU_FIRST, IOU_SECOND, MAX_COAST_S, MAX_TRACKS, PATH_X, Measurement,
-                                                         SceneTracker, Track, greedy_match, iou, predicted_path)
+                                                         HIGH_CONF, IOU_FIRST, IOU_SECOND, MAX_COAST_S, MAX_TRACKS, PATH_X, PERSON_GH_NEAR_M,
+                                                         PERSON_HEIGHT, Measurement, SceneTracker, Track, greedy_match, iou, predicted_path)
 
 CAMS = DEVICE_CAMERAS[('mici', 'os04c10')]
 RPY, WIDE_EULER, HEIGHT = [0.0, 0.03, 0.01], [0.0, 0.005, -0.003], 1.3
@@ -38,10 +38,17 @@ CROSSWALK_PEDESTRIAN = [(912.45, 0.84, (356, 154, 401, 255)), (912.50, 0.81, (32
                         (912.60, 0.86, (254, 154, 305, 256)), (912.65, 0.81, (216, 154, 269, 257))]
 
 
-def calibration(demo=False):
+# public comma four route 49d0fc1df3e7320b/00000002--d2df953add, segment 14, frame 82: its calibration and the full pass's box of a
+# traffic mirror's reflection in the hood that YOLO called a person (conf 0.38): 3.3 m by ground contact and 0.19 m tall. It matched
+# a real person's confirmed track 3 m to the right, moved it into the path and ramped a hard stop to -7 m/s^2 (peds P1)
+HOOD_CALIBRATION = ([-0.000104, 0.04508, -0.005989], WIDE_EULER, 1.206)
+HOOD_REFLECTION = (1037.7, 694.8, 1096.4, 760.0)
+
+
+def calibration(demo=False, values=None):
   msg = messaging.new_message('extrinsicsCalibration')
   cal = msg.extrinsicsCalibration
-  rpy, wide, height = DEMO_CALIBRATION if demo else (RPY, WIDE_EULER, HEIGHT)
+  rpy, wide, height = values if values is not None else DEMO_CALIBRATION if demo else (RPY, WIDE_EULER, HEIGHT)
   cal.rpyCalib, cal.wideFromDeviceEuler, cal.height = rpy, wide, [height]
   cal.calStatus = 'calibrated'
   return msg.as_reader().extrinsicsCalibration
@@ -630,3 +637,63 @@ def test_a_run_before_calibration_is_no_run_never_a_clear_one():
   trk = SceneTracker(CAMS, 'mici')
   trk.update_runs([d(trk, 1., 0)], calibration(), car_state(), now=1.)
   assert trk.raw_new and len(trk.raw.boxes) == 1 and trk.available
+
+
+def person_run(boxes, camera='road', t=1., frame_id=0):
+  """A run of person boxes (x0, y0, x1, y1, conf), in the camera's pixels."""
+  rows = np.array([[*b[:4], b[4], PERSON] for b in boxes], dtype=np.float32).reshape(-1, 6)
+  msg = messaging.new_message('turnpilotDetections')
+  fill_detections(msg.turnpilotDetections, rows, frame_id, int(t * 1e9), camera, 0.005)
+  return msg.as_reader().turnpilotDetections
+
+
+def ground_range(trk, camera, cal, u, v):
+  """m from the camera, on the ground, to the ground point at pixel (u, v)."""
+  wide_euler = list(cal.wideFromDeviceEuler) if camera == 'wide' else None
+  return float(np.hypot(*ground_point(trk.lenses[camera], calib_from_view(list(cal.rpyCalib), wide_euler), camera_height(cal), u, v)))
+
+
+def person_box(trk, camera, x, tall, wide=0.6, conf=0.6):
+  """The box of something `tall` m high and `wide` m across standing x m straight ahead, on the test calibration."""
+  x0, _, x1, v = box(trk, camera, PERSON, x, 0.)
+  u, scale = (x0 + x1) / 2, trk.lenses[camera].f / x
+  return (u - wide * scale / 2, v - tall * scale, u + wide * scale / 2, v, conf)
+
+
+def test_a_hood_reflection_is_no_person_and_starts_no_track():
+  # peds P1: a box under MIN_PERSON_GROUND_HEIGHT_NEAR tall where its feet are, nearer than PERSON_GH_NEAR_M, is no person. A
+  # real person within 8 m is about 140 px or more tall on the road camera; in 11,596 comma four person boxes none read under
+  # 1.0 m that near. The reflection is too short for MIN_PERSON_ASPECT and MAX_PERSON_GROUND_HEIGHT to catch (h/w 1.11)
+  cal, trk = calibration(values=HOOD_CALIBRATION), SceneTracker(CAMS, 'mici')
+  f, (x0, y0, x1, y1) = trk.lenses['road'].f, HOOD_REFLECTION
+  rng = ground_range(trk, 'road', cal, (x0 + x1) / 2, y1)
+  assert rng < PERSON_GH_NEAR_M and abs(rng * (y1 - y0) / f - 0.19) < 0.01
+  assert not trk.measure(person_run([(*HOOD_REFLECTION, 0.38)]).detections[0], 'road', cal).plausible
+  for i in range(6):  # at any confidence: it never starts a track, so nothing stands 3 m ahead
+    trk.update(person_run([(*HOOD_REFLECTION, 0.8)], t=1. + 0.1 * i, frame_id=i), cal, car_state(), now=1. + 0.1 * i)
+  assert trk.tracks == []
+  # a person standing at the same spot, 1.7 m tall there, is a person and starts a track
+  tall = ((x0 + x1) / 2 - 0.3 * f / rng, y1 - PERSON_HEIGHT * f / rng, (x0 + x1) / 2 + 0.3 * f / rng, y1)
+  trk = SceneTracker(CAMS, 'mici')
+  assert trk.measure(person_run([(*tall, 0.38)]).detections[0], 'road', cal).plausible
+  for i in range(3):
+    tracks = trk.update(person_run([(*tall, 0.8)], t=1. + 0.1 * i, frame_id=i), cal, car_state(), now=1. + 0.1 * i)
+  assert len(tracks) == 1 and tracks[0].x[0] < PERSON_GH_NEAR_M
+
+
+def test_the_near_ground_height_bound_takes_short_boxes_only_within_8_m():
+  # peds P1's bound reaches PERSON_GH_NEAR_M: inside it a box 0.4 m tall at its feet is no person, past it (9-11 m, where a
+  # child or someone half behind a car may read that short) it stays one. A person 1.7 m tall stays one at any range, on either lens
+  cal, trk = calibration(), SceneTracker(CAMS, 'mici')
+
+  def measured(camera, b):
+    rng = ground_range(trk, camera, cal, (b[0] + b[2]) / 2, b[3])
+    return rng, rng * (b[3] - b[1]) / trk.lenses[camera].f, trk.measure(person_run([b], camera).detections[0], camera, cal)
+  for x, plausible in ((5., False), (7.5, False), (9., True), (10., True), (11., True)):
+    rng, gh, m = measured('road', person_box(trk, 'road', x, tall=0.4, wide=0.3))
+    assert abs(gh - 0.4) < 0.05 and (rng < PERSON_GH_NEAR_M) != plausible, (x, rng, gh)
+    assert m.plausible == plausible and (m.xy is not None), (x, rng, gh)
+  for camera in ('road', 'wide'):
+    for x in (2., 5., 8., 15., 25., 40.):
+      rng, gh, m = measured(camera, person_box(trk, camera, x, tall=PERSON_HEIGHT))
+      assert m.plausible and abs(gh - PERSON_HEIGHT) < 0.15, (camera, x, rng, gh)

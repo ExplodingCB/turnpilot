@@ -260,9 +260,12 @@ Later on 2026-10-27 (H3), same setup, 19.2-20.0 model runs a second in every run
 
 ## Map stops and signals
 
-The driving model doesn't stop for red lights (0 of 31 in the phase 3 eval) and rarely for stop signs, so TurnPilot stops
-for the route's mapped controls (`selfdrive/turnpilot/map_controls.py`). In the sim the controls come from tiles built
-with the level's own stop signs and signals:
+TurnPilot stops for the route's mapped controls (`selfdrive/turnpilot/map_controls.py`). In the phase 3 eval the driving
+model rarely stopped for stop signs, sim evidence only. It stopped at 0 of 31 reds too, a count that says nothing about real
+roads: BeamNG renders a red lamp salmon (hue 18-20 deg, saturation 0.31-0.33, against 349-354 deg and 0.67-0.83 for real
+comma four red heads), and the fork's own light reader read no colour on any of 184 BeamNG light boxes (lights r2,
+2026-10-30). The big model's red behaviour on real roads is unmeasured until Saturday's log. In the sim the controls come
+from tiles built with the level's own stop signs and signals:
 
 ```bash
 tools/turnpilot/build_sim_tiles.sh   # -> ~/turnpilot_data/valhalla/west_coast_usa_signals (seconds, no game needed)

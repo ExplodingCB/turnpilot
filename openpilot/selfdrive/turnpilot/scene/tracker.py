@@ -16,6 +16,10 @@ says which bearings it covered at the horizon (cover_deg). A far box matching a 
 farHits) and does nothing else: it never starts a track, never counts as a hit (TrackedObject.age, which a hard stop's
 confirmation reads: scene_policy), never moves the filter, never keeps a track alive, never makes the scene fresh. So the
 full pass alone feeds every stop, as before the far crop.
+Tracker B (scene/tracker_b.py, TurnPilotFarPeds) is a second SceneTracker that also takes the far crop's people and two-wheelers
+through update_tiles: they start and extend its tracks, and nothing of freshness is theirs. Only its pedestrians no tracker A
+pedestrian holds reach the scene policy, as objects that can never confirm (scene_policy.B_ID); tracker A, turnpilotScene and
+everything that reads them are as above.
 
 The stop sweep's runs (STOP_SIGNS.md 1.3, SG3b) say their view too: a side view's boxes (sideLeft, sideRight) are in the wide
 camera's fisheye pixels, so they range, bear and match as the wide camera's. The latest RawFrame of each view is kept in
@@ -72,13 +76,27 @@ PERSON_HEIGHT = 1.7      # m: a pedestrian's range is the nearer of the ground a
 MIN_PERSON_ASPECT = 1.0  # box h/w: the overpass pillar and bush read 0.45-0.52, real pedestrians 1.8-3.8, the cyclist (a person
                          # box) 1.39-1.64
 MAX_PERSON_GROUND_HEIGHT = 12.  # m, ground range x box height / focal length: pedestrians with visible feet read 1.5-2.8 m, the
-                                # cyclist, whose box ends a few px under the horizon, 7.6-9.8 m, the pillar 14-33 m. No lower bound:
-                                # there's no example of a too-short person box to set one from
+                                # cyclist, whose box ends a few px under the horizon, 7.6-9.8 m, the pillar 14-33 m
+# ...and a lower bound near the car (peds P1): a person box ranged nearer than PERSON_GH_NEAR_M by its ground contact and under this
+# tall there is a reflection in the hood or windshield. Public comma four route 49d0fc1df3e7320b/00000002--d2df953add segment 14
+# frame 82: a traffic mirror's reflection at the hood's edge, 3.3 m and 0.19 m tall, matched a real person's confirmed track 3 m to
+# the right, moved it into the path and ramped a hard stop to -7 m/s^2. A real person within 8 m is about 140 px tall or more on
+# the road camera, and in 11,596 comma four person boxes none read under 1.0 m that near; farther out a child or someone half
+# behind a car may read that short, so the bound stops at PERSON_GH_NEAR_M
+MIN_PERSON_GROUND_HEIGHT_NEAR = 0.6  # m
+PERSON_GH_NEAR_M = 8.0               # m
 # every run's boxes, tracked or not, for the unprotected left's gap rule (unprotected_left.py; CRITIQUE REQUIRED 2): a box's
 # nearest plausible range is its ground range with the box bottom this many pixels lower (about 1.5 px at the YOLO input)
 NEAR_PX = 3.
 FAR_COVER_MARGIN_PX = 16  # a far run covers its bearings only with the horizon this far inside its rows (the band's far cars are
                           # within ~10 px under it)
+# tracker B (update_tiles, TurnPilotFarPeds: scene/tracker_b.py): the far crop's boxes of these classes start and extend its tracks.
+# A box within EDGE_PX of a crop edge that isn't also the frame's (left, right or bottom: a cut body or clipped feet range wrong) is
+# dropped; one cut by the crop's top keeps its feet, so its ground range holds (the peds replays measured the rule so). Boxes of one
+# run overlapping by TILE_NMS_IOU in a class group are one, the most confident kept (vtrack.merge_tiles, as measured)
+TILE_CLASSES = (PERSON, BICYCLE, MOTORCYCLE)
+EDGE_PX = 4.
+TILE_NMS_IOU = 0.5
 ACCEL_STD = 3.0          # m/s^2, the filter's process noise
 VEL_STD0 = 5.0           # m/s, a new track's velocity uncertainty
 
@@ -270,6 +288,7 @@ class SceneTracker:
                                                 # sectors [(inner, outer, quality)]), for the stop-sign evidence
     self.coast_s = MAX_COAST_S                  # SWEEP_COAST_S while a stop sweep runs (turnpilotd)
     self.uncalibrated = False                   # runs are coming before calibration (update(): no runs), logged once a spell
+    self.tile_key: tuple | None = None          # the latest far run update_tiles took (tracker B)
 
   def measure(self, det, camera: str, calibration) -> Measurement:
     box = np.array([det.x0, det.y0, det.x1, det.y1], dtype=np.float64)
@@ -291,6 +310,9 @@ class SceneTracker:
     if m.cls == PERSON and box[3] > box[1]:
       rng, rng_h = float(np.hypot(*m.xy)), PERSON_HEIGHT * lens.f / (box[3] - box[1])
       if rng * (box[3] - box[1]) / lens.f > MAX_PERSON_GROUND_HEIGHT:
+        m.plausible = False
+        return m
+      if rng < PERSON_GH_NEAR_M and rng * (box[3] - box[1]) / lens.f < MIN_PERSON_GROUND_HEIGHT_NEAR:
         m.plausible = False
         return m
       if rng_h < rng:
@@ -514,6 +536,63 @@ class SceneTracker:
     for i, _ in greedy_match(np.where(same_group, iou(predicted, boxes), -1.), IOU_FIRST):
       tracks[i].far_hits += 1
       tracks[i].view = 'far'
+
+  def update_tiles(self, far, calibration, car_state=None, model_v2=None, now: float | None = None,
+                   yaw_rate: float | None = None) -> None:
+    """Tracker B's far crop (scene/tracker_b.py, TurnPilotFarPeds; never tracker A's, which takes update_far). far: the latest
+    TurnpilotFarDetections (None before the first). A new run's boxes of TILE_CLASSES (tile_boxes: the crop-edge rule, one box of
+    an overlapping group) are measured (measure, every plausibility bound with it) and associated with the tracks as update()
+    does: a matched track is corrected (view far), and an unmatched box at NEW_TRACK_CONF or more, ranged, starts one.
+    Nothing that makes the scene fresh or says what a run saw changes (last_recv, last_key, last_t, raw, raw_new, raw_by_view,
+    new_views, new_runs, raw_far, far_key), nor any track's missed runs (a far match is no forward run of the full pass), so
+    staleness and the detectorStopped handback stay the full pass's. A run seen already (the far crop's 10 Hz through a 20 Hz
+    loop), before calibration, without its crop, or older than the newest full-pass run taken (the filter only moves forward:
+    tracker_b.TrackerB takes a frame's runs in camera-time order around it) is no run. car_state, model_v2, yaw_rate: as
+    update()'s, to predict the tracks to the run's time and say which are in the path; now, as update_far's, is never read."""
+    run = far.run if far is not None else None
+    key = (run.frameId, run.timestampEof) if run is not None else None
+    if key is None or key == self.tile_key or run.timestampEof <= 0:
+      return
+    self.tile_key = key
+    t = run.timestampEof * 1e-9
+    if not is_calibrated(calibration) or len(far.crop) != 4 or (self.last_t is not None and t < self.last_t):
+      return
+    v_ego = float(car_state.vEgo) if car_state is not None else 0.0
+    if yaw_rate is None:
+      yaw_rate = default_yaw_rate(car_state, model_v2)
+    for trk in self.tracks:
+      self.predict(trk, t, v_ego, yaw_rate)
+    meas = [m for m in (self.measure(d, 'road', calibration) for d in self.tile_boxes(run.detections, tuple(far.crop))) if m.plausible]
+    pairs, unmatched = self.associate(meas, 'road')
+    for i, j in pairs:
+      trk = self.tracks[i]
+      misses = trk.misses
+      self.correct(trk, meas[j], 'road', t, 'far')
+      trk.misses = misses
+    for j in unmatched:
+      if meas[j].conf >= NEW_TRACK_CONF and meas[j].xy is not None:
+        self.new_track(meas[j], 'road', t, 'far')
+    self.tracks = [trk for trk in self.tracks if t - trk.t_seen <= max(MAX_AGE_S, self.hold_s(trk))]
+    if len(self.tracks) > MAX_TRACKS:
+      self.tracks = sorted(self.tracks, key=lambda trk: (trk.t_seen + self.hold_s(trk), trk.hits), reverse=True)[:MAX_TRACKS]
+    self.update_in_path(model_v2)
+
+  def tile_boxes(self, detections, crop: tuple) -> list:
+    """The far run's detections update_tiles takes: of TILE_CLASSES, none within EDGE_PX of a crop edge that isn't also the
+    frame's (the top edge excepted: TILE_CLASSES' comment), and of boxes overlapping by TILE_NMS_IOU in a class group only the
+    most confident."""
+    w, h = self.sizes['road']
+    x0, _, x1, y1 = crop
+    kept = sorted((d for d in detections if int(d.cls) in TILE_CLASSES and not (
+      (x0 > 0 and d.x0 <= x0 + EDGE_PX) or (x1 < w and d.x1 >= x1 - EDGE_PX) or (y1 < h and d.y1 >= y1 - EDGE_PX))), key=lambda d: -d.conf)
+    out: list = []
+    for d in kept:
+      box = np.array([[d.x0, d.y0, d.x1, d.y1]], dtype=np.float64)
+      same = [o for o in out if CLASS_GROUP[int(o.cls)] == CLASS_GROUP[int(d.cls)]]
+      if same and (iou(box, np.array([[o.x0, o.y0, o.x1, o.y1] for o in same], dtype=np.float64)) >= TILE_NMS_IOU).any():
+        continue
+      out.append(d)
+    return out
 
   def far_cover(self, crop, rot: np.ndarray) -> tuple | None:
     """(right, left) bearings of the far crop's edges at the horizon, None if the horizon isn't FAR_COVER_MARGIN_PX inside it."""
