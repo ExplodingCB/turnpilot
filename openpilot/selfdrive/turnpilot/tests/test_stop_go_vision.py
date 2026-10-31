@@ -16,6 +16,7 @@ from openpilot.selfdrive.turnpilot.routing.tests.test_certify import ETA, two_wa
 from openpilot.selfdrive.turnpilot.stop_evidence import CAR_HALF_LEN_M, DEFAULT_LINE_M, junction_lanes
 from openpilot.selfdrive.turnpilot.tests.test_stop_evidence import track as ev_track
 from openpilot.selfdrive.turnpilot.tests.test_stop_go import Drive, World, arrived_at, first_go, raw_box, rolling
+from openpilot.selfdrive.turnpilot.visibility import OracleLive
 
 MPH = sr.MPH
 SHIPPED = vt.load(vt.SHIPPED)
@@ -661,3 +662,28 @@ def test_vision_a_person_turnpilot_lost_in_front_is_the_front_zone_no_go_and_h7_
   w = vworld(tmp_path, 25)
   assert first_go(w.run(5., person_front=True)) is None
   assert first_go(w.run(6.)) is not None
+
+
+# ------------------------------------------------------------------------------------- the stand past the line (re-run R7)
+
+@pytest.mark.parametrize('past_m,goes', [(1.01, True), (0.2, True), (1.8, False)])
+def test_vision_a_stand_past_the_line_still_goes_across_an_empty_junction(tmp_path, past_m, goes):
+  # the re-run at 6ba8582 (R7, stop_allway_empty): the bridge's low-speed overshoot (-4.9 measured for -2.0 asked) stood the car
+  # 1.01 m past the mapped line, 2.29 m from dEdgeMin (3.30 unsurveyed); the junction read clear, "Going" was said, and the go
+  # handed back on its frame (H5 "no room for a go: 2.29 m to the closest edge, 2.48 needed"). Under vision a go needs the room
+  # for its abort after a VISION_NUDGE_M nudge, the gate point judged live on the launch as ever: from 1.01 m past (and the
+  # morning's 0.2 m) it goes across, every stop -2.0 or gentler; from 1.8 m past (1.5 m left) no go can start: H5, held. The
+  # run's live view is the sim's cross oracle (every lane seen to 60 m, as R7's decider read it)
+  w = vdrive(tmp_path, 25, d0=-past_m)
+  w.kw['live'] = OracleLive(60.)
+  out = w.run(20.)
+  room = w.sg.edges.d_min - past_m
+  assert abs(w.sg.edges.d_min - 3.30) < 0.01
+  if past_m > 1.:
+    assert room < sr.go_room_m(w.kw['t_abort'])  # R7's own shortfall
+  assert all(s.accel_cap >= -2. - 1e-9 for d in out for s in d.stops)
+  if goes:
+    assert first_go(out) is not None and not any(d.fault for d in out), [(d.state, d.fault, d.reason) for d in out[::20]]
+    assert any(d.state == 'done' for d in out)
+  else:
+    assert first_go(out) is None and out[-1].fault == 'H5' and out[-1].prompt == 'stopSignTakeControl'
