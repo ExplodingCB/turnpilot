@@ -2,6 +2,8 @@ import math
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_ACCEL_MIN as MAP_DECEL_MAX, plan_accel
 from openpilot.selfdrive.turnpilot.route_follower import NOMINAL_ANGLE_DEG, Maneuver, classify
@@ -1046,3 +1048,415 @@ def test_tracker_bs_stop_never_asks_for_more_than_stop_decel_the_speed_caps_lag_
     d = sp.update([], False, None, 1000., v)
     assert d.reason == "pedestrian in path" and plan_accel(d.accel_cap, d.speed_cap, v) >= -STOP_DECEL - 1e-9
   assert sp.carried and all(s.soft for s in sp.carried)
+
+
+# --- a person who may be in front (WARGAME_FIXES WF-13; BeamNG SAT validation row 6: ScenePolicy.person_front) ---
+
+RUN6_HIT, RUN6_COAST_V = (3.31, -1.14), (0.18, -0.09)  # track 1's last hit, and the velocity it coasted on unmatched for 3 s
+
+
+class Person:
+  """One pedestrian track as the tracker publishes it at 20 Hz: a new hit on every detector run (10 Hz) while seen, its age
+  frozen while it coasts."""
+  def __init__(self, track_id=1, age=6, conf=0.8):
+    self.track_id, self.age, self.conf, self.k = track_id, age, conf, 0
+
+  def seen(self, x, y, cls='pedestrian', **fields):
+    self.k += 1
+    self.age += self.k % 2 == 0
+    return self.coasting(x, y, cls=cls, **fields)
+
+  def coasting(self, x, y, cls='pedestrian', **fields):
+    return {'trackId': self.track_id, 'cls': cls, 'x': x, 'y': y, 'age': self.age, 'conf': self.conf, 'inPath': abs(y) < 1.5,
+            **fields}
+
+
+def front_frames(sp, seconds, objects=lambda k: (), v=0., raw_people=False, driver=False, available=True, path=None):
+  ds = []
+  for k in range(round(seconds / DT_MDL)):
+    sc = scene(list(objects(k)), available)
+    ds.append(sp.update(sc.objects, sc.available, None, 1000., v, path=path, driver=driver, raw_people=raw_people))
+  return ds
+
+
+def run6_lost(sp=None):
+  """Run 6 in ScenePolicy alone: the car standing, track 1 seen at its last hit for 2 s, coasting 3 s with no hits on its last
+  velocity, then gone. Returns (sp, the coast's decisions, the gone frame's)."""
+  sp = sp or ScenePolicy()
+  her = Person()
+  front_frames(sp, 2., lambda k: [her.seen(*RUN6_HIT)])
+  coast = front_frames(sp, 3., lambda k: [her.coasting(RUN6_HIT[0] + RUN6_COAST_V[0] * k * DT_MDL,
+                                                      RUN6_HIT[1] + RUN6_COAST_V[1] * k * DT_MDL)])
+  return sp, coast, front_frames(sp, DT_MDL)[0]
+
+
+def test_run_6_a_confirmed_person_lost_in_front_of_the_standing_car_holds_it_from_the_frame_her_track_ends():
+  from openpilot.selfdrive.turnpilot.scene_policy import PERSON_FRONT_NOTE
+  with mock.patch('openpilot.selfdrive.turnpilot.scene_policy.cloudlog') as log:
+    sp, coast, gone = run6_lost()
+  assert all(d.should_stop and d.reason == "pedestrian in path" for d in coast)
+  assert sp.person_front is not None and gone.should_stop and gone.reason == PERSON_FRONT_NOTE
+  assert gone.speed_cap == 0. and gone.accel_cap == NO_ACCEL_CAP and not gone.hard_brake and gone.rest_d == 0.
+  ev, = [c.kwargs for c in log.event.call_args_list if c.args[0] == "turnpilot.person_front"]
+  assert (ev['track_id'], ev['hit_x'], ev['hit_y'], ev['earned']) == (1, 3.31, -1.14, True) and ev['error']
+  later = front_frames(sp, 30.)  # nothing seen of her: held, whatever the time (turnpilotd hands back at its bound)
+  assert all(d.should_stop and d.reason == PERSON_FRONT_NOTE for d in later)
+
+
+def test_its_hold_brings_a_slow_car_to_rest_on_the_comfortable_curve_and_none_is_set_faster():
+  """A confirmed walker beside the path, 2 m right (no stop for her: off the corridor, inside its margin), lost about 6 m ahead
+  with the car rolling at 1.8 m/s: braked to rest no harder than STOP_DECEL, no accel cap, never the hard tier. At 2.5 m/s,
+  over PERSON_FRONT_SPEED, nothing is set."""
+  from openpilot.selfdrive.turnpilot.scene_policy import PERSON_FRONT_NOTE, PERSON_FRONT_SPEED
+  for v0, latched in ((1.8, True), (PERSON_FRONT_SPEED + 0.5, False)):
+    sp, her, v, s = ScenePolicy(), Person(age=10), v0, 0.
+    for _ in range(20):  # seen, the car at v0 (nothing of hers slows it)
+      sc = scene([her.seen(8. - s, -2.0)])
+      d = sp.update(sc.objects, True, None, 1000., v)
+      assert not d.holding and sp.person_front is None, v0
+      s += v * DT_MDL
+    ds, accels = [], []
+    for _ in range(round(4. / DT_MDL)):  # lost: the car under the plan's limits
+      d = sp.update([], True, None, 1000., v, raw_people=False)
+      a = plan_accel(d.accel_cap, d.speed_cap, v)
+      ds.append(d)
+      accels.append(a)
+      v = max(v + max(min(a if not d.should_stop else min(a, -1.), 0.), -3.5) * DT_MDL, 0.)  # longcontrol's stopping state
+    assert (sp.person_front is not None) is latched, v0
+    if latched:
+      assert ds[0].reason == PERSON_FRONT_NOTE and v == 0. and ds[-1].should_stop
+      assert min(accels) >= -STOP_DECEL - 1e-6 and all(d.accel_cap == NO_ACCEL_CAP and not d.hard_brake for d in ds)
+    else:
+      assert v == v0 and not any(d.holding for d in ds)
+
+
+def seen_back_and_walking_out(sp, raw_people=False, extra=lambda k: [], to_y=-3.5):
+  """After run 6's loss: nothing for 1 s, then a new track where she was for 1 s, then walking out to the right at 1.2 m/s and
+  standing at to_y, seen. Returns (the decisions from her walk on, the frame index she was first clear of the corridor, the
+  frame index she was seen leaving it: PERSON_FRONT_LEAVING_HITS new hits in a row clear, None if never)."""
+  back = Person(track_id=2, age=2)
+  front_frames(sp, 1., raw_people=raw_people)
+  front_frames(sp, 1., lambda k: [back.seen(*RUN6_HIT)] + extra(k), raw_people=raw_people)
+  ys = [max(RUN6_HIT[1] - 1.2 * (k + 1) * DT_MDL, to_y) for k in range(round(6. / DT_MDL))]
+  ds, left_k = [], None
+  for k, y in enumerate(ys):
+    sc = scene([back.seen(RUN6_HIT[0], y)] + extra(k))
+    ds.append(sp.update(sc.objects, sc.available, None, 1000., 0., raw_people=raw_people))
+    if left_k is None and (sp.person_front is None or sp.person_front.left):
+      left_k = k
+  return ds, next(k for k, y in enumerate(ys) if y <= -2.5 - 1e-9), left_k
+
+
+def test_seen_again_and_walking_clear_of_the_corridor_it_lets_go_after_2_s_of_nothing_in_front():
+  """Seen leaving is PERSON_FRONT_LEAVING_HITS new hits in a row clear of the corridor (0.4 s of 10 Hz runs from her first
+  clear one); it lets go PERSON_FRONT_CLEAR_S after."""
+  from openpilot.selfdrive.turnpilot.scene_policy import PERSON_FRONT_CLEAR_S, PERSON_FRONT_LEAVING_HITS
+  sp, _, _ = run6_lost()
+  with mock.patch('openpilot.selfdrive.turnpilot.scene_policy.cloudlog') as log:
+    ds, clear_k, left_k = seen_back_and_walking_out(sp)
+  free = next(k for k, d in enumerate(ds) if not d.should_stop)
+  assert (left_k - clear_k) * DT_MDL == pytest.approx((PERSON_FRONT_LEAVING_HITS - 1) * 2 * DT_MDL, abs=0.06)
+  assert (free - left_k + 1) * DT_MDL == pytest.approx(PERSON_FRONT_CLEAR_S, abs=0.06) and sp.person_front is None
+  names = [c.args[0] for c in log.event.call_args_list]
+  assert "turnpilot.person_front_leaving" in names and log.event.call_args_list[-1].kwargs['why'] == 'left'
+
+
+def test_no_clock_while_a_raw_person_box_is_in_front_or_raw_boxes_arent_known_or_the_scene_is_stale():
+  for raw_people in (True, None):
+    sp, _, _ = run6_lost()
+    ds, _, _ = seen_back_and_walking_out(sp, raw_people=raw_people)
+    assert all(d.should_stop for d in ds) and sp.person_front is not None, raw_people
+  # seen leaving, then the scene stale for 5 s: no clock; back live, 2 s more
+  sp, _, _ = run6_lost()
+  seen_back_and_walking_out(sp, to_y=-3.5)
+  assert sp.person_front is None  # control: the clock ran
+  sp, _, _ = run6_lost()
+  back = Person(track_id=2, age=2)
+  front_frames(sp, 1., lambda k: [back.seen(*RUN6_HIT)])
+  front_frames(sp, 0.5, lambda k: [back.seen(RUN6_HIT[0], -3.0)])
+  assert sp.person_front.left
+  assert all(d.should_stop for d in front_frames(sp, 5., available=False))
+  assert sp.person_front is not None and sp.person_front.clear_s < 1.5
+
+
+def test_a_coast_drifting_out_someone_tracked_elsewhere_or_a_cyclist_in_front_never_clears_it():
+  # her new track's coast (no hits) drifting out of the corridor is no sighting of her leaving
+  sp, _, _ = run6_lost()
+  back = Person(track_id=2, age=2)
+  front_frames(sp, 1., lambda k: [back.seen(*RUN6_HIT)])
+  front_frames(sp, 0.4, lambda k: [back.coasting(RUN6_HIT[0], RUN6_HIT[1] - 1.2 * k * DT_MDL)])
+  assert not sp.person_front.left
+  assert all(d.should_stop for d in front_frames(sp, 5.))
+  # a walker the tracker had elsewhere when she was lost (at the kerb), walking in front and out again: someone else
+  sp = ScenePolicy()
+  her, other = Person(), Person(track_id=5, age=20)
+  front_frames(sp, 2., lambda k: [her.seen(*RUN6_HIT), other.seen(6., -4.)])
+  front_frames(sp, 3., lambda k: [her.coasting(*RUN6_HIT), other.seen(6., -4.)])
+  front_frames(sp, DT_MDL, lambda k: [other.seen(6., -4.)])
+  assert sp.person_front is not None
+  front_frames(sp, 1., lambda k: [other.seen(6., -1.)])
+  assert all(d.should_stop for d in front_frames(sp, 6., lambda k: [other.seen(6., -4.)]))
+  # seen leaving, but a cyclist in front keeps the clock at 0
+  sp, _, _ = run6_lost()
+  bike = Person(track_id=9, age=10)
+  ds, _, _ = seen_back_and_walking_out(sp, extra=lambda k: [bike.seen(7., 0.5, cls='cyclist')])
+  assert all(d.should_stop for d in ds)
+
+
+def test_the_driver_ends_it_and_while_driving_sets_none():
+  sp, _, _ = run6_lost()
+  with mock.patch('openpilot.selfdrive.turnpilot.scene_policy.cloudlog') as log:
+    d, = front_frames(sp, DT_MDL, driver=True)
+  assert sp.person_front is None and not d.holding and log.event.call_args_list[-1].kwargs['why'] == 'driver'
+  sp = ScenePolicy()
+  her = Person()
+  front_frames(sp, 2., lambda k: [her.seen(*RUN6_HIT)], driver=True)
+  assert not front_frames(sp, 1., driver=True)[-1].holding and sp.person_front is None
+  assert not front_frames(sp, 1.)[-1].holding  # nor once re-engaged: her track ended with the driver driving
+
+
+def test_a_track_ending_further_out_off_the_corridor_unconfirmed_and_unstopped_for_or_walked_clear_sets_none():
+  from openpilot.selfdrive.turnpilot.scene_policy import PERSON_FRONT_X_M
+  def ended(make, seconds=2.):
+    sp = ScenePolicy()
+    front_frames(sp, seconds, lambda k: [make()])
+    front_frames(sp, 1.)
+    return sp.person_front
+  her = Person()
+  assert ended(lambda: her.seen(PERSON_FRONT_X_M + 0.5, 0.)) is None   # further out, in the path
+  her = Person()
+  assert ended(lambda: her.seen(4., -2.6)) is None                     # 4 m ahead, off the corridor by more than its margin
+  weak = Person(age=1, conf=0.5)
+  assert ended(lambda: weak.seen(4., -2.0), seconds=0.3) is None       # unconfirmed and no stop for it
+  weak = Person(age=1, conf=0.5)
+  assert ended(lambda: weak.seen(4., -0.5), seconds=0.3) is None       # unconfirmed, the car already standing: no stop of TurnPilot's for it
+  her, ys = Person(), iter([RUN6_HIT[1] - 0.06 * k for k in range(200)])
+  assert ended(lambda: her.seen(RUN6_HIT[0], next(ys))) is None        # seen walking out to 3.5 m right, then lost
+
+
+def test_in_front_reads_the_model_path_and_the_tracker_corridor():
+  from openpilot.selfdrive.turnpilot.scene_policy import clear_of_path, in_front
+  path = ([0., 10., 20.], [0., -3., -6.])  # the model's path bending right
+  assert not in_front(6., -3.5, False) and in_front(6., -3.5, False, path) and in_front(6., -3.5, True)
+  assert clear_of_path(6., 3.0, False, path) and not clear_of_path(6., -3.5, False, path) and not clear_of_path(6., 3.0, True)
+  assert not in_front(-0.5, 0., True) and not in_front(8.5, 0., True)
+  # the corridor's margin counts ahead of the bumper only: level with the bonnet there is beside the car
+  assert in_front(1.1, -1.0, False) and not in_front(1.1, -2.3, False) and in_front(2.5, -2.3, False)
+
+
+def test_a_kerb_side_walker_passed_at_a_crawl_and_lost_by_the_front_corner_sets_none():
+  """A confirmed walker standing at the kerb 2.3 m right (inside the corridor's margin), the car crawling past at 1.5 m/s: the
+  wide camera keeps her until she leaves its frame by the front corner, 1.1 m ahead of the camera. Beside the car, not in
+  front of it: nothing set. Lost 3 m ahead instead (ahead of the bumper, inside the margin): set."""
+  for lost_at, latched in ((1.1, False), (3.0, True)):
+    sp, her, s = ScenePolicy(), Person(age=10), 0.
+    while 10. - s > lost_at:
+      sc = scene([her.seen(10. - s, -2.3)])
+      sp.update(sc.objects, True, None, 1000., 1.5)
+      s += 1.5 * DT_MDL
+    sp.update([], True, None, 1000., 1.5)
+    assert (sp.person_front is not None) is latched, lost_at
+
+
+def hit(person, x, y, cls='pedestrian'):
+  """A new hit of person's track on this very frame (its age up one), as the tracker publishes it."""
+  person.age += 1
+  return person.coasting(x, y, cls=cls)
+
+
+def walk(sp, person, start, end, speed=1.2, raw_people=False):
+  """person walking from start to end (x, y) at speed, a new hit on every detector run (Person.seen); the decisions."""
+  n = max(round(math.dist(start, end) / (speed * DT_MDL)), 1)
+  pts = [(start[0] + (end[0] - start[0]) * k / n, start[1] + (end[1] - start[1]) * k / n) for k in range(n + 1)]
+  return front_frames(sp, len(pts) * DT_MDL, lambda k: [person.seen(*pts[k])], raw_people=raw_people)
+
+
+@pytest.mark.parametrize('first', [(4., 4.), (6., 4.), (7.5, 4.), (6., -4.), (6.5, 0.5)])
+def test_someone_else_crossing_in_front_and_gone_never_clears_it_for_her(first):
+  """B1 (skeptic round 1, second_person): she is lost in front (run 6) and stays there unseen. A second walker, a track first
+  seen since off the corridor (a kerb, 4 m left or right) or first seen in front of the car but further than
+  PERSON_FRONT_MATCH_M from where she was lost (6.5 m ahead, 0.5 m left: 3.6 m from her), crosses in front of the car and out
+  of the corridor, seen on every run, and is gone: someone else, never her seen leaving, so the car stays held. At ed9e31d any
+  pedestrian track not published when it was set, with a new hit in front and then one clear, cleared it."""
+  from openpilot.selfdrive.turnpilot.scene_policy import PERSON_FRONT_NOTE
+  sp, _, _ = run6_lost()
+  other = Person(track_id=10, age=2)
+  x, y = first
+  walk(sp, other, (x, y), (x, -4. if y > -4. else 4.))
+  ds = front_frames(sp, 10.)
+  assert sp.person_front is not None and not sp.person_front.left, first
+  assert all(d.should_stop and d.reason == PERSON_FRONT_NOTE for d in ds), first
+
+
+def test_her_seen_leaving_is_new_hits_in_a_row_clear_of_the_corridor_not_one():
+  """B1's one-hit form (skeptic round 1, flicker_with_one_outlier_hit): a short track where she was, one new hit 2.7 m right
+  (an outlier), then gone; more short tracks where she was, 2.5 s apart: held throughout, never seen leaving. Leaving is
+  PERSON_FRONT_LEAVING_HITS new hits in a row clear of the corridor: one short of it, a hit back in front, and one short again
+  is none; the next clear hit is the run, and the release follows PERSON_FRONT_CLEAR_S after it."""
+  from openpilot.selfdrive.turnpilot.scene_policy import PERSON_FRONT_CLEAR_S, PERSON_FRONT_LEAVING_HITS
+  sp, _, _ = run6_lost()
+  b = Person(track_id=30, age=2)
+  front_frames(sp, 2 * DT_MDL, lambda k: [hit(b, *RUN6_HIT)])
+  front_frames(sp, DT_MDL, lambda k: [hit(b, RUN6_HIT[0], -2.7)])
+  for tid in range(31, 35):
+    assert all(d.should_stop for d in front_frames(sp, 2.5)), tid
+    f = Person(track_id=tid, age=2)
+    front_frames(sp, 4 * DT_MDL, lambda k, f=f: [f.seen(*RUN6_HIT)])
+  assert sp.person_front is not None and not sp.person_front.left
+  # in a row: her track (a new one where she was) clear PERSON_FRONT_LEAVING_HITS - 1 times, back in front, again
+  sp, _, _ = run6_lost()
+  her, out = Person(track_id=2, age=2), (RUN6_HIT[0], -3.0)
+  front_frames(sp, 3 * DT_MDL, lambda k: [hit(her, *RUN6_HIT)])
+  for _ in range(2):
+    front_frames(sp, (PERSON_FRONT_LEAVING_HITS - 1) * DT_MDL, lambda k: [hit(her, *out)])
+    assert not sp.person_front.left
+    front_frames(sp, DT_MDL, lambda k: [hit(her, *RUN6_HIT)])
+  front_frames(sp, (PERSON_FRONT_LEAVING_HITS - 1) * DT_MDL, lambda k: [hit(her, *out)])
+  assert not sp.person_front.left
+  front_frames(sp, DT_MDL, lambda k: [hit(her, *out)])
+  assert sp.person_front.left
+  ds = front_frames(sp, 3., lambda k: [her.coasting(*out)])
+  free = next(k for k, d in enumerate(ds) if not d.should_stop) + 2  # frames from the one she was seen leaving on, both counted
+  assert free * DT_MDL == pytest.approx(PERSON_FRONT_CLEAR_S, abs=0.06) and sp.person_front is None
+
+
+@pytest.mark.parametrize('her_first', [True, False])
+def test_two_people_lost_in_front_are_each_seen_leaving(her_first):
+  """Two confirmed walkers in front of the standing car, she 1.14 m right and he 1.0 m left, their tracks ending 1 s apart
+  (hers first: it is set for her, then for him too). Each, seen again where they were and walking out of the corridor, clears
+  their own place only: whichever of them is seen leaving first, it stays set and the car held; once the other is seen leaving
+  too, it lets go PERSON_FRONT_CLEAR_S later."""
+  from openpilot.selfdrive.turnpilot.scene_policy import PERSON_FRONT_CLEAR_S
+  hers, his = (RUN6_HIT, (RUN6_HIT[0], -3.5)), ((4.5, 1.0), (4.5, 3.5))
+  first, then = (hers, his) if her_first else (his, hers)
+  sp, a, b = ScenePolicy(), Person(track_id=1), Person(track_id=3)
+  front_frames(sp, 2., lambda k: [a.seen(*hers[0]), b.seen(*his[0])])
+  front_frames(sp, 1., lambda k: [b.seen(*his[0])])
+  assert sp.person_front is not None
+  front_frames(sp, 1.)
+  p1, p2 = Person(track_id=11, age=2), Person(track_id=13, age=2)
+  front_frames(sp, 0.5, lambda k: [p1.seen(*first[0])])
+  walk(sp, p1, *first)
+  ds = front_frames(sp, 5.)
+  assert all(d.should_stop for d in ds) and sp.person_front is not None and not sp.person_front.left
+  front_frames(sp, 0.5, lambda k: [p2.seen(*then[0])])
+  walk(sp, p2, *then)
+  assert sp.person_front.left
+  ds = front_frames(sp, 3.)
+  free = next(k for k, d in enumerate(ds) if not d.should_stop)
+  assert PERSON_FRONT_CLEAR_S - 1. < free * DT_MDL < PERSON_FRONT_CLEAR_S and sp.person_front is None
+
+
+def test_someone_first_seen_beside_where_she_was_lost_but_off_the_corridor_is_someone_else():
+  """A walker first seen since at the kerb 1.5 m right of where she was lost (within PERSON_FRONT_MATCH_M of her place, but
+  clear of the corridor: never in front of the car), standing there seen on every run: someone else, never her seen leaving,
+  however many of their hits are clear. Held."""
+  from openpilot.selfdrive.turnpilot.scene_policy import PERSON_FRONT_MATCH_M
+  sp, _, _ = run6_lost()
+  kerb = (RUN6_HIT[0], RUN6_HIT[1] - 1.5)
+  assert math.dist(kerb, RUN6_HIT) < PERSON_FRONT_MATCH_M
+  other = Person(track_id=12, age=2)
+  ds = front_frames(sp, 5., lambda k: [other.seen(*kerb)]) + front_frames(sp, 3.)
+  assert all(d.should_stop for d in ds) and sp.person_front is not None and not sp.person_front.left
+
+
+def test_her_new_track_lost_in_front_again_is_where_she_is_now():
+  """Seen again (a new track) where she was lost, she walks 2.5 m on along the lane, still in the path, and that track ends
+  there too: she is now where it ended, not where the first one did. A track first seen there walking out of the corridor
+  clears it; at her first place (2.5 m back), nobody needs to be seen leaving."""
+  sp, _, _ = run6_lost()
+  front_frames(sp, 1.)
+  back, on = Person(track_id=2, age=2), (RUN6_HIT[0] + 2.5, RUN6_HIT[1])
+  front_frames(sp, 1., lambda k: [back.seen(*RUN6_HIT)])
+  walk(sp, back, RUN6_HIT, on)
+  front_frames(sp, 1., lambda k: [back.seen(*on)])
+  front_frames(sp, 1.)  # gone there
+  assert sp.person_front is not None and not sp.person_front.left
+  again = Person(track_id=4, age=2)
+  front_frames(sp, 0.5, lambda k: [again.seen(*on)])
+  walk(sp, again, on, (on[0], -3.5))
+  front_frames(sp, 3.)
+  assert sp.person_front is None
+
+
+def test_where_she_was_lost_moves_with_the_car():
+  """A confirmed walker 2 m right of the path, inside its margin (no stop for her), the car rolling at 1.8 m/s: her track
+  coasts MAX_COAST_S on no hits and ends, the latch brings the car to rest. She, seen again where she stands, 0.45 m further
+  right, is her: where she was lost is her last hit less the car's travel since (ScenePolicy.odo), here further than
+  PERSON_FRONT_MATCH_M from her last hit read as it was. Walking out she clears it."""
+  from openpilot.selfdrive.turnpilot.scene.tracker import MAX_COAST_S
+  from openpilot.selfdrive.turnpilot.scene_policy import PERSON_FRONT_MATCH_M
+  sp, her, v, s = ScenePolicy(), Person(age=10), 1.8, 0.
+  for _ in range(20):
+    sc = scene([her.seen(8. - s, -2.0)])
+    sp.update(sc.objects, True, None, 1000., v)
+    s += v * DT_MDL
+  hit_x, s_hit = 8. - (s - v * DT_MDL), s - v * DT_MDL
+  for _ in range(round(MAX_COAST_S / DT_MDL)):
+    sc = scene([her.coasting(8. - s, -2.0)])
+    sp.update(sc.objects, True, None, 1000., v)
+    s += v * DT_MDL
+  for _ in range(round(4. / DT_MDL)):
+    d = sp.update([], True, None, 1000., v, raw_people=False)
+    a = plan_accel(d.accel_cap, d.speed_cap, v)
+    v = max(v + max(min(a if not d.should_stop else min(a, -1.), 0.), -3.5) * DT_MDL, 0.)  # longcontrol's stopping state
+    s += v * DT_MDL
+  assert sp.person_front is not None and v == 0.
+  travel = s - s_hit
+  now = (hit_x - travel, -2.45)
+  assert math.dist(now, (hit_x, -2.0)) > PERSON_FRONT_MATCH_M, travel  # her last hit as it was is no match
+  back = Person(track_id=2, age=2)
+  front_frames(sp, 0.5, lambda k: [back.seen(*now)])
+  walk(sp, back, now, (now[0], -4.))
+  front_frames(sp, 3.)
+  assert sp.person_front is None
+
+
+def test_an_unconfirmed_track_sets_it_only_if_its_stop_brought_the_car_to_rest():
+  """B2 (skeptic round 1, blip_at_a_red): stood is TurnPilot's stop for the track bringing the car to rest, not any stop for it
+  in force while something else stands the car. A 2-hit blip 6 m ahead in the path, seen with the car standing (held at a
+  red), then gone: nothing set (at ed9e31d set, the car held through the green to the 30 s handback). The same kind of
+  unconfirmed track seen with the car rolling at 1 m/s, its stop braking the car to rest, then gone: set."""
+  from openpilot.selfdrive.turnpilot.scene_policy import CONFIRM_STEADY_HITS
+  sp, blip = ScenePolicy(), Person(track_id=50, age=1, conf=0.8)
+  front_frames(sp, 4 * DT_MDL, lambda k: [blip.seen(6., 0.2)])
+  front_frames(sp, 0.5, lambda k: [blip.coasting(6., 0.2)])
+  ds = front_frames(sp, 3.)
+  assert sp.person_front is None and not any(d.holding for d in ds)
+  sp, weak, v, s, k = ScenePolicy(), Person(age=1, conf=0.5), 1.0, 0., 0
+  while v > 0.:  # matched on every other detector run, at conf 0.5: never confirmed
+    sc = scene([weak.seen(5.5 - s, -0.5) if k % 2 == 0 else weak.coasting(5.5 - s, -0.5)])
+    d = sp.update(sc.objects, True, None, 1000., v, raw_people=False)
+    assert d.reason == "pedestrian in path"
+    a = plan_accel(d.accel_cap, d.speed_cap, v)
+    v = max(v + max(min(a if not d.should_stop else min(a, -1.), 0.), -3.5) * DT_MDL, 0.)
+    s, k = s + v * DT_MDL, k + 1
+  assert weak.age < CONFIRM_STEADY_HITS and not sp.tracks[1].earned and sp.tracks[1].stood
+  front_frames(sp, 1.)
+  assert sp.person_front is not None and not sp.person_front.evidence['earned']
+
+
+def test_stood_is_its_own_stop_braking_the_car_to_rest_in_force_all_along():
+  """B2's two edges. An unconfirmed blip 7 m ahead in the path seen while the car rolls to rest from 0.6 m/s for something else
+  (a red): its stop, 2 m ahead, never braked the car (its speed cap over v_ego all along), so its loss sets nothing. And an
+  unconfirmed track whose stop braked the car, then off the path while the car rolls on and stops for something else, then back
+  in the path with the car standing: its stop was not in force all along, so it did not bring the car to rest, and its loss
+  sets nothing."""
+  def frames(sp, vs, obj=lambda: None):
+    for v in vs:
+      o = obj()
+      sc = scene([o] if o is not None else [])
+      sp.update(sc.objects, True, None, 1000., v, raw_people=False)
+  sp, blip = ScenePolicy(), Person(track_id=50, age=1, conf=0.8)
+  frames(sp, (0.6, 0.45, 0.3, 0.15, 0.), lambda: blip.seen(7., 0.2))
+  assert not sp.tracks[50].earned and not sp.tracks[50].stood
+  frames(sp, (0.,) * 20)
+  assert sp.person_front is None
+  sp, weak = ScenePolicy(), Person(track_id=60, age=1, conf=0.5)
+  frames(sp, (1.,) * 6, lambda: weak.seen(6., 0.2))                    # in the path: its stop brakes the car
+  assert sp.tracks[60].braking
+  frames(sp, (1., 0.8, 0.6, 0.4, 0.2, 0.), lambda: weak.seen(5., -2.6))  # off the path, the car rolling on to rest (a red)
+  frames(sp, (0.,) * 4, lambda: weak.seen(4., -0.5))                     # back in the path, the car standing
+  assert not sp.tracks[60].earned and not sp.tracks[60].stood
+  frames(sp, (0.,) * 20)
+  assert sp.person_front is None

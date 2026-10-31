@@ -14,7 +14,7 @@ from openpilot.selfdrive.turnpilot.scene.tracker import RawBox, RawFrame
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, ONCOMING_ENTRY_M, SceneDecision
 from openpilot.selfdrive.turnpilot.tests.synthetic import model_v2
 from openpilot.selfdrive.turnpilot.tests.test_go_override import WARM_S, new_planner, planner_sm
-from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, WALKER, FakeParams, Sim, go_from_a_red, go_from_the_hold,
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, WALKER, WALKER_CLEAR, FakeParams, Sim, go_from_a_red, go_from_the_hold,
                                                                  junction_of, oracle_lights, stand, stop_at, walker_stops_the_car)
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import JUNCTION, LEFT_25, TEST_RANGE_M, V_25, drive, left_sim, road_runs, run_objects
 from openpilot.selfdrive.turnpilot.turnpilotd import (GO_OVERRIDE_DEFAULT, LEFT_LAUNCH_SPEED, LEFT_LIFT_ROOM_M, NO_MOVE_REASON, NO_MOVE_S,
@@ -68,7 +68,7 @@ def test_the_go_ends_at_its_window():
     sim.step(engaged=True, yaw_rate=-0.3 if sim.v > 0.5 else 0.)
     assert sim.t < 200.
   walker_stops_the_car(sim)
-  plans = stand(sim, GO_WINDOW_S + 0.5)
+  plans = stand(sim, DT_MDL, objects=WALKER_CLEAR) + stand(sim, GO_WINDOW_S + 0.5 - DT_MDL)
   certified = [q for q in plans if go(q)[0] == 'turnRelease']
   assert abs(len(certified) * DT_MDL - GO_WINDOW_S) < 1e-6 and go(plans[-1])[0] == 'none' and sim.tp.go_cert.end == 'window'
 
@@ -131,9 +131,9 @@ def test_a_tracked_walker_coming_into_the_path_or_a_hold_withdraws_it():
   stand(sim, 0.3)
   q = stand(sim, DT_MDL, objects=WALKER)[0]  # a walker 4 m ahead in the path: TurnPilot holds, and the go is withdrawn
   assert go(q)[0] == 'none' and sim.tp.go_cert.end in ('inPath', 'hold')
-  # the walker clears: TurnPilot's hold lets go at a standstill, a new go with a new id (its own window)
+  # the walker walks clear: TurnPilot's hold lets go at a standstill, a new go with a new id (its own window)
   first = sim.tp.go_cert.id
-  plans = stand(sim, 1., objects=WALKER) + stand(sim, DT_MDL)
+  plans = stand(sim, 1., objects=WALKER) + stand(sim, DT_MDL, objects=WALKER_CLEAR)
   assert all(go(q)[0] == 'none' for q in plans[:-1]) and go(plans[-1])[:2] == ('turnRelease', first + 1)
 
 
@@ -429,7 +429,7 @@ def walker_clears_at_the_models_red(lights=None, controls=((290., 'signal'),)):
   held = [sim.step(WALKER, engaged=True) for _ in range(round(2. / DT_MDL))]
   assert held[-1].shouldStop
   s0 = sim.s
-  return sim, [sim.step(engaged=True) for _ in range(round(8. / DT_MDL))], s0
+  return sim, [sim.step(WALKER_CLEAR, engaged=True)] + [sim.step(engaged=True) for _ in range(round(8. / DT_MDL) - 1)], s0
 
 
 def test_a_walker_clearing_at_a_red_only_the_model_holds_for_is_no_certified_go():
@@ -518,7 +518,7 @@ def committed_left_stopped_by_a_walker(signal=False):
   assert JUNCTION - sim.s - ONCOMING_ENTRY_M > 1.
   state['car'], state['t'] = sim.s + 45., sim.t
   s0 = sim.s
-  return sim, drive(sim, 6.), s0, lambda: state['car'] - V_25 * (sim.t - state['t'])
+  return sim, [sim.step(WALKER_CLEAR, engaged=True)] + drive(sim, 6. - DT_MDL), s0, lambda: state['car'] - V_25 * (sim.t - state['t'])
 
 
 def test_a_committed_far_side_turn_released_in_the_junction_is_never_lifted():
@@ -549,7 +549,7 @@ def test_a_curb_side_turn_released_in_the_junction_at_a_green_is_certified_and_a
       sim.step(engaged=True, yaw_rate=-0.3 * side if sim.v > 0.5 else 0.)
       assert sim.t < 200.
     walker_stops_the_car(sim)
-    plans = stand(sim, DT_MDL)  # the walker clears: the hold lets go in the junction
+    plans = stand(sim, DT_MDL, objects=WALKER_CLEAR)  # the walker walks clear: the hold lets go in the junction
     assert not plans[0].shouldStop and sim.tp.go_in_junction
     return sim, plans + stand(sim, STALL_PROMPT_S + 0.5)
   sim, plans = released_in_the_junction(RIGHT_AT_A_SIGNAL, Desire.turnRight, 1)

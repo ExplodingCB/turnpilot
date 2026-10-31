@@ -2909,11 +2909,16 @@ def test_a_withdrawn_go_is_not_given_again_by_a_hold_that_comes_and_goes():
 
 
 WALKER = ({'cls': 'pedestrian', 'x': 4., 'y': 0.1, 'vx': 0., 'vy': 0., 'inPath': True},)
+# ...and seen walking clear of the car's path, a new hit 3 m to its left (out of the corridor and its margin): her stop ends
+# that frame, and her track then ends off the corridor. Lost in front of the car instead, she is WF-13's person who may be in
+# front (scene_policy.person_front; test_turnpilotd_person_front): held, no go
+WALKER_CLEAR = ({'cls': 'pedestrian', 'x': 4., 'y': 3., 'vx': 0., 'vy': 1.2, 'inPath': False, 'age': 11},)
 
 
 def walker_stops_the_car(sim, n_max=400):
   """A walker on the turn's exit crosswalk, in the path, stops the car where it is (scene_policy: a pedestrian in the path
-  still stops a committed turn), and stands in front of it 2 s. Then they clear: the hold lets go at standstill, a go."""
+  still stops a committed turn), and stands in front of it 2 s. Then they clear (WALKER_CLEAR, the next frame: seen walking out
+  of the path): the hold lets go at standstill, a go."""
   n = 0
   while sim.v > 0.05:
     sim.step(WALKER, engaged=True)
@@ -2943,7 +2948,7 @@ def test_a_go_in_the_junction_is_never_withdrawn_and_the_turn_is_finished():
     assert sim.t < 200.
   walker_stops_the_car(sim)
   assert sim.distance() < HOLD_LINE_M - 2. and sim.tp.scene.committed_id == sim.tp.follower.maneuver_id
-  plans = stand(sim, 0.05)  # the walker gone: TurnPilot's go, its post-go caps (only lowering speed) from where it is
+  plans = stand(sim, 0.05, objects=WALKER_CLEAR)  # the walker walks clear: TurnPilot's go, its post-go caps (only lowering speed) from where it is
   assert sim.tp.release_go and sim.tp.go_id == sim.tp.follower.maneuver_id and sim.tp.post_go.turned_deg >= 45.
   assert sim.tp.go_wait_s is None and not sim.tp.go_withdrawn
   plans += stand(sim, 3.15)  # the model hesitates
@@ -2970,7 +2975,7 @@ def test_a_go_in_an_unprotected_left_across_the_oncoming_lanes_is_never_withdraw
   sim.go_taps = False
   walker_stops_the_car(sim)
   assert sim.distance() < HOLD_LINE_M
-  plans = stand(sim, LEFT_NO_MOVE_S + 0.5)
+  plans = stand(sim, DT_MDL, objects=WALKER_CLEAR) + stand(sim, LEFT_NO_MOVE_S + 0.5 - DT_MDL)  # the walker walks clear
   assert sim.tp.no_move_limit == LEFT_NO_MOVE_S and sim.tp.post_go.profile == POST_GO_PROFILES['left']
   assert not any(p.shouldStop or p.controlPrompt == 'cantStartTakeControl' for p in plans) and not sim.tp.go_withdrawn
   plans = stand(sim, STALL_PROMPT_S - LEFT_NO_MOVE_S)  # handed back without a hold as a stall in the turn
@@ -2990,7 +2995,7 @@ def test_a_go_past_the_hold_line_under_20_deg_in_is_handed_back_as_a_stall_never
     assert sim.t < 200.
   walker_stops_the_car(sim)
   assert sim.distance() < HOLD_LINE_M - 2. and sim.tp.desires.turned_deg < 15.
-  plans = stand(sim, STALL_PROMPT_S - 0.2)
+  plans = stand(sim, DT_MDL, objects=WALKER_CLEAR) + stand(sim, STALL_PROMPT_S - 0.2 - DT_MDL)  # the walker walks clear
   assert not any(p.shouldStop or p.controlPrompt != 'none' for p in plans)
   p = stand(sim, 0.4)[-1]
   assert p.controlPrompt == 'stalledTakeControl' and not p.shouldStop and p.desire == Desire.none

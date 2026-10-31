@@ -783,6 +783,8 @@ def mid_block_go_then_lead(driver):
   walker = {'on': False}
 
   def objects(s):
+    if walker['on'] == 'clear':  # seen walking clear of the path, a new hit (WF-13: never lost in front of the car)
+      return ({'cls': 'pedestrian', 'x': WALKER_MID_BLOCK - s.s, 'y': 3., 'age': 6 + int(s.t * 10.)},)
     return ({'cls': 'pedestrian', 'x': WALKER_MID_BLOCK - s.s, 'y': 0., 'age': 5 + int(s.t * 10.)},) if walker['on'] else ()
 
   def step():
@@ -800,6 +802,8 @@ def mid_block_go_then_lead(driver):
     step()
   stood_at = sim.distance()
   assert sim.tp.desires.started, f"the right turn's desire is out ({stood_at:.1f} m short)"
+  walker['on'] = 'clear'
+  step()
   walker['on'] = False
   while sim.v < 0.5:
     step()

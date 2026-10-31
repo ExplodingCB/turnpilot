@@ -22,7 +22,7 @@ from openpilot.selfdrive.turnpilot.stop_go import Frame
 from openpilot.selfdrive.turnpilot.tests.test_camera_lights import detections
 from openpilot.selfdrive.turnpilot.tests.test_go_override import WARM_S
 from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of, model_v2
-from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, RIGHT_AT_A_CORNER, T_LEFT, WALKER, Sim, go_from_a_red,
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, RIGHT_AT_A_CORNER, T_LEFT, WALKER, WALKER_CLEAR, Sim, go_from_a_red,
                                                                  model_stands_in_the_turn, oracle_lights, stand, stop_at, walker_stops_the_car)
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_go import attach_planner, holding, model_stops_at, raw_person
 from openpilot.selfdrive.turnpilot.unprotected_left import LIGHT_RED_MAX_S, STAND_UNDECIDED_S
@@ -296,7 +296,7 @@ def test_a_scene_hold_let_go_on_a_straight_starts_the_release_clock():
     sim.tp.always_drive = on
     sim.run(2.)
     walker_stops_the_car(sim)
-    plans = stand(sim, NO_MOVE_MAX_S + 1.)
+    plans = stand(sim, DT_MDL, objects=WALKER_CLEAR) + stand(sim, NO_MOVE_MAX_S + 1. - DT_MDL)
     assert not any(q.shouldStop for q in plans), on
     assert any(q.controlPrompt == 'cantStartTakeControl' for q in plans) is on
     assert all(str(q.goCertified.cause) == 'none' for q in plans)
@@ -629,7 +629,7 @@ def released_where_no_signal_is(on: bool, status='ok', controls=(), lights=NO_HE
   attach_planner(sim, holding)
   held = [sim.step(WALKER, engaged=True) for _ in range(round(hold_s / DT_MDL))]
   assert held[-1].shouldStop
-  return [sim.step(engaged=True) for _ in range(round(3. / DT_MDL))]
+  return [sim.step(WALKER_CLEAR, engaged=True)] + [sim.step(engaged=True) for _ in range(round(3. / DT_MDL) - 1)]
 
 
 def certified_causes(plans):

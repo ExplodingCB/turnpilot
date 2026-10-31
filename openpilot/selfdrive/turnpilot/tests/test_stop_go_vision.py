@@ -627,3 +627,19 @@ def test_vision_a_pedestrian_in_the_crosswalk_is_waited_for_then_the_go_after_th
   peds = [k for k, d in enumerate(out) if any(h.key.startswith(('ped:', 'pedArrive')) for h in d.holds)]
   i = first_go(out)
   assert peds and i is not None and i > max(peds) and (i - max(peds)) * DT_MDL >= sr.VISION_CLEAR_S - 0.06
+
+
+def test_vision_a_person_turnpilot_lost_in_front_is_the_front_zone_no_go_and_h7_after_30_s(tmp_path):
+  """WARGAME_FIXES WF-13: turnpilotd's person-may-be-in-front latch (Frame.person_front, scene_policy.person_front) is the front
+  zone occupied (P6): the go that came at 2.5 s waits ("a person may be in front of the car"), H7 at FRONT_ZONE_MAX_S. Once it
+  ends, the go comes on its own window."""
+  w = vworld(tmp_path, 25)
+  out = w.run(31., person_front=True)
+  assert first_go(out) is None and all(d.go_cause == 'none' and d.release is None for d in out)
+  assert any(h.key == 'front' for h in out[round(5. / DT_MDL)].holds)
+  assert out[round(5. / DT_MDL)].reason == "Waiting: a person may be in front of the car"
+  h7 = next(k for k, d in enumerate(out) if d.fault == 'H7')
+  assert (h7 + 1) * DT_MDL >= sg.FRONT_ZONE_MAX_S - 1e-6 and out[h7].reason == sg.REASONS['H7']
+  w = vworld(tmp_path, 25)
+  assert first_go(w.run(5., person_front=True)) is None
+  assert first_go(w.run(6.)) is not None
