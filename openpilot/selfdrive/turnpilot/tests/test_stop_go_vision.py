@@ -496,6 +496,18 @@ def test_vision_v8_the_car_yawed_up_to_8_deg_is_straight_enough_reach_deciding(t
     assert any(h.key.startswith('reach:') for h in out[-1].holds)  # honest: the walk's reach, never the yaw
 
 
+@pytest.mark.parametrize('yaw, steer, goes', [(1.2, 30.1, True), (1.2, -45., True), (9., 0., False), (1.2, 95., False)])
+def test_vision_straight_is_the_cars_heading_against_its_approach_the_wheel_only_a_sanity_bound(tmp_path, yaw, steer, goes):
+  """SAT_VALIDATION row 8 (stop_allway_empty): standing with its heading within 1.2 deg of the approach, the car's wheel sat at
+  30.1 deg (the model's last-metres curvature), over VISION_STEER_GO_DEG 30, and the yaw hold never let the go come. Under
+  vision the car is straight on its approach by its heading (yaw20_deg, the heading change over its last 20 m: against the
+  approach it drove in on) within VISION_YAW_GO_DEG; the wheel is a sanity bound only (VISION_STEER_SANITY_DEG)."""
+  w = vworld(tmp_path, 15)
+  out = w.run(6., yaw20_deg=yaw, steer_deg=steer)
+  assert (first_go(out) is not None) == goes
+  assert any(h.key == 'yaw' for d in out for h in d.holds) == (not goes)
+
+
 def test_vision_v9_a_corner_occluder_starts_the_creep_for_a_view_after_2_s(tmp_path):
   # a car standing at the corner 10 m down the near lane hides the lane behind it: a static wait on reach alone, and the
   # creep for a view's rung is tried VISION_CREEP_AFTER_S into it (STATIC_WAIT_S under the other modes); a bearing-only
