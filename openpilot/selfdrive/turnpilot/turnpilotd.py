@@ -125,7 +125,8 @@ them only by a launch (left_launch): short of LEFT_LAUNCH_SPEED with LEFT_LAUNCH
 withdrawn and handed back, never a coast across them on the lift's speed.
 Standing engaged with nothing of TurnPilot's holding the car (no shouldStop, no cap biting), no lead from the model within
 STOPPED_LEAD_M that the live scene corroborates (one further on doesn't hold a standing car, nor one nothing in the scene
-shows: a phantom, a mailbox), gas and brake off, the model stopped on its own: said, with one info chime a stand (carStoppedNote), on the
+shows: a phantom, a mailbox), gas and brake off, the model stopped on its own: said, with one info chime a stand (carStoppedNote; none
+within STOPPED_CONTROL_M of a mapped signal, where the model stands at every red), on the
 status line after STOPPED_NOTE_S (STOPPED_NOTE), and handed back loudly (controlPrompt carStoppedTakeControl) after
 STOPPED_HANDBACK_S, or NEAR_CONTROL_STAND_S with a map control within STOPPED_CONTROL_M (CRITIQUE REQUIRED 6: a model
 stall at a mapped signal TurnPilot doesn't hold for is never silent, and a red the map doesn't know, the car first in
@@ -617,6 +618,7 @@ class TurnPilot:
     self.go_cert.withdraw('reset')  # a disabled plan carries no go
     self.decider_turn_id: int | None = None  # the route's turn whose stop sign the decider acted for last frame (update())
     self.stopped_s = 0.            # standing engaged with nothing holding the car (carStoppedTakeControl)
+    self.stopped_signal = False    # ...within STOPPED_CONTROL_M of a mapped signal (stopped_unheld): the note doesn't chime
     self.stall_s = 0.              # standing in a route turn, nothing holding the car (stalledTakeControl)
     self.stall_stand_s = 0.        # ...standing there, a corroborated lead or not (LEAD_STAND_MAX_S)
     self.stall_said = False        # ...handed back for it (its log once)
@@ -1243,8 +1245,11 @@ class TurnPilot:
       plan.controlPrompt, plan.reason = 'stalledTakeControl', STALLED_REASON
     elif stopped == STOPPED_NOTE:
       plan.reason = plan.reason or STOPPED_NOTE
-      if self.stopped_s < STOPPED_NOTE_S + ABORT_HOLD_S - 1e-6 and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS:
-        plan.controlAlert = 'carStoppedNote'  # PF-14: the note's info chime, once a stand (stopped_s starts over with it)
+      # PF-14: the note's info chime, once a stand (stopped_s starts over with it); never within STOPPED_CONTROL_M of a mapped
+      # signal, where the model stands first in line at every red (ALWAYS_DRIVE.md ST-07 (stops)): the status line alone there
+      if self.stopped_s < STOPPED_NOTE_S + ABORT_HOLD_S - 1e-6 and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS and \
+         not self.stopped_signal:
+        plan.controlAlert = 'carStoppedNote'
     elif stopped:
       plan.controlPrompt, plan.reason = 'carStoppedTakeControl', stopped
     # the route's stop signs (route_notice.py, STOP_SIGNS.md 3.4): at its start, and 300 m before each it couldn't avoid; said
@@ -2123,6 +2128,7 @@ class TurnPilot:
       not self.go_withdrawn and \
       not decision.holding and not lead and not cs.gasPressed and not cs.brakePressed and not map_handback(mapd)
     limit = NEAR_CONTROL_STAND_S if near else STOPPED_HANDBACK_S
+    self.stopped_signal = any(c.kind == 'signal' for c in near)
     was = self.stopped_s >= limit - 1e-6
     self.stopped_s = self.stopped_s + DT_MDL if unheld else 0.
     if self.stopped_s < limit - 1e-6:
@@ -2130,7 +2136,7 @@ class TurnPilot:
     if not was:
       cloudlog.event("turnpilot.stopped_unheld", error=True, stood_s=round(self.stopped_s, 1), reason=decision.reason,
                      near=[c.kind for c in near], **self.lead_log(sm['modelV2']))
-    return SIGNAL_STOPPED_REASON if any(c.kind == 'signal' for c in near) else STOPPED_REASON
+    return SIGNAL_STOPPED_REASON if self.stopped_signal else STOPPED_REASON
 
   def map_update(self, sm, v_ego: float, gas_pressed: bool, turn=None, left: LeftCommand | None = None, release=None, creep=None,
                  stop: StopCommand | None = None):

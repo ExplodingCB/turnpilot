@@ -23,7 +23,7 @@ from openpilot.selfdrive.turnpilot.turnpilotd import (CAR_UNKNOWN_REASON, DETECT
                                                        LEAD_STAND_MAX_S, NO_MOVE_MAX_S, SIGNAL_STOPPED_REASON, STALL_MIN_DEG, STALL_PROMPT_S,
                                                        STALLED_REASON, TURN_ABANDON_CURV, TURN_ABANDON_S, TURN_ABANDONED_REASON,
                                                        WRONG_SIDE_MIN_SPEED, WRONG_SIDE_REASON, WRONG_SIDE_S, yellow_on_the_right,
-                                                       STOPPED_HANDBACK_S, STOPPED_LEAD_M, STOPPED_NOTE, STOPPED_NOTE_S, STOPPED_REASON,
+                                                       STOPPED_CONTROL_M, STOPPED_HANDBACK_S, STOPPED_LEAD_M, STOPPED_NOTE, STOPPED_NOTE_S, STOPPED_REASON,
                                                        TURN_MISSED_REASON, WAITING_REASON, TurnPilot, long_control_for)
 from openpilot.selfdrive.turnpilot.handback import Handback
 from openpilot.selfdrive.turnpilot.scene.tracker import STALE_S
@@ -1978,15 +1978,42 @@ def test_the_stopped_note_chimes_once_a_stand_and_the_handback_comes_as_before()
   assert len(note_chimes(first)) == 1 and not note_chimes(held) and held[-1].reason != STOPPED_NOTE
   assert len(note_chimes(again)) == 1
 
-  # near a map control the note chimes at the same STOPPED_NOTE_S, and the handback still waits NEAR_CONTROL_STAND_S
-  sim = Sim([(2000., 'turn', 'left', T_LEFT)], controls=[(20., 'signal')])
+  # near a map control the note chimes at the same STOPPED_NOTE_S, and the handback still waits NEAR_CONTROL_STAND_S; near
+  # a mapped signal the note is silent (test_the_stopped_notes_chime_is_silent_near_a_mapped_signal)
+  sim = Sim([(2000., 'turn', 'left', T_LEFT)], controls=[(20., 'stop')])
   sim.run(0.2)
   plans = stand(sim, NEAR_CONTROL_STAND_S + 0.2)
   (start, n), = note_chimes(plans)
   back = next(i for i, p in enumerate(plans) if p.controlPrompt != 'none')
-  assert n == hold and plans[back].controlPrompt == 'carStoppedTakeControl' and plans[back].reason == SIGNAL_STOPPED_REASON
+  assert n == hold and plans[back].controlPrompt == 'carStoppedTakeControl' and plans[back].reason == STOPPED_REASON
   assert (back - start) * DT_MDL == pytest.approx(NEAR_CONTROL_STAND_S - STOPPED_NOTE_S, abs=1.5 * DT_MDL)
   assert all(p.controlAlert != 'carStoppedNote' for p in plans[back:])
+
+
+@pytest.mark.parametrize("always_drive", [False, True])
+def test_the_stopped_notes_chime_is_silent_near_a_mapped_signal(always_drive):
+  """ALWAYS_DRIVE.md ST-07 (stops), the chime suppression (unconditional): the model stands first in line at every red, and
+  with tp/chase-car's chime (PF-14) the 5 s note chimed at each. Within STOPPED_CONTROL_M of a mapped signal the note is the
+  status line alone, with no chime; the handback at NEAR_CONTROL_STAND_S comes as before, with its own sound. A signal past
+  STOPPED_CONTROL_M, or a stop sign near, chimes once a stand as before."""
+  hold = int(round(ABORT_HOLD_S / DT_MDL))
+  sim = Sim([(2000., 'turn', 'left', T_LEFT)], controls=[(20., 'signal')])
+  sim.tp.always_drive = always_drive
+  sim.run(0.2)
+  plans = stand(sim, NEAR_CONTROL_STAND_S + 0.2)
+  note = next(i for i, p in enumerate(plans) if p.reason == STOPPED_NOTE)
+  back = next(i for i, p in enumerate(plans) if p.controlPrompt != 'none')
+  assert not note_chimes(plans)
+  assert (note + 1) * DT_MDL == pytest.approx(STOPPED_NOTE_S, abs=1.5 * DT_MDL)
+  assert all(p.reason == STOPPED_NOTE and p.controlAlert == 'none' for p in plans[note:back])  # the status line, silent
+  assert plans[back].controlPrompt == 'carStoppedTakeControl' and plans[back].reason == SIGNAL_STOPPED_REASON
+  assert (back - note) * DT_MDL == pytest.approx(NEAR_CONTROL_STAND_S - STOPPED_NOTE_S, abs=1.5 * DT_MDL)
+  sim = Sim([(2000., 'turn', 'left', T_LEFT)], controls=[(STOPPED_CONTROL_M + 8., 'signal')])  # 35 m on: not near it
+  sim.tp.always_drive = always_drive
+  sim.run(0.2)
+  plans = stand(sim, STOPPED_HANDBACK_S + 0.2)
+  (_, n), = note_chimes(plans)
+  assert n == hold and next(p for p in plans if p.controlPrompt != 'none').reason == STOPPED_REASON
 
 
 def test_a_turn_lane_a_map_stop_leaves_no_room_for_is_skipped_out_loud_never_turned_from_the_wrong_lane():
