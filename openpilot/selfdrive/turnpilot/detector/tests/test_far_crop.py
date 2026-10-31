@@ -10,7 +10,7 @@ from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.selfdrive.turnpilot.detector.decoder import CAR, TRAFFIC_LIGHT
 from openpilot.selfdrive.turnpilot.detector.graph import FAR_HORIZON_ROW, Crop
 from openpilot.selfdrive.turnpilot.detector.modeld_detector import (FAR_BUDGET_S, FAR_STATUS_S, FORCE_RUN_FRAMES, RUN_EVERY,
-                                                                    STEP_BUDGET_S, TIME_WINDOW, FarCrop, LightStatus)
+                                                                    STEP_BUDGET_S, TIME_WINDOW, FarCrop, LanePaintStatus, LightStatus)
 from openpilot.selfdrive.turnpilot.detector.tests.test_modeld_detector import FakeLights, FakeOutput, Meta, make_detector
 from openpilot.selfdrive.turnpilot.scene.ranging import road_lens
 
@@ -185,6 +185,53 @@ class TestFarCrop(OpenpilotTestCase):
     steps(det, pm, 2 * RUN_EVERY)
     assert not det.far.disabled and len(pm.far) == 2 and all(fd.run.lightStatus == LightStatus.disabled for fd in pm.far)
     assert all(len(fd.run.detections) == 1 for fd in pm.far)
+
+
+class TestOddPaint(OpenpilotTestCase):
+  """PF-03: while the full pass looks through the wide camera, the lane paint is read on the far crop's road frame."""
+  def turn(self, det, pm, n, start=0, model_time=0.010):
+    for k in range(n):
+      det.step(pm, det.model_state, model_time, 0.0, log.Desire.turnLeft, [Meta(start + 2 * k), Meta(start + 2 * k + 1)], 'auto', 0.)
+
+  def test_a_turn_reads_the_paint_on_the_far_crops_frame(self):
+    det, pm = far_detector(), FarPM()
+    self.turn(det, pm, 3 * RUN_EVERY)
+    assert [str(td.camera) for td in pm.full] == ['wide'] * 3 and len(pm.far) == 3
+    # each far run's road frame, behind the far crop's one box (its car), in frame pixels
+    assert det.lane_paint.calls == [('host0', 2, 1), ('host0', 6, 1), ('host0', 10, 1)]
+    # the first wide run had no read before it; each later one carries the read of the step before
+    assert pm.full[0].lanePaintStatus == LanePaintStatus.wideCamera and len(pm.full[0].lanePaint) == 0
+    for td in pm.full[1:]:
+      assert td.lanePaintStatus == LanePaintStatus.read and len(td.lanePaint) == 4 and str(td.lanePaint[2].color) == 'yellow'
+      assert td.lanePaintTime >= 0.
+
+  def test_straight_on_the_road_camera_the_far_crop_reads_no_paint(self):
+    det, pm = far_detector(), FarPM()
+    steps(det, pm, 2 * RUN_EVERY)
+    assert det.lane_paint.calls == [('host0', 0, 1), ('host0', 4, 1)]  # the full runs' own, as before
+    assert all(str(td.camera) == 'road' and td.lanePaintStatus == LanePaintStatus.read for td in pm.full)
+
+  def test_no_room_no_read_and_a_stale_read_is_not_sent(self):
+    det = far_detector()
+    det.last_cam = 'wide'
+    det.paint_times.extend([0.004] * 3)
+    det.read_odd_paint(det.model_state, [Meta(2), Meta(3)], np.zeros((0, 6), np.float32), STEP_BUDGET_S - 0.003)
+    assert det.lane_paint.calls == [] and det.odd_paint is None
+    det.read_odd_paint(det.model_state, [Meta(2), Meta(3)], np.zeros((0, 6), np.float32), STEP_BUDGET_S - 0.005)
+    assert det.lane_paint.calls == [('host0', 2, 0)] and det.odd_paint is not None
+    # a read older than the step before (the full run it was for had no room) is dropped, not sent
+    det, pm = far_detector(), FarPM()
+    self.turn(det, pm, 2)
+    det.steps += 1
+    self.turn(det, pm, 1, start=20)
+    assert len(pm.full) == 2 and pm.full[1].lanePaintStatus == LanePaintStatus.wideCamera and len(pm.full[1].lanePaint) == 0
+
+  def test_paint_failure_on_the_far_frame_turns_only_the_paint_off(self):
+    det, pm = far_detector(), FarPM()
+    det.lane_paint.fail = True
+    self.turn(det, pm, 3 * RUN_EVERY)
+    assert det.lane_paint is None and not det.far.disabled and len(pm.far) == 3 and len(pm.full) == 3
+    assert all(td.lanePaintStatus == LanePaintStatus.wideCamera and len(td.lanePaint) == 0 for td in pm.full)  # as before
 
 
 def test_crop_views_of_modelds_frame_buffer():

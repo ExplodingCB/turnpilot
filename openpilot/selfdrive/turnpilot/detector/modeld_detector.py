@@ -6,10 +6,16 @@ It runs in modeld because the chestnut's USB interface is claimed by one process
 
 Each run on the road camera also reads the lane paint (scene/lane_paint.py) on that frame, from the host copy modeld made
 of it, with the frame's modelV2 and calibration read back off the bus and the detections masking what they hide, and
-publishes it in the same message, with lanePaintStatus saying why when it isn't read. A run on the wide camera reads none:
-unmasked, a white car over a yellow line reads as broken white paint. It costs about 1 ms on a Mac (lane_paint_video.py
-measures it) and has its own budget: a read slower than PAINT_BUDGET_S (median) turns the paint off for the drive, loudly,
-and the detector, which the pedestrian holds need, keeps running.
+publishes it in the same message, with lanePaintStatus saying why when it isn't read. A run on the wide camera reads none
+on its own frame (no boxes for the road frame: unmasked, a white car over a yellow line reads as broken white paint), but
+while the full pass looks through the wide camera (a turn, a curve, their WIDE_HOLD_S) the far crop's run on the frame
+between reads it on that road frame, behind the far crop's boxes, where the step has room (read_odd_paint), and the next
+wide run's message carries it (lanePaintStatus read): the wrong-side guard's paint on a turn's approach and exit (PF-03).
+On comma's public comma four routes (lane_paint.py's, 37 turns), the guard's line was read on none of the moving approach,
+turn and exit steps before and on 29%, 13% and 37% of them so, with no wrong-side fire added in any; without lane_paint's
+chromaticity test it added two, in a turn and an exit.
+It costs about 1.5-2 ms on a Mac and has its own budget: a read slower than PAINT_BUDGET_S (median) turns the paint off
+for the drive, loudly, and the detector, which the pedestrian holds need, keeps running.
 
 The traffic lights are read the same way (DESIGN phase 4 G2, detector/light_state.py): on road camera runs, from the host
 copy of the frame, on the detector's class-9 boxes (decode_lights, never in the detections), with the frame's calibration
@@ -517,6 +523,9 @@ class ModeldDetector:
   sweep: str | None = None        # the stop sweep running (SWEEPS), or None
   sweep_runs = 0                  # forward runs in this sweep, for the held cycle's full wide and road alternation
   signal_near = False             # a signal mapped within SWEEP_SIGNAL_M (plan_inputs), this step
+  steps = 0                       # step() calls, for odd_paint's age
+  last_cam: str | None = None     # the camera of the last full run
+  odd_paint: tuple | None = None  # (paint, lanePaintStatus, its time, steps) read on the far crop's frame (read_odd_paint)
 
   def __init__(self, model_state, cam_w: int, cam_h: int, cameras: dict[str, int]):
     """cameras: 'road' and/or 'wide' -> index of its frame in modeld's packed input."""
@@ -594,6 +603,7 @@ class ModeldDetector:
       # DetectorHost picks the detector by model, so this is a bug: raise for the host to log and retry, never a quiet off
       raise ValueError("turnpilot detector stepped with a driving model it wasn't loaded for")
     now = time.monotonic()
+    self.steps += 1
     sweep = view if view in SWEEPS else None
     if sweep != self.sweep:
       self.sweep, self.sweep_runs = sweep, 0
@@ -620,17 +630,21 @@ class ModeldDetector:
       t0 = time.perf_counter()
       raw = self.run(input_frame=self.frames[cam]).numpy()
       dt = time.perf_counter() - t0
-      self.since_run, self.last_run_t = 0, time.monotonic()
+      self.since_run, self.last_run_t, self.last_cam = 0, time.monotonic(), cam
       meta = metas[self.cameras[cam]]
       dets = decode(raw, self.lb)
       msg = messaging.new_message('turnpilotDetections', valid=bool(np.isfinite(raw).all()))
       td = msg.turnpilotDetections
       fill_detections(td, dets, meta.frame_id, meta.timestamp_eof, cam, dt)
       self.times.append(dt)
+      odd, self.odd_paint = self.odd_paint, None
       if cam == 'road' and sweep is None:
         self.read_lane_paint(td, model_state, metas, dets)
       elif cam == 'road':
         td.lanePaintStatus = LanePaintStatus.sweep if self.lane_paint is not None else LanePaintStatus.disabled
+      elif sweep is None and odd is not None and odd[3] == self.steps - 1 and self.lane_paint is not None:
+        fill_lane_paint(td.init('lanePaint', 4), odd[0])  # read on the far crop's frame, the step before (read_odd_paint)
+        td.lanePaintStatus, td.lanePaintTime = odd[1], odd[2]
       else:
         td.lanePaintStatus = LanePaintStatus.wideCamera if 'road' in self.cameras else LanePaintStatus.disabled
       if cam == 'road' and lights_read:
@@ -762,13 +776,36 @@ class ModeldDetector:
       i = self.cameras['road']
       meta = metas[i]
       msg = messaging.new_message('turnpilotFarDetections', valid=bool(np.isfinite(raw).all()))
-      fill_far(msg.turnpilotFarDetections, decode_far(raw, crop), crop, bearing, meta.frame_id, meta.timestamp_eof, dt)
+      boxes = decode_far(raw, crop)
+      fill_far(msg.turnpilotFarDetections, boxes, crop, bearing, meta.frame_id, meta.timestamp_eof, dt)
       light_dt = self.read_far_lights(msg.turnpilotFarDetections.run, model_state, metas, raw, crop)
       pm.send('turnpilotFarDetections', msg)
       far.ran(time.monotonic(), dt, model_execution_time + dt + light_dt > STEP_BUDGET_S)
     except Exception:
       cloudlog.exception("turnpilot far crop failed")
       far.disable("failed")
+      return
+    self.read_odd_paint(model_state, metas, boxes, model_execution_time + dt + light_dt)
+
+  def read_odd_paint(self, model_state, metas: list, boxes: np.ndarray, used_s: float) -> None:
+    """While the full pass looks through the wide camera (a turn, a curve, their WIDE_HOLD_S), the lane paint on the far
+    crop's road frame, behind the far crop's boxes, kept in odd_paint for the next full run's message, where the step has
+    room for it (used_s: the step's time so far). Its failures and budget are the paint's own (read_lane_paint's)."""
+    if self.last_cam != 'wide' or self.lane_paint is None or 'road' not in self.cameras:
+      return
+    if self.paint_times and used_s + float(np.median(self.paint_times)) > STEP_BUDGET_S:
+      return  # no room: this wide run's message says wideCamera, as before
+    t0 = time.perf_counter()
+    try:
+      i = self.cameras['road']
+      paint, status = self.lane_paint.read(model_state.frames[i], metas[i], boxes)
+    except Exception:
+      cloudlog.exception("turnpilot lane paint failed, off for this drive")
+      self.lane_paint = None
+      return
+    dt = time.perf_counter() - t0
+    self.odd_paint = (paint, status, dt, self.steps)
+    self.paint_over_budget(dt)
 
   def read_far_lights(self, td, model_state, metas: list, raw: np.ndarray, crop: Crop) -> float:
     """The far crop's class-9 boxes through its own reader, always shadow: td.lights, lightStatus, lightTime. A failure or
@@ -818,6 +855,10 @@ class ModeldDetector:
     dt = time.perf_counter() - t0
     fill_lane_paint(td.init('lanePaint', 4), paint)
     td.lanePaintStatus, td.lanePaintTime = status, dt
+    self.paint_over_budget(dt)
+
+  def paint_over_budget(self, dt: float) -> None:
+    """Counts a paint read's time; a median over PAINT_BUDGET_S turns the paint off for the drive."""
     self.paint_times.append(dt)
     if len(self.paint_times) == TIME_WINDOW and float(np.median(self.paint_times)) > PAINT_BUDGET_S:
       cloudlog.error(f"turnpilot lane paint over budget ({np.median(self.paint_times) * 1e3:.1f} ms), off for this drive")
