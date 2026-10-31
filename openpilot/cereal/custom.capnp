@@ -187,6 +187,9 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
                                     # (turnpilotd.py: turn_abandoned): take control; no hold, the turn's caps stay
     wrongSideTakeControl @19;       # right-hand traffic, moving: the first painted line to the car's right read yellow
                                     # (turnpilotd.py: wrong_side): left of the centre line, take control; no hold, no steering
+    # ALWAYS_DRIVE.md SC-02: the right-turn crosswalk hold standing STAND_UNDECIDED_S on walkers who all stand (turnpilotd.py:
+    # crosswalk_standoff): "Pedestrian waiting: take control", the car held, never a go past them
+    pedestrianWaitingTakeControl @20;
   }
   enum ControlAlert {
     none @0;
@@ -227,6 +230,22 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     # PERF_BACKLOG PF-14: the model standing the car with nothing of TurnPilot's holding it (turnpilotd.py stopped_unheld),
     # at the status line's note (STOPPED_NOTE_S), for ABORT_HOLD_S: the note's info chime, once a stand; the handback after is unchanged
     carStoppedNote @24;
+    # ALWAYS_DRIVE.md LEFT-21 (TurnPilotAlwaysDrive): a clearBox lift for a stand partway round a curb-side turn, nothing ahead
+    # and nobody near its path (turnpilotd.py stalled_in_turn): "Stalled: finishing the turn", a chime, at each lift
+    stallLift @25;
+    # ALWAYS_DRIVE.md ST-07 (stops) (TurnPilotAlwaysDrive): standing at a mapped signal, nothing in the path, the camera's shadow
+    # reader reading a steady green and the model not going (turnpilotd.py stopped_unheld): "Light green: car not moving", a chime,
+    # once a green; never a lift
+    lightGreenNotMoving @26;
+    # ALWAYS_DRIVE.md section 4.5 (TurnPilotAlwaysDrive): the unstick lift for a model stop off any hold (turnpilotd.py
+    # stopped_unheld): "Nothing ahead is holding the car: going on", a chime
+    unstickLift @27;
+    # ALWAYS_DRIVE.md SC-02: the crosswalk hold has stood the car PED_NOTE_S (turnpilotd.py crosswalk_standoff): "Waiting for
+    # pedestrian", a chime, once a hold
+    pedestrianWaiting @28;
+    # ALWAYS_DRIVE.md MC-03 (TurnPilotAlwaysDrive): mapControlsUnavailable's line with no sound, once its status has been said
+    # (map_controls.py): its later onsets, after an alert covered it, are silent
+    mapControlsUnavailableSilent @29;
   }
   mapControl @24 :MapControlStatus;
   controlPrompt @25 :ControlPrompt;
@@ -312,6 +331,7 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
       rollUp @4;           # rolling up to the stop line after a queue
       creep @5;            # one creep step
       clearBox @6;         # stalled past the in-lane point after the commit
+      unstick @7;          # ALWAYS_DRIVE.md section 4.5 (TurnPilotAlwaysDrive): a model stop off any hold, nothing seen to stop for
     }
     cause @0 :Cause;
     id @1 :UInt32;     # a new one for every go (never repeated in a drive): plannerd gives each go its own window

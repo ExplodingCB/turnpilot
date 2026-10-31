@@ -209,6 +209,9 @@ STOP_SIGN_REASON = "Stop sign: take control to proceed"
 # or not, so a re-engage inside the junction hears it again. It assumes a junction under about 20 m across past its centre:
 # a mapped line set well back from a wide junction (BUILD_FINDINGS D4's setback) can end it before the far side
 DRIVEN_THROUGH_M = 30.
+# navd's bad controls statuses, how much they leave unknown (MC-03: a worse one is said again with its chime): a lookup pending,
+# a walk or snap route or some tiles without the sidecar, none at all
+STATUS_RANK = {'pending': 1, 'walkOrSnap': 2, 'partial': 2, 'unsupported': 3, 'failed': 3}
 CROSSED_CAUSES = ('driverWent', 'drivenOff', 'movedOff')  # a latch let go by the car's motion, never by a go
 DRIVEN_PROMPT = {'stop': 'stopSignTakeControl', UNPROTECTED: 'unprotectedTurnTakeControl'}
 # The autonomous unprotected left (unprotected_left.py, DESIGN phase 4 G4) creeps its held stop point on for a view
@@ -535,6 +538,9 @@ class MapControlPolicy:
     self._lights = NO_LIGHTS  # the last update's lights (turn_light)
     self._signal_turn_id: int | None = None  # the unprotected turn a signal at its junction was seen for (turn_light)
     self.driven: Driven | None = None  # a line crossed with no go, its take-control up until through (DRIVEN_THROUGH_M)
+    self._status_said: set = set()  # under the switch, navd's bad controls statuses said with mapControlsUnavailable's chime (MC-03)
+    self._status_last = ''          # ...the last bad status reported
+    self._status_chime_t = 0.       # ...s of the chiming alert left
 
   def stop_ahead(self) -> float | None:
     """m to the nearest stop sign or signal the car is going to stop at, or None: a stop sign not released, a signal only
@@ -631,6 +637,22 @@ class MapControlPolicy:
   def held_stops(self) -> list:
     """The latch alone, for a faulted plan whose map update failed: a held car stays held."""
     return [Stop(HOLD_ACCEL, 0., True, "Stopped at a map stop", 0., rest=True)] if self.held is not None else []
+
+  def _status_alert(self, dt: float) -> str:
+    """navd's controls status not ok, said (MC-03): mapControlsUnavailable, with its chime; under TurnPilotAlwaysDrive the
+    chiming alert ABORT_HOLD_S once a drive for each status, and again only when the status gets worse than the last one
+    reported (STATUS_RANK), else its silent twin, so its later onsets, after an alert covered it, make no sound."""
+    if not self.always_drive:
+      return 'mapControlsUnavailable'
+    st = self.tracker.status
+    if st != self._status_last:
+      if st not in self._status_said or STATUS_RANK.get(st, 3) > STATUS_RANK.get(self._status_last, 0):
+        self._status_said.add(st)
+        self._status_chime_t = ABORT_HOLD_S
+      self._status_last = st
+    chime = self._status_chime_t > 1e-6
+    self._status_chime_t = max(self._status_chime_t - dt, 0.)
+    return 'mapControlsUnavailable' if chime else 'mapControlsUnavailableSilent'
 
   def _transient(self, alert: str) -> None:
     self._alert, self._alert_t = alert, ABORT_HOLD_S
@@ -863,7 +885,7 @@ class MapControlPolicy:
     elif unknown:
       out.alert = 'offRouteStopsUnknown'
     elif status_bad:
-      out.alert = 'mapControlsUnavailable'
+      out.alert = self._status_alert(dt)
     elif lights.rejected:
       out.alert = 'lightSourceRejected'
     elif self._camera_off_t > 0.:

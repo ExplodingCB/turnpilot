@@ -445,3 +445,11 @@ def test_the_stopped_note_is_heard_once_with_the_info_chime_never_as_a_handback(
   assert all(w.alert_text_1 == 'Car Stopped' for w in after[:90]) and all(w.alert_text_1 == '' for w in after[110:])
   rises = [i for i in range(1, len(sounds)) if sounds[i] != sounds[i - 1]]
   assert [sounds[i] for i in rises] == [AudibleAlert.prompt, AudibleAlert.none]  # one chime, never tpHandback
+
+
+def test_the_map_stops_status_line_has_a_silent_twin():
+  """ALWAYS_DRIVE.md MC-03 (TurnPilotAlwaysDrive): the same 'Map Stops Unavailable' line with no sound, for its later onsets."""
+  loud, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='mapControlsUnavailable', reason='Map stops/signals: partial')))
+  quiet, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='mapControlsUnavailableSilent', reason='Map stops/signals: partial')))
+  assert (quiet.alert_text_1, quiet.alert_text_2) == (loud.alert_text_1, loud.alert_text_2)
+  assert loud.audible_alert == AudibleAlert.prompt and quiet.audible_alert == AudibleAlert.none

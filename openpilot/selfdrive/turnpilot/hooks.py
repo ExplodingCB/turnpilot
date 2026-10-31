@@ -54,19 +54,22 @@ def limits_plan(sm, now: float | None = None):
 # above too fast to turn. The stop-sign decider's (stop_go.py): a cross vehicle met in a lane, the cross-traffic camera paused
 # while held, stalled past the in-lane point: said with a chime, never a handback themselves
 CONTROL_ALERT_FIRST = ('hardBrake', 'cannotStopComfortably', 'offRouteStopsUnknown', 'oncomingHolding', 'crossTrafficAfterCommit',
-                       'cameraPaused', 'stalledInJunction', 'overrideWriteFailed', 'otherTurn')
+                       'cameraPaused', 'stalledInJunction', 'overrideWriteFailed', 'otherTurn', 'stallLift')
 # handbacks: the car held while the driver is told to take control (map_controls.py, turnpilotd.py), above too fast to turn
 TAKE_CONTROL_PROMPTS = ('stopSignTakeControl', 'unprotectedTurnTakeControl', 'carStoppedTakeControl', 'stalledTakeControl',
                         'cantStartTakeControl', 'leftUndecidedTakeControl', 'signalUnseenTakeControl',
-                        'turnAbandonedTakeControl', 'wrongSideTakeControl')
+                        'turnAbandonedTakeControl', 'wrongSideTakeControl', 'pedestrianWaitingTakeControl')
 # shown, never heard: the unprotected left waiting at its line or creeping for a view, and a stop sign waiting for cross traffic,
 # are ordinary (no intervention); the stop sign's wait chimes once a WAIT_INFO_S (turnpilotPlan.stopGo.chime: stop_go.py)
 SILENT_PROMPTS = ('none', 'yieldAhead', 'waitingForGap', 'creepingForView', 'waitingForCross')
 # never sent since gas go went (2026-10-28), kept in the append-only schema: the driver's gas tap as a go, and going on red
 RETIRED_PROMPTS = ('stopSignGo', 'signalGo', 'unprotectedTurnGo', 'carStoppedGo')
 RETIRED_ALERTS = ('goingOnRed',)
-CONTROL_ALERT_EVENTS = ('stopOverrun', 'proceedingOnYellow', 'junctionUncertain', 'carStoppedNote')  # below the prompt, above a lane change
-CONTROL_STATUS_ALERTS = ('mapControlsUnavailable', 'lightSourceRejected', 'farViewOff', 'sideCamerasOff')  # last of all, a status line
+CONTROL_ALERT_EVENTS = ('stopOverrun', 'proceedingOnYellow', 'junctionUncertain', 'carStoppedNote',  # below the prompt, above a lane change
+                        'lightGreenNotMoving', 'unstickLift', 'pedestrianWaiting')
+CONTROL_STATUS_ALERTS = ('mapControlsUnavailable', 'lightSourceRejected', 'farViewOff', 'sideCamerasOff',  # last of all, a status line
+                         'mapControlsUnavailableSilent')
+SILENT_STATUS_ALERTS = ('mapControlsUnavailableSilent',)  # ...that line with no sound (MC-03)
 # the route's stop signs (route_notice.py, STOP_SIGNS.md 3.4): said engaged or not (turnpilotRouteNotice, a permanent alert), the
 # text in turnpilotPlan.routeNotice; all but routeAvoidsStops with a chime
 ROUTE_NOTICES = ('routeAvoidsStops', 'routeDetour', 'stopsNeedYou', 'firstStopNeedsYou', 'stopRoutingFailed', 'stopAheadNeedsYou')
@@ -157,12 +160,14 @@ CONTROL_PROMPT_TEXT = {
   'signalUnseenTakeControl': 'TurnPilot can\'t see the light',
   'turnAbandonedTakeControl': 'The car is steering out of the turn',
   'wrongSideTakeControl': 'Yellow line on the right: the car is left of the centre line',
+  'pedestrianWaitingTakeControl': 'A pedestrian has stood at the crosswalk 45 s',
 }
 CONTROL_ALERT_TEXT = {
   'cannotStopComfortably': 'Cannot stop gently for the stop/signal',
   'stopOverrun': 'Passed the stop line without stopping',
   'proceedingOnYellow': 'Too close to stop for the yellow',
   'mapControlsUnavailable': 'Map stops and signals unavailable',
+  'mapControlsUnavailableSilent': 'Map stops and signals unavailable',  # its status said already (MC-03): no sound
   'lightSourceRejected': 'Light source not accepted: lights unknown',
   'junctionUncertain': 'GPS unsure where the junction is: slow, may stop short of it',
   'offRouteStopsUnknown': 'Map stops unknown: take control or wait for reroute',
@@ -173,6 +178,7 @@ CONTROL_ALERT_TEXT = {
   'crossTrafficAfterCommit': 'Cross traffic: carrying on through the junction',
   'cameraPaused': 'Cross-traffic camera paused: holding',
   'stalledInJunction': 'Stalled in the junction: going again',
+  'stallLift': 'Stalled: finishing the turn',  # under TurnPilotAlwaysDrive, a lift for a stand in a curb-side turn (LEFT-21)
   'overrideWriteFailed': 'Stop sign junction not saved: the route may use it again',
   'otherTurn': "The route's turn can't be checked here: rerouting after it",
   # the route's stop signs (route_notice.py): their own text is turnpilotPlan.routeNotice, these stand in without it
@@ -183,6 +189,9 @@ CONTROL_ALERT_TEXT = {
   'stopRoutingFailed': 'Stop-sign routing failed: stops may need you',
   'stopAheadNeedsYou': 'Stop sign ahead needs you',
   'carStoppedNote': 'Nothing ahead is holding the car',  # the stopped note's chime (turnpilotd.py), before its handback
+  'lightGreenNotMoving': 'Light green: car not moving',  # under TurnPilotAlwaysDrive, a steady camera green the model doesn't go on
+  'unstickLift': 'Nothing ahead is holding the car: going on',  # under TurnPilotAlwaysDrive, section 4.5's lift
+  'pedestrianWaiting': 'Waiting for pedestrian',  # the crosswalk hold's standoff (SC-02), once a hold at PED_NOTE_S
 }
 
 
