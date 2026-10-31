@@ -190,11 +190,34 @@ def floor10(m):
   return int(math.floor(m / 10.) * 10)
 
 
-def run(msgs, **kw):
-  d = lr.Drive()
+def drives_of(msgs):
+  """The messages as main reads them: split into a Drive per stretch of continuous log time."""
+  drives = lr.Drives()
   for m in msgs:
-    d.feed(m)
-  return lr.measure(d, **kw)
+    drives.feed(m)
+  return drives.drives
+
+
+def run(msgs, **kw):
+  return lr.measure(drives_of(msgs), **kw)
+
+
+def shifted(msgs, dt):
+  """The messages dt s later in log and camera time (another route in the same boot)."""
+  out = []
+  for m in msgs:
+    b = m.as_builder()
+    b.logMonoTime = m.logMonoTime + int(round(dt * 1e9))
+    which = b.which()
+    if which == 'turnpilotDetections':
+      b.turnpilotDetections.timestampEof += int(round(dt * 1e9))
+    elif which == 'turnpilotFarDetections':
+      b.turnpilotFarDetections.run.timestampEof += int(round(dt * 1e9))
+    elif which == 'turnpilotScene':
+      for o in b.turnpilotScene.objects:
+        o.tSeen += dt
+    out.append(b.as_reader())
+  return out
 
 
 def text(result):
@@ -439,6 +462,60 @@ def test_a_box_that_closes_at_another_rate_is_not_followed_back():
   msgs, truth = drive(cars + [stopped], far=False)
   s = {s.track_id: s for s in run(msgs).samples}[11]
   assert s.road_why == 'ambiguous' and s.road_m < near_of(box_at(150., 3.6)) - 5.
+
+
+@pytest.mark.parametrize("dt", (3600., 0.), ids=("same boot an hour later", "after a reboot"))
+def test_two_routes_are_each_measured_on_their_own(dt, tmp_path, capsys):
+  """Two routes of 35 oncoming cars each, the second an hour later in the same boot or after a reboot (its log and camera
+  times start over): each turnpilotd's tracker numbers its tracks from 1, so the routes' track ids are the same ones. Each
+  route is measured on its own time base, so all 70 cars are samples and route 1's car 10 (boxed only from 100 m) is
+  confirmed from its own first box, never from a box of route 2's; through main too, read as two files."""
+  a_cars = stream(35, far_from=0.)
+  a_cars[10].road_from = 100.
+  a, a_truth = drive(a_cars, far=False)
+  b, _ = drive(stream(35, far_from=0.), far=False)
+  second = shifted(b, dt)
+  drives = drives_of(a + second)
+  assert len(drives) == 2
+  result = lr.measure(drives)
+  assert len(result.samples) == 70
+  worst = [s for s in result.samples if s.drive == 0 and s.track_id == 11]
+  assert len(worst) == 1 and worst[0].road_m == pytest.approx(a_truth[10]['road'], abs=0.01) and worst[0].road_why == 'unboxed'
+  assert result.road.range_m == floor10(a_truth[10]['road'])
+  out = text(result)
+  assert "2 drives" in out and "drive 1" in out
+  for name, msgs in (("a", a), ("b", second)):
+    save_log(str(tmp_path / f"{name}--0--rlog.zst"), msgs)
+  assert lr.main([str(tmp_path / "a--0--rlog.zst"), str(tmp_path / "b--0--rlog.zst")]) == 0
+  assert f"--set TurnPilotLeftRangeM={floor10(a_truth[10]['road'])}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("how", ("unavailable", "gap"))
+def test_turnpilotd_starting_again_mid_drive_drops_no_car(how):
+  """turnpilotd's tracker starts again mid-drive, and its track ids with it: its scene failed (one unavailable scene, then a
+  new tracker) or the process restarted (no scene for 1.5 s). Car 35, not yet a sample, takes the id car 34's track had 0.15
+  s before: it is another car, and all 70 are samples."""
+  cars = stream(70, far_from=0.)
+  msgs, _ = drive(cars, far=False)
+  t_restart = round(4. * 35 + 8.4, 6)
+  out, first = [], True
+  for m in msgs:
+    t = round(m.logMonoTime * 1e-9 - OFFSET_S, 6)
+    if m.which() != 'turnpilotScene' or t < t_restart:
+      out.append(m)
+      continue
+    if how == 'gap' and t < t_restart + 1.5:
+      continue
+    b = m.as_builder()
+    if how == 'unavailable' and first:
+      b.turnpilotScene.available = False
+      b.turnpilotScene.init('objects', 0)
+    for o in b.turnpilotScene.objects:
+      o.trackId = o.trackId - 1 if o.trackId >= 36 else o.trackId
+    first = False
+    out.append(b.as_reader())
+  result = run(out)
+  assert len(result.samples) == 70
 
 
 def test_a_spell_with_no_road_runs_is_no_range_not_a_clear_road():
