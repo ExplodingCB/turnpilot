@@ -1703,7 +1703,8 @@ def test_a_holds_braking_after_a_re_engage_is_modelled_on_what_it_asks_never_on_
   for v in (0.2, 0.5, 0.8, 1.2, 1.5, 1.92, 2.12, 2.4, 3., 4., 6.):
     for caps, held_at in holds:
       model, actual = reengage_stop_m(v, caps), stands(v, held_at)
-      assert actual <= model <= actual + v * REENGAGE_LAG_S + 0.35, (v, caps.__name__, round(model, 2), round(actual, 2))
+      assert actual + v * REENGAGE_LAG_S <= model <= actual + v * REENGAGE_LAG_S + 0.35, (v, caps.__name__, round(model, 2),
+                                                                                         round(actual, 2))
   # the skeptic's two re-engages, well short of 0.5 m/s^2's 3.7 and 4.5 m
   assert reengage_stop_m(1.92, hold_caps) < 2.4 and reengage_stop_m(2.12, latch_hold_caps) < 2.6
   assert reengage_stop_m(0., hold_caps) == 0.
@@ -1784,3 +1785,27 @@ def test_the_latch_reengaged_too_fast_inside_its_creep_is_let_go_on_the_drivers_
   assert row[5].driven and row[5].prompt == 'unprotectedTurnTakeControl'
   inside = [r for e, _, r in rows[first:] if e and r[1] < 250. - HOLD_LINE_M - 1. + DRIVEN_THROUGH_M - 1.]
   assert inside and all(r[5].prompt == 'unprotectedTurnTakeControl' and not r[4].should_stop for r in inside)
+
+
+def test_metres_the_driver_moved_past_the_latch_that_a_later_creep_takes_in_are_turnpilots_again():
+  """The driver's metres past the latch count only while past what TurnPilot asks (min(past, driver_past_m)): a 1 m gas
+  nudge from where it latched (held again, the left waiting), then the left's 2 m creep for a view takes the car on over
+  them, and a 1.6 m nudge on from the creep is under the reach from where TurnPilot put it: held (c), never let go on the
+  2.3 m the driver moved past its stop point in all."""
+  car = left_car()
+  wait = left_cmd(reason="Waiting for a gap")
+  car.run_until(held, left=wait)
+  car.run(2., left=wait)
+  s_held = car.s
+  while car.s < s_held + 1.:
+    car.step(left=wait, gas=True, accel=0.4 if car.v < 0.5 else 0.)
+  car.run(3., left=wait)
+  assert car.policy.held is not None and car.v < 0.05 and car.policy.turn.state.driver_past_m > 0.6
+  creep = left_cmd(creep_m=2., reason="Creeping for a view")
+  car.run(8., left=creep)
+  assert car.policy.held is not None and car.v < 0.05 and abs(car.s - s_held - 2.) < 0.2
+  stood = car.s
+  while car.s < stood + 1.6:
+    car.step(left=creep, gas=True, accel=0.4 if car.v < 0.5 else 0.)
+  out, dec, _ = car.run(4., left=creep)
+  assert car.policy.held is not None and car.policy.driven is None and held(out, dec) and out.prompt == 'none'

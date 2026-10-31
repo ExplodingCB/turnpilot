@@ -1237,6 +1237,19 @@ def test_a_gas_nudge_short_of_the_lefts_reach_stays_held_for_the_full_check():
   assert not any(p.desire == Desire.turnLeft or str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in after)
 
 
+
+def test_a_quicker_gas_crawl_short_of_the_reach_re_engaged_rolling_is_held_on_the_latchs_own_stop():
+  """Skeptic round 1 (tp/left-hold), through turnpilotd: held at the left's line, the driver's gas (disengaged) takes the car
+  1.8 m on at up to 1.5 m/s, short of the latch's reach, and they re-engage rolling. The latch's own stop carries it about
+  0.7 m further, engaged: TurnPilot's metres (turnpilotd hands map_controls openpilot's engaged), never the driver's, so
+  the latch holds the car short of the oncoming lanes, the left waiting for its gap (c), never let go on its own braking."""
+  sim, after, past = gas_crawl_at_the_line(1.8, v_crawl=1.5)
+  lift_v = sim.trace[-len(after) - 1][1]
+  assert past < 2. and lift_v > 1.2, (past, lift_v)
+  assert all(p.shouldStop for p in after[30:]) and sim.v < 0.05 and JUNCTION - sim.s > ONCOMING_ENTRY_M + 1.
+  assert {str(p.unprotectedLeft.state) for p in after[30:]} == {'waitGap'} and sim.tp.map_controls.driven is None
+  assert not any(p.desire == Desire.turnLeft or str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in after)
+
 def withdrawn_go():
   """LEFT_25 at its line through four oncoming cars 6 s apart; the go certified, and at its first motion a car 90 m up the
   oncoming lane at the limit withdraws it (skeptic SIMFIX round 2): the car stands on the left's own hold
