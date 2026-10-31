@@ -55,6 +55,9 @@ st[0-9A-Za-z][0-9A-Za-z][0-9A-Za-z][0-9A-Za-z][0-9A-Za-z][0-9A-Za-z]
 !openpilot/selfdrive/turnpilot/models/big_detector_1344x760_tinygrad.pkl
 !openpilot/selfdrive/turnpilot/models/big_far_detector_1344x760_tinygrad.pkl
 !openpilot/selfdrive/turnpilot/models/big_side_detector_1344x760_tinygrad.pkl
+# ...and the native schedule's strips (TurnPilotNativeDetect strip and full)
+!openpilot/selfdrive/turnpilot/models/big_native_detector_1344x760_1344x384_tinygrad.pkl
+!openpilot/selfdrive/turnpilot/models/big_native_detector_1344x760_1344x512_tinygrad.pkl
 config.json
 compile_commands.json
 compare_runtime*.html

@@ -32,8 +32,8 @@ def run_gaps(det, pm, frames: int, model_time: float) -> list[int]:
 
 
 class FakeParams:
-  def __init__(self, enabled=False, lights=None, far=None, signs=None, drop=None):
-    self.enabled, self.lights, self.far, self.signs, self.drop = enabled, lights, far, signs, drop
+  def __init__(self, enabled=False, lights=None, far=None, signs=None, drop=None, native=None):
+    self.enabled, self.lights, self.far, self.signs, self.drop, self.native = enabled, lights, far, signs, drop, native
     self.read: list[str] = []
 
   def get_bool(self, key):
@@ -45,7 +45,7 @@ class FakeParams:
     if key == "TurnPilotSimDropDetectionsS" and self.drop == 'unknown':
       raise UnknownKeyName(key)
     return {"TurnPilotCameraLights": self.lights, "TurnPilotFarCrop": self.far, "TurnPilotCameraStopSigns": self.signs,
-            "TurnPilotSimDropDetectionsS": self.drop}[key]
+            "TurnPilotSimDropDetectionsS": self.drop, "TurnPilotNativeDetect": self.native}[key]
 
 
 class FakeLoad:

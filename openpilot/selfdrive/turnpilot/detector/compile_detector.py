@@ -18,6 +18,12 @@ self-test runs both frames at two crops each (a corner and the far one), alterna
 
   DEV=USB+AMD:LLVM python3 compile_detector.py --far --retargetable --sizes 1344x760
 
+--native strip|full compiles the native schedule's strip (graph.NATIVE_SIZES: 1344x384 for strip, 1344x512 for full) in
+the far crop's graph at that size (native_detector_{w}x{h}_{sw}x{sh}_tinygrad.pkl, big_ on the chestnut). Its self-test
+runs both frames at the top and the bottom strip of the frame, alternating, against unjitted runs.
+
+  DEV=USB+AMD:LLVM python3 compile_detector.py --native full --retargetable --sizes 1344x760
+
 --side compiles the stop sweep's side views (graph.py make_side_detector: side_detector_{w}x{h}_tinygrad.pkl, big_ on the
 chestnut), which take the wide frame's view and a side view's maps (sideview.SideMap: luma_idx, chroma_idx, weights) as
 inputs, so one pkl serves both views and any calibration. Its self-test runs both frames through both views' maps for the
@@ -32,9 +38,10 @@ from pathlib import Path
 
 import numpy as np
 
-from openpilot.selfdrive.turnpilot.detector.graph import (DEFAULT_MODEL, FAR_CROP_SIZE, INPUT_SIZES, MODELS_DIR, SIDE_INPUT_SIZE, Crop,
-                                                         crop_views, detector_pkl_path, far_detector_pkl_path, make_detector,
-                                                         make_far_detector, make_side_detector, onnx_path, side_detector_pkl_path,
+from openpilot.selfdrive.turnpilot.detector.graph import (DEFAULT_MODEL, FAR_CROP_SIZE, INPUT_SIZES, MODELS_DIR, NATIVE_SIZES,
+                                                         SIDE_INPUT_SIZE, Crop, crop_views, detector_pkl_path, far_detector_pkl_path,
+                                                         make_detector, make_far_detector, make_side_detector,
+                                                         native_detector_pkl_path, onnx_path, side_detector_pkl_path,
                                                          side_input_specs)
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 
@@ -106,21 +113,26 @@ def _compile_one(cam_w: int, cam_h: int, model: str, out: Path, runs: int, retar
   print(f'wrote {out} ({out.stat().st_size / 1e6:.1f} MB)', flush=True)
 
 
-def compile_far(cam_w: int, cam_h: int, model: str, out: Path, runs: int, retargetable: bool) -> None:
+def compile_far(cam_w: int, cam_h: int, model: str, out: Path, runs: int, retargetable: bool, size: tuple[int, int] | None = None) -> None:
+  """The far crop, or with size a native strip (graph.NATIVE_SIZES) in the same graph."""
   with compile_context():
-    _compile_far(cam_w, cam_h, model, out, runs, retargetable)
+    _compile_far(cam_w, cam_h, model, out, runs, retargetable, size)
 
 
-def _compile_far(cam_w: int, cam_h: int, model: str, out: Path, runs: int, retargetable: bool) -> None:
+def _compile_far(cam_w: int, cam_h: int, model: str, out: Path, runs: int, retargetable: bool, size: tuple[int, int] | None) -> None:
   from tinygrad import Device, Tensor, TinyJit, dtypes
   from tinygrad.engine.realize import lower_and_compile
   from tinygrad.uop.ops import UOp
   from tinygrad_repo.examples.openpilot.helpers import dump_pickle, load_pickle, make_retargetable
   stride, y_height, uv_height, _ = get_nv12_info(cam_w, cam_h)
   frame_size = stride * (y_height + uv_height)
-  w, h = FAR_CROP_SIZE
-  detect = make_far_detector(cam_w, cam_h, model)
-  crops = [Crop(cam_w, cam_h, 0, 0), Crop(cam_w, cam_h, (cam_w - w) // 64 * 32, (cam_h - h) // 4 * 2)]
+  native = size is not None
+  w, h = size if native else FAR_CROP_SIZE
+  detect = make_far_detector(cam_w, cam_h, model, (w, h))
+  if native:  # the top and the bottom strip of the frame
+    crops = [Crop(cam_w, cam_h, 0, 0, w, h), Crop(cam_w, cam_h, 0, (cam_h - h) // 2 * 2, w, h)]
+  else:
+    crops = [Crop(cam_w, cam_h, 0, 0), Crop(cam_w, cam_h, (cam_w - w) // 64 * 32, (cam_h - h) // 4 * 2)]
 
   rng = np.random.default_rng(43)
   frames = rng.integers(0, 256, (2, frame_size), dtype=np.uint8)
@@ -157,14 +169,15 @@ def _compile_far(cam_w: int, cam_h: int, model: str, out: Path, runs: int, retar
     run(luma=luma, chroma=chroma).realize()
     Device.default.synchronize()
     times.append((time.perf_counter() - st) * 1e3)
-  print(f'far {model} {cam_w}x{cam_h} crop {w}x{h} on {Device.DEFAULT}: min {min(times):.2f} ms, median {np.median(times):.2f} ms')
+  kind = 'native' if native else 'far'
+  print(f'{kind} {model} {cam_w}x{cam_h} crop {w}x{h} on {Device.DEFAULT}: min {min(times):.2f} ms, median {np.median(times):.2f} ms')
 
   if retargetable:
     make_retargetable(run)
   (_, ln), (_, cn) = crop_views(crops[0])
   specs = {'luma': ((ln,), np.dtype(np.uint8).str, Device.DEFAULT), 'chroma': ((cn,), np.dtype(np.uint8).str, Device.DEFAULT)}
-  metadata = {'model': model, 'onnx_sha256': hashlib.sha256(onnx_path(model).read_bytes()).hexdigest(), 'kind': 'far',
-              'camera_size': (cam_w, cam_h), 'input_size': (w, h)}
+  metadata = {'model': model, 'onnx_sha256': hashlib.sha256(onnx_path(model).read_bytes()).hexdigest(),
+              'kind': 'native' if native else 'far', 'camera_size': (cam_w, cam_h), 'input_size': (w, h)}
   dump_pickle({'metadata': metadata, 'run': run, 'input_specs': specs,
                'output_specs': {'output': ((1, 300, 6), np.dtype(np.float32).str, Device.DEFAULT)}}, out)
 
@@ -251,11 +264,15 @@ def main():
   ap.add_argument('--retargetable', action='store_true', help='rebuild host programs on load (for a pkl built off the device)')
   ap.add_argument('--far', action='store_true', help='the far crop (graph.make_far_detector) instead of the full frame')
   ap.add_argument('--side', action='store_true', help='the side views (graph.make_side_detector) instead of the full frame')
+  ap.add_argument('--native', choices=('strip', 'full'), help="the native schedule's strip (graph.NATIVE_SIZES) instead of the full frame")
   args = ap.parse_args()
   chestnut = 'AMD' in Device.DEFAULT
   for size in args.sizes:
     w, h = map(int, size.split('x'))
-    if args.side:
+    if args.native:
+      strip = NATIVE_SIZES[(w, h)][args.native]
+      compile_far(w, h, args.model, native_detector_pkl_path(w, h, strip, chestnut, args.out), args.benchmark_runs, args.retargetable, strip)
+    elif args.side:
       compile_side(w, h, args.model, side_detector_pkl_path(w, h, chestnut, args.out), args.benchmark_runs, args.retargetable)
     elif args.far:
       compile_far(w, h, args.model, far_detector_pkl_path(w, h, chestnut, args.out), args.benchmark_runs, args.retargetable)

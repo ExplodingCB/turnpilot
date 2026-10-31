@@ -145,6 +145,23 @@ def test_far_crop(tmp_path):
   assert ok.status == PASS and "300 m" in ok.detail
 
 
+def test_native(tmp_path):
+  # TurnPilotNativeDetect: off is today's far crop; on, its pkl or the far crop in its place, a warning never a failure
+  off = preflight.check_native('off', None, True)
+  assert off.status == INFO and "far crop" in off.detail
+  path = tmp_path / "big_native_detector_1344x760_1344x512_tinygrad.pkl"
+  missing = preflight.check_native('full', path, True)
+  assert missing.status == WARN and "missing" in missing.detail and "far crop" in missing.detail
+  path.write_bytes(b"version https://git-lfs.github.com/spec/v1\n")
+  assert preflight.check_native('full', path, True).status == WARN
+  path.write_bytes(b"\0" * 5000)
+  assert preflight.check_native('full', path, False).status == WARN
+  ok = preflight.check_native('full', path, True)
+  assert ok.status == PASS and ok.detail.startswith("full: the whole frame natively") and path.name in ok.detail
+  assert preflight.check_native('strip', path, True).detail.startswith("strip: the 1344x384 native strip")
+  assert preflight.check_native('strip', None, True).status == WARN
+
+
 def test_big_model():
   assert preflight.check_big_model(True).status == PASS
   assert preflight.check_big_model(False).status == FAIL
@@ -232,14 +249,14 @@ def test_collect_runs():
   names = [c.name for c in checks]
   assert len(names) == len(set(names))
   assert {"non-release branch", "car", "alpha longitudinal", "valhalla tiles", "detector pkl", "far crop", "chestnut", "pairing URL"} <= set(names)
-  assert "always drive" in names
+  assert "always drive" in names and "native detect" in names
   assert all(c.status in (PASS, FAIL, WARN, INFO) for c in checks)
   assert preflight.render(checks)
 
 
 # Everything the car path imports has to exist on the comma: the stdlib, the dependencies in pyproject.toml, and the submodules.
 # These files are Mac tools (compiling the detector, exporting YOLO26, replaying an rlog) and never run on the device.
-DEV_TOOLS = {"detector/compile_detector.py", "detector/replay_route.py", "models/export_yolo26.py"}
+DEV_TOOLS = {"detector/compile_detector.py", "detector/replay_route.py", "detector/replay_native.py", "models/export_yolo26.py"}
 SUBMODULE_PACKAGES = {"opendbc", "msgq", "panda", "rednose", "teleoprtc", "tinygrad", "tinygrad_repo"}
 
 

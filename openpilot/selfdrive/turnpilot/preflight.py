@@ -228,6 +228,24 @@ def check_far_crop(path: Path, far_range_m: float, on: bool) -> Check:
   return Check(name, PASS, f"{path.name} ({size / 1e6:.1f} MB), proven range {far_range_m:.0f} m")
 
 
+def check_native(mode: str, path: Path | None, far_on: bool) -> Check:
+  """TurnPilotNativeDetect (detector/modeld_detector.py, the native schedule): the mode and the pkl it loads. Off is today's
+  far crop (INFO); on without its pkl, or with TurnPilotFarCrop off, the car drives on the far crop or without the slot: a
+  warning, never a failure."""
+  name = "native detect"
+  if mode == 'off':
+    return Check(name, INFO, "off: the far crop (640x384 at the horizon) between the full pass's runs")
+  what = {'strip': "the 1344x384 native strip at the horizon", 'full': "the whole frame natively, the 1344x512 top and bottom strips alternating"}[mode]
+  size = path.stat().st_size if path is not None and path.is_file() else 0
+  if size <= MIN_PKL_BYTES:
+    why = "no strip for this camera" if path is None else f"{path.name} is {'empty or a pointer' if path.is_file() else 'missing'}"
+    return Check(name, WARN, f"{mode}: {why}, so the far crop runs in its place", "update to a branch that carries it (compile_detector.py --native)")
+  if not far_on:
+    return Check(name, WARN, f"{mode}, but TurnPilotFarCrop is off, which turns its slot off", "preflight --set TurnPilotFarCrop=1")
+  fallback = "over its budget on this device it goes back to the far crop for the drive (nativeStatus fallback)"
+  return Check(name, PASS, f"{mode}: {what} in the far crop's place, {path.name} ({size / 1e6:.1f} MB); {fallback}")
+
+
 VISION_SAYS = ' '.join(("vision: goes by itself at stop signs and yields with every cross road 25 mph or less after a 2.5 s clear",
                         "look (4 s and 'Look both ways' where one is faster or of unknown speed), in daylight with the sun not ahead,",
                         "side views on; everything else hands back after 1 s"))
@@ -345,9 +363,10 @@ def collect(params) -> list[Check]:
   from openpilot.common.hardware.usb import get_usb_state
   from openpilot.selfdrive.modeld.helpers import chestnut_compiled
   from openpilot.selfdrive.turnpilot import visibility_table
-  from openpilot.selfdrive.turnpilot.detector.graph import detector_pkl_path, far_detector_pkl_path, side_detector_pkl_path
+  from openpilot.selfdrive.turnpilot.detector.graph import (NATIVE_SIZES, detector_pkl_path, far_detector_pkl_path, native_detector_pkl_path,
+                                                           side_detector_pkl_path)
   from openpilot.selfdrive.turnpilot.stop_go import mode_for
-  from openpilot.selfdrive.turnpilot.detector.modeld_detector import far_crop_on
+  from openpilot.selfdrive.turnpilot.detector.modeld_detector import far_crop_on, native_detect_mode
   from openpilot.selfdrive.turnpilot.turnpilotd import left_far_range_for
   from openpilot.selfdrive.turnpilot.maps.client import MapError, missing_config
   from openpilot.selfdrive.turnpilot.maps.coverage import STATUS_PARAM as COVERAGE_STATUS, CoverageCache
@@ -398,6 +417,7 @@ def collect(params) -> list[Check]:
       checks.append(check_route(None, sum(s["distance"] for s in steps), time.monotonic() - t0))
     except Exception as e:
       checks.append(check_route(f"{type(e).__name__}: {e}", 0., 0.))
+  native_mode = native_detect_mode(params)
   raw_stop = params.get("TurnPilotStopSignGo")
   stop_mode, stop_known = mode_for(raw_stop)
   if not stop_known:
@@ -407,6 +427,8 @@ def collect(params) -> list[Check]:
     check_big_model(chestnut_compiled()),
     check_detector(detector_pkl_path(*CAR_CAMERA, chestnut), chestnut),
     check_far_crop(far_detector_pkl_path(*CAR_CAMERA, chestnut), left_far_range_for(params), far_crop_on(params)),
+    check_native(native_mode, native_detector_pkl_path(*CAR_CAMERA, NATIVE_SIZES[CAR_CAMERA][native_mode], chestnut)
+                 if native_mode != 'off' and native_mode in NATIVE_SIZES.get(CAR_CAMERA, {}) else None, far_crop_on(params)),
     check_stop_sign_go(stop_mode, stop_known, params.get_bool("TurnPilotAvoidStops"), vis is not None and vis.camera_ready()[0],
                        side_detector_pkl_path(*CAR_CAMERA, chestnut)),
     check_chestnut(devices),

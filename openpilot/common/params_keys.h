@@ -133,6 +133,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"TurnPilotPhoneSeen", {PERSISTENT, FLOAT}},
     {"TurnPilotValhallaInstall", {CLEAR_ON_MANAGER_START, JSON}},
     {"TurnPilotValhallaRetry", {CLEAR_ON_MANAGER_START, BOOL}},
+    {"TurnPilotNativeDetect", {PERSISTENT, STRING, "off"}},
     {"NetworkMetered", {PERSISTENT, BOOL}},
     {"ObdMultiplexingChanged", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, BOOL}},
     {"ObdMultiplexingEnabled", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, BOOL}},

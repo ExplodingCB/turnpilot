@@ -31,6 +31,13 @@ FAR_HORIZON_ROW = 256       # the calibrated horizon this many rows down the cro
                             # below it, signal heads from about 21 m out above it (4.8 m over the camera)
 FAR_ALIGN_X = 32            # the crop's x0 a multiple of this, so its views' offsets stay aligned (strides are of 128)
 SIDE_INPUT_SIZE = (768, 512)  # the side views (sideview.SIDE_SIZE): the YOLO input as it is
+# the native schedule (TurnPilotNativeDetect, modeld_detector.NativeStrips): full-width strips of the frame at native
+# resolution in the far crop's graph at the strip's size, so a box maps back with the strip's offset alone (Crop). They take
+# the far crop's slot (the model frames between the full pass's runs), never the full pass's. strip: one 1344x384 strip
+# aimed at the horizon (crop_at); full: two 1344x512 strips, the top and the bottom of the frame (rows 0-511 and 248-759, 264
+# rows shared around the horizon), alternating, so the whole frame natively every 200 ms and the horizon band every 100 ms
+NATIVE_MODES = ('off', 'strip', 'full')
+NATIVE_SIZES = {(1344, 760): {'strip': (1344, 384), 'full': (1344, 512)}}
 
 
 @dataclass(frozen=True)
@@ -198,6 +205,11 @@ def detector_pkl_path(cam_w: int, cam_h: int, chestnut: bool, models_dir: Path =
 def far_detector_pkl_path(cam_w: int, cam_h: int, chestnut: bool, models_dir: Path = MODELS_DIR) -> Path:
   """The compiled far crop for a camera size (detector_pkl_path's naming)."""
   return models_dir / f'{"big_" if chestnut else ""}far_detector_{cam_w}x{cam_h}_tinygrad.pkl'
+
+
+def native_detector_pkl_path(cam_w: int, cam_h: int, size: tuple[int, int], chestnut: bool, models_dir: Path = MODELS_DIR) -> Path:
+  """The compiled native strip of size (w, h) for a camera size (detector_pkl_path's naming)."""
+  return models_dir / f'{"big_" if chestnut else ""}native_detector_{cam_w}x{cam_h}_{size[0]}x{size[1]}_tinygrad.pkl'
 
 
 def side_input_specs(cam_w: int, cam_h: int, device: str) -> dict:
