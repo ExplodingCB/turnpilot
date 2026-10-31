@@ -57,6 +57,11 @@ details { margin-top: 28px; } summary { min-height: 44px; font-weight: 600; }
   color: var(--fg); font: 15px ui-monospace, Menlo, monospace; border-radius: 0; }
 #mapform textarea { min-height: 120px; }
 #mapform button { margin-top: 12px; width: 100%; }
+#keybox input { width: 100%; min-height: 44px; padding: 8px; border: 2px solid var(--line); background: var(--bg); color: var(--fg);
+  font: 15px ui-monospace, Menlo, monospace; border-radius: 0; }
+#keybox button { margin-top: 12px; width: 100%; }
+#keyresult { margin: 10px 0 0; font-weight: 600; min-height: 1.35em; }
+#keyresult.bad { color: var(--bad); }
 code { display: block; word-break: break-all; margin: 4px 0 12px; padding: 8px; border: 1px solid var(--line); font: 14px ui-monospace, Menlo, monospace; }
 </style>
 </head>
@@ -66,6 +71,16 @@ code { display: block; word-break: break-all; margin: 4px 0 12px; padding: 8px; 
 <div id="app">
 <div id="status"><div class="note">Connecting...</div></div>
 <div id="error" role="alert"></div>
+
+<section id="keybox" hidden>
+  <h2>Map key</h2>
+  <div class="note">Paste the map key Kellen sent you, then tap Save key.</div>
+  <form id="keyform" onsubmit="return false">
+    <input id="keyonly" type="password" placeholder="Paste the map key here" aria-label="Map key" autocomplete="off" autocapitalize="none" spellcheck="false">
+    <button class="go" type="submit" id="keysave">Save key</button>
+  </form>
+  <div id="keyresult" role="status"></div>
+</section>
 
 <h2>Mapped area</h2>
 <div id="maperror" role="alert" hidden></div>
@@ -318,7 +333,11 @@ function renderMap(s) {
   if (m.override) {
     problems = [];
   } else {
-    if (m.missing.length) problems.push("Map server not set up: no " + m.missing.join(", ") + ". Open Map server below.");
+    if (m.missing.length) problems.push(m.missing.length === 1 && m.missing[0] === "API key" ?
+      "No map key yet. Paste it in Map key above." : "Map server not set up: no " + m.missing.join(", ") + ". Open Map server below.");
+    if (m.refresh && m.refresh.ok === false && m.refresh.code === "unauthorized") {
+      $("keybox").hidden = false; $("keyform").hidden = false;  // a wrong key: paste the right one in the same place
+    }
     if (m.coverage_error) problems.push(m.coverage_error);
     else if (m.car_outside) problems.push(m.outside_message.replace("Outside", "The car is outside"));
     // the cached area still shows, but the server refused the last update (a new key or certificate, the server down)
@@ -354,6 +373,7 @@ function renderMap(s) {
 
 async function loadMapSettings() {
   var d = await api("/api/map");
+  if (!d.key_set) { $("keybox").hidden = false; $("keyform").hidden = false; }
   $("maphost").value = d.host;
   $("mapkey").value = "";
   $("mapkey").placeholder = d.key_set ? "saved" + (d.key_hint ? ", ends in " + d.key_hint : "") + "; type to replace" : "not set";
@@ -362,6 +382,41 @@ async function loadMapSettings() {
   $("mapcertinfo").textContent = d.cert_set ? "Saved certificate SHA-256: " + d.cert_fingerprint : "No certificate saved.";
   return d;
 }
+
+function keyResult(text, bad) {
+  var r = $("keyresult");
+  r.textContent = text;
+  r.className = bad ? "bad" : "";
+}
+
+// The map key on its own: the comma already has the map server's address and certificate, so the key is all it needs.
+$("keyform").onsubmit = function () {
+  var key = $("keyonly").value.trim();
+  if (!key) { keyResult("Paste the key first.", true); return false; }
+  keyResult("Checking the key with the map server...", false);
+  $("keysave").disabled = true;
+  (async function () {
+    try {
+      var d = await api("/api/map", "POST", { key: key });
+      $("keyonly").value = "";
+      await loadMapSettings();
+      if (d.coverage_ok) {
+        var s = await api("/api/status");
+        var names = s.map && s.map.coverage ? s.map.coverage.names : "";
+        keyResult("Key works. TurnPilot can drive around " + (names || "its mapped area") + ". The comma moves on by itself.", false);
+        $("keyform").hidden = true;
+      } else {
+        keyResult("Saved, but it didn't work: " + d.coverage_error, true);
+      }
+      await poll();
+    } catch (e) {
+      keyResult("Not saved: " + e.message, true);
+    } finally {
+      $("keysave").disabled = false;
+    }
+  })();
+  return false;
+};
 
 $("mapsave").onclick = function () {
   act(async function () {

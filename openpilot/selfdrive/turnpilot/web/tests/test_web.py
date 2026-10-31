@@ -1069,3 +1069,11 @@ class TestMapDefaultsOnTheWeb(WebTestCase):
     code, body, _ = self.call("POST", "/api/map", {"host": "https://maps.example.test"})
     assert code == 400 and "Enter the API key again" in body["error"]
     assert self.params.get("TurnPilotMapHost") == DEFAULT_MAP_HOST
+
+  def test_page_has_one_field_for_the_key(self):
+    page = server.INDEX.read_text()
+    box = page.split('<section id="keybox"')[1].split("</section>")[0]
+    assert box.count("<input") == 1 and box.count("<button") == 1 and "Save key" in box and "Kellen" in box
+    script = page.split("<script>")[1]
+    assert 'api("/api/map", "POST", { key: key })' in script  # the key alone: the address and certificate are the comma's
+    assert "Key works." in script and "Not saved: " in script
