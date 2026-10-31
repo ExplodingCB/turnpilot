@@ -135,6 +135,7 @@ class TestToken(WebTestCase):
       code, body, headers = self.call("GET", path, auth="none")
       assert code == 200 and body == page and headers["Content-Type"].startswith("text/html"), path
     assert b'id="unpaired"' in page  # what the page shows when the API says 401
+    assert b'settings &gt; turnpilot &gt; pair phone' in page  # after setup the code is only there, not on the comma's screen
     assert self.call("GET", "/nope", auth="none")[0] == 401  # only the page and the icon are open
     assert self.call("POST", "/", {}, auth="none")[0] == 401
     assert self.call("GET", f"/api/status?t={self.token}", auth="none")[0] == 401

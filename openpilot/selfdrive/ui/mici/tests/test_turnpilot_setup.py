@@ -53,13 +53,18 @@ class TestSetupWiring(OpenpilotTestCase):
     from openpilot.selfdrive.ui.mici.layouts.turnpilot_setup import done_lines
     params = BlockingParams()
     lines = done_lines(params)
-    assert "15 mph" in lines[0] and "cruise stalk" in lines[1] and "destination on the phone" in lines[2]
-    assert lines[3] == "TurnPilot starts live: it drives the route."
-    assert "Signal Left" in lines[4]  # car signals off: the car asks for the stalk
+    # in the car the comma reaches the internet (each drive's map) and the phone only on the phone's hotspot, and the
+    # page's address changes there (INSTALL.md, First drive): the done screen says both, with no document to read
+    assert "phone's hotspot" in lines[0] and "settings > network" in lines[0]
+    assert "scan the code again" in lines[1].lower() and "settings > turnpilot > pair phone" in lines[1]
+    assert "15 mph" in lines[2] and "cruise stalk" in lines[3] and "destination on the phone" in lines[4]
+    assert [ln[:3] for ln in lines[:5]] == ["1. ", "2. ", "3. ", "4. ", "5. "]
+    assert lines[5] == "TurnPilot starts live: it drives the route."
+    assert "Signal Left" in lines[6]  # car signals off: the car asks for the stalk
     params.put_bool("TurnPilotShadowMode", True)
     params.put("TurnPilotCarSignals", "on")
     lines = done_lines(params)
-    assert lines[3].startswith("TurnPilot starts watch only") and len(lines) == 4
+    assert lines[5].startswith("TurnPilot starts watch only") and len(lines) == 6
     from openpilot.selfdrive.ui.mici.layouts.turnpilot_setup import DONE_LINES_MAX
     params.put("TurnPilotCarSignals", "off")
     assert len(done_lines(params)) == DONE_LINES_MAX  # the done screen has a card for every line it can show

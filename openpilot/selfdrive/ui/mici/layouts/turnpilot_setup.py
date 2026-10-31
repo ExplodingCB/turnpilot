@@ -53,16 +53,19 @@ def setup_needed(params) -> bool:
   return not params.get_bool(ss.SETUP_DONE) and not (params.get('TurnPilotValhallaTiles') or '').strip()
 
 
-DONE_LINES_MAX = 5
+DONE_LINES_MAX = 7
 
 
 def done_lines(params) -> list[str]:
-  """The last screen's sentences, from the params as they are now."""
+  """The last screen's sentences, from the params as they are now. In the car the comma reaches the internet (each drive's
+  map) and the phone only over the phone's hotspot, where the page's address changes, so the first two say so."""
   live = "watch only: it shows what it would do, and you drive" if params.get_bool('TurnPilotShadowMode') else \
          "live: it drives the route"
-  lines = ["1. Drive straight above 15 mph for a few minutes. The camera calibrates.",
-           "2. Engage with the cruise stalk.",
-           "3. Enter a destination on the phone.",
+  lines = ["1. In the car, turn on your phone's hotspot. Join it in settings > network.",
+           "2. Scan the code again in settings > turnpilot > pair phone.",
+           "3. Drive straight above 15 mph for a few minutes. The camera calibrates.",
+           "4. Engage with the cruise stalk.",
+           "5. Enter a destination on the phone.",
            f"TurnPilot starts {live}."]
   if (params.get('TurnPilotCarSignals') or 'off') != 'on':
     lines.append("When the comma chimes \"Signal Left\" or \"Signal Right\", tap the stalk that way.")
