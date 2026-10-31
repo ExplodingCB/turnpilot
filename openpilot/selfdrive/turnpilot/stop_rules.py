@@ -67,6 +67,22 @@ GO_NUDGE_M = 1.0          # m of nudge in GO_ROOM_M
 GO_ROOM_RIGHT_M = 0.5     # m more for a right, whose swing reaches the far lane
 GO_ROOM_V = 1.0           # m/s the nudge reaches
 
+# TurnPilotStopSignGo=vision (tp/vision-go; owner decision 2026-10-30 18:20, "vision based go"): the go from what the camera
+# sees live, no survey, validation stamp, camera fields or launch stamp
+VISION_MAX_LIMIT = 25. * MPH  # m/s: a conflicting lane at or under this posted (or class default) speed gets VISION_CLEAR_S
+VISION_LIMIT_TOL = 0.05   # m/s: a 40 km/h tag (24.9 mph) reads as 25 mph
+VISION_CLEAR_S = 2.5      # s every go condition holds before a vision go (CLEAR_S stays the sector and dropout window)
+# a lane over VISION_MAX_LIMIT, or of unknown speed (assumedLimit 0), no longer hands back (owner direction 2026-10-30
+# 19:15-19:55, "it needs to always drive"): the longer look, its floor judged at VISION_MAX_LIMIT (ALWAYS_DRIVE V12), the
+# window VISION_LONG_CLEAR_S on every view, and "Look both ways" said before the go
+VISION_LONG_CLEAR_S = 4.0
+VISION_ANNOUNCE_S = 1.0   # s before the go its line ("Going", or "Look both ways") and chime
+VISION_CREEP_AFTER_S = 2.0  # s of a wait on reach alone before the creep for a view (ALWAYS_DRIVE V9)
+# D-V1, the reach each conflicting lane must show under vision: 'stop' (option A, built) an attentive driver at the limit,
+# first seen as we go, stops short of our path; 'allway' (option B) the all-way need on an approach the map says stops, and
+# no vision go on any other
+VISION_FLOOR = 'stop'
+
 # geometry (1.2)
 POS_ERR_M = 2.0           # m, the car's along-track position error
 SURVEY_ERR_M = 0.5        # m, a surveyed distance's
@@ -165,6 +181,35 @@ def r_req_two_way(v_limit: float, d_edge_max: float, a_launch: float = A_LAUNCH_
 
 def reach_needed_two_way(v_limit: float, d_edge_max: float, a_launch: float = A_LAUNCH_PLAN) -> float:
   return r_req_two_way(v_limit, d_edge_max, a_launch) + V_CROSS_FACTOR * v_limit * T_LAT
+
+
+def vision_speed_ok(v_limit: float) -> bool:
+  """A conflicting lane vision judges at its own limit with VISION_CLEAR_S: posted (or its class default) 25 mph or less. 0 is
+  an unmatched or default limit: not known."""
+  return 0. < v_limit <= VISION_MAX_LIMIT + VISION_LIMIT_TOL
+
+
+def vision_limit(v_limit: float) -> float:
+  """m/s a lane's vision floor is judged at: its own limit at 25 mph or less, else (faster, or not known) VISION_MAX_LIMIT,
+  the long look's (ALWAYS_DRIVE V12; the owner's direction of 2026-10-30 19:15-19:55)."""
+  return v_limit if vision_speed_ok(v_limit) else VISION_MAX_LIMIT
+
+
+def stop_mapped(a) -> bool:
+  """The map says the approach stops: tier mapStrong or mapWeak, or Valhalla's control on it a stop."""
+  return a is not None and (a.tier in ('mapStrong', 'mapWeak') or a.control == 'stop')
+
+
+def reach_needed_vision(v_limit: float, approach=None, floor: str | None = None) -> float:
+  """m of a conflicting lane the walk must reach under vision (D-V1), at vision_limit(v_limit). 'stop' (option A): an
+  attentive driver at the limit, first visible as we go, reacting T_R and braking at A_PHANTOM, stops short of our path:
+  v T_R + v^2 / (2 A_PHANTOM), no V_CROSS_FACTOR, no M_STOP; compared with the walk's raw reach, never reach less v_c T_LAT
+  (a car seen in the last T_LAT is the launch's re-check's and the band's). 'allway' (option B): an approach the map says
+  stops needs the all-way reach, any other is never met."""
+  v = vision_limit(v_limit)
+  if (floor or VISION_FLOOR) == 'allway':
+    return reach_needed_allway(v) if stop_mapped(approach) else math.inf
+  return v * T_R + v * v / (2. * A_PHANTOM)
 
 
 def allway_limit_mph(reach_m: float) -> int | None:

@@ -447,3 +447,130 @@ class TestModeParam:
     assert ce.stop_sign_mode(SimpleNamespace(get=lambda k: None)) == 'shadow'
     assert [ce.stop_sign_mode(SimpleNamespace(get=lambda k, m=m: m)) for m in ('off', 'trial', 'auto')] == ['off', 'trial', 'auto']
     assert ce.stop_sign_mode(SimpleNamespace(get=lambda k: b'auto')) == 'auto'
+
+
+# ------------------------------------------------------------------------------------------------- TurnPilotStopSignGo=vision
+
+VISION = ce.Runtime(mode='vision', side_views=True)
+MAPPED = {'left': 'mapStrong', 'right': 'mapStrong', 'opposite': 'mapStrong'}
+
+
+def vision_junction(mph=25, tiers=None, **kw):
+  """test_certify's junction as the car meets it on Saturday: no survey, the map's tiers (mapStrong: an all-way)."""
+  return junction(mph=mph, tiers=tiers or MAPPED, surveyed=False, **kw)
+
+
+def two_way_junction(mph=25, **kw):
+  j = vision_junction(mph, tiers={'left': 'no', 'right': 'no', 'opposite': 'mapStrong'}, **kw)
+  for a in j.approaches:
+    if a.role in ('left', 'right'):
+      a.control = 'none'
+  return j
+
+
+class TestVision:
+  """Vision reads no survey, validation stamp, camera field or launch stamp: the shipped file (PV1 tables, camera fields
+  null, the veil unmeasured) and no surveys certify, and a lane's floor is the vision floor on the optimistic row."""
+  shipped = vt.load(vt.SHIPPED)
+
+  def test_vision_is_a_mode_that_acts(self):
+    assert 'vision' in ce.MODES and 'vision' in ce.ACTING and ce.VISION == 'vision'
+    from types import SimpleNamespace
+    assert ce.stop_sign_mode(SimpleNamespace(get=lambda k: b'vision')) == 'vision'
+
+  @pytest.mark.parametrize('mph', [15, 20, 25])
+  @pytest.mark.parametrize('make', [vision_junction, two_way_junction])
+  def test_an_unsurveyed_junction_certifies_on_the_shipped_file_at_25_mph_or_less(self, mph, make):
+    v = ce.assess(make(mph), 'straight', self.shipped, [], ETA, VISION)
+    assert (v.certification, v.reason) == ('certifiable', 'none'), v.detail
+    assert not v.validated and v.long_look == [] and v.rows == {'day'}
+    assert all(not ln.stopping and ln.need == pytest.approx(sr.reach_needed_vision(mph * MPH)) and ln.reach >= ln.need for ln in v.lanes)
+    assert {ln.role for ln in v.lanes} == {'left', 'right', 'opposite'}
+
+  def test_the_floor_is_an_attentive_driver_stopping_short(self):
+    # D-V1 option A: v T_R + v^2 / (2 A_PHANTOM) at the approach's limit, no 1.15, no M_STOP; option B the all-way need
+    assert [round(sr.reach_needed_vision(m * MPH), 1) for m in (15, 20, 25)] == [17.6, 26.7, 37.6]
+    a = vision_junction().approaches[0]
+    assert sr.stop_mapped(a) and not sr.stop_mapped(None)
+    assert sr.reach_needed_vision(25 * MPH, a, floor='allway') == pytest.approx(sr.reach_needed_allway(25 * MPH))
+    a2 = two_way_junction().approaches[0]
+    assert not sr.stop_mapped(a2) and sr.reach_needed_vision(25 * MPH, a2, floor='allway') == float('inf')
+
+  @pytest.mark.parametrize('mph', [30, 35, 0])
+  def test_a_cross_road_over_25_mph_or_of_unknown_speed_is_the_long_look_never_a_handback(self, mph):
+    # the owner's direction (2026-10-30 19:15-19:55): it still goes, after the longer look, judged at 25 mph (V12)
+    j = vision_junction(mph)
+    v = ce.assess(j, 'straight', self.shipped, [], ETA, VISION)
+    assert (v.certification, v.reason) == ('certifiable', 'none'), v.detail
+    assert sorted(v.long_look) == ['left', 'opposite', 'right']
+    assert all(ln.need == pytest.approx(sr.reach_needed_vision(25 * MPH)) for ln in v.lanes)
+    assert ('speed not known' if mph == 0 else f'{mph} mph') in v.detail
+
+  def test_the_speed_gate_reads_25_mph_and_a_40_kmh_tag(self):
+    assert sr.vision_speed_ok(25 * MPH) and sr.vision_speed_ok(40 / 3.6) and sr.vision_speed_ok(15 * MPH)
+    assert not sr.vision_speed_ok(0.) and not sr.vision_speed_ok(26 * MPH) and not sr.vision_speed_ok(30 * MPH)
+    assert sr.vision_limit(35 * MPH) == sr.VISION_MAX_LIMIT and sr.vision_limit(0.) == sr.VISION_MAX_LIMIT
+    assert sr.vision_limit(20 * MPH) == 20 * MPH
+
+  def test_side_views_off_is_side_views(self):
+    v = ce.assess(vision_junction(), 'straight', self.shipped, [], ETA, ce.Runtime(mode='vision', side_views=False))
+    assert (v.certification, v.reason, v.detail) == ('uncertifiable', 'sideViews', 'side views off for this drive')
+
+  @pytest.mark.parametrize('eta, heading, why', [
+    (ETA + 8 * 3600., 0., 'night at ETA'),
+    (utc(2026, 10, 28, 23, 0), 0., 'dusk at ETA'),
+    (utc(2026, 10, 28, 22, 0), 0., 'low sun along an approach at ETA'),
+    (utc(2026, 10, 28, 17, 0), 180., 'sun ahead at ETA'),
+    (None, 0., "the clock isn't set"),
+  ])
+  def test_night_dusk_low_sun_the_sun_ahead_and_no_clock_fail_light(self, eta, heading, why):
+    v = ce.assess(vision_junction(heading_in=heading), 'straight', self.shipped, [], eta, ce.Runtime(mode='vision', side_views=True, window=(0., 0.)))
+    assert (v.certification, v.reason) == ('uncertifiable', 'light') and why in v.detail, v.detail
+
+  @pytest.mark.parametrize('changes, reason', [({'roundabout': True}, 'geometry'), ({'divided': True}, 'geometry'),
+                                               ({'rail_distance': 12.}, 'geometry'), ({'rail_distance': -2.}, 'geometry'),
+                                               ({'status': 'partial'}, 'unknownLeg')])
+  def test_geometry_and_unknown_legs_are_unchanged(self, changes, reason):
+    v = ce.assess(vision_junction(**changes), 'straight', self.shipped, [], ETA, VISION)
+    assert (v.certification, v.reason) == ('uncertifiable', reason)
+
+  def test_skew_an_unknown_control_and_an_override_are_unchanged(self):
+    j = vision_junction()
+    j.approaches[0].rel_bearing = -60.
+    assert ce.assess(j, 'straight', self.shipped, [], ETA, VISION).reason == 'skew'
+    j = vision_junction()
+    j.approaches[0].control = 'unknown'
+    assert ce.assess(j, 'straight', self.shipped, [], ETA, VISION).reason == 'unknownLeg'
+    j = vision_junction()
+    j.approaches[1].overridden = True
+    assert ce.assess(j, 'straight', self.shipped, [], ETA, VISION).reason == 'override'
+
+  def test_never_no_table_no_launch_not_surveyed_or_not_validated(self, tmp_path):
+    for vis in (self.shipped, visibility(tmp_path, launchVerified=None)):
+      for surveys in ([], [survey()]):
+        v = ce.assess(vision_junction(), 'straight', vis, surveys, ETA, VISION)
+        assert v.reason not in ('noTable', 'noLaunch', 'notSurveyed', 'notValidated'), v.reason
+    assert ce.assess(vision_junction(), 'straight', None, [], ETA, VISION).reason == 'noTable'  # no file at all
+
+  def test_route_time_reach_is_the_walk_on_the_optimistic_row(self):
+    # the conservative side bin (32 m) gives 27 m down the near lane, short of 25 mph's 37.6; the optimistic (44 m) 38.8 m
+    v = ce.assess(vision_junction(), 'straight', self.shipped, [], ETA, VISION)
+    near = next(ln for ln in v.lanes if ln.role == 'left')
+    assert near.reach == pytest.approx(38.8, abs=0.3)
+    # yawed 3 deg at route time the near lane's frame edge reaches 32 m: a route-time 'reach' (the decider ignores it)
+    v = ce.assess(vision_junction(), 'straight', self.shipped, [], ETA, ce.Runtime(mode='vision', side_views=True, yaw_offset_deg=3.))
+    assert (v.certification, v.reason) == ('uncertifiable', 'reach') and 'left lane 1' in v.detail
+
+  def test_the_union_of_the_conflict_sets_is_judged_off_the_route(self):
+    v = ce.assess(vision_junction(15), 'unknown', self.shipped, [], ETA, VISION)
+    assert v.certification == 'certifiable' and {ln.role for ln in v.lanes} == {'left', 'right', 'opposite'}
+    assert {ln.movement for ln in v.lanes} >= {'cross', 'swing', 'leftTurners', 'straightRight'}
+
+  @pytest.mark.parametrize('mph, ok', [(15, True), (20, False), (25, False)])
+  def test_a_rights_swing_zone_is_judged_from_its_conflict_point_15_m_down_the_far_lane(self, mph, ok):
+    # the far lane's swing movement starts SWING_ZONE_M out: 38.8 m seen down it is 23.8 m from there, the 15 mph floor's
+    # 17.6 met, 20 mph's 26.7 not; so navd routes around a right at a 20-25 mph stop under vision (the decider would wait)
+    v = ce.assess(vision_junction(mph, maneuver='right'), 'right', self.shipped, [], ETA, VISION)
+    swing = next(ln for ln in v.lanes if ln.movement == 'swing')
+    assert swing.reach == pytest.approx(23.8, abs=0.3)
+    assert (v.certification == 'certifiable') == ok and (ok or 'swing' in v.detail)

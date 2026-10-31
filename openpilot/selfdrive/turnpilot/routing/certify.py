@@ -27,6 +27,11 @@ certify(junction, maneuver, visibility, surveys, eta, runtime) returns (certific
                    curb, at the junction's stop point; with the side views off, the road and full-pass tables instead
 ('unchecked', 'none') for a signal (not this certifier's).
 
+Under TurnPilotStopSignGo=vision (_assess_vision) only checks 4-6, 8, 9 and 11 run, with sideViews (the side views off for the
+drive) after 6: no survey, stamp, camera field or launch stamp is read, every lane is judged as possibly not stopping, and
+check 11's reach is the walk on the PV1 optimistic row against stop_rules.reach_needed_vision. A conflicting approach over
+25 mph or of unknown speed doesn't fail: it is the longer look (Verdict.long_look), its floor judged at 25 mph.
+
 A validation stamp (written by junction_validate.py, SG3b) is {lighting, date, passes, approachBearingDeg (required: the
 heading toward the junction of the approach it was measured from; a stamp without it validates no approach), cars: {left,
 right, opposite}, minFirstTrackM and maxDropoutS: {left, right, opposite} each a list per binding lane, nearest first (or
@@ -39,16 +44,17 @@ car on it toward the junction sees them): the left approach's right curb (the ne
 right approach's left curb; parking on the far curbs hides neither lane.
 """
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.turnpilot import stop_rules as sr
 from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
 from openpilot.selfdrive.turnpilot.routing.junctions import LEG_HEADING_TOL, survey_approach
 
-MODES = ('off', 'shadow', 'trial', 'auto')
+VISION = 'vision'                # the go from the live camera alone (tp/vision-go; _assess_vision)
+MODES = ('off', 'shadow', 'trial', 'auto', VISION)
 MODE_PARAM = 'TurnPilotStopSignGo'
-ACTING = ('trial', 'auto')
+ACTING = ('trial', 'auto', VISION)
 BINDING_CURB = {'left': 'right', 'right': 'left'}
 
 
@@ -84,6 +90,7 @@ class Verdict:
   lanes: list[LaneReach] = field(default_factory=list)
   rows: set = field(default_factory=set)   # the lighting rows the ETA window needs
   validated: bool = False
+  long_look: list = field(default_factory=list)  # vision: the roles of the conflicting approaches over 25 mph or of unknown speed
 
 
 def _fail(reason: str, detail: str, **kw) -> Verdict:
@@ -143,24 +150,9 @@ def pick_stamp(entry: dict, row: str, heading_in: float) -> dict | None:
   return max(fits, key=lambda v: str(v.get('date'))) if fits else None
 
 
-def assess(junction: sr.Junction, maneuver: str, visibility, surveys, eta: float | None, runtime: Runtime) -> Verdict:
-  """certify() with its detail: the failing check's why, each conflicting lane's need and reach, the lighting rows."""
-  j = junction
-  # 1 the camera
-  if not visibility:
-    return _fail('noTable', 'no visibility file')
-  ready, missing = visibility.camera_ready()
-  if not ready:
-    return _fail('noTable', f"visibility.json has no {', '.join(missing)} (step S1)")
-  # 2, 3 the mode and the launch
-  if runtime.mode not in ACTING:
-    return _fail('modeOff', f"TurnPilotStopSignGo is {runtime.mode}")
-  launch = runtime.launch_verified if runtime.launch_verified is not None else visibility.launch_passed
-  if not launch and runtime.mode != 'trial':
-    return _fail('noLaunch', 'no passing launchVerified stamp (step S4a)' + (f": its verdict is {visibility.launch_verified.get('verdict')}"
-                                                                           if visibility.launch_verified else ''))
+def _geometry(j: sr.Junction, maneuver: str, moves: list) -> Verdict | None:
+  """Checks 4-6 (geometry, skew, unknown legs), the same for every mode: the first that fails, None when all pass."""
   # 4 geometry
-  moves = sr.conflict_movements(j, maneuver, runtime.yaw_deg)
   exit_leg = next((a for a in j.approaches if a.role == 'exit'), None)
   channel = [a for a in [m.approach for m in moves] + ([exit_leg] if exit_leg is not None else []) if a.use in ('turnChannel', 'turn_channel')]
   if j.roundabout:
@@ -186,6 +178,89 @@ def assess(junction: sr.Junction, maneuver: str, visibility, surveys, eta: float
   for m in moves:
     if m.approach.control == 'unknown':
       return _fail('unknownLeg', f"the {m.role} approach's control is unknown")
+  return None
+
+
+def vision_lanes(j: sr.Junction, maneuver: str, setback: float, yaw_deg: float = 0.) -> list[sr.Lane]:
+  """The conflicting lanes as vision judges them: every approach as possibly not stopping (stopping False, whatever its
+  tier), placed on the unsurveyed edge band."""
+  edges = sr.edge_band(j.stop_point_distance, cross_lanes(j), None)
+  return [replace(ln, stopping=False) for ln in sr.conflict_lanes(j, maneuver, edges, setback, yaw_deg)]
+
+
+def long_look(j: sr.Junction, maneuver: str, yaw_deg: float = 0.) -> list[tuple[str, float]]:
+  """(role, assumed limit m/s) of each conflicting approach vision doesn't judge at its own limit (over 25 mph, or 0: not
+  known): the longer look's (owner direction 2026-10-30 19:15-19:55)."""
+  out = []
+  for m in sr.conflict_movements(j, maneuver, yaw_deg):
+    if not sr.vision_speed_ok(m.approach.assumed_limit) and m.role not in [r for r, _ in out]:
+      out.append((m.role, m.approach.assumed_limit))
+  return out
+
+
+def _assess_vision(j: sr.Junction, maneuver: str, visibility, eta: float | None, runtime: Runtime) -> Verdict:
+  """TurnPilotStopSignGo=vision's checks, in order: geometry, skew and unknown legs (4-6, as every mode), side views off for
+  the drive (sideViews), an override (8), the light over runtime.window (9: night, dusk, low sun, the sun ahead with the veil
+  unmeasured, no clock), and at route time the reach each lane's walk predicts on the optimistic row against the vision floor
+  (11; the decider ignores 'reach' and walks live). No survey, validation stamp, camera field or launch stamp is read. A
+  conflicting approach over 25 mph or of unknown speed is no failure: the longer look (Verdict.long_look), its floor judged at
+  25 mph."""
+  moves = sr.conflict_movements(j, maneuver, runtime.yaw_deg)
+  bad = _geometry(j, maneuver, moves)
+  if bad is not None:
+    return bad
+  if not runtime.side_views:
+    return _fail('sideViews', 'side views off for this drive')
+  slow = long_look(j, maneuver, runtime.yaw_deg)
+  look = '; '.join(f"the {r} approach is {lim / sr.MPH:.0f} mph" if lim > 0. else f"the {r} approach's speed not known" for r, lim in slow)
+  if any(a.overridden for a in j.approaches):
+    return _fail('override', 'an approach is in TurnPilotJunctionOverrides')
+  if eta is None:
+    return _fail('light', "the clock isn't set (no GPS time yet): the sun can't be placed")
+  looks = sorted({m.approach.bearing for m in moves})
+  rows, why = sr.light_window(j.lat, j.lon, eta, j.heading_in, visibility.veil, looks, *runtime.window)
+  if why:
+    return _fail('light', why)
+  setback = visibility.setback if visibility.setback is not None else 1.9
+  lanes = vision_lanes(j, maneuver, float(setback), runtime.yaw_deg)
+  rot = sr.angle_bound(False, runtime.yaw_offset_deg)
+  out, short = [], []
+  for ln in lanes:
+    need = sr.reach_needed_vision(ln.limit, ln.approach)
+    reach = min((sr.reach_walk(ln, visibility.sight(visibility.views(row, bound='optimistic', use='allWay')), rot) for row in sorted(rows)),
+                default=0.)
+    out.append(LaneReach(ln.role, ln.index, ln.movement, need, reach, False))
+    if reach + 1e-9 < need:
+      short.append(f"{ln.role} lane {ln.index} {ln.movement}: {reach:.1f} of {need:.1f} m")
+  roles = [r for r, _ in slow]
+  if short:
+    return _fail('reach', '; '.join(short), lanes=out, rows=rows, long_look=roles)
+  return Verdict('certifiable', 'none', f"long look: {look}" if look else '', out, rows, False, roles)
+
+
+def assess(junction: sr.Junction, maneuver: str, visibility, surveys, eta: float | None, runtime: Runtime) -> Verdict:
+  """certify() with its detail: the failing check's why, each conflicting lane's need and reach, the lighting rows."""
+  j = junction
+  # 1 the camera
+  if not visibility:
+    return _fail('noTable', 'no visibility file')
+  if runtime.mode == VISION:
+    return _assess_vision(j, maneuver, visibility, eta, runtime)
+  ready, missing = visibility.camera_ready()
+  if not ready:
+    return _fail('noTable', f"visibility.json has no {', '.join(missing)} (step S1)")
+  # 2, 3 the mode and the launch
+  if runtime.mode not in ACTING:
+    return _fail('modeOff', f"TurnPilotStopSignGo is {runtime.mode}")
+  launch = runtime.launch_verified if runtime.launch_verified is not None else visibility.launch_passed
+  if not launch and runtime.mode != 'trial':
+    return _fail('noLaunch', 'no passing launchVerified stamp (step S4a)' + (f": its verdict is {visibility.launch_verified.get('verdict')}"
+                                                                           if visibility.launch_verified else ''))
+  # 4 geometry, 5 skew, 6 unknown legs
+  moves = sr.conflict_movements(j, maneuver, runtime.yaw_deg)
+  bad = _geometry(j, maneuver, moves)
+  if bad is not None:
+    return bad
   # 7, 8 surveyed, overrides
   if not j.surveyed:
     return _fail('notSurveyed', 'no counting survey of the junction (decision D10)')
@@ -250,7 +325,7 @@ def assess(junction: sr.Junction, maneuver: str, visibility, surveys, eta: float
 
 
 def stop_sign_mode(params) -> str:
-  """TurnPilotStopSignGo (off, shadow, trial, auto), read the way light_state reads its param: a value this build doesn't
+  """TurnPilotStopSignGo (off, shadow, trial, auto, vision), read the way light_state reads its param: a value this build doesn't
   know, or a param it doesn't know (UnknownKeyName, before SG4a adds it), or none at all, acts as shadow, logged."""
   try:
     value = params.get(MODE_PARAM)
