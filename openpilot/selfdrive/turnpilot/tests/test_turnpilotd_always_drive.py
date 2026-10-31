@@ -481,6 +481,23 @@ def test_a_stall_with_a_model_lead_or_in_a_far_side_turn_is_never_lifted():
   assert any(q.controlPrompt == 'stalledTakeControl' for q in plans)
 
 
+def test_a_stalls_handback_for_a_flickering_model_lead_stays_and_no_lift_follows_it():
+  """SAT_RERUN R4/R5 (red_right_g62, red_right): the car stood 58 deg into the right against the far kerb, the model's lead
+  (the building, 14.6 m) read p 0.72 one frame and under the lift's bar the next. The lift refused for it, 'Stalled in the turn:
+  take control' showed 0.1 s, then 'Finishing the Turn' and a clearBox lift toward the lead (R5: lift 5 moved the car to
+  1.71 m/s 8 s after the handback, the lead still read). Once handed back the stand stays handed back: the prompt on every frame
+  and no lift, until the car moves, the driver acts or the turn changes."""
+  sim = stalled_right(True, deg=58.)
+  plans = []
+  for k in range(round((STALL_PROMPT_S + 10.) / DT_MDL)):
+    plans += stand(sim, DT_MDL, lead_prob=0.72 if k % 2 else 0.05, lead_x=14.6)
+  handed = next(i for i, q in enumerate(plans) if q.controlPrompt == 'stalledTakeControl')
+  assert all(q.controlPrompt == 'stalledTakeControl' for q in plans[handed:]), \
+    [i * DT_MDL for i, q in enumerate(plans[handed:], handed) if q.controlPrompt != 'stalledTakeControl'][:5]
+  assert not [s for s in lifts_of(plans) if s[0] > handed], lifts_of(plans)
+  assert not any(q.shouldStop for q in plans)
+
+
 # --- ST-09 (stalls): a queue in a turn ---
 
 def queued(sim, seconds, moves_every=None):
