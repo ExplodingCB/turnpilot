@@ -107,7 +107,8 @@ far its own stop carries the car is never the driver's and nothing is let go on 
 held there and the full check goes on (c) (skeptic round 1: a re-engage inside the ask was let go a frame or two on, on
 TurnPilot's braking, and openpilot drove the car into the junction). So driven, or its hold line's latch let go as the
 driver's (driven: the map's Driven for its maneuver), the left is done: undecided ('driven'), no stop, no go, no turn pulse
-(TurnPilot never pulses a left nobody checked), the crossing's prompt said.
+(TurnPilot never pulses a left nobody checked, and a pulse of a withdrawn go still out comes out of the model's queue under
+TURN_STARTED_DEG into it: turnpilotd.clear_driven_left, the car going straight on, missed), the crossing's prompt said.
 """
 import math
 from dataclasses import dataclass, field

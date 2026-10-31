@@ -6,7 +6,7 @@ import pytest
 
 from openpilot.cereal import log, messaging
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
+from openpilot.selfdrive.turnpilot.hooks import CLEAR_DESIRE, TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.scene.tracker import RawBox, RawFrame
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, ONCOMING_ENTRY_M
 from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of, nav_instruction
@@ -1452,6 +1452,7 @@ def test_after_a_go_withdrawn_in_its_launch_a_re_engage_is_held_short_of_the_lan
     reengage = next(k for k, (engaged, _, _) in enumerate(rows) if engaged)
     assert let_go == reengage, f"let go on row {let_go}, the re-engage {reengage}"
     assert not any(p.shouldStop for e, _, p in rows if e), "let go on TurnPilot's own braking"
+    assert not any(p.desire == Desire.turnLeft for _, _, p in rows[let_go:]), "the go's turnLeft out on a left let go as the driver's"
     assert crossing_said(after, LINE + DRIVEN_THROUGH_M - 1.), sorted({(str(p.controlPrompt), p.reason) for *_, p in after})
   else:  # held where it stands, short of the lanes, the full check going on
     assert let_go is None, f"let go {'engaged' if rows[let_go][0] else 'disengaged'}: the full check (c) skipped"
@@ -1533,3 +1534,41 @@ def test_a_nudge_from_the_lefts_full_creep_braked_short_of_the_lanes_and_re_enga
   assert moved < 0.05 and all(p.shouldStop for p in plans[5:]), f"re-engaged standing {at:.2f} m out: moved {moved:.2f} m, {states}"
   assert sim.tp.map_controls.driven is None and ('undecided', 'driven') not in states, states
   assert not any(p.desire == Desire.turnLeft for p in plans)
+
+
+@pytest.mark.parametrize("then", ['rolling', 'stop_then_standing'])
+@pytest.mark.parametrize("gas", [True, False])
+@pytest.mark.parametrize("frac", [0.6, 0.9])
+@pytest.mark.parametrize("v_w", [2.5, 2.7])
+def test_after_a_go_withdrawn_in_its_launch_a_left_let_go_as_the_drivers_is_never_turned_on_its_go(v_w, frac, gas, then):
+  """Skeptic round 2 (tp/left-hold): the go withdrawn later in its launch, the driver (disengaged: the gas, or a cancel and a
+  coast) keeps the speed over frac of the stop TurnPilot asked, then re-engages rolling, or brakes to a stop short of the
+  oncoming lanes and re-engages standing. Let go as the driver's ('driven': no stop, no go, no pulse), the go's turnLeft
+  stayed out on the engaged frames (110 of 120 re-engaged rolling, 41 of them inside ONCOMING_ENTRY_M of the centre): with
+  no hold, an uncertified left across the lanes the go was withdrawn for, which the model steers in the car (the sim has no
+  yaw). Owner decision (b): a left the driver took with no certified go goes straight on and is missed; its pulse comes out
+  of the model's queue (CLEAR_DESIRE) on the frame it is let go, never turnLeft after. Held instead (short of the lanes),
+  no turnLeft standing either."""
+  sim = late_withdrawn_go(v_w)
+  asked = sim.tp.left.hold_asked
+  s0 = sim.s
+  sim.accel = lambda sim, plan: 0.
+  while sim.s - s0 < frac * asked - 1e-3 and sim.tp.left.hold_here:
+    sim.step(engaged=False, gas=gas)
+  if then == 'stop_then_standing':
+    sim.accel = lambda sim, plan: -2.5
+    while sim.v > 0.:
+      sim.step(engaged=False)
+  sim.accel = None
+  rows = []  # (the left's own hold standing after it, the plan)
+  for _ in range(int(6. / DT_MDL)):
+    p = sim.step(engaged=True)
+    rows.append((sim.tp.left.hold_here, p))
+  let_go = next((k for k, (here, _) in enumerate(rows) if not here), None)
+  if let_go is not None:
+    out = [k for k, (_, p) in enumerate(rows[let_go:]) if p.desire == Desire.turnLeft]
+    assert not out, f"turnLeft on {len(out)} of {len(rows) - let_go} engaged frames after the left was let go as the driver's"
+    assert rows[let_go][1].desire == CLEAR_DESIRE  # out of the model's queue on the frame it is let go
+    assert any(p.turnMissed for _, p in rows) or JUNCTION - sim.s > -2., "driven straight through, never missed"
+  standing = [p for (_, p), (s, v, _) in zip(rows, sim.trace[-len(rows):], strict=True) if v < 0.05]
+  assert not any(p.desire == Desire.turnLeft for p in standing)

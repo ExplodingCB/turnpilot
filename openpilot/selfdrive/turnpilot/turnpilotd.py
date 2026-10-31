@@ -190,8 +190,9 @@ from openpilot.selfdrive.turnpilot.scene_policy import (CURB_PED_CAP_DEFAULT, HO
                                                          STOP_DECEL, VEHICLES, ScenePolicy, far_side_turn, in_path)
 from openpilot.selfdrive.turnpilot.turn_skip import SkipState, TurnSkip, can_make_turn
 from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
-from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, LINE_D, OFF, ROAD_RANGE_M, ROUTE_REACH_MARGIN_M,
-                                                           LeftInput, UnprotectedLeft, left_mode_for, reach_at_line)
+from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, DRIVEN, LINE_D, OFF, ROAD_RANGE_M,
+                                                           ROUTE_REACH_MARGIN_M, LeftInput, UnprotectedLeft, left_mode_for,
+                                                           reach_at_line)
 
 FAR_OFF_ALERT_S = ABORT_HOLD_S  # farViewOff is shown this long, once, when the far crop goes off for the drive
 FAR_STATUS_STALE_S = 1.         # the full pass's farStatus older than this: the far crop isn't known to read
@@ -990,6 +991,7 @@ class TurnPilot:
         d_on = None  # the driver overruled it (stop_go: handed back, held): no desire for it, ever
     if sg.turn_missed:
       self.missed_t = MISSED_HOLD_S  # the other turn taken: the route's planned turn is missed, navd reroutes at once (3.5)
+    self.clear_driven_left(rf)
     desire = self.desires.update(d_on, d_dist, d_id, d_passed, v_ego, cs.steeringAngleDeg,
                                  not keep_why[LEFT], not keep_why[RIGHT], DT_MDL, default_yaw_rate(cs, model),
                                  lat_active=lat_active, replaced=d_replaced,
@@ -1391,6 +1393,22 @@ class TurnPilot:
       self.post_go = None
       cloudlog.event("turnpilot_turn_missed", error=True, driven=True, turned_deg=round(dl[2], 1), v_ego=round(v_ego, 2),
                      distance=round(rf.distance, 1), passed=bool(rf.passed))
+
+  def clear_driven_left(self, rf) -> None:
+    """The autonomous left done as the driver's (unprotected_left: DRIVEN, its own hold or its line taken past with no
+    certified go) with its go's pulse still out and the car under TURN_STARTED_DEG into it: the pulse comes out of the
+    model's queue now (CLEAR_DESIRE, in this very plan) and nothing more goes for it, so the car goes straight on and the
+    left is missed (check_driven_left: turnMissed, navd's reroute), never an uncertified left across the lanes its go was
+    withdrawn for (owner decision (b); skeptic round 2: let go as the driver's, the go's turnLeft stayed out on the
+    re-engage, the model steering the left). Turned further, the turn is under way and is finished, as a committed one is.
+    Before this frame's desire (update())."""
+    left, d = self.left_now, self.desires
+    if left is None or left.state != 'undecided' or left.why != DRIVEN:
+      return
+    if d.maneuver_id == rf.maneuver_id and d.started and d.side != 0 and not d.done and d.turned_deg < TURN_STARTED_DEG:
+      cloudlog.event("turnpilot.left_driven_desire_cleared", error=True, turned_deg=round(d.turned_deg, 1),
+                     distance=round(rf.distance, 1), cause=left.crossed or 'line')
+      d.cancel()
 
   def watch_far(self, sm) -> None:
     """The far crop's state from the full pass's latest farStatus: read, or off for the drive (said once, farViewOff,
