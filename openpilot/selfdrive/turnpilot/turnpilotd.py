@@ -1366,9 +1366,21 @@ class TurnPilot:
         again = self.always_drive_on and not self.go_left and self.go_wait_s is None and not self.go_withdrawn and \
           not self.go_in_junction and not self.cant_start_unheld
         if again:
-          self.go_wait_s, self.go_lead_s, self.go_moved, self.go_clock_again = 0., 0., False, True
+          self.go_wait_s, self.go_lead_s, self.go_moved, self.go_clock_again, self.go_rolled = 0., 0., False, True, False
         cloudlog.event("turnpilot.go_spent", distance=round(rf.distance, 1), turned_deg=round(self.desires.turned_deg, 1),
                        clock_again=again)
+    elif self.go_id == rf.maneuver_id and self.go_clock_again and self.go_wait_s is None and not self.go_withdrawn and \
+        not self.go_in_junction and not self.cant_start_unheld:
+      # per stand, not once a go: the model crept on again from that stand (its clock ended as followed) and came back to rest
+      # short of the junction again, its line included (in the junction, STALL_MIN_DEG turned or the scene committed or released
+      # into it, is the stall's handback); the clock runs again from this stand too, to the same handback at NO_MOVE_MAX_S
+      in_junction = rf.maneuver_id in (self.scene.committed_id, self.scene.released_id) or self.desires.turned_deg >= STALL_MIN_DEG
+      if v_ego >= STANDSTILL_SPEED:
+        self.go_rolled = True
+      elif self.go_rolled and rf.distance > 0. and not in_junction:
+        self.go_wait_s, self.go_lead_s, self.go_moved, self.go_rolled = 0., 0., False, False
+        cloudlog.event("turnpilot.go_spent", distance=round(rf.distance, 1), turned_deg=round(self.desires.turned_deg, 1),
+                       clock_again=True)
     went = self.go_id == rf.maneuver_id and not self.go_withdrawn and not self.go_spent
     at_rest = v_ego < STANDSTILL_SPEED and rf.distance > -PROTECT_PAST_M and self.desires.turned_deg < TURN_STARTED_DEG and \
       not went and rf.maneuver_id not in (self.scene.committed_id, self.scene.released_id)

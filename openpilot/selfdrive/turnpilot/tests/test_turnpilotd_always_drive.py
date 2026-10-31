@@ -978,3 +978,22 @@ def test_the_clock_run_again_after_a_creep_adds_no_lift():
   plans = stand(sim, NO_MOVE_MAX_S + 1.)
   assert all(go_id_of(q) is None for q in plans), "no lift from the stand after the creep"
   assert any(q.controlPrompt == 'cantStartTakeControl' for q in plans) and not any(q.shouldStop for q in plans)
+
+
+def test_a_second_creep_and_stall_in_the_same_go_hands_back_at_20_s_too():
+  """Per stand, not once a go: after the first creep's stand (its clock run again), the model creeps on again, which ends that
+  clock as followed, and stands again short of the junction behind the same phantom. The release's clock runs again from this
+  stand as well, to the same loud no-hold handback NO_MOVE_MAX_S into it, never the signal's 90 s."""
+  sim = crept_and_stood_again_at_a_green()
+  stand(sim, 5., lead_prob=0.87, lead_x=13.)
+  for _ in range(round(3. / DT_MDL)):  # the second creep, 1.2 m, still short of the junction
+    sim.model_kw = {'lead_prob': 0.87, 'lead_x': 13.}
+    sim.v = 0.4
+    sim.step(engaged=True)
+  assert sim.tp.go_wait_s is None and sim.tp.follower.distance > 5., "the creep ended the clock again, short of the junction"
+  plans = stand(sim, NO_MOVE_MAX_S + 1., lead_prob=0.87, lead_x=13.)
+  first = next((i for i, q in enumerate(plans) if q.controlPrompt == 'cantStartTakeControl'), None)
+  assert first is not None, "handed back within NO_MOVE_MAX_S of the second stand, not the signal's 90 s"
+  assert abs((first + 1) * DT_MDL - NO_MOVE_MAX_S) <= 3 * DT_MDL + 1e-6, first * DT_MDL
+  assert plans[first].reason == NO_MOVE_REASON and not any(q.shouldStop for q in plans), "loud, never a hold"
+  assert all(go_id_of(q) is None for q in plans), "no lift from it either"
