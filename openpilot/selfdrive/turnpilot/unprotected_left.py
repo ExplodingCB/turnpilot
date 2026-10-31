@@ -92,21 +92,22 @@ Committed, nothing here ever stops the car (a pedestrian in the path still does:
 on within turnpilotd's LEFT_NO_MOVE_S is withdrawn and handed back there (the model holding the car; G5's bounded go is the
 remedy).
 The left's own hold after a withdrawn go (hold_here: the band, the position fault, a veto) has the latch's release rule
-(map_controls._held; owner decisions (a), (b), (c), 2026-10-30), position-free: the car past where TurnPilot's stop put it by
-the driver's own metres (moved with openpilot disengaged: the gas, or the brake let off) beyond LATCH_PAST_M, or so far on
-that the hold could no longer stand it short of the oncoming lanes (from its speed at REENGAGE_DECEL, the room to
-ONCOMING_ENTRY_M read where the hold began), is the driver's: never held again (a re-engage there is never a hold in the
-oncoming lanes or the junction), and its crossing is said (crossed: map_controls raises its Driven, the take-control up
-until the car is through, turnpilotd's turnMissed for one driven straight on). However far TurnPilot's own stop carries the
-car, engaged, is TurnPilot's; short of the reach a re-engage is held there and the full check goes on (c). So driven, or
-its hold line's latch let go as the driver's (driven: the map's Driven for its maneuver), the left is done: undecided
-('driven'), no stop, no go, no turn pulse (TurnPilot never pulses a left nobody checked), the crossing's prompt said.
+(map_controls._held; owner decisions (a), (b), (c), 2026-10-30), position-free: the car past where TurnPilot's stop put it
+by the driver's own metres (moved with openpilot disengaged: the gas, or the brake let off) beyond LATCH_PAST_M, or so far
+on that the hold could no longer stand it short of the oncoming lanes (from its speed as its own braking takes it, hold_caps
+through map_controls.reengage_stop_m, the room to ONCOMING_ENTRY_M read where the hold began), is the driver's: never held
+again (a re-engage there is never a hold in the oncoming lanes or the junction), and its crossing is said (crossed:
+map_controls raises its Driven, the take-control up until the car is through, turnpilotd's turnMissed for one driven
+straight on). However far TurnPilot's own stop carries the car, engaged, is TurnPilot's; short of the reach a re-engage is
+held there and the full check goes on (c). So driven, or its hold line's latch let go as the driver's (driven: the map's
+Driven for its maneuver), the left is done: undecided ('driven'), no stop, no go, no turn pulse (TurnPilot never pulses a
+left nobody checked), the crossing's prompt said.
 """
 import math
 from dataclasses import dataclass, field
 
 from openpilot.common.swaglog import cloudlog
-from openpilot.selfdrive.turnpilot.map_controls import LATCH_PAST_M, REENGAGE_DECEL
+from openpilot.selfdrive.turnpilot.map_controls import LATCH_PAST_M, reengage_stop_m
 from openpilot.selfdrive.turnpilot.route_follower import UNCERTAIN_M
 from openpilot.selfdrive.turnpilot.scene_policy import (CROSSWALK_X_AFTER_M, CROSSWALK_X_BEFORE_M, ONCOMING_ENTRY_M, ONCOMING_PAST_M,
                                                         ONCOMING_Y_FAR_M, ONCOMING_Y_NEAR_M, STOP_DECEL, VEHICLES, box_overlap,
@@ -283,6 +284,13 @@ class LeftDecision:
   far_range_m: float = 0.         # the far crop's proven range while it reads, else 0
   withdrawable: bool = False      # go: a veto read next frame still withdraws it short of the oncoming lanes (VETO_MARGIN_M)
   crossed: str = ''               # the frame the driver took the car past its own hold: the cause (map_controls.Driven's)
+
+
+def hold_caps(v: float) -> tuple[float, float]:
+  """Its own hold's (accel cap, speed cap) at v m/s, as a re-engage takes it up (map_controls.reengage_stop_m): waitGap's
+  and _undecided's stop(v, 0, confirmed=False), STOP_DECEL down to STOP_DECEL x SPEED_CAP_TAU, its speed cap's -v/tau under it."""
+  s = stop(v, 0., '', confirmed=False)
+  return s.accel_cap, s.speed_cap
 
 
 def t_clear(path_m: float) -> float:
@@ -795,7 +803,7 @@ class UnprotectedLeft:
     past = min(self.hold_m - self.hold_asked, self.hold_drv_m)
     if past <= 0.:
       return ''
-    if past > LATCH_PAST_M or self.hold_m + v * v / (2. * REENGAGE_DECEL) > self.hold_entry:
+    if past > LATCH_PAST_M or self.hold_m + reengage_stop_m(v, hold_caps) > self.hold_entry:
       return 'driverWent' if self.state == 'undecided' else 'drivenOff'
     return ''
 

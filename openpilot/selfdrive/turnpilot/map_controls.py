@@ -26,10 +26,11 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   openpilot disengaged or under the gas (update()'s engaged); with it engaged the plan is TurnPilot's, so the latch's own
   stop carrying a car re-engaged rolling is never theirs. A peek-creep past the line is never held again in the crossing
   lanes on a re-engage. At an unprotected turn so is the car on past both by less, once a hold could no longer stand it
-  short of the oncoming lanes (from its speed at REENGAGE_DECEL, to ONCOMING_ENTRY_M before the junction as latched): after
-  the left's full creep the reach lies inside them. Short of either nothing is let go (owner decision (a), 2026-10-30): a gas nudge inside a roll-up or
-  a creep is TurnPilot's metres, a handback the car doesn't move from lets nothing go (the car is held, the handback said),
-  and a re-engage short of the line goes back to the full check. The autonomous left's own hold after a withdrawn go
+  short of the oncoming lanes (from its speed as the latch's own braking takes it, reengage_stop_m, to ONCOMING_ENTRY_M
+  before the junction as latched): after the left's full creep the reach lies inside them. Short of either nothing is let
+  go (owner decision (a), 2026-10-30): a gas nudge inside a roll-up or a creep is TurnPilot's metres, a handback the car
+  doesn't move from lets nothing go (the car is held, the handback said), and a re-engage short of the line goes back to
+  the full check. The autonomous left's own hold after a withdrawn go
   (unprotected_left: hold_here, the latch already let go by the go) has the same rule there, its crossing said here
   (update()'s left, LeftCommand.crossed: Driven). A stop's or an unprotected turn's line crossed with no go
   (let go so, or overrun) is never silent (owner decision (b)): its take-control (DRIVEN_PROMPT) stays up, engaged or not,
@@ -131,9 +132,10 @@ from dataclasses import dataclass, field
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.turnpilot.control_tracker import JUMP_M, ControlTracker, TrackedControl
-from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, SPEED_CAP_ACCEL_MIN, TAKE_CONTROL_PROMPTS
+from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, SPEED_CAP_ACCEL_MIN, TAKE_CONTROL_PROMPTS, plan_accel
 from openpilot.selfdrive.turnpilot.route_follower import LEFT, TURN
-from openpilot.selfdrive.turnpilot.scene_policy import HARD_STOP_MIN_M, HOLD_LINE_M, NO_ACCEL_CAP, ONCOMING_ENTRY_M, STOP_LAG_S, Stop
+from openpilot.selfdrive.turnpilot.scene_policy import (HARD_STOP_MIN_M, HOLD_LINE_M, NO_ACCEL_CAP, ONCOMING_ENTRY_M, STOP_LAG_S,
+                                                        STOP_SPEED, Stop)
 from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP
 
 MAP_STOP_DECEL = 1.5          # m/s^2, the braking curve to a map stop point
@@ -145,7 +147,10 @@ LATCH_SPEED = 0.3             # m/s: slower than this...
 LATCH_NEAR_M = 5.             # ...this close to the stop point...
 LATCH_PAST_M = 2.             # ...or this far past it, the latch holds the car
 HOLD_ACCEL = -0.5             # m/s^2, the held car's accel cap
-REENGAGE_DECEL = -HOLD_ACCEL  # m/s^2: a hold taken up by a re-engage stops a rolling car from v within v^2/(2 x this)
+# s a hold taken up by a re-engage leaves a rolling car at its speed before it brakes (reengage_stop_m): the plan's frame and
+# the car's longitudinal actuator delay (opendbc's default 0.15 s, the Model 3's)
+REENGAGE_LAG_S = 0.2
+REENGAGE_MAX_S = 60.          # s of a hold's braking reengage_stop_m follows at most
 STOP_SIGN_HANDBACK_S = 1.0    # s stopped at a stop sign before it hands back (DESIGN phase 4: a 1 s full stop)
 GREEN_STEADY_S = 0.5          # s of green before it counts (the sim oracle; a camera would need 1.0)
 # a held signal with no accepted light read this long hands back (signalUnseenTakeControl), held: BeamNG S14 (BUILD_FINDINGS
@@ -250,6 +255,32 @@ class LeftCommand:
   take_control: bool = False
   reason: str = ''
   crossed: str = ''
+
+
+def latch_hold_caps(v: float) -> tuple[float, float]:
+  """The held latch's (accel cap, speed cap) at v m/s: its stop's (_held's, held_stops)."""
+  return HOLD_ACCEL, 0.
+
+
+def reengage_stop_m(v: float, caps) -> float:
+  """m a hold taken up by a re-engage carries a car rolling at v m/s before it stands (the lanes test of _held's latch and
+  unprotected_left's own hold): REENGAGE_LAG_S on at v, then braking as the hold itself asks, caps(v) its (accel cap, speed
+  cap) at each speed through plan_accel (its candidate in the planner), down to STOP_SPEED, and from there at -HOLD_ACCEL;
+  inf if it never brakes. Never HOLD_ACCEL from v: that is the held car's accel cap, not what a hold brakes at, and put a car
+  re-engaged at 1.9-2.1 m/s 3.7-4.5 m on where the holds stood it in 1.55-1.66 m (skeptic round 1). In the car a hold that
+  says shouldStop still rolling (the latch's) goes to longcontrol's stopping state, which ramps its accel down from the
+  last output at 1 m/s^2/s instead of following plan_accel: from 2.1 m/s that stands the car about 2.9 m on, past this."""
+  v = max(v, 0.)
+  d = v * REENGAGE_LAG_S
+  for _ in range(round(REENGAGE_MAX_S / DT_MDL)):
+    if v <= STOP_SPEED:
+      return d + v * v / (2. * -HOLD_ACCEL)
+    a = plan_accel(*caps(v), v)
+    if a >= 0.:
+      break
+    v = max(v + a * DT_MDL, 0.)
+    d += v * DT_MDL
+  return math.inf
 
 
 def yield_last_stop_m(v_ego: float) -> float:
@@ -958,10 +989,11 @@ class MapControlPolicy:
     # (residual-check-1, d)
     # at an unprotected turn, short of the reach too once a hold could no longer stand the car short of the oncoming lanes
     # (ONCOMING_ENTRY_M before its junction, HOLD_LINE_M + MAP_MARGIN_M past the stop point as latched; a hold taken up by a
-    # re-engage carries a rolling car on v^2/(2 REENGAGE_DECEL)): the left's full creep stands the car CREEP_SHORT_M short of
-    # them, where the reach (LATCH_PAST_M past it) is 1 m inside them (the invariant: never a TurnPilot hold there)
+    # re-engage carries a rolling car on as reengage_stop_m, the latch's own braking): the left's full creep stands the car
+    # CREEP_SHORT_M short of them, where the reach (LATCH_PAST_M past it) is 1 m inside them (the invariant: never a
+    # TurnPilot hold there)
     lanes = c.kind == UNPROTECTED and drv > 0. and \
-      st.moved_m + v * v / (2. * REENGAGE_DECEL) > c.d + HOLD_LINE_M + MAP_MARGIN_M - ONCOMING_ENTRY_M
+      st.moved_m + reengage_stop_m(v, latch_hold_caps) > c.d + HOLD_LINE_M + MAP_MARGIN_M - ONCOMING_ENTRY_M
     drivers = stop_like and (drv > LATCH_PAST_M or lanes)
     if cause is None and drivers:
       # handed back: theirs, said already (driverWent); else lifting must not stop the car in the junction (drivenOff), nor

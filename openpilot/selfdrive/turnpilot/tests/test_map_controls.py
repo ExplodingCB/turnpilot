@@ -1591,8 +1591,8 @@ def test_a_nudge_on_from_the_lefts_full_creep_is_never_held_in_the_oncoming_lane
   junction after the left's full creep (CREEP_MAX_M on, to ONCOMING_ENTRY_M + CREEP_SHORT_M out), 1 m inside the lanes: a
   1-1.5 m gas nudge on from there and a re-engage held the car standing 3.5-4 m from the centre. At an unprotected turn the
   car moved on past the latch's ask is the driver's too once a hold could no longer stand it short of the lanes (from its
-  speed at REENGAGE_DECEL; the junction HOLD_LINE_M + MAP_MARGIN_M past the stop point as latched), said until through.
-  Short of that, held there (c)."""
+  speed as the latch's own braking takes it, reengage_stop_m; the junction HOLD_LINE_M + MAP_MARGIN_M past the stop point as
+  latched), said until through. Short of that, held there (c)."""
   from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M
   junction = 250.
   car = left_car(at=junction)
@@ -1674,3 +1674,36 @@ def test_an_idle_creep_short_of_the_latchs_reach_stays_held_for_the_full_check()
   out, dec, _ = car.run(5.)
   assert held(out, dec) and out.prompt == 'stopSignTakeControl' and car.v < 0.05 and car.s < 150. + 2.5
   assert car.policy.driven is None
+
+
+def test_a_holds_braking_after_a_re_engage_is_modelled_on_what_it_asks_never_on_its_accel_cap():
+  """Skeptic round 1 (tp/left-hold): the lanes test (a hold that could no longer stand the car short of the oncoming lanes)
+  took a hold re-engaged rolling to brake at REENGAGE_DECEL, -HOLD_ACCEL (0.5 m/s^2): the held car's accel cap, not what a
+  hold brakes at. From 1.92 and 2.12 m/s it put the car 3.7 and 4.5 m on, where the left's own hold and the latch stood it
+  in 1.66 and 1.55 m, so it let go of holds that would have stood the car short of the lanes. reengage_stop_m follows the
+  hold's own caps through plan_accel, the car first rolling on REENGAGE_LAG_S: never short of where the hold stands the car
+  (the sims' braking, shouldStop's -1 m/s^2 floor and all), and never far past it."""
+  from openpilot.selfdrive.turnpilot.map_controls import HOLD_ACCEL, REENGAGE_LAG_S, latch_hold_caps, reengage_stop_m
+  from openpilot.selfdrive.turnpilot.scene_policy import Stop, stop
+  from openpilot.selfdrive.turnpilot.unprotected_left import hold_caps
+
+  def stands(v, held):
+    """m the hold held(v) (a Stop) stands a car rolling at v in, the plan applied as the sims apply it."""
+    d = 0.
+    while v > 0.:
+      dec = decide([held(v)], v)
+      a = plan_accel(dec.accel_cap, dec.speed_cap, v)
+      if dec.should_stop:
+        a = min(a, -1.)
+      v = max(v + a * DT_MDL, 0.)
+      d += v * DT_MDL
+    return d
+  holds = ((hold_caps, lambda v: stop(v, 0., '', confirmed=False)),  # unprotected_left's own hold
+           (latch_hold_caps, lambda v: Stop(HOLD_ACCEL, 0., True, '', 0., rest=True)))  # the latch's
+  for v in (0.2, 0.5, 0.8, 1.2, 1.5, 1.92, 2.12, 2.4, 3., 4., 6.):
+    for caps, held_at in holds:
+      model, actual = reengage_stop_m(v, caps), stands(v, held_at)
+      assert actual <= model <= actual + v * REENGAGE_LAG_S + 0.35, (v, caps.__name__, round(model, 2), round(actual, 2))
+  # the skeptic's two re-engages, well short of 0.5 m/s^2's 3.7 and 4.5 m
+  assert reengage_stop_m(1.92, hold_caps) < 2.4 and reengage_stop_m(2.12, latch_hold_caps) < 2.6
+  assert reengage_stop_m(0., hold_caps) == 0.

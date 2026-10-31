@@ -881,10 +881,11 @@ def test_the_lefts_own_hold_is_let_go_only_past_it_by_the_drivers_own_metres():
 def test_the_lefts_own_hold_short_of_the_oncoming_lanes_lets_go_before_a_hold_could_stand_the_car_in_them():
   """The invariant: never a TurnPilot hold that stands the car in the oncoming lanes on a re-engage. A go from a creep
   (ONCOMING_ENTRY_M + CREEP_SHORT_M out) withdrawn at first motion holds the car 1.5 m short of the lanes, under LATCH_PAST_M:
-  a driver's nudge on is theirs once the hold could no longer stop the car short of them (REENGAGE_DECEL from its speed),
-  never held inside. Standing, a reading that jumps nearer is no movement of the driver's (position-free): the position
-  fault, held, never let go."""
-  from openpilot.selfdrive.turnpilot.map_controls import LATCH_PAST_M, REENGAGE_DECEL
+  a driver's nudge on is theirs once the hold could no longer stop the car short of them (from its speed as its own braking
+  takes it: hold_caps, map_controls.reengage_stop_m), never held inside. Standing, a reading that jumps nearer is no
+  movement of the driver's (position-free): the position fault, held, never let go."""
+  from openpilot.selfdrive.turnpilot.map_controls import LATCH_PAST_M, reengage_stop_m
+  from openpilot.selfdrive.turnpilot.unprotected_left import hold_caps
   j = Junction()
   j.distance = ONCOMING_ENTRY_M + CREEP_SHORT_M + 0.6
   withdrawn(j, 0.5)
@@ -896,7 +897,7 @@ def test_the_lefts_own_hold_short_of_the_oncoming_lanes_lets_go_before_a_hold_co
   assert len(crossed) == 1 and not j.left.hold_here
   at = stood - 0.8 * DT_MDL * (crossed[0] + 1)
   # let go short of the lanes, where a hold could no longer stand the car short of them, well inside LATCH_PAST_M
-  assert stood - at < LATCH_PAST_M - 0.5 and ONCOMING_ENTRY_M < at < ONCOMING_ENTRY_M + 0.8 ** 2 / (2. * REENGAGE_DECEL) + 0.1, (stood, at)
+  assert stood - at < LATCH_PAST_M - 0.5 and ONCOMING_ENTRY_M < at < ONCOMING_ENTRY_M + reengage_stop_m(0.8, hold_caps) + 0.1, (stood, at)
   # standing on the hold, a reading 4 m nearer: the position fault, held, never the driver's
   j = Junction()
   withdrawn(j, 0.5)
