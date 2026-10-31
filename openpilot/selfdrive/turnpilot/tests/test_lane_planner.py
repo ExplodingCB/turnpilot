@@ -8,7 +8,7 @@ from openpilot.cereal import custom, log
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S
-from openpilot.selfdrive.turnpilot.lane_planner import (LANE_UNKNOWN_REASON, LANE_WIDTH,
+from openpilot.selfdrive.turnpilot.lane_planner import (LANE_UNKNOWN_REASON, LANE_WIDTH, LC_HOLD_CLEAR_S, LC_RELEASE_S,
                                                         LC_ABORT_COOLDOWN_S, LC_ABORT_SETTLE_S, LC_CONFIRM_FRAMES, LC_REQUEST_TIMEOUT_S,
                                                         LC_SIGNAL_TIMEOUT_S, LC_WARN_S, YELLOW_HOLD_S, LanePlanner, ModelLanes, Phase,
                                                         slow_zone,
@@ -287,7 +287,8 @@ class Drive:
       self.lanes_left, self.lanes_right = self.lanes_left - k, self.lanes_right + k
     frac = min(self.lc_t / 3., 1.)
     self.offset = 0. if not starting else k * LANE_WIDTH * (frac if frac < 0.5 else frac - 1.)
-    cs = car_state(self.v, left_blinker=left_blinker, right_blinker=right_blinker)
+    cs = car_state(self.v, left_blinker=left_blinker, right_blinker=right_blinker, left_blindspot=blindspot == LaneChange.left,
+                   right_blindspot=blindspot == LaneChange.right)  # DesireHelper's own blind spot check, as on the car
     self._lc_seen.append(self.dh.lane_change_state)
     self.dh.update(cs, True, prob, d.lane_change)
     self.t += DT_MDL
@@ -537,8 +538,11 @@ def d_time(drive, d):
   return next(k * DT_MDL for k, x in enumerate(drive.decisions) if x is d)
 
 
-def test_blind_spot_or_car_at_the_offer_holds_it_back():
+@pytest.mark.parametrize("always_drive", [False, True])
+def test_blind_spot_or_car_at_the_offer_holds_it_back(always_drive):
+  """Before an offer: the pre-offer waits stay under TurnPilotAlwaysDrive too (LC-01 changes only an offer's hold)."""
   drive = Drive(lanes_left=0, lanes_right=1)
+  drive.lp.always_drive = always_drive
   m = maneuver("turn", "right", TWO_LANES_RIGHT_TURN)
   distance = drive.run(m, 300., 3., blindspot=LaneChange.right)
   assert not drive.offers and drive.decisions[-1].reason == "car in blind spot"
@@ -547,6 +551,178 @@ def test_blind_spot_or_car_at_the_offer_holds_it_back():
   assert not drive.offers and drive.decisions[-1].reason == "car in target lane"
   drive.run(m, distance, 6.)
   assert [r for r, _, _ in drive.requests] == [LaneChange.right]
+
+
+# ------------------------------------------------ LC-01, LC-02 (ALWAYS_DRIVE.md step S4, TurnPilotAlwaysDrive): the blind spot hold
+
+def always(drive):
+  drive.lp.always_drive = True
+  return drive
+
+
+def to_request(drive, m, distance):
+  """Drive on, nothing in the way, to the offer's first request frame (the car signalling: its countdown out); the distance."""
+  while not drive.requests:
+    drive.step(m, distance)
+    distance -= drive.v * DT_MDL
+  assert drive.lp.phase == Phase.REQUEST
+  return distance
+
+
+def to_phase(drive, m, phase, distance=290.):
+  """An offer in phase, nothing in the way: WARN (its countdown under way), WAIT (the countdown out, the driver signalling and
+  not yet signalled), REQUEST (the car signalling, the request's first frame). The distance."""
+  distance = drive.run(m, distance, LC_CONFIRM_FRAMES * DT_MDL + (LC_WARN_S + 0.2 if phase == Phase.WAIT else 0.5))
+  if phase == Phase.REQUEST:
+    distance = to_request(drive, m, distance)
+  assert drive.lp.phase == phase and len(drive.offers) == 1
+  return distance
+
+
+def test_a_blind_spot_under_an_offer_holds_it_under_the_switch_never_aborts_it():
+  """LC-01: under TurnPilotAlwaysDrive a car in the blind spot during an offer (WARN, WAIT or REQUEST) no longer cancels it
+  ('blindspot', a 6 s cooldown and a fresh offer chime, over and over): the offer stays up, any request withdrawn so DesireHelper
+  never goes on its own the instant it clears, for longer than LC_REQUEST_TIMEOUT_S and LC_SIGNAL_TIMEOUT_S (LC-02: neither
+  runs while the blind spot holds it). WARN and REQUEST are held (hold 'blindspot', the status line saying why); WAIT, the
+  driver's blinker still to come, keeps asking for it. With the switch off it aborts as today."""
+  m = maneuver("turn", "right", TWO_LANES_RIGHT_TURN)
+  for on in (False, True):
+    for phase in (Phase.WARN, Phase.WAIT, Phase.REQUEST):
+      drive = Drive(0, 1, driver_signals=phase == Phase.WAIT)
+      drive.lp.always_drive = on
+      distance = to_phase(drive, m, phase)
+      n, requests = len(drive.decisions), len(drive.requests)
+      drive.run(m, distance, max(LC_REQUEST_TIMEOUT_S, LC_SIGNAL_TIMEOUT_S) + 0.5, blindspot=LaneChange.right)
+      held = drive.decisions[n:]
+      if not on:
+        assert [a for a, _ in drive.aborts] == ['blindspot'] and all(d.hold == 'none' for d in drive.decisions), phase
+        continue
+      assert not drive.aborts and len(drive.offers) == 1 and len(drive.requests) == requests, phase
+      assert all(d.offer == LaneChange.right and d.lane_change == LaneChange.none for d in held), phase
+      assert drive.dh.lane_change_state != LaneChangeState.laneChangeStarting and drive.lp.changes == 0, phase
+      if phase == Phase.WAIT:
+        assert drive.lp.phase == Phase.WAIT and all(d.hold == 'none' and d.prompt == LaneChange.right for d in held)
+      else:
+        assert all(d.hold == 'blindspot' and d.countdown == 0. and d.reason == "car in blind spot" for d in held), phase
+
+
+def test_the_blind_spot_clearing_says_the_change_again_and_counts_down_before_the_request():
+  """LC-01's release: the blind spot read clear for LC_HOLD_CLEAR_S (0.5 s), the change is said again (hold 'clear': the lane
+  change chime, selfdrived) with an LC_RELEASE_S (1.5 s) countdown, and only then the request, which DesireHelper makes. One
+  offer throughout, never an abort; no request on any frame before the countdown is out."""
+  m = maneuver("turn", "right", TWO_LANES_RIGHT_TURN)
+  for phase in (Phase.WARN, Phase.REQUEST):
+    drive = always(Drive(0, 1))
+    distance = to_phase(drive, m, phase)
+    distance = drive.run(m, distance, 4., blindspot=LaneChange.right)
+    n = len(drive.decisions)
+    drive.run(m, distance, 6.)
+    after = drive.decisions[n:]
+    k_clear = next(i for i, d in enumerate(after) if d.hold == 'clear')
+    k_req = next(i for i, d in enumerate(after) if d.lane_change != LaneChange.none)
+    assert all(d.hold == 'blindspot' for d in after[:k_clear]) and k_clear * DT_MDL == pytest.approx(LC_HOLD_CLEAR_S, abs=DT_MDL), phase
+    assert all(d.hold == 'clear' for d in after[k_clear:k_req]), phase
+    assert (k_req - k_clear) * DT_MDL == pytest.approx(LC_RELEASE_S, abs=DT_MDL / 2), phase
+    counting = [d.countdown for d in after[k_clear:k_req]]
+    assert counting[0] == pytest.approx(LC_RELEASE_S) and all(a > b for a, b in zip(counting, counting[1:], strict=False)), phase
+    assert after[k_req].hold == 'none' and after[k_req].countdown == 0.
+    assert len(drive.offers) == 1 and not drive.aborts and drive.lp.changes == 1, phase
+    assert (drive.lanes_left, drive.lanes_right) == (1, 0), phase
+
+
+def test_a_blind_spot_back_inside_the_release_countdown_holds_again_with_no_request_sent():
+  m = maneuver("turn", "right", TWO_LANES_RIGHT_TURN)
+  drive = always(Drive(0, 1))
+  distance = to_phase(drive, m, Phase.WARN)
+  distance = drive.run(m, distance, 2., blindspot=LaneChange.right)
+  distance = drive.run(m, distance, LC_HOLD_CLEAR_S + 0.5)  # clear: into the release countdown
+  assert drive.decisions[-1].hold == 'clear' and drive.decisions[-1].countdown < LC_RELEASE_S
+  n = len(drive.decisions)
+  distance = drive.run(m, distance, 1., blindspot=LaneChange.right)  # back before the countdown is out
+  assert all(d.hold == 'blindspot' and d.lane_change == LaneChange.none for d in drive.decisions[n:])
+  n = len(drive.decisions)
+  drive.run(m, distance, 6.)
+  k_req = next(i for i, d in enumerate(drive.decisions[n:]) if d.lane_change != LaneChange.none)
+  assert k_req * DT_MDL == pytest.approx(LC_HOLD_CLEAR_S + LC_RELEASE_S, abs=DT_MDL)  # the full release again, from the start
+  assert [r for r, _, _ in drive.requests] == [LaneChange.right] and not drive.aborts and drive.lp.changes == 1
+
+
+def test_no_timed_out_while_the_blind_spot_holds_the_request_timed_out_kept_with_it_clear():
+  """LC-02: DesireHelper waiting LC_REQUEST_TIMEOUT_S aborts timedOut only while the request is out: held for the blind spot it
+  is withdrawn and the clock stops; released, with the blind spot clear and DesireHelper still not starting the change, it runs
+  on and aborts as before. Off the switch the blind spot aborts the request."""
+  m = maneuver("turn", "right", TWO_LANES_RIGHT_TURN)
+  for on in (False, True):
+    lp = LanePlanner()
+    lp.always_drive = on
+    args = {'lanes': model_lanes(*road(0, 1)), 'v_ego': 15., 'left_blinker': False, 'right_blinker': False, 'objects': (),
+            'driver_signals': False, 'right_hand_traffic': True, 'dt': DT_MDL, 'paint': paint(right=BW), 'lc_state': LaneChangeState.preLaneChange}
+    distance, d = 290., None
+    while d is None or d.lane_change == LaneChange.none:
+      d = lp.update(m, distance, **args)
+      distance -= 15. * DT_MDL
+    distance = 250.  # standing in for a long road: the window's end never comes
+    held = [lp.update(m, distance, right_blindspot=True, **args) for _ in range(int(12. / DT_MDL))]
+    if not on:
+      assert any(x.abort == 'blindspot' for x in held)
+      continue
+    assert all(x.abort == 'none' and x.hold == 'blindspot' and x.lane_change == LaneChange.none for x in held)
+    clear = [lp.update(m, distance, **args) for _ in range(int((LC_HOLD_CLEAR_S + LC_RELEASE_S + LC_REQUEST_TIMEOUT_S + 1.) / DT_MDL))]
+    k_req = next(i for i, x in enumerate(clear) if x.lane_change != LaneChange.none)
+    k_out = next(i for i, x in enumerate(clear) if x.abort == 'timedOut')
+    assert (k_out - k_req) * DT_MDL == pytest.approx(LC_REQUEST_TIMEOUT_S, abs=LC_ABORT_SETTLE_S + 2 * DT_MDL)
+
+
+def test_a_blind_spot_held_to_the_windows_end_aborts_too_late_and_the_turn_is_skipped():
+  """The hold lasts until the window's end (tooLate, the request never sent), then LC-03 skips the turn out loud."""
+  drive = always(Drive(0, 1))
+  m = maneuver("turn", "right", TWO_LANES_RIGHT_TURN)
+  distance = to_phase(drive, m, Phase.WARN)
+  frames = through_the_window(drive, m, distance, blindspot=LaneChange.right)
+  assert [a for a, _ in drive.aborts] == ['tooLate'] and len(drive.offers) == 1 and not drive.requests
+  assert_blocked_at_the_end(drive, frames)
+
+
+def test_the_drivers_blinker_ending_under_the_hold_asks_again_never_no_signal():
+  """The driver signalling (car signals off): the stalk let go while only the blind spot holds the change returns it to WAIT
+  ('Signal Right to Change Lanes', its chime: hold none again) instead of aborting noSignal; WAIT's LC_SIGNAL_TIMEOUT_S doesn't
+  run while the blind spot reads occupied; signalled again it is held, then released and made."""
+  m = maneuver("turn", "right", TWO_LANES_RIGHT_TURN)
+  drive = always(Drive(0, 1, driver_signals=True))
+  distance = to_phase(drive, m, Phase.WARN)
+  distance = drive.run(m, distance, 2., blinker=LaneChange.right, blindspot=LaneChange.right)  # the go-ahead, held
+  assert drive.lp.phase == Phase.REQUEST and drive.decisions[-1].hold == 'blindspot' and drive.decisions[-1].prompt == LaneChange.right
+  distance = drive.run(m, distance, 1., blindspot=LaneChange.right)  # the stalk let go
+  d = drive.decisions[-1]
+  assert drive.lp.phase == Phase.WAIT and d.hold == 'none' and d.prompt == LaneChange.right and d.offer == LaneChange.right
+  drive.run(m, distance, LC_SIGNAL_TIMEOUT_S + 1., moving=False, blindspot=LaneChange.right)
+  assert not drive.aborts and drive.lp.phase == Phase.WAIT
+  distance = drive.run(m, distance, 1., blinker=LaneChange.right, blindspot=LaneChange.right)  # signalled again: held
+  assert drive.lp.phase == Phase.REQUEST and drive.decisions[-1].hold == 'blindspot' and not drive.requests
+  drive.run(m, distance, 6., blinker=LaneChange.right)
+  assert len(drive.offers) == 1 and not drive.aborts and drive.lp.changes == 1 and len(drive.requests) == 1
+
+
+def test_the_cars_lamp_stays_lit_through_the_hold_and_a_car_in_the_target_lane_still_aborts():
+  """Where the car signals, its lamp stays on its side through the hold (signal_side), the change going at the release once
+  the lamp has led it by the legal distance. A car TurnPilot's cameras see in the target lane still aborts the offer (R13)."""
+  m = maneuver("turn", "right", TWO_LANES_RIGHT_TURN)
+  drive = always(Drive(0, 1))
+  drive.car_kw, drive.car_lamp = {'lit_m': 0., 'lead_m': 91.44}, True
+  distance = to_phase(drive, m, Phase.WARN)
+  sides = []
+  for _ in range(int(6. / DT_MDL)):
+    drive.step(m, distance, blindspot=LaneChange.right)
+    sides.append(drive.lp.signal_side)
+    distance -= drive.v * DT_MDL
+  assert set(sides) == {LaneChange.right} and drive.car_kw['lit_m'] > 91.44 and not drive.requests
+  drive.run(m, distance, 6.)
+  assert len(drive.requests) == 1 and drive.lp.changes == 1 and not drive.aborts
+  drive = always(Drive(0, 1))
+  distance = to_phase(drive, m, Phase.WARN)
+  distance = drive.run(m, distance, 1., blindspot=LaneChange.right)
+  drive.run(m, distance, 1., blindspot=LaneChange.right, objects=scene([{'cls': 'car', 'x': 2., 'y': -3.6, 'vx': 15.}]).objects)
+  assert [a for a, _ in drive.aborts] == ['carInLane']
 
 
 def test_driver_lane_change_gets_a_cooldown_too():

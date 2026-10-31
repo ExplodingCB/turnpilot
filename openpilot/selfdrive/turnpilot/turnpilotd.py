@@ -1057,6 +1057,7 @@ class TurnPilot:
     plan.laneChange, plan.signalPrompt, lane_reason = lc.lane_change, lc.prompt, lc.reason
     plan.laneChangeOffer, plan.laneChangeCountdown, plan.laneChangeAbort = lc.offer, lc.countdown, lc.abort
     plan.laneChangeWait, plan.laneChangeWant = lc.wait, max(min(lc.want, 127), -128)
+    plan.laneChangeHold = lc.hold  # held for the blind spot, or its release (LC-01, under the switch)
     committed = self.desires.maneuver_id == rf.maneuver_id and self.desires.started  # this frame's desire included
     if (lc.unreachable or lc.blocked) and act_on is not None and not committed and not self.skip.skipped:
       # a map stop leaves no room to get into the maneuver's lane before it nor after its go, or the change it needs hadn't

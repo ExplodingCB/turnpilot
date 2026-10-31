@@ -278,8 +278,10 @@ def turnpilot_wrong_lane_alert(CP: car.CarParams, CS: car.CarState, sm: messagin
 def turnpilot_lane_change_alert(side: str) -> AlertCallbackType:
   def func(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
     plan = shown_plan(sm)
-    sound = AudibleAlert.tpLaneChangeLeft if side == 'left' else AudibleAlert.tpLaneChangeRight
-    return Alert(lane_change_text(plan, side), "TurnPilot, for the route",
+    # held for the blind spot (LC-01): no sound, so its release ('clear') chimes again (soundd plays a sound it changes to)
+    held = plan is not None and str(plan.laneChangeHold) == 'blindspot'
+    sound = AudibleAlert.none if held else AudibleAlert.tpLaneChangeLeft if side == 'left' else AudibleAlert.tpLaneChangeRight
+    return Alert(lane_change_text(plan, side), "Car in blind spot" if held else "TurnPilot, for the route",
                  AlertStatus.userPrompt, AlertSize.mid,
                  Priority.LOW, VisualAlert.none, sound, .1)
   return func

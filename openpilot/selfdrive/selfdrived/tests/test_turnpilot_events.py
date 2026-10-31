@@ -44,6 +44,30 @@ def test_lane_change_warning_left_and_right():
     assert a.alert_type == f'turnpilotLaneChange{side.capitalize()}/warning'  # separate names: a chime per side later
 
 
+def test_a_change_held_for_the_blind_spot_is_silent_and_its_release_chimes_and_counts_down():
+  """LC-01 (ALWAYS_DRIVE.md S4, TurnPilotAlwaysDrive): an offered change held while the blind spot reads occupied
+  (laneChangeHold blindspot) stays up with no sound, so its release (laneChangeHold clear) sounds the lane change chime again,
+  with its 1.5 s countdown: soundd plays a sound when selfdriveState's changes to it. Nothing else said: no mirror prompt."""
+  for name, side, chime in ((EventName.turnpilotLaneChangeLeft, 'left', AudibleAlert.tpLaneChangeLeft),
+                            (EventName.turnpilotLaneChangeRight, 'right', AudibleAlert.tpLaneChangeRight)):
+    a, = alerts(name, FakeSM(plan(laneChangeOffer=side, laneChangeHold='blindspot', signalPrompt=side)))
+    assert a.alert_text_1 == f'Changing Lanes {side.capitalize()} Once Clear' and a.alert_text_2 == 'Car in blind spot'
+    assert a.audible_alert == AudibleAlert.none
+    a, = alerts(name, FakeSM(plan(laneChangeOffer=side, laneChangeHold='clear', laneChangeCountdown=1.4)))
+    assert a.alert_text_1 == f'Clear: Lane Change {side.capitalize()} in 2' and a.audible_alert == chime
+    assert a.alert_text_2 == 'TurnPilot, for the route'
+  # frame by frame through AlertManager: the offer's chime, silence through the hold, the chime again at its release
+  slot, sounds = AlertSlot(), []
+  for frame in range(400):
+    hold = 'none' if frame < 100 else 'blindspot' if frame < 300 else 'clear'
+    countdown = max(3. - frame * 0.01, 0.) if frame < 100 else 0. if frame < 300 else max(1.5 - (frame - 300) * 0.01, 0.01)
+    a = slot.step(plan(laneChangeOffer='right', laneChangeCountdown=countdown, laneChangeHold=hold))
+    assert a.alert_type == 'turnpilotLaneChangeRight/warning', frame
+    sounds.append(a.audible_alert)
+  onsets = [i for i, s in enumerate(sounds) if s == AudibleAlert.tpLaneChangeRight and (i == 0 or sounds[i - 1] != s)]
+  assert onsets == [0, 300]
+
+
 def test_lane_change_aborted():
   a, = alerts(EventName.turnpilotLaneChangeAborted, FakeSM(plan(laneChangeAbort='blindspot')))
   assert a.alert_text_1 == 'Lane Change Cancelled' and a.alert_text_2 == 'Car in blind spot'

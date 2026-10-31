@@ -57,6 +57,20 @@ signalling keeps it to its end. A change the driver makes alone gets the same co
 offer, for the lines to settle. TurnPilotLanePaintActive off plans no change at all; turnpilotd then publishes what this
 would have asked for in laneChangePaintRule.
 
+Under TurnPilotAlwaysDrive (ALWAYS_DRIVE.md step S4; LanePlanner.always_drive, handed over every frame), Kellen's blind spot
+rule. A blind spot that reads occupied once a change is offered holds it instead of aborting it (LC-01): the offer stays up
+(laneChangeHold blindspot, its line silent), any request is withdrawn, so DesireHelper, which starts a requested change the
+instant the blind spot clears, never goes on its own, and neither LC_REQUEST_TIMEOUT_S nor LC_SIGNAL_TIMEOUT_S runs while it
+reads occupied (LC-02). Once it has read clear LC_HOLD_CLEAR_S the change is said again, with the lane change chime, and
+counted down LC_RELEASE_S (laneChangeHold clear) before the request: the driver hears it when a held change goes. Occupied
+again inside the countdown, it is held again with nothing sent. With the driver signalling, the stalk let go while only the
+blind spot holds the change asks for it again (WAIT) instead of aborting noSignal. The hold lasts to the window's end
+(tooLate, then LC-03) or anything else's abort: the line, the lane, a car TurnPilot's cameras see in it (R13), the route, the
+speed. Before an offer a blind spot still keeps it back. Nothing tells a blind spot signal stuck at SNA from a car beside it
+(opendbc's Tesla carstate reads DAS_blindSpotRearLeft != 0, LC-04), so SNA holds every change to its window's end and LC-03
+skips the turn, said each time; a stale DAS_status fails carState's CAN check (inputs_valid): no change. Saying 'Blind Spot
+Monitor Unavailable' once waits on opendbc carrying SNA (ALWAYS_DRIVE.md S7).
+
 A map stop between the car and the maneuver (stop_d: MapControlPolicy.stop_ahead) inside the window (BeamNG lane_change on
 the signal tiles, 2026-10-28: a signal 164 m before the turn, and braking for it kept the car under DesireHelper's speed
 minimum from 227 m in, so no change was offered). Its braking curve takes the car under that minimum slow_zone(v) before
@@ -123,6 +137,9 @@ LC_SIGNAL_TIMEOUT_S = 8.    # after the countdown, the driver has this long to s
 LC_COOLDOWN_S = 3.          # after any lane change, ours or the driver's, for the model's lane lines to settle
 LC_ABORT_COOLDOWN_S = 6.    # after an abort, before the same change is offered again
 LC_REQUEST_TIMEOUT_S = 8.   # DesireHelper waiting this long (blindspot) aborts the request
+# under TurnPilotAlwaysDrive a blind spot holding an offered change reads clear this long, then the change is said again (its
+# chime) and counted down this long before the request (LC-01, module docstring)
+LC_HOLD_CLEAR_S, LC_RELEASE_S = 0.5, 1.5
 # an abort once the request is out waits this long, the request withdrawn, to see whether DesireHelper started the change
 # already: modeld runs it on the plan it last had, and turnpilotd sees its state a modelV2 or two later
 LC_ABORT_SETTLE_S = 0.2
@@ -143,6 +160,7 @@ GO_ACCEL = 1.0              # m/s^2: the model pulls away from a stop at about t
 AFTER_GO_M = LC_SPEED_MIN ** 2 / (2. * GO_ACCEL) + LC_SPEED_MIN * (LC_CONFIRM_FRAMES * DT_MDL + LC_OFFER_ROOM_S)
 
 LANE_UNKNOWN_REASON = "can't confirm lane"
+HOLD_REASON = "car in blind spot"  # an offer held for it (LC-01), as the wait before one
 AFTER_STOP_REASON = "lane change after the stop"
 UNREACHABLE_REASON = "can't reach the turn lane before the stop"
 
@@ -578,6 +596,7 @@ class LaneDecision(NamedTuple):
                              # no room to change before it nor after its go: turnpilotd skips the maneuver
   blocked: bool = False      # the change the maneuver needs hadn't gone by the window's end, the car placed in a lane the
                              # maneuver doesn't leave from (LC-03, module docstring): turnpilotd skips the maneuver
+  hold: str = 'none'         # TurnpilotPlan.laneChangeHold: the offer held for the blind spot, or its release (LC-01)
 
 
 class LanePlanner:
@@ -618,6 +637,9 @@ class LanePlanner:
     self._judged_id = UNJUDGED        # the maneuver whose window's end LC-03 judged
     self._blocked = False             # ...and its verdict, held for it: LaneDecision.blocked
     self._last_wait = 'none'          # the last decision's wait (LC-03's log: what held the change)
+    self._hold = 'none'               # under the switch, the offer held for the blind spot ('blindspot') or its release counting
+                                      # down ('clear'): LaneDecision.hold (LC-01)
+    self._clear_t = 0.                # ...s the blind spot holding it has read clear
 
   @property
   def active(self) -> bool:
@@ -806,14 +828,19 @@ class LanePlanner:
       return self._abort(reason)
     if want_dir != d:
       return self._abort('notNeeded')  # the model's lane count says the car is in the lane it wants
-    if left_blindspot if d == LEFT else right_blindspot:
-      return self._abort('blindspot')
+    occupied = left_blindspot if d == LEFT else right_blindspot
+    if occupied and not self.always_drive:
+      return self._abort('blindspot')  # under the switch the blind spot holds the change instead (LC-01)
     if target_lane_blocked(objects, d, v_ego, lanes.width):
       return self._abort('carInLane')
 
     signaled = left_blinker if d == LEFT else right_blinker
     if not driver_signals and car_block and self.phase in (Phase.WARN, Phase.REQUEST):
       return self._abort('noSignal')  # the driver's lamp the other way, or hazards: the driver declines the change
+    if self._hold != 'none':
+      held = self._held(occupied, driver_signals, signaled, dt)
+      if held is not None:
+        return held
     if self.phase == Phase.WARN:
       self.countdown = max(self.countdown - dt, 0.)
       if driver_signals and signaled:  # the driver's go-ahead, any time in the countdown
@@ -823,7 +850,8 @@ class LanePlanner:
       elif self.countdown <= 0. and (lead_m is None or lit_m >= lead_m):
         self.phase = Phase.REQUEST  # the car's lamp has led the change by the legal distance
     elif self.phase == Phase.WAIT:
-      self._wait_t += dt
+      if not occupied:  # (occupied only under the switch here) no noSignal while the blind spot holds the change (LC-01)
+        self._wait_t += dt
       if signaled:
         self.phase = Phase.REQUEST
       elif self._wait_t > LC_SIGNAL_TIMEOUT_S:
@@ -831,14 +859,42 @@ class LanePlanner:
     elif self.phase == Phase.REQUEST:
       if driver_signals and not signaled:
         return self._abort('noSignal')  # the blinker went off before the change started: never change unsignaled
-      if lc_state == LaneChangeState.preLaneChange:
+      if lc_state == LaneChangeState.preLaneChange and not occupied:  # LC-02: held, the request is withdrawn, its clock stops
         self._pre_t += dt
         if self._pre_t > LC_REQUEST_TIMEOUT_S:
           return self._abort('timedOut')
+    if occupied and self.phase in (Phase.WARN, Phase.REQUEST):  # LC-01 (off the switch it aborted above): held
+      self._hold, self._clear_t, self.countdown = 'blindspot', 0., 0.
+      return self._decision(HOLD_REASON, prompt=driver_signals)
     if self.phase == Phase.REQUEST:
       self.countdown = 0.
       return self._decision(request=True, prompt=driver_signals)
     return self._decision(prompt=driver_signals)
+
+  def _held(self, occupied: bool, driver_signals: bool, signaled: bool, dt: float) -> LaneDecision | None:
+    """LC-01, under TurnPilotAlwaysDrive: an offer held for the blind spot ('blindspot', nothing requested, so DesireHelper,
+    which starts a requested change the instant it clears, never goes on its own) or its release counting down ('clear'). The
+    decision this frame, or None once released: the phase's own rules go on this frame (the request; the driver's blinker or
+    the lamp's lead from a held WARN, its countdown spent)."""
+    if driver_signals and not signaled and self.phase == Phase.REQUEST:
+      # the driver's blinker ended while only the blind spot held the change: asked again (WAIT's prompt, its chime), never
+      # aborted noSignal; WAIT's clock waits while the blind spot reads occupied
+      self.phase, self._wait_t, self._hold, self.countdown = Phase.WAIT, 0., 'none', 0.
+      return self._decision(prompt=True)
+    if occupied:  # (back) in the blind spot, the release countdown too: held, nothing requested
+      self._hold, self._clear_t, self.countdown = 'blindspot', 0., 0.
+      return self._decision(HOLD_REASON, prompt=driver_signals)
+    if self._hold == 'blindspot':
+      self._clear_t += dt
+      if self._clear_t < LC_HOLD_CLEAR_S - 1e-6:
+        return self._decision(HOLD_REASON, prompt=driver_signals)
+      self._hold, self.countdown = 'clear', LC_RELEASE_S  # said again, its chime, then counted down: when the driver looks
+      return self._decision(prompt=driver_signals)
+    self.countdown = max(self.countdown - dt, 0.)
+    if self.countdown > 1e-6:
+      return self._decision(prompt=driver_signals)
+    self._hold, self.countdown = 'none', 0.
+    return None
 
   def cancel(self, reason: str) -> bool:
     """TurnPilot stopped acting (reason 'handedBack' or 'fault'): an offered change that DesireHelper hasn't started is
@@ -867,9 +923,11 @@ class LanePlanner:
     self.phase, self.offer, self.countdown = Phase.IDLE, LaneChange.none, 0.
     self._confirm, self._candidate, self._wait_t, self._pre_t = 0, LaneChange.none, 0., 0.
     self._pending, self._pending_t = '', 0.
+    self._hold, self._clear_t = 'none', 0.
 
   def _decision(self, reason: str = "", request: bool = False, prompt: bool = False) -> LaneDecision:
     wait = 'none' if self.phase != Phase.IDLE or self.ours or self._lc_dir is not None else self._wait
     self._last_wait = wait
     return LaneDecision(self.offer if request else LaneChange.none, self.offer if prompt else LaneChange.none,
-                        reason, self.offer, self.countdown, self.abort, wait, self._want, self._unreachable, self._blocked)
+                        reason, self.offer, self.countdown, self.abort, wait, self._want, self._unreachable, self._blocked,
+                        self._hold)

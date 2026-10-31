@@ -419,6 +419,39 @@ def test_lane_not_confirmed_is_said_not_changed():
   assert any(plan.laneChange == LaneChange.left for _, _, plan in sim.trace)
   assert all(plan.laneMismatch == custom.TurnpilotPlan.LaneMismatch.none for _, _, plan in sim.trace)
 
+
+@pytest.mark.parametrize("always_drive", [False, True])
+def test_a_blind_spot_under_an_offer_is_waited_out_and_its_release_said_again(always_drive):
+  """LC-01 closed loop: a two-lane right turn, the car one lane left of the turn's lane; a car sits in its right blind spot from
+  1 s into the offer for 6 s. Under TurnPilotAlwaysDrive: one offer, never an abort, no request while it lasts (laneChangeHold
+  blindspot), then LC_HOLD_CLEAR_S clear, the release said again (laneChangeHold clear, the chime) with its LC_RELEASE_S
+  countdown, and only then the request. Off: the 'blindspot' abort and a fresh offer after the cooldown, as today."""
+  from openpilot.selfdrive.turnpilot.lane_planner import LC_HOLD_CLEAR_S, LC_RELEASE_S
+  sim = Sim([(500., 'turn', 'right'), (2000., 'turn', 'left')], cruise=15., nav_lanes={0: TWO_LANES_RIGHT_TURN}, model_lanes=(0, 1),
+            paint=BROKEN_WHITE_RIGHT)
+  sim.tp.always_drive = always_drive
+  offered = []
+
+  def blindspot(sim):
+    if not offered and sim.trace and sim.trace[-1][2].laneChangeOffer == LaneChange.right:
+      offered.append(sim.t)
+    return False, bool(offered) and offered[0] + 1. <= sim.t < offered[0] + 7.
+  sim.blindspot = blindspot
+  sim.run(26.)
+  plans = [(t * DT_MDL, p) for t, (_, _, p) in enumerate(sim.trace)]
+  offers = rising(sim.trace, 'laneChangeOffer', LaneChange.right)
+  aborts = {str(p.laneChangeAbort) for _, p in plans} - {'none'}
+  if not always_drive:
+    assert aborts == {'blindspot'} and len(offers) == 2 and all(str(p.laneChangeHold) == 'none' for _, p in plans)
+    return
+  assert not aborts and len(offers) == 1
+  first_request = next(t for t, p in plans if p.laneChange == LaneChange.right)
+  assert first_request == pytest.approx(offered[0] + 7. + LC_HOLD_CLEAR_S + LC_RELEASE_S, abs=2 * DT_MDL)
+  holds = [str(p.laneChangeHold) for t, p in plans if offered[0] + 1.1 < t < first_request]
+  assert holds[:5] == ['blindspot'] * 5 and holds[-5:] == ['clear'] * 5 and set(holds) == {'blindspot', 'clear'}
+  assert all(p.laneChangeOffer == LaneChange.right and p.state == State.laneChange for t, p in plans if offered[0] < t < first_request)
+
+
 def test_shadow_computes_the_same_plan():
   def oncoming(sim):
     return ({'cls': 'car', 'x': 330. - sim.s, 'y': 5., 'vx': -9.},) if sim.t > 18. else ()
