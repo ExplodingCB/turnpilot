@@ -349,6 +349,19 @@ def test_one_car_tracked_twice_is_one_sample():
   assert len(run(msgs).samples) == 58
 
 
+def test_one_cars_tracks_merge_to_its_shorter_road_and_its_shorter_far_range():
+  """Chains through a shared box are one car (through a third too: 1 shares with 2, 2 with 3), and it keeps the shortest of
+  each range on its own, with that chain's reason: never the longer of two readings of one car."""
+  def sample(track, road, far, boxes):
+    return lr.Sample(track, 'car', float(track), 15., road_m=road, road_why=f"r{track}", far_m=far, far_why=f"f{track}",
+                     boxes=frozenset(boxes))
+  merged = lr.merge([sample(1, 100., 200., {(5, 0)}), sample(2, 110., 150., {(5, 0), (6, 0)}), sample(3, 90., 300., {(6, 0)}),
+                     sample(4, 50., 60., {(9, 1)})])
+  assert len(merged) == 2
+  one = next(s for s in merged if s.track_id != 4)
+  assert (one.road_m, one.road_why, one.far_m, one.far_why) == (90., 'r3', 150., 'f2')
+
+
 def test_two_boxes_where_the_car_could_be_end_its_chain():
   """Two cars side by side in one lane's width: neither chain can tell which box was its car's, so each ends at its own
   seed's box (ambiguous), and the range is that short."""
