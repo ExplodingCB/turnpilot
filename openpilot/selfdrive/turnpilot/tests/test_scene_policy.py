@@ -478,6 +478,82 @@ def test_crosswalk_hold_needs_a_walker_steadily_leaving():
   assert all(holds[:CROSSWALK_LEAVING_FRAMES - 1]) and not any(holds[CROSSWALK_LEAVING_FRAMES:])
 
 
+# BeamNG ped_crosswalk_right at 6ba8582 (sim/rerun R3, ped_crosswalk_right-20261031-124715, rlog 14.63-16.98 s): the walker's
+# wide camera track on each published frame from its first, as the car came into the right at 4.77 m/s 13.4 m from the
+# maneuver point. (the car's maneuverDistance on that frame, x, y, vx, vy, hits, conf, missedRuns). Her vx of 4-5.6 m/s is
+# the turning car's ego motion left in the track: over PED_MAX_SPEED, read standing
+R3_WALKER = (
+  (13.4, 5.1, -2.2, 0.9, 0.4, 2, 0.39, 0), (13.1, 5.1, -2.2, 2.4, 0.2, 3, 0.49, 0), (12.9, 5.1, -2.2, 2.4, 0.2, 3, 0.49, 0),
+  (12.7, 5.1, -2.2, 2.4, 0.2, 3, 0.49, 0), (12.4, 5.1, -2.3, 3.5, -0.1, 4, 0.57, 0), (12.2, 5.1, -2.3, 3.5, -0.1, 4, 0.57, 0),
+  (12.0, 5.2, -2.3, 4.0, -0.3, 5, 0.46, 0), (11.7, 5.1, -2.4, 4.0, -0.3, 5, 0.46, 1), (11.5, 5.1, -2.4, 4.0, -0.3, 5, 0.46, 1),
+  (11.3, 5.4, -2.5, 4.7, -0.6, 6, 0.55, 0), (11.0, 5.4, -2.5, 4.7, -0.6, 6, 0.55, 0), (10.8, 5.6, -2.7, 5.1, -0.8, 7, 0.66, 0),
+  (10.5, 5.6, -2.7, 5.1, -0.8, 7, 0.66, 0), (10.3, 5.6, -2.7, 5.1, -0.8, 7, 0.66, 0), (10.1, 5.7, -2.8, 5.2, -0.9, 8, 0.76, 0),
+  (9.8, 5.7, -2.8, 5.2, -0.9, 8, 0.76, 0), (9.6, 5.8, -2.9, 5.3, -1.0, 9, 0.68, 0), (9.4, 6.0, -3.1, 5.4, -1.1, 10, 0.77, 0),
+  (9.1, 6.0, -3.1, 5.4, -1.1, 10, 0.77, 0), (8.9, 6.0, -3.1, 5.4, -1.1, 10, 0.77, 0), (8.7, 6.0, -3.1, 5.4, -1.1, 10, 0.77, 0),
+  (8.5, 6.1, -3.2, 5.4, -1.1, 11, 0.8, 0), (8.4, 6.2, -3.3, 5.4, -1.1, 11, 0.8, 1), (8.2, 6.7, -3.6, 5.6, -1.4, 12, 0.67, 0),
+  (8.1, 6.7, -3.6, 5.6, -1.4, 12, 0.67, 0), (7.9, 6.7, -3.6, 5.6, -1.4, 12, 0.67, 0), (7.8, 6.9, -3.8, 5.5, -1.5, 13, 0.8, 0),
+  (7.7, 7.1, -3.9, 5.3, -1.5, 14, 0.79, 0), (7.6, 7.1, -3.9, 5.3, -1.5, 14, 0.79, 0), (7.5, 7.1, -3.9, 5.3, -1.5, 14, 0.79, 0),
+  (7.4, 7.3, -4.1, 5.1, -1.5, 15, 0.49, 0), (7.4, 7.4, -4.1, 4.7, -1.5, 16, 0.45, 0), (7.3, 7.4, -4.1, 4.7, -1.5, 16, 0.45, 0),
+  (7.2, 7.4, -4.1, 4.7, -1.5, 16, 0.45, 0), (7.2, 7.5, -4.2, 4.3, -1.4, 17, 0.67, 0), (7.1, 7.5, -4.2, 4.3, -1.4, 17, 0.67, 0),
+  (7.0, 7.4, -4.2, 4.0, -1.3, 18, 0.58, 0), (6.9, 7.4, -4.2, 3.7, -1.2, 19, 0.64, 0), (6.8, 7.4, -4.2, 3.7, -1.2, 19, 0.64, 0),
+  (6.7, 7.6, -4.3, 3.7, -1.2, 19, 0.64, 1), (6.6, 7.6, -4.3, 3.7, -1.2, 19, 0.64, 1), (6.5, 7.6, -4.3, 3.7, -1.2, 19, 0.64, 1),
+  (6.4, 7.4, -4.2, 3.2, -0.9, 20, 0.59, 0), (6.3, 7.4, -4.2, 3.2, -0.9, 20, 0.59, 0), (6.2, 7.1, -4.1, 2.8, -0.7, 21, 0.59, 0),
+  (6.1, 7.1, -4.0, 2.6, -0.6, 22, 0.7, 0), (6.0, 7.1, -4.0, 2.6, -0.6, 22, 0.7, 0), (5.9, 7.0, -4.0, 2.4, -0.5, 23, 0.62, 0),
+)
+R3_LAG_FRAMES = 6  # the run's car took about 0.3 s to answer the hold's brake (4.72 to 4.64 m/s over its first 0.4 s)
+
+
+def test_beamng_crosswalk_hold_braking_over_the_line_stops_for_her_there():
+  """R3 (ped_crosswalk_right at 6ba8582): the walker was first tracked 5.1 m off the wide camera with the car 5.4 m short of
+  its hold line at 4.77 m/s. Her hold came 6 hits in (11.3 m out), confirmed on the next, and braked toward the line, but the
+  car crossed it at 2.66 m/s, over COMMIT_SPEED: committed_past_line committed the turn, the hold fell away for good with her
+  still in the crosswalk 6.7 m ahead, and the car drove on toward her at the curb cap (the scorer: "never held to a stop for
+  the pedestrian in the crosswalk"). A confirmed walker's crosswalk hold braking the car over its line doesn't commit it: the
+  hold stands it there, past the line, until she leaves, and only then does the turn go on and commit. Closed loop, her track
+  the run's frame by frame (her x moved with the car's own travel), then standing where it left her, then walking away down
+  the cross street."""
+  sp, v, dist, mid = ScenePolicy(), 4.77, R3_WALKER[0][0], 3
+  lag = [0.] * R3_LAG_FRAMES
+  out = []  # (dist, v, her x, decision, committed then)
+  stand_frames, walk_frames = int(5. / DT_MDL), int(10. / DT_MDL)
+  x_end, y_end, hits = R3_WALKER[-1][1] - R3_WALKER[-1][0], R3_WALKER[-1][2], R3_WALKER[-1][5]  # her place as the run left her
+  for k in range(len(R3_WALKER) + stand_frames + walk_frames):
+    if k < len(R3_WALKER):
+      d_run, x, y, vx, vy, hits, conf, missed = R3_WALKER[k]
+      x += dist - d_run  # where she was, from where this car is
+    else:
+      j = k - len(R3_WALKER) - stand_frames  # frames since she set off down the cross street, under 0 standing
+      hits += k % 2
+      x, y, vx, vy, conf, missed = x_end + dist, y_end - max(j, 0) * 1.2 * DT_MDL, 0., -1.2 if j >= 0 else 0., 0.62, 0
+    sc = scene([ped(x, y, vx, vy, age=hits, conf=conf, trackId=1, camera='wide', missedRuns=missed)])
+    d = sp.update(sc.objects, True, RIGHT_TURN, dist, v, maneuver_id=mid)
+    out.append((dist, v, x, d, sp.committed_id == mid))
+    # the run's car: its turn speed cap (4.3 m/s), the bridge's braking to -5 m/s^2 (aEgo -5.25 for TurnPilot's -5.0), late
+    a = max(min(plan_accel(d.accel_cap, min(d.speed_cap, 4.3), v), 0.5), -5.)
+    if d.should_stop:
+      a = min(a, -1.)
+    lag.append(a)
+    v = max(v + lag.pop(0) * DT_MDL, 0.)
+    dist -= v * DT_MDL
+  hold = next(k for k, o in enumerate(out) if o[3].reason == "pedestrian in crosswalk")
+  assert out[hold][0] == pytest.approx(11.3, abs=0.3)  # 6 hits in, as in the run
+  # the run's crossing: over the line faster than COMMIT_SPEED, the hold braking the car for her. It holds on, uncommitted
+  rest = next((k for k, o in enumerate(out) if o[1] == 0.), len(out))
+  over = [o for o in out[hold:rest] if o[0] < HOLD_LINE_M and o[1] > COMMIT_SPEED]
+  assert over
+  assert all(o[3].holding and o[3].reason == "pedestrian in crosswalk" and not o[4] for o in over)
+  # it stood past the line, short of her, held by her crosswalk hold all the way from its first frame, never committed
+  assert rest < len(out) and out[rest][0] < HOLD_LINE_M
+  assert all(o[3].reason == "pedestrian in crosswalk" and not o[4] for o in out[hold:rest])
+  assert min(o[2] for o in out[:rest + 1]) > 3.  # m, camera to her: never run up on her
+  standing = out[rest:len(R3_WALKER) + stand_frames]
+  assert len(standing) > 4. / DT_MDL
+  assert all(o[1] == 0. and o[3].should_stop and o[3].reason == "pedestrian in crosswalk" and not o[4] for o in standing)
+  # she walks away down the cross street: the hold lets her go, the car goes on and, over COMMIT_SPEED, commits the turn
+  went = next(k for k, o in enumerate(out) if k > rest and not o[3].holding)
+  assert went > len(R3_WALKER) + stand_frames
+  assert out[-1][1] > COMMIT_SPEED and out[-1][4]
+
 def test_fault_keeps_a_junction_open():
   # committed to a left (id 5) when turnpilotd faults: the route comes back with the same left under a new id (7), the
   # car slow at it with an oncoming car in range. It isn't held in the junction. The next junction, further on, is

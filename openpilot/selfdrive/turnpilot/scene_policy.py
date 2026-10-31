@@ -29,7 +29,12 @@ while it's held: otherwise re-engaging brings the hold back, inside the junction
 press with openpilot still engaged is never a go (no gas go, 2026-10-28). Past the hold line a turn is committed for good once stopping in the
 junction is worse than finishing it (committed_past_line): a curb-side turn faster than COMMIT_SPEED, a far-side one
 once it can't stop short of the oncoming lanes on the comfortable curve, so the oncoming hold still stops a car pulling
-away from the line on its go (BeamNG: it held only because the car happened to be under 2 m/s there). Slowing
+away from the line on its go (BeamNG: it held only because the car happened to be under 2 m/s there). Not a curb-side turn
+whose crosswalk hold, confirmed for its walker and in force since (ScenePolicy.crosswalk_id), is braking the car over the
+line: finishing that turn is entering the crosswalk with her in it (BeamNG R3, ped_crosswalk_right at 6ba8582: first
+tracked 5.1 m off, she was held for from 11.3 m out at 4.7 m/s, the car crossed its line at 2.66 m/s, committed, and the
+hold let go of her for good), so the hold stops the car where it can past the line and stands it there while anyone still
+holds it; once no one does, the turn goes on and commits as any other. Slowing
 later in the junction never brings its junction hold back (pedestrians in the path still stop it). ScenePolicy keeps
 those and the rest of what one frame can't know; scene_policy() is one frame on its own.
 A turnpilotd fault (fault()) loses the route, and with it the maneuver a junction hold is for: the hold in force then
@@ -349,26 +354,29 @@ def pedestrian_stops(objects, v_ego: float, is_confirmed=confirmed_track) -> lis
   return stops
 
 
-def committed_past_line(distance: float, v_ego: float, far_side: bool) -> bool:
+def committed_past_line(distance: float, v_ego: float, far_side: bool, crosswalk_held: bool = False) -> bool:
   """Past the hold line and committed to the turn: stopping in the junction is worse than finishing it. A curb-side turn
-  faster than COMMIT_SPEED. A far-side one once it can't stop short of the oncoming lanes (ONCOMING_ENTRY_M) on the
-  comfortable curve: pulling away from the line on its go is no commitment while it still can."""
+  faster than COMMIT_SPEED, but for one its crosswalk hold is braking over the line for a confirmed walker (crosswalk_held:
+  ScenePolicy.crosswalk_id): finishing it is driving into the crosswalk with her in it. A far-side one once it can't stop
+  short of the oncoming lanes (ONCOMING_ENTRY_M) on the comfortable curve: pulling away from the line on its go is no
+  commitment while it still can."""
   if distance >= HOLD_LINE_M:
     return False
   if not far_side:
-    return v_ego > COMMIT_SPEED
+    return v_ego > COMMIT_SPEED and not crosswalk_held
   return distance < ONCOMING_ENTRY_M or v_ego ** 2 / (2. * STOP_DECEL) > distance - ONCOMING_ENTRY_M
 
 
 def hold_line_stop(maneuver, distance, v_ego, reason: str, far_side: bool = False, confirmed: bool = True,
-                   evidence: dict | None = None) -> list[Stop]:
+                   evidence: dict | None = None, crosswalk_held: bool = False) -> list[Stop]:
   """A stop at the hold line before a turn, while the junction rules apply. Past it and not committed, a far-side turn
   stops where the comfortable curve can (standing, where it is), which is short of the oncoming lanes: never a hard stop
-  in the junction, never creeping on toward them. confirmed: as stop()'s, the evidence for it earned a hard stop."""
+  in the junction, never creeping on toward them; a curb-side one stops where it is (its crosswalk hold over the line,
+  crosswalk_held: committed_past_line). confirmed: as stop()'s, the evidence for it earned a hard stop."""
   if maneuver is None or maneuver.kind != TURN or distance < -TURN_ZONE_PAST_M:
     return []
   d_hold = distance - HOLD_LINE_M
-  if committed_past_line(distance, v_ego, far_side):
+  if committed_past_line(distance, v_ego, far_side, crosswalk_held):
     return []
   if d_hold < 0. and far_side:
     d_hold = v_ego ** 2 / (2. * STOP_DECEL)
@@ -473,13 +481,16 @@ def road_frame(objects, heading_deg: float, side: int) -> list:
 
 
 def junction_stops(objects, maneuver, distance, v_ego, right_hand_traffic, is_walker=crosswalk_walker,
-                   may_leave=confirmed_track, may_harden=confirmed_track, heading_deg: float = 0.) -> list[Stop]:
+                   may_leave=confirmed_track, may_harden=confirmed_track, heading_deg: float = 0.,
+                   crosswalk_held: bool = False) -> list[Stop]:
   """Holds at the hold line before a turn: the crosswalk of a curb-side turn, oncoming traffic across a far-side one.
   may_leave: whether a walker's velocity is trusted to let it go when it is leaving the crosswalk; may_harden: whether a
   walker's or an oncoming vehicle's track is confirmed, to brake harder than the curve for it. heading_deg: the car's
-  heading change toward the turn since its first pulse (turnpilotd.track_yaw); the oncoming band is the road's frame (road_frame)."""
+  heading change toward the turn since its first pulse (turnpilotd.track_yaw); the oncoming band is the road's frame (road_frame).
+  crosswalk_held: the crosswalk hold for a confirmed walker has been in force since (ScenePolicy.crosswalk_id), so crossing the
+  line faster than COMMIT_SPEED under it commits nothing (committed_past_line) while anyone still holds it."""
   far_side = far_side_turn(maneuver, right_hand_traffic)
-  if not hold_line_stop(maneuver, distance, v_ego, "", far_side):
+  if not hold_line_stop(maneuver, distance, v_ego, "", far_side, crosswalk_held=crosswalk_held):
     return []
   side = maneuver.side  # the crosswalk and the oncoming lanes are both on the turn side; y is positive left
   if not far_side:
@@ -488,7 +499,8 @@ def junction_stops(objects, maneuver, distance, v_ego, right_hand_traffic, is_wa
       return []
     # the hold hardens only for a confirmed walker, and says which one (the most confirmed, then the nearest)
     walker = min(walkers, key=lambda obj: (not may_harden(obj), obj.x))
-    return hold_line_stop(maneuver, distance, v_ego, CROSSWALK_REASON, far_side, may_harden(walker), track_evidence(walker))
+    return hold_line_stop(maneuver, distance, v_ego, CROSSWALK_REASON, far_side, may_harden(walker), track_evidence(walker),
+                          crosswalk_held)
   holds = []
   for obj in road_frame(objects, heading_deg, side):
     # a new track's vx is range noise, its sign included (VEL_TRUST_HITS): taken as coming, never as going away. Taken so,
@@ -582,6 +594,9 @@ class ScenePolicy:
     self.accel_cap = NO_ACCEL_CAP
     self.released_id: int | None = None  # the maneuver whose junction hold a gas press released
     self.committed_id: int | None = None  # the maneuver the car passed the hold line for faster than COMMIT_SPEED
+    # the maneuver whose crosswalk hold was confirmed (braking harder than the curve may for its walker) and has been in force on
+    # every frame since: crossing its line under it commits nothing (committed_past_line) while anyone still holds it
+    self.crosswalk_id: int | None = None
     self.carried: list[Stop] = []        # the last available frame's pedestrian stops, moved with the car since
     self.carried_junction: tuple[int | None, Stop] | None = None  # (maneuver id, its junction hold): reason, confirmed, evidence
     self.junction: Stop | None = None    # the junction hold in force on the last frame
@@ -633,6 +648,7 @@ class ScenePolicy:
     far_side = far_side_turn(maneuver, right_hand_traffic)
     self.t += dt
     self.odo += v_ego * dt
+    crosswalk_held = maneuver_id is not None and self.crosswalk_id == maneuver_id
     if available:
       objects = trusted_velocity(list(objects) + list(extra_objects))  # before any rule reads them: no pedestrian faster than PED_MAX_SPEED
       self.update_evidence(objects)
@@ -646,7 +662,7 @@ class ScenePolicy:
       self.stood_for(objects, peds, v_ego)
       junction = junction_stops(objects, maneuver, distance, v_ego, right_hand_traffic, lambda obj: self.tracks[obj.trackId].walker,
                                 lambda obj: self.tracks[obj.trackId].confirmed and self.tracks[obj.trackId].leaving >= CROSSWALK_LEAVING_FRAMES,
-                                lambda obj: self.tracks[obj.trackId].confirmed, heading_deg)
+                                lambda obj: self.tracks[obj.trackId].confirmed, heading_deg, crosswalk_held)
       self.carried = peds
       self.carried_junction = (maneuver_id, junction[0]) if junction else None
     else:
@@ -658,15 +674,18 @@ class ScenePolicy:
       if self.carried_junction is not None and self.carried_junction[0] == maneuver_id:
         # the hold keeps what its evidence earned: an unconfirmed track's hold stays on the comfortable curve
         h = self.carried_junction[1]
-        junction = hold_line_stop(maneuver, distance, v_ego, h.reason, far_side, h.confirmed, h.evidence)
+        junction = hold_line_stop(maneuver, distance, v_ego, h.reason, far_side, h.confirmed, h.evidence,
+                                  crosswalk_held and h.reason == CROSSWALK_REASON)
 
     if junction and gas_pressed and maneuver_id is not None and distance - HOLD_LINE_M < GAS_RELEASE_M:
       self.released_id = maneuver_id  # the driver took over and goes: stopping again further in would be worse
     # a standing car a latch holds (map_controls: position-free) is where the latch put it, short of its line: a reading that
     # puts it past (GPS while standing) never commits it (skeptic G4: the unprotected left stopped judging, held forever)
     latched = v_ego < STOP_SPEED and any(s.should_stop for s in extra_stops)
+    # ...nor does a crosswalk hold still holding the car over its line for a confirmed walker (crosswalk_id: BeamNG R3)
+    walker_held = crosswalk_held and bool(junction) and junction[0].reason == CROSSWALK_REASON
     if maneuver_id is not None and maneuver is not None and maneuver.kind == TURN and not latched and \
-       committed_past_line(distance, v_ego, far_side):
+       committed_past_line(distance, v_ego, far_side, walker_held):
       self.committed_id = maneuver_id  # never stopped in the junction for it again, however slow the car gets in there
     if self.fault_open and maneuver_id is not None and maneuver is not None and maneuver.kind == TURN:
       self.fault_open = False
@@ -675,6 +694,12 @@ class ScenePolicy:
     if maneuver_id is not None and maneuver_id in (self.released_id, self.committed_id):
       junction = []
     self.junction = junction[0] if junction else None
+    if self.junction is None or self.junction.reason != CROSSWALK_REASON or maneuver_id is None:
+      self.crosswalk_id = None
+    elif self.junction.confirmed:
+      self.crosswalk_id = maneuver_id
+    elif self.crosswalk_id != maneuver_id:
+      self.crosswalk_id = None
     if self.junction is None or self.junction.reason != CROSSWALK_REASON:
       self.holders_standing = None
     elif available:  # the scene gone: what it last showed stands
