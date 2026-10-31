@@ -18,14 +18,19 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from openpilot.common.hardware import PC
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.turnpilot.car_signals import MODES as CAR_SIGNAL_MODES, read_mode
 from openpilot.selfdrive.turnpilot.maps import coverage as coverage_cache
 from openpilot.selfdrive.turnpilot.maps.client import MapError, cert_fingerprint, check_cert, check_key, missing_config, normalize_host
 from openpilot.selfdrive.turnpilot.maps.coverage import CoverageCache, CoverageRefresher, check_trip
+from openpilot.selfdrive.turnpilot.maps.defaults import ensure_map_defaults
+from openpilot.selfdrive.turnpilot.maps.paths import wall_time
 from openpilot.selfdrive.turnpilot.maps.status import for_destination, read_status
 from openpilot.selfdrive.turnpilot.routing.sources import local_override
+from openpilot.selfdrive.turnpilot.setup_state import PHONE_SEEN
+from openpilot.selfdrive.turnpilot.valhalla_install import SetupThread
 from openpilot.selfdrive.turnpilot.web import places
 from openpilot.selfdrive.turnpilot.web.pairing import PORT, icon_png, pairing_url, qr_svg
 from openpilot.selfdrive.turnpilot.web.status import StatusReader, format_status
@@ -38,6 +43,7 @@ REQUEST_TIMEOUT = 10.  # s a client may stall on one socket read or write; Safar
 LOOPBACK = ("127.0.0.1", "::1")
 MAX_CONNECTIONS = 32  # sockets handled at once; past this a new one is closed unanswered. A page opens several at once
 BIND_RETRY_S = 5.  # s between tries to listen: the manager doesn't restart a dead process, and a dead one soft-disables openpilot
+PHONE_SEEN_WRITE_S = 10.  # s between writes of TurnPilotPhoneSeen: the page polls every 2 s
 
 
 class ApiError(Exception):
@@ -67,6 +73,16 @@ class App:
     self.maps_dir = maps_dir
     self.coverage = CoverageCache(maps_dir)
     self.refresh = refresh if refresh is not None else (lambda: coverage_cache.refresh(params, maps_dir))
+    self.phone_seen_at = 0.  # monotonic time of the last TurnPilotPhoneSeen write
+
+  def phone_seen(self):
+    """The phone made a request with the pairing token: the comma's setup screen shows it as connected."""
+    now = time.monotonic()
+    if now - self.phone_seen_at < PHONE_SEEN_WRITE_S:
+      return
+    self.phone_seen_at = now
+    with self.store.lock:
+      self.store.params.put(PHONE_SEEN, wall_time(), block=True)  # epoch s, compared with the UI clock
 
   def valid_token(self, candidates) -> str | None:
     """The stored token if any candidate matches it, else None."""
@@ -315,6 +331,8 @@ class Handler(BaseHTTPRequestHandler):
         authorized = authorized or self.client_address[0] in LOOPBACK
       if not authorized:
         raise ApiError(401, "unauthorized")
+      if self.client_address[0] not in LOOPBACK:
+        self.app.phone_seen()
       if method == "POST" and not self.headers.get("Content-Type", "").lower().startswith("application/json"):
         raise ApiError(415, "send application/json")  # a cross-site form can't send this without a preflight
       if method == "GET" and path == "/pair.svg":
@@ -333,6 +351,7 @@ class Handler(BaseHTTPRequestHandler):
   def page(self, query):
     extra = []
     if token := self.app.valid_token(query.get("t", [])):  # opened with the token: remember it for the next visit
+      self.app.phone_seen()
       extra = [("Set-Cookie", f"{COOKIE}={token}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Strict")]  # the stored token, never the query's
     self.send(200, INDEX.read_bytes(), "text/html; charset=utf-8", extra)
 
@@ -439,6 +458,9 @@ class Server(ThreadingHTTPServer):
 def main():
   params = Params()
   ensure_token(params)
+  ensure_map_defaults(params)  # the shipped map server's address and certificate: the phone only adds the key
+  if not PC:  # the map engine installs itself on the comma; a PC has its own (or the sim's local tiles)
+    SetupThread(params).start()
   reader = StatusReader()
   reader.start()
   refresher = CoverageRefresher(params)  # keeps TurnPilot's mapped area fresh while the comma is online

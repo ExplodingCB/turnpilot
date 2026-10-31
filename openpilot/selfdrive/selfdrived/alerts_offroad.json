@@ -33,6 +33,11 @@
     "text": "Chestnut overheated. Ensure good airflow.",
     "severity": 0
   },
+  "Offroad_TurnPilotSetup": {
+    "text": "TurnPilot is not ready to drive. %1",
+    "severity": 0,
+    "_comment": "Set extra field to what is missing and where to fix it (turnpilot/setup_state.py readiness_line)."
+  },
   "Offroad_ChestnutPcieUnavailable": {
     "text": "%1",
     "severity": 0
