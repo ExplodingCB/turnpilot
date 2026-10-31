@@ -137,6 +137,64 @@ def test_vision_a_cross_road_over_25_mph_or_unknown_goes_after_the_4_s_long_look
   assert w.sg.long_look and out[i].log['longLook']
 
 
+# ------------------------------------------------------------------------------------- re-engaged at the line, said first
+
+def announced(events):
+  return [kw for name, kw in events if name == 'turnpilot.stop_go_vision_announce']
+
+
+@pytest.mark.parametrize('mph, reason', [(25, sg.GOING_REASON), (35, sg.LOOK_REASON), (0, sg.LOOK_REASON)])
+def test_vision_re_engaged_at_the_line_with_the_window_run_says_it_1_s_before_the_go(tmp_path, monkeypatch, mph, reason):
+  # the driver's brake or gas at the line disengages openpilot for the whole window, which counts on meanwhile; re-engaged,
+  # the go's line and chime come first ("Look both ways" at a long look), 1 s of engaged frames, then the go: never a go on
+  # the re-engaged frame with nothing said
+  events = []
+  monkeypatch.setattr(sg.cloudlog, 'event', lambda name, **kw: events.append((name, kw)))
+  w = vworld(tmp_path, mph)
+  w.run(1.5)
+  off = w.run(6., enabled=False)
+  assert first_go(off) is None and not any(d.prompt == 'stopGo' or d.release is not None for d in off)
+  n = len(announced(events))
+  out = w.run(3.)
+  i = first_go(out)
+  assert i is not None and out[i].reason == 'Going' and out[i].release == ((0, 1), 'clear')
+  assert i * DT_MDL == pytest.approx(1.0, abs=0.06)  # VISION_ANNOUNCE_S: the line said on engaged frames this long first
+  assert all(out[k].prompt == 'stopGo' and out[k].reason == reason and out[k].release is None for k in range(i))
+  assert len(announced(events)) == n + 1 and announced(events)[-1]['reason'] == reason  # the re-engage's own line, logged
+
+
+def test_vision_disengaged_inside_the_announcement_says_it_again_for_1_s_before_the_go(tmp_path, monkeypatch):
+  # a brake tap 0.5 s into "Going": the go is not 0.2 s after the re-engage on the old line, it is said again for 1 s
+  events = []
+  monkeypatch.setattr(sg.cloudlog, 'event', lambda name, **kw: events.append((name, kw)))
+  w = vworld(tmp_path, 25)
+  pre = [w.step()]
+  while pre[-1].prompt != 'stopGo':
+    pre.append(w.step())
+    assert len(pre) < round(6. / DT_MDL)
+  pre += w.run(0.5)
+  assert first_go(pre) is None and len(announced(events)) == 1
+  w.run(0.3, enabled=False)
+  out = w.run(3.)
+  i = first_go(out)
+  assert i is not None and i * DT_MDL == pytest.approx(1.0, abs=0.06)
+  assert all(out[k].prompt == 'stopGo' and out[k].reason == sg.GOING_REASON for k in range(i))
+  assert len(announced(events)) == 2
+
+
+def test_vision_disengaged_short_of_the_announcement_goes_on_the_window_as_before(tmp_path):
+  # re-engaged with the window not yet at its line: nothing changes, the line 1 s before, the go 2.5 s after the arrival
+  w = vworld(tmp_path, 25)
+  out = w.run(1.5)
+  a = arrived_at(out)
+  out += w.run(0.5, enabled=False)
+  out += w.run(4.)
+  i = first_go(out)
+  assert i is not None and (i - a) * DT_MDL == pytest.approx(2.5, abs=0.11)
+  said = [k for k in range(a, i) if out[k].prompt == 'stopGo']
+  assert said and (i - said[0]) * DT_MDL == pytest.approx(1.0, abs=0.06)
+
+
 def test_vision_an_unknown_speed_lane_is_watched_as_a_fast_one(tmp_path):
   # assumedLimit 0 (unmatched): its floor is the long look's 25 mph, but a raw box down the lane, an untrusted track's speed
   # and the band's threat take it as UNKNOWN_CLASS_MPH, never 0 (a raw car 20 m down the near lane, then a car seen 30 m down

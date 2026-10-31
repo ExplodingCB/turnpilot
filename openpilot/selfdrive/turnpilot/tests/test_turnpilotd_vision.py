@@ -94,6 +94,27 @@ def test_vision_a_cross_road_over_25_mph_or_unknown_goes_after_the_4_s_long_look
   assert not any(p.controlPrompt == 'stopSignTakeControl' for p in plans) and caps_ok(plans)
 
 
+@pytest.mark.parametrize('mph, reason', [(25., sg.GOING_REASON), (35., sg.LOOK_REASON)])
+def test_vision_re_engaged_at_the_line_after_the_window_says_it_1_s_before_the_go(tmp_path, mph, reason):
+  # the brake at the line through the whole window (openpilot disengaged), then re-engaged: the plan's stopGo prompt with its
+  # line ("Look both ways" at a long look), the car held, for 1 s before the latch lets go; never a go on the re-engaged frame
+  sim = vsim(tmp_path, mph=mph)
+  run_to_line(sim)
+  sim.run(1.5)
+  sim.brake, sim.engaged = True, False
+  sim.run(6.)
+  assert go_frame(sim) is None
+  sim.brake, sim.engaged = False, True
+  n0 = len(sim.plans())
+  sim.run(6.)
+  plans = sim.plans()
+  k = go_frame(sim)
+  assert k is not None and (k - n0) * DT_MDL == pytest.approx(1.0, abs=0.06)  # VISION_ANNOUNCE_S after the re-engage
+  assert all(plans[i].controlPrompt == 'stopGo' and plans[i].reason == reason and plans[i].shouldStop for i in range(n0, k))
+  assert plans[k].reason == 'Going' and not plans[k].shouldStop
+  assert not any(p.controlPrompt == 'stopSignTakeControl' for p in plans) and caps_ok(plans)
+
+
 @pytest.mark.parametrize('status', ['off', 'disabled', 'unset'])
 def test_vision_side_views_off_or_disabled_hands_back_at_1_s_saying_so(tmp_path, status):
   sim = vsim(tmp_path)

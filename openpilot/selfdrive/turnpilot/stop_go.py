@@ -74,7 +74,9 @@ stops is a shield (stop_evidence's vision_shield), and the go comes after VISION
 its floor judged at 25 mph, the window VISION_LONG_CLEAR_S, the creep to the best view first, "Look both ways" announced. A
 gate that fails before the first go is the 1 s handback saying which ("Stop sign: side cameras off: take control", H9); after
 it, a held fault (H9), never shadow (C14). ALWAYS_DRIVE's amendments V1-V10 hold under vision alone (each marked V<n> below);
-the other four modes are as they were (tests/test_stop_go_modes_golden.py).
+the other four modes are as they were (tests/test_stop_go_modes_golden.py). The go's line is said on VISION_ANNOUNCE_S of
+acting, engaged frames in a row before it: re-engaged (or acting again) with the window already run, the line comes first and
+the go VISION_ANNOUNCE_S after it, never on the re-engaged frame.
 
 Faults (7.1), each stopSignTakeControl with its reason, the car held (by the latch, or by the decider's own stop once the latch
 has let go): H1 a needed view without a run for DET_FAULT_S (held: cameraPaused for FAULT_GRACE_S first; moving before commit,
@@ -504,7 +506,7 @@ class StopGo:
     self.gate_logged = None         # the gate's last logged result
     self.need_s = sr.CLEAR_S        # s the go conditions must hold for the go
     self.long_look: list = []       # (role, limit) of the conflicting approaches over 25 mph or of unknown speed
-    self.announced = False          # this go's line and chime said
+    self.said_t = None              # decider clock this go's line and chime were first said, said every frame since (None: not)
     self.vision_top = ''            # the top hold's key last logged (stop_go_vision_wait)
     self.vision_creep_tried = False  # V9: the creep for a view started on a reach-only wait
     self.look_crept = False         # the long look's creep to the best view tried
@@ -1066,15 +1068,19 @@ class StopGo:
     if go and not self.would_go_logged:
       self.would_go_logged = True
       cloudlog.event("turnpilot.stop_go_would_go", key=list(self.key), acting=acting, why=why, t=round(self.t, 2), pos=round(pos, 2))
-    if not go or not acting or not f.enabled:
+    # vision's go is said first (guard 5): its line and chime on VISION_ANNOUNCE_S of acting, engaged frames in a row before it,
+    # a frame that can't say it (a hold, openpilot disengaged, as shadow) ending the line; V7's later no-lift goes say nothing
+    said = self.vision and not (self.no_lift and self.no_lift_said)
+    if said and acting and f.enabled and not holds and not creeping and self.clear_s >= need_s - sr.VISION_ANNOUNCE_S - 1e-6:
+      self._announce(d, need_s)
+    else:
+      self.said_t = None
+    heard = not said or (self.said_t is not None and self.t - self.said_t >= sr.VISION_ANNOUNCE_S - 1e-6)
+    if not go or not acting or not f.enabled or not heard:
       # openpilot disengaged (the driver's pedal: DisengageOnAccelerator): never a go of TurnPilot's, which would let go of
       # the latch while the driver drives and leave a crossing nobody certified silent (owner decision (b), 2026-10-30).
-      # The window goes on counting: re-engaged short of the line, the go comes on it
-      if self.vision and acting and f.enabled and not holds and not creeping and \
-         self.clear_s >= need_s - sr.VISION_ANNOUNCE_S - 1e-6 and not (self.no_lift and self.no_lift_said):
-        self._announce(d, need_s)  # the go's line and chime, VISION_ANNOUNCE_S before it
-      elif holds:
-        self.announced = False
+      # The window goes on counting: re-engaged short of the line, the go comes on it (under vision VISION_ANNOUNCE_S after
+      # its line, said from the re-engage)
       return
     room = self.edges.d_min - pos
     need = sr.go_room_m(f.t_abort, right=f.maneuver == 'right')
@@ -1099,7 +1105,7 @@ class StopGo:
     if silent:
       d.prompt, d.reason = 'waitingForCross', "Waiting: " + NO_LIFT_REASON
     self.no_lift_said = self.no_lift_said or self.no_lift
-    self.announced = False
+    self.said_t = None
     d.stops = []
     d.speed_cap = sr.STOP_GO_V_MAX
     d.withdrawable = True  # standing where it was held, GO_ROOM_M or more short of dEdgeMin
@@ -1116,10 +1122,11 @@ class StopGo:
 
   def _announce(self, d: StopGoDecision, need_s: float) -> None:
     """Vision's go said before it comes (guard 5): the stopGo prompt (its chime) with "Going", or "Look both ways" for the
-    long look so the supervisor checks both ways; a hold inside it starts the window again and the wait's words come back."""
+    long look so the supervisor checks both ways; a hold inside it starts the window again and the wait's words come back. Each
+    line is logged once, a re-engage's its own."""
     d.prompt, d.reason = 'stopGo', LOOK_REASON if self.long_look else GOING_REASON
-    if not self.announced:
-      self.announced = True
+    if self.said_t is None:
+      self.said_t = self.t
       cloudlog.event("turnpilot.stop_go_vision_announce", key=list(self.key), clear_s=round(self.clear_s, 2), need_s=need_s,
                      reason=d.reason, longLook=[(r, round(lim / sr.MPH, 1)) for r, lim in self.long_look])
 
