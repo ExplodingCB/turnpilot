@@ -2909,6 +2909,9 @@ def test_a_withdrawn_go_is_not_given_again_by_a_hold_that_comes_and_goes():
 
 
 WALKER = ({'cls': 'pedestrian', 'x': 4., 'y': 0.1, 'vx': 0., 'vy': 0., 'inPath': True},)
+# ...clearing: seen out of the path (past the turn side's crosswalk zone, CROSSWALK_Y_FAR_M) on the frame before her track ends.
+# A walker whose track just ends in front of a standing car is lost, not gone (WF-13 (a), turnpilotd.LOST_*): no lift past her
+WALKER_GONE = ({'cls': 'pedestrian', 'x': 4., 'y': -16., 'vx': 0., 'vy': 0., 'inPath': False},)
 
 
 def walker_stops_the_car(sim, n_max=400):

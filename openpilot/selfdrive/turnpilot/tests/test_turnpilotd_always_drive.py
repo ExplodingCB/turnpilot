@@ -22,7 +22,7 @@ from openpilot.selfdrive.turnpilot.stop_go import Frame
 from openpilot.selfdrive.turnpilot.tests.test_camera_lights import detections
 from openpilot.selfdrive.turnpilot.tests.test_go_override import WARM_S
 from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of, model_v2
-from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, RIGHT_AT_A_CORNER, T_LEFT, WALKER, Sim, go_from_a_red,
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, RIGHT_AT_A_CORNER, T_LEFT, WALKER, WALKER_GONE, Sim, go_from_a_red,
                                                                  model_stands_in_the_turn, oracle_lights, stand, stop_at, walker_stops_the_car)
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_go import attach_planner, holding, model_stops_at, raw_person
 from openpilot.selfdrive.turnpilot.unprotected_left import LIGHT_RED_MAX_S, STAND_UNDECIDED_S
@@ -629,7 +629,7 @@ def released_where_no_signal_is(on: bool, status='ok', controls=(), lights=NO_HE
   attach_planner(sim, holding)
   held = [sim.step(WALKER, engaged=True) for _ in range(round(hold_s / DT_MDL))]
   assert held[-1].shouldStop
-  return [sim.step(engaged=True) for _ in range(round(3. / DT_MDL))]
+  return [sim.step(WALKER_GONE if i == 0 else (), engaged=True) for i in range(round(3. / DT_MDL))]
 
 
 def certified_causes(plans):
@@ -865,3 +865,65 @@ def test_a_stand_at_a_turns_line_with_its_desire_out_never_gets_the_unstick_lift
   assert sim.tp.turn_committed and sim.tp.desires.turned_deg < STALL_MIN_DEG
   plans = stand(sim, UNSTICK_S + 5.)
   assert not unstick_spans(plans)
+
+
+# --- WF-13 (a): never lift into a person TurnPilot lost (SAT_VALIDATION run 6, ped_step_out at 263065a) ---
+
+def stood_for_a_walker_at_a_green(walker=lambda sim: {'x': 3.8, 'y': -1.4, 'vx': 0., 'vy': 0., 'inPath': True}):
+  """SAT_VALIDATION run 6: a walker stepped 2 m into the lane and stood there, about 1 m right of the car's centreline; TurnPilot
+  stopped the car for her ('pedestrian in path') with her last track 3.8 m ahead and 1.4 m right, in the path, age 71, the
+  junction ahead a signal read green. Here the same: the car stands for her 18 m short of the green signal, she stands in front
+  of it (walker(sim): her track's fields, or None once the scene has none for her). Returns the sim, stood 2 s with her."""
+  sim = Sim(STRAIGHT, controls=[(290., 'signal')], cruise=6.)
+  sim.tp.always_drive, sim.go_taps, sim.tp.oracle_ok = True, False, True
+  sim.lights = oracle_lights('green', 290.)
+  s_her = 290. - 18.
+  while sim.v > 0.05 or s_her - sim.s > 10.:
+    sim.step(({'cls': 'pedestrian', 'x': s_her - sim.s, 'y': -0.5, 'vx': 0., 'vy': 0., 'inPath': True},), engaged=True)
+    assert sim.t < 120.
+  assert sim.trace[-1][2].shouldStop and 2. < s_her - sim.s < 8.
+  stood = stand(sim, 2., objects=({'cls': 'pedestrian', **walker(sim), 'age': 71},))
+  assert all(p.shouldStop for p in stood) and all(str(p.goCertified.cause) == 'none' for p in stood)
+  return sim
+
+
+def test_a_walker_whose_track_ends_in_front_of_the_standing_car_gets_no_lift():
+  """SAT_VALIDATION run 6 (ped_step_out at 263065a, CONTACT): the car stood for a walker in its path; her track coasted on
+  unmatched frames (the detector on the road camera, her below its view) and ended at 12.9 s with her still 2.8 m ahead of the
+  camera; with no track, the straight release went at once (go_certified turnRelease, +0.5 m/s^2), the model drove on, and the
+  car passed her at 3.5 m/s 0.93 m from its centreline. WARGAME_FIXES WF-13 (a): a person in the path the scene stops publishing
+  while the car stands is lost, not gone: no lift of any cause is certified (go_blocked 'lost'), so the model alone decides,
+  until the car has moved LOST_CLEAR_M on its own or the driver takes over."""
+  sim = stood_for_a_walker_at_a_green()
+  with mock.patch('openpilot.selfdrive.turnpilot.turnpilotd.cloudlog') as log:
+    plans = stand(sim, NO_MOVE_MAX_S + 1.)  # her track gone, she still there
+  assert all(str(p.goCertified.cause) == 'none' for p in plans), "never a lift past a person TurnPilot lost"
+  assert not any(p.shouldStop for p in plans[int(1. / DT_MDL):]), "no TurnPilot hold either: the model decides"
+  events = [c.args[0] for c in log.event.call_args_list]
+  assert 'turnpilot.person_lost' in events
+  assert any(c.args[0] == 'turnpilot.go_not_certified' and c.kwargs.get('why') == 'lost' for c in log.event.call_args_list)
+  # the model drives the car on by itself LOST_CLEAR_M: the loss is over, and the next stand's release may lift again
+  from openpilot.selfdrive.turnpilot.turnpilotd import LOST_CLEAR_M
+  sim.model_holds = False
+  while sim.tp.odo_m - sim.tp.lost_person[2] <= LOST_CLEAR_M if sim.tp.lost_person is not None else False:
+    sim.step(engaged=True)
+    assert sim.t < 200.
+  assert sim.tp.lost_person is None
+
+
+def test_a_walker_seen_leaving_the_path_before_her_track_ends_is_no_loss():
+  """WF-13 (a)'s other side: a walker the scene shows out of the car's path (she stepped back to the kerb) before her track
+  ends left it, so the release lifts as before; and the driver taking over ends a loss."""
+  out = {'on': False}
+  sim = stood_for_a_walker_at_a_green(lambda sim: {'x': 3.8, 'y': -4.5 if out['on'] else -1.4, 'vx': 0., 'vy': 0.,
+                                                   'inPath': not out['on']})
+  out['on'] = True
+  stand(sim, 0.5, objects=({'cls': 'pedestrian', 'x': 3.8, 'y': -4.5, 'vx': 0., 'vy': 0., 'inPath': False, 'age': 76},))
+  plans = stand(sim, 3.)
+  assert any(str(p.goCertified.cause) == 'turnRelease' for p in plans), "seen leaving: the release lifts"
+  assert sim.tp.lost_person is None
+  sim = stood_for_a_walker_at_a_green()
+  stand(sim, 1.)
+  assert sim.tp.lost_person is not None
+  sim.step(engaged=False, gas=True)
+  assert sim.tp.lost_person is None

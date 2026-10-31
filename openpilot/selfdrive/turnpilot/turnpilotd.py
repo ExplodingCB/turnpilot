@@ -452,6 +452,18 @@ PED_NOTE_S = 10.
 PED_WAITING_NOTE = "Waiting for pedestrian"
 PED_WAITING_REASON = "Pedestrian waiting: take control"
 UNSTICK_REASON = "Nothing ahead is holding the car: going on"
+# WARGAME_FIXES WF-13 (a), never lift into a person TurnPilot lost (SAT_VALIDATION run 6, ped_step_out at 263065a: the car stood
+# for a walker in its path, her track coasted on unmatched frames, the detector on the road camera and her below its view, and
+# ended with her still 2.8 m ahead; with no track the straight release lifted at once, the model drove on and passed her 0.93 m
+# from the car's centreline at 3.5 m/s). A pedestrian track in the path (scene_policy.in_path) within LOST_PERSON_M that the
+# scene stops publishing while the car stands (under STANDSTILL_SPEED) is lost, not gone: no go of TurnPilot's is certified
+# and one out is withdrawn (go_blocked 'lost'), so the model alone decides; no hold of its own. The loss ends once a pedestrian
+# track is seen again within LOST_NEAR_M of where she was last (re-tracked: the live track rules from then on), once the car
+# has moved LOST_CLEAR_M by turnpilotd's odometer (the model or the driver drove it on), or the driver takes over (disengaged,
+# a pedal). A track seen out of the path before it ends left it: no loss
+LOST_PERSON_M = GO_CLEAR_M
+LOST_NEAR_M = 1.5
+LOST_CLEAR_M = 2.
 # the stop-sign decider's go causes (stop_go.py, go_override.CAUSES): its own watchdog (the gate, G5's window, GO_RETRIES, H5)
 # follows them, never the no-move clock, and turnRelease never certifies alongside one
 STOP_GO_CAUSES = ('stopSign', 'rollUp', 'creep', 'clearBox')
@@ -747,6 +759,8 @@ class TurnPilot:
     self.unstick_done = False      # under the switch, section 4.5's lift went for this release: no second try (stopped_unheld)
     self.unstick_id: int | None = None  # ...as this go (GoCertifier.id)
     self.unstick_alert_t = 0.      # ...s left of its unstickLift alert
+    self.front_people: dict = {}   # WF-13 (a): {track id: (x, y)} of the pedestrian tracks in the path within LOST_PERSON_M
+    self.lost_person: tuple | None = None  # ...one the scene stopped publishing with the car standing: (x, y, odo_m, id)
     self.ped_hold_s = 0.           # the crosswalk hold has stood the car this long (SC-02, crosswalk_standoff)...
     self.ped_stand_s = 0.          # ...with every walker it is for standing
     self.ped_said = False          # ...its note chimed
@@ -1139,6 +1153,7 @@ class TurnPilot:
     decision = self.scene_now = self.scene.update(objects, available, scene_m, scene_d, v_ego, right_hand_traffic, scene_id,
                                                  took_over, extra_stops=mapd.stops + left_stops + sg.stops, heading_deg=scene_yaw,
                                                  path=predicted_path(model), extra_objects=extra_objects if available else ())
+    self.watch_lost_people(sm, cs, v_ego, objects, available)
     self.last_holding = decision.holding
     # a TurnPilot stop in force brings the car to rest at or short of the junction (shouldStop at its end: a walker's
     # hold, a red, a stop sign), braking toward it on the speed cap's curve (shouldStop false until about standstill) or
@@ -2168,6 +2183,37 @@ class TurnPilot:
     cloudlog.event("turnpilot.post_go", profile=name, unprotected=left, turned_deg=round(turned_deg, 1), distance=round(distance, 1),
                    at_line=at_line)
 
+  def watch_lost_people(self, sm, cs, v_ego: float, objects, available: bool) -> None:
+    """WF-13 (a)'s loss (LOST_*): the pedestrian tracks in the path within LOST_PERSON_M, and one of them the scene stops
+    publishing with the car standing, until it is re-tracked near where it was, the car has moved LOST_CLEAR_M or the driver
+    takes over. Nothing is seen gone without a live scene (go_blocked refuses on 'scene' meanwhile)."""
+    if not sm['carControl'].enabled or cs.gasPressed or cs.brakePressed:
+      if self.lost_person is not None:
+        cloudlog.event("turnpilot.person_lost_end", why='driver', track_id=self.lost_person[3])
+      self.front_people, self.lost_person = {}, None
+      return
+    if self.lost_person is not None and self.odo_m - self.lost_person[2] > LOST_CLEAR_M:
+      cloudlog.event("turnpilot.person_lost_end", why='moved', track_id=self.lost_person[3], moved_m=round(self.odo_m - self.lost_person[2], 2))
+      self.lost_person = None
+    if not available:
+      return
+    peds = {int(o.trackId): o for o in objects if str(o.cls) == 'pedestrian'}
+    if self.lost_person is not None:
+      x, y, _, lost_id = self.lost_person
+      near = [i for i, o in peds.items() if math.hypot(float(o.x) - x, float(o.y) - y) < LOST_NEAR_M]
+      if near:
+        cloudlog.event("turnpilot.person_lost_end", why='retracked', track_id=lost_id, new_id=near[0])
+        self.lost_person = None
+    for i, (x, y) in list(self.front_people.items()):
+      o = peds.get(i)
+      if o is not None:
+        continue
+      del self.front_people[i]
+      if v_ego < STANDSTILL_SPEED and self.lost_person is None:
+        self.lost_person = (x, y, self.odo_m, i)
+        cloudlog.event("turnpilot.person_lost", error=True, track_id=i, x=round(x, 2), y=round(y, 2), v=round(v_ego, 2))
+    self.front_people = {i: (float(o.x), float(o.y)) for i, o in peds.items() if 0. < o.x <= LOST_PERSON_M and in_path(o)}
+
   def go_blocked(self, sm, cs, available: bool, objects, raw, decision, took_over: bool, own_cap: float | None = None) -> str:
     """Why TurnPilot's go can't be certified for plannerd's lift now, '' if it can (go_override.py): the driver on a pedal or
     disengaged, no live scene to see the path by, a hold of TurnPilot's in force (a walker's, a map stop's), a lead within
@@ -2180,6 +2226,8 @@ class TurnPilot:
       return 'scene'
     if decision.should_stop or (decision.holding and (own_cap is None or decision.speed_cap < own_cap - OWN_CAP_TOL)):
       return 'hold'
+    if self.lost_person is not None:
+      return 'lost'
     if close_lead(sm['modelV2']):
       return 'lead'
     return 'inPath' if path_blocker(objects, raw) else ''
