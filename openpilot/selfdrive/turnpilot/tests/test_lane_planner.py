@@ -8,7 +8,7 @@ from openpilot.cereal import custom, log
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S
-from openpilot.selfdrive.turnpilot.lane_planner import (LANE_UNKNOWN_REASON, LANE_WIDTH, LC_HOLD_CLEAR_S, LC_RELEASE_S,
+from openpilot.selfdrive.turnpilot.lane_planner import (LANE_UNKNOWN_REASON, LANE_WIDTH, LATCHED_YELLOW, LC_HOLD_CLEAR_S, LC_RELEASE_S,
                                                         LC_ABORT_COOLDOWN_S, LC_ABORT_SETTLE_S, LC_CONFIRM_FRAMES, LC_REQUEST_TIMEOUT_S,
                                                         LC_SIGNAL_TIMEOUT_S, LC_WARN_S, YELLOW_HOLD_S, LanePlanner, ModelLanes, Phase,
                                                         slow_zone,
@@ -159,6 +159,39 @@ def test_every_change_needs_broken_white_into_a_travel_lane():
   # left-hand traffic: never away from the curb (the center line is broken white there)
   assert change_blocker(RIGHT, lanes, paint(right=BW), right_hand_traffic=False) == 'noLane'
   assert change_blocker(LEFT, lanes, paint(left=BW), right_hand_traffic=False) == ''
+
+
+# less than paint, never solid, yellow or no line: the kind unknown, or broken short of the bar, white or of unknown colour
+LESS_THAN_PAINT = (UNKNOWN, LinePaint('unknown', 'white', 0.9, 0.3), UNSURE_BW, COLORLESS)
+
+
+def test_a_curb_side_change_on_less_than_paint_needs_section_4_10s_conditions():
+  """ALWAYS_DRIVE.md 4.10, the owner's yes for the curb side only (unpainted_curb, under TurnPilotAlwaysDrive): the ego line
+  toward the curb read short of broken white but never solid, yellow or no line, the model's next line out 0.85-1.5 lane
+  widths beyond it with a trusted road edge, the lane not parked (carInLane and the blind spot are the planner's, at the offer
+  and on every frame of it). Never toward the far side, never with nothing read (no scene checks the lane then), never held
+  yellow, and never without unpainted_curb."""
+  lanes = model_lanes(*road(1, 1))
+  for p in LESS_THAN_PAINT:
+    assert change_blocker(RIGHT, lanes, paint(right=p)) == 'lineNotBroken', p  # without it: as today
+    assert change_blocker(RIGHT, lanes, paint(right=p), unpainted_curb=True) == '', p
+    assert change_blocker(LEFT, lanes, paint(left=p), unpainted_curb=True) == 'lineNotBroken', p  # the far side: never
+  for p in (SW, SY, BY, NO_LINE, LATCHED_YELLOW, LinePaint('solid', 'unknown', 0.9, 0.95), LinePaint('unknown', 'yellow', 0.2, 0.)):
+    assert change_blocker(RIGHT, lanes, paint(right=p), unpainted_curb=True) == 'lineNotBroken', p
+  assert change_blocker(RIGHT, lanes, (), unpainted_curb=True) == 'lineNotBroken'
+  # the next line out a lane's width beyond, painted, with a trusted edge: else no lane of less than paint
+  assert change_blocker(RIGHT, model_lanes(*road(1, 0)), paint(right=UNKNOWN), unpainted_curb=True) == 'lineNotBroken'
+  assert change_blocker(RIGHT, model_lanes(*road(1, 1, edge_std=2.)), paint(right=UNKNOWN), unpainted_curb=True) == 'lineNotBroken'
+  line_ys, probs, edges, stds = road(1, 1)
+  line_ys[3] = line_ys[2] + 0.7 * LANE_WIDTH  # a bike lane's width out
+  assert change_blocker(RIGHT, model_lanes(line_ys, probs, edges, stds), paint(right=UNKNOWN), unpainted_curb=True) == 'lineNotBroken'
+  # parked cars ahead in it: a parking strip; the map's lane list none that way
+  parked = scene([{'cls': 'car', 'x': 30., 'y': -3.6, 'vx': 0.}]).objects
+  assert change_blocker(RIGHT, lanes, paint(right=UNKNOWN), parked, unpainted_curb=True) == 'laneParked'
+  assert change_blocker(RIGHT, lanes, paint(right=UNKNOWN), nav_room=0, unpainted_curb=True) == 'noLane'
+  # left-hand traffic: the curb is the left
+  assert change_blocker(LEFT, lanes, paint(left=UNKNOWN), right_hand_traffic=False, unpainted_curb=True) == ''
+  assert change_blocker(RIGHT, lanes, paint(right=UNKNOWN), right_hand_traffic=False, unpainted_curb=True) == 'noLane'
 
 
 def test_lanes_needed_every_path_gated():
@@ -723,6 +756,42 @@ def test_the_cars_lamp_stays_lit_through_the_hold_and_a_car_in_the_target_lane_s
   distance = drive.run(m, distance, 1., blindspot=LaneChange.right)
   drive.run(m, distance, 1., blindspot=LaneChange.right, objects=scene([{'cls': 'car', 'x': 2., 'y': -3.6, 'vx': 15.}]).objects)
   assert [a for a, _ in drive.aborts] == ['carInLane']
+
+
+def test_the_planner_changes_toward_the_curb_on_less_than_paint_only_under_the_switch():
+  """4.10 in the planner: a right turn without a lane list, the curb lane beyond a line the paint can't read. Off the switch no
+  offer (lineNotBroken, as today); on it the offer, its LC_WARN_S countdown said first, then the change. A line read solid white
+  or yellow on any frame of the window is never less than paint: no such change for the rest of it. The blind spot and a car
+  in the target lane hold it back as any change; toward the far side nothing changes."""
+  m = maneuver("turn", "right")
+  def unread(left, right):
+    return paint(left=SW, right=UNKNOWN if right else SW)
+  for on in (False, True):
+    drive = Drive(0, 1, paint=unread)
+    drive.lp.always_drive = on
+    drive.run(m, 290., 8.)
+    if not on:
+      assert not drive.offers and drive.decisions[-1].wait == 'lineNotBroken'
+      continue
+    (side, _, t_offer), = drive.offers
+    (_, _, t_request), = drive.requests
+    assert side == LaneChange.right and t_request - t_offer == pytest.approx(LC_WARN_S, abs=1.5 * DT_MDL)
+    assert drive.lp.changes == 1 and (drive.lanes_left, drive.lanes_right) == (1, 0) and not drive.aborts
+  for marked in (SW, SY):
+    frames = {'n': 0}
+    def once(left, right, marked=marked, frames=frames):
+      frames['n'] += 1
+      return paint(left=SW, right=marked if frames['n'] <= 3 else UNKNOWN)
+    drive = always(Drive(0, 1, paint=once))
+    drive.run(m, 290., 9.)
+    assert not drive.offers and drive.decisions[-1].wait == 'lineNotBroken', marked
+  drive = always(Drive(0, 1, paint=unread))
+  distance = drive.run(m, 290., 3., blindspot=LaneChange.right)
+  drive.run(m, distance, 2., objects=scene([{'cls': 'car', 'x': -3., 'y': -3.6, 'vx': 15.}]).objects)
+  assert not drive.offers
+  drive = always(Drive(1, 0, paint=lambda left, right: paint(left=UNKNOWN if left else SY, right=SW)))
+  drive.run(maneuver("turn", "left"), 290., 8.)
+  assert not drive.offers and drive.decisions[-1].wait == 'lineNotBroken'
 
 
 def test_driver_lane_change_gets_a_cooldown_too():
