@@ -50,7 +50,7 @@ import bisect
 import math
 import sys
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -74,6 +74,10 @@ BEARING_GATE_DEG = 1.                # deg either side of where the car would be
 BEARING_RATE_DEG_S = 1.              # ...plus this per s back from its last box (the car's own yaw, a lane change)
 AMBIGUOUS_GATE = 2.                  # any other band box inside this x both gates may be taken for it: no credit past there
 SEED_IOU = 0.5                       # the track's box is its run's box at this overlap
+DRIVE_GAP_S = 5.                     # log time this far ahead, or back past LOG_JITTER_S, starts another drive (route, boot)
+LOG_JITTER_S = 1.                    # messages are logged as they come, not in strict logMonoTime order
+TRACK_GAP_S = 1.                     # a track id unseen this long (or the scene this long) is another track: a track coasts
+                                     # MAX_COAST_S (0.5 s), and a new tracker numbers its tracks from 1 again
 MPH = 0.44704
 PREFLIGHT = "python3 -m openpilot.selfdrive.turnpilot.preflight"
 REASONS = {
@@ -100,7 +104,7 @@ class Run:
 class Sample:
   track_id: int
   cls: str
-  t: float            # s into the drive the track became a sample
+  t: float            # s into its drive the track became a sample
   speed: float        # m/s over the ground toward the car
   road_m: float = 0.  # confirmed range on the road camera's full pass, near_m
   road_why: str = ''
@@ -111,6 +115,7 @@ class Sample:
   far_gap_s: float = 0.
   far_ground_m: float = 0.
   boxes: frozenset = frozenset()  # (run index, box index) of its chain, to tell one car's two tracks apart
+  drive: int = 0      # its drive's index (Drives): its runs and boxes are that drive's alone
 
 
 @dataclass
@@ -165,11 +170,13 @@ def snapshot_detections(d) -> SimpleNamespace:
 
 
 class Drive:
-  """What the logs hold that the measure needs, fed one message at a time (LogReader order)."""
-  def __init__(self):
-    self.remote = None
-    self.device_type = ''
-    self.sensor = ''
+  """What one drive's logs hold that the measure needs, fed one message at a time (LogReader order): one stretch of
+  continuous log time (Drives), so one time base. prev: the drive before it, whose software and camera it starts with (an
+  initData or deviceState says otherwise), never its calibration."""
+  def __init__(self, prev: 'Drive | None' = None):
+    self.remote = prev.remote if prev is not None else None
+    self.device_type = prev.device_type if prev is not None else ''
+    self.sensor = prev.sensor if prev is not None else ''
     self.cal = None
     self.ego_t: list[float] = []
     self.ego_v: list[float] = []
@@ -179,6 +186,9 @@ class Drive:
     self.wide_runs = 0
     self.t0: float | None = None
     self.t1 = 0.
+    self.scene_t: float | None = None  # the last turnpilotScene's log time
+    self.epoch = 0                     # the tracker's: one more at an unavailable scene, or none for TRACK_GAP_S
+    self.tracks: dict[int, tuple] = {} # track id -> (its key, log time last seen, epoch then)
 
   def feed(self, msg) -> None:
     which = msg.which()
@@ -218,22 +228,59 @@ class Drive:
       if f.run.timestampEof > 0 and str(f.run.view) == 'far':
         self.runs.append(Run(f.run.timestampEof * 1e-9, t_log, 'far', snapshot_detections(f.run), self.cal, tuple(f.crop)))
     elif which == 'turnpilotScene':
-      if msg.turnpilotScene.available:
-        self.scene.append((t_log, [SimpleNamespace(trackId=int(o.trackId), cls=str(o.cls), x=float(o.x), y=float(o.y),
-                                                   vx=float(o.vx), vy=float(o.vy), age=int(o.age), camera=str(o.camera),
-                                                   view=str(o.view), box=tuple(o.box), tSeen=float(o.tSeen))
-                                   for o in msg.turnpilotScene.objects]))
+      sc = msg.turnpilotScene
+      if not sc.available or (self.scene_t is not None and t_log - self.scene_t > TRACK_GAP_S):
+        self.epoch += 1  # a scene that failed (turnpilotd starts a new tracker) or a turnpilotd that restarted
+      self.scene_t = t_log
+      if sc.available:
+        self.scene.append((t_log, [SimpleNamespace(trackId=int(o.trackId), key=self.track_key(int(o.trackId), t_log),
+                                                   cls=str(o.cls), x=float(o.x), y=float(o.y), vx=float(o.vx),
+                                                   vy=float(o.vy), age=int(o.age), camera=str(o.camera), view=str(o.view),
+                                                   box=tuple(o.box), tSeen=float(o.tSeen))
+                                   for o in sc.objects]))
+
+  def track_key(self, track_id: int, t_log: float) -> tuple:
+    """Which track this id is: another one after the tracker started again (epoch) or the id went unseen TRACK_GAP_S. One
+    car's track split in two is merged back by its boxes (merge), but two cars on one key would drop the second."""
+    seen = self.tracks.get(track_id)
+    key = seen[0] if seen is not None and seen[2] == self.epoch and t_log - seen[1] <= TRACK_GAP_S else \
+      (track_id, self.epoch, t_log)
+    self.tracks[track_id] = (key, t_log, self.epoch)
+    return key
 
   @property
   def sunnypilot(self) -> bool:
     return self.remote is not None and 'sunnypilot' in self.remote.lower()
 
+  @property
+  def empty(self) -> bool:
+    """Nothing to measure: no detector run and no scene."""
+    return not self.runs and not self.scene and not self.wide_runs and not self.far_status
+
+
+class Drives:
+  """Every file's messages in order, split into one Drive per stretch of continuous log time: another route (its own
+  turnpilotd, whose tracker numbers its tracks from 1 again) or another boot (logMonoTime starts over) is measured on its own
+  time base, so no car's chain runs through another drive's boxes and no track id is taken for another drive's."""
+  def __init__(self):
+    self.drives: list[Drive] = []
+    self.t_last: float | None = None
+
+  def feed(self, msg) -> None:
+    t = msg.logMonoTime * 1e-9
+    if self.t_last is None or t < self.t_last - LOG_JITTER_S or t > self.t_last + DRIVE_GAP_S:
+      self.drives.append(Drive(self.drives[-1] if self.drives else None))
+      self.t_last = t
+    self.t_last = max(self.t_last, t)
+    self.drives[-1].feed(msg)
+
 
 class Ego:
   """The car's own distance travelled, from carState.vEgo over log time."""
   def __init__(self, t, v):
-    self.t = np.asarray(t, dtype=np.float64)
-    v = np.asarray(v, dtype=np.float64)
+    order = np.argsort(np.asarray(t, dtype=np.float64), kind='stable')  # np.interp needs its times increasing
+    self.t = np.asarray(t, dtype=np.float64)[order]
+    v = np.asarray(v, dtype=np.float64)[order]
     self.s = np.concatenate([[0.], np.cumsum(np.diff(self.t) * (v[1:] + v[:-1]) / 2.)]) if len(self.t) else np.zeros(0)
 
   def between(self, a: float, b: float) -> float:
@@ -305,11 +352,11 @@ def seeds(drive: Drive) -> list:
   out, done = [], set()
   for t_log, objects in drive.scene:
     for o in objects:
-      if o.trackId in done or o.camera != 'road' or o.cls not in MOTOR_VEHICLES or not velocity_trusted(o):
+      if o.key in done or o.camera != 'road' or o.cls not in MOTOR_VEHICLES or not velocity_trusted(o):
         continue
       if SEED_MIN_M <= o.x <= SEED_MAX_M and ONCOMING_Y_NEAR_M <= o.y <= ONCOMING_Y_FAR_M and o.vx <= -ONCOMING_MIN_MPS and \
          abs(o.vy) <= abs(o.vx):
-        done.add(o.trackId)
+        done.add(o.key)
         out.append((o, t_log))
   return out
 
@@ -342,10 +389,8 @@ def merge(samples: list[Sample]) -> list[Sample]:
   for g in groups:
     road = min(g, key=lambda m: m.road_m)
     far = min(g, key=lambda m: m.far_m)
-    one = Sample(road.track_id, road.cls, min(m.t for m in g), road.speed, road.road_m, road.road_why, road.road_gap_s,
-                 road.road_ground_m, far.far_m, far.far_why, far.far_gap_s, far.far_ground_m,
-                 frozenset().union(*(m.boxes for m in g)))
-    out.append(one)
+    out.append(replace(road, t=min(m.t for m in g), far_m=far.far_m, far_why=far.far_why, far_gap_s=far.far_gap_s,
+                       far_ground_m=far.far_ground_m, boxes=frozenset().union(*(m.boxes for m in g))))
   return sorted(out, key=lambda s: s.t)
 
 
@@ -370,22 +415,24 @@ def ordinal(k: int) -> str:
   return {1: '', 2: 'second', 3: 'third'}.get(k, f"{k}th")
 
 
-def measure(drive: Drive, allow_misses: bool = False) -> Result:
+def refusal(drive: Drive) -> str:
+  """Why this drive's log can't be used, '' if it can."""
+  from openpilot.common.transformations.camera import DEVICE_CAMERAS
+  if drive.sunnypilot:
+    return f"a sunnypilot log ({drive.remote}): its own messages sit on turnpilotDetections' slot, so it is never read"
+  if drive.remote is None:
+    return "no initData: not a log this fork can be told from"
+  if (drive.device_type, drive.sensor) not in DEVICE_CAMERAS:
+    return f"no camera to range by (deviceType {drive.device_type or 'none'}, road sensor {drive.sensor or 'none'})"
+  if not drive.ego_t:
+    return "no carState: the car's own motion is unknown"
+  return ''
+
+
+def measure_drive(drive: Drive, index: int, facts: dict) -> list[Sample]:
+  """One drive's samples on its own time base (its runs, its carState, its tracks), its counts added to facts."""
   from openpilot.common.transformations.camera import DEVICE_CAMERAS
   from openpilot.selfdrive.turnpilot.scene.tracker import SceneTracker
-  res = Result(allow_misses=allow_misses)
-  res.facts = {'s': drive.t1 - (drive.t0 or drive.t1), 'wide': drive.wide_runs, 'far_status': dict(drive.far_status)}
-  if drive.sunnypilot:
-    res.refused = f"a sunnypilot log ({drive.remote}): its own messages sit on turnpilotDetections' slot, so it is never read"
-  elif drive.remote is None:
-    res.refused = "no initData: not a log this fork can be told from"
-  elif (drive.device_type, drive.sensor) not in DEVICE_CAMERAS:
-    res.refused = f"no camera to range by (deviceType {drive.device_type or 'none'}, road sensor {drive.sensor or 'none'})"
-  elif not drive.ego_t:
-    res.refused = "no carState: the car's own motion is unknown"
-  if res.refused:
-    res.road.why = res.far.why = res.refused
-    return res
   tracker = SceneTracker(DEVICE_CAMERAS[(drive.device_type, drive.sensor)], drive.device_type)
   runs = sorted(drive.runs, key=lambda r: r.t)
   for r in runs:
@@ -394,29 +441,56 @@ def measure(drive: Drive, allow_misses: bool = False) -> Result:
   times = [r.t for r in runs]
   full = [r for r in runs if r.view == 'full']
   far_runs = [r for r in runs if r.view == 'far']
-  res.facts.update(full=len(full), calibrated=sum(r.frame is not None for r in full), far=len(far_runs),
-                   far_calibrated=sum(r.frame is not None for r in far_runs))
+  for k, v in (('full', len(full)), ('calibrated', sum(r.frame is not None for r in full)), ('far', len(far_runs)),
+               ('far_calibrated', sum(r.frame is not None for r in far_runs))):
+    facts[k] = facts.get(k, 0) + v
   ego = Ego(drive.ego_t, drive.ego_v)
-  missing = 0
+  samples = []
   for o, t_log in seeds(drive):
     found = seed_box(runs, times, o)
     if found is None:
-      missing += 1
+      facts['seeds_without_box'] = facts.get('seeds_without_box', 0) + 1
       continue
-    s = Sample(o.trackId, o.cls, t_log - (drive.t0 or 0.), -o.vx)
+    s = Sample(o.trackId, o.cls, t_log - (drive.t0 or 0.), -o.vx, drive=index)
     (s.road_m, s.road_ground_m), s.road_why, s.road_gap_s, used = chain(runs, found, s.speed, ego, ('full',))
     (s.far_m, s.far_ground_m), s.far_why, s.far_gap_s, used_far = chain(runs, found, s.speed, ego, ('full', 'far'))
     s.boxes = frozenset(used | used_far)
-    res.samples.append(s)
-  res.facts['seeds_without_box'] = missing
-  res.samples = merge(res.samples)
+    samples.append(s)
+  return merge(samples)
+
+
+def measure(drives, allow_misses: bool = False) -> Result:
+  """The recommendation over these drives (a Drive, or Drives.drives): each measured on its own, their samples pooled. Any
+  drive refused (a sunnypilot log anywhere) refuses them all: a car of it unmeasured could be the shortest."""
+  drives = [drives] if isinstance(drives, Drive) else list(drives)
+  res = Result(allow_misses=allow_misses)
+  measured = [d for d in drives if not d.empty] or drives[:1]
+  far_status = sum((d.far_status for d in measured), Counter())
+  res.facts = {'s': sum(d.t1 - (d.t0 or d.t1) for d in measured), 'drives': len(measured),
+               'wide': sum(d.wide_runs for d in measured), 'far_status': dict(far_status), 'seeds_without_box': 0}
+  sunny = next((d for d in drives if d.sunnypilot), None)
+  if not drives:
+    res.refused = "no messages"
+  elif sunny is not None:
+    res.refused = refusal(sunny)
+  else:
+    for k, d in enumerate(measured):
+      if why := refusal(d):
+        res.refused = (f"drive {k + 1} of {len(measured)}: " if len(measured) > 1 else '') + why
+        break
+  if res.refused:
+    res.road.why = res.far.why = res.refused
+    return res
+  for k, d in enumerate(measured):
+    res.samples += measure_drive(d, k, res.facts)
+  res.samples.sort(key=lambda s: (s.drive, s.t))
   if res.facts['calibrated'] == 0:
     res.road.why = res.far.why = "no calibrated road run in the logs: nothing can be ranged"
     return res
   res.road = pick('TurnPilotLeftRangeM', [(s.road_m, s) for s in res.samples], allow_misses)
   far = Pick('TurnPilotLeftFarRangeM', n=len(res.samples))
-  if not far_runs:
-    reading = drive.far_status.get('read', 0)
+  if not res.facts['far']:
+    reading = far_status.get('read', 0)
     far.why = f"no turnpilotFarDetections in the logs, though the full pass's farStatus read on {reading} runs: the far runs were " + \
       "not logged, so nothing shows what the far crop boxed" if reading else \
       "far crop off: no turnpilotFarDetections in the logs, and the full pass's farStatus never read"
@@ -430,13 +504,14 @@ def measure(drive: Drive, allow_misses: bool = False) -> Result:
   return res
 
 
-def sample_line(s: Sample, far: bool = False) -> str:
+def sample_line(s: Sample, far: bool = False, drives: int = 1) -> str:
   m, why = (s.far_m, s.far_why) if far else (s.road_m, s.road_why)
-  return f"    t {s.t:7.1f} s  track {s.track_id} {s.cls} closing {s.speed:.0f} m/s: {m:.0f} m, " + \
+  where = f"drive {s.drive + 1} " if drives > 1 else ""
+  return f"    {where}t {s.t:7.1f} s  track {s.track_id} {s.cls} closing {s.speed:.0f} m/s: {m:.0f} m, " + \
     REASONS.get(why, why).format(gap=f"over {MAX_DROPOUT_S:.2f} s")
 
 
-def pick_lines(p: Pick, label: str, far: bool) -> list[str]:
+def pick_lines(p: Pick, label: str, far: bool, drives: int = 1) -> list[str]:
   out = [f"{label}: {p.n} oncoming cars"]
   if p.range_m is None:
     out.append(f"  no {p.key}: {p.why}")
@@ -451,7 +526,7 @@ def pick_lines(p: Pick, label: str, far: bool) -> list[str]:
              f"{supported_mph(p.range_m)} mph ({supported_mph(p.range_m, 1)} mph with one opposing lane mapped)")
   if p.misses:
     out.append(f"  short of it (--allow-misses): {len(p.misses)}")
-    out += [sample_line(s, far) for s in p.misses]
+    out += [sample_line(s, far, drives) for s in p.misses]
   return out
 
 
@@ -459,7 +534,9 @@ def render(res: Result) -> list[str]:
   f = res.facts
   if res.refused:
     return [f"left_range: refused: {res.refused}", "no recommendation"]
-  out = [f"left_range: {f.get('s', 0.):.0f} s of log; road camera full-pass runs {f.get('full', 0)} " +
+  drives = f.get('drives', 1)
+  each = f" in {drives} drives, each on its own time base (a route, or a boot)" if drives > 1 else ""
+  out = [f"left_range: {f.get('s', 0.):.0f} s of log{each}; road camera full-pass runs {f.get('full', 0)} " +
          f"({f.get('calibrated', 0)} calibrated), wide camera runs {f.get('wide', 0)}, far crop runs {f.get('far', 0)} " +
          f"({f.get('far_calibrated', 0)} calibrated)",
          f"oncoming cars sampled: {len(res.samples)} (tracks {SEED_MIN_M:.0f}-{SEED_MAX_M:.0f} m ahead in the oncoming lanes, " +
@@ -473,13 +550,13 @@ def render(res: Result) -> list[str]:
     out.append(f"  (those boxes' own ground range, not used: median {np.median([s.road_ground_m for s in res.samples]):.0f} m; " +
                f"near_m takes the box bottom {NEAR_PX:.0f} px lower, as the left's gap rule does)")
     out.append("  the shortest five:")
-    out += [sample_line(s) for s in sorted(res.samples, key=lambda s: s.road_m)[:5]]
+    out += [sample_line(s, drives=drives) for s in sorted(res.samples, key=lambda s: s.road_m)[:5]]
     if f.get('far'):
       far = sorted(s.far_m for s in res.samples)
       out.append(f"  confirmed range with the far crop too, near_m: shortest {far[0]:.0f} m, median {np.median(far):.0f} m, " +
                  f"longest {far[-1]:.0f} m")
-  out += pick_lines(res.road, "road camera", False)
-  out += pick_lines(res.far, "far crop", True)
+  out += pick_lines(res.road, "road camera", False, drives)
+  out += pick_lines(res.far, "far crop", True, drives)
   if res.road.range_m is not None:
     sets = [f"--set {res.road.key}={res.road.range_m}"]
     if res.far.range_m is not None:
@@ -509,11 +586,11 @@ def main(argv=None) -> int:
   if not paths:
     print("left_range: no rlog in " + ' '.join(args.route), file=sys.stderr)
     return 1
-  drive = Drive()
+  drives = Drives()
   for p in paths:
     for msg in LogReader(str(Path(p)), only_union_types=True):
-      drive.feed(msg)
-  res = measure(drive, args.allow_misses)
+      drives.feed(msg)
+  res = measure(drives.drives, args.allow_misses)
   print('\n'.join(render(res)))
   if res.refused:
     return 1
