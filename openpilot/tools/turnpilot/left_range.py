@@ -11,8 +11,13 @@ the go. A left is attempted only where R_req fits under TurnPilotLeftRangeM (tur
 past it under TurnPilotLeftFarRangeM while the far crop reads, whose boxes in the band block at any range. So the range is
 safe only if an oncoming car inside it is boxed on the road runs, with no stretch of them long enough for the window to
 fill: CRITIQUE REQUIRED 2 sets the window at least 3x the longest dropout at R_req, so a car is confirmed from the
-farthest near_m from which it never went MAX_DROPOUT_S (CLEAR_WINDOW_S / 3) without a box. R_req's own margins (the opposing
-road's limit x SPEED_MARGIN 1.3, PET_S, the lanes) are route time's, and this measures only the eyes.
+farthest near_m from which it never went MAX_DROPOUT_S (CLEAR_WINDOW_S / 3) without a box at the left. The drive is not the
+left: its full pass is on the road camera every run and the car closes at the oncoming car's speed plus its own, while held
+at the line the left's road runs are 2 in WIDE_EVERY (roadAndWide) and the car closes at its own speed alone. So a gap on
+the drive counts as the longer of the two it would be there (left_gap_s): the same missed runs LEFT_SCHEDULE x as long, the
+same stretch of road at the car's speed. The far crop's runs aren't thinned at the left, but its chain takes the same
+(the safe side). R_req's own margins (the opposing road's limit x SPEED_MARGIN 1.3, PET_S, the lanes) are route time's,
+and this measures only the eyes.
 
 How. Every oncoming car the drive saw near is a sample: a turnpilotScene vehicle track (car, truck, bus, motorcycle) on the
 road camera, velocity-trusted (scene_policy.velocity_trusted), SEED_MIN_M..SEED_MAX_M ahead in the oncoming lanes
@@ -24,8 +29,8 @@ the band (band_blockers) where the car would have been. Its range comes from the
 the car's own, carState.vEgo), never re-centred on a hit, so the box of anything closing at another rate (a parked car, a
 lead) drifts out of the gate, within the tracker's ground gate grown SPEED_ERR_MPS a second back from the seed, and the
 same from its last box (the range rate since it); its bearing within BEARING_GATE_DEG of its last box's lateral offset.
-Its confirmed range is the farthest near_m of that chain, which ends at MAX_DROPOUT_S without its
-box: unboxed (runs went on, none boxed it: the detector's reach, or the car wasn't there yet), noRuns (no road run: the full
+Its confirmed range is the farthest near_m of that chain, which ends at what would be MAX_DROPOUT_S without its box at
+the left: unboxed (runs went on, none boxed it: the detector's reach, or the car wasn't there yet), noRuns (no road run: the full
 pass on the wide camera, the detector stopped) or uncalibrated (the runs can't be ranged), all of them no range: unknown is
 never a clear road. A run with any other band box inside AMBIGUOUS_GATE x those gates, or its one box there but outside
 them, ends it too (ambiguous): something else could be taken for it there (a car close ahead or behind, one parked by the
@@ -56,13 +61,15 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from openpilot.selfdrive.turnpilot.detector.modeld_detector import WIDE_EVERY
 from openpilot.selfdrive.turnpilot.route_follower import LEFT
 from openpilot.selfdrive.turnpilot.scene.tracker import GROUND_GATE_FRAC, GROUND_GATE_M, NEAR_PX, iou, is_calibrated
 from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_Y_FAR_M, ONCOMING_Y_NEAR_M, velocity_trusted
 from openpilot.selfdrive.turnpilot.turnpilotd import LEFT_RANGE_MAX_M
 from openpilot.selfdrive.turnpilot.unprotected_left import CLEAR_WINDOW_S, ROUTE_REACH_MARGIN_M, band_blockers, reach_at_line
 
-MAX_DROPOUT_S = CLEAR_WINDOW_S / 3.  # CRITIQUE REQUIRED 2: the window at least 3x the longest dropout
+MAX_DROPOUT_S = CLEAR_WINDOW_S / 3.  # CRITIQUE REQUIRED 2: the window at least 3x the longest dropout, at the left
+LEFT_SCHEDULE = WIDE_EVERY / (WIDE_EVERY - 1)  # held at its line (roadAndWide) the full pass is on the road camera 2 runs in 3
 COVERAGE, CONFIDENCE = 0.95, 0.95    # DESIGN section 6: the range where recall is 95%; at 95% confidence
 MIN_VEHICLES = 59                    # the fewest for which the shortest is that bound (1 - 0.95^n >= 0.95)
 ROUND_M = 10.                        # recommended ranges round down to this
@@ -287,6 +294,14 @@ class Ego:
     return float(np.interp(b, self.t, self.s) - np.interp(a, self.t, self.s))
 
 
+def left_gap_s(back: float, ego_m: float, speed: float) -> float:
+  """How long a gap of back s with no box of the car on the drive would be at the left, held at its line: the longer of the
+  same missed road runs at its schedule (roadAndWide: the full pass on the road camera WIDE_EVERY - 1 runs in WIDE_EVERY, so
+  LEFT_SCHEDULE x as long; the drive's are all on it) and the same stretch of road at the car's own speed (the drive closed
+  it at speed and the car's own, ego_m more; the car waiting at its line doesn't move)."""
+  return max(back * LEFT_SCHEDULE, (speed * back + max(ego_m, 0.)) / speed)
+
+
 def in_band(boxes) -> list:
   """The left's own band test on a straight approach (heading 0, its maneuver point at the car, reach unlimited)."""
   return band_blockers(boxes, 0., LEFT, math.inf, 0.)
@@ -311,7 +326,7 @@ def chain(runs: list[Run], seed: tuple, speed: float, ego: Ego, views: tuple) ->
     back = last_t - r.t
     if back <= 0.:
       continue
-    if back > MAX_DROPOUT_S + 1e-6:
+    if left_gap_s(back, ego.between(r.t_log, last_log), speed) > MAX_DROPOUT_S + 1e-6:
       why = 'unboxed' if seen_calibrated else 'uncalibrated' if seen_uncalibrated else 'noRuns'
       return (far_box.near_m, math.hypot(*far_box.xy)), why, back, used
     if r.frame is None:
@@ -508,7 +523,7 @@ def sample_line(s: Sample, far: bool = False, drives: int = 1) -> str:
   m, why = (s.far_m, s.far_why) if far else (s.road_m, s.road_why)
   where = f"drive {s.drive + 1} " if drives > 1 else ""
   return f"    {where}t {s.t:7.1f} s  track {s.track_id} {s.cls} closing {s.speed:.0f} m/s: {m:.0f} m, " + \
-    REASONS.get(why, why).format(gap=f"over {MAX_DROPOUT_S:.2f} s")
+    REASONS.get(why, why).format(gap=f"what would be over {MAX_DROPOUT_S:.2f} s at the left")
 
 
 def pick_lines(p: Pick, label: str, far: bool, drives: int = 1) -> list[str]:
@@ -520,7 +535,8 @@ def pick_lines(p: Pick, label: str, far: bool, drives: int = 1) -> list[str]:
   passes = "the full pass or the far crop" if far else "the road camera's full pass"
   out.append(f"  recommend {p.key} {p.range_m} m: {rule}, {p.stat_m:.1f} m rounded down to {ROUND_M:.0f} m. A one-sided " +
              f"{CONFIDENCE:.0%} lower bound on the 5th percentile (Wilks): at {CONFIDENCE:.0%} confidence {COVERAGE:.0%} of oncoming " +
-             f"cars are boxed by {passes} from there in, never {MAX_DROPOUT_S:.2f} s (CLEAR_WINDOW_S / 3) without a box")
+             f"cars are boxed by {passes} from there in, never {MAX_DROPOUT_S:.2f} s (CLEAR_WINDOW_S / 3) without a box " +
+             "at the left (its road runs 2 in 3, the car closing at its own speed)")
   reading = " with the far crop reading" if far else ""
   out.append(f"  a left with no mapped stop line is attempted{reading} up to a mapped opposing limit of " +
              f"{supported_mph(p.range_m)} mph ({supported_mph(p.range_m, 1)} mph with one opposing lane mapped)")
