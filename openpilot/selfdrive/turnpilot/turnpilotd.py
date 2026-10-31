@@ -181,7 +181,7 @@ from openpilot.selfdrive.turnpilot.car_signals import (TurnSignalIntent, TurnSig
 from openpilot.selfdrive.turnpilot.lane_planner import (SAMPLE_IDX, LanePlanner, Phase, keep_blocker, lane_change_window,
                                                         lane_mismatch, model_lanes_from_msg)
 from openpilot.selfdrive.turnpilot.route_follower import (KEEP, LEFT, RIGHT, SAME_TURN_M, TURN, UNCERTAIN_M, Maneuver, RouteFollower,
-                                                           same_junction)
+                                                           same_junction, turn_angle)
 from openpilot.selfdrive.turnpilot.route_notice import RouteNotices
 from openpilot.selfdrive.turnpilot.scene.lane_paint import lane_paint_from_msg
 from openpilot.selfdrive.turnpilot.scene.tracker import (MAX_COAST_S, STALE_S, SWEEP_COAST_S, RawFrame, SceneTracker, default_yaw_rate,
@@ -353,6 +353,21 @@ WRONG_SIDE_BEYOND_M = 1.
 WRONG_SIDE_EDGE_STD_MAX = 2.  # an edge the model sees at all (the demo route's right edge 0.7-0.8; none there reads 20-60)
 WRONG_SIDE_GAP_S = 1.  # no read this long and the count starts over
 WRONG_SIDE_REASON = "Wrong side of the road: take control"
+# an off-route turn is a mess-up said loudly (SAT_VALIDATION row 1, route_demo: the route went straight on, TurnPilot sent no
+# desire, and the model turned right on its own, 6.6 m into the oncoming lane with every paint read unknown, into a roadside
+# object; the follower dead-reckons, so the turn read as on route). Engaged, moving, with a route: the car's heading changing
+# OFF_ROUTE_TURN_DEG or more within OFF_ROUTE_TURN_M of travel, none of that travel within OFF_ROUTE_NEAR_M of a route maneuver
+# (ahead or just passed) or with a turn desire of TurnPilot's out, is handed back (offRouteTakeControl, OFF_ROUTE_TURN_REASON)
+# until the driver takes over: no braking, no steering. A bend the route itself makes that way in the step (the last
+# maneuver's bearing out to the next one's bearing in, OFF_ROUTE_BEND_MARGIN_DEG short of the threshold) explains it: no
+# handback. On 110 real Tesla and comma four segments (68.9 km, every heading event of OFF_ROUTE_TURN_DEG taken as its route's
+# maneuver) and 286 BeamNG logs with their routes (the gate's and the validation's turns) it fired on none; on row 1 it fires
+# 3.7 s after the pull-away, about 2.3 s before the car was on the wrong side
+OFF_ROUTE_TURN_DEG = 35.
+OFF_ROUTE_TURN_M = 30.
+OFF_ROUTE_NEAR_M = 40.
+OFF_ROUTE_BEND_MARGIN_DEG = 10.
+OFF_ROUTE_TURN_REASON = "Off route: take control"
 LEAD_CORROBORATE_M = 3.
 LEAD_BEARING_TOL_DEG = 3.
 LEAD_SEEN_HOLD_S = 1.
@@ -771,6 +786,10 @@ class TurnPilot:
     self.wrong_s = 0.              # s of reads of a yellow line on the car's right (wrong_side)
     self.wrong_unread_s = 0.       # ...since the last read of that line
     self.wrong_side_on = False     # ...handed back for it, until the driver takes over
+    self.or_win: list = []         # (odometer, deg) of the car's heading change off the route's maneuvers (off_route_turn)
+    self.or_near_odo = -1e9        # odometer where a route maneuver or a turn desire last was near
+    self.or_id, self.or_after, self.or_prev_after = None, None, None  # the maneuver, its bearing out, the last one's
+    self.or_on = False             # handed back for an off-route turn, until the driver takes over
     self.abandoned_id: int | None = None  # ...the maneuver handed back for it, until the driver takes over
     self.straight: StraightDrive | None = None  # R8b's watch over a committed turn driven straight (watch_straight)
     self.straight_cleared = False  # ...R8b's fire cleared the turn's desire this frame (CLEAR_DESIRE in this very plan)
@@ -1462,6 +1481,7 @@ class TurnPilot:
     if self.straight_cleared:  # R8b's fire: the turn's desire out of the model's queue from this very plan on
       plan.desire = self.last_desire = CLEAR_DESIRE
     wrong_side = self.wrong_side(sm, cs, v_ego, acting, paint, right_hand_traffic)
+    off_route = self.off_route_turn(sm, cs, v_ego, acting, rf, upcoming, default_yaw_rate(cs, model))
     if withdrawn or self.cant_start_unheld:  # the switch's has no hold: the model drives on under it (no_move)
       plan.controlPrompt, plan.reason = 'cantStartTakeControl', NO_MOVE_REASON
     elif ped_handed:  # the crosswalk hold's standoff (SC-02): held, take control
@@ -1470,6 +1490,8 @@ class TurnPilot:
       plan.controlPrompt, plan.reason = 'turnAbandonedTakeControl', TURN_ABANDONED_REASON
     elif wrong_side:
       plan.controlPrompt, plan.reason = 'wrongSideTakeControl', WRONG_SIDE_REASON
+    elif off_route:
+      plan.controlPrompt, plan.reason = 'offRouteTakeControl', OFF_ROUTE_TURN_REASON
     elif stalled:
       plan.controlPrompt, plan.reason = 'stalledTakeControl', STALLED_REASON
     elif stopped in (STOPPED_NOTE, LIGHT_WAIT_NOTE):
@@ -2772,6 +2794,40 @@ class TurnPilot:
     i = 3 if paint[2].kind == 'none' else 2
     cloudlog.event("turnpilot.wrong_side", error=True, v=round(v_ego, 2), line=i, paint=[[str(q.kind), str(q.color), round(q.confidence, 2)] for q in paint],
                    line_y=round(geom[0][i], 2), edge_y=round(geom[2][1], 2), edge_std=round(geom[3][1], 2))
+    return True
+
+  def off_route_turn(self, sm, cs, v_ego: float, acting: bool, rf, upcoming, yaw_rate: float) -> bool:
+    """The car turning off its route with no desire of TurnPilot's (OFF_ROUTE_*): handed back from the frame its heading has
+    changed OFF_ROUTE_TURN_DEG within OFF_ROUTE_TURN_M of travel away from any route maneuver, held until the driver takes over
+    (openpilot disengaged). Nothing here steers or brakes."""
+    enabled = sm['carControl'].enabled
+    if self.or_on:
+      self.or_on = enabled
+      return self.or_on
+    if rf.maneuver_id != self.or_id:
+      self.or_id, self.or_prev_after = rf.maneuver_id, self.or_after
+    bearings = upcoming.bearings if upcoming is not None and upcoming.geometry and len(upcoming.bearings) == 2 else None
+    self.or_after = bearings[1] if bearings is not None else None
+    d = self.desires
+    desire_out = (d.started and not d.done and d.side != 0) or self.last_desire in (Desire.turnLeft, Desire.turnRight)
+    if upcoming is None or abs(rf.distance) <= OFF_ROUTE_NEAR_M or desire_out:
+      self.or_near_odo = self.odo_m
+    if not (acting and enabled and upcoming is not None and not cs.gasPressed) or self.odo_m - self.or_near_odo <= OFF_ROUTE_NEAR_M:
+      self.or_win = []
+      return False
+    if v_ego >= YAW_MIN_SPEED:
+      self.or_win.append((self.odo_m, math.degrees(yaw_rate * DT_MDL)))
+      while self.or_win and self.or_win[0][0] < self.odo_m - OFF_ROUTE_TURN_M:
+        self.or_win.pop(0)
+    right = -sum(y for _, y in self.or_win)  # deg, + right (the bearings' sense)
+    if abs(right) < OFF_ROUTE_TURN_DEG - 1e-6:
+      return False
+    bend = turn_angle(self.or_prev_after, bearings[0]) if bearings is not None and self.or_prev_after is not None else 0.
+    if bend * right > 0. and abs(bend) >= OFF_ROUTE_TURN_DEG - OFF_ROUTE_BEND_MARGIN_DEG:
+      return False  # the route bends that way in this step
+    self.or_on, self.or_win = True, []
+    cloudlog.event("turnpilot.off_route_turn", error=True, v=round(v_ego, 2), turned_deg=round(right, 1), bend_deg=round(bend, 1),
+                   distance=round(rf.distance, 1), maneuver_id=rf.maneuver_id)
     return True
 
   def watch_lead(self, model, objects, raw) -> None:

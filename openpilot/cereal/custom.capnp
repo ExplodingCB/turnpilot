@@ -192,6 +192,9 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     # ALWAYS_DRIVE.md SC-02: the right-turn crosswalk hold standing STAND_UNDECIDED_S on walkers who all stand (turnpilotd.py:
     # crosswalk_standoff): "Pedestrian waiting: take control", the car held, never a go past them
     pedestrianWaitingTakeControl @20;
+    # SAT_VALIDATION row 1: the car's heading turning OFF_ROUTE_TURN_DEG within OFF_ROUTE_TURN_M away from any route maneuver,
+    # no turn desire out (turnpilotd.py: off_route_turn): the model turned off the route, take control; no hold, no steering
+    offRouteTakeControl @21;
   }
   enum ControlAlert {
     none @0;
