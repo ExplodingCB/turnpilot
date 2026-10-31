@@ -539,7 +539,7 @@ def test_vision_a_car_coming_after_the_commit_aborts_in_the_band_and_past_the_in
   # braked for. test_stop_go's V8 test passes on either outcome, so the band abort turned off under vision (mutant M39) passed
   w = vdrive(tmp_path, mph, lag_s=0.2)
   out, k = [], None
-  for _ in range(round(16. / DT_MDL)):
+  for _ in range(round(24. / DT_MDL)):
     d = w.step()
     out.append(d)
     if k is None and d.state == stage:
@@ -552,9 +552,15 @@ def test_vision_a_car_coming_after_the_commit_aborts_in_the_band_and_past_the_in
   if stage == 'committed':
     assert aborts and not said, [(d.state, d.withdraw, d.alert) for d in after[:5]]
     assert all(s.accel_cap >= -2. - 1e-9 for d in after for s in d.stops) and any(d.stops for d in after)
-    # at rest short of the band's midpoint, never in the cross lane: un-committed there, looking again
-    assert max(d.position_m for d in after) <= sr.band_midpoint(w.sg.edges) - sr.M_EDGE + 1e-6
-    assert any(d.state == 'observe' for d in after) and not any(d.state in ('inLane', 'done') for d in after)
+    # at rest short of the band's midpoint, never in the cross lane while the car comes
+    ab = next(i for i, d in enumerate(after) if d.withdraw == 'bandAbort')
+    rest = next(i for i in range(ab, len(after)) if w.cmds[k + i][1] < sg.STAND_V)
+    on = next((i for i in range(rest, len(after)) if after[i].position_m > after[rest].position_m + 0.2), len(after))
+    assert max(d.position_m for d in after[:on]) <= sr.band_midpoint(w.sg.edges) - sr.M_EDGE + 1e-6
+    # then (the re-run's R2) that stand is the stall's, never V26's un-commit to a go with no GO_ROOM_M from there (H5): held
+    # while the car comes, across once it has gone by, never a handback
+    assert not any(d.state == 'observe' for d in after) and not any(d.fault for d in after)
+    assert on < len(after) and any(d.state == 'done' for d in after[on:])
   else:
     assert said and not aborts and not any(d.withdraw for d in after)
     assert all(not d.stops for d in after) and any(d.state == 'done' for d in after)
