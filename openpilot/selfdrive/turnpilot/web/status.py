@@ -1,12 +1,16 @@
 """Status for the phone: a thread reads cereal into a plain snapshot, and handlers format the latest one."""
+import statistics
 import threading
 import time
+from collections import deque
 
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.navigation.helpers import latest_gps_source
 from openpilot.selfdrive.turnpilot.control_text import DECIDER_ACTIONS, hold_text, is_map_reason
 
-SERVICES = ["deviceState", "navInstruction", "turnpilotPlan", "gpsLocation", "gpsLocationExternal"]
+SERVICES = ["deviceState", "navInstruction", "turnpilotPlan", "gpsLocation", "gpsLocationExternal",
+            "modelV2", "turnpilotDetections", "turnpilotFarDetections"]  # the last three for the diagnostics' model and step times
+TIME_SAMPLES = 20  # snapshots each step time's median is over (10 s at SNAPSHOT_PERIOD)
 SNAPSHOT_PERIOD = 0.5  # s between snapshots; the page polls every 2 s, so 2 Hz is plenty
 SERVICE_TIMEOUT = 3.  # s since a service last published before it counts as not running
 STALE_AFTER = 5.  # s without a new snapshot means the reader thread is stuck or dead
@@ -20,10 +24,15 @@ MANEUVER_NAMES = {"new name": "continue", "end of road": "turn", "on ramp": "tak
                   "rotary": "roundabout", "roundabout turn": "roundabout"}
 
 
+def service_up(sm, s) -> bool:
+  """SubMaster's own alive is 10 periods, which is half a second for turnpilotPlan; the phone only needs a few seconds."""
+  return bool(sm.seen[s]) and time.monotonic() - sm.recv_time[s] < SERVICE_TIMEOUT
+
+
 def read_services(sm) -> dict:
   """Plain values out of a SubMaster. Nothing else in the web app touches cereal."""
-  def up(s):  # SubMaster's own alive is 10 periods, which is half a second for turnpilotPlan; the phone only needs a few seconds
-    return sm.seen[s] and time.monotonic() - sm.recv_time[s] < SERVICE_TIMEOUT
+  def up(s):
+    return service_up(sm, s)
 
   # navd sends navInstruction with valid=False when it has no route, and turnpilotd doesn't set valid at all
   ni, plan = sm["navInstruction"], sm["turnpilotPlan"]
@@ -37,10 +46,30 @@ def read_services(sm) -> dict:
     "onroad": bool(up("deviceState") and sm["deviceState"].started),
     "route": route,
     "plan": {"state": str(plan.state), "reason": plan.reason, "shadow": plan.shadow,
+             "prompt": str(plan.controlPrompt), "alert": str(plan.controlAlert), "missed": plan.turnMissed,  # the diagnostics' events
              "map": {"kind": str(plan.mapControl.kind), "action": str(plan.mapControl.action), "light": str(plan.mapControl.lightState),
                      "source": str(plan.mapControl.lightSource), "status": str(plan.mapControl.controlsStatus)}}
             if up("turnpilotPlan") else None,
     "gps": (sm[source].latitude, sm[source].longitude) if source else None,
+  }
+
+
+def read_live(sm, samples: dict[str, deque]) -> dict:
+  """The driving model and the detector as they run now, for the diagnostics: modelV2.big (the big model on the chestnut),
+  nativeStatus and farStatus, and each step time's median over the last TIME_SAMPLES snapshots that brought a new message."""
+  for s, key, read in (("modelV2", "model_s", lambda m: m.modelExecutionTime), ("turnpilotDetections", "full_s", lambda m: m.executionTime),
+                       ("turnpilotFarDetections", "far_s", lambda m: m.run.executionTime)):
+    if sm.updated[s]:
+      samples.setdefault(key, deque(maxlen=TIME_SAMPLES)).append(float(read(sm[s])))
+    elif not service_up(sm, s):
+      samples.pop(key, None)  # stopped: no stale times
+  td = sm["turnpilotDetections"] if service_up(sm, "turnpilotDetections") else None
+  return {
+    "model_big": bool(sm["modelV2"].big) if service_up(sm, "modelV2") else None,
+    "native": str(td.nativeStatus) if td is not None else None,
+    "far": str(td.farStatus) if td is not None else None,
+    **{key: statistics.median(v) for key, v in samples.items() if v},
+    "samples": len(samples.get("model_s", ())),
   }
 
 
@@ -121,11 +150,14 @@ def format_status(snap: dict | None, destination, enabled: bool, metric: bool, n
 
 
 class StatusReader(threading.Thread):
-  def __init__(self):
+  """events: the diagnostics' EventLog, fed each snapshot's plan and every errorLogMessage."""
+  def __init__(self, events=None):
     super().__init__(name="status", daemon=True)
     self.lock = threading.Lock()
     self.snapshot = None
     self.stopped = threading.Event()
+    self.events = events
+    self.samples: dict[str, deque] = {}
 
   def stop(self):
     self.stopped.set()
@@ -135,17 +167,23 @@ class StatusReader(threading.Thread):
       return self.snapshot
 
   def run(self):
-    sm, logged = None, False
+    sm, errors, logged = None, None, False
     while not self.stopped.is_set():
       try:
         if sm is None:
           # imported here so a missing messaging build leaves the search and destination working
           from openpilot.cereal import messaging
           sm = messaging.SubMaster(SERVICES)
+          errors = messaging.sub_sock("errorLogMessage", conflate=False) if self.events is not None else None
         sm.update(0)  # the sockets conflate, so this takes the newest message of each service
         snap = read_services(sm)
+        snap["live"] = read_live(sm, self.samples)
         with self.lock:
           self.snapshot = snap
+        if self.events is not None:
+          self.events.see_plan(snap["plan"])
+          for msg in messaging.drain_sock(errors):
+            self.events.see_log(msg.errorLogMessage)
       except Exception:
         if not logged:
           cloudlog.exception("turnpilot_web.status_failed")

@@ -6,6 +6,7 @@ from openpilot.selfdrive.turnpilot.web.pairing import pairing_url
 from openpilot.selfdrive.turnpilot.web.store import last_gps_position
 from openpilot.selfdrive.ui.lib.turnpilot import mapped_area_text
 from openpilot.selfdrive.turnpilot import setup_state as ss
+from openpilot.selfdrive.turnpilot.diagnostics import agnos_version, settings_line
 from openpilot.selfdrive.ui.mici.widgets.button import BigButton, BigParamControl, BigToggle, GreyBigButton
 from openpilot.selfdrive.ui.mici.widgets.qr import QR
 from openpilot.selfdrive.ui.ui_state import ui_state
@@ -122,13 +123,14 @@ class TurnPilotSettingsLayout(NavScroller):
                                 description="Go through TurnPilot setup again: the phone, the map key and the map engine.")
     self._setup_btn.set_click_callback(self._on_setup)
     self._update_card = GreyBigButton("updates", ss.UPDATE_LINE)
+    self._diag_card = GreyBigButton("diagnostics", settings_line(ui_state.params, agnos_version()))  # the phone page's report
     self._last_refresh = -1e9
 
     toggles = [t for _, t in self._toggles]
     for item in (*toggles, self._stop_sign):
       item.set_enabled(lambda: not ui_state.engaged)
     self._scroller.add_widgets([self._pair_btn, toggles[0], toggles[1], self._stop_sign, toggles[2], self._engine_btn, self._setup_btn,
-                                self._update_card])
+                                self._update_card, self._diag_card])
 
   def show_event(self):
     super().show_event()

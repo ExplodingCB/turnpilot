@@ -21,6 +21,7 @@ from pathlib import Path
 from openpilot.common.hardware import PC
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.turnpilot import diagnostics
 from openpilot.selfdrive.turnpilot.car_signals import MODES as CAR_SIGNAL_MODES, read_mode
 from openpilot.selfdrive.turnpilot.maps import coverage as coverage_cache
 from openpilot.selfdrive.turnpilot.maps.client import MapError, cert_fingerprint, check_cert, check_key, missing_config, normalize_host
@@ -33,7 +34,7 @@ from openpilot.selfdrive.turnpilot.setup_state import PHONE_SEEN
 from openpilot.selfdrive.turnpilot.valhalla_install import SetupThread
 from openpilot.selfdrive.turnpilot.web import places
 from openpilot.selfdrive.turnpilot.web.pairing import PORT, icon_png, pairing_url, qr_svg
-from openpilot.selfdrive.turnpilot.web.status import StatusReader, format_status
+from openpilot.selfdrive.turnpilot.web.status import STALE_AFTER, StatusReader, format_status
 from openpilot.selfdrive.turnpilot.web.store import Store, ensure_token, valid_latlon
 
 INDEX = Path(__file__).with_name("index.html")
@@ -64,10 +65,12 @@ def number(value):
 
 
 class App:
-  """What the handlers share. search and resolve can be swapped for tests."""
-  def __init__(self, params, reader=None, search=places.search, resolve=places.resolve_apple_maps, maps_dir=None, refresh=None):
+  """What the handlers share. search, resolve and preflight can be swapped for tests."""
+  def __init__(self, params, reader=None, search=places.search, resolve=places.resolve_apple_maps, maps_dir=None, refresh=None,
+               preflight=None):
     self.store = Store(params)
     self.reader = reader
+    self.preflight = preflight or diagnostics.Preflight()
     self.search = search
     self.resolve = resolve
     self.maps_dir = maps_dir
@@ -104,6 +107,16 @@ class App:
     status = format_status(snap, self.store.destination(), self.store.flag("TurnPilotEnabled"), self.store.flag("IsMetric"))
     status["map"] = self.map_status(status["gps"], status["onroad"])
     return status
+
+  def diagnostics(self) -> dict:
+    """The diagnostics report as plain text (diagnostics.py): never the map key, the token or a position."""
+    snap = self.reader.get() if self.reader else None
+    live = snap.get("live") if snap and time.monotonic() - snap["at"] < STALE_AFTER else None
+    events = self.reader.events.get() if self.reader is not None and getattr(self.reader, "events", None) is not None else []
+    preflight = self.preflight.get()
+    with self.store.lock:
+      text = diagnostics.report(self.store.params, live, events, preflight, diagnostics.agnos_version())
+    return {"text": text}
 
   # TurnPilot's mapped area (the geofence) and its map server
 
@@ -377,6 +390,8 @@ class Handler(BaseHTTPRequestHandler):
       return app.map_settings()
     if method == "POST" and path == "/api/map":
       return {"ok": True, **app.set_map_settings(self.body())}
+    if method == "GET" and path == "/api/diagnostics":
+      return app.diagnostics()
     if method == "GET" and path == "/api/car-signals":
       return app.car_signals()
     if method == "POST" and path == "/api/car-signals":
@@ -461,7 +476,7 @@ def main():
   ensure_map_defaults(params)  # the shipped map server's address and certificate: the phone only adds the key
   if not PC:  # the map engine installs itself on the comma; a PC has its own (or the sim's local tiles)
     SetupThread(params).start()
-  reader = StatusReader()
+  reader = StatusReader(diagnostics.EventLog(params))  # the diagnostics' recent events, from every plan and logged error
   reader.start()
   refresher = CoverageRefresher(params)  # keeps TurnPilot's mapped area fresh while the comma is online
   refresher.start()

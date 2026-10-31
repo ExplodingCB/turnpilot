@@ -394,6 +394,8 @@ A comma installed with the Mac script ("Install from the Mac") has `DisableUpdat
 
 ## When something fails
 
+To send Kellen what the comma knows, open the phone page, tap **Diagnostics**, wait for it to collect (up to a minute), tap **Copy** and paste it into a text. It holds the build, the AGNOS version, the driving model and detector as they run, preflight's lines and TurnPilot's last handbacks, faults and errors, and never the map key, the pairing token or where the car is. **Settings > TurnPilot > diagnostics** shows the build and AGNOS version on the comma.
+
 | What you see | What it means |
 | --- | --- |
 | The alpha longitudinal toggle is missing | The comma hasn't identified the car yet, or the branch is a release branch. See the `car` and `non-release branch` lines |

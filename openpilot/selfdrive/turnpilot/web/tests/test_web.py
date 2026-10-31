@@ -1086,3 +1086,66 @@ class TestCarSignalsPage(WebTestCase):
     assert '$("csdrive").hidden = !devMode ||' in script  # the guided setup runs the check in Park only
     assert 'get("dev") === "1"' in script
     assert '$("carsignals").open = true' in script and "loadCarSignals().catch" in script
+
+
+class TestDiagnostics(WebTestCase):
+  """/api/diagnostics: the report Chase copies for Kellen (turnpilot/diagnostics.py), from the live reader and preflight."""
+  KEY = "tpk_live_7f3a9c2e5b1d8046"
+
+  def prepare(self):
+    from openpilot.selfdrive.turnpilot import diagnostics
+    self.diagnostics = diagnostics
+    self.params.put("GitCommit", "691321d4c0ffee5e1f2a3b4c5d6e7f8091a2b3c4")
+    self.params.put("TurnPilotMapKey", self.KEY)
+    url = f"http://192.168.43.2:8088/?t={self.token}"
+    self.app.preflight = diagnostics.Preflight(lambda: ["PASS  car          tesla TESLA_MODEL_3", f"PASS  pairing URL  {url}",
+                                                        "PASS  web server   answering on port 8088"])
+
+  def test_needs_the_token_and_never_says_a_secret(self):
+    self.prepare()
+    assert self.call("GET", "/api/diagnostics", auth=None)[0] == 401
+    code, body, _ = self.call("GET", "/api/diagnostics")
+    assert code == 200 and "build: 691321d4c0" in body["text"] and "TESLA_MODEL_3" in body["text"] and "PASS  web server" in body["text"]
+    assert self.KEY not in body["text"] and self.token not in body["text"] and "pairing URL" not in body["text"]
+
+  def test_the_reader_brings_the_model_the_step_times_and_the_events(self):
+    self.prepare()
+    reader = status.StatusReader(self.diagnostics.EventLog(self.params))
+    self.app.reader = reader
+    reader.start()
+    self.addCleanup(reader.stop)
+    pm = messaging.PubMaster(["modelV2", "turnpilotDetections", "turnpilotFarDetections", "turnpilotPlan", "errorLogMessage"])
+
+    def publish():
+      msg = messaging.new_message("modelV2")
+      msg.modelV2.big, msg.modelV2.modelExecutionTime = True, 0.0213
+      pm.send("modelV2", msg)
+      msg = messaging.new_message("turnpilotDetections")
+      msg.turnpilotDetections.executionTime, msg.turnpilotDetections.nativeStatus = 0.0061, "full"
+      pm.send("turnpilotDetections", msg)
+      msg = messaging.new_message("turnpilotFarDetections")
+      msg.turnpilotFarDetections.run.executionTime = 0.012
+      pm.send("turnpilotFarDetections", msg)
+      msg = messaging.new_message("turnpilotPlan")
+      msg.turnpilotPlan.controlPrompt, msg.turnpilotPlan.reason = "stalledTakeControl", "Stalled in the turn"
+      pm.send("turnpilotPlan", msg)
+      rec = {"msg": "turnpilotd plan failed", "ctx": {"daemon": "turnpilotd"}, "levelnum": 40, "exc_info": "Traceback\nKeyError: 'lead'"}
+      pm.send("errorLogMessage", messaging.new_message(None, valid=True, errorLogMessage=json.dumps(rec)))
+
+    text, deadline = "", time.monotonic() + 10
+    while time.monotonic() < deadline:
+      publish()
+      time.sleep(0.3)
+      text = self.call("GET", "/api/diagnostics")[1]["text"]
+      if "far slot" in text and "error turnpilotd" in text and "handback" in text:
+        break
+    assert "driving model: the big model on the chestnut" in text and "native detect: full" in text
+    assert "model 21.3 ms, full pass 6.1 ms, far slot 12.0 ms" in text
+    assert "handback stalledTakeControl: Stalled in the turn" in text and "error turnpilotd" in text and "KeyError: 'lead'" in text
+    assert [e["what"] for e in self.params.get("TurnPilotDiagEvents")].count("handback stalledTakeControl") == 1  # its onset, once
+
+  def test_the_page_collects_on_open_and_copies_plain_text(self):
+    page = server.INDEX.read_text()
+    assert '<details id="diag">' in page and 'id="diagtext" readonly' in page and 'id="diagcopy"' in page
+    script = page.split("<script>")[1]
+    assert 'api("/api/diagnostics")' in script and 'document.execCommand("copy")' in script and "window.isSecureContext" in script

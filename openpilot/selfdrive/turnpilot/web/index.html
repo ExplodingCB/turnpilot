@@ -64,6 +64,10 @@ details { margin-top: 28px; } summary { min-height: 44px; font-weight: 600; }
 #keybox button { margin-top: 12px; width: 100%; }
 #keyresult { margin: 10px 0 0; font-weight: 600; min-height: 1.35em; }
 #keyresult.bad { color: var(--bad); }
+#diagtext { display: block; width: 100%; min-height: 280px; margin-top: 12px; padding: 8px; border: 2px solid var(--line); border-radius: 0;
+  background: var(--bg); color: var(--fg); font: 13px/1.35 ui-monospace, Menlo, monospace; white-space: pre; overflow: auto; }
+#diag button { width: 100%; margin-top: 12px; }
+#diagcopied { margin: 8px 0 0; font-weight: 600; min-height: 1.35em; }
 code { display: block; word-break: break-all; margin: 4px 0 12px; padding: 8px; border: 1px solid var(--line); font: 14px ui-monospace, Menlo, monospace; }
 </style>
 </head>
@@ -130,6 +134,16 @@ code { display: block; word-break: break-all; margin: 4px 0 12px; padding: 8px; 
     <button class="go" type="button" id="csyes">Yes, they flashed</button>
     <button class="stop" type="button" id="csno">No</button>
   </div>
+</details>
+
+<details id="diag">
+  <summary>Diagnostics</summary>
+  <div class="note">If something went wrong, copy this and text it to Kellen. It has the build, the checks and TurnPilot's last
+    events, and never the map key or where the car is.</div>
+  <button class="go" type="button" id="diagcopy" disabled>Copy</button>
+  <div id="diagcopied" role="status"></div>
+  <textarea id="diagtext" readonly aria-label="Diagnostics report" autocapitalize="none" spellcheck="false"></textarea>
+  <button type="button" id="diagrefresh">Collect again</button>
 </details>
 
 <details>
@@ -468,6 +482,35 @@ function answer(verdict, checkId) {
 
 $("csdrive").onclick = function () {
   act(async function () { await api("/api/car-signals", "POST", { startInDrive: true }); await loadCarSignals(); });
+};
+
+// Diagnostics: collected when opened (preflight runs on the comma, up to a minute), copied as plain text to send to Kellen.
+// The page is plain http on the hotspot, where Safari has no clipboard API, so Copy selects the text and copies the selection.
+async function loadDiagnostics() {
+  $("diagcopy").disabled = true;
+  $("diagcopied").textContent = "";
+  $("diagtext").value = "Collecting, up to a minute...";
+  var d = await api("/api/diagnostics");
+  $("diagtext").value = d.text;
+  $("diagcopy").disabled = false;
+}
+
+$("diag").addEventListener("toggle", function () { if ($("diag").open) act(loadDiagnostics); });
+$("diagrefresh").onclick = function () { act(loadDiagnostics); };
+$("diagcopy").onclick = function () {
+  var box = $("diagtext"), copied = false;
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(box.value).then(function () { $("diagcopied").textContent = "Copied. Paste it in a text to Kellen."; },
+      function () { $("diagcopied").textContent = "Select the text above and copy it."; });
+    return;
+  }
+  box.readOnly = false;  // iOS selects a read-only field's text only while it is editable
+  box.focus();
+  box.setSelectionRange(0, box.value.length);
+  try { copied = document.execCommand("copy"); } catch (e) {}
+  box.readOnly = true;
+  box.blur();
+  $("diagcopied").textContent = copied ? "Copied. Paste it in a text to Kellen." : "Select the text above and copy it.";
 };
 
 function line(dl, label, value) {
