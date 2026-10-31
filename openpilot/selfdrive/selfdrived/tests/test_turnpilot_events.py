@@ -266,6 +266,19 @@ def test_a_hard_brake_for_a_confirmed_pedestrian_is_raised_first_with_the_handba
   assert plan_events(FakeSM(plan(controlAlert='hardBrake', tooFastToTurn=True))) == ['turnpilotControlAlert']
 
 
+def test_car_crossing_the_stop_signs_in_path_rail_is_as_loud_as_a_hard_brake_and_outranks_a_handback():
+  # SAT-11: the decider's in-path rail past its commit point says "Car crossing" with the hard brake's sound and fcw, however
+  # gently it brakes, over a take-control prompt in the same plan
+  a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='carCrossing', reason='Car crossing')))
+  assert a.alert_text_1 == 'Car Crossing' and a.alert_text_2 == 'Car crossing'
+  assert a.audible_alert == AudibleAlert.tpHandback and a.visual_alert == VisualAlert.fcw
+  a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='carCrossing')))
+  assert a.alert_text_2 == 'Car crossing: stopping short of it'
+  from openpilot.selfdrive.turnpilot.hooks import plan_events
+  assert plan_events(FakeSM(plan(controlAlert='carCrossing', controlPrompt='stopSignTakeControl'))) == ['turnpilotControlAlert']
+  assert plan_events(FakeSM(plan(controlAlert='carCrossing', tooFastToTurn=True))) == ['turnpilotControlAlert']
+
+
 def test_take_control_prompts_are_loud_and_outrank_a_skip():
   from openpilot.selfdrive.turnpilot.hooks import plan_events
   for prompt, title in (('stopSignTakeControl', 'Stop sign: take control to proceed'),

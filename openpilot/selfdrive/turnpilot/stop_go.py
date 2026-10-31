@@ -76,7 +76,12 @@ gate that fails before the first go is the 1 s handback saying which ("Stop sign
 it, a held fault (H9), never shadow (C14). ALWAYS_DRIVE's amendments V1-V10 hold under vision alone (each marked V<n> below);
 the other four modes are as they were (tests/test_stop_go_modes_golden.py). The go's line is said on VISION_ANNOUNCE_S of
 acting, engaged frames in a row before it: re-engaged (or acting again) with the window already run, the line comes first and
-the go VISION_ANNOUNCE_S after it, never on the re-engaged frame.
+the go VISION_ANNOUNCE_S after it, never on the re-engaged frame. SAT-11, under vision alone: every vehicle standing at the go is
+watched for its start (_watch_starts: its ground point and speed toward our path, our own motion taken out), its start before
+the commit withdrawing the go and after it a threat in the band; and from the commit point on, a confirmed vehicle in our path
+corridor ahead (in it, or entering it within RAIL_ENTER_S and still there when we reach it) is the in-path rail (_rail): the
+car stopped short of it, as hard as it needs, "Car crossing" said loudly (carCrossing), in a cross lane too, since a car is
+entering our own path; V8's carrying on is for the cross cars that aren't. A stand it leaves is the stall's clearBox lifts.
 
 Faults (7.1), each stopSignTakeControl with its reason, the car held (by the latch, or by the decider's own stop once the latch
 has let go): H1 a needed view without a run for DET_FAULT_S (held: cameraPaused for FAULT_GRACE_S first; moving before commit,
@@ -118,7 +123,8 @@ from openpilot.selfdrive.turnpilot.map_controls import CREEP_AT_M, CREEP_SPEED, 
 from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
 from openpilot.selfdrive.turnpilot.routing import certify as ce
 from openpilot.selfdrive.turnpilot.routing.junctions import survey_approach
-from openpilot.selfdrive.turnpilot.scene_policy import PATH_HALF_WIDTH_M, STOP_SPEED, Stop, stop
+from openpilot.selfdrive.turnpilot.scene_policy import CONFIRM_CONF, CONFIRM_HITS, CONFIRM_STEADY_HITS, ENTER_T_S, HARD_MISSED_RUNS, \
+  PATH_HALF_WIDTH_M, STOP_SPEED, Stop, stop
 from openpilot.selfdrive.turnpilot.stop_evidence import APPROACH_V, DOWNGRADE_V, DOWNGRADE_WINDOW_M, MOVE_TOL_M, StopEvidence, class_name, \
   junction_lanes
 from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP
@@ -265,6 +271,15 @@ START_RANGE_FRAC = 0.02         # along it for a parallel one), plus this share 
 START_V = 0.8                   # m/s, ...or its ground speed toward our path over this (run 11's camera track read 0.4 standing)...
 START_FRAMES = 2                # ...on this many frames in a row: it has started (the go withdrawn; in the band, a threat)
 START_REF_S = 1.0               # s of its matches standing where the car stood at the go its reference ground point is the median of
+# the in-path rail (SAT-11 item 2), under vision from the commit point on: a vehicle confirmed in our path corridor ahead
+CROSSING_REASON = "Car crossing"
+RAIL_FRAMES = 3                 # frames in a row a vehicle's conflict must hold: never a phantom's one or two
+RAIL_AHEAD_M = 15.              # m ahead of the bumper the rail looks: scene_policy's NEAR_PATH_M, its close-in corridor
+RAIL_GAP_M = 1.0                # m short of the vehicle's ground point (its near side) the rail stops the car
+RAIL_MARGIN_S = 1.0             # s: a vehicle clearing our corridor this long before we would reach it passes ahead of us
+RAIL_HALF_LEN_M = CAR_LEN_M / 2.  # m either side of a crossing vehicle's ground point along its motion its body reaches
+RAIL_ENTER_S = ENTER_T_S        # s: a vehicle entering our corridor within this is in our path (scene_policy's for a walker)
+RAIL_RELEASE_S = 1.0            # s a rail's conflict must have stopped holding before the rail lets go (a coast, a frame's gap)
 
 
 @dataclass
@@ -533,7 +548,11 @@ class StopGo:
     self.rollup_odo: float | None = None  # V3: the odometer at the roll-ups' count's start
     self.takeover_fails = 0         # V3: goes withdrawn because the model didn't take over (GO_RETRIES bounds these alone)
     self.box_next = STALL_BOX_S     # V4: s of the stand at which the next clearBox may go
-
+    # SAT-11: the in-path rail (_rail): trackId: frames its conflict has held in a row; the vehicle it holds for, since when
+    # its conflict last held; whether it held this encounter (a stand past the commit point is then the stall's, not V26's)
+    self.rail_count: dict[int, int] = {}
+    self.rail_on: dict | None = None
+    self.rail_held = False
 
   def _take(self, ctl, f: Frame) -> None:
     """A new encounter with control ctl (held, or engaged ahead)."""
@@ -641,8 +660,109 @@ class StopGo:
       self._inlane(f, d, pos)
     elif self.state == 'ladder':
       self._ladder(f, d, ctl)
+    if self.vision and acting and self.state in ('committed', 'inLane'):
+      self._rail(f, d, d.position_m)
+    elif self.rail_on is not None or self.rail_count:
+      self.rail_on, self.rail_count = None, {}
     self._finish(f, d, acting, why)
     return d
+
+  # ---------------------------------------------------------------------------------------------------- the in-path rail
+
+  @staticmethod
+  def _rail_confirmed(o) -> bool:
+    """A track the rail may stop hard for: scene_policy.confirmed_track's hits (CONFIRM_HITS at CONFIRM_CONF, or
+    CONFIRM_STEADY_HITS at any), the detector still matching it (no more than HARD_MISSED_RUNS missed runs since its last
+    match). Never tracker B's (b_only)."""
+    age, conf = int(getattr(o, 'age', 0) or 0), float(getattr(o, 'conf', 0.) or 0.)
+    if getattr(o, 'b_only', False) or int(getattr(o, 'missedRuns', 0) or 0) > HARD_MISSED_RUNS:
+      return False
+    return (age >= CONFIRM_HITS and conf >= CONFIRM_CONF) or age >= CONFIRM_STEADY_HITS
+
+  @staticmethod
+  def _corridor(o) -> tuple[float, float]:
+    """(s it enters our path corridor, s it leaves it) from now, by its lateral motion: a vehicle moving across (its ground
+    speed across our path over MOVING_V, more than along it) has its body RAIL_HALF_LEN_M either side of its ground point, so
+    it is in the corridor (PATH_HALF_WIDTH_M either side of our axis) while that body overlaps it; anything else is in it while
+    its ground point is. inf: never."""
+    y, vx, vy = float(o.y), float(o.vx), float(o.vy)
+    crossing = abs(vy) > MOVING_V and abs(vy) > abs(vx)
+    if not crossing and vx > MOVING_V:
+      return math.inf, math.inf  # moving on ahead of us along our path: a lead, the model's
+    w = PATH_HALF_WIDTH_M + (RAIL_HALF_LEN_M if crossing else 0.)
+    inside = abs(y) <= w
+    if not crossing:
+      return (0., math.inf) if inside else (math.inf, math.inf)
+    t_exit = (math.copysign(w, vy) - y) / vy
+    if inside:
+      return 0., t_exit
+    return ((abs(y) - w) / abs(vy), t_exit) if y * vy < 0. else (math.inf, math.inf)
+
+  @staticmethod
+  def _t_at(dist: float, v: float, a: float) -> float:
+    """s our car takes to cover dist m from v at a (m/s^2, 0 or more), at 0.1 m/s at least."""
+    if a > 1e-3:
+      return (-v + math.sqrt(v * v + 2. * a * max(dist, 0.))) / a
+    return max(dist, 0.) / max(v, 0.1)
+
+  def _rail(self, f: Frame, d: StopGoDecision, pos: float) -> None:
+    """SAT-11 item 2, under vision from the commit point on (committed, inLane): a motor vehicle or cyclist in our path
+    corridor ahead of the bumper (within RAIL_AHEAD_M), or entering it within RAIL_ENTER_S (scene_policy's ENTER_T_S) before our
+    rear is past it, and still in it when we reach it (RAIL_MARGIN_S either way: one clearing it before we arrive passes ahead
+    of us; one further off is V8's, said and carried on), a confirmed track (_rail_confirmed) on RAIL_FRAMES
+    frames in a row, is the in-path rail: a stop RAIL_GAP_M short of it, confirmed (scene_policy.stop: as hard as it needs, the
+    hard tier raising hardBrake), and "Car crossing" said loudly (carCrossing) while it holds. It may stop the car in a cross
+    lane: a car is entering our own path (V8's carrying on is for cross cars that aren't). Held until the vehicle has been out
+    of our corridor and not coming back into it within RAIL_MARGIN_S for RAIL_RELEASE_S; a stand it leaves past the commit
+    point is the stall's (_vision_stall: the lanes left to cross tested before any lift), never V26's un-commit."""
+    v, a = max(f.v_ego, 0.), max(f.a_ego, 0.)
+    best, seen, held = None, set(), None
+    for o in f.objects or ():
+      if class_name(o.cls) not in MOTOR + CYCLISTS:
+        continue
+      gap = float(o.x) - self.setback
+      if self.rail_on is not None and o.trackId == self.rail_on['track']:
+        held = (gap, o)  # the vehicle it holds for, wherever it is now (at the bumper too), while the tracker publishes it
+      if not self._rail_confirmed(o) or not 0. < gap <= RAIL_AHEAD_M:
+        continue
+      t_enter, t_exit = self._corridor(o)
+      t_reach, t_pass = self._t_at(gap, v, a), self._t_at(gap + CAR_LEN_M + 2. * RAIL_GAP_M, v, a)
+      # in our corridor now or within RAIL_ENTER_S, before our rear is past it (and a margin); still there when we reach it
+      if t_enter <= min(RAIL_ENTER_S, t_pass + RAIL_MARGIN_S) and t_exit >= t_reach - RAIL_MARGIN_S:
+        seen.add(o.trackId)
+        n = self.rail_count[o.trackId] = self.rail_count.get(o.trackId, 0) + 1
+        if n >= RAIL_FRAMES and (best is None or gap < best[0]):
+          best = (gap, o)
+    self.rail_count = {k: n for k, n in self.rail_count.items() if k in seen}
+    if best is not None and (self.rail_on is None or best[1].trackId != self.rail_on['track']):
+      gap, o = best
+      if self.rail_on is None:
+        cloudlog.event("turnpilot.stop_go_rail", error=True, key=list(self.key), state=self.state, pos=round(pos, 2), v=round(v, 2),
+                       track=int(o.trackId), cls=class_name(o.cls), gap=round(gap, 2), y=round(float(o.y), 2), vy=round(float(o.vy), 2),
+                       hits=int(getattr(o, 'age', 0) or 0), conf=round(float(getattr(o, 'conf', 0.) or 0.), 3))
+      self.rail_on = {'track': o.trackId, 'gap': gap, 'clear_s': 0., 'obj': o}
+      held = best
+    if self.rail_on is None:
+      return
+    r = self.rail_on
+    if held is not None:
+      gap, o = held
+      t_enter, _ = self._corridor(o)
+      r.update(gap=gap, obj=o, clear_s=r['clear_s'] + f.dt if t_enter > RAIL_MARGIN_S else 0.)  # out, and not coming back in
+    else:
+      r.update(gap=r['gap'] - v * f.dt, clear_s=r['clear_s'] + f.dt)  # unmatched: dead-reckoned, and its clock running
+    if r['clear_s'] >= RAIL_RELEASE_S - 1e-6:
+      cloudlog.event("turnpilot.stop_go_rail_released", key=list(self.key), state=self.state, pos=round(pos, 2), track=int(r['track']))
+      self.rail_on = None
+      return
+    self.rail_held = True
+    o = r['obj']
+    ev = {'track_id': int(o.trackId), 'cls': class_name(o.cls), 'hits': int(getattr(o, 'age', 0) or 0),
+          'conf': round(float(getattr(o, 'conf', 0.) or 0.), 3), 'x': round(float(o.x), 2), 'y': round(float(o.y), 2),
+          'vx': round(float(o.vx), 2), 'vy': round(float(o.vy), 2), 'in_path': True}
+    d.stops.append(stop(v, max(r['gap'] - RAIL_GAP_M, 0.), CROSSING_REASON, confirmed=True, evidence=ev))
+    d.reason = CROSSING_REASON
+    self._show_alert('carCrossing')
 
   def _driver(self, f: Frame, d: StopGoDecision, ctl) -> None:
     """The driver taking over (openpilot disengaged: a pedal, O6 and O7). During the launch the encounter is theirs at once; a
@@ -1215,6 +1335,16 @@ class StopGo:
       cloudlog.event("turnpilot.stop_go_in_lane", key=list(self.key), pos=round(pos, 2), v=round(f.v_ego, 2))
       self._inlane(f, d, pos)
       return
+    if self.vision and self.rail_held and standing and self.aborting is None:
+      # SAT-11: a stand past the commit point the in-path rail made is the stall's (V4's clearBox lifts once nothing of
+      # TurnPilot's holds the car, the lanes left to cross tested first; H5 at VISION_STALL_H5_S), never V26's un-commit: no go
+      # from there has GO_ROOM_M, and the car may be standing in a cross lane
+      free = not f.tp_holding and self.rail_on is None and (f.lead_m is None or f.lead_m > LEAD_GO_M)
+      self.stall_s = self.stall_s + f.dt if free else 0.
+      if self.stall_s >= STALL_BOX_S - 1e-6:
+        d.reason = STALLED_REASON
+      self._vision_stall(f, d, pos, standing, self._threat(f, pos))
+      return
     self.uncommit_s = self.uncommit_s + f.dt if standing else 0.
     if self.uncommit_s >= UNCOMMIT_STOP_S - 1e-6:
       # a full stop in the band un-commits (V26): observe from here, the rank kept, a fresh go only after CLEAR_S, never clearBox
@@ -1255,7 +1385,7 @@ class StopGo:
     if threat:
       self._after_commit(threat)  # never braked for: stopping in a lane is worse than going on (V8)
     standing = f.v_ego < STAND_V
-    free = not f.tp_holding and (f.lead_m is None or f.lead_m > LEAD_GO_M)
+    free = not f.tp_holding and self.rail_on is None and (f.lead_m is None or f.lead_m > LEAD_GO_M)  # the rail's stand isn't a stall
     self.stall_s = self.stall_s + f.dt if standing and free else 0.
     if self.stall_s >= STALL_BOX_S - 1e-6:
       d.reason = STALLED_REASON  # said on the status line (control_text) while it lasts

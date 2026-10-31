@@ -14,8 +14,8 @@ from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.locationd.calibrationd import MIN_SPEED_FILTER
 from openpilot.common.hardware import HARDWARE
 from openpilot.selfdrive.turnpilot.hooks import (ABORT_TEXT, CAR_SIGNAL_EVENTS, CONTROL_ALERT_TEXT, CONTROL_PROMPT_TEXT, CONTROL_STATUS_ALERTS,
-                                               KEEP_FOLLOW, KEEP_REROUTED, SILENT_PROMPTS, SILENT_STATUS_ALERTS, TAKE_CONTROL_PROMPTS, fresh_plan,
-                                               lane_change_text, shown_plan, too_fast_title)
+                                               KEEP_FOLLOW, KEEP_REROUTED, LOUD_ALERTS, SILENT_PROMPTS, SILENT_STATUS_ALERTS, TAKE_CONTROL_PROMPTS,
+                                               fresh_plan, lane_change_text, shown_plan, too_fast_title)
 
 AlertSize = log.SelfdriveState.AlertSize
 AlertStatus = log.SelfdriveState.AlertStatus
@@ -363,7 +363,7 @@ CONTROL_ALERT_TITLE = {'cannotStopComfortably': "Take Control", 'stopOverrun': "
                        'mapControlsUnavailable': "Map Stops Unavailable", 'lightSourceRejected': "Light Source Rejected",
                        'mapControlsUnavailableSilent': "Map Stops Unavailable",
                        'junctionUncertain': "Junction Position Uncertain", 'offRouteStopsUnknown': "Off Route",
-                       'hardBrake': "Braking Hard", 'oncomingHolding': "Oncoming: Holding", 'farViewOff': "Far View Off",
+                       'hardBrake': "Braking Hard", 'carCrossing': "Car Crossing", 'oncomingHolding': "Oncoming: Holding", 'farViewOff': "Far View Off",
                        'sideCamerasOff': "Side Cameras Off", 'crossTrafficAfterCommit': "Cross Traffic", 'cameraPaused': "Camera Paused",
                        'stalledInJunction': "Stalled in Junction", 'overrideWriteFailed': "Junction Not Saved",
                        'carStoppedNote': "Car Stopped", 'stallLift': "Stalled: Finishing the Turn",
@@ -405,7 +405,7 @@ def turnpilot_control_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.S
     return Alert("TAKE CONTROL", "TurnPilot stopped responding while holding the car", AlertStatus.critical, AlertSize.mid,
                  Priority.MID, VisualAlert.steerRequired, AudibleAlert.tpHandback, .1)
   kind = str(plan.controlAlert)
-  if kind == 'hardBrake':  # a confirmed track's hard stop (scene_policy.py), while it lasts: what it is for, loud
+  if kind in LOUD_ALERTS:  # a confirmed track's hard stop (scene_policy.py), or the in-path rail's (stop_go.py), while it lasts: loud
     return Alert(CONTROL_ALERT_TITLE[kind], plan.reason or CONTROL_ALERT_TEXT[kind], AlertStatus.critical, AlertSize.mid,
                  Priority.MID, VisualAlert.fcw, AudibleAlert.tpHandback, .1)
   if kind == 'cannotStopComfortably':

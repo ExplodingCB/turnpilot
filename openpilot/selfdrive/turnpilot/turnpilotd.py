@@ -192,10 +192,10 @@ from openpilot.selfdrive.turnpilot.junction_watch import JunctionWatch, detector
 from openpilot.selfdrive.turnpilot import visibility_table
 from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
 from openpilot.common.time_helpers import system_time_valid
-from openpilot.selfdrive.turnpilot.scene_policy import (CROSSWALK_REASON, CROSSWALK_X_AFTER_M, CROSSWALK_X_BEFORE_M, CROSSWALK_Y_FAR_M, CROSSWALK_Y_NEAR_M,
-                                                         CURB_PED_CAP_DEFAULT, CURB_PED_EDGE_M, CURB_PED_X_M, HOLD_LINE_M, NO_ACCEL_CAP,
-                                                         ONCOMING_ENTRY_M, PATH_HALF_WIDTH_M, STOP_DECEL, VEHICLES, ScenePolicy, far_side_turn,
-                                                         in_path, velocity_trusted)
+from openpilot.selfdrive.turnpilot.scene_policy import (CONFIRM_STEADY_HITS, CROSSWALK_REASON, CROSSWALK_X_AFTER_M, CROSSWALK_X_BEFORE_M,
+                                                         CROSSWALK_Y_FAR_M, CROSSWALK_Y_NEAR_M, CURB_PED_CAP_DEFAULT, CURB_PED_EDGE_M, CURB_PED_X_M,
+                                                         HOLD_LINE_M, NO_ACCEL_CAP, ONCOMING_ENTRY_M, PATH_HALF_WIDTH_M, STOP_DECEL, VEHICLES,
+                                                         ScenePolicy, far_side_turn, in_path, velocity_trusted)
 from openpilot.selfdrive.turnpilot.turn_skip import SkipState, TurnSkip, can_make_turn
 from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
 from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, DRIVEN, LIGHT_RED_MAX_S, LINE_D, OFF, ROAD_RANGE_M,
@@ -2044,7 +2044,9 @@ class TurnPilot:
       view = 'full' if abs(b) < 40. else 'sideLeft' if b > 0. else 'sideRight'
       tracks.append(SimpleNamespace(track_id=ORACLE_ID + int(c.id), t_seen=t, bearing_seen=b, width_seen=1.8 * 904. / r, view=view,
                                     cls=ORACLE_CLASS.get(cls, 2), x=np.array([x, y, vx, vy]), span_seen=(b - half, b + half), hits=5))
-      objs.append(SimpleNamespace(trackId=ORACLE_ID + int(c.id), cls=cls, x=x, y=y, vx=vx, vy=vy))
+      # ground truth, so a confirmed track's (scene_policy.confirmed_track's hits) for the decider's in-path rail (SAT-11)
+      objs.append(SimpleNamespace(trackId=ORACLE_ID + int(c.id), cls=cls, x=x, y=y, vx=vx, vy=vy, age=CONFIRM_STEADY_HITS, conf=1.,
+                                  missedRuns=0))
     runs = tuple((v, t, RawFrame([], 'road' if v == 'road' else 'wide', t, v if v.startswith('side') else 'full'), None)
                  for v in ('road', 'full', 'sideLeft', 'sideRight'))
     return OracleLive(float(msg.crossRangeM)), tuple(tracks), runs, objs, 'running'
@@ -2135,8 +2137,8 @@ class TurnPilot:
       # standing short of a line it never latched, nothing else of TurnPilot's holding the car, waiting on its roll-up
       # (its bound's wait, stop_go._short_wait): said over the map control's approach text
       plan.reason = sg.reason
-    if sg.alert != 'none' and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS:
-      plan.controlAlert = sg.alert
+    if sg.alert != 'none' and (str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS or sg.alert == 'carCrossing'):
+      plan.controlAlert = sg.alert  # the in-path rail's "Car crossing" over any map alert (a hard brake for it outranks it below)
     if sg.state in ('going', 'committed', 'inLane') or (sg.state in ('observe', 'ladder') and self.map_controls.held_control() is None):
       mc = plan.mapControl
       mc.kind, mc.distance, mc.action = 'stop', float(-sg.position_m), sg.action if sg.action != 'none' else 'held'

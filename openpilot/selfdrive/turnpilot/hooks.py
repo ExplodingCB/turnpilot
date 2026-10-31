@@ -53,8 +53,11 @@ def limits_plan(sm, now: float | None = None):
 
 # above too fast to turn. The stop-sign decider's (stop_go.py): a cross vehicle met in a lane, the cross-traffic camera paused
 # while held, stalled past the in-lane point: said with a chime, never a handback themselves
-CONTROL_ALERT_FIRST = ('hardBrake', 'cannotStopComfortably', 'offRouteStopsUnknown', 'oncomingHolding', 'crossTrafficAfterCommit',
+CONTROL_ALERT_FIRST = ('hardBrake', 'carCrossing', 'cannotStopComfortably', 'offRouteStopsUnknown', 'oncomingHolding', 'crossTrafficAfterCommit',
                        'cameraPaused', 'stalledInJunction', 'overrideWriteFailed', 'otherTurn', 'stallLift')
+# a confirmed track's stop the driver must hear at once, above every handback: scene_policy's hard brake, and the stop-sign
+# decider's in-path rail past its commit point (stop_go.py _rail: "Car crossing", SAT-11), however gently it brakes
+LOUD_ALERTS = ('hardBrake', 'carCrossing')
 # handbacks: the car held while the driver is told to take control (map_controls.py, turnpilotd.py), above too fast to turn
 TAKE_CONTROL_PROMPTS = ('stopSignTakeControl', 'unprotectedTurnTakeControl', 'carStoppedTakeControl', 'stalledTakeControl',
                         'cantStartTakeControl', 'leftUndecidedTakeControl', 'signalUnseenTakeControl',
@@ -92,7 +95,8 @@ def plan_events(sm, now: float | None = None) -> list[str]:
   TurnPilot's alerts share one slot, at most one of them a frame, by this priority:
   1. a handback (turnpilotDetectorStopped, turnpilotNoDetector, turnpilotModelFellBack; handback.py): nothing here while one is set;
   2. a fault (turnpilotUnavailable);
-  3. a hard brake for a confirmed pedestrian or oncoming vehicle (turnpilotControlAlert, hardBrake), then a handback
+  3. a hard brake for a confirmed pedestrian or oncoming vehicle (turnpilotControlAlert, hardBrake), or the stop-sign
+     decider's in-path rail for a confirmed vehicle in the car's path past the commit point (carCrossing), then a handback
      with the car held (turnpilotControlPrompt, TAKE_CONTROL_PROMPTS: a stop sign, an unprotected turn, the car stopped
      or stalled in a turn, or not pulling away after TurnPilot's go), then a map stop it can't make gently (turnpilotControlAlert, cannotStopComfortably: take
      control), or off the route with the map stops ahead unknown (offRouteStopsUnknown: the speed capped, take control
@@ -127,7 +131,7 @@ def plan_events(sm, now: float | None = None) -> list[str]:
   if plan.shadow:  # in shadow mode the driver drives, and TurnPilot acts on nothing
     return []
   alert = str(plan.controlAlert)
-  if alert == 'hardBrake':
+  if alert in LOUD_ALERTS:
     return ['turnpilotControlAlert']
   if str(plan.controlPrompt) in TAKE_CONTROL_PROMPTS:
     return ['turnpilotControlPrompt']
@@ -188,6 +192,7 @@ CONTROL_ALERT_TEXT = {
   'junctionUncertain': 'GPS unsure where the junction is: slow, may stop short of it',
   'offRouteStopsUnknown': 'Map stops unknown: take control or wait for reroute',
   'hardBrake': 'Braking hard',
+  'carCrossing': 'Car crossing: stopping short of it',
   'oncomingHolding': 'Oncoming traffic: holding short of its lanes',
   'farViewOff': 'Far view off for this drive: no lefts across fast oncoming traffic',
   'sideCamerasOff': 'Side cameras off for this drive: stop signs see less cross traffic',
