@@ -6,6 +6,7 @@ from openpilot.selfdrive.ui.mici.layouts.offroad_alerts import MiciOffroadAlerts
 from openpilot.selfdrive.ui.mici.onroad.augmented_road_view import AugmentedRoadView
 from openpilot.selfdrive.ui.ui_state import device, ui_state
 from openpilot.selfdrive.ui.mici.layouts.onboarding import OnboardingWindow
+from openpilot.selfdrive.ui.mici.layouts.turnpilot_setup import setup_needed, setup_window
 from openpilot.selfdrive.ui.body.layouts.onroad import BodyLayout
 from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.widgets.scroller import Scroller
@@ -57,12 +58,22 @@ class MiciMainLayout(Scroller):
     gui_app.push_widget(self)
 
     # Start onboarding if terms or training not completed, make sure to push after self
-    self._onboarding_window = OnboardingWindow(lambda: gui_app.pop_widgets_to(self))
+    self._onboarding_window = OnboardingWindow(self._on_onboarding_completed)
+    # TurnPilot setup follows the stock onboarding, and opens on every boot until it is finished
+    self._setup_window = setup_window()
     if not self._onboarding_window.completed:
       gui_app.push_widget(self._onboarding_window)
+    elif setup_needed(ui_state.params):
+      self._setup_window.open()
 
     # initialize correct onroad layout
     self._on_body_changed()
+
+  def _on_onboarding_completed(self):
+    if setup_needed(ui_state.params):
+      gui_app.pop_widgets_to(self, self._setup_window.open)
+    else:
+      gui_app.pop_widgets_to(self)
 
   @property
   def _onroad_layout(self) -> Widget:
@@ -121,7 +132,9 @@ class MiciMainLayout(Scroller):
 
     # FIXME: these two pops can interrupt user interacting in the settings
     if self._onroad_time_delay is not None and rl.get_time() - self._onroad_time_delay >= ONROAD_DELAY:
-      gui_app.pop_widgets_to(self, lambda: self._scroll_to(self._onroad_layout))
+      # TurnPilot setup stays up while the car is parked with the ignition on; it goes once the car moves (below)
+      if not gui_app.widget_in_stack(self._setup_window):
+        gui_app.pop_widgets_to(self, lambda: self._scroll_to(self._onroad_layout))
       self._onroad_time_delay = None
 
     # When car leaves standstill, pop nav stack and scroll to onroad
@@ -131,8 +144,8 @@ class MiciMainLayout(Scroller):
     self._prev_standstill = CS.standstill
 
   def _on_interactive_timeout(self):
-    # Don't pop if onboarding
-    if gui_app.widget_in_stack(self._onboarding_window):
+    # Don't pop if onboarding or TurnPilot setup
+    if gui_app.widget_in_stack(self._onboarding_window) or gui_app.widget_in_stack(self._setup_window):
       return
 
     if ui_state.started:
