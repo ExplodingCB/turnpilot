@@ -194,8 +194,9 @@ from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
 from openpilot.common.time_helpers import system_time_valid
 from openpilot.selfdrive.turnpilot.scene_policy import (CROSSWALK_REASON, CROSSWALK_X_AFTER_M, CROSSWALK_X_BEFORE_M, CROSSWALK_Y_FAR_M, CROSSWALK_Y_NEAR_M,
                                                          CURB_PED_CAP_DEFAULT, CURB_PED_EDGE_M, CURB_PED_X_M, HOLD_LINE_M, NO_ACCEL_CAP,
-                                                         ONCOMING_ENTRY_M, PATH_HALF_WIDTH_M, STOP_DECEL, VEHICLES, ScenePolicy, far_side_turn,
-                                                         in_path, velocity_trusted)
+                                                         ONCOMING_ENTRY_M, PATH_HALF_WIDTH_M, PERSON_FRONT_BUMPER_M, PERSON_FRONT_HALF_M,
+                                                         PERSON_FRONT_X_M, STOP_DECEL, VEHICLES, ScenePolicy, far_side_turn, in_path,
+                                                         velocity_trusted)
 from openpilot.selfdrive.turnpilot.turn_skip import SkipState, TurnSkip, can_make_turn
 from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
 from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, DRIVEN, LIGHT_RED_MAX_S, LINE_D, OFF, ROAD_RANGE_M,
@@ -1138,7 +1139,9 @@ class TurnPilot:
     self.scene.curb_cap = self.curb_ped_cap
     decision = self.scene_now = self.scene.update(objects, available, scene_m, scene_d, v_ego, right_hand_traffic, scene_id,
                                                  took_over, extra_stops=mapd.stops + left_stops + sg.stops, heading_deg=scene_yaw,
-                                                 path=predicted_path(model), extra_objects=extra_objects if available else ())
+                                                 path=predicted_path(model), extra_objects=extra_objects if available else (),
+                                                 driver=not sm['carControl'].enabled or cs.gasPressed,
+                                                 raw_people=self.people_in_front(model))
     self.last_holding = decision.holding
     # a TurnPilot stop in force brings the car to rest at or short of the junction (shouldStop at its end: a walker's
     # hold, a red, a stop sign), braking toward it on the speed cap's curve (shouldStop false until about standstill) or
@@ -2599,6 +2602,26 @@ class TurnPilot:
       cloudlog.event("turnpilot.crosswalk_standoff", error=True, held_s=round(self.ped_hold_s, 1), **(j.evidence or {}))
     return self.ped_handed
 
+  def people_in_front(self, model) -> bool:
+    """A person box of each camera's last detector run (watch_people) in front of the car: up to PERSON_FRONT_X_M ahead, its bottom
+    across PATH_HALF_WIDTH_M of straight ahead or of the model's path, PERSON_FRONT_HALF_M ahead of the bumper (scene_policy.in_front's
+    zone); an unranged one can't be placed, so it is. The person-may-be-in-front latch's clearance waits while one is
+    (ScenePolicy.update's raw_people)."""
+    px, py = predicted_path(model)
+    for _, boxes in self.people_runs.values():
+      for b in boxes:
+        if b.xy is None:
+          return True
+        x = float(b.xy[0])
+        if not 0. < x <= PERSON_FRONT_X_M:
+          continue
+        rng = math.hypot(*b.xy)
+        lats = sorted(rng * math.sin(math.radians(e)) for e in b.span_deg)
+        half = PERSON_FRONT_HALF_M if x > PERSON_FRONT_BUMPER_M else PATH_HALF_WIDTH_M
+        if any(lats[0] < c + half and lats[-1] > c - half for c in (0., float(np.interp(x, px, py)))):
+          return True
+    return False
+
   def watch_people(self, *runs) -> None:
     """The person boxes of each camera's last detector run (PEOPLE), PERSON_RUN_HOLD_S at most (person_near_turn)."""
     for key in list(self.people_runs):
@@ -2948,7 +2971,8 @@ class TurnPilot:
           log_error("turnpilotd.fault_stop_go_failed")
         took_over = cs.gasPressed and not sm['carControl'].enabled
         decision = self.scene.update(list(scene.objects) if scene.available else [], scene.available, None, float('inf'),
-                                     max(cs.vEgo, 0.), gas_pressed=took_over, extra_stops=stops)
+                                     max(cs.vEgo, 0.), gas_pressed=took_over, extra_stops=stops,
+                                     driver=not sm['carControl'].enabled or cs.gasPressed)
         self.was_stopping = decision.should_stop
       if self.hold_v is not None:
         self.hold_v = None if not sm['carControl'].latActive else \

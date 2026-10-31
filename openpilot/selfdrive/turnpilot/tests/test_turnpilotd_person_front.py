@@ -197,3 +197,52 @@ def test_with_no_person_anywhere_the_release_is_todays():
     plans.append(sim.step(engaged=True))
     assert len(plans) < 400
   assert str(plans[-1].goCertified.cause) == 'turnRelease' and all(p.reason != NOTE for p in plans)
+
+
+
+def test_a_fault_keeps_it_and_its_hold():
+  """turnpilotd failing every frame with the latch set: the faulted plan carries its hold (fault_limits, the scene kept through
+  the fault), the car never let go toward her; the driver's gas still ends it there."""
+  from unittest import mock
+  from openpilot.selfdrive.turnpilot.turnpilotd import TurnPilot
+  sim, w = run6(True)
+  lose_her(sim, w)
+  with mock.patch.object(TurnPilot, 'update', side_effect=RuntimeError('boom')):
+    plans = [sim.step(engaged=True) for _ in range(round(2. / DT_MDL))]
+    assert all(str(p.state) == 'disabled' and p.shouldStop for p in plans) and sim.v < 0.05
+    plans = [sim.step(gas=True, engaged=False) for _ in range(3)]
+  assert not plans[-1].shouldStop and sim.tp.scene.person_front is None
+
+def seen_back_walking_out(sim, seconds=6.):
+  """After the loss: 1 s of nothing, a new track where she was for 1 s, then walking out to 3.5 m right and standing there."""
+  for _ in range(round(1. / DT_MDL)):
+    sim.step(engaged=True)
+  back, y, plans = Walker(track_id=2, age=2), LAST_HIT[1], []
+  for _ in range(round(1. / DT_MDL)):
+    plans.append(sim.step(back.seen(LAST_HIT[0], y), engaged=True))
+  for _ in range(round(seconds / DT_MDL)):
+    y = max(y - 1.2 * DT_MDL, -3.5)
+    plans.append(sim.step(back.seen(LAST_HIT[0], y), engaged=True))
+  return plans
+
+
+@pytest.mark.parametrize('box, held', [((5., 0.3), True), (None, True), ((5., -2.4), True), ((5., -4.5), False), ((9., 0.), False)])
+def test_a_raw_person_box_in_front_keeps_it_set(box, held):
+  """Her walking out seen, but a person box of the detector's runs in front of the car (in the corridor or its margin, up to
+  PERSON_FRONT_X_M; one that can't be ranged can't be placed, so it is in front): nothing person-like is clear, so it stays
+  set and the car held. Off the corridor's margin or further out, the release goes."""
+  import math
+  from openpilot.selfdrive.turnpilot.scene.tracker import RawBox, RawFrame
+
+  def raw(sim):
+    if box is None:
+      return RawFrame([RawBox('road', 'pedestrian', 0.4, 0., (-1., 1.), None, None, ())], 'road', sim.t)
+    x, y = box
+    b, r = math.degrees(math.atan2(y, x)), math.hypot(x, y)
+    d = math.degrees(math.atan2(0.3, r))
+    return RawFrame([RawBox('road', 'pedestrian', 0.4, b, (b - d, b + d), (x, y), r, ())], 'road', sim.t)
+  sim, w = run6(True)
+  lose_her(sim, w)
+  sim.raw = raw
+  plans = seen_back_walking_out(sim)
+  assert all(p.shouldStop for p in plans) is held, [p.shouldStop for p in plans][-40:]

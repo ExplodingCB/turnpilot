@@ -80,6 +80,24 @@ never a gate. Its stop is soft (Stop.soft): never asking for more than STOP_DECE
 track's other stops brake on the curve too, but the lagged speed cap can ask up to SPEED_CAP_ACCEL_MIN, -1.7 m/s^2 on a KITTI
 replay tick of one), carried so through a stale scene. The pedestrian velocity trust (trusted_velocity) reads it as it reads the
 scene's.
+
+A person who may be in front (WARGAME_FIXES WF-13; BeamNG SAT validation row 6, ped_step_out-20261031-084546 at 263065a: the
+car stood 2.9 m short of a walker for her confirmed track, the track coasted CLOSE_HOLD_S on no hits and ended with her still
+standing below the bonnet line, and TurnPilot's straight release drove the car past her 0.93 m off her centre). A pedestrian
+track TurnPilot stopped for (a pedestrian stop for it in force with the car at rest: TrackEvidence.stood) or that earned
+confirmation, whose last new hit was in front of the car (in_front: up to PERSON_FRONT_X_M ahead, the tracker's close hold's
+reach, in the path's corridor, or ahead of the bumper within PERSON_FRONT_MARGIN_M of it, straight ahead or the model's path), and that ends (no
+longer published: lost, coasted out, aged out) with the car at PERSON_FRONT_SPEED or slower and the driver not driving, sets
+ScenePolicy.person_front. While it is set a stop holds the car standing, or brings it to rest on the comfortable curve (soft:
+never more than STOP_DECEL; the track was confirmed or had stopped the car, so no phantom's), first among the stops so its
+reason, PERSON_FRONT_NOTE, is the decision's; turnpilotd bars every go of its own on it and hands back after its bound. It
+ends only on the driver (update's driver: openpilot disengaged or the gas pressed) or once a pedestrian track first seen since
+it was set (or the lost one back) has had a new hit in front of the car and then one clear of the corridor by the margin
+(clear_of_path: a coast drifting out is no hit, someone already tracked elsewhere when it was set is someone else), and after
+that nothing person-like (a person or cyclist track in front of the car, or a raw person box near: update's raw_people,
+turnpilotd's) for PERSON_FRONT_CLEAR_S on live frames. No scene, or raw boxes not known (raw_people None, a fault's update),
+runs no clock: no evidence is never a reason to release. A track that ends further out or off the corridor, or a walker seen
+walking clear before her track ends, sets none, and the stops are as before.
 """
 import math
 from collections import deque
@@ -91,7 +109,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_ACCEL_MIN, SPEED_CAP_TAU, plan_accel
 from openpilot.selfdrive.turnpilot.route_follower import LEFT, TURN
-from openpilot.selfdrive.turnpilot.scene.tracker import CLOSE_HOLD_S, MAX_AGE_S
+from openpilot.selfdrive.turnpilot.scene.tracker import CLOSE_HOLD_M, CLOSE_HOLD_S, MAX_AGE_S
 from openpilot.selfdrive.turnpilot.turn_speed import NO_ACCEL_CAP, NO_SPEED_CAP
 
 VEHICLES = ("car", "truck", "bus", "motorcycle", "cyclist")
@@ -195,6 +213,16 @@ CURB_PED_HOLD_S = 1.        # the cap lets go this long after the last such trac
 CURB_PED_REASON = "pedestrian by the road"
 
 B_ID = 1_000_000  # tracker B's objects' trackIds are offset by this (scene/tracker_b.py), apart from tracker A's (module docstring)
+
+# a person who may be in front (module docstring; WARGAME_FIXES WF-13): ScenePolicy.person_front
+PERSON_FRONT_X_M = CLOSE_HOLD_M  # m ahead (camera to person) a lost person may be in front: as far as the tracker holds a close one
+PERSON_FRONT_MARGIN_M = 1.       # ...in the path's corridor or within this of it
+PERSON_FRONT_HALF_M = PATH_HALF_WIDTH_M + PERSON_FRONT_MARGIN_M
+PERSON_FRONT_BUMPER_M = 1.9  # m camera to front bumper (junction_watch.DEFAULT_SETBACK_M): the margin counts only ahead of it
+PERSON_FRONT_SPEED = COMMIT_SPEED  # m/s: set only with the car this slow or standing; its hold brings it to rest on the curve
+PERSON_FRONT_CLEAR_S = 2.        # s of nothing person-like in front after a person is seen leaving the corridor
+PERSON_FRONT_NOTE = "Person may be in front"
+PERSON_LIKE = ('pedestrian', 'cyclist')
 
 
 @dataclass
@@ -382,6 +410,30 @@ class StillPedestrian:
     return getattr(self.obj, name)
 
 
+def path_offsets(x: float, y: float, path) -> tuple[float, ...]:
+  """|y| m off straight ahead and, with the model's path (x, y left), off it at x."""
+  if path is None or not len(path[0]):
+    return (abs(y),)
+  return abs(y), abs(y - float(np.interp(x, path[0], path[1])))
+
+
+def in_front(x: float, y: float, in_path_flag: bool, path=None) -> bool:
+  """(x, y) is in front of the car for the person-may-be-in-front latch (module docstring): up to PERSON_FRONT_X_M ahead, in
+  the tracker's corridor (in_path_flag: TrackedObject.inPath) or within PATH_HALF_WIDTH_M of straight ahead or of the model's
+  path (path, as curb_ped's), or ahead of the bumper (PERSON_FRONT_BUMPER_M) within its margin too, PERSON_FRONT_HALF_M: a
+  person in that margin level with the bonnet is beside the car, not in front (a kerb-side walker passed at a crawl, lost
+  as she leaves the wide camera's frame by the front corner)."""
+  if not 0. < x <= PERSON_FRONT_X_M:
+    return False
+  off = min(path_offsets(x, y, path))
+  return in_path_flag or off < PATH_HALF_WIDTH_M or (x > PERSON_FRONT_BUMPER_M and off < PERSON_FRONT_HALF_M)
+
+
+def clear_of_path(x: float, y: float, in_path_flag: bool, path=None) -> bool:
+  """(x, y) is clear of the car's corridor by PERSON_FRONT_MARGIN_M, straight ahead and the model's path both."""
+  return not in_path_flag and min(path_offsets(x, y, path)) >= PERSON_FRONT_HALF_M
+
+
 def trusted_velocity(objects) -> list:
   """objects with each pedestrian moving faster than PED_MAX_SPEED read standing (StillPedestrian)."""
   return [StillPedestrian(obj) if str(obj.cls) == "pedestrian" and math.hypot(obj.vx, obj.vy) > PED_MAX_SPEED else obj for obj in objects]
@@ -478,6 +530,21 @@ class TrackEvidence:
   hit_x: float = math.inf                       # m ahead at its last new hit (LOST_CLOSE_M)
   walker: bool = False                          # earned a crosswalk hold
   leaving: int = 0                              # frames in a row leaving the turn's crosswalk
+  hit_y: float = 0.                             # m left at its last new hit (the person-may-be-in-front latch)...
+  hit_t: float = -math.inf                      # ...ScenePolicy.t of it
+  hit_front: bool = False                       # ...in front of the car then (in_front)
+  stood: bool = False                           # a pedestrian stop for it held the car at rest: TurnPilot stopped for it
+
+
+@dataclass
+class PersonFront:
+  """The person-may-be-in-front latch (module docstring): what set it, and its clearance so far."""
+  t: float                                      # ScenePolicy.t when it was set (turnpilotd's bound runs from it)
+  evidence: dict                                # the lost track's, logged
+  others: set = field(default_factory=set)      # tracks published when it was set: someone else, never her seen again
+  inside: set = field(default_factory=set)      # pedestrian tracks with a new hit in front of the car since
+  left: bool = False                            # one of them since had a new hit clear of the corridor
+  clear_s: float = 0.                           # s since, on live frames, with nothing person-like in front
 
 
 class ScenePolicy:
@@ -502,6 +569,8 @@ class ScenePolicy:
     self.curb_logged: set[int] = set()  # tracks it was logged for
     # the crosswalk hold in force: whether every walker it is for stands (walker_standing), None with no crosswalk hold (SC-02)
     self.holders_standing: bool | None = None
+    self.person_front: PersonFront | None = None  # a person who may be in front (module docstring)
+    self.front_tracks: dict[int, dict] = {}  # ...the last live frame's tracks that set it should they end: their evidence
 
   def fault(self, maneuver_id: int | None = None) -> None:
     """turnpilotd faulted and dropped the route (maneuver_id: its maneuver): the junction hold in force stays where it
@@ -526,12 +595,15 @@ class ScenePolicy:
 
   def update(self, objects, available: bool, maneuver, distance: float, v_ego: float, right_hand_traffic: bool = True,
              maneuver_id: int | None = None, gas_pressed: bool = False, dt: float = DT_MDL, extra_stops=(),
-             heading_deg: float = 0., path=None, extra_objects=()) -> SceneDecision:
+             heading_deg: float = 0., path=None, extra_objects=(), driver: bool = False,
+             raw_people: bool | None = None) -> SceneDecision:
     """As scene_policy(), plus maneuver_id (RouteFollower.maneuver_id), once per frame dt apart. gas_pressed: the driver
     taking over (turnpilotd: carState.gasPressed with openpilot disengaged), never a go. extra_stops: the map's stop signs
     and signals (map_controls.py), composed with the scene's like any other stop. heading_deg: as scene_policy()'s. path:
     the model's path ahead (scene.tracker.predicted_path: x, y left), None straight ahead, for the curb cap. extra_objects:
-    tracker B's b_only objects (module docstring), taken after the scene's, and like them only while it is available."""
+    tracker B's b_only objects (module docstring), taken after the scene's, and like them only while it is available.
+    driver: the driver has the car (openpilot disengaged, or the gas pressed), which ends person_front and sets none;
+    raw_people: a raw person box of the last detector runs is in front of the car (turnpilotd), None not known (person_front)."""
     far_side = far_side_turn(maneuver, right_hand_traffic)
     self.t += dt
     if available:
@@ -541,7 +613,13 @@ class ScenePolicy:
         ev = self.tracks[obj.trackId]
         leaving = maneuver is not None and maneuver.kind == TURN and leaving_crosswalk(obj, distance, maneuver.side)
         ev.leaving = ev.leaving + 1 if leaving else 0
+        if ev.hit_t == self.t:
+          ev.hit_front = in_front(float(obj.x), float(obj.y), bool(obj.inPath), path)
       peds = pedestrian_stops(objects, v_ego, lambda obj: self.tracks[obj.trackId].confirmed)
+      if v_ego < STOP_SPEED:  # standing under a pedestrian's stop: TurnPilot stopped for them
+        for s in peds:
+          if s.rest and s.evidence is not None and s.evidence['track_id'] in self.tracks:
+            self.tracks[s.evidence['track_id']].stood = True
       junction = junction_stops(objects, maneuver, distance, v_ego, right_hand_traffic, lambda obj: self.tracks[obj.trackId].walker,
                                 lambda obj: self.tracks[obj.trackId].confirmed and self.tracks[obj.trackId].leaving >= CROSSWALK_LEAVING_FRAMES,
                                 lambda obj: self.tracks[obj.trackId].confirmed, heading_deg)
@@ -579,12 +657,67 @@ class ScenePolicy:
       holders = crosswalk_holders(objects, distance, maneuver.side, lambda obj: self.tracks[obj.trackId].walker,
                                   lambda obj: self.tracks[obj.trackId].confirmed and self.tracks[obj.trackId].leaving >= CROSSWALK_LEAVING_FRAMES)
       self.holders_standing = all(walker_standing(obj) for obj in holders) if holders else None
-    stops = peds + junction + self._fault_hold(available, maneuver, distance, v_ego, gas_pressed, dt) + list(extra_stops)
+    front = self.front_update(objects if available else None, v_ego, path, driver, raw_people, dt)
+    stops = front + peds + junction + self._fault_hold(available, maneuver, distance, v_ego, gas_pressed, dt) + list(extra_stops)
     stops += self.curb_ped(objects if available else [], v_ego, path, dt)
     decision = decide(stops, v_ego)
     decision.accel_cap = self.ramp(decision.accel_cap, dt)
     self.hard_brake(decision, stops, v_ego)
     return decision
+
+  def front_update(self, objects, v_ego: float, path, driver: bool, raw_people: bool | None, dt: float) -> list[Stop]:
+    """The person-may-be-in-front latch this frame (module docstring): ended by the driver, set by a track it watches ending,
+    cleared by her seen leaving and PERSON_FRONT_CLEAR_S of nothing person-like in front; and its stop while it is set.
+    objects: this frame's (trusted_velocity's, evidence updated), None with no live scene."""
+    if driver and self.person_front is not None:
+      self._front_end('driver')
+    if objects is not None:
+      present = {obj.trackId for obj in objects}
+      lost = [ev for tid, ev in self.front_tracks.items() if tid not in present]
+      if lost and not driver and v_ego <= PERSON_FRONT_SPEED + 1e-6:
+        self._front_set(min(lost, key=lambda ev: ev['hit_x']), present, v_ego)
+      self.front_tracks = {}
+      for obj in objects:
+        ev = self.tracks[obj.trackId]
+        if str(obj.cls) == "pedestrian" and ev.hit_front and (ev.earned or ev.stood):
+          self.front_tracks[obj.trackId] = {**track_evidence(obj), 'hit_x': round(ev.hit_x, 2), 'hit_y': round(ev.hit_y, 2),
+                                            'stood': ev.stood, 'earned': ev.earned}
+      if self.person_front is not None:
+        self._front_clear(objects, path, raw_people, dt)
+    if self.person_front is None:
+      return []
+    return [stop(v_ego, v_ego ** 2 / (2. * STOP_DECEL), PERSON_FRONT_NOTE, confirmed=False, evidence=self.person_front.evidence,
+                 soft=True)]
+
+  def _front_set(self, evidence: dict, present: set, v_ego: float) -> None:
+    pf = self.person_front
+    if pf is None:
+      self.person_front = PersonFront(self.t, evidence, others=set(present))
+    else:  # another one lost in front while it is set: her clearance starts over, its bound runs on
+      pf.evidence, pf.others, pf.inside, pf.left, pf.clear_s = evidence, pf.others | present, set(), False, 0.
+    cloudlog.event("turnpilot.person_front", error=True, again=pf is not None, v_ego=round(v_ego, 2), **evidence)
+
+  def _front_clear(self, objects, path, raw_people: bool | None, dt: float) -> None:
+    pf = self.person_front
+    for obj in objects:
+      ev = self.tracks[obj.trackId]
+      if str(obj.cls) != "pedestrian" or ev.hit_t != self.t or obj.trackId in pf.others:
+        continue  # a new hit of a person who isn't someone else's track: a coast drifting is no sighting
+      if ev.hit_front:
+        pf.inside.add(obj.trackId)
+      elif obj.trackId in pf.inside and clear_of_path(float(obj.x), float(obj.y), bool(obj.inPath), path) and not pf.left:
+        pf.left = True
+        cloudlog.event("turnpilot.person_front_leaving", track_id=int(obj.trackId), x=round(float(obj.x), 2), y=round(float(obj.y), 2),
+                       held_s=round(self.t - pf.t, 1))
+    near = raw_people is None or raw_people or \
+      any(str(o.cls) in PERSON_LIKE and in_front(float(o.x), float(o.y), bool(o.inPath), path) for o in objects)
+    pf.clear_s = pf.clear_s + dt if pf.left and not near else 0.
+    if pf.clear_s >= PERSON_FRONT_CLEAR_S - 1e-6:
+      self._front_end('left')
+
+  def _front_end(self, why: str) -> None:
+    pf, self.person_front = self.person_front, None
+    cloudlog.event("turnpilot.person_front_clear", why=why, held_s=round(self.t - pf.t, 1), track_id=pf.evidence.get('track_id'))
 
   def curb_ped(self, objects, v_ego: float, path, dt: float) -> list[Stop]:
     """The curb-pedestrian speed cap (module docstring): a speed cap of CURB_PED_SPEED eased to ask no more than
@@ -650,9 +783,9 @@ class ScenePolicy:
     for obj in objects:
       ev = tracks.get(obj.trackId)
       if ev is None or obj.age < ev.hits:
-        ev = TrackEvidence(obj.age, self.t, obj.age, hit_x=float(obj.x))
+        ev = TrackEvidence(obj.age, self.t, obj.age, hit_x=float(obj.x), hit_y=float(obj.y), hit_t=self.t)
       elif obj.age > ev.hits:
-        ev.hit_x = float(obj.x)
+        ev.hit_x, ev.hit_y, ev.hit_t = float(obj.x), float(obj.y), self.t
       ev.recent.extend([self.t] * max(obj.age - ev.hits, 0))
       ev.hits, ev.seen_t = obj.age, self.t
       while ev.recent and ev.recent[0] <= self.t - RECENT_S:

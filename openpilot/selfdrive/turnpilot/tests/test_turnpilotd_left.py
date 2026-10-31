@@ -881,13 +881,17 @@ def test_after_the_red_the_go_waits_for_a_fresh_window_and_the_exit_crosswalk():
 def test_a_hold_after_the_go_withdraws_it_and_the_car_waits_for_a_fresh_go():
   # skeptic G4 (blocker 2): any hold after the go (a walker in the path) left a stale go that ran when the hold let go. Now
   # the go is withdrawn while it can be, the car stands, and it goes again only on a fresh window after the hold
-  st = {'go_t': None}
+  st = {'go_t': None, 'clear': False}
 
   def ped(sim):
     if st['go_t'] is None and sim.tp.left_now is not None and sim.tp.left_now.state == 'go':
       st['go_t'] = sim.t
     if st['go_t'] is not None and sim.t < st['go_t'] + 3.:
       return ({'cls': 'pedestrian', 'x': 6., 'y': 0., 'vx': 0., 'vy': 0., 'age': 40, 'trackId': 5, 'conf': 0.8, 'inPath': True,
+               'camera': 'road'},)
+    if st['go_t'] is not None and not st['clear']:  # seen walking clear of the path (WF-13: never lost in front of the car)
+      st['clear'] = True
+      return ({'cls': 'pedestrian', 'x': 6., 'y': 3., 'vx': 0., 'vy': 1.2, 'age': 41, 'trackId': 5, 'conf': 0.8, 'inPath': False,
                'camera': 'road'},)
     return ()
   sim = left_sim()
