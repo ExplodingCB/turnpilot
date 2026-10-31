@@ -17,9 +17,9 @@ from openpilot.selfdrive.turnpilot.stop_go import Frame
 from openpilot.selfdrive.turnpilot.tests.test_camera_lights import detections
 from openpilot.selfdrive.turnpilot.tests.test_go_override import WARM_S
 from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of, model_v2
-from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, RIGHT_AT_A_CORNER, T_LEFT, Sim, go_from_a_red,
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, RIGHT_AT_A_CORNER, T_LEFT, WALKER, Sim, go_from_a_red,
                                                                  model_stands_in_the_turn, oracle_lights, stand, stop_at, walker_stops_the_car)
-from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_go import attach_planner, holding, raw_person
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_go import attach_planner, holding, model_stops_at, raw_person
 from openpilot.selfdrive.turnpilot.unprotected_left import LIGHT_RED_MAX_S
 from openpilot.selfdrive.turnpilot.turnpilotd import (LEAD_STAND_MAX_S, LIGHT_GREEN_REASON, LIGHT_WAIT_NOTE, NEAR_CONTROL_STAND_S, NO_MOVE_MAX_S,
                                                       NO_MOVE_REASON, NO_MOVE_S, QUEUE_STILL_MAX_S, RELEASE_GOES, RELEASE_LIFT_M, STALLED_REASON,
@@ -555,3 +555,60 @@ def test_a_steady_camera_green_the_model_doesnt_go_on_chimes():
       assert t_green <= said[0] * DT_MDL <= t_green + 5. and plans[said[0]].reason == LIGHT_GREEN_REASON
       assert said == list(range(said[0], said[0] + len(said))) and len(said) * DT_MDL <= 3.1  # one chime, held a moment
     assert all(str(q.goCertified.cause) == 'none' for q in plans)
+
+
+# --- LEFT-20 (ST-07 (stalls)): a release where no signal is (RELEASE_UNSIGNALIZED under section 4.5's conditions) ---
+
+def camera_heads(*heads):
+  """turnpilotLights with no source and the camera's shadow reader live (lightStatus read) reading heads [(state, s of the
+  head)] every frame (none: it reads no head of any colour)."""
+  none = messaging.new_message('turnpilotLights').as_reader().turnpilotLights
+
+  def lights(sim):
+    msg = messaging.new_message('turnpilotDetections')
+    td = msg.turnpilotDetections
+    td.camera, td.lightStatus = 'road', 'read'
+    td.lights.source, td.lights.shadow = 'camera', True
+    td.lights.lights = [{'state': st, 'distance': s - sim.s, 'governs': True, 'votes': 4, 'conf': 0.7} for st, s in heads]
+    sim.sm.put('turnpilotDetections', msg.as_reader().turnpilotDetections)
+    return none
+  return lights
+
+
+NO_HEADS = camera_heads()
+
+
+def released_where_no_signal_is(on: bool, status='ok', controls=(), lights=NO_HEADS, signs=False):
+  """RIGHT_AT_A_CORNER (no signal there), navd's controls status status, the model stopping the car short of the corner and
+  holding it (plannerd in the loop) while a walker crosses in front; they clear and TurnPilot's hold lets go. lights: the
+  camera's reads; signs: each road run has a stop-sign box. Returns the plans from the walker clearing."""
+  sim = Sim(RIGHT_AT_A_CORNER, controls=list(controls), controls_status=status)
+  sim.tp.always_drive, sim.go_taps = on, False
+  sim.lights = lights
+  sim.raw = lambda s: RawFrame([], 'road', s.t, signs=((0., 2., 0.8),) if signs else ())
+  sim.accel = model_stops_at(289.)
+  while not (sim.v < 0.05 and sim.s > 280.):
+    sim.step(engaged=True)
+    assert sim.t < 80.
+  attach_planner(sim, holding)
+  held = [sim.step(WALKER, engaged=True) for _ in range(round(2. / DT_MDL))]
+  assert held[-1].shouldStop
+  return [sim.step(engaged=True) for _ in range(round(3. / DT_MDL))]
+
+
+def certified_causes(plans):
+  return {str(q.goCertified.cause) for q in plans} - {'none'}
+
+
+def test_a_release_where_no_signal_is_mapped_is_lifted_only_under_section_4_5s_conditions():
+  """ALWAYS_DRIVE.md LEFT-20: under the switch RELEASE_UNSIGNALIZED holds for a curb-side or straight release where
+  release_light reads 'none' (navd's controls ok: the sidecar served), no map control is within 30 m, the camera's shadow
+  reader is live and reads no head of any colour, and no detector stop-sign box was seen; never with 'partial', a head, a
+  sign box or a control near; switch off, never (RELEASE_UNSIGNALIZED False)."""
+  assert certified_causes(released_where_no_signal_is(True)) == {'turnRelease'}
+  assert certified_causes(released_where_no_signal_is(False)) == set()
+  assert certified_causes(released_where_no_signal_is(True, status='partial')) == set()
+  assert certified_causes(released_where_no_signal_is(True, lights=camera_heads(('unknown', 330.)))) == set()
+  assert certified_causes(released_where_no_signal_is(True, lights=None)) == set()  # the reader not live: no head can't be known
+  assert certified_causes(released_where_no_signal_is(True, signs=True)) == set()
+  assert certified_causes(released_where_no_signal_is(True, controls=[(315., 'yield')])) == set()

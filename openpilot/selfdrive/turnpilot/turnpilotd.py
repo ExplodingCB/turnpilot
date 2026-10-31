@@ -408,6 +408,12 @@ LEFT_LIFT_ROOM_M = 0.5 * GO_ACCEL * GO_WINDOW_S ** 2 + (GO_ACCEL * GO_WINDOW_S) 
 # certifies it at a junction navd maps with no signal (controls ok); an unmapped signal or stop sign, and cross traffic, then
 # go unchecked
 RELEASE_UNSIGNALIZED = False
+# ...under TurnPilotAlwaysDrive (ALWAYS_DRIVE.md LEFT-20) it is True for a curb-side or straight release where release_light reads
+# 'none' (navd's controls ok: the sidecar served) and section 4.5's conditions hold, since 'ok' means the sidecar came, not that
+# OSM has every signal and stop sign (unsignalized_why): no map control within STOPPED_CONTROL_M, the camera's shadow reader
+# live and reading no head of any colour, no detector stop-sign box in a forward run for SIGN_CLEAR_S (and the camera's signs
+# read at all). A red or yellow from any source still blocks, a mapped signal still needs an accepted green
+SIGN_CLEAR_S = 5.
 # the stop-sign decider's go causes (stop_go.py, go_override.CAUSES): its own watchdog (the gate, G5's window, GO_RETRIES, H5)
 # follows them, never the no-move clock, and turnRelease never certifies alongside one
 STOP_GO_CAUSES = ('stopSign', 'rollUp', 'creep', 'clearBox')
@@ -625,6 +631,8 @@ class TurnPilot:
     self.override_failed_t = 0.   # s overrideWriteFailed has left to show
     self.always_drive = ALWAYS_DRIVE_DEFAULT  # TurnPilotAlwaysDrive (main())
     self.shadow = False           # the last plan's shadow mode: the switch does nothing in it (always_drive_on)
+    self.rht = True               # this frame's right_hand_traffic (update())
+    self.sign_seen_s = 0.         # s since a forward detector run had a stop-sign box (unsignalized_why), from 0 at the start
     self.rel_takeover = Takeover()  # the model's takeover predicate frame by frame, a go out or not (watch_release)
     self.rel_takeover_held = False  # ...held this frame
     self.reset()
@@ -677,6 +685,7 @@ class TurnPilot:
     self.stall_gap_s = math.inf    # ...s since the last one ended
     self.stall_why = ''            # ...why none may go now, as last logged
     self.stall_alert_t = 0.        # ...s left of its stallLift alert
+    self.unsig_why = ''            # under the switch, why a release where no signal is mapped isn't lifted, as last logged
     self.people_runs: dict = {}    # (camera, view) -> [s old, the person boxes] of each camera's last detector run
     self.abandon_s = 0.            # the model steering away from the route's turn in the junction (turn_abandoned)
     self.wrong_s = 0.              # s of reads of a yellow line on the car's right (wrong_side)
@@ -890,6 +899,10 @@ class TurnPilot:
     handback = self.handback(available, sm.updated['modelV2'], sm['carControl'].enabled)
     plan.handback = handback
     self.watch_people(raw, raw_far)
+    self.rht = right_hand_traffic
+    forward = [r for r in [raw] + [run for key, _t, run, _s in self.runs_now if key in ('road', 'full')]
+               if r is not None and r.camera == 'road' and r.view == 'full']
+    self.sign_seen_s = 0. if any(getattr(r, 'signs', ()) for r in forward) else self.sign_seen_s + DT_MDL
     self.watch_lead(model, objects, raw)
     acting = self.detector_seen and handback == Handback.none
     lat_active = sm['carControl'].latActive
@@ -2062,7 +2075,30 @@ class TurnPilot:
       # its own go read its junction (turn_light: no signal there, or a green from some source): at a signal the lift needs
       # the green from an accepted source; with none there it goes on its gap
       return '' if light == 'green' or not self.map_controls.signal_known(self.follower.maneuver_id, distance) else 'light'
+    if light == 'none' and not RELEASE_UNSIGNALIZED and self.always_drive_on and \
+       not far_side_turn(None if self.go_straight else self.follower.upcoming, self.rht):
+      why = self.unsignalized_why(distance)
+      if why != self.unsig_why:
+        cloudlog.event("turnpilot.release_unsignalized", ok=not why, why=why, distance=round(distance, 1))
+        self.unsig_why = why
+      return 'light' if why else ''
     return '' if light == 'green' or (light == 'none' and RELEASE_UNSIGNALIZED) else 'light'
+
+  def unsignalized_why(self, distance: float) -> str:
+    """Why release_light's 'none' at the junction distance m ahead can't stand for no signal there under the switch, '' if
+    it can (ALWAYS_DRIVE.md LEFT-20 and section 4.5's conditions): a map control within STOPPED_CONTROL_M of the car or the
+    junction, the camera's shadow reader not live or reading a head of any colour, or a stop-sign box seen in a forward run
+    within SIGN_CLEAR_S (or the camera's signs not read)."""
+    mc = self.map_controls
+    controls = [c for c in list(mc.tracker.controls.values()) + [mc.turn] if c is not None]
+    if any(abs(c.d) < STOPPED_CONTROL_M or abs(c.d - distance) < STOPPED_CONTROL_M for c in controls):
+      return 'control'
+    camera = mc._lights.camera  # the camera's reader as the last map update had it (None: off, stale or not read)
+    if camera is None or camera.status != 'read' or camera.heads:
+      return 'camera'
+    if not self.camera_signs or self.sign_seen_s < SIGN_CLEAR_S - 1e-6:
+      return 'stopSign'
+    return ''
 
   def withdraw_go(self, sm, cs, acting: bool, available: bool, objects, raw, decision, took_over: bool, distance: float) -> None:
     """The certified go out withdrawn this frame, plannerd's lift with it, once anything it was certified on stops holding
