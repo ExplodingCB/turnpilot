@@ -1205,11 +1205,19 @@ class TurnPilot:
       self.missed_t = MISSED_HOLD_S  # the other turn taken: the route's planned turn is missed, navd reroutes at once (3.5)
     self.clear_driven_left(rf)
     self.clear_withdrawn_left(rf)
+    # no turn on red, ever (SAT_VALIDATION row 14; Kellen: "it should always stop on red"): a red read at the turn's junction
+    # from any source (release_light: the oracle's, a mapped signal's, the camera's in shadow too, as it vetoes lifts) holds
+    # the desire at none, standing as moving, until the car is TURN_STARTED_DEG into the turn (a turn under way is never
+    # taken back). DesireTiming keeps its pulse's timing, so the turn isn't judged too late, and the green's go pulses a fresh
+    # edge as after any hold
+    red_here = self.map_controls.release_light(d_dist) == 'red'
     desire = self.desires.update(d_on, d_dist, d_id, d_passed, v_ego, cs.steeringAngleDeg,
                                  not keep_why[LEFT], not keep_why[RIGHT], DT_MDL, default_yaw_rate(cs, model),
                                  lat_active=lat_active, replaced=d_replaced,
                                  may_start=skip.feasible_now and not held and not hold_pulse, go=self.release_go,
-                                 holding=decision.should_stop or withdrawn)
+                                 holding=decision.should_stop or withdrawn or red_here)
+    if red_here and desire in (Desire.turnLeft, Desire.turnRight) and self.desires.turned_deg < TURN_STARTED_DEG:
+      desire = Desire.none
     self._yaw_ticked = True
     self.keep_unsent(act_on, rf, v_ego, lat_active, keep_why, model, plan)
     d = self.desires

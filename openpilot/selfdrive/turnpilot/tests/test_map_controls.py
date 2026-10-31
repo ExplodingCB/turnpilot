@@ -334,6 +334,43 @@ def test_flicker_green_unknown_green():
       assert not out.stops and dec.speed_cap >= car.v
 
 
+@pytest.mark.parametrize("past", [0., 2.5, 4.])
+def test_a_red_crept_past_its_line_is_never_dropped_the_car_stops_where_it_is_and_waits_for_green(past):
+  """SAT_VALIDATION row 14 (red_right_g62): under a red the sim car crept over the line at 1.1 m/s and 2 m past it the red
+  was dropped as an overrun, then the turn went on red. A red the car crosses slower than COMMIT_SPEED is never dropped:
+  the car stops where it is on the comfortable curve (never below -MAP_STOP_DECEL asked), waits ("Waiting at the light"),
+  held until a steady green, with no overrun said and no take-control."""
+  from openpilot.selfdrive.turnpilot.map_controls import MAP_STOP_DECEL, RED_PAST_REASON
+  car = Car([(200., 'signal')], v=1.1, cruise=1.1)
+  car.s = 185.
+  car.run_until(lambda out, dec: out.stops, lights=oracle('red'))
+  # the car creeps on at 1.1 m/s whatever is asked (BeamNG's light brake below 3 m/s), openpilot engaged
+  car.run_until(lambda out, dec: car.s > 200. + past, max_s=40., lights=oracle('red'), accel=0., engaged=True)
+  s_over, alerts, asked = car.s, [], []
+  for _ in range(int(20. / DT_MDL)):
+    out, dec, cmd = car.step(lights=oracle('red'))
+    alerts.append(out.alert)
+    asked.append(cmd)
+  assert car.v == 0. and car.s - s_over < 1.0
+  assert held(out, dec) and dec.reason == RED_PAST_REASON == "Waiting at the light" and out.prompt == 'none'
+  assert 'stopOverrun' not in alerts and out.driven == '' and min(asked) >= -MAP_STOP_DECEL - 1e-6
+  out, dec, _ = car.run(GREEN_STEADY_S + 0.1, lights=oracle('green'))
+  assert not dec.should_stop
+  out, dec, _ = car.run(3., lights=oracle('green'))
+  assert car.v > 0.5 and not out.stops
+
+
+def test_a_red_crossed_faster_than_commit_speed_is_still_the_cars_going():
+  # past the line at more than COMMIT_SPEED the car is in the junction: never stopped there (the overrun, said, dropped)
+  car = Car([(200., 'signal')], v=6., cruise=6.)
+  car.s = 150.
+  car.run_until(lambda out, dec: out.stops, lights=oracle('red'))
+  car.run_until(lambda out, dec: car.s > 203., max_s=40., lights=oracle('red'), accel=0., engaged=True)
+  alerts = [car.step(lights=oracle('red'))[0].alert for _ in range(20)]
+  out, dec, _ = car.step(lights=oracle('red'))
+  assert 'stopOverrun' in alerts and not out.stops and car.v > 5.
+
+
 def test_a_red_whose_light_is_lost_stays_stopped_until_a_steady_green():
   car = Car([(150., 'signal')])
   car.run_until(held, lights=oracle('red'))
