@@ -93,6 +93,7 @@ class Sim:
     self.answers_prompt = False
     self._signal = 'none'
     self.car_signal = None  # carState.carSignal's fields, a function of the sim (the car's own turn signal), or None
+    self.blindspot = None  # (left, right) of the car's blind spot monitor, a function of the sim, or None for both clear
     self.trace = []
 
   def step(self, objects=(), available=True, steer=0., blinker=False, lat_active=True, yaw_rate=0., gas=False,
@@ -116,9 +117,11 @@ class Sim:
         self._signal = prompt
       elif self.tp.turn_signal.armed_id is None:
         self._signal = 'none'
+    left_bs, right_bs = self.blindspot(self) if self.blindspot is not None else (False, False)
     self.sm.put('carState', car_state(self.v, steer, left_blinker=blinker or self._signal == 'left',
                                       right_blinker=self._signal == 'right', yaw_rate=yaw_rate, gas_pressed=gas,
-                                      car_signal=self.car_signal(self) if self.car_signal is not None else None))
+                                      car_signal=self.car_signal(self) if self.car_signal is not None else None,
+                                      left_blindspot=left_bs, right_blindspot=right_bs))
     self.sm.put('carControl', car_control(lat_active, engaged))
     if self.model_running:
       self.sm.put('modelV2', self.model(self) if self.model is not None else
@@ -3132,3 +3135,61 @@ def test_a_stop_approached_at_road_speed_keeps_the_road_camera_at_10_hz_for_hard
   cams = [ModeldDetector.choose_camera(det, 0., log.Desire.none, k * RUN_EVERY * DT_MDL, v) for k, v in enumerate(fast[::RUN_EVERY])]
   road_hz = cams.count('road') / len(cams) / (RUN_EVERY * DT_MDL)
   assert road_hz == pytest.approx(10.) and road_hz * CONFIRM_WINDOW_S >= 2 * CONFIRM_RECENT_HITS
+
+
+TWO_LANES_RIGHT_TURN = ((("straight",), False), (("right",), True))
+BROKEN_WHITE_RIGHT = (UNKNOWN, SW, BW, UNKNOWN)
+
+
+def skipped_for_its_lane(sim, turn_s):
+  """The plans, and the index of the first skip: skipReason laneBlocked once the lane change window has ended, the skip held
+  to the junction, and never a turn pulse or a change from the lane the car is in."""
+  plans = [p for _, _, p in sim.trace]
+  first = next((i for i, p in enumerate(plans) if p.tooFastToTurn), None)
+  assert first is not None, {str(p.laneChangeWait) for p in plans}
+  assert plans[first].skipReason == 'laneBlocked'
+  assert turn_s - sim.trace[first][0] <= lane_change_window(sim.trace[first][1])[1] + 1.
+  assert all(p.tooFastToTurn for p in plans[first:] if 0. < p.maneuverDistance < turn_s - sim.trace[first][0])
+  assert all(p.desire == Desire.none and p.laneChange == LaneChange.none for p in plans)
+  return plans, first
+
+
+@pytest.mark.parametrize("always_drive", [False, True])
+def test_a_turn_whose_lane_change_never_went_is_skipped_out_loud_never_turned_from_the_wrong_lane(always_drive):
+  """LC-03 (ALWAYS_DRIVE.md 4.11), unconditional: today the wrong lane is only flagged ('Wrong Lane', silent) and the turn is
+  pulsed from the lane the car is in, across the next one. The map's lane list puts the car one lane left of the right turn's
+  lane; a car held in the blind spot through the window, or the car at 15 mph (DesireHelper changes no lanes under 20 mph:
+  never offered), and the change never goes. At the window's end the turn is skipped out loud and navd reroutes ("Can't Reach
+  Turn Lane", skipReason laneBlocked), with the switch off as well as on."""
+  sim = Sim([(400., 'turn', 'right'), (2000., 'turn', 'left')], cruise=15., nav_lanes={0: TWO_LANES_RIGHT_TURN}, model_lanes=(0, 1),
+            paint=BROKEN_WHITE_RIGHT)
+  sim.tp.always_drive = always_drive
+  sim.blindspot = lambda sim: (False, True)
+  sim.run(26.)
+  plans, first = skipped_for_its_lane(sim, 400.)
+  assert {str(p.laneChangeWait) for i, p in enumerate(plans[:first]) if 120. < 400. - sim.trace[i][0] < 280.} == {'blindspot'}
+  sim = Sim([(300., 'turn', 'right'), (2000., 'turn', 'left')], cruise=6.7, nav_lanes={0: TWO_LANES_RIGHT_TURN}, model_lanes=(0, 1),
+            paint=BROKEN_WHITE_RIGHT)
+  sim.tp.always_drive = always_drive
+  sim.run(40.)
+  plans, first = skipped_for_its_lane(sim, 300.)
+  assert not any(p.laneChangeOffer != LaneChange.none for p in plans)
+
+
+def test_a_turn_whose_desire_went_out_is_never_skipped_for_its_lane():
+  """A committed turn goes on (R13): the lane planner's block skips only a turn whose desire hasn't gone out. The block is
+  forced on here from the frame the turn's desire is out, never before it."""
+  sim = Sim([(400., 'turn', 'right'), (2000., 'turn', 'left')], cruise=15., nav_lanes={0: TWO_LANES_RIGHT_TURN}, model_lanes=(0, 1),
+            paint=BROKEN_WHITE_RIGHT)
+  sim.blindspot = lambda sim: (False, True)
+  real = sim.tp.lanes.update
+  committed = []
+
+  def update(*a, **kw):
+    d = real(*a, **kw)
+    committed.append(sim.tp.desires.started)
+    return d._replace(blocked=sim.tp.desires.started)  # blocked only once the desire is out
+  with mock.patch.object(sim.tp.lanes, 'update', side_effect=update):
+    sim.run(30.)
+  assert any(committed)
+  assert not any(p.tooFastToTurn for _, _, p in sim.trace)

@@ -308,12 +308,14 @@ def keep_skip_title(plan) -> str | None:
 def turnpilot_too_fast_to_turn_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool,
                                      soft_disable_time: int, personality) -> Alert:
   """The turn ahead is skipped and navd reroutes (turnpilotPlan.tooFastToTurn): too fast to make it, or a map stop left no
-  room to get into its lane (laneChangeWait unreachable, lane_planner.py), or a keep the model can't be sent (skipReason
+  room to get into its lane (laneChangeWait unreachable, lane_planner.py) or the change into it never went by the lane change
+  window's end (skipReason laneBlocked: LC-03), or a keep the model can't be sent (skipReason
   keepNoLine: no lane line that way; keepFarSide: no lane of ours beyond it toward the far side, turnpilotd.keep_unsent). Or a
   turn the car pulled away into from a standstill went straight past its junction (turnpilotPlan.turnMissed, turnpilotd.py):
   missed, and navd reroutes."""
   plan = shown_plan(sm)
-  lane = plan is not None and str(plan.laneChangeWait) == 'unreachable'
+  # a map stop leaving no room to get into the turn's lane, or a change it needed that never went (LC-03, skipReason laneBlocked)
+  lane = plan is not None and (str(plan.laneChangeWait) == 'unreachable' or str(plan.skipReason) == 'laneBlocked')
   missed = plan is not None and plan.turnMissed
   blind = plan is not None and str(plan.unprotectedLeft.state) == 'skipped'  # oncoming too fast for the detector's range
   signal = too_fast_title(plan) if plan is not None else None  # the turn signal's skips (car_signals.py: a veto, a side in doubt)

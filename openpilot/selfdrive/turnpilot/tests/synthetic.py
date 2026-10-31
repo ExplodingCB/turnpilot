@@ -165,8 +165,9 @@ def model_v2(lanes_left=0, lanes_right=0, lane_change_state='off', big=False, le
 
 
 def car_state(v_ego=10., steering_angle_deg=0., left_blinker=False, right_blinker=False, gas_pressed=False, yaw_rate=0.,
-              brake_pressed=False, car_signal=None):
-  """car_signal: carState.carSignal's fields (a port working its own turn signal), or None for none."""
+              brake_pressed=False, car_signal=None, left_blindspot=False, right_blindspot=False):
+  """car_signal: carState.carSignal's fields (a port working its own turn signal), or None for none; blindspots: the car's
+  blind spot monitor (Tesla DAS_status)."""
   msg = messaging.new_message('carState')
   cs = msg.carState
   for k, v in (car_signal or {}).items():
@@ -178,6 +179,7 @@ def car_state(v_ego=10., steering_angle_deg=0., left_blinker=False, right_blinke
   cs.rightBlinker = right_blinker
   cs.gasPressed = gas_pressed
   cs.brakePressed = brake_pressed
+  cs.leftBlindspot, cs.rightBlindspot = left_blindspot, right_blindspot
   return msg.as_reader().carState
 
 

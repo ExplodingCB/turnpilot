@@ -68,6 +68,19 @@ unreachable, and the reason), and where the map's lane list places the car in a 
 LaneDecision.unreachable: turnpilotd skips the maneuver by the too-fast rules (turn_skip.py: out loud, navd reroutes),
 never a turn from the wrong lane or a change too late. Every frame LaneDecision.wait says why a change the route wants
 isn't offered (turnpilotPlan.laneChangeWait), and want how many it wants (laneChangeWant), whatever the car's speed.
+
+A change the route still wants at the window's end (LC-03, ALWAYS_DRIVE.md 4.11): whatever held it (the blind spot, a car in
+the target lane, the car too slow for DesireHelper and so never offered one, no signal, DesireHelper waiting too long, the
+lane parked, the line solid), with the car placed in a lane the maneuver doesn't leave from, the turn isn't pulsed from that
+lane across the next one: LaneDecision.blocked, and turnpilotd skips the maneuver out loud as for an unreachable lane
+(skipReason laneBlocked: "Can't Reach Turn Lane", navd reroutes), unless its desire has gone out. Judged once a maneuver, on
+the first frame at or past lane_change_window's end with nothing offered or under way, and held for it. Placed: by the map's
+lane list (every lane the car may be in is one the maneuver doesn't leave from, lane_unconfirmed false); without one, by a
+frame of the window on which the model read both ego lines and change_blocker found a travel lane that way (since the car's
+last lane change: the lane it changed from was no evidence about the one it is in). A window that only ever read the line
+solid or the lane parked doesn't place it: a bike lane behind solid white, a parking strip. The one exception is noLane at the
+window's end (the model sees no lane that way, or one only beyond a yellow line): the lane list may be wrong, or the car is
+at the edge already, and the turn goes as before.
 """
 import math
 from dataclasses import dataclass, field, replace
@@ -134,6 +147,7 @@ AFTER_STOP_REASON = "lane change after the stop"
 UNREACHABLE_REASON = "can't reach the turn lane before the stop"
 
 SIDE_DIRECTIONS = {LEFT: ("left", "slightLeft"), RIGHT: ("right", "slightRight")}
+UNJUDGED = object()  # LanePlanner's LC-03 verdict for no maneuver yet (maneuver ids may be None)
 
 
 def offer_room_s(v_ego: float, lead_m: float | None) -> float:
@@ -562,6 +576,8 @@ class LaneDecision(NamedTuple):
   want: int = 0       # TurnpilotPlan.laneChangeWant: the changes the route wants, positive left, at any speed
   unreachable: bool = False  # the lane list places the car in a lane the maneuver doesn't leave from, and a map stop leaves
                              # no room to change before it nor after its go: turnpilotd skips the maneuver
+  blocked: bool = False      # the change the maneuver needs hadn't gone by the window's end, the car placed in a lane the
+                             # maneuver doesn't leave from (LC-03, module docstring): turnpilotd skips the maneuver
 
 
 class LanePlanner:
@@ -597,6 +613,11 @@ class LanePlanner:
     self._wait, self._want, self._unreachable = 'none', 0, False  # this frame's LaneDecision.wait, want, unreachable
     self._unreachable_logged = None   # the maneuver whose unreachable lane was logged
     self._offer_driver = True         # who signals this offer, latched at its warning (module docstring)
+    self._lane_seen = False           # a travel lane read the way wanted on a frame of the window, since the car's last lane
+                                      # change (LC-03's placement without a lane list)
+    self._judged_id = UNJUDGED        # the maneuver whose window's end LC-03 judged
+    self._blocked = False             # ...and its verdict, held for it: LaneDecision.blocked
+    self._last_wait = 'none'          # the last decision's wait (LC-03's log: what held the change)
 
   @property
   def active(self) -> bool:
@@ -630,6 +651,9 @@ class LanePlanner:
         self.abort = 'none'
     if maneuver_id != self._done_id:  # a new maneuver: its changes are counted from here
       self._done_id, self.done, self._start = maneuver_id, 0, None
+      self._lane_seen = False
+    if maneuver_id != self._judged_id:
+      self._blocked = False
     changing = lc_state in (LaneChangeState.laneChangeStarting, LaneChangeState.laneChangeFinishing)
     paint = self.yellow.update(paint, v_ego, dt, changing)
     if changing and self._lc_dir is None:
@@ -658,10 +682,12 @@ class LanePlanner:
       self._lc_dir = None
       self.lines.reset()
       self._cooldown = max(self._cooldown, LC_COOLDOWN_S)
+      self._lane_seen = False  # read from the lane the car left
     elif self.lines.moved:  # the car crossed a line with no change of DesireHelper's (openpilot off, a manual change)
       self.yellow.shift(0)
       self.done, self._start = None, None
       self.lines.reset()
+      self._lane_seen = False
     if self.ours:  # DesireHelper is done with it, whether or not a held blinker keeps it in preLaneChange
       self.ours = False
       self.changes += 1
@@ -693,6 +719,15 @@ class LanePlanner:
         cloudlog.event("turnpilot.lane_unreachable", error=True, want=wanted, distance=round(distance, 1), stop_d=round(stop_d, 1),
                        v_ego=round(v_ego, 2), lane_list=nav_known)
       idle_reason = idle_reason or (AFTER_STOP_REASON if stop_wait == 'afterStop' else UNREACHABLE_REASON)
+    wanted_dir = LEFT if wanted > 0 else RIGHT if wanted < 0 else 0
+    blocker = change_blocker(wanted_dir, lanes, paint, objects, right_hand_traffic,
+                             nav_room(maneuver, lanes, wanted_dir, right_hand_traffic, paint, self.done, self._start)) \
+      if wanted_dir else ''
+    if wanted_dir and end < distance < start and lanes.measured and not blocker:
+      self._lane_seen = True  # a travel lane that way, offered or not (LC-03)
+    if self._judged_id != maneuver_id and maneuver is not None and 0. < distance <= end and self.phase == Phase.IDLE and \
+       not self._pending:
+      self._judge_end(maneuver, maneuver_id, distance, lanes, paint, v_ego, right_hand_traffic, wanted, blocker, nav)
 
     if self._pending:  # the request is withdrawn; DesireHelper didn't start the change (else `changing` above): abort
       self._pending_t -= dt
@@ -708,10 +743,6 @@ class LanePlanner:
                              left_blinker, right_blinker, left_blindspot, right_blindspot, self._offer_driver, right_hand_traffic, dt,
                              inputs_valid, lit_m, lead_m, car_block)
 
-    wanted_dir = LEFT if wanted > 0 else RIGHT if wanted < 0 else 0
-    blocker = change_blocker(wanted_dir, lanes, paint, objects, right_hand_traffic,
-                             nav_room(maneuver, lanes, wanted_dir, right_hand_traffic, paint, self.done, self._start)) \
-      if wanted_dir else ''
     self._wait = 'none' if maneuver is None else 'paintRuleOff' if not self.paint_rule else \
       'inputsInvalid' if not inputs_valid else 'laneUnknown' if self.lane_unknown else 'none' if not wanted else \
       stop_wait or ('cooldown' if self._cooldown > 0. else 'beforeWindow' if distance >= win_start else
@@ -741,6 +772,18 @@ class LanePlanner:
     self._maneuver_id, self._wait_t, self._pre_t = maneuver_id, 0., 0.
     self.abort, self._abort_t = 'none', 0.
     return self._decision(prompt=driver_signals)
+
+  def _judge_end(self, maneuver, maneuver_id, distance, lanes, paint, v_ego, right_hand_traffic, wanted, blocker, nav) -> None:
+    """LC-03 at the window's end, once for the maneuver (module docstring): blocked when a change is still wanted (wanted,
+    desired_changes': a car never offered one for its speed counts), the car is placed, the planner is on and the model sees a
+    lane that way (blocker isn't noLane)."""
+    self._judged_id = maneuver_id
+    placed = not lane_unconfirmed(maneuver, lanes, right_hand_traffic, paint, self.done, self._start) if nav else self._lane_seen
+    self._blocked = bool(wanted) and placed and self.paint_rule and blocker != 'noLane'
+    if wanted:
+      cloudlog.event("turnpilot.lane_blocked" if self._blocked else "turnpilot.lane_not_blocked", error=self._blocked, want=wanted,
+                     distance=round(distance, 1), v_ego=round(v_ego, 2), lane_list=bool(nav), placed=placed, blocker=blocker,
+                     abort=self.abort, wait=self._last_wait)
 
   def _follow_up(self, maneuver, maneuver_id, distance, end, want_dir, fast, lanes, paint, objects, lc_state, v_ego,
                  left_blinker, right_blinker, left_blindspot, right_blindspot, driver_signals, right_hand_traffic, dt,
@@ -827,5 +870,6 @@ class LanePlanner:
 
   def _decision(self, reason: str = "", request: bool = False, prompt: bool = False) -> LaneDecision:
     wait = 'none' if self.phase != Phase.IDLE or self.ours or self._lc_dir is not None else self._wait
+    self._last_wait = wait
     return LaneDecision(self.offer if request else LaneChange.none, self.offer if prompt else LaneChange.none,
-                        reason, self.offer, self.countdown, self.abort, wait, self._want, self._unreachable)
+                        reason, self.offer, self.countdown, self.abort, wait, self._want, self._unreachable, self._blocked)

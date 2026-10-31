@@ -1056,10 +1056,11 @@ class TurnPilot:
     plan.laneChangeOffer, plan.laneChangeCountdown, plan.laneChangeAbort = lc.offer, lc.countdown, lc.abort
     plan.laneChangeWait, plan.laneChangeWant = lc.wait, max(min(lc.want, 127), -128)
     committed = self.desires.maneuver_id == rf.maneuver_id and self.desires.started  # this frame's desire included
-    if lc.unreachable and act_on is not None and not committed and not self.skip.skipped:
-      # a map stop leaves no room to get into the maneuver's lane before it nor after its go: skipped out loud and
-      # rerouted (turn_skip.py), never a turn from the wrong lane. Never one whose desire went out: a committed turn goes on
-      self.skip.skip(act_on, rf.distance, rf.maneuver_id, v_ego, 'laneUnreachable')
+    if (lc.unreachable or lc.blocked) and act_on is not None and not committed and not self.skip.skipped:
+      # a map stop leaves no room to get into the maneuver's lane before it nor after its go, or the change it needs hadn't
+      # gone by the window's end, the car placed in a lane it doesn't leave from (LC-03, lane_planner.py): skipped out loud
+      # and rerouted (turn_skip.py), never a turn from the wrong lane. Never one whose desire went out: a committed turn goes on
+      self.skip.skip(act_on, rf.distance, rf.maneuver_id, v_ego, 'laneUnreachable' if lc.unreachable else 'laneBlocked')
       plan.tooFastToTurn = True
     rule = lc if paint_rule else self.paint_rule_lanes.update(*lane_args, **lane_kw)  # its offers and aborts are never raised
     plan.laneChangePaintRule = rule.lane_change if rule.lane_change != LaneChange.none else rule.prompt

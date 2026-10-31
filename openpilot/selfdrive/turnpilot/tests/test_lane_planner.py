@@ -1006,3 +1006,121 @@ def test_offer_room_uses_the_lead():
   assert offer_room_s(11.2, None) == LC_OFFER_ROOM_S
   assert offer_room_s(11.2, 91.44) == pytest.approx(91.44 / 11.2 + 1.5)  # 25 mph: 9.7 s
   assert offer_room_s(40., 91.44) == pytest.approx(LC_WARN_S + 1.5)  # fast enough that the warning is longer
+
+
+# ----------------------------------------------------------------------- LC-03: a change that never went (ALWAYS_DRIVE 4.11)
+
+def through_the_window(drive, m, start, stop=20., **kw):
+  """Drive from start m to stop m before the maneuver: [(distance, decision)] for every frame."""
+  out, distance = [], start
+  while distance > stop:
+    out.append((distance, drive.step(m, distance, **kw)))
+    distance -= drive.v * DT_MDL
+  return out
+
+
+def first_blocked(frames):
+  return next((d for d, x in frames if x.blocked), None)
+
+
+def assert_blocked_at_the_end(drive, frames):
+  """LaneDecision.blocked from the first frame at or past the window's end on which nothing is offered, and on every frame
+  after it for the maneuver; never before the window's end."""
+  _, end = lane_change_window(drive.v)
+  at = first_blocked(frames)
+  assert at is not None and end - (LC_ABORT_SETTLE_S + 3. * DT_MDL) * drive.v < at <= end + 1e-6, (at, end)
+  assert all(x.blocked for d, x in frames if d <= at)
+  assert not any(x.blocked for d, x in frames if d > end + 1e-6)
+
+
+TWO_LANE_RIGHT = maneuver("turn", "right", TWO_LANES_RIGHT_TURN)
+
+
+def test_a_change_the_lane_list_still_wants_at_the_windows_end_is_blocked_for_any_reason_but_no_lane():
+  """LC-03 (ALWAYS_DRIVE.md 4.11, unconditional): the map's lane list places the car in a lane the right turn doesn't leave
+  from, and the change it needs hasn't gone by the window's end, whatever held it: the turn is skipped and rerouted
+  (turnpilotd, skipReason laneBlocked), never pulsed from that lane. Each reason here: a car in the blind spot, a car in the
+  target lane, too slow for DesireHelper (never offered), no signal from the driver, DesireHelper waiting too long, the
+  lane parked, the line solid."""
+  beside = scene([{'cls': 'car', 'x': -3., 'y': -3.6, 'vx': 15.}]).objects
+  parked = scene([{'cls': 'car', 'x': 50., 'y': -3.6, 'vx': 0.}]).objects
+  cases = {
+    'blindspot': (Drive(0, 1), {'blindspot': LaneChange.right}),
+    'carInLane': (Drive(0, 1), {'objects': beside}),
+    'tooSlow': (Drive(0, 1, v=7.), {}),
+    'noSignal': (Drive(0, 1, driver_signals=True), {}),
+    'laneParked': (Drive(0, 1), {'objects': parked}),
+    'lineNotBroken': (Drive(0, 1, paint=lambda left, right: paint(right=SW)), {}),
+  }
+  for why, (drive, kw) in cases.items():
+    frames = through_the_window(drive, TWO_LANE_RIGHT, lane_change_window(drive.v)[0] + 30., **kw)
+    assert not drive.requests or why == 'noSignal', why
+    assert drive.lp.changes == 0, why
+    assert_blocked_at_the_end(drive, frames)
+  # DesireHelper never starting the change it was asked for (timedOut), on the planner alone
+  lp = LanePlanner()
+  args = {'lanes': model_lanes(*road(0, 1)), 'v_ego': 15., 'left_blinker': False, 'right_blinker': False, 'objects': (),
+          'driver_signals': False, 'right_hand_traffic': True, 'dt': DT_MDL, 'paint': paint(right=BW)}
+  distance, decisions = 320., []
+  while distance > 20.:
+    decisions.append((distance, lp.update(TWO_LANE_RIGHT, distance, lc_state=LaneChangeState.preLaneChange, **args)))
+    distance -= 15. * DT_MDL
+  assert any(x.abort == 'timedOut' for _, x in decisions)
+  at = first_blocked(decisions)
+  assert at is not None and at <= lane_change_window(15.)[1] and all(x.blocked for d, x in decisions if d <= at)
+
+
+def test_no_lane_that_way_is_never_blocked():
+  """The one exception: the model sees no lane the way the list says to change (noLane: the list may be wrong, or the car is
+  at the edge already). The turn goes as today."""
+  m = maneuver("turn", "left", THREE_LANES_LEFT_TURN)
+  drive = Drive(0, 0, paint=lambda left, right: paint(left=BW, right=SW))
+  frames = through_the_window(drive, m, 350.)
+  assert {x.wait for d, x in frames if 100. < d < 300.} == {'noLane'} and drive.decisions[-1].want == 2
+  assert not any(x.blocked for _, x in frames)
+
+
+def test_without_a_lane_list_the_car_is_placed_only_by_a_travel_lane_seen_that_way():
+  """No lane list: the car is placed in a lane the turn doesn't leave from only by a frame of the window on which the model
+  read the lane that way and change_blocker found it a travel lane. A curb lane before a right (solid white beyond, or no
+  lane), a bike lane behind solid white or a parked strip never places it: the turn goes as today."""
+  m = maneuver("turn", "right")
+  start = lane_change_window(15.)[0] + 30.
+  drive = Drive(0, 1)
+  frames = through_the_window(drive, m, start, blindspot=LaneChange.right)
+  assert not drive.offers and {x.wait for d, x in frames if 100. < d < 280.} == {'blindspot'}
+  assert_blocked_at_the_end(drive, frames)
+  drive = Drive(0, 1, v=7.)  # too slow, a travel lane read that way: never offered, blocked
+  assert_blocked_at_the_end(drive, through_the_window(drive, m, lane_change_window(7.)[0] + 20.))
+  for drive, kw in ((Drive(0, 0), {}),  # the curb lane: solid white beyond it
+                    (Drive(0, 1, paint=lambda left, right: paint(right=SW)), {}),  # a bike lane behind solid white
+                    (Drive(0, 1), {'objects': scene([{'cls': 'car', 'x': 50., 'y': -3.6, 'vx': 0.}]).objects})):  # a parked strip
+    frames = through_the_window(drive, m, start, **kw)
+    assert not any(x.blocked for _, x in frames), {x.wait for _, x in frames}
+
+
+def test_a_change_made_in_the_window_is_never_blocked():
+  """The change goes: with the lane list the car is in the turn's lane; without it, the travel lane read before the change is
+  no evidence about the lane the car is in now (the curb lane, solid white beyond it)."""
+  for m in (TWO_LANE_RIGHT, maneuver("turn", "right")):
+    drive = Drive(0, 1)
+    frames = through_the_window(drive, m, lane_change_window(15.)[0] + 30.)
+    assert drive.lp.changes == 1 and not any(x.blocked for _, x in frames), m
+
+
+def test_blocked_only_with_the_planner_on_and_a_lane_it_can_place():
+  """TurnPilotLanePaintActive off plans no change, so blocks none; nor does a lane the list can't place (lane_unknown, 'Can't
+  Confirm Lane' instead: R12)."""
+  drive = Drive(0, 1, paint_rule=False, v=7.)
+  assert not any(x.blocked for _, x in through_the_window(drive, TWO_LANE_RIGHT, 200.))
+  three_right = maneuver("turn", "right", ((("straight",), False), (("straight",), False), (("right",), True)))
+  drive = Drive(0, 1, curb_unpainted=True, v=7.)
+  frames = through_the_window(drive, three_right, 200.)
+  assert any(x.wait == 'laneUnknown' for _, x in frames) and not any(x.blocked for _, x in frames)
+
+
+def test_blocked_holds_for_its_maneuver_and_ends_with_it():
+  drive = Drive(0, 1, v=7.)
+  frames = through_the_window(drive, TWO_LANE_RIGHT, 200.)
+  assert frames[-1][1].blocked
+  assert not drive.step(TWO_LANE_RIGHT, 300., maneuver_id=1).blocked  # the next maneuver (a reroute's): judged afresh
