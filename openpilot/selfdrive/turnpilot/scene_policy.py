@@ -76,7 +76,10 @@ Tracker B's people (TurnPilotFarPeds, scene/tracker_b.py; PERCEPTION_PLAN item 5
 them after the scene's (extra_objects), each b_only, its trackId offset by B_ID and its age 0. A b_only object is never confirmed
 or earned (no hard tier, no following stop) and never a crosswalk walker or a curb-cap track, whatever its fields say, so all
 it can ever do is a "pedestrian in path" stop on the STOP_DECEL curve: a TurnPilot veto for a person the far crop saw first,
-never a gate. The pedestrian velocity trust (trusted_velocity) reads it as it reads the scene's.
+never a gate. Its stop is soft (Stop.soft): never asking for more than STOP_DECEL, the speed cap's lag included (an unconfirmed
+track's other stops brake on the curve too, but the lagged speed cap can ask up to SPEED_CAP_ACCEL_MIN, -1.7 m/s^2 on a KITTI
+replay tick of one), carried so through a stale scene. The pedestrian velocity trust (trusted_velocity) reads it as it reads the
+scene's.
 """
 import math
 from collections import deque
@@ -217,6 +220,7 @@ class Stop:
   confirmed: bool = True
   evidence: dict | None = None  # the track it is for (track_evidence()), logged with a hard brake
   rest: bool = False      # it ends with the car at rest at d_stop (should_stop there), not a speed cap or a following gap
+  soft: bool = False      # it never asks for more than STOP_DECEL, the speed cap's lag included (tracker B's: module docstring)
 
 
 def stop_command(v_ego: float, d_stop: float) -> tuple[float, float, bool]:
@@ -235,14 +239,16 @@ def track_evidence(obj) -> dict:
           'vx': round(float(obj.vx), 2), 'vy': round(float(obj.vy), 2), 'in_path': bool(obj.inPath)}
 
 
-def stop(v_ego: float, d_stop: float, reason: str, confirmed: bool = True, v_lead: float = 0., evidence: dict | None = None) -> Stop:
+def stop(v_ego: float, d_stop: float, reason: str, confirmed: bool = True, v_lead: float = 0., evidence: dict | None = None,
+         soft: bool = False) -> Stop:
   """A stop point d_stop m ahead, moving away at v_lead (then the car only has to slow to v_lead by there). Unconfirmed,
-  it brakes no harder than the curve: no accel cap, and a speed cap no further below v_ego than STOP_DECEL takes."""
+  it brakes no harder than the curve: no accel cap, and a speed cap no further below v_ego than STOP_DECEL takes. Soft (tracker
+  B's), that speed cap's floor holds whatever the curve asks, so nothing from it ever asks for more than STOP_DECEL."""
   accel_cap, speed_cap, should_stop = stop_command(max(v_ego - v_lead, 0.), d_stop)
   speed_cap += v_lead
-  if not confirmed and accel_cap < NO_ACCEL_CAP:
+  if soft or (not confirmed and accel_cap < NO_ACCEL_CAP):
     accel_cap, speed_cap = NO_ACCEL_CAP, max(speed_cap, v_ego - STOP_DECEL * SPEED_CAP_TAU)
-  return Stop(accel_cap, speed_cap, should_stop and v_lead <= 0., reason, d_stop, v_lead, confirmed, evidence, v_lead <= 0.)
+  return Stop(accel_cap, speed_cap, should_stop and v_lead <= 0., reason, d_stop, v_lead, confirmed, evidence, v_lead <= 0., soft)
 
 
 def b_only(obj) -> bool:
@@ -298,7 +304,8 @@ def pedestrian_stops(objects, v_ego: float, is_confirmed=confirmed_track) -> lis
       stops.append(stop(v_ego, obj.x - PED_STOP_GAP_M - obj.vx * FOLLOW_GAP_S, "following pedestrian", is_confirmed(obj), obj.vx,
                         track_evidence(obj)))
     else:
-      stops.append(stop(v_ego, obj.x - PED_STOP_GAP_M, "pedestrian in path", is_confirmed(obj), evidence=track_evidence(obj)))
+      stops.append(stop(v_ego, obj.x - PED_STOP_GAP_M, "pedestrian in path", is_confirmed(obj), evidence=track_evidence(obj),
+                        soft=b_only(obj)))
   return stops
 
 
@@ -525,7 +532,8 @@ class ScenePolicy:
       self.carried_junction = (maneuver_id, junction[0]) if junction else None
     else:
       # no evidence either way: keep what was in force, the pedestrians where they were relative to the road
-      self.carried = [stop(v_ego, s.d_stop - (v_ego - s.v_lead) * dt, s.reason, s.confirmed, s.v_lead, s.evidence) for s in self.carried]
+      self.carried = [stop(v_ego, s.d_stop - (v_ego - s.v_lead) * dt, s.reason, s.confirmed, s.v_lead, s.evidence, s.soft)
+                      for s in self.carried]
       peds = self.carried
       junction = []
       if self.carried_junction is not None and self.carried_junction[0] == maneuver_id:

@@ -1027,3 +1027,22 @@ def test_tracker_bs_objects_count_only_while_the_scene_is_available_and_never_mo
       out.append((ev.confirmed, ev.earned, ev.walker, ev.hits, a_stops, d.hard_brake, d.accel_cap))
     return out
   assert run(True) == run(False) and any(r[5] for r in run(True))
+
+
+def test_tracker_bs_stop_never_asks_for_more_than_stop_decel_the_speed_caps_lag_included():
+  # a KITTI replay tick (0000, k 181): 6.78 m/s, the person 20.38 m ahead. The curve's own need is -1.49 m/s^2, so an unconfirmed
+  # track gets no floor, and the speed cap's 1 s lag asks -1.70 of the planner. Tracker B's stop is soft: -1.5 at most
+  v, x = 6.78, 20.38
+  d = ScenePolicy().update([], True, None, 1000., v, extra_objects=[b_ped(x, 0., inPath=True, age=0, conf=0.49)])
+  assert d.reason == "pedestrian in path" and d.accel_cap == NO_ACCEL_CAP
+  assert abs(plan_accel(d.accel_cap, d.speed_cap, v) + STOP_DECEL) < 1e-9
+  # tracker A's unconfirmed track there asks what it asks today
+  d = ScenePolicy().update([b_ped(x, 0., inPath=True, age=2, conf=0.5, b_only=False)], True, None, 1000., v)
+  assert abs(plan_accel(d.accel_cap, d.speed_cap, v) + 1.70) < 0.01
+  # carried through a stale scene, B's stays soft
+  sp = ScenePolicy()
+  sp.update([], True, None, 1000., v - 0.5, extra_objects=[b_ped(x + 3., 0., inPath=True, age=0, conf=0.49)])
+  for _ in range(10):
+    d = sp.update([], False, None, 1000., v)
+    assert d.reason == "pedestrian in path" and plan_accel(d.accel_cap, d.speed_cap, v) >= -STOP_DECEL - 1e-9
+  assert sp.carried and all(s.soft for s in sp.carried)
