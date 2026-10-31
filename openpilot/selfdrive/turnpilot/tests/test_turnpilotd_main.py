@@ -357,11 +357,12 @@ def test_always_drive_unknown_to_the_build_reads_off_and_says_so():
   assert 'unknown' in log_error.call_args.args[0] and 'off' in log_error.call_args.args[0]
 
 
-def test_always_drive_is_a_persistent_bool_off_by_default():
+def test_always_drive_is_a_persistent_bool_on_by_default():
+  # Saturday's value as the fresh install's default (test_saturday_defaults.py); unset, turnpilotd still reads it off
   import re
   from pathlib import Path
   header = (Path(__file__).parents[3] / 'common' / 'params_keys.h').read_text()
-  assert re.search(r'\{"TurnPilotAlwaysDrive", \{PERSISTENT, BOOL, "0"\}\}', header)
+  assert re.search(r'\{"TurnPilotAlwaysDrive", \{PERSISTENT, BOOL, "1"\}\}', header)
 
 
 @pytest.mark.parametrize("value,on", [(None, True), (True, True), (False, False), ('0', False), (b'1', True)])
