@@ -495,3 +495,17 @@ def test_vision_the_other_modes_are_unchanged_by_its_branch(tmp_path):
   out = w.run(4.)
   assert first_go(out) is None and gate_fault(out).reason == sg.REASONS['H4camera']
   assert not any(d.mode == 'vision' for d in out) and 'vision' in ce.MODES
+
+
+def test_vision_a_pedestrian_in_the_crosswalk_is_waited_for_then_the_go_after_the_window(tmp_path):
+  from openpilot.selfdrive.turnpilot.tests.test_stop_go import person
+  w = vworld(tmp_path, 20)
+  # a person crossing the near crosswalk left to right at 1.2 m/s from 1 s, out past its right end about 5 s later
+  def walker(w):
+    t = w.t_cam - 100.
+    return (person(70, 4.9, 2.0 - 1.2 * max(t - 1., 0.), 0., -1.2),) if 1. <= t < 7.5 else ()
+  w.objects = walker
+  out = w.run(12.)
+  peds = [k for k, d in enumerate(out) if any(h.key.startswith(('ped:', 'pedArrive')) for h in d.holds)]
+  i = first_go(out)
+  assert peds and i is not None and i > max(peds) and (i - max(peds)) * DT_MDL >= sr.VISION_CLEAR_S - 0.06
