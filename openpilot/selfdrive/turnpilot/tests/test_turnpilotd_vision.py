@@ -10,9 +10,11 @@ from openpilot.selfdrive.turnpilot import stop_rules as sr
 from openpilot.selfdrive.turnpilot import visibility_table as vt
 from openpilot.selfdrive.turnpilot.hooks import plan_accel
 from openpilot.selfdrive.turnpilot.routing.tests.test_certify import ETA, LAT, LON, NODE
+from openpilot.selfdrive.turnpilot.tests import test_stop_go_modes_golden as golden
+from openpilot.selfdrive.turnpilot.tests import test_turnpilotd_stop as ts
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import FakeParams
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_stop import CYCLE, S_LINE, StopSim, go_frame, raw_box, run_to_line
-from openpilot.selfdrive.turnpilot.turnpilotd import stop_sign_mode_for
+from openpilot.selfdrive.turnpilot.turnpilotd import always_drive_for, stop_sign_mode_for
 
 MPH = sr.MPH
 SHIPPED = vt.load(vt.SHIPPED)
@@ -215,3 +217,50 @@ def test_vision_the_brake_during_the_go_ends_the_lift_and_the_decider_resets(tmp
   sim.run(1.)
   plans = sim.plans()
   assert str(plans[-1].goCertified.cause) == 'none' and str(plans[-1].stopGo.state) in ('done', 'off')
+
+
+# ---------------------------------------------------------- TurnPilotAlwaysDrive implies nothing about TurnPilotStopSignGo
+
+@pytest.mark.parametrize('value', [None, b'off', b'shadow', b'trial', b'auto', b'vision', b'yes please'])
+def test_always_drive_never_sets_nor_changes_the_stop_sign_mode(value):
+  # the switch is its own param and so is TurnPilotStopSignGo: the mode reads the same with the switch on, off or unset, and
+  # vision only when it is set to vision (ALWAYS_DRIVE.md section 1: the switch never changes TurnPilotStopSignGo)
+  base = {} if value is None else {'TurnPilotStopSignGo': value}
+  want = stop_sign_mode_for(FakeParams(base))
+  for always in (b'1', b'0'):
+    params = FakeParams(base, TurnPilotAlwaysDrive=always)
+    assert stop_sign_mode_for(params) == want and always_drive_for(params) == (always == b'1')
+  assert (want[0] == 'vision') == (value == b'vision')
+
+
+def stop_sim_with(always: bool, vision: bool):
+  """StopSim with TurnPilotAlwaysDrive as given (live: never in shadow mode) and, for vision, Saturday's vision inputs (vsim)."""
+  class Sim(StopSim):
+    def __init__(self, tmp_path, *args, **kw):
+      if vision:
+        kw.update(mode='vision', vis=SHIPPED, entries=[])
+      super().__init__(tmp_path, *args, **kw)
+      if vision:
+        self.navd.controls[0] = (S_LINE, 'stop', False, True, False, vinfo())
+      self.tp.always_drive = always
+  return Sim
+
+
+@pytest.mark.parametrize('scenario', ['C1_empty', 'C1_V25_waiting_car', 'O17_withdrawn_at_speed', 'V3_downgrade'])
+@pytest.mark.parametrize('mode', ['off', 'shadow', 'trial', 'auto', 'vision'])
+def test_always_drive_changes_nothing_the_stop_sign_decider_does_in_any_mode(tmp_path, monkeypatch, scenario, mode):
+  # test_stop_go_modes_golden's closed-loop scenarios with the switch on: every frame of the plan as with it off, so the four
+  # older modes keep their golden hashes and vision its own trace; the switch neither turns vision on nor changes it
+  plans = {}
+  for always in (False, True):
+    monkeypatch.setattr(ts, 'StopSim', stop_sim_with(always, mode == 'vision'))
+    path = tmp_path / ('on' if always else 'off')
+    path.mkdir()
+    sim = golden.SCENARIOS[scenario](path, 'auto' if mode == 'vision' else mode)
+    assert sim.tp.always_drive_on == always
+    plans[always] = sim.plans()
+  assert mode != 'vision' or all(str(p.stopGo.mode) == 'vision' for p in plans[True])
+  assert [golden.frame_tuple(p) for p in plans[True]] == [golden.frame_tuple(p) for p in plans[False]]
+  if mode != 'vision':
+    got = {'frames': len(plans[True]), 'sha256': golden.digest(plans[True])}
+    assert golden._golden()[f'trace:{scenario}:{mode}'] == got

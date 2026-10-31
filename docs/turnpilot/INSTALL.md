@@ -263,6 +263,8 @@ python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotAlwaysDrive=1 
 | `TurnPilotAlwaysDrive` | 0 | 1: always drive (above). turnpilotd reads it every second, and navd reads it each time it routes. |
 | `TurnPilotNoMoveS` | 2 | Seconds a turn TurnPilot let go of at a standstill waits for the car to pull away before "Can't start the turn: take control", 2 to 20. An unprotected left's 1 s is fixed. Read every second. |
 
+The switch doesn't set or change `TurnPilotStopSignGo`. The car goes by itself at stop signs and yields only with `TurnPilotStopSignGo=vision`, which you set on its own (see "Let the car go by itself at stop signs"). With the switch on, every stop-sign mode, `vision` included, stops, waits, goes and hands back exactly as it does with the switch off, and navd keeps and avoids the same stops.
+
 Whatever the switch says, a lane change the turn needs that hasn't happened by 60 to 120 m before the turn skips the turn ("Can't Reach Turn Lane", "Rerouting"), and navd reroutes. The turn isn't made from the wrong lane. openpilot changes no lanes under 20 mph, so in slow traffic every turn that needs a lane change is skipped.
 
 ## Run preflight before every drive

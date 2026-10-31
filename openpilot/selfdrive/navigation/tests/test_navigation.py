@@ -1426,3 +1426,24 @@ class TestStopAvoidance(unittest.TestCase):
     router = self.start([a, y], reroutes=[[]])
     self.assertEqual([c.cert_reason for c in (a, y)], ['sideViews', 'sideViews'])
     self.assertEqual(len(router.reroute_calls[0][4]), 2)
+
+  def test_always_drive_changes_nothing_navd_certifies_keeps_or_avoids_under_vision_or_auto(self):
+    """TurnPilotAlwaysDrive implies nothing about TurnPilotStopSignGo: at route time navd certifies, keeps and avoids the same
+    stops with the switch on as off, under vision and under auto (the mode turnpilotd publishes, never the switch)."""
+    seen = {}
+    for mode in ('vision', 'auto'):
+      for always in ('0', '1'):
+        self.values['TurnPilotAlwaysDrive'] = always
+        self.vision_engine()
+        if mode == 'auto':
+          self.values['TurnPilotStopSignGo'] = 'auto'
+          self.sm.data['turnpilotPlan'].stopGo.mode = 'auto'
+        keep, fast, divided = self.vision_stop(1, 60.), self.vision_stop(2, 150., mph=35), self.vision_stop(3, 170., divided=True)
+        router = self.start([keep, fast, divided], reroutes=[[keep, fast], [keep], []])
+        self.assertIs(self.engine.route_always_drive, always == '1')
+        seen[mode, always] = (self.engine.runtime_inputs().mode, [(c.certification, c.cert_reason) for c in (keep, fast, divided)],
+                              [len(r[4]) for r in router.reroute_calls])
+      self.assertEqual(seen[mode, '1'], seen[mode, '0'], seen)
+    self.assertEqual((seen['vision', '1'][0], seen['auto', '1'][0]), ('vision', 'auto'))
+    self.assertEqual(seen['vision', '1'][1][0], ('certifiable', 'none'))
+    self.assertNotEqual(seen['vision', '1'][1], seen['auto', '1'][1])  # the mode, not the switch, decides
