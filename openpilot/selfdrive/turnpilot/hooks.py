@@ -67,6 +67,11 @@ RETIRED_PROMPTS = ('stopSignGo', 'signalGo', 'unprotectedTurnGo', 'carStoppedGo'
 RETIRED_ALERTS = ('goingOnRed',)
 CONTROL_ALERT_EVENTS = ('stopOverrun', 'proceedingOnYellow', 'junctionUncertain', 'carStoppedNote')  # below the prompt, above a lane change
 CONTROL_STATUS_ALERTS = ('mapControlsUnavailable', 'lightSourceRejected', 'farViewOff', 'sideCamerasOff')  # last of all, a status line
+# TurnpilotPlan.skipReason for a keep that can't be sent under TurnPilotAlwaysDrive (ALWAYS_DRIVE.md R7, turnpilotd.keep_unsent):
+# skipped with navd's skip mark (tooFastToTurn) while the model drives the fork, said as a status line (KEEP_FOLLOW); navd
+# recomputing past it, the skip's chime and 'Rerouting' (KEEP_REROUTED, held turnpilotd.MISSED_HOLD_S, tooFastToTurn false)
+KEEP_FOLLOW = 'keepFollow'
+KEEP_REROUTED = 'keepRerouted'
 # the route's stop signs (route_notice.py, STOP_SIGNS.md 3.4): said engaged or not (turnpilotRouteNotice, a permanent alert), the
 # text in turnpilotPlan.routeNotice; all but routeAvoidsStops with a chime
 ROUTE_NOTICES = ('routeAvoidsStops', 'routeDetour', 'stopsNeedYou', 'firstStopNeedsYou', 'stopRoutingFailed', 'stopAheadNeedsYou')
@@ -89,14 +94,16 @@ def plan_events(sm, now: float | None = None) -> list[str]:
      or stalled in a turn, or not pulling away after TurnPilot's go), then a map stop it can't make gently (turnpilotControlAlert, cannotStopComfortably: take
      control), or off the route with the map stops ahead unknown (offRouteStopsUnknown: the speed capped, take control
      or wait for the reroute), or an unprotected left's go withdrawn for oncoming traffic (oncomingHolding);
-  4. too fast to turn, or a turn from a standstill missed (turnpilotTooFastToTurn, turnMissed);
+  4. too fast to turn, or a turn from a standstill missed (turnpilotTooFastToTurn, turnMissed), or navd's reroute past a keep
+     the model drove under TurnPilotAlwaysDrive (KEEP_REROUTED);
   5. a map control's other prompt (turnpilotControlPrompt: yield ahead, an unprotected left waiting for a gap or creeping for
      a view, visual only; its go, a short chime);
   6. a map control's other alerts (turnpilotControlAlert: a stop line overrun, going on a yellow, an unprotected turn's
      junction uncertain, the car stopped with nothing holding it: the stopped note's chime);
   7. a planned lane change, offered or just aborted (turnpilotLaneChangeLeft/Right/Aborted, LaneChangeEvents);
   8. the wrong lane, or a lane it can't confirm (turnpilotWrongLane);
-  9. the map controls' status (turnpilotControlAlert: map stops unavailable, light source rejected).
+  9. a keep the model drives under TurnPilotAlwaysDrive (turnpilotTooFastToTurn, KEEP_FOLLOW: a status line), then the map
+     controls' status (turnpilotControlAlert: map stops unavailable, light source rejected).
   The alerts of 4 to 9 are all Priority.LOW or lower, where AlertManager shows the newest, so the order is kept by not
   raising the lower ones: the wrong lane isn't raised while a lane change is offered or its abort holds (the car is in a
   turn-only lane at an intersection before the turn the change is for), and lane_change_events raises nothing while the
@@ -125,7 +132,7 @@ def plan_events(sm, now: float | None = None) -> list[str]:
     return ['turnpilotControlAlert']
   if alert in ROUTE_NOTICES:
     return ['turnpilotRouteNotice']
-  if plan.tooFastToTurn or plan.turnMissed:
+  if skip_said(plan):
     return ['turnpilotTooFastToTurn']
   if str(plan.controlPrompt) != 'none':
     return ['turnpilotControlPrompt']
@@ -135,9 +142,18 @@ def plan_events(sm, now: float | None = None) -> list[str]:
     return []  # the lane change outranks the wrong lane
   if plan.laneMismatch != custom.TurnpilotPlan.LaneMismatch.none:
     return ['turnpilotWrongLane']
+  if plan.tooFastToTurn:  # a keep the model drives under TurnPilotAlwaysDrive (KEEP_FOLLOW): its status line, last of TurnPilot's own
+    return ['turnpilotTooFastToTurn']
   if alert in CONTROL_STATUS_ALERTS:
     return ['turnpilotControlAlert']
   return []
+
+
+def skip_said(plan) -> bool:
+  """The skip's slot (plan_events' 4): a turn skipped (tooFastToTurn) but for a keep the model drives under TurnPilotAlwaysDrive
+  (KEEP_FOLLOW, a status line), a turn missed (turnMissed), or navd's reroute past such a keep (KEEP_REROUTED)."""
+  reason = str(plan.skipReason)
+  return (plan.tooFastToTurn and reason != KEEP_FOLLOW) or plan.turnMissed or reason == KEEP_REROUTED
 
 
 # turnpilotPlan.controlPrompt / controlAlert -> what the driver is told (selfdrived/events.py)
@@ -219,7 +235,8 @@ def lane_change_events(plan) -> tuple[str, ...]:
   from its warning until it starts, and an abort while laneChangeAbort holds its reason. Nothing while the plan is too
   fast to turn, faulted, or has a map control's prompt or alert above it: those outrank it (plan_events). plan:
   shown_plan's, or None."""
-  if plan is None or plan.tooFastToTurn or plan.turnMissed or plan.fault != custom.TurnpilotPlan.Fault.none or control_outranks_lane_change(plan):
+  if plan is None or plan.tooFastToTurn or skip_said(plan) or plan.fault != custom.TurnpilotPlan.Fault.none or \
+     control_outranks_lane_change(plan):
     return ()
   offer = str(plan.laneChangeOffer)
   events = ('turnpilotLaneChangeLeft',) if offer == 'left' else ('turnpilotLaneChangeRight',) if offer == 'right' else ()

@@ -164,7 +164,7 @@ from openpilot.selfdrive.turnpilot.desire_timing import ENTRY_M, TURN_STARTED_DE
 from openpilot.selfdrive.turnpilot.control_text import STOPPED_NOTE
 from openpilot.selfdrive.turnpilot.go_override import GO_ACCEL, GO_CLEAR_M, GO_WINDOW_S, GoCertifier
 from openpilot.selfdrive.turnpilot.handback import Handback
-from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, CLEAR_DESIRE, CONTROL_STATUS_ALERTS, TAKE_CONTROL_PROMPTS
+from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, CLEAR_DESIRE, CONTROL_STATUS_ALERTS, KEEP_FOLLOW, KEEP_REROUTED, TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.detector.light_state import LIGHT_MODE_DEFAULT, camera_lights_mode
 from openpilot.selfdrive.turnpilot.map_controls import (CAMERA_STALE_S, KEEP_TURN, LATCH_PAST_M, LIGHT_STALE_S, MAP_MARGIN_M, PROTECT_PAST_M, YELLOW_DECEL,
                                                          YELLOW_DECEL_MAX, LeftCommand, MapControlPolicy, StopCommand, camera_light_input,
@@ -675,6 +675,8 @@ class TurnPilot:
       self.turn_cap_id: int | None = None  # ...whose turn speed cap stays, its desire having gone out
       self.turn_held_id: int | None = None  # ...whose turn desire was out: held to its clear, never cancelled
       self.skip_cap_id: int | None = None  # a dropped turn skipped on taking it up: its cap stays until it is passed
+      self.keep_follow_id: int | None = None  # a keep that couldn't be sent, the model driving the fork (keep_unsent, R7)
+      self.keep_rerouted_t = 0.  # ...navd recomputed past it: the skip's chime and 'Rerouting' while this counts down
       self.veto_hold_id: int | None = None  # a turn vetoed standing at a hold: the hold keeps it until it lets go
       self.vetoed: VetoedTurn | None = None  # the turn the driver overruled, by its junction: skipped across a reroute
       self.line_deferred_id: int | None = None  # the maneuver last logged as waiting on a line veto's record (line_veto_defers)
@@ -876,6 +878,7 @@ class TurnPilot:
       self._take_up_dropped(upcoming, rf, v_ego, right_hand_traffic)
     self.acting = acting
     self.check_straight(rf, v_ego, acting, said=self.check_missed(rf, v_ego, acting))
+    self.check_keep_followed(rf)
     self.check_driven_left(rf, default_yaw_rate(cs, model), v_ego, acting)
     self.track_yaw(upcoming, rf, default_yaw_rate(cs, model), v_ego)
     self.track_yaw20(default_yaw_rate(cs, model), v_ego)
@@ -1221,6 +1224,9 @@ class TurnPilot:
       self.skip.reason in ('driverSignal', 'hazards', 'signalLost', 'sideUncertain')
     plan.turnSignal.skip = self.skip.reason if signal_skip else 'none'
     plan.skipReason = self.skip.reason if plan.tooFastToTurn and self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id else ''
+    if self.keep_rerouted_t > 0. and acting and not plan.tooFastToTurn:
+      plan.skipReason = KEEP_REROUTED  # R7: navd recomputed past the fork the model drove: the skip's chime now (keep_unsent)
+    self.keep_rerouted_t = max(self.keep_rerouted_t - DT_MDL, 0.)
     hazards_hold = ts.side != LaneChange.none and str(port.block) == 'hazard'
     plan.reason = decision.reason or (TURN_MISSED_REASON if plan.turnMissed else "") or lane_reason or mapd.reason or \
       (HAZARDS_REASON if hazards_hold else "") or (NO_JUNCTION_DATA_REASON if no_junction_data else "")
@@ -1401,18 +1407,37 @@ class TurnPilot:
     lane line seen): skipped (turn_skip: tooFastToTurn, skipReason its reason; selfdrived's skip chime and line, navd's reroute
     or its move on to the next step if the model took the route's branch anyway), logged once, never sent after (a late
     swerve), its cap kept to its pass (a car slowing for it never speeds up into it). Never one whose desire went out, nor with
-    openpilot not steering (no desire goes then: the driver steers)."""
+    openpilot not steering (no desire goes then: the driver steers).
+    Under TurnPilotAlwaysDrive (ALWAYS_DRIVE.md R7) the model drives the fork: skipped all the same, navd's skip mark and its
+    cap as above, but said as a status line (skipReason KEEP_FOLLOW), never the chime and 'Rerouting' while the model may yet
+    take the branch; those come only if navd recomputes past it (check_keep_followed)."""
     d = self.desires
     reason = why.get(keep.side, '') if keep is not None and keep.kind == KEEP else ''
     if not reason or not lat_active or self.skip.skipped or d.maneuver_id != rf.maneuver_id or d.started or d.done or \
        rf.distance >= keep_last(v_ego):
       return
-    self.skip.skip(keep, rf.distance, rf.maneuver_id, v_ego, reason)
+    follow = self.always_drive_on
+    self.skip.skip(keep, rf.distance, rf.maneuver_id, v_ego, KEEP_FOLLOW if follow else reason)
     self.skip_cap_id = rf.maneuver_id
+    self.keep_follow_id = rf.maneuver_id if follow else None
     plan.tooFastToTurn = True
-    cloudlog.event("turnpilot.keep_not_sent", error=True, side='left' if keep.side == LEFT else 'right', reason=reason,
+    cloudlog.event("turnpilot.keep_not_sent", error=True, side='left' if keep.side == LEFT else 'right', reason=reason, follow=follow,
                    probs=[round(float(p), 2) for p in model.laneLineProbs], type=keep.type, modifier=keep.modifier,
                    angle_deg=round(keep.angle_deg, 1), distance=round(rf.distance, 1), v=round(v_ego, 2))
+
+  def check_keep_followed(self, rf) -> None:
+    """R7: the keep the model was left to drive (keep_unsent, KEEP_FOLLOW) is over. navd moved on to the next step (the model
+    took the route's branch, or navd's skipped_turn_passed found the car on it): nothing to say. navd dropped the route or
+    sent a new one (RouteFollower.replaced: off it, rerouting): the skip's chime and 'Rerouting' now (KEEP_REROUTED, for
+    MISSED_HOLD_S), never as a skip mark of the new route (tooFastToTurn) nor a turnMissed, which would end its turn's signal.
+    Right after this frame's route update."""
+    k = self.keep_follow_id
+    if k is None or rf.maneuver_id == k:
+      return
+    self.keep_follow_id = None
+    if rf.replaced:
+      self.keep_rerouted_t = MISSED_HOLD_S
+      cloudlog.event("turnpilot.keep_rerouted", error=True, maneuver_id=k)
 
   def check_missed(self, rf, v_ego: float, acting: bool) -> bool:
     """The turn a hold let go of at standstill is passed (the follower's pass, this update) having turned under

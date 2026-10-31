@@ -349,3 +349,33 @@ def test_a_missed_turn_takes_the_too_fast_to_turn_slot():
   assert events(turnMissed=True, controlPrompt='carStoppedGo') == ['turnpilotTooFastToTurn']
   assert events(turnMissed=True, fault='error') == ['turnpilotUnavailable']
   assert events(turnMissed=True, shadow=True) == []
+
+
+def test_a_keep_followed_under_always_drive_is_a_status_line_and_its_reroute_takes_the_skip_slot():
+  """ALWAYS_DRIVE.md R7 (S3): a keep that can't be sent, under TurnPilotAlwaysDrive, keeps navd's skip mark (tooFastToTurn)
+  but is said as a status line (skipReason keepFollow): last of all, under every prompt, alert, lane change and wrong lane,
+  over the map controls' own status. navd recomputing past it (skipReason keepRerouted, tooFastToTurn false) is the skip's
+  slot again, over a lane change; a fault and a handback outrank both."""
+  from openpilot.selfdrive.turnpilot.hooks import KEEP_FOLLOW, KEEP_REROUTED
+
+  def events(**fields):
+    msg = messaging.new_message('turnpilotPlan')
+    for k, v in fields.items():
+      setattr(msg.turnpilotPlan, k, v)
+    plan = msg.as_reader().turnpilotPlan
+    return plan_events(FakeSM({'turnpilotPlan': plan})) + list(lane_change_events(plan))
+  follow = {'tooFastToTurn': True, 'skipReason': KEEP_FOLLOW}
+  assert events(**follow) == ['turnpilotTooFastToTurn']
+  assert events(**follow, controlPrompt='yieldAhead') == ['turnpilotControlPrompt']
+  assert events(**follow, controlAlert='stopOverrun') == ['turnpilotControlAlert']
+  assert events(**follow, laneMismatch='wrongLaneForTurn') == ['turnpilotWrongLane']
+  assert events(**follow, controlAlert='mapControlsUnavailable') == ['turnpilotTooFastToTurn']
+  assert events(**follow, laneChangeOffer='left') == ['turnpilotTooFastToTurn']  # the maneuver is skipped: no change for it
+  assert events(**follow, fault='error') == ['turnpilotUnavailable']
+  rerouted = {'skipReason': KEEP_REROUTED}
+  assert events(**rerouted) == ['turnpilotTooFastToTurn']
+  assert events(**rerouted, laneChangeOffer='left', controlPrompt='yieldAhead') == ['turnpilotTooFastToTurn']
+  assert events(**rerouted, controlAlert='cannotStopComfortably') == ['turnpilotControlAlert']
+  assert events(**rerouted, handback='detectorStopped') == []
+  # any other keep reason is the skip as today, at its own rank
+  assert events(tooFastToTurn=True, skipReason='keepNoLine', controlPrompt='yieldAhead') == ['turnpilotTooFastToTurn']

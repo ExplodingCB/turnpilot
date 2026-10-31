@@ -196,6 +196,22 @@ def test_off_route_under_always_drive_is_said_once_then_a_status_line_without_ta
   assert 'take control or wait for reroute' in a.alert_text_2 and a.visual_alert == VisualAlert.steerRequired
 
 
+def test_a_keep_followed_under_always_drive_is_a_silent_status_line_then_the_chime_if_navd_reroutes():
+  """ALWAYS_DRIVE.md R7 (S3): under TurnPilotAlwaysDrive a keep that can't be sent (skipReason keepFollow) is a status line,
+  'Fork: Following the Model', with no chime: the model drives the fork. The skip's chime and 'Rerouting' come only once navd
+  recomputes past it (skipReason keepRerouted). Any other keep reason is said as today."""
+  from openpilot.selfdrive.selfdrived.events import Priority
+  from openpilot.selfdrive.turnpilot.hooks import KEEP_FOLLOW, KEEP_REROUTED
+  a, = alerts(EventName.turnpilotTooFastToTurn, FakeSM(plan(tooFastToTurn=True, skipReason=KEEP_FOLLOW, maneuverModifier='slight right')))
+  assert a.alert_text_1 == 'Fork: Following the Model' and 'Rerouting' not in a.alert_text_1 + a.alert_text_2
+  assert a.audible_alert == AudibleAlert.none and a.alert_status == log.SelfdriveState.AlertStatus.normal
+  assert a.priority == Priority.LOWER and a.visual_alert == VisualAlert.none
+  a, = alerts(EventName.turnpilotTooFastToTurn, FakeSM(plan(skipReason=KEEP_REROUTED)))
+  assert a.alert_text_1 == 'Fork Missed' and a.alert_text_2 == 'Rerouting' and a.audible_alert == AudibleAlert.tpTooFastTurn
+  a, = alerts(EventName.turnpilotTooFastToTurn, FakeSM(plan(tooFastToTurn=True, skipReason='keepNoLine')))
+  assert a.alert_text_1 == "Can't See Lanes" and a.alert_text_2 == 'Rerouting' and a.audible_alert == AudibleAlert.tpTooFastTurn
+
+
 def test_cannot_stop_outranks_and_the_handback_chimes_while_it_lasts():
   slot = AlertSlot()
   a = slot.step(plan(controlAlert='cannotStopComfortably', tooFastToTurn=True))

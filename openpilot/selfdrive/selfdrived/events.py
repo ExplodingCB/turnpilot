@@ -14,7 +14,8 @@ from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.locationd.calibrationd import MIN_SPEED_FILTER
 from openpilot.common.hardware import HARDWARE
 from openpilot.selfdrive.turnpilot.hooks import (ABORT_TEXT, CAR_SIGNAL_EVENTS, CONTROL_ALERT_TEXT, CONTROL_PROMPT_TEXT, CONTROL_STATUS_ALERTS,
-                                               SILENT_PROMPTS, TAKE_CONTROL_PROMPTS, fresh_plan, lane_change_text, shown_plan, too_fast_title)
+                                               KEEP_FOLLOW, KEEP_REROUTED, SILENT_PROMPTS, TAKE_CONTROL_PROMPTS, fresh_plan, lane_change_text,
+                                               shown_plan, too_fast_title)
 
 AlertSize = log.SelfdriveState.AlertSize
 AlertStatus = log.SelfdriveState.AlertStatus
@@ -314,14 +315,20 @@ def turnpilot_too_fast_to_turn_alert(CP: car.CarParams, CS: car.CarState, sm: me
   turn the car pulled away into from a standstill went straight past its junction (turnpilotPlan.turnMissed, turnpilotd.py):
   missed, and navd reroutes."""
   plan = shown_plan(sm)
+  # a keep the model drives under TurnPilotAlwaysDrive (ALWAYS_DRIVE.md R7, skipReason KEEP_FOLLOW): a status line, no chime;
+  # the skip's chime and 'Rerouting' only once navd recomputes past it (KEEP_REROUTED)
+  if plan is not None and plan.tooFastToTurn and not plan.turnMissed and str(plan.skipReason) == KEEP_FOLLOW:
+    return Alert("Fork: Following the Model", "TurnPilot didn't steer for it", AlertStatus.normal, AlertSize.mid,
+                 Priority.LOWER, VisualAlert.none, AudibleAlert.none, .2)
+  rerouted = plan is not None and str(plan.skipReason) == KEEP_REROUTED
   # a map stop leaving no room to get into the turn's lane, or a change it needed that never went (LC-03, skipReason laneBlocked)
   lane = plan is not None and (str(plan.laneChangeWait) == 'unreachable' or str(plan.skipReason) == 'laneBlocked')
   missed = plan is not None and plan.turnMissed
   blind = plan is not None and str(plan.unprotectedLeft.state) == 'skipped'  # oncoming too fast for the detector's range
   signal = too_fast_title(plan) if plan is not None else None  # the turn signal's skips (car_signals.py: a veto, a side in doubt)
   keep = keep_skip_title(plan) if plan is not None else None
-  return Alert("Turn Missed" if missed else signal if signal else keep if keep else "Can't Reach Turn Lane" if lane else
-               "Can't See Far Enough to Turn" if blind else "Too Fast to Turn", "Rerouting",
+  return Alert("Turn Missed" if missed else "Fork Missed" if rerouted else signal if signal else keep if keep else
+               "Can't Reach Turn Lane" if lane else "Can't See Far Enough to Turn" if blind else "Too Fast to Turn", "Rerouting",
                AlertStatus.userPrompt, AlertSize.mid,
                Priority.LOW, VisualAlert.none, AudibleAlert.tpTooFastTurn, 3.)
 
