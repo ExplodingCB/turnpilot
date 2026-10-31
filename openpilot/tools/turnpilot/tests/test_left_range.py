@@ -521,6 +521,37 @@ def test_two_routes_are_each_measured_on_their_own(dt, tmp_path, capsys):
   assert f"--set TurnPilotLeftRangeM={floor10(a_truth[10]['road'])}" in capsys.readouterr().out
 
 
+def test_one_route_in_segments_is_one_drive():
+  """loggerd builds a route's initData once and writes it first in every segment, so segment 2 opens with the route's start
+  time (60 s back on Chase's route), and a message can come logged a second behind (procLog, 0.98 s there): one drive."""
+  msgs, truth = drive(stream(60, far_from=0.), far=False)
+  init = next(m for m in msgs if m.which() == 'initData')
+  half = len(msgs) // 2
+  late = messaging.new_message('deviceState')
+  late.deviceState.deviceType = DEVICE
+  late.logMonoTime = msgs[half].logMonoTime - int(2e9)
+  segmented = msgs[:half] + [init, late.as_reader()] + msgs[half:]
+  assert len(drives_of(segmented)) == 1
+  result = run(segmented)
+  assert len(result.samples) == 60 and result.road.range_m == floor10(min(t['road'] for t in truth))
+
+
+def test_a_reboot_whose_log_times_overlap_the_last_route_is_another_drive():
+  """After a reboot logMonoTime starts over, and the new route can start a few seconds before the last one's log time
+  ended: its own initData (another route's) tells it apart all the same."""
+  a_cars = stream(35, far_from=0.)
+  a_cars[10].road_from = 100.
+  a, a_truth = drive(a_cars, far=False)
+  b, _ = drive(stream(35, far_from=0.), far=False)
+  b = shifted(b, (a[-1].logMonoTime - b[0].logMonoTime) * 1e-9 - 3.)
+  init = b[0].as_builder()
+  init.initData.wallTimeNanos = 2
+  drives = drives_of(a + [init.as_reader()] + b[1:])
+  assert len(drives) == 2
+  result = lr.measure(drives)
+  assert len(result.samples) == 70 and result.road.range_m == floor10(a_truth[10]['road'])
+
+
 @pytest.mark.parametrize("how", ("unavailable", "gap"))
 def test_turnpilotd_starting_again_mid_drive_drops_no_car(how):
   """turnpilotd's tracker starts again mid-drive, and its track ids with it: its scene failed (one unavailable scene, then a
