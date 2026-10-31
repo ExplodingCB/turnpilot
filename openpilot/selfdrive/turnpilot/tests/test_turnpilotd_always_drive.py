@@ -20,11 +20,12 @@ from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of, model_v2
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, RIGHT_AT_A_CORNER, T_LEFT, WALKER, Sim, go_from_a_red,
                                                                  model_stands_in_the_turn, oracle_lights, stand, stop_at, walker_stops_the_car)
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_go import attach_planner, holding, model_stops_at, raw_person
-from openpilot.selfdrive.turnpilot.unprotected_left import LIGHT_RED_MAX_S
+from openpilot.selfdrive.turnpilot.unprotected_left import LIGHT_RED_MAX_S, STAND_UNDECIDED_S
 from openpilot.selfdrive.turnpilot.turnpilotd import (LEAD_STAND_MAX_S, LIGHT_GREEN_REASON, LIGHT_WAIT_NOTE, NEAR_CONTROL_STAND_S, NO_MOVE_MAX_S,
-                                                      NO_MOVE_REASON, NO_MOVE_S, QUEUE_STILL_MAX_S, RELEASE_GOES, RELEASE_LIFT_M, STALLED_REASON,
-                                                      STALL_LIFTS, STALL_LIFT_GAP_S, STALL_LIFT_REASON, STALL_PROMPT_S, STALL_REPULSE_S,
-                                                      STANDSTILL_SPEED, STOPPED_HANDBACK_S, STOPPED_NOTE, STOPPED_NOTE_S, TurnPilot, UNSTICK_S)
+                                                      NO_MOVE_REASON, NO_MOVE_S, PED_NOTE_S, PED_WAITING_NOTE, PED_WAITING_REASON, QUEUE_STILL_MAX_S,
+                                                      RELEASE_GOES, RELEASE_LIFT_M, STALLED_REASON, STALL_LIFTS, STALL_LIFT_GAP_S, STALL_LIFT_REASON,
+                                                      STALL_PROMPT_S, STALL_REPULSE_S, STANDSTILL_SPEED, STOPPED_HANDBACK_S, STOPPED_NOTE,
+                                                      STOPPED_NOTE_S, TurnPilot, UNSTICK_S)
 
 Desire = log.Desire
 
@@ -662,3 +663,59 @@ def test_a_stand_in_a_turn_never_gets_the_unstick_lift():
   plans = stand(sim, UNSTICK_S + 5., objects=person)
   assert not unstick_spans(plans) and not lifts_of(plans)
   assert any(q.controlPrompt == 'stalledTakeControl' for q in plans)
+
+
+# --- SC-02 (unconditional): the right-turn crosswalk hold's standoff ---
+
+def held_at_the_corner(on: bool, walker):
+  """A right at 300 m, the car held at its hold line by the crosswalk hold for walker(sim) (a dict or None), steady on every
+  10 Hz detector run. Returns the sim, standing held."""
+  sim = Sim([(300., "turn", "right"), (1500., "turn", "left")])
+  sim.tp.always_drive = on
+  sim.walker = walker
+  while not (sim.v < 0.05 and sim.s > 250.):
+    sim.step(objects_of(sim), engaged=True)
+    assert sim.t < 60.
+  assert sim.trace[-1][2].reason == "pedestrian in crosswalk" and sim.trace[-1][2].shouldStop
+  return sim
+
+
+def objects_of(sim):
+  w = sim.walker(sim)
+  return (dict(w, age=5 + int(sim.t * 10.)),) if w is not None else ()
+
+
+def hold_for(sim, seconds):
+  plans = []
+  for _ in range(round(seconds / DT_MDL)):
+    sim.v = 0.
+    plans.append(sim.step(objects_of(sim), engaged=True))
+  return plans
+
+
+@pytest.mark.parametrize("on", [False, True])
+def test_a_walker_standing_on_the_corner_is_said_at_10_s_and_handed_back_at_45_s_held(on):
+  """ALWAYS_DRIVE.md SC-02 (unconditional): the crosswalk hold has no bound today, so a person waiting on the corner held a right
+  for good with only a status line. Once the hold has stood the car PED_NOTE_S, one chime and 'Waiting for pedestrian'; once
+  every walker holding it has stood still (velocity trusted and under WALKER_STAND_SPEED, or not yet trusted) for
+  STAND_UNDECIDED_S, 'Pedestrian waiting: take control' with the car held, never a go past them."""
+  sim = held_at_the_corner(on, lambda sim: {'cls': 'pedestrian', 'x': 300. - sim.s + 3., 'y': -5.})
+  plans = hold_for(sim, STAND_UNDECIDED_S + 3.)
+  said = [i for i, q in enumerate(plans) if str(q.controlAlert) == 'pedestrianWaiting']
+  assert said and abs(said[0] * DT_MDL - PED_NOTE_S) < 0.3 and said == list(range(said[0], said[0] + len(said))), said[:3]
+  assert all(q.reason == PED_WAITING_NOTE for q in plans[said[0]:said[-1]])
+  first = next(i for i, q in enumerate(plans) if q.controlPrompt == 'pedestrianWaitingTakeControl')
+  assert abs(first * DT_MDL - STAND_UNDECIDED_S) < 0.5, first * DT_MDL
+  assert plans[first].reason == PED_WAITING_REASON
+  assert all(q.shouldStop for q in plans) and all(q.controlPrompt == 'pedestrianWaitingTakeControl' for q in plans[first:])
+  assert all(str(q.goCertified.cause) == 'none' for q in plans)
+
+
+@pytest.mark.parametrize("on", [False, True])
+def test_a_walker_moving_in_the_crosswalk_is_waited_through_without_a_handback(on):
+  """SC-02: walkers who move are waited through however long, as the left waits through moving traffic."""
+  def pacing(sim):
+    return {'cls': 'pedestrian', 'x': 300. - sim.s + 1., 'y': -5., 'vx': 1.2 if int(sim.t / 2.) % 2 else -1.2}  # up and down it
+  sim = held_at_the_corner(on, pacing)
+  plans = hold_for(sim, STAND_UNDECIDED_S + 20.)
+  assert not any(q.controlPrompt in TAKE_CONTROL_PROMPTS for q in plans) and all(q.shouldStop for q in plans)

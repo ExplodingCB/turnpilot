@@ -187,6 +187,9 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
                                     # (turnpilotd.py: turn_abandoned): take control; no hold, the turn's caps stay
     wrongSideTakeControl @19;       # right-hand traffic, moving: the first painted line to the car's right read yellow
                                     # (turnpilotd.py: wrong_side): left of the centre line, take control; no hold, no steering
+    # ALWAYS_DRIVE.md SC-02: the right-turn crosswalk hold standing STAND_UNDECIDED_S on walkers who all stand (turnpilotd.py:
+    # crosswalk_standoff): "Pedestrian waiting: take control", the car held, never a go past them
+    pedestrianWaitingTakeControl @20;
   }
   enum ControlAlert {
     none @0;
@@ -237,6 +240,9 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     # ALWAYS_DRIVE.md section 4.5 (TurnPilotAlwaysDrive): the unstick lift for a model stop off any hold (turnpilotd.py
     # stopped_unheld): "Nothing ahead is holding the car: going on", a chime
     unstickLift @27;
+    # ALWAYS_DRIVE.md SC-02: the crosswalk hold has stood the car PED_NOTE_S (turnpilotd.py crosswalk_standoff): "Waiting for
+    # pedestrian", a chime, once a hold
+    pedestrianWaiting @28;
   }
   mapControl @24 :MapControlStatus;
   controlPrompt @25 :ControlPrompt;

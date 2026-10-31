@@ -58,7 +58,7 @@ CONTROL_ALERT_FIRST = ('hardBrake', 'cannotStopComfortably', 'offRouteStopsUnkno
 # handbacks: the car held while the driver is told to take control (map_controls.py, turnpilotd.py), above too fast to turn
 TAKE_CONTROL_PROMPTS = ('stopSignTakeControl', 'unprotectedTurnTakeControl', 'carStoppedTakeControl', 'stalledTakeControl',
                         'cantStartTakeControl', 'leftUndecidedTakeControl', 'signalUnseenTakeControl',
-                        'turnAbandonedTakeControl', 'wrongSideTakeControl')
+                        'turnAbandonedTakeControl', 'wrongSideTakeControl', 'pedestrianWaitingTakeControl')
 # shown, never heard: the unprotected left waiting at its line or creeping for a view, and a stop sign waiting for cross traffic,
 # are ordinary (no intervention); the stop sign's wait chimes once a WAIT_INFO_S (turnpilotPlan.stopGo.chime: stop_go.py)
 SILENT_PROMPTS = ('none', 'yieldAhead', 'waitingForGap', 'creepingForView', 'waitingForCross')
@@ -66,7 +66,7 @@ SILENT_PROMPTS = ('none', 'yieldAhead', 'waitingForGap', 'creepingForView', 'wai
 RETIRED_PROMPTS = ('stopSignGo', 'signalGo', 'unprotectedTurnGo', 'carStoppedGo')
 RETIRED_ALERTS = ('goingOnRed',)
 CONTROL_ALERT_EVENTS = ('stopOverrun', 'proceedingOnYellow', 'junctionUncertain', 'carStoppedNote',  # below the prompt, above a lane change
-                        'lightGreenNotMoving', 'unstickLift')
+                        'lightGreenNotMoving', 'unstickLift', 'pedestrianWaiting')
 CONTROL_STATUS_ALERTS = ('mapControlsUnavailable', 'lightSourceRejected', 'farViewOff', 'sideCamerasOff')  # last of all, a status line
 # the route's stop signs (route_notice.py, STOP_SIGNS.md 3.4): said engaged or not (turnpilotRouteNotice, a permanent alert), the
 # text in turnpilotPlan.routeNotice; all but routeAvoidsStops with a chime
@@ -158,6 +158,7 @@ CONTROL_PROMPT_TEXT = {
   'signalUnseenTakeControl': 'TurnPilot can\'t see the light',
   'turnAbandonedTakeControl': 'The car is steering out of the turn',
   'wrongSideTakeControl': 'Yellow line on the right: the car is left of the centre line',
+  'pedestrianWaitingTakeControl': 'A pedestrian has stood at the crosswalk 45 s',
 }
 CONTROL_ALERT_TEXT = {
   'cannotStopComfortably': 'Cannot stop gently for the stop/signal',
@@ -187,6 +188,7 @@ CONTROL_ALERT_TEXT = {
   'carStoppedNote': 'Nothing ahead is holding the car',  # the stopped note's chime (turnpilotd.py), before its handback
   'lightGreenNotMoving': 'Light green: car not moving',  # under TurnPilotAlwaysDrive, a steady camera green the model doesn't go on
   'unstickLift': 'Nothing ahead is holding the car: going on',  # under TurnPilotAlwaysDrive, section 4.5's lift
+  'pedestrianWaiting': 'Waiting for pedestrian',  # the crosswalk hold's standoff (SC-02), once a hold at PED_NOTE_S
 }
 
 

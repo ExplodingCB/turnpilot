@@ -187,13 +187,14 @@ from openpilot.selfdrive.turnpilot.junction_watch import JunctionWatch, detector
 from openpilot.selfdrive.turnpilot import visibility_table
 from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
 from openpilot.common.time_helpers import system_time_valid
-from openpilot.selfdrive.turnpilot.scene_policy import (CROSSWALK_X_AFTER_M, CROSSWALK_X_BEFORE_M, CROSSWALK_Y_FAR_M, CROSSWALK_Y_NEAR_M,
+from openpilot.selfdrive.turnpilot.scene_policy import (CROSSWALK_REASON, CROSSWALK_X_AFTER_M, CROSSWALK_X_BEFORE_M, CROSSWALK_Y_FAR_M, CROSSWALK_Y_NEAR_M,
                                                          CURB_PED_CAP_DEFAULT, CURB_PED_EDGE_M, CURB_PED_X_M, HOLD_LINE_M, NO_ACCEL_CAP,
                                                          ONCOMING_ENTRY_M, PATH_HALF_WIDTH_M, STOP_DECEL, VEHICLES, ScenePolicy, far_side_turn,
                                                          in_path, velocity_trusted)
 from openpilot.selfdrive.turnpilot.turn_skip import SkipState, TurnSkip, can_make_turn
 from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
 from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, DRIVEN, LIGHT_RED_MAX_S, LINE_D, OFF, ROAD_RANGE_M,
+                                                           STAND_UNDECIDED_S,
                                                            ROUTE_REACH_MARGIN_M, LeftInput, UnprotectedLeft, left_mode_for,
                                                            reach_at_line)
 
@@ -419,6 +420,12 @@ SIGN_CLEAR_S = 5.
 # is in the path and no model lead within GO_CLEAR_M (go_blocked), and no far-side turn or the left is near; said with a chime
 # (unstickLift), inside the release's RELEASE_LIFT_M, no second try until the model drives on (unstick_done)
 UNSTICK_S = 10.
+# the right-turn crosswalk hold's standoff (ALWAYS_DRIVE.md SC-02, unconditional): held standing by it PED_NOTE_S, one chime and
+# PED_WAITING_NOTE; once every walker holding it has stood still (scene_policy.walker_standing) STAND_UNDECIDED_S, the left's
+# same standoff, pedestrianWaitingTakeControl with the car held, never a go past them; walkers who move are waited through
+PED_NOTE_S = 10.
+PED_WAITING_NOTE = "Waiting for pedestrian"
+PED_WAITING_REASON = "Pedestrian waiting: take control"
 UNSTICK_REASON = "Nothing ahead is holding the car: going on"
 # the stop-sign decider's go causes (stop_go.py, go_override.CAUSES): its own watchdog (the gate, G5's window, GO_RETRIES, H5)
 # follows them, never the no-move clock, and turnRelease never certifies alongside one
@@ -695,6 +702,11 @@ class TurnPilot:
     self.unstick_done = False      # under the switch, section 4.5's lift went for this release: no second try (stopped_unheld)
     self.unstick_id: int | None = None  # ...as this go (GoCertifier.id)
     self.unstick_alert_t = 0.      # ...s left of its unstickLift alert
+    self.ped_hold_s = 0.           # the crosswalk hold has stood the car this long (SC-02, crosswalk_standoff)...
+    self.ped_stand_s = 0.          # ...with every walker it is for standing
+    self.ped_said = False          # ...its note chimed
+    self.ped_handed = False        # ...handed back, held, while the hold stands the car
+    self.ped_alert_t = 0.          # ...s left of its pedestrianWaiting alert
     self.people_runs: dict = {}    # (camera, view) -> [s old, the person boxes] of each camera's last detector run
     self.abandon_s = 0.            # the model steering away from the route's turn in the junction (turn_abandoned)
     self.wrong_s = 0.              # s of reads of a yellow line on the car's right (wrong_side)
@@ -1336,6 +1348,7 @@ class TurnPilot:
     self.override_failed_t = max(self.override_failed_t - DT_MDL, 0.)
     if decision.hard_brake:  # a confirmed track's hard stop outranks the map's alerts (scene_policy.py)
       plan.controlAlert = 'hardBrake'
+    ped_handed = self.crosswalk_standoff(sm, v_ego, acting, decision)
     stalled = self.stalled_in_turn(sm, cs, v_ego, acting, decision, mapd, objects=objects, raw=raw, available=available,
                                    took_over=took_over, right_hand_traffic=right_hand_traffic)
     stopped = self.stopped_unheld(sm, cs, v_ego, acting, decision, mapd, objects=objects, raw=raw)
@@ -1346,6 +1359,8 @@ class TurnPilot:
     wrong_side = self.wrong_side(sm, cs, v_ego, acting, paint, right_hand_traffic)
     if withdrawn or self.cant_start_unheld:  # the switch's has no hold: the model drives on under it (no_move)
       plan.controlPrompt, plan.reason = 'cantStartTakeControl', NO_MOVE_REASON
+    elif ped_handed:  # the crosswalk hold's standoff (SC-02): held, take control
+      plan.controlPrompt, plan.reason = 'pedestrianWaitingTakeControl', PED_WAITING_REASON
     elif abandoned:
       plan.controlPrompt, plan.reason = 'turnAbandonedTakeControl', TURN_ABANDONED_REASON
     elif wrong_side:
@@ -1361,6 +1376,11 @@ class TurnPilot:
         plan.controlAlert = 'carStoppedNote'
     elif stopped:
       plan.controlPrompt, plan.reason = 'carStoppedTakeControl', stopped
+    if self.ped_hold_s >= PED_NOTE_S - 1e-6 and str(plan.controlPrompt) == 'none':
+      plan.reason = PED_WAITING_NOTE  # the crosswalk hold standing the car past PED_NOTE_S (SC-02), its chime once
+      if self.ped_alert_t > 0. and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS:
+        plan.controlAlert = 'pedestrianWaiting'
+    self.ped_alert_t = max(self.ped_alert_t - DT_MDL, 0.)
     if self.unstick_alert_t > 0. and str(plan.controlPrompt) == 'none' and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS:
       plan.controlAlert, plan.reason = 'unstickLift', UNSTICK_REASON  # section 4.5's lift: said with a chime
     self.unstick_alert_t = max(self.unstick_alert_t - DT_MDL, 0.)
@@ -2358,6 +2378,26 @@ class TurnPilot:
     controls ok (release_light 'none'), or unsignalized_why."""
     light = self.map_controls.release_light(0.)
     return f"light {light}" if light != 'none' else self.unsignalized_why(0.)
+
+  def crosswalk_standoff(self, sm, v_ego: float, acting: bool, decision) -> bool:
+    """The right-turn crosswalk hold's standoff (ALWAYS_DRIVE.md SC-02, unconditional; module constants): its clocks, the note's
+    chime at PED_NOTE_S, and the handback once every walker it is for has stood STAND_UNDECIDED_S, held while it stands the car."""
+    j = self.scene.junction
+    held = acting and sm['carControl'].enabled and decision.should_stop and v_ego < STANDSTILL_SPEED and j is not None and \
+      j.reason == CROSSWALK_REASON
+    if not held:
+      self.ped_hold_s = self.ped_stand_s = 0.
+      self.ped_said = self.ped_handed = False
+      return False
+    self.ped_hold_s += DT_MDL
+    self.ped_stand_s = self.ped_stand_s + DT_MDL if self.scene.holders_standing else 0.
+    if self.ped_hold_s >= PED_NOTE_S - 1e-6 and not self.ped_said:
+      self.ped_said, self.ped_alert_t = True, ABORT_HOLD_S
+      cloudlog.event("turnpilot.crosswalk_wait", held_s=round(self.ped_hold_s, 1), standing=bool(self.scene.holders_standing))
+    if self.ped_stand_s >= STAND_UNDECIDED_S - 1e-6 and not self.ped_handed:
+      self.ped_handed = True
+      cloudlog.event("turnpilot.crosswalk_standoff", error=True, held_s=round(self.ped_hold_s, 1), **(j.evidence or {}))
+    return self.ped_handed
 
   def watch_people(self, *runs) -> None:
     """The person boxes of each camera's last detector run (PEOPLE), PERSON_RUN_HOLD_S at most (person_near_turn)."""

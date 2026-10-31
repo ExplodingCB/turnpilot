@@ -150,6 +150,8 @@ CROSSWALK_LEAVING_SPEED = 0.8
 CROSSWALK_LEAVING_PAST_M = 3.
 CROSSWALK_LEAVING_RATIO = 0.5
 CROSSWALK_LEAVING_FRAMES = 10  # ScenePolicy: leaving on this many frames in a row (0.5 s), not a frame of velocity noise
+CROSSWALK_REASON = "pedestrian in crosswalk"
+WALKER_STAND_SPEED = 0.5  # m/s: a walker holding the crosswalk hold stands below this, or with its velocity not yet trusted (SC-02)
 KEEP_EVIDENCE_S = max(MAX_AGE_S, CLOSE_HOLD_S)  # the longest the tracker keeps a track it no longer matches
 RECENT_S = max(CROSSWALK_STEADY_S, CONFIRM_WINDOW_S)  # TrackEvidence.recent keeps the hits of this long
 
@@ -313,6 +315,22 @@ def far_side_turn(maneuver, right_hand_traffic: bool) -> bool:
   return maneuver is not None and maneuver.kind == TURN and (maneuver.side == LEFT) == right_hand_traffic
 
 
+def walker_standing(obj) -> bool:
+  """A walker holding the crosswalk hold stands (ALWAYS_DRIVE.md SC-02): its velocity trusted and under WALKER_STAND_SPEED, or not
+  yet trusted."""
+  return not velocity_trusted(obj) or math.hypot(obj.vx, obj.vy) < WALKER_STAND_SPEED
+
+
+def crosswalk_holders(objects, distance: float, side: int, is_walker=crosswalk_walker, may_leave=confirmed_track) -> list:
+  """The walkers a curb-side turn's crosswalk hold is for (junction_stops): walker-grade pedestrians in the turn side's zone,
+  CROSSWALK_X_BEFORE_M before to CROSSWALK_X_AFTER_M past the maneuver point and CROSSWALK_Y_NEAR_M to CROSSWALK_Y_FAR_M to
+  the side, but for one trusted to be leaving it."""
+  return [obj for obj in objects if str(obj.cls) == "pedestrian" and is_walker(obj) and
+          distance - CROSSWALK_X_BEFORE_M < obj.x < distance + CROSSWALK_X_AFTER_M and
+          CROSSWALK_Y_NEAR_M < obj.y * side < CROSSWALK_Y_FAR_M and
+          not (may_leave(obj) and leaving_crosswalk(obj, distance, side))]
+
+
 def leaving_crosswalk(obj, distance: float, side: int) -> bool:
   """A walker moving away from the turn's crosswalk (its velocity trusted: a confirmed track's): on along the car's axis
   well past the maneuver point, or down the cross street away from the car's road."""
@@ -357,15 +375,12 @@ def junction_stops(objects, maneuver, distance, v_ego, right_hand_traffic, is_wa
     return []
   side = maneuver.side  # the crosswalk and the oncoming lanes are both on the turn side; y is positive left
   if not far_side:
-    walkers = [obj for obj in objects if str(obj.cls) == "pedestrian" and is_walker(obj) and
-               distance - CROSSWALK_X_BEFORE_M < obj.x < distance + CROSSWALK_X_AFTER_M and
-               CROSSWALK_Y_NEAR_M < obj.y * side < CROSSWALK_Y_FAR_M and
-               not (may_leave(obj) and leaving_crosswalk(obj, distance, side))]
+    walkers = crosswalk_holders(objects, distance, side, is_walker, may_leave)
     if not walkers:
       return []
     # the hold hardens only for a confirmed walker, and says which one (the most confirmed, then the nearest)
     walker = min(walkers, key=lambda obj: (not may_harden(obj), obj.x))
-    return hold_line_stop(maneuver, distance, v_ego, "pedestrian in crosswalk", far_side, may_harden(walker), track_evidence(walker))
+    return hold_line_stop(maneuver, distance, v_ego, CROSSWALK_REASON, far_side, may_harden(walker), track_evidence(walker))
   holds = []
   for obj in road_frame(objects, heading_deg, side):
     # a new track's vx is range noise, its sign included (VEL_TRUST_HITS): taken as coming, never as going away. Taken so,
@@ -439,6 +454,8 @@ class ScenePolicy:
     self.curb_cap = CURB_PED_CAP_DEFAULT  # TurnPilotCurbPedCap: the curb-pedestrian speed cap (module docstring)
     self.curb_t = math.inf  # s since a track last earned it
     self.curb_logged: set[int] = set()  # tracks it was logged for
+    # the crosswalk hold in force: whether every walker it is for stands (walker_standing), None with no crosswalk hold (SC-02)
+    self.holders_standing: bool | None = None
 
   def fault(self, maneuver_id: int | None = None) -> None:
     """turnpilotd faulted and dropped the route (maneuver_id: its maneuver): the junction hold in force stays where it
@@ -508,6 +525,12 @@ class ScenePolicy:
     if maneuver_id is not None and maneuver_id in (self.released_id, self.committed_id):
       junction = []
     self.junction = junction[0] if junction else None
+    if self.junction is None or self.junction.reason != CROSSWALK_REASON:
+      self.holders_standing = None
+    elif available:  # the scene gone: what it last showed stands
+      holders = crosswalk_holders(objects, distance, maneuver.side, lambda obj: self.tracks[obj.trackId].walker,
+                                  lambda obj: self.tracks[obj.trackId].confirmed and self.tracks[obj.trackId].leaving >= CROSSWALK_LEAVING_FRAMES)
+      self.holders_standing = all(walker_standing(obj) for obj in holders) if holders else None
     stops = peds + junction + self._fault_hold(available, maneuver, distance, v_ego, gas_pressed, dt) + list(extra_stops)
     stops += self.curb_ped(objects if available else [], v_ego, path, dt)
     decision = decide(stops, v_ego)
