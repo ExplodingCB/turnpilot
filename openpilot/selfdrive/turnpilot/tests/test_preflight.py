@@ -50,10 +50,12 @@ def test_alpha_long():
 
 
 def test_shadow():
+  # Saturday runs live from the first drive (TurnPilotShadowMode 0, the default): live is INFO, shadow mode the WARN
   assert preflight.check_shadow(False, False).status == INFO
-  assert preflight.check_shadow(True, True).status == INFO
   live = preflight.check_shadow(True, False)
-  assert live.status == WARN and "TurnPilotShadowMode=1" in live.fix
+  assert live.status == INFO and "live" in live.detail and not live.fix
+  shadow = preflight.check_shadow(True, True)
+  assert shadow.status == WARN and "nothing acts" in shadow.detail and "TurnPilotShadowMode=0" in shadow.fix
 
 
 def test_always_drive():
@@ -293,3 +295,12 @@ def test_stop_sign_go(tmp_path):
     assert preflight.check_stop_sign_go(mode, True, True, True, side).status == INFO
   c = preflight.check_stop_sign_go('shadow', False, True, False, side)
   assert c.status == WARN and 'unknown' in c.detail
+
+
+def test_pyvalhalla_says_how_its_self_install_is_going():
+  assert preflight.check_pyvalhalla("3.9.1", install={"state": "failed"}).status == PASS
+  installing = preflight.check_pyvalhalla(None, install={"state": "installing", "progress": 0.5, "stage": "downloading"})
+  assert installing.status == FAIL and "installing itself 50%" in installing.detail
+  failed = preflight.check_pyvalhalla(None, install={"state": "failed", "why": "less than 300 MB free", "short": "storage full"})
+  assert "less than 300 MB free" in failed.detail and "retry" in failed.fix
+  assert "internet" in preflight.check_pyvalhalla(None, install={"state": "offline"}).detail

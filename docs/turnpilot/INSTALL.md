@@ -1,37 +1,100 @@
 # Install TurnPilot on a comma four
 
-This guide takes a comma four with a chestnut eGPU from stock openpilot to a TurnPilot install that is ready for the first shadow-mode drive. It is written for Chase's car, a 2017 Model 3 with HW3. The drives are in [SHADOW_CHECKLIST.md](SHADOW_CHECKLIST.md).
+This guide takes a comma four with a chestnut eGPU from sunnypilot or stock openpilot to TurnPilot, ready to drive. It is written for Chase's car, a 2017 Model 3 with HW3. "Install like stock" is the whole install as Chase does it, with the comma's screen, his phone and the map key Kellen texts him. Everything after it is for Kellen or a developer with SSH. The drives are in [SHADOW_CHECKLIST.md](SHADOW_CHECKLIST.md).
 
-Run every command on the comma from `/data/openpilot` over SSH, unless the step says it runs on your computer.
+## Install like stock
 
-## What you need
+TurnPilot installs the way sunnypilot does: the comma's own setup screens, one URL, then TurnPilot's own setup screens through to "ready to drive". There is no SSH, laptop or document in it.
 
-- A comma four with the chestnut attached and the car harness installed.
-- Home Wi-Fi for the install. The download is more than 800 MB, mostly the 775 MB big driving model.
-- A Model 3 whose software is new enough for this openpilot. opendbc treats a Tesla without the 3-bit steering firmware as dashcam only; its comment dates that firmware to 2026.8.6 on HW3. If the comma stays in dashcam mode once it has seen the car, the car's software is the reason, and preflight reports it.
-- An iPhone with Personal Hotspot.
-- A GitHub account with an SSH key. The comma fetches the public keys from GitHub.
-- A computer with `ssh` and `scp`, and the Indiana tile file `tiles.tar` (390 MB). `tools/turnpilot/build_valhalla_tiles.sh` builds it; it is in `~/turnpilot_data/valhalla/indiana/` on Kellen's Mac.
+The numbers in brackets name screenshots of the real comma screens. `python -m openpilot.selfdrive.ui.tests.turnpilot_setup_screenshots <dir>` draws them; Kellen's copy is in `turnpilot-artifacts/phase4/night/onboarding_shots`, with the phone page's three shots beside them (`phone_1` to `phone_3`). The stock screens before the terms page aren't drawn there, so their words below come from the stock setup code (`openpilot/system/ui/mici_setup.py` and `mici_updater.py`).
 
-## What the branch name does
+### What you need
 
-The installer URL is `installer.comma.ai/kaileh57/turnpilot`. The installer clones `github.com/kaileh57/openpilot.git`, which GitHub redirects to `kaileh57/turnpilot`, and checks out the branch `turnpilot`. To check this from any computer:
+- The comma four with the chestnut attached, mounted in the car on its harness. The chestnut occupies the comma's USB-C port, so the car powers the comma. Keep the car awake from the first step to "ready to drive", for example with the climate kept on. The downloads are about 1 GB for the comma's OS update and more than 800 MB for TurnPilot, and nobody has timed the first compile on a comma four.
+- Home Wi-Fi that reaches the parked car.
+- A phone that can join that Wi-Fi, and later share its own hotspot with the comma (iPhone: Personal Hotspot).
+- The map key, which Kellen texts as a message of its own.
+- A Model 3 whose software is new enough for this openpilot. opendbc treats a Tesla without the 3-bit steering firmware as dashcam only, and its comment dates that firmware to 2026.8.6 on HW3. Chase's car ran sunnypilot `staging-chestnut`, which has the same requirement.
 
-```
-git ls-remote https://github.com/kaileh57/openpilot.git turnpilot
-```
+### Remove sunnypilot
 
-The command prints one line, `<commit>  refs/heads/turnpilot`.
+1. On the comma, open sunnypilot's settings, go to **Software**, and uninstall. These are sunnypilot's screens, which this guide hasn't checked. Stock openpilot has **uninstall openpilot** at the end of **Settings > Software**: tap it, then slide to uninstall.
+2. Stock openpilot's uninstall restarts the comma, erases `/data` ("resetting device") and opens the stock setup. sunnypilot is built on it and is expected to do the same. The erase takes sunnypilot, its settings, the camera calibration and the recorded drives, so upload any drive you want to keep first.
 
-openpilot decides what a branch is from its name. `RELEASE_BRANCHES` in `openpilot/common/version.py` lists `release-mici`, `nightly-chestnut` and a few others. `turnpilot` is not in the list, and that has three effects this install depends on:
+### Install from the stock setup
 
-1. The manager sets `IsReleaseBranch` to 0, so **Settings > Developer** shows the **alpha longitudinal** and **navigation (alpha)** toggles. Both are hidden on release branches. Tesla longitudinal (Autospeed) is alpha and needs the first one.
-2. The branch has no `prebuilt` file, so the comma runs the build on every boot, and the first boot compiles openpilot from source, including the panda firmware. Later boots finish in seconds, until an update changes files. The panda build without `RELEASE=1` defines `ALLOW_DEBUG`, and the Tesla safety code only accepts longitudinal control in that build (`tesla.h`). The first boot reflashes the panda with the debug firmware.
-3. The comma shows "WARNING: This branch is not tested" at startup. That is expected.
+1. Tap **start**.
+2. Slide **slide to install custom software**, the lower of the two sliders.
+3. Swipe through "caution: installing 3rd party software" and tap **next**.
+4. On "connect to internet", tap the Wi-Fi card, pick the home network, and enter its password. The pill reads "waiting for internet..." until the comma is online, then turns into **choose software**. Tap it.
+5. Type `kaileh57/turnpilot` and confirm. Setup turns the short form into `installer.comma.ai/kaileh57/turnpilot`, and typing the full URL works too.
+6. The screen shows "downloading..." while it fetches comma's installer, then "installing..." with a percentage while the installer clones TurnPilot and pulls the 776 MB driving model, then "finishing setup". The comma restarts.
 
-## Install from the Mac (private opendbc)
+If the URL is mistyped, setup shows "download failed" with the reason, such as "No custom software found at this URL". Swipe down and type it again.
 
-The installer path in "Install" below can't install this build. The build's `opendbc_repo` gitlink is a commit in the private repo `github.com/kaileh57/turnpilot-opendbc`, and the installer clones over unauthenticated https with its submodules, so the clone fails at opendbc. No credential goes on the comma or into the repo, so the fix is to build the tree on Kellen's Mac and copy it over SSH. Until opendbc is public, use this section in place of steps 2 to 5 of "Install". The comma fetches nothing from GitHub.
+### First boot
+
+1. The comma asks to update its operating system: "update required", "the download size is approximately 1 GB". TurnPilot needs AGNOS 20.1, and sunnypilot `staging-chestnut` at the commit Chase's car ran (820eaf287d) uses 19.9, so expect this screen. Tap **next**, check the Wi-Fi, and tap **download & install**. The comma downloads, installs and restarts. A comma already on 20.1 skips this screen.
+2. The comma compiles TurnPilot behind a spinning comma logo with a progress bar, and then flashes the panda with this build's firmware. Don't let the car sleep. If the compile fails, the screen shows the compiler's output: send Kellen a photo of it.
+
+### Stock terms and training
+
+1. "terms and conditions" [01]: swipe through and slide **accept terms**.
+2. The stock training: "what is openpilot?" with its four rules, then **next**; "driver monitoring check", where the comma's camera has to see your face; and "cabin camera data", where you slide **allow data uploading** or **no, don't upload**.
+
+### TurnPilot setup
+
+TurnPilot setup opens by itself when the training ends. It uses the stock cards and buttons: each step is a row of cards that you swipe left and right, and the green pill at the end moves on. A step that is still waiting shows a dimmed pill. A step that fails says what to do and adds **retry**. Every step but the last ends with **set up later** (the X): tap it and slide to confirm, and setup closes until the next boot.
+
+1. **what is turnpilot?** [02-04]. "TurnPilot drives your navigation route: the turns, the lane changes and the stops." Tap **next**. This also fills in the map server's address and certificate (`maps/defaults.py`), so only the key is left to enter.
+2. **pair your phone** [05-10]. With the phone on the same Wi-Fi as the comma, scan the QR code with the phone camera and open the link. It opens the TurnPilot page in the phone's browser, at an address like `http://192.168.1.68:8088/?t=...` [07], which can also be typed by hand. The part after `?t=` is the comma's password, so keep it to yourself. The pill reads "waiting for phone..." [08] and turns into a green **next** once the page is open [09], with "phone connected" on the status card [10]. Optional: in Safari, tap Share, then Add to Home Screen.
+3. **add the map key** [11-18]. "Open the TurnPilot page on your phone and paste the map key Kellen sent you." [12]. Copy Kellen's text, paste it in the page's **Map key** box ("Paste the map key here" [phone_1]) and tap **Save key**. The page answers "Key works. TurnPilot can drive around Indianapolis and Seattle. Now tap next on the comma." [phone_3], and the comma's card reads "map key works" with the mapped area [17]. Tap **next** [18]. If the comma reads "key not accepted" [14] and the page "That key didn't work" [phone_2], copy the whole text again and paste it in place of the first try. "map server offline" [16] means the comma can't reach the server: check the comma's Wi-Fi, then tap **retry** [15].
+4. **map engine** [19-25]. The comma installs its map engine (pyvalhalla, a 35 MB download) by itself whenever it is online, so this is often done before the step opens. The card shows "installing" with a percentage [20], then "map engine installed" [24]; tap **next**. "waiting for internet" [21] goes on by itself once the comma is online. "install failed" [22] gives the reason, such as "storage full" (it needs 300 MB free): tap **retry** [23].
+5. **car turn signals**, optional [26-42]. Tap **skip** [29], the default. With car signals off, the comma chimes "Signal Left" or "Signal Right" at a turn below 20 mph, and you tap the stalk that way. The check lets the car work its own turn signal, and it can be run on any later day from **Settings > turnpilot > run setup again**. It needs the car parked in P (the **check signals** button [30] is dimmed otherwise) and someone outside to watch the lamps:
+   1. Tap **check signals**. Park in P with room on both sides [32].
+   2. Turn the car off and on, with hands off the stalk [33]. The car blinks each side.
+   3. Step out and watch each side's lamps [34], then answer on the phone whether they flashed [35, 37]. The page's **Car turn signal** section opens the question by itself.
+   4. If they flashed, try the wipers, the headlights, the high beams and both stalk signals [38]. Tap **they all work** [39], then turn the car off and on once more [41]. The car signals its own turns from then on. **something's wrong** [40], or any failed check, turns car signals off again [42].
+6. **ready to drive** [43-51]. "1. In the car, turn on your phone's hotspot. Join it in settings > network." [44] "2. Scan the code again in settings > turnpilot > pair phone." [45] ("First drive" below says why.) "3. Drive straight above 15 mph for a few minutes. The camera calibrates." "4. Engage with the cruise stalk." "5. Enter a destination on the phone." "TurnPilot starts live: it drives the route." [49]. With car signals off it adds the stalk line [50]. Tap **done** [51].
+
+Setup opens again at every boot, at the first step that isn't finished, until **done** is tapped. While anything is missing, the home screen counts one more alert [63], "TurnPilot is not ready to drive", which says what is missing and where to fix it [62]. It goes away once nothing is missing [64]. A fresh install also shows the stock "Finish setup. Pair your device with comma connect" alert, which TurnPilot doesn't need.
+
+**Settings > turnpilot** [52-59] has **pair phone**, **watch only** (off: live), **always drive**, **stop-sign go** and **far pedestrians** (the last three on), the map engine's state, and **run setup again**.
+
+### First drive
+
+Setup stays up while the car is parked with the comma on, and closes once the car moves.
+
+1. In the car the comma needs internet for each drive's map, and the phone has to reach the comma. Turn on the phone's hotspot, then on the comma open **Settings > Network** and join it. The comma remembers it for later drives.
+2. The page's address changes on the hotspot. Open **Settings > turnpilot > pair phone** [53] and scan the QR code again. A bookmark of the home address doesn't load there, and the page opened without the code says "Not paired" and where the code is. The ready to drive screen says steps 1 and 2 [44, 45].
+3. When the car turns on, the comma shows "WARNING: This branch is not tested". That is expected on this branch.
+4. Drive straight above 15 mph for a few minutes, so the camera calibrates. The uninstall erased sunnypilot's calibration.
+5. Engage with the cruise stalk, then search for a destination on the phone page and tap Navigate. Place search needs the hotspot's internet.
+
+### Go back to sunnypilot
+
+1. On the comma, open **Settings > Software**, tap **uninstall openpilot**, and slide to uninstall. The comma erases `/data`, including TurnPilot's settings, pairing and map key, and opens the stock setup.
+2. Follow "Install from the stock setup" with sunnypilot's URL in step 5: `sunnypilot/staging-chestnut`, the branch Chase's car ran (at 820eaf287d on 2026-10-31), or `sunnypilot/release-mici`, sunnypilot's release for the comma four. Neither has been tried from this guide, and sunnypilot's own instructions may give another URL.
+3. sunnypilot `staging-chestnut` uses AGNOS 19.9, so its first boot may show the OS update screen again.
+
+To come back to TurnPilot later, start again at "Remove sunnypilot". The map key has to be entered again.
+
+### What was checked
+
+From a Mac on 2026-10-31, at the merge of the guided setup and the defaults (b8a4fbe on `tp/sat-setup`): the 253 git-lfs files are the same set of objects as at 263065a, every one of which is on the `.lfsconfig` server (comma's Hugging Face LFS repo); `github.com/kaileh57/openpilot.git` redirects to this repo; and the installer's own commands from `openpilot/selfdrive/ui/installer/installer.cc` (`git clone --depth=1 --recurse-submodules`, `checkout`, `reset --hard`, `submodule update --init`) with no GitHub login leave every submodule at its gitlink from its public URL and no LFS pointer anywhere. The big driving model's sha256 matches its pointer. The TurnPilot screens are the real UI code drawn on the Mac.
+
+Not checked, because only a comma or the car can show it:
+
+- that AGNOS's git runs git-lfs during the installer's clone. Stock openpilot's own LFS files depend on it too.
+- that sunnypilot's uninstall erases `/data` as stock's does. The defaults land only on params that are unset, so a comma that kept sunnypilot's params keeps its old values.
+- the OS update from 19.9 to 20.1, the free space on `/data`, and how long the first compile takes.
+- the map engine's self-install on the comma, "phone connected" over a real hotspot, setup staying up with the car on and closing when it moves, and the turn signal check across real ignition cycles.
+
+## Install from the Mac (fallback)
+
+The comma's own installer ("Install like stock" above) is the install path. Every submodule in `.gitmodules` is public, `github.com/kaileh57/turnpilot-opendbc` included, so the installer's unauthenticated clone gets them all, and every git-lfs file the device reads is on the `.lfsconfig` server (comma's Hugging Face LFS repo). Use this section only when the installer can't be used, in place of "Remove sunnypilot" and "Install from the stock setup". It needs SSH on the comma ("Turn on SSH" below), which takes the comma's screen and a GitHub username. It builds the tree on Kellen's Mac and copies it over SSH, and the comma fetches nothing from GitHub.
+
+With `--map-key` the script also writes the map server's API key from the Mac's `~/turnpilot_data/mapserver/client/key` into the comma's `TurnPilotMapKey`. `--map-key-only` writes only the key, onroad or off, and changes nothing else. The key travels over SSH's standard input, never on a command line, and the script never prints it. Without either flag it never opens the key file.
 
 `openpilot/tools/turnpilot/deploy_to_comma.py` does the whole job and prints each step. It runs with the Mac's `python3` and needs `git-lfs` on the Mac.
 
@@ -39,7 +102,7 @@ The installer path in "Install" below can't install this build. The build's `ope
 2. It builds the tree in a temporary directory from the Mac's own clones: the commit on branch `turnpilot`, tracking `origin/turnpilot` (origin is `https://github.com/kaileh57/turnpilot.git`, which nothing fetches while `DisableUpdates` is 1), depth 1. Each submodule is at its gitlink, from `.git/modules/<name>`. A submodule commit missing there comes from the public URL in `.gitmodules`; the opendbc commit is on the Mac. Every git-lfs file (the driving models, the fonts, the AGNOS updater) is its real bytes, checked against its sha256. No build output from the Mac goes, because the tree comes from git objects, not from a working copy.
 3. It copies the tree to `/data/openpilot.tp-incoming-<stamp>`, then checks it on the comma: every file's sha256 against the Mac's manifest, the file count, the symlinks, `HEAD`, the branch and its upstream, and each submodule's commit. It runs the same git commands as `is_dirty()` in `openpilot/common/version.py`, which also makes git-lfs hash the model files once, so the first boot doesn't. The tree's own git config sets git-lfs's clean filter (`filter.lfs.clean`, `filter.lfs.required`), so this check and the device's `is_dirty()` don't depend on how AGNOS configures git for user `comma`. It sets no smudge filter, so checkouts keep whatever AGNOS gives them.
 4. It checks again that the comma is offroad, renames `/data/openpilot` to `/data/openpilot.prev-<stamp>`, and moves the new tree to `/data/openpilot`. The comma does both moves even if the SSH connection drops between them.
-5. It sets `DisableUpdates` to 1, so the updater doesn't try GitHub, and asks before it reboots the comma. Before the reboot, the comma checks again that it is offroad, that `DisableUpdates` is 1, and that `/data/openpilot/.overlay_init` doesn't exist. Sunnypilot's updater keeps running until the reboot, and it creates that file when it sets up its overlay over the new tree. With the file there, the next boot would install any update the updater stages from GitHub over the deployed build.
+5. It sets `DisableUpdates` to 1, so the updater doesn't try GitHub, and asks before it reboots the comma. This differs from the installer path, where updates stay on (the default, 0) so a pushed fix can reach the car; whether the script should leave them on too is Kellen's call, and until then set `DisableUpdates=0` after a Mac deploy to get updates ("Update" below). Before the reboot, the comma checks again that it is offroad, that `DisableUpdates` is 1, and that `/data/openpilot/.overlay_init` doesn't exist. Sunnypilot's updater keeps running until the reboot, and it creates that file when it sets up its overlay over the new tree. With the file there, the next boot would install any update the updater stages from GitHub over the deployed build.
 
 If a step fails, the script stops and says which state the comma is in: as it was, with both trees intact (the old one still in `/data/openpilot`, the new one beside it), or unknown. The state is unknown when the SSH connection ends during the swap or the rollback. Then don't reboot the comma or start the car until `--dry-run` has shown what `/data/openpilot` holds. The message gives the commands that put a missing tree back and that set `DisableUpdates`. A leftover `openpilot.tp-incoming-*` directory is listed on the next run with the command that removes it.
 
@@ -81,7 +144,7 @@ The copy is about 1.2 GB (1.18 GB and 4,229 files for commit `c8dff2e`; the 776 
 
 ### What the first boot does
 
-The comma boots `/data/openpilot` the way sunnypilot's tree booted (`/data/continue.sh` starts `launch_openpilot.sh`). The branch has no `prebuilt` file, so the first boot compiles openpilot from source, with a progress bar, and then pandad flashes the panda with this build's debug firmware ("What the branch name does" explains why). Nobody has timed the compile on this branch. Keep the comma powered until the road view shows. The tree has no `.overlay_init`, so the launcher doesn't install an update that sunnypilot left in `/data/safe_staging`. If sunnypilot's updater creates one after the swap, the script refuses to reboot. Then continue at "Turn on SSH" below. SSH is already on, because the settings carry over.
+The comma boots `/data/openpilot` the way sunnypilot's tree booted (`/data/continue.sh` starts `launch_openpilot.sh`). The branch has no `prebuilt` file, so the first boot compiles openpilot from source, with a progress bar, and then pandad flashes the panda with this build's debug firmware ("What the branch name does" explains why). Nobody has timed the compile on this branch. Keep the comma powered until the road view shows. The tree has no `.overlay_init`, so the launcher doesn't install an update that sunnypilot left in `/data/safe_staging`. If sunnypilot's updater creates one after the swap, the script refuses to reboot. The params carry over from sunnypilot, so the stock terms and training show only if their versions are new to this comma; TurnPilot setup opens either way, as in "Install like stock", and with `--map-key` its key step only waits for the map server's answer. SSH stays on, because the settings carry over.
 
 ### What stays
 
@@ -116,18 +179,30 @@ The script's tests run the whole flow against a stand-in comma on the Mac (`open
 - how long the first compile takes, and whether 3 GB of headroom covers it.
 - that sunnypilot reflashes its panda firmware after a rollback.
 
-## Install
+## Work over SSH
 
-Do this at home on Wi-Fi, with the comma powered for the whole first boot. The chestnut occupies the comma four's USB-C port, so power comes from the harness: keep the car awake, or use a bench 12 V supply.
+The rest of this guide is for Kellen or a developer. Run every command on the comma from `/data/openpilot` over SSH, unless the step says it runs on your computer. Besides what "Install like stock" needs, you need:
 
-1. Join your home Wi-Fi.
-2. If openpilot is already installed, open **Settings > Software**, tap **uninstall openpilot**, and confirm. The device resets its data partition and restarts into setup, so upload any routes you want to keep first.
-3. On the setup screen, slide to install custom software, accept the warning, pick your Wi-Fi network, and tap **choose software**.
-4. Enter `installer.comma.ai/kaileh57/turnpilot`. Setup also accepts the short form `kaileh57/turnpilot`.
-5. Wait for the install. The screen shows a percentage while the comma clones the branch and its submodules and pulls the big driving model from comma's Hugging Face LFS server.
-6. The comma restarts into the first boot. A progress bar shows the compile. This takes a while; nobody has timed it for this branch. Do not cut power. If the compile fails, the screen shows the compiler output.
+- A GitHub account with an SSH key. The comma fetches the public keys from GitHub.
+- A computer with `ssh` and `scp`. For the sim's local routing, the Indiana tile file `tiles.tar` (390 MB): `tools/turnpilot/build_valhalla_tiles.sh` builds it, and it is in `~/turnpilot_data/valhalla/indiana/` on Kellen's Mac.
 
-When the comma shows the road view, the install is done.
+TurnPilot setup never opens while `TurnPilotValhallaTiles` is set, as in the sim, since local tiles need no map server and no phone.
+
+## What the branch name does
+
+The installer URL is `installer.comma.ai/kaileh57/turnpilot`. The installer clones `github.com/kaileh57/openpilot.git`, which GitHub redirects to `kaileh57/turnpilot`, and checks out the branch `turnpilot`. To check this from any computer:
+
+```
+git ls-remote https://github.com/kaileh57/openpilot.git turnpilot
+```
+
+The command prints one line, `<commit>  refs/heads/turnpilot`.
+
+openpilot decides what a branch is from its name. `RELEASE_BRANCHES` in `openpilot/common/version.py` lists `release-mici`, `nightly-chestnut` and a few others. `turnpilot` is not in the list, and that has three effects this install depends on:
+
+1. The manager sets `IsReleaseBranch` to 0, so **Settings > Developer** shows the **alpha longitudinal** and **navigation (alpha)** toggles. Both are hidden on release branches. Tesla longitudinal (Autospeed) is alpha and needs the first one.
+2. The branch has no `prebuilt` file, so the comma runs the build on every boot, and the first boot compiles openpilot from source, including the panda firmware. Later boots finish in seconds, until an update changes files. The panda build without `RELEASE=1` defines `ALLOW_DEBUG`, and the Tesla safety code only accepts longitudinal control in that build (`tesla.h`). The first boot reflashes the panda with the debug firmware.
+3. The comma shows "WARNING: This branch is not tested" at startup. That is expected.
 
 ## Turn on SSH
 
@@ -153,22 +228,24 @@ The `car` line shows `tesla TESLA_MODEL_3` once the comma has identified the car
 
 ## Set the toggles
 
+In this fork the toggles below are on by default, along with `TurnPilotEnabled` and the rest of Saturday's params, so a fresh install needs none of this section: the manager writes each param's default at boot when it is unset, and uninstalling openpilot clears every param. A device that kept its params from an earlier install keeps the values it had; turn them on there.
+
 On the comma screen, in **Settings > Developer**:
 
 - Turn on **alpha longitudinal** and confirm. The comma cycles its driving processes to apply it. Without it, openpilot does not control speed on the Tesla, and TurnPilot's stops and speed caps do nothing.
 - Turn on **navigation (alpha)**. This is the `NavigationEnabled` param. It starts navd, which routes, and mapsd, which draws the map.
 - Turn on **Disengage on accelerator pedal**. This is the `DisengageOnAccelerator` param. Any gas press must disengage, because TurnPilot never takes a gas press as its go. A device that had this toggle off for an earlier TurnPilot keeps it off until you turn it on, and while it is off TurnPilot shows "TurnPilot Unavailable: turn on Disengage on accelerator pedal" and does nothing. Preflight's `gas disengages` line fails while it is off.
 
-Over SSH, turn on TurnPilot in shadow mode. The stock params tool can't write boolean params, so use preflight:
+TurnPilot is on and live by default. For a drive in shadow mode, set it over SSH. The stock params tool can't write boolean params, so use preflight:
 
 ```
-python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotEnabled=1 --set TurnPilotShadowMode=1
+python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotShadowMode=1
 ```
 
 | Param | Value | What it does |
 | --- | --- | --- |
 | `TurnPilotEnabled` | 1 | Starts `turnpilot_web` (the phone app) within a few seconds, makes `turnpilotd` produce a plan, and makes modeld load the detector the next time the car turns on. |
-| `TurnPilotShadowMode` | 1 | TurnPilot computes the plan and publishes it marked as shadow. modeld and the planner ignore it, so the car drives as stock openpilot. Set it to 0 only from the second rung of the car ladder. |
+| `TurnPilotShadowMode` | 0 | 1: TurnPilot computes the plan and publishes it marked as shadow. modeld and the planner ignore it, so the car drives as stock openpilot. 0, the default: live. |
 | `TurnPilotMapHost` | `https://<ip>` | TurnPilot's map server. Set it in the phone app's Map server section. |
 | `TurnPilotMapKey` | the API key | Sent as a Bearer token. Set it in the phone app, which never shows it again (only its last 4 characters). |
 | `TurnPilotMapCert` | PEM | The server's self-signed certificate. Every request is verified against it. |
@@ -180,7 +257,7 @@ python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotEnabled=1 --se
 
 On a Tesla, TurnPilot can work the car's own turn signal through `DAS_bodyControls` (0x3E9). It is off by default, and it stays off on a car until a lamp check passes on that car and you confirm on the phone that the outside lamps flashed. Until then, and whenever the car's signal fails, every turn below 20 mph prompts "Signal Left" or "Signal Right" and the driver signals. The panda allows the message only in a debug build, the build this branch already flashes.
 
-1. On the phone page's **Car turn signal** section, set the mode to **check**, then turn the car off and on. In Park, with hands off the stalk, the check runs by itself after 3 s: it blinks each side, says each step, and takes 75 to 110 s. If Park gives no lamp, set **check** again, restart, stop in Drive with the brake held, and tap **Start check in Drive**.
+1. On the phone page's **Car turn signal** section, set the mode to **check**, then turn the car off and on. In Park, with hands off the stalk, the check runs by itself after 3 s: it blinks each side, says each step, and takes 75 to 110 s. If Park gives no lamp, set **check** again, restart, stop in Drive with the brake held, and tap **Start check in Drive**. The page shows that button only with `&dev=1` added to its address; TurnPilot setup runs the check in Park only.
 2. When it passes, the card asks whether the front, side and rear lamps flashed outside on each side. Answer it, then set the mode to **on**.
 3. At the next ignition the car checks the record against its VIN and firmware. A record from a check in Park also blinks each side once in Park before the first drive. A Tesla update that changes the firmware voids the record: run the check again.
 
@@ -199,20 +276,26 @@ In the BeamNG sim the car signals by default: `launch_openpilot.sh` and `run_bri
 
 ## Let the car go by itself at stop signs
 
-By default (`auto`) every stop sign and yield hands back after a 1 s full stop: `auto` acts only on a camera fit and a junction survey, and neither exists for this car yet. `vision` makes the car go by itself from what the cameras see live. It stops fully at the line, looks for 2.5 s with every view fresh and nothing in a conflicting lane, chimes "Going", and goes. Where a cross road is over 25 mph, or its speed isn't known, it looks for 4 s and says "Look both ways" first, so check both ways yourself. If you brake or press the gas at the line and then re-engage, it still says "Going" (or "Look both ways") for 1 s before it goes, never going the moment you re-engage. It hands back after 1 s, saying why, at night, at dusk, in low sun, with the sun ahead, with the side cameras off, without the stop-sign map data, and at a divided road, a roundabout or a rail crossing.
+By default (`vision`) the car goes by itself from what the cameras see live. (`auto` acts only on a camera fit and a junction survey, neither of which exists for this car yet, so under `auto` every stop sign and yield hands back after a 1 s full stop.) Under `vision` the car stops fully at the line, looks for 2.5 s with every view fresh and nothing in a conflicting lane, chimes "Going", and goes. Where a cross road is over 25 mph, or its speed isn't known, it looks for 4 s and says "Look both ways" first, so check both ways yourself. If you brake or press the gas at the line and then re-engage, it still says "Going" (or "Look both ways") for 1 s before it goes, never going the moment you re-engage. It hands back after 1 s, saying why, at night, at dusk, in low sun, with the sun ahead, with the side cameras off, without the stop-sign map data, and at a divided road, a roundabout or a rail crossing.
+
+To have every stop sign and yield hand back instead (Saturday's fallback when preflight's `stop-sign go` line warns):
 
 ```
-python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotStopSignGo=vision
+python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotStopSignGo=off
 ```
 
 | Param | Value | What it does |
 | --- | --- | --- |
-| `TurnPilotStopSignGo` | `auto` | `off` and `shadow`: every stop sign and yield hands back after 1 s. `auto` and `trial`: the go only at a surveyed, validated junction with the camera fit, so on this car they act as `shadow`. `vision`: the go from the live cameras (above). Any other value acts as `shadow`, logged. Read every second. |
+| `TurnPilotStopSignGo` | `vision` | `off` and `shadow`: every stop sign and yield hands back after 1 s. `auto` and `trial`: the go only at a surveyed, validated junction with the camera fit, so on this car they act as `shadow`. `vision`: the go from the live cameras (above). Any other value acts as `shadow`, logged. Read every second. |
 | `TurnPilotAvoidStops` | 1 | navd routes around the stops and yields TurnPilot can't take. Under `vision` it keeps every one vision can take on the route, and avoids the rest (the ones it would hand back). Off, every stop stays on the route and the ones vision can't take hand back at the line. |
 
 ## Install Valhalla for offline routing
 
-The system Python on the comma is read-only, so pyvalhalla goes into `/data/turnpilot/pyvalhalla`, which survives updates. The comma needs internet once for the 35 MB wheel, from home Wi-Fi or the hotspot:
+Driving needs pyvalhalla even with the map server: navd routes each drive's corridor with it on the comma. The system Python on the comma is read-only, so pyvalhalla goes into `/data/turnpilot/pyvalhalla`, which survives updates.
+
+`turnpilot_web` installs it by itself (`valhalla_install.py`): once a boot while it is missing and the comma is online, again every 30 s while offline, and again when you tap `retry` in setup or in **Settings > turnpilot > map engine**. It runs at the lowest CPU priority and never holds up boot or a drive. It uses the same wheel and sha256 as the script below, and preflight's `pyvalhalla` line shows how it is going.
+
+To install it by hand instead, the comma needs internet once for the 35 MB wheel, from home Wi-Fi or the hotspot:
 
 ```
 bash tools/turnpilot/install_valhalla_device.sh
@@ -224,7 +307,7 @@ The script checks the wheel's sha256, unpacks it, and imports it as a test. It n
 
 TurnPilot routes only inside its mapped areas, around Indianapolis and Seattle. There is no Mapbox and no fallback.
 
-1. Open the phone app, then **Map server**. Enter the address, the API key and the server's certificate (PEM), and tap **Save and check**. The comma fetches the mapped area at once, so the comma must be online. It then refreshes it every 6 hours while online and keeps it in `/data/turnpilot/maps/coverage.json`.
+1. The comma already has the map server's address and certificate. Open the phone app and paste the API key in **Map key**, then tap **Save key**. To use another server, open **Map server**, enter the address, the API key and the server's certificate (PEM) together, and tap **Save and check**. The comma fetches the mapped area at once, so the comma must be online. It then refreshes it every 6 hours while online and keeps it in `/data/turnpilot/maps/coverage.json`.
 2. The **Mapped area** section draws the areas, the car and the destination. A destination outside them is refused with "Outside TurnPilot's mapped area". Until the comma has fetched the mapped area once, every destination is refused.
 3. When a destination is set, navd downloads that drive's map (a corridor of tiles around the route, 20-50 MB) from the server, checks every file's SHA-256, and unpacks it under `/data/turnpilot/maps/corridors/`. The phone shows "Downloading map for this drive…" and then "Ready". Reroutes run on the comma with no internet. The last 3 corridors are kept.
 4. Any failure means no route, with the reason on the phone and on the comma's onroad screen ("No route"): server unreachable, wrong key, certificate mismatch, a corridor that fails its check, or the server refusing the drive.
@@ -252,16 +335,16 @@ The page shows the route, the next maneuver, and TurnPilot's state. To start nav
 
 ## Let TurnPilot drive on where it is unsure
 
-`TurnPilotAlwaysDrive` is the always-drive switch. Off, the default, TurnPilot hands back, skips or waits wherever it is unsure. On, it drives on in those places, and hands back, loudly, only where it made a mistake. It does nothing in shadow mode. The ALWAYS_DRIVE plan's steps S2 to S5 add what it changes; on a build without them the switch is read and printed and changes nothing. Set it parked, with the no-move limit Saturday uses:
+`TurnPilotAlwaysDrive` is the always-drive switch. On, the default, TurnPilot drives on where it is only unsure, and hands back, loudly, only where it made a mistake. Off, it hands back, skips or waits wherever it is unsure. It does nothing in shadow mode. Its default comes with the no-move limit Saturday uses, 20 s. To turn it off, parked:
 
 ```
-python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotAlwaysDrive=1 --set TurnPilotNoMoveS=20
+python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotAlwaysDrive=0 --set TurnPilotNoMoveS=2
 ```
 
 | Param | Value | What it does |
 | --- | --- | --- |
-| `TurnPilotAlwaysDrive` | 0 | 1: always drive (above). turnpilotd reads it every second, and navd reads it each time it routes. |
-| `TurnPilotNoMoveS` | 2 | Seconds a turn TurnPilot let go of at a standstill waits for the car to pull away before "Can't start the turn: take control", 2 to 20. An unprotected left's 1 s is fixed. Read every second. |
+| `TurnPilotAlwaysDrive` | 1 | 1: always drive (above). turnpilotd reads it every second, and navd reads it each time it routes. |
+| `TurnPilotNoMoveS` | 20 | Seconds a turn TurnPilot let go of at a standstill waits for the car to pull away before "Can't start the turn: take control", 2 to 20. An unprotected left's 1 s is fixed. Read every second. |
 
 The switch doesn't set or change `TurnPilotStopSignGo`. The car goes by itself at stop signs and yields only with `TurnPilotStopSignGo=vision`, which you set on its own (see "Let the car go by itself at stop signs"). With the switch on, every stop-sign mode, `vision` included, stops, waits, goes and hands back exactly as it does with the switch off, and navd keeps and avoids the same stops.
 
@@ -290,7 +373,7 @@ Each line starts with PASS, FAIL, WARN or INFO. A FAIL line is followed by a `fi
 | `chestnut` | The chestnut is present with its firmware and a USB 3 link |
 | `web token`, `pairing URL`, `web server` | The token exists, the comma has a network address, and `turnpilot_web` answers on port 8088 |
 
-`shadow mode` and `route source` are INFO lines. `route source` warns when `TurnPilotValhallaTiles` is set, since the car should use the map server.
+`shadow mode` and `route source` are INFO lines. `shadow mode` warns when it is on, since TurnPilot then drives nothing. `route source` warns when `TurnPilotValhallaTiles` is set, since the car should use the map server.
 
 ## Update
 
@@ -300,13 +383,14 @@ The comma pulls from the `turnpilot` branch of `github.com/kaileh57/openpilot`, 
 2. Open **Settings > Software** and tap **check for update**. If it offers **download update**, tap that. When the download finishes, **install now** appears (the car must be off). The comma restarts and recompiles, which takes several minutes.
 3. Run preflight.
 
-The updater applies a downloaded update at the next boot, and the comma boots every time the car wakes. On a test day, stop surprise updates with:
+Updates are on, as in stock openpilot (`DisableUpdates` 0, the default since SATURDAY_PARAMS.md's 11:50 change), so a fix pushed to the `turnpilot` branch reaches the comma through **Settings > Software** with no SSH. The updater applies a downloaded update at the next boot, and the comma boots every time the car wakes. To keep a build fixed for a test day, turn updates off over SSH and back on afterwards:
 
 ```
 python3 -m openpilot.selfdrive.turnpilot.preflight --set DisableUpdates=1
+python3 -m openpilot.selfdrive.turnpilot.preflight --set DisableUpdates=0
 ```
 
-Set it to 0 when you want to update. The files in `/data/turnpilot` (pyvalhalla and the maps) stay through updates, but not through an uninstall.
+A comma installed with the Mac script ("Install from the Mac") has `DisableUpdates` 1, which that script sets, so **check for update** finds nothing there until it is set to 0. The files in `/data/turnpilot` (pyvalhalla and the maps) stay through updates, but not through an uninstall.
 
 ## When something fails
 

@@ -135,6 +135,7 @@ class TestToken(WebTestCase):
       code, body, headers = self.call("GET", path, auth="none")
       assert code == 200 and body == page and headers["Content-Type"].startswith("text/html"), path
     assert b'id="unpaired"' in page  # what the page shows when the API says 401
+    assert b'settings &gt; turnpilot &gt; pair phone' in page  # after setup the code is only there, not on the comma's screen
     assert self.call("GET", "/nope", auth="none")[0] == 401  # only the page and the icon are open
     assert self.call("POST", "/", {}, auth="none")[0] == 401
     assert self.call("GET", f"/api/status?t={self.token}", auth="none")[0] == 401
@@ -1036,3 +1037,52 @@ class TestCarSignals(WebTestCase):
 
   def test_empty_body(self):
     assert self.call("POST", "/api/car-signals", {})[0] == 400
+
+
+class TestPhoneSeen(WebTestCase):
+  """The comma's setup screen shows "phone connected" from TurnPilotPhoneSeen, which only the phone's own requests write."""
+
+  def test_page_with_the_token_marks_the_phone(self):
+    assert self.call("GET", "/?t=wrong", auth="none")[0] == 200
+    assert self.params.get("TurnPilotPhoneSeen") is None
+    assert self.call("GET", f"/?t={self.token}", auth="none")[0] == 200
+    seen = self.params.get("TurnPilotPhoneSeen")
+    assert isinstance(seen, float) and abs(seen - time.time()) < 60  # noqa: TID251
+
+  def test_api_marks_the_phone_but_not_the_comma_itself(self):
+    assert self.call("GET", "/api/status")[0] == 200  # from 127.0.0.1: the comma, not a phone
+    assert self.params.get("TurnPilotPhoneSeen") is None
+    with mock.patch.object(server, "LOOPBACK", ()):  # as if from the phone on the hotspot
+      assert self.call("GET", "/api/status")[0] == 200
+      assert self.call("GET", "/api/status", auth="none")[0] == 401
+    assert self.params.get("TurnPilotPhoneSeen") is not None
+
+
+class TestMapDefaultsOnTheWeb(WebTestCase):
+  def test_only_the_key_is_needed_and_a_new_host_still_needs_it(self):
+    from openpilot.selfdrive.turnpilot.maps.defaults import DEFAULT_MAP_HOST, DEFAULT_MAP_CERT_SHA256, ensure_map_defaults
+    ensure_map_defaults(self.params)
+    settings = self.call("GET", "/api/map")[1]
+    assert settings["host"] == DEFAULT_MAP_HOST and settings["cert_fingerprint"] == DEFAULT_MAP_CERT_SHA256 and not settings["key_set"]
+    self.app.refresh = lambda: None
+    code, body, _ = self.call("POST", "/api/map", {"key": "k" * 32})
+    assert code == 200 and body["key_set"] and body["host"] == DEFAULT_MAP_HOST
+    code, body, _ = self.call("POST", "/api/map", {"host": "https://maps.example.test"})
+    assert code == 400 and "Enter the API key again" in body["error"]
+    assert self.params.get("TurnPilotMapHost") == DEFAULT_MAP_HOST
+
+  def test_page_has_one_field_for_the_key(self):
+    page = server.INDEX.read_text()
+    box = page.split('<section id="keybox"')[1].split("</section>")[0]
+    assert box.count("<input") == 1 and box.count("<button") == 1 and "Save key" in box and "Kellen" in box
+    script = page.split("<script>")[1]
+    assert 'api("/api/map", "POST", { key: key })' in script  # the key alone: the address and certificate are the comma's
+    assert "Key works." in script and "Not saved: " in script
+
+
+class TestCarSignalsPage(WebTestCase):
+  def test_the_drive_check_is_for_developers_and_the_lamp_question_opens_itself(self):
+    script = server.INDEX.read_text().split("<script>")[1]
+    assert '$("csdrive").hidden = !devMode ||' in script  # the guided setup runs the check in Park only
+    assert 'get("dev") === "1"' in script
+    assert '$("carsignals").open = true' in script and "loadCarSignals().catch" in script

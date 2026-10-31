@@ -7,6 +7,7 @@ from openpilot.selfdrive.ui.mici.layouts.settings.device.device_layout import De
 from openpilot.selfdrive.ui.mici.layouts.settings.developer import DeveloperLayoutMici
 from openpilot.selfdrive.ui.mici.layouts.settings.software import SoftwareLayoutMici
 from openpilot.selfdrive.ui.mici.layouts.settings.firehose import FirehoseLayout
+from openpilot.selfdrive.ui.mici.layouts.settings.turnpilot import TurnPilotSettingsLayout
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 
 
@@ -19,6 +20,10 @@ class SettingsLayout(NavScroller):
   def __init__(self):
     super().__init__()
     self._params = Params()
+
+    turnpilot_panel = TurnPilotSettingsLayout()
+    turnpilot_btn = SettingsBigButton("turnpilot", "", gui_app.texture("icons_mici/turn_intent_left.png", 90, 36))
+    turnpilot_btn.set_click_callback(lambda: gui_app.push_widget(turnpilot_panel))
 
     toggles_panel = TogglesLayoutMici()
     toggles_btn = SettingsBigButton("toggles", "", gui_app.texture("icons_mici/settings.png", 64, 64))
@@ -45,6 +50,7 @@ class SettingsLayout(NavScroller):
     firehose_btn.set_click_callback(lambda: gui_app.push_widget(firehose_panel))
 
     self._scroller.add_widgets([
+      turnpilot_btn,
       toggles_btn,
       network_btn,
       self._device_button,

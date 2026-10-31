@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""Install one TurnPilot commit on a comma four over SSH, from this Mac's own clones.
+"""Install one TurnPilot commit on a comma four over SSH, from this Mac's own clones: the fallback to installer.comma.ai.
 
-The installer (installer.comma.ai) can't install this fork while opendbc_repo points at the private
-kaileh57/turnpilot-opendbc: it clones over unauthenticated https, and no credential may go on the comma. This builds the
-tree here instead, with every submodule at its gitlink and every LFS file as its real bytes, copies it to a new directory
-on the comma, verifies it, and only then swaps it in. The old /data/openpilot (sunnypilot) is kept as
-/data/openpilot.prev-<stamp>; --rollback swaps it back. The comma never fetches anything.
+The comma's own installer (installer.comma.ai/kaileh57/turnpilot) is the install path: every submodule is public and every
+LFS object is on the .lfsconfig server. This is for when it can't be used. It builds the tree here, with every submodule at
+its gitlink and every LFS file as its real bytes, copies it to a new directory on the comma, verifies it, and only then
+swaps it in. The old /data/openpilot (sunnypilot) is kept as /data/openpilot.prev-<stamp>; --rollback swaps it back. The
+comma never fetches anything.
 
-  python3 openpilot/tools/turnpilot/deploy_to_comma.py <comma address> [--commit <sha>] [--dry-run]
+--map-key also writes the map server's API key, from this Mac's ~/turnpilot_data/mapserver/client/key, into the comma's
+TurnPilotMapKey; --map-key-only writes only that. The key goes over ssh's stdin, never on a command line, and is never
+printed. Without either flag the key file is never opened.
+
+  python3 openpilot/tools/turnpilot/deploy_to_comma.py <comma address> [--commit <sha>] [--map-key] [--dry-run]
+  python3 openpilot/tools/turnpilot/deploy_to_comma.py <comma address> --map-key-only [--dry-run]
   python3 openpilot/tools/turnpilot/deploy_to_comma.py <comma address> --rollback [--prev openpilot.prev-<stamp>]
   python3 openpilot/tools/turnpilot/deploy_to_comma.py <comma address> --reboot
   python3 openpilot/tools/turnpilot/deploy_to_comma.py --stage-only <dir> [--commit <sha>]
@@ -29,6 +34,8 @@ import tempfile
 import time
 from pathlib import Path
 
+MAP_KEY_PARAM = "TurnPilotMapKey"  # PERSISTENT | DONT_LOG
+MAP_KEY_FILE = Path.home() / "turnpilot_data" / "mapserver" / "client" / "key"  # SECRET: never printed, never in a repo
 BRANCH = "turnpilot"  # the branch name the comma sees: not in RELEASE_BRANCHES, so IsReleaseBranch is 0
 ORIGIN_URL = "https://github.com/kaileh57/turnpilot.git"  # credential-free; only read, since DisableUpdates is set
 LFS_HEADER = b"version https://git-lfs.github.com/spec/v1\n"
@@ -47,7 +54,7 @@ GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_LFS
            "GIT_COMMITTER_NAME": "deploy_to_comma", "GIT_COMMITTER_EMAIL": "deploy_to_comma@localhost", "LC_ALL": "C"}
 
 # The comma's half, one POSIX sh script run as `sh -c SCRIPT <name> <action> <args>`. It prints [comma] lines, and exits 3
-# with a FAILED line when it stops. Every action but receive/verify/swap/set_param/rollback/reboot only reads.
+# with a FAILED line when it stops. Every action but receive/verify/swap/set_param/set_secret/rollback/reboot only reads.
 REMOTE_SH = r'''
 set -u
 act="$1"; shift
@@ -170,6 +177,17 @@ set_param)
   tmp="$root/params/.tmp_value_deploy_$$"
   printf '%s' "$value" > "$tmp" && mv -f "$tmp" "$root/params/d/$key" && sync || die "could not write $key"
   say "$key: $old -> $value"
+  ;;
+set_secret)
+  # the value comes on stdin, never in argv (ps shows argv), and is never echoed; the file is the owner's alone
+  root="$1"; key="$2"
+  [ -d "$root/params/d" ] || die "no $root/params/d"
+  tmp="$root/params/.tmp_value_deploy_$$"
+  umask 077
+  cat > "$tmp" || { rm -f "$tmp"; die "could not write $key"; }
+  [ -s "$tmp" ] || { rm -f "$tmp"; die "no value came for $key"; }
+  mv -f "$tmp" "$root/params/d/$key" && sync || { rm -f "$tmp"; die "could not write $key"; }
+  say "$key: set (not printed)"
   ;;
 rollback)
   root="$1"; want="$2"; newprev="$3"
@@ -488,12 +506,22 @@ class Comma:
     remote = " ".join(["sh", "-c", shlex.quote(REMOTE_SH), "deploy_to_comma", action, *map(shlex.quote, args)])
     return [self.ssh, *SSH_OPTS, self.host, remote]
 
-  def run(self, action: str, *args: str, stdin: str | None = None, echo: bool = True) -> tuple[int, str]:
+  def run(self, action: str, *args: str, stdin: str | None = None, echo: bool = True, secret: str | None = None) -> tuple[int, str]:
     r = subprocess.run(self.cmd(action, *args), input=stdin, capture_output=True, text=True)
     out = r.stdout + r.stderr
+    if secret:  # nothing on the comma's side prints it; never let it through if something ever did
+      out = out.replace(secret, "<not printed>")
     for line in out.splitlines() if echo else []:
       print(line if line.startswith("  [comma]") else f"    {line}", flush=True)
     return r.returncode, out
+
+  def set_map_key(self, key: str) -> None:
+    """TurnPilotMapKey, written from ssh's stdin. Raises Failed when it isn't written."""
+    step(f"writing the map server's API key into {MAP_KEY_PARAM} (over ssh's stdin, not printed)")
+    rc, out = self.run("set_secret", self.root, MAP_KEY_PARAM, stdin=key, secret=key)
+    if rc != 0:
+      why = [line.split("FAILED: ", 1)[1] for line in out.splitlines() if line.startswith("  [comma] FAILED: ")]
+      raise Failed(f"{MAP_KEY_PARAM} was not written: {why[0] if why and rc == 3 else f'ssh exit {rc}'}")
 
   def probe(self) -> dict:
     step(f"reading the comma's state ({self.host}, read only)")
@@ -545,6 +573,42 @@ class Comma:
                  f".overlay_init, then {sys.argv[0]} {self.host} --reboot")
     raise Refused(f"the comma did not reboot: {why[0]}" if why and rc == 3 else
                   f"the reboot didn't go through (ssh exit {rc}): {out.strip()[-300:]}")
+
+
+def read_map_key(path: Path) -> str:
+  """The map server's API key from this Mac's file, checked as the web app checks it (maps/client.py check_key): printable
+  ASCII with no spaces. Raises Refused, naming the file and never its contents."""
+  try:
+    data = path.read_bytes()
+  except OSError as e:
+    raise Refused(f"can't read the map key file {path} ({type(e).__name__})") from None
+  try:
+    key = data.decode("ascii").strip()
+  except UnicodeDecodeError:
+    raise Refused(f"the map key file {path} isn't ASCII text") from None
+  if not key:
+    raise Refused(f"the map key file {path} is empty")
+  if key.startswith("-----BEGIN"):
+    raise Refused(f"{path} is a PEM file, not the map server's API key")
+  if not key.isprintable() or any(c.isspace() for c in key):
+    raise Refused(f"the map key in {path} isn't one word of printable characters")
+  return key
+
+
+def map_key_only(args, comma: Comma) -> int:
+  """--map-key-only: write TurnPilotMapKey and nothing else, onroad or off (turnpilotd and navd read it as they route)."""
+  path = Path(args.map_key_file)
+  state = comma.probe()
+  if state.get("params") != "1":
+    raise Refused(f"no {comma.root}/params/d on the comma")
+  if args.dry_run:
+    if not path.is_file():
+      raise Refused(f"no map key file at {path}")
+    step(f"dry run: nothing on the comma changed. This would write {MAP_KEY_PARAM} from {path}")
+    return 0
+  comma.set_map_key(read_map_key(path))
+  step(f"done: {MAP_KEY_PARAM} is set; the web app's Map server section shows its last 4 characters")
+  return 0
 
 
 def not_rebooted(comma: Comma, running_from: str) -> str:
@@ -606,6 +670,12 @@ def stream_tree(stage: Path, comma: Comma, incoming: str, total: int) -> None:
 
 
 def deploy(args, comma: Comma, stamp: str) -> int:
+  map_key = None
+  if args.map_key:  # checked before anything on the comma changes; a dry run only looks for the file
+    path = Path(args.map_key_file)
+    if args.dry_run and not path.is_file():
+      raise Refused(f"no map key file at {path}")
+    map_key = None if args.dry_run else read_map_key(path)
   state = comma.probe()
   comma.require_offroad(state)
   if state["missing_tool"]:
@@ -634,6 +704,8 @@ def deploy(args, comma: Comma, stamp: str) -> int:
       info(f"copy {facts['nfiles']} files ({gb(facts['bytes'])}) to {incoming}, and check them")
       info(f"rename {comma.root}/openpilot ({current}) to {prev}" if current else f"({comma.root}/openpilot is absent)")
       info(f"move {incoming} to {comma.root}/openpilot, set DisableUpdates=1, and ask before rebooting")
+      if args.map_key:
+        info(f"write {MAP_KEY_PARAM} from {args.map_key_file}")
       return 0
 
     intact = (f"Both trees are intact: {comma.root}/openpilot is still {current}, and the new tree is at {incoming}. " +
@@ -669,6 +741,12 @@ def deploy(args, comma: Comma, stamp: str) -> int:
     if rc != 0:
       raise Failed(f"TurnPilot is in {comma.root}/openpilot and the old tree is at {prev}, but DisableUpdates is NOT set. " +
                    f"Don't reboot until it is: ssh {comma.host} \"printf 1 > {comma.root}/params/d/DisableUpdates\"")
+    if map_key is not None:
+      try:
+        comma.set_map_key(map_key)
+      except Failed as e:
+        raise Failed(f"{e}. TurnPilot is in {comma.root}/openpilot and DisableUpdates is 1; write the key with: " +
+                     f"{sys.argv[0]} {comma.host} --map-key-only, or in the web app's Map server section") from None
     step(f"done: {comma.root}/openpilot is TurnPilot {facts['sha'][:12]}; the old tree ({current}) is {prev}")
     info("the first boot compiles openpilot and flashes the panda; keep the comma powered until the road view shows")
     info(f"to go back: {sys.argv[0]} {comma.host} --rollback")
@@ -716,14 +794,22 @@ def main(argv: list[str] | None = None) -> int:
   p.add_argument("--prev", help="with --rollback: the kept tree to restore, e.g. openpilot.prev-20261031-080000")
   p.add_argument("--reboot", action="store_true", help="only reboot the comma, after the checks a deploy's reboot makes")
   p.add_argument("--stage-only", metavar="DIR", help="only build the tree into DIR (must not exist) and keep it; no ssh")
+  p.add_argument("--map-key", action="store_true",
+                 help=f"also write the map server's API key from {MAP_KEY_FILE} into the comma's {MAP_KEY_PARAM} (never printed)")
+  p.add_argument("--map-key-only", action="store_true", help=f"only write {MAP_KEY_PARAM}, as --map-key; nothing else changes")
+  p.add_argument("--map-key-file", default=str(MAP_KEY_FILE), help=argparse.SUPPRESS)  # tests: a fixture key
   p.add_argument("--repo", default=str(Path(__file__).resolve().parents[3]), help="source repo (default: this checkout)")
   p.add_argument("--data-root", default="/data", help=argparse.SUPPRESS)  # tests: the fake comma's /data
   p.add_argument("--stamp", default=datetime.datetime.now().strftime("%Y%m%d-%H%M%S"), help=argparse.SUPPRESS)
   args = p.parse_args(argv)
   if args.prev and ("/" in args.prev or not args.prev.startswith("openpilot.prev-")):
     p.error("--prev takes a name like openpilot.prev-20261031-080000")
-  if args.reboot and (args.rollback or args.dry_run or args.stage_only or args.commit or args.prev):
+  if args.reboot and (args.rollback or args.dry_run or args.stage_only or args.commit or args.prev or args.map_key or args.map_key_only):
     p.error("--reboot takes only the comma's address")
+  if args.map_key_only and (args.rollback or args.stage_only or args.commit or args.prev or args.map_key):
+    p.error("--map-key-only takes only the comma's address, and --dry-run")
+  if args.map_key and (args.rollback or args.stage_only):
+    p.error("--map-key goes with a deploy")
   try:
     if args.stage_only:
       if Path(args.stage_only).exists():
@@ -738,6 +824,8 @@ def main(argv: list[str] | None = None) -> int:
       comma.require_offroad(comma.probe())
       comma.reboot()
       return 0
+    if args.map_key_only:
+      return map_key_only(args, comma)
     return rollback(args, comma, args.stamp) if args.rollback else deploy(args, comma, args.stamp)
   except Refused as e:
     print(f"REFUSED: {e}. Nothing on the comma changed.", flush=True)

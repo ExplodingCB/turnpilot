@@ -210,6 +210,10 @@ class DeveloperLayoutMici(NavScroller):
   def _on_turnpilot(self, state: bool):
     # BigParamControl writes the param after this callback, so set the flag here and "pair phone" enables at once
     ui_state.turnpilot_enabled = state
+    if not state:  # turnpilot_web, which keeps the readiness alert, stops with TurnPilot: nothing is missing now
+      from openpilot.selfdrive.selfdrived.alertmanager import set_offroad_alert
+      from openpilot.selfdrive.turnpilot.setup_state import ALERT
+      set_offroad_alert(ALERT, False)
     # TurnPilot follows navd's route
     if state:
       ui_state.params.put_bool("NavigationEnabled", True, block=True)

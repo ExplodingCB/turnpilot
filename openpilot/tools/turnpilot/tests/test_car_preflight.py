@@ -49,8 +49,8 @@ SUNNYPILOT = {"branch": "staging-chestnut", "remote": "https://github.com/sunnyp
 GOOD_PARAMS = {
   "TurnPilotEnabled": True, "NavigationEnabled": True, "AlphaLongitudinalEnabled": True, "DisengageOnAccelerator": True,
   "TurnPilotCarSignals": "off", "TurnPilotCameraLights": "shadow", "TurnPilotCameraStopSigns": "shadow",
-  "TurnPilotStopSignGo": "off", "TurnPilotAvoidStops": True, "TurnPilotCurbPedCap": True, "TurnPilotLeftRangeM": 0.,
-  "TurnPilotShadowMode": True, "DisableUpdates": True, "TurnPilotAutoLeft": "auto", "TurnPilotAlwaysDrive": True,
+  "TurnPilotStopSignGo": "vision", "TurnPilotAvoidStops": True, "TurnPilotCurbPedCap": True, "TurnPilotLeftRangeM": 0.,
+  "TurnPilotShadowMode": False, "DisableUpdates": False, "TurnPilotAutoLeft": "auto", "TurnPilotAlwaysDrive": True,
   "TurnPilotMapHost": "maps.turnpilot.test", "TurnPilotMapKey": "not-a-real-key", "TurnPilotMapCert": "not-a-real-cert",
   "IsReleaseBranch": False,
 }
@@ -712,29 +712,54 @@ def test_param_missing_from_the_library(tmp_path):
 
 
 def test_param_wrong_or_default(tmp_path):
-  params = {k: v for k, v in GOOD_PARAMS.items() if k != "TurnPilotStopSignGo"} | {"TurnPilotValhallaTiles": "/data/tiles",
-                                                                                    "TurnPilotShadowMode": False, "DisableUpdates": False}
+  params = GOOD_PARAMS | {"TurnPilotStopSignGo": "auto", "TurnPilotValhallaTiles": "/data/tiles", "TurnPilotShadowMode": True,
+                          "DisableUpdates": True}
   lines = run_live(tmp_path, params=params)
   s = statuses(lines)
-  assert s["TurnPilotStopSignGo"] == NO_GO and "auto (default)" in line(lines, "TurnPilotStopSignGo").detail
-  assert "TurnPilotStopSignGo=off" in line(lines, "TurnPilotStopSignGo").fix
+  assert s["TurnPilotStopSignGo"] == NO_GO and "auto, Saturday needs vision" in line(lines, "TurnPilotStopSignGo").detail
+  assert "TurnPilotStopSignGo=vision" in line(lines, "TurnPilotStopSignGo").fix
   assert s["TurnPilotValhallaTiles"] == NO_GO
-  assert s["TurnPilotShadowMode"] == WARN and s["DisableUpdates"] == WARN
+  assert s["TurnPilotShadowMode"] == WARN and "nothing acts" in line(lines, "TurnPilotShadowMode").detail
+  assert "TurnPilotShadowMode=0" in line(lines, "TurnPilotShadowMode").fix
+  assert s["DisableUpdates"] == WARN and "no fix pushed" in line(lines, "DisableUpdates").detail
+  assert "DisableUpdates=0" in line(lines, "DisableUpdates").fix
   assert cpf.exit_code(lines) == 1
 
 
+def test_the_saturday_values_are_the_defaults(tmp_path):
+  """A fresh install's params (params_keys.h's defaults, test_saturday_defaults.py) read as Saturday's: TurnPilotStopSignGo
+  vision and TurnPilotShadowMode 0 among them, with no NO-GO that Saturday needs off and no WARN that live is wrong."""
+  unset = dict.fromkeys(("TurnPilotEnabled", "NavigationEnabled", "AlphaLongitudinalEnabled", "DisengageOnAccelerator",
+                         "TurnPilotStopSignGo", "TurnPilotShadowMode", "DisableUpdates", "TurnPilotAlwaysDrive"))
+  lines = run_live(tmp_path, params=GOOD_PARAMS | unset)
+  s = statuses(lines)
+  for key in ("TurnPilotEnabled", "NavigationEnabled", "AlphaLongitudinalEnabled", "DisengageOnAccelerator", "TurnPilotStopSignGo"):
+    assert s[key] == GO and "(default)" in line(lines, key).detail, line(lines, key)
+  assert line(lines, "TurnPilotStopSignGo").detail.startswith("vision")
+  for key in ("TurnPilotShadowMode", "DisableUpdates", "TurnPilotAlwaysDrive"):
+    assert s[key] == INFO and "(default)" in line(lines, key).detail, line(lines, key)
+  assert "live" in line(lines, "TurnPilotShadowMode").detail
+  assert line(lines, "DisableUpdates").detail.startswith("0 (default): updates on")
+
+
+def test_stop_sign_go_off_is_saturdays_fallback_warned(tmp_path):
+  """off is Saturday's value only when preflight's stop-sign go line WARNs (the side views missing): a WARN, never a NO-GO."""
+  lines = run_live(tmp_path, params=GOOD_PARAMS | {"TurnPilotStopSignGo": "off"})
+  got = line(lines, "TurnPilotStopSignGo")
+  assert got.status == WARN and "hands back" in got.detail and "TurnPilotStopSignGo=vision" in got.fix
+
+
 def test_always_drive_is_printed_and_off_warns(tmp_path):
-  """TurnPilotAlwaysDrive (ALWAYS_DRIVE.md section 1; CHASE_CAR_CHECKLIST step 14's read-back): printed, INFO on, and a WARN
-  off or unset, with the fix (Saturday sets 1 at step 12). Never NO-GO: off is today's behaviour."""
+  """TurnPilotAlwaysDrive (ALWAYS_DRIVE.md section 1; CHASE_CAR_CHECKLIST step 14's read-back): printed, INFO on (set, or unset
+  and so the default, 1), and a WARN off, with the fix. Never NO-GO: off is today's behaviour."""
   lines = run_live(tmp_path)
   assert statuses(lines)["TurnPilotAlwaysDrive"] == INFO and line(lines, "TurnPilotAlwaysDrive").detail.startswith("1:")
-  for value in (False, None):
-    params = {**GOOD_PARAMS, "TurnPilotAlwaysDrive": value} if value is not None else \
-      {k: v for k, v in GOOD_PARAMS.items() if k != "TurnPilotAlwaysDrive"}
-    lines = run_live(tmp_path, params=params)
-    off = line(lines, "TurnPilotAlwaysDrive")
-    assert off.status == WARN and "TurnPilotAlwaysDrive=1" in off.fix, off
-    assert cpf.exit_code(lines) == 0
+  lines = run_live(tmp_path, params={k: v for k, v in GOOD_PARAMS.items() if k != "TurnPilotAlwaysDrive"})
+  assert statuses(lines)["TurnPilotAlwaysDrive"] == INFO and line(lines, "TurnPilotAlwaysDrive").detail.startswith("1 (default):")
+  lines = run_live(tmp_path, params={**GOOD_PARAMS, "TurnPilotAlwaysDrive": False})
+  off = line(lines, "TurnPilotAlwaysDrive")
+  assert off.status == WARN and "TurnPilotAlwaysDrive=1" in off.fix, off
+  assert cpf.exit_code(lines) == 0
 
 
 def test_map_key_unset_live(tmp_path):
