@@ -81,8 +81,10 @@ BEARING_GATE_DEG = 1.                # deg either side of where the car would be
 BEARING_RATE_DEG_S = 1.              # ...plus this per s back from its last box (the car's own yaw, a lane change)
 AMBIGUOUS_GATE = 2.                  # any other band box inside this x both gates may be taken for it: no credit past there
 SEED_IOU = 0.5                       # the track's box is its run's box at this overlap
-DRIVE_GAP_S = 5.                     # log time this far ahead, or back past LOG_JITTER_S, starts another drive (route, boot)
-LOG_JITTER_S = 1.                    # messages are logged as they come, not in strict logMonoTime order
+DRIVE_GAP_S = 5.                     # log time this far ahead, or back past LOG_JITTER_S, starts another drive (route, boot);
+                                     # so does another route's initData (Drives)
+LOG_JITTER_S = 10.                   # messages are logged as they come, not in logMonoTime order (procLog 0.98 s behind on
+                                     # Chase's route); a reboot this close in log time has its own initData
 TRACK_GAP_S = 1.                     # a track id unseen this long (or the scene this long) is another track: a track coasts
                                      # MAX_COAST_S (0.5 s), and a new tracker numbers its tracks from 1 again
 MPH = 0.44704
@@ -200,13 +202,13 @@ class Drive:
   def feed(self, msg) -> None:
     which = msg.which()
     t_log = msg.logMonoTime * 1e-9
-    self.t0 = t_log if self.t0 is None else self.t0
-    self.t1 = max(self.t1, t_log)
-    if which == 'initData':
+    if which == 'initData':  # the route's, built once and written first in every segment: its time is the route's start
       self.remote = str(msg.initData.gitRemote)
       if not self.device_type and str(msg.initData.deviceType) != 'unknown':
         self.device_type = str(msg.initData.deviceType)
       return
+    self.t0 = t_log if self.t0 is None else self.t0
+    self.t1 = max(self.t1, t_log)
     if self.sunnypilot:
       return  # its own messages on our union slots: never read
     if which == 'deviceState' and str(msg.deviceState.deviceType) != 'unknown':
@@ -266,19 +268,31 @@ class Drive:
 
 
 class Drives:
-  """Every file's messages in order, split into one Drive per stretch of continuous log time: another route (its own
-  turnpilotd, whose tracker numbers its tracks from 1 again) or another boot (logMonoTime starts over) is measured on its own
-  time base, so no car's chain runs through another drive's boxes and no track id is taken for another drive's."""
+  """Every file's messages in order, split into one Drive per route and per stretch of continuous log time: another route
+  (its own turnpilotd, whose tracker numbers its tracks from 1 again) or another boot (logMonoTime starts over) is measured on
+  its own time base, so no car's chain runs through another drive's boxes and no track id is taken for another drive's.
+  loggerd builds a route's initData once and writes it first in every segment: the same one is the same route, another one
+  another route, and its time (the route's start) is never the log's time."""
   def __init__(self):
     self.drives: list[Drive] = []
     self.t_last: float | None = None
+    self.init: tuple | None = None  # the current drive's initData (logMonoTime, wallTimeNanos)
+
+  def new(self) -> None:
+    self.drives.append(Drive(self.drives[-1] if self.drives else None))
+    self.t_last = None
 
   def feed(self, msg) -> None:
-    t = msg.logMonoTime * 1e-9
-    if self.t_last is None or t < self.t_last - LOG_JITTER_S or t > self.t_last + DRIVE_GAP_S:
-      self.drives.append(Drive(self.drives[-1] if self.drives else None))
-      self.t_last = t
-    self.t_last = max(self.t_last, t)
+    if msg.which() == 'initData':
+      init = (msg.logMonoTime, msg.initData.wallTimeNanos)
+      if not self.drives or (self.init is not None and init != self.init):
+        self.new()
+      self.init = init
+    else:
+      t = msg.logMonoTime * 1e-9
+      if not self.drives or (self.t_last is not None and not (self.t_last - LOG_JITTER_S <= t <= self.t_last + DRIVE_GAP_S)):
+        self.new()
+      self.t_last = t if self.t_last is None else max(self.t_last, t)
     self.drives[-1].feed(msg)
 
 
