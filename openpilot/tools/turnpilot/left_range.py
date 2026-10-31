@@ -20,12 +20,17 @@ road camera, velocity-trusted (scene_policy.velocity_trusted), SEED_MIN_M..SEED_
 A car parked by the road stands still over the ground and is never one, nor is a lead. From the track's box on its run
 (the fork's tracker publishes the box it matched, at the run's camera time) the car is followed back run by run through
 the logged boxes, ranged and borne by the fork's own SceneTracker.raw_frame with that moment's calibration: the box in
-the band (band_blockers) where the car would have been, by its ground speed and the car's own (carState.vEgo), within the
-tracker's ground gate. Its confirmed range is the farthest near_m of that chain, which ends at MAX_DROPOUT_S without its
+the band (band_blockers) where the car would have been. Its range comes from the seed's own motion (its ground speed and
+the car's own, carState.vEgo), never re-centred on a hit, so the box of anything closing at another rate (a parked car, a
+lead) drifts out of the gate, within the tracker's ground gate grown SPEED_ERR_MPS a second back from the seed, and the
+same from its last box (the range rate since it); its bearing within BEARING_GATE_DEG of its last box's lateral offset.
+Its confirmed range is the farthest near_m of that chain, which ends at MAX_DROPOUT_S without its
 box: unboxed (runs went on, none boxed it: the detector's reach, or the car wasn't there yet), noRuns (no road run: the full
 pass on the wide camera, the detector stopped) or uncalibrated (the runs can't be ranged), all of them no range: unknown is
-never a clear road. A run with two boxes where the car could be ends it too (ambiguous): no credit for a guess. The far
-crop's range is the same chain through the far crop's runs as well (turnpilotFarDetections, view far).
+never a clear road. A run with any other band box inside AMBIGUOUS_GATE x those gates, or its one box there but outside
+them, ends it too (ambiguous): something else could be taken for it there (a car close ahead or behind, one parked by the
+lane, a lead), so no credit for a guess, and no box of another object is ever its. The far crop's range is the same chain
+through the far crop's runs as well (turnpilotFarDetections, view far).
 
 The recommendation is conservative. With n samples the k-th shortest confirmed range is a one-sided 95% lower confidence
 bound on the 5th percentile (Wilks: P(Bin(n, 0.05) >= k) >= 0.95), so at 95% confidence 95% of oncoming cars are confirmed
@@ -64,9 +69,10 @@ ROUND_M = 10.                        # recommended ranges round down to this
 MOTOR_VEHICLES = ('car', 'truck', 'bus', 'motorcycle')  # the samples: what comes at a left's R_req speeds
 SEED_MIN_M, SEED_MAX_M = 10., 80.    # m ahead an oncoming track is taken as a sample: near, its velocity trusted
 ONCOMING_MIN_MPS = 3.                # m/s toward the car over the ground: moving, not parked (velocity noise near is ~1 m/s)
-SPEED_ERR_MPS = 3.                   # the gate grows by this x the time back from the car's last box
+SPEED_ERR_MPS = 3.                   # the range gates grow by this x the time back from the seed, and from its last box
 BEARING_GATE_DEG = 1.                # deg either side of where the car would be...
 BEARING_RATE_DEG_S = 1.              # ...plus this per s back from its last box (the car's own yaw, a lane change)
+AMBIGUOUS_GATE = 2.                  # any other band box inside this x both gates may be taken for it: no credit past there
 SEED_IOU = 0.5                       # the track's box is its run's box at this overlap
 MPH = 0.44704
 PREFLIGHT = "python3 -m openpilot.selfdrive.turnpilot.preflight"
@@ -74,7 +80,7 @@ REASONS = {
   'unboxed': "no box of it for {gap} with runs going (the detector's reach, or it wasn't there yet)",
   'noRuns': "no road run for {gap} (the full pass on the wide camera, or the detector stopped): unknown, no range",
   'uncalibrated': "runs not calibrated for {gap}: unknown, no range",
-  'ambiguous': "two boxes where it could be: no credit",
+  'ambiguous': "another box where it could be, or its one box off its motion: no credit",
   'logStart': "the log starts",
 }
 
@@ -245,7 +251,9 @@ def chain(runs: list[Run], seed: tuple, speed: float, ego: Ego, views: tuple) ->
   box is seed (run index, box index, RawBox), closing at speed over the ground: back through the runs of these views
   (module docstring)."""
   i_seed, j_seed, last = seed
-  last_t, last_log = runs[i_seed].t, runs[i_seed].t_log
+  t_seed, log_seed = runs[i_seed].t, runs[i_seed].t_log
+  x_seed = last.xy[0]
+  last_t, last_log = t_seed, log_seed
   far_box = last
   used = {(i_seed, j_seed)}
   seen_calibrated = seen_uncalibrated = False
@@ -263,21 +271,32 @@ def chain(runs: list[Run], seed: tuple, speed: float, ego: Ego, views: tuple) ->
       seen_uncalibrated = True
       continue
     seen_calibrated = True
-    x = last.xy[0] + speed * back + ego.between(r.t_log, last_log)
+    # where the car was, from its last box (the range rate since it, the bearing of its lateral offset: the car's own yaw)
+    # and from the seed's own motion, never re-centred on a hit: a box closing at another rate drifts out of that gate
     y = last.xy[1]
+    x = last.xy[0] + speed * back + ego.between(r.t_log, last_log)
     rng, bearing = math.hypot(x, y), math.degrees(math.atan2(y, x))
     gate_m = GROUND_GATE_M + GROUND_GATE_FRAC * rng + SPEED_ERR_MPS * back
     gate_deg = BEARING_GATE_DEG + BEARING_RATE_DEG_S * back
-    hits = [(j, b) for j, b in enumerate(r.frame.boxes) if b.xy is not None and b.near_m is not None and in_band([b]) and
-            abs(math.hypot(*b.xy) - rng) <= gate_m and abs(b.bearing_deg - bearing) <= gate_deg]
-    if len(hits) > 1:
+    since = t_seed - r.t
+    rng_seed = math.hypot(x_seed + speed * since + ego.between(r.t_log, log_seed), y)
+    gate_seed_m = GROUND_GATE_M + GROUND_GATE_FRAC * rng_seed + SPEED_ERR_MPS * since
+    near = []  # every band box that could be taken for it: inside AMBIGUOUS_GATE x the gates
+    for j, b in enumerate(r.frame.boxes):
+      if b.xy is None or b.near_m is None or not in_band([b]):
+        continue
+      d_m, d_deg = abs(math.hypot(*b.xy) - rng), abs(b.bearing_deg - bearing)
+      if d_m <= AMBIGUOUS_GATE * gate_m and d_deg <= AMBIGUOUS_GATE * gate_deg:
+        near.append((j, b, d_m <= gate_m and d_deg <= gate_deg and abs(math.hypot(*b.xy) - rng_seed) <= gate_seed_m))
+    if not near:
+      continue
+    if len(near) > 1 or not near[0][2]:
       return (far_box.near_m, math.hypot(*far_box.xy)), 'ambiguous', 0., used
-    if hits:
-      j, last = hits[0]
-      last_t, last_log = r.t, r.t_log
-      far_box = last if last.near_m > far_box.near_m else far_box
-      used.add((i, j))
-      seen_calibrated = seen_uncalibrated = False
+    j, last, _ = near[0]
+    last_t, last_log = r.t, r.t_log
+    far_box = last if last.near_m > far_box.near_m else far_box
+    used.add((i, j))
+    seen_calibrated = seen_uncalibrated = False
   return (far_box.near_m, math.hypot(*far_box.xy)), 'logStart', 0., used
 
 

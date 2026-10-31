@@ -182,8 +182,8 @@ def x_at(c, t):
   return c.x0 - (c.speed + EGO_V) * (t - c.t0)
 
 
-def stream(n, **kw):
-  return [Car(t0=SPACING_S * i, **kw) for i in range(n)]
+def stream(n, spacing=SPACING_S, **kw):
+  return [Car(t0=spacing * i, **kw) for i in range(n)]
 
 
 def floor10(m):
@@ -319,9 +319,10 @@ def test_no_far_range_without_a_road_range():
 
 
 def test_a_car_parked_by_the_road_is_not_an_oncoming_sample():
-  """Parked 9 m left of the car's lane, inside the band, boxed all the way in and tracked, standing still over the ground:
-  never a sample, so 58 oncoming cars and it are too few, and 59 and it are enough."""
-  parked = Car(t0=0., x0=300., y=9., speed=0., far_from=0.)
+  """Parked 12 m left of the car's lane, inside the band, boxed all the way in and tracked, standing still over the ground:
+  never a sample, so 58 oncoming cars and it are too few, and 59 and it are enough. (At 9 m it is inside the ambiguity gate
+  of the oncoming car that passes it about 140 m out, which is then confirmed only to there: the tests below.)"""
+  parked = Car(t0=0., x0=300., y=12., speed=0., far_from=0.)
   msgs, _ = drive([parked] + stream(58, far_from=0.), far=False)
   result = run(msgs)
   assert 1 not in [s.track_id for s in result.samples]
@@ -360,9 +361,9 @@ def test_two_boxes_where_the_car_could_be_end_its_chain():
   assert result.road.range_m == floor10(min(s.road_m for s in result.samples))
 
 
-def late_car_stream():
+def late_car_stream(spacing=SPACING_S):
   """60 oncoming cars, car 10 (track 11) boxed only from 100 m: the true shortest, its first box's near_m about 82 m."""
-  cars = stream(60, far_from=0.)
+  cars = stream(60, spacing=spacing, far_from=0.)
   cars[10].road_from = 100.
   return cars
 
@@ -409,6 +410,22 @@ def test_a_lead_in_our_lane_gives_no_credit(x):
   result = run(msgs)
   no_credit_past_its_own_boxes(result, truth[:60])
   assert len(result.samples) == 60
+
+
+def test_a_box_that_closes_at_another_rate_is_not_followed_back():
+  """A car stopped in the oncoming lane, boxed from 150 m until car 10 passes it about 105 m out and hides it, so going back
+  its box is the one where car 10 would be the run after car 10's first: never inside the ambiguity gate beside car 10's.
+  Re-centred on each box, car 10's chain would follow it back to its own first box (150 m). The seed's own motion closes at
+  25 m/s and it at 10: once they part by the gate, the chain ends there (ambiguous). Bounded, not prevented: the gate is the
+  tracker's (2 m + 15% of range) wide. Cars 8 s apart, so no other ends car 10's chain first."""
+  cars = late_car_stream(spacing=8.)
+  t1 = cars[10].t0 + (cars[10].x0 - 100.) / (cars[10].speed + EGO_V)  # car 10's first box, 100 m out
+  t1 = first_road_run(t1)
+  t_hidden = round(t1 - 0.15, 6)
+  stopped = Car(t0=t1 - 15., x0=x_at(cars[10], t1 - 0.2) + EGO_V * 14.8, speed=0., far_from=0., gaps=((t_hidden, 1e6),))
+  msgs, truth = drive(cars + [stopped], far=False)
+  s = {s.track_id: s for s in run(msgs).samples}[11]
+  assert s.road_why == 'ambiguous' and s.road_m < near_of(box_at(150., 3.6)) - 5.
 
 
 def test_a_spell_with_no_road_runs_is_no_range_not_a_clear_road():
