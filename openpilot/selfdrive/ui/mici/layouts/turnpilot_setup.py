@@ -53,7 +53,7 @@ def setup_needed(params) -> bool:
   return not params.get_bool(ss.SETUP_DONE) and not (params.get('TurnPilotValhallaTiles') or '').strip()
 
 
-DONE_LINES_MAX = 7
+DONE_LINES_MAX = 8
 
 
 def done_lines(params) -> list[str]:
@@ -69,6 +69,7 @@ def done_lines(params) -> list[str]:
            f"TurnPilot starts {live}."]
   if (params.get('TurnPilotCarSignals') or 'off') != 'on':
     lines.append("When the comma chimes \"Signal Left\" or \"Signal Right\", tap the stalk that way.")
+  lines.append(ss.UPDATE_LINE)
   return lines
 
 

@@ -21,6 +21,9 @@ INSTALL_PARAM = 'TurnPilotValhallaInstall'
 RETRY_PARAM = 'TurnPilotValhallaRetry'
 ALERT = 'Offroad_TurnPilotSetup'
 PHONE_LIVE_S = 30.  # the page polls every 2 s while it is open
+# how a fix pushed to the turnpilot branch reaches the car (DisableUpdates 0): updated fetches it in the background on an
+# unmetered network, or when asked in settings > software, and it is applied only at the next boot
+UPDATE_LINE = "Updates download on Wi-Fi and install when the comma next starts. To update now: settings > software > check for update."
 
 GOOD, WAITING, BUSY, ERROR = 'good', 'waiting', 'busy', 'error'
 

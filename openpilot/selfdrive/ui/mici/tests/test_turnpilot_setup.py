@@ -1,4 +1,6 @@
 """TurnPilot setup's and settings > turnpilot's wiring to their params, without a window."""
+from pathlib import Path
+
 from openpilot.common.params import Params
 from openpilot.common.test import OpenpilotTestCase
 
@@ -64,10 +66,23 @@ class TestSetupWiring(OpenpilotTestCase):
     params.put_bool("TurnPilotShadowMode", True)
     params.put("TurnPilotCarSignals", "on")
     lines = done_lines(params)
-    assert lines[5].startswith("TurnPilot starts watch only") and len(lines) == 6
+    assert lines[5].startswith("TurnPilot starts watch only") and len(lines) == 7
     from openpilot.selfdrive.ui.mici.layouts.turnpilot_setup import DONE_LINES_MAX
     params.put("TurnPilotCarSignals", "off")
     assert len(done_lines(params)) == DONE_LINES_MAX  # the done screen has a card for every line it can show
+
+  def test_done_screen_and_settings_say_how_to_update(self):
+    # DisableUpdates 0: a fix pushed to the turnpilot branch reaches the car through settings > software, applied at a boot
+    from openpilot.selfdrive.turnpilot.setup_state import UPDATE_LINE
+    from openpilot.selfdrive.ui.mici.layouts import turnpilot_setup
+    from openpilot.selfdrive.ui.mici.layouts.settings import turnpilot
+    assert "settings > software > check for update" in UPDATE_LINE and "next starts" in UPDATE_LINE
+    params = BlockingParams()
+    for signals in ("off", "on"):
+      params.put("TurnPilotCarSignals", signals)
+      assert turnpilot_setup.done_lines(params)[-1] == UPDATE_LINE
+    assert "GreyBigButton(\"updates\", ss.UPDATE_LINE)" in Path(turnpilot.__file__).read_text()
+    assert Params().get_default_value("DisableUpdates") is False
 
   def test_steps_match_the_state_module(self):
     from openpilot.selfdrive.turnpilot.setup_state import STEPS

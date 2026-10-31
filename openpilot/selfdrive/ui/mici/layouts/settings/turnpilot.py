@@ -121,12 +121,14 @@ class TurnPilotSettingsLayout(NavScroller):
     self._setup_btn = BigButton("run setup again", icon=gui_app.texture("icons_mici/setup/green_info.png", 64, 64),
                                 description="Go through TurnPilot setup again: the phone, the map key and the map engine.")
     self._setup_btn.set_click_callback(self._on_setup)
+    self._update_card = GreyBigButton("updates", ss.UPDATE_LINE)
     self._last_refresh = -1e9
 
     toggles = [t for _, t in self._toggles]
     for item in (*toggles, self._stop_sign):
       item.set_enabled(lambda: not ui_state.engaged)
-    self._scroller.add_widgets([self._pair_btn, toggles[0], toggles[1], self._stop_sign, toggles[2], self._engine_btn, self._setup_btn])
+    self._scroller.add_widgets([self._pair_btn, toggles[0], toggles[1], self._stop_sign, toggles[2], self._engine_btn, self._setup_btn,
+                                self._update_card])
 
   def show_event(self):
     super().show_event()
