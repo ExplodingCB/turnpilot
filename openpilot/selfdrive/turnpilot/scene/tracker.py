@@ -72,8 +72,15 @@ PERSON_HEIGHT = 1.7      # m: a pedestrian's range is the nearer of the ground a
 MIN_PERSON_ASPECT = 1.0  # box h/w: the overpass pillar and bush read 0.45-0.52, real pedestrians 1.8-3.8, the cyclist (a person
                          # box) 1.39-1.64
 MAX_PERSON_GROUND_HEIGHT = 12.  # m, ground range x box height / focal length: pedestrians with visible feet read 1.5-2.8 m, the
-                                # cyclist, whose box ends a few px under the horizon, 7.6-9.8 m, the pillar 14-33 m. No lower bound:
-                                # there's no example of a too-short person box to set one from
+                                # cyclist, whose box ends a few px under the horizon, 7.6-9.8 m, the pillar 14-33 m
+# ...and a lower bound near the car (peds P1): a person box ranged nearer than PERSON_GH_NEAR_M by its ground contact and under this
+# tall there is a reflection in the hood or windshield. Public comma four route 49d0fc1df3e7320b/00000002--d2df953add segment 14
+# frame 82: a traffic mirror's reflection at the hood's edge, 3.3 m and 0.19 m tall, matched a real person's confirmed track 3 m to
+# the right, moved it into the path and ramped a hard stop to -7 m/s^2. A real person within 8 m is about 140 px tall or more on
+# the road camera, and in 11,596 comma four person boxes none read under 1.0 m that near; farther out a child or someone half
+# behind a car may read that short, so the bound stops at PERSON_GH_NEAR_M
+MIN_PERSON_GROUND_HEIGHT_NEAR = 0.6  # m
+PERSON_GH_NEAR_M = 8.0               # m
 # every run's boxes, tracked or not, for the unprotected left's gap rule (unprotected_left.py; CRITIQUE REQUIRED 2): a box's
 # nearest plausible range is its ground range with the box bottom this many pixels lower (about 1.5 px at the YOLO input)
 NEAR_PX = 3.
@@ -291,6 +298,9 @@ class SceneTracker:
     if m.cls == PERSON and box[3] > box[1]:
       rng, rng_h = float(np.hypot(*m.xy)), PERSON_HEIGHT * lens.f / (box[3] - box[1])
       if rng * (box[3] - box[1]) / lens.f > MAX_PERSON_GROUND_HEIGHT:
+        m.plausible = False
+        return m
+      if rng < PERSON_GH_NEAR_M and rng * (box[3] - box[1]) / lens.f < MIN_PERSON_GROUND_HEIGHT_NEAR:
         m.plausible = False
         return m
       if rng_h < rng:
