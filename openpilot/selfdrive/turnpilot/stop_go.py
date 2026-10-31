@@ -108,6 +108,8 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+import numpy as np
+
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.turnpilot import stop_rules as sr
@@ -117,7 +119,8 @@ from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
 from openpilot.selfdrive.turnpilot.routing import certify as ce
 from openpilot.selfdrive.turnpilot.routing.junctions import survey_approach
 from openpilot.selfdrive.turnpilot.scene_policy import PATH_HALF_WIDTH_M, STOP_SPEED, Stop, stop
-from openpilot.selfdrive.turnpilot.stop_evidence import APPROACH_V, DOWNGRADE_V, DOWNGRADE_WINDOW_M, StopEvidence, class_name, junction_lanes
+from openpilot.selfdrive.turnpilot.stop_evidence import APPROACH_V, DOWNGRADE_V, DOWNGRADE_WINDOW_M, MOVE_TOL_M, StopEvidence, class_name, \
+  junction_lanes
 from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP
 
 MODES = ce.MODES                # off, shadow, trial, auto, vision (TurnPilotStopSignGo)
@@ -252,6 +255,16 @@ GOING_REASON = "Going"
 NO_LIFT_REASON = "signal at the junction: the car's own go"  # V7
 VISION_GATE_TEXT = {'table': "no visibility file", 'sideViews': "side cameras off", 'H8': "map data unavailable",
                     'lens': "camera lens mismatch"}
+# SAT-11 (SAT_VALIDATION row 11, BeamNG at 263065a, stop_allway_out_of_turn under vision): a car standing 4.4 m back of its
+# assumed line read U2 'far' at the go, which _known_moved judged only by its go-time distance less its go-time speed (0.08
+# m/s) carried on: its start 0.5 s after our go withdrew nothing, the band skipped it as still, and the cars touched. Under
+# vision every vehicle standing at the go is watched for its start (_watch_starts), from the tracker's ground point and ground
+# speed (ego motion and our yaw since the go taken out), never its fit's trust, which our own motion restarts
+START_M = 0.3                   # m a standing vehicle's ground point must come toward our path (across ours for a cross lane,
+START_RANGE_FRAC = 0.02         # along it for a parallel one), plus this share of its range at the go (mono ranging's noise)...
+START_V = 0.8                   # m/s, ...or its ground speed toward our path over this (run 11's camera track read 0.4 standing)...
+START_FRAMES = 2                # ...on this many frames in a row: it has started (the go withdrawn; in the band, a threat)
+START_REF_S = 1.0               # s of its matches standing where the car stood at the go its reference ground point is the median of
 
 
 @dataclass
@@ -521,6 +534,7 @@ class StopGo:
     self.takeover_fails = 0         # V3: goes withdrawn because the model didn't take over (GO_RETRIES bounds these alone)
     self.box_next = STALL_BOX_S     # V4: s of the stand at which the next clearBox may go
 
+
   def _take(self, ctl, f: Frame) -> None:
     """A new encounter with control ctl (held, or engaged ahead)."""
     self.reset()
@@ -609,6 +623,8 @@ class StopGo:
     if self.state == 'approach' and ctl is not None:
       self.state, self.dwell_s = 'stopped', 0.
     self._driver(f, d, ctl)
+    if self.vision and self.go is not None and self.state in ('going', 'committed', 'inLane'):
+      self._watch_starts(f)  # SAT-11: once a frame, before the launch's re-check and the band's threat test read it
     if self.state == 'approach':
       self._approach(f, d, pos, acting)
     elif self.state == 'stopped':
@@ -1529,7 +1545,51 @@ class StopGo:
       if trk is not None:
         out[tid] = {'role': e.role, 'index': e.index, 'shield': e.shield, 'u2': e.u2, 'x': float(trk.x[0]), 'y': float(trk.x[1]),
                     'odo': f.odo_m, 'span': getattr(trk, 'span_seen', None), 'd_lo': e.d_lo, 'v_hi': e.v_hi, 't': self.t}
+        if self.vision:
+          # SAT-11: standing at the go (its speed trusted under SHIELD_V), wherever it stands: watched for its start from its
+          # reference ground point (the median of its matches here over START_REF_S, a single match's noise left out)
+          here = [s for s in self.evidence.hist.get(tid, ()) if abs(s.d_stop - self.evidence.d_stop) <= MOVE_TOL_M and
+                  s.t >= e.t - START_REF_S - 1e-9]
+          gx = float(np.median([s.x for s in here])) if here else float(trk.x[0])
+          gy = float(np.median([s.y for s in here])) if here else float(trk.x[1])
+          out[tid].update(stood=e.v_trusted and e.v_hi < sr.SHIELD_V, gx=gx, gy=gy, cross=e.role in ('left', 'right'),
+                          run=0, started=False)
     return out
+
+  def _watch_starts(self, f: Frame) -> None:
+    """SAT-11, under vision from the go on: each vehicle known standing at the go (_known_tracks) has started once, on
+    START_FRAMES frames in a row, its ground point (the tracker's, put back in the go's frame: our odometer and our yaw since
+    the go taken out) has come START_M plus START_RANGE_FRAC of its range toward our path (across it from a cross lane, along
+    it from a parallel one), or its ground speed toward our path is over START_V. Latched for the encounter's go: a start
+    before the commit withdraws the go (_lane_holds' outOfTurn), after it the band's threat test reads it moving."""
+    known = self.go['tracks'] if self.go is not None else {}
+    by_id = {t.track_id: t for t in f.tracks or () if getattr(t, 'x', None) is not None}
+    th = math.radians(f.turned_deg)
+    c, s = math.cos(th), math.sin(th)
+    for tid, k in known.items():
+      if not k.get('stood') or k['started']:
+        continue
+      trk = by_id.get(tid)
+      if trk is None:
+        continue  # coasting, unmatched: the count waits for it
+      moved = f.odo_m - k['odo']
+      xn, yn = float(trk.x[0]), float(trk.x[1])
+      vxn, vyn = (float(trk.x[2]), float(trk.x[3])) if len(trk.x) > 3 else (0., 0.)
+      # the go's frame: our car moved `moved` m along a heading that turned th, the turn taken as gradual
+      xg = moved * math.cos(th / 2.) + xn * c - yn * s
+      yg = moved * math.sin(th / 2.) + xn * s + yn * c
+      vxg, vyg = vxn * c - vyn * s, vxn * s + vyn * c
+      if k['cross']:
+        toward, v_toward = abs(k['gy']) - abs(yg), -math.copysign(1., k['gy']) * vyg
+      else:
+        toward, v_toward = k['gx'] - xg, -vxg
+      need = START_M + START_RANGE_FRAC * math.hypot(k['gx'], k['gy'])
+      k['run'] = k['run'] + 1 if toward >= need or v_toward >= START_V else 0
+      if k['run'] >= START_FRAMES:
+        k['started'] = True
+        cloudlog.event("turnpilot.stop_go_start_seen", key=list(self.key), track=int(tid), role=k['role'], state=self.state,
+                       toward=round(toward, 2), need=round(need, 2), v_toward=round(v_toward, 2), moved=round(moved, 2),
+                       go_t=round(self.t - self.go['t'], 2))
 
   def _still(self, f: Frame) -> dict:
     """The tracks known at the go that haven't moved since (_known_moved): the go stands on them as it found them."""
@@ -1552,9 +1612,18 @@ class StopGo:
     """A track known at the go, during the launch (its bearings from a moving car aren't comparable, so stop_evidence restarts
     its trust): one stopped at its line moved once the tracker's ground motion (ego-compensated) since the go passes
     SHIELD_MOVE_M or its ground speed SHIELD_V, each with the ranging's allowance; one that was far stays so only while its
-    go-time distance less its go-time speed carried on still lets it stop at A_U2; anything else is moving."""
+    go-time distance less its go-time speed carried on still lets it stop at A_U2; anything else is moving. Under vision one
+    standing at the go has moved once _watch_starts saw it start, and a far one standing has moved only then."""
     trk = next((t for t in f.tracks or () if t.track_id == tid), None)
+    # SAT-11, under vision: one standing at the go has moved once it has started (_watch_starts: its ground point and speed,
+    # ego motion and our yaw taken out), at its line or not. A 'far' one standing back of its line is judged by that alone,
+    # never by its go-time speed carried on, which for a standing car never runs out (run 11: 0.08 m/s at 16.7 m)
+    stood = self.vision and k.get('stood', False)
+    if stood and k['started']:
+      return True
     if k['u2'] == 'far':
+      if stood:
+        return False
       d_lo = k['d_lo'] - k['v_hi'] * (self.t - k['t'])
       room = d_lo - sr.U2_LINE_M
       return room <= 0. or k['v_hi'] ** 2 / (2. * room) > sr.A_U2
