@@ -80,7 +80,8 @@ profile): the road camera only from the go to the commit (CRITIQUE REQUIRED 3; t
 while held, for the exit crosswalk). Until the car can no longer stop short of the oncoming lanes on the comfortable curve
 (scene_policy.committed_past_line), every road run is checked again for the remaining clear time, and at its first motion
 (STANDSTILL_SPEED: CRITIQUE REQUIRED 4) with the latency gone: a car in the band then withdraws the go, the car stops
-where the comfortable curve can (oncomingHolding, a chime) and waits again; standing where it was held, it can always
+where the comfortable curve can (oncomingHolding, a chime) and waits again, the go's pulse out of the model's queue as
+it is withdrawn (turnpilotd.clear_withdrawn_left), a fresh one at the next go; standing where it was held, it can always
 stay. So does anything else the go was certified on no longer holding (the exit crosswalk, the view, another hold, the
 light gone red or yellow): a go never outlives them to run stale when they let go. A person overruling the car's left (the
 driver's lamp the other way, hazards, our lamp put out: car_signals.py, DESIGN phase4/blinker 6.6) withdraws it the same

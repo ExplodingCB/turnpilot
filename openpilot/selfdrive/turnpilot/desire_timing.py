@@ -26,7 +26,9 @@ pedestrian) none goes, and the model finishes it (H2: 9 of 10 from 25-42 degrees
 a fresh edge in the very plan that lets the car go (BeamNG unprotected_left_visible: let go a frame or more before its
 pulse, the car drove straight across the junction). A turn with no pulse before its hold (the autonomous unprotected left:
 turnpilotd holds may_start off on its approach, so the car stands straight with the road camera up the oncoming approach)
-takes its go as its first pulse, at once.
+takes its go as its first pulse, at once. That left's go withdrawn to its own hold while the car still rolls (withdraw())
+takes its pulse out of the model's queue on the withdrawal (CLEAR_DESIRE) and sends none while held, so the model plans no
+left as the hold brakes the car; the next go pulses a fresh edge.
 A repeat pulse is a short drop to none, long enough that modeld (unsynchronized, conflated subscriber) can't miss it.
 The model keeps the rising edges of the last 132 frames (6.6 s at 20 Hz, the big model's state_desire_q), and
 forgets a pulse when it leaves that queue. A pulse still in the queue once the car is round the corner turns it
@@ -173,6 +175,14 @@ class DesireTiming:
     its desire comes out of the model's queue now, and nothing more goes for it."""
     self._clear()
     self.done, self.active = True, False
+
+  def withdraw(self):
+    """A turn's go withdrawn short of its junction with its pulse out (turnpilotd: the autonomous left's go withdrawn to its
+    own hold, under TURN_STARTED_DEG into it): its pulse comes out of the model's queue now (CLEAR_DESIRE), so the model
+    plans no turn while the hold brakes the car, and none goes while it is held; the next go pulses a fresh edge, as after a
+    standstill (STANDSTILL_REPULSE_MAX_DEG). The turn stays the maneuver's (started, side and done kept)."""
+    self.clear_frames, self._pending = CLEAR_FRAMES, None
+    self.active, self._gap, self._rearmed = False, 0, True
 
   def _clear(self):
     self.clear_frames, self._pending, self.side = CLEAR_FRAMES, None, 0

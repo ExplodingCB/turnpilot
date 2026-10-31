@@ -718,6 +718,7 @@ class TurnPilot:
       self.disengaged_s = 0.       # ...of it with openpilot disengaged
       self.engaged_wait_s = 0.     # time since the first engaged frame, before the first detection
       self.left = UnprotectedLeft()  # the autonomous unprotected left (unprotected_left.py); kept through a fault, as its latch
+      self.left_hold_was = False     # ...its own hold (hold_here) last frame: a withdrawn go's is its rising edge
       self.stop_go = StopGo()  # the stop-sign decider: kept through a fault, as the latch it decides for
       self.stop_go.on_signal_seen = self.signal_seen_override
       self.stop_go.on_downgrade = self.downgrade_override
@@ -1187,6 +1188,7 @@ class TurnPilot:
     if sg.turn_missed:
       self.missed_t = MISSED_HOLD_S  # the other turn taken: the route's planned turn is missed, navd reroutes at once (3.5)
     self.clear_driven_left(rf)
+    self.clear_withdrawn_left(rf)
     desire = self.desires.update(d_on, d_dist, d_id, d_passed, v_ego, cs.steeringAngleDeg,
                                  not keep_why[LEFT], not keep_why[RIGHT], DT_MDL, default_yaw_rate(cs, model),
                                  lat_active=lat_active, replaced=d_replaced,
@@ -1727,6 +1729,26 @@ class TurnPilot:
       cloudlog.event("turnpilot.left_driven_desire_cleared", error=True, turned_deg=round(d.turned_deg, 1),
                      distance=round(rf.distance, 1), cause=left.crossed or 'line')
       d.cancel()
+
+  def clear_withdrawn_left(self, rf) -> None:
+    """The autonomous left's go withdrawn to its own hold this frame (unprotected_left: hold_here rising, for the band, the
+    exit crosswalk, the view, another hold, the light, the position fault or the driver's signal) with its pulse out and the
+    car under TURN_STARTED_DEG into it: the pulse comes out of the model's queue now (CLEAR_DESIRE, in this very plan) and
+    none goes while the car is held (DesireTiming.withdraw), so the model plans no left while the hold brakes the car to its
+    stand short of the oncoming lanes; the next go pulses a fresh edge (tp/left-hold's recheck, follow-up 2: the go's
+    turnLeft stayed out on 40 of 44 and 44 of 48 frames the hold braked the car, dropping only once it stood). The turn stays
+    the maneuver's, so a left the driver then takes from the hold is cleared and missed as before (clear_driven_left), or
+    finished, turned TURN_STARTED_DEG or more. turnpilotd's own no-move withdrawal stands the car already: never here.
+    Before this frame's desire (update())."""
+    here = self.left.hold_here
+    rising, self.left_hold_was = here and not self.left_hold_was, here
+    d = self.desires
+    if not rising or self.left_now is None:
+      return
+    if d.maneuver_id == rf.maneuver_id and d.started and d.side != 0 and not d.done and d.turned_deg < TURN_STARTED_DEG:
+      cloudlog.event("turnpilot.left_withdrawn_desire_cleared", turned_deg=round(d.turned_deg, 1), distance=round(rf.distance, 1),
+                     state=str(self.left_now.state), why=str(self.left_now.why))
+      d.withdraw()
 
   def watch_far(self, sm) -> None:
     """The far crop's state from the full pass's latest farStatus: read, or off for the drive (said once, farViewOff,

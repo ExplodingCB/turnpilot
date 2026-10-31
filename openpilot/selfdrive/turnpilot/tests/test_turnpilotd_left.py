@@ -1623,3 +1623,34 @@ def test_a_left_the_driver_has_turned_into_when_it_is_let_go_keeps_its_desire_to
   plans = [sim.step(engaged=False, gas=True, yaw_rate=sim.v / 6.) for _ in range(5)]
   assert not any(p.desire == CLEAR_DESIRE for p in plans) and not d.done
   assert str(plans[-1].controlPrompt) == 'unprotectedTurnTakeControl'
+
+
+@pytest.mark.parametrize("v_w", [2.5, 2.7])
+def test_a_go_withdrawn_in_its_launch_has_its_pulse_cleared_while_the_hold_brakes_and_the_next_go_pulses_afresh(v_w):
+  """tp/left-hold's recheck, round 1, follow-up 2 (as at e93750b): the go withdrawn later in its launch with openpilot engaged
+  throughout, the go's turnLeft stayed out on 40 of 44 (2.5) and 44 of 48 (2.7) of the frames the left's own hold braked the
+  car to its stand, dropping only once it stood: the model steering the left the go was withdrawn for, its pulse queued. The
+  pulse comes out of the model's queue on the withdrawal frame (CLEAR_DESIRE, one run of it), and no turnLeft goes while
+  the car is held; the hold still stands the car short of the oncoming lanes, and the next go pulses a fresh edge and the
+  turn is taken."""
+  from openpilot.selfdrive.turnpilot.desire_timing import CLEAR_FRAMES
+  sim = late_withdrawn_go(v_w)
+  withdrawal = sim.trace[-1][2]
+  assert withdrawal.desire == CLEAR_DESIRE, withdrawal.desire
+  n = len(sim.trace)
+  for _ in range(int(6. / DT_MDL)):
+    sim.step(engaged=True)
+  held = sim.trace[n:]
+  rolling = [p for _, v, p in held if v > 0.05]
+  assert rolling and not any(p.desire == Desire.turnLeft for p in rolling), \
+    f"turnLeft on {sum(p.desire == Desire.turnLeft for p in rolling)} of {len(rolling)} rolling frames under the hold"
+  assert not any(p.desire == Desire.turnLeft for _, _, p in held)
+  clears = [k for k, p in enumerate([withdrawal] + [p for _, _, p in held]) if p.desire == CLEAR_DESIRE]
+  assert clears == list(range(CLEAR_FRAMES)), clears  # once, from the withdrawal frame
+  stood = [JUNCTION - s for s, v, _ in held if v < 0.05]
+  assert stood and min(stood) > ONCOMING_ENTRY_M and sim.tp.left.hold_here and str(held[-1][2].unprotectedLeft.state) == 'waitGap'
+  plans = drive(sim, 25.)
+  first = next((k for k, p in enumerate(plans) if p.desire == Desire.turnLeft), None)
+  assert first is not None and str(plans[first].unprotectedLeft.state) == 'go', "no fresh pulse at the next go"
+  assert not any(p.desire == CLEAR_DESIRE for p in plans[:first])
+  assert sim.s > JUNCTION + 10.
