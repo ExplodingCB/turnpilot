@@ -1,0 +1,199 @@
+"""A person TurnPilot saw who may still be in front of the car (WARGAME_FIXES WF-13, FREEZE.md item 15), closed loop.
+
+BeamNG SAT validation row 6 (ped_step_out-20261031-084546, tp/integrate 263065a, TurnPilotAlwaysDrive on, a green signal ahead):
+a walker stepped into the lane and stood about 1 m right of the car's centreline. TurnPilot's hard brake (track 1, confirmed,
+25 hits) stood the car short of her; her track's last hit was at 3.31 m, 1.14 m right, then it coasted on unmatched frames (age
+frozen at 71) out to 3.85 m, 1.41 m right for CLOSE_HOLD_S and ended at 12.9 s with her still standing there below the bonnet
+line. With no track, S2's straight release went that frame (go_certified turnRelease), the model drove on, and the car passed
+her at 3.5 m/s 0.93 m off her centre: on a road, the right front corner and the mirror strike her.
+
+Here the same timeline on the point-mass Sim: the car brakes for her, stands, she stands 3.31 m ahead and 1.14 m right with
+hits for 2 s, her track coasts 3 s with no hits and ends. Nothing of TurnPilot's goes and the car stays held, whatever the
+switch says; she is said to be maybe in front on the status line from that frame; seen again and seen walking out of the
+corridor, the release goes 2 s after she is clear; the driver's gas is the driver's go; 30 s on it hands back loudly with the car
+held. A person who walks clear of the path while tracked releases as today."""
+import pytest
+
+from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Sim, oracle_lights
+
+STRAIGHT = [(2000., 'turn', 'left')]  # nothing to turn at for 2 km
+SIGNAL_S = 290.   # a mapped signal on the straight, green all along (the sim's oracle)
+WALKER_S = 270.   # where she steps out, 20 m short of it: the release is judged at the signal (STOPPED_CONTROL_M)
+STEP_OUT_M = 17.07  # run 6: she stepped out 17.07 m ahead of the car at 6.48 m/s
+LAST_HIT = (3.31, -1.14)  # run 6: track 1's last hit, m ahead of the camera and m left (she stood right of the centreline)
+COAST_V = (0.18, -0.09)   # ...and the velocity it coasted on, unmatched, for CLOSE_HOLD_S
+COAST_S = 3.0
+NOTE = "Person may be in front"
+REASON = "Person may be in front: take control"
+PROMPT = 'personFrontTakeControl'
+
+
+class Walker:
+  """Run 6's walker as the tracker published her: one track, a hit on every detector run (10 Hz) while seen."""
+  def __init__(self, track_id=1, age=6):
+    self.track_id, self.age, self.k = track_id, age, 0
+
+  def seen(self, x, y, vx=0., vy=0.):
+    self.k += 1
+    if self.k % 2 == 0:
+      self.age += 1
+    return self.obj(x, y, vx, vy)
+
+  def coasting(self, x, y, vx, vy):
+    return self.obj(x, y, vx, vy)  # no new hit: its age stays
+
+  def obj(self, x, y, vx, vy):
+    return ({'trackId': self.track_id, 'cls': 'pedestrian', 'x': x, 'y': y, 'vx': vx, 'vy': vy, 'age': self.age, 'conf': 0.8,
+             'inPath': abs(y) < 1.5, 'camera': 'road'},)
+
+
+def run6(always_drive: bool):
+  """The car engaged at 6.5 m/s on a straight toward a green signal; she steps out STEP_OUT_M ahead from the right kerb and
+  walks 1.5 m into the lane; TurnPilot stands the car for her; she stands at LAST_HIT seen for 2 s. Returns (sim, walker)."""
+  sim = Sim(STRAIGHT, cruise=6.5, controls=[(SIGNAL_S, 'signal')])
+  sim.tp.always_drive, sim.go_taps, sim.tp.oracle_ok = always_drive, False, True
+  sim.lights = oracle_lights('green', SIGNAL_S)
+  w = Walker()
+  while WALKER_S - sim.s > STEP_OUT_M + 10.:
+    sim.step(engaged=True)
+    assert sim.t < 60.
+  y = -2.86  # on the kerb, by the road (the curb cap's track)
+  while sim.v > 0.05 or sim.t < 1.:
+    if WALKER_S - sim.s <= STEP_OUT_M:
+      y = min(y + 0.8 * DT_MDL, LAST_HIT[1])  # stepping in at 0.8 m/s
+    sim.step(w.seen(WALKER_S - sim.s, y, vy=0.8 if y < LAST_HIT[1] else 0.), engaged=True)
+    assert sim.t < 90.
+  assert any(p.reason == "pedestrian in path" and p.shouldStop for _, _, p in sim.trace[-5:])
+  for _ in range(round(2. / DT_MDL)):  # she stands 3.31 m ahead, 1.14 m right, seen on every run
+    sim.step(w.seen(*LAST_HIT), engaged=True)
+  assert sim.v < 0.05 and sim.trace[-1][2].shouldStop
+  return sim, w
+
+
+def lose_her(sim, w):
+  """Run 6 from her last hit: her track coasts COAST_S with no hits (age frozen), drifting on its last velocity, then ends.
+  Returns the plans of the coast and of the frame it ended."""
+  plans = []
+  for k in range(round(COAST_S / DT_MDL)):
+    t = k * DT_MDL
+    plans.append(sim.step(w.coasting(LAST_HIT[0] + COAST_V[0] * t, LAST_HIT[1] + COAST_V[1] * t, *COAST_V), engaged=True))
+  plans.append(sim.step(engaged=True))  # gone: run 6's 12.9 s
+  return plans
+
+
+def certified(plans):
+  return [str(p.goCertified.cause) for p in plans if str(p.goCertified.cause) != 'none']
+
+
+@pytest.mark.parametrize('always_drive', [True, False])
+def test_run_6_her_track_ends_in_front_of_the_standing_car_and_nothing_goes(always_drive):
+  """Run 6's own timeline: at 263065a the gone frame was S2's straight release (turnRelease, the lift, the model on). Now
+  nothing of TurnPilot's goes, the car stays held standing (shouldStop, a 0 speed cap) with the model free to drive, and the
+  status line says she may be in front from the gone frame on. With the switch off too (no lift there: the model alone drove
+  on)."""
+  sim, w = run6(always_drive)
+  plans = lose_her(sim, w)
+  gone = plans[-1]
+  assert not certified(plans), certified(plans)
+  assert gone.shouldStop and gone.speedCap == 0. and str(gone.state) == 'holding', (gone.shouldStop, gone.speedCap, gone.state)
+  assert gone.reason == NOTE and str(gone.controlPrompt) not in TAKE_CONTROL_PROMPTS
+  held = [sim.step(engaged=True) for _ in range(round(20. / DT_MDL))]  # nothing seen of her: the model would drive on
+  assert all(p.shouldStop and p.reason == NOTE and str(p.goCertified.cause) == 'none' for p in held)
+  assert max(v for _, v, _ in sim.trace[-len(held) - 1:]) < 0.05, "the car moved toward her"
+
+
+@pytest.mark.parametrize('always_drive', [True, False])
+def test_seen_again_and_walking_out_of_the_corridor_the_release_goes_2_s_after(always_drive):
+  """She comes back into view (a new track, standing where she was), then walks out of the car's path to the kerb, seen on
+  every run: the latch lets go 2 s after she is clear of the corridor by its margin with nothing person-like in it, and then
+  the release is today's (the switch on: turnRelease at the green; off: the model's own go)."""
+  sim, w = run6(always_drive)
+  lose_her(sim, w)
+  for _ in range(round(1. / DT_MDL)):  # nothing seen
+    sim.step(engaged=True)
+  back = Walker(track_id=2, age=2)
+  plans = []
+  y = LAST_HIT[1]
+  for _ in range(round(1. / DT_MDL)):  # seen again where she was
+    plans.append(sim.step(back.seen(LAST_HIT[0], y), engaged=True))
+  clear_k = None
+  for _ in range(round(6. / DT_MDL)):  # walks to the kerb at 1.2 m/s and stands there, seen
+    y = max(y - 1.2 * DT_MDL, -3.5)
+    plans.append(sim.step(back.seen(LAST_HIT[0], y, vy=-1.2 if y > -3.5 else 0.), engaged=True))
+    if clear_k is None and y <= -2.5 - 1e-9:
+      clear_k = len(plans) - 1
+  assert clear_k is not None
+  first_free = next(k for k, p in enumerate(plans) if not p.shouldStop)
+  assert all(p.shouldStop for p in plans[:first_free])
+  assert (first_free - clear_k) * DT_MDL == pytest.approx(2., abs=0.11), (first_free - clear_k) * DT_MDL
+  assert all(p.reason == NOTE for p in plans[:first_free])
+  after = plans[first_free:]
+  if always_drive:
+    assert certified(after)[:1] == ['turnRelease'] and certified(plans[:first_free]) == []
+  assert sim.v > 0.3, "the release: the car pulls away once she has walked clear"
+
+
+def test_the_drivers_gas_is_the_drivers_go():
+  """The driver presses the gas (DisengageOnAccelerator: openpilot disengages a frame later): the latch ends, TurnPilot holds
+  nothing and certifies no go of its own."""
+  sim, w = run6(True)
+  lose_her(sim, w)
+  for _ in range(round(3. / DT_MDL)):
+    sim.step(engaged=True)
+  plans = [sim.step(gas=True, engaged=True)] + [sim.step(gas=True, engaged=False) for _ in range(round(1. / DT_MDL))]
+  assert not plans[-1].shouldStop and plans[-1].reason != NOTE
+  assert not certified(plans)
+
+
+def test_30_s_on_it_hands_back_loudly_with_the_car_still_held():
+  """Nothing seen of her for 30 s: "Person may be in front: take control", the handback's prompt (its repeating chime in
+  selfdrived), the car still held; it stays until the driver takes over."""
+  sim, w = run6(True)
+  lose_her(sim, w)
+  plans = [sim.step(engaged=True) for _ in range(round(35. / DT_MDL))]
+  first = next(k for k, p in enumerate(plans) if str(p.controlPrompt) == PROMPT)
+  assert (first + 1) * DT_MDL == pytest.approx(30., abs=0.11)
+  assert PROMPT in TAKE_CONTROL_PROMPTS
+  assert all(p.shouldStop for p in plans)
+  assert all(str(p.controlPrompt) == PROMPT and p.reason == REASON for p in plans[first:])
+  assert all(str(p.controlPrompt) not in TAKE_CONTROL_PROMPTS and p.reason == NOTE for p in plans[:first])
+  assert not certified(plans)
+
+
+@pytest.mark.parametrize('always_drive', [True, False])
+def test_a_person_who_walks_clear_of_the_path_while_tracked_releases_as_today(always_drive):
+  """She walks out of the path to the kerb, seen on every run, and only then is lost: no latch, and the hold lets go the frame
+  her stop ends, as at 263065a (the switch on: turnRelease at the green)."""
+  sim, w = run6(always_drive)
+  plans, y = [], LAST_HIT[1]
+  while y > -3.5:
+    y -= 1.2 * DT_MDL
+    plans.append(sim.step(w.seen(LAST_HIT[0], y, vy=-1.2), engaged=True))
+  plans += [sim.step(engaged=True) for _ in range(round(3. / DT_MDL))]  # lost at the kerb
+  free = next(k for k, p in enumerate(plans) if not p.shouldStop)
+  assert plans[free - 1].reason == "pedestrian in path" and all(p.reason != NOTE for p in plans)
+  if always_drive:
+    assert str(plans[free].goCertified.cause) == 'turnRelease'
+  assert sim.v > 0.3
+
+
+def test_with_no_person_anywhere_the_release_is_todays():
+  """A red, then the green, on the same straight, nobody anywhere: the map hold lets go and the release is certified that
+  frame (ALWAYS_DRIVE.md ST-12), as at 263065a."""
+  sim = Sim(STRAIGHT, controls=[(SIGNAL_S, 'signal')])
+  sim.tp.always_drive, sim.go_taps, sim.tp.oracle_ok = True, False, True
+  light = {'state': 'red'}
+  sim.lights = lambda sim: oracle_lights(light['state'], SIGNAL_S)(sim)
+  while not (sim.v < 0.05 and sim.s > SIGNAL_S - 50.):
+    sim.step(engaged=True)
+    assert sim.t < 60.
+  for _ in range(round(1. / DT_MDL)):
+    sim.step(engaged=True)
+  light['state'] = 'green'
+  plans = []
+  while not plans or plans[-1].shouldStop:
+    plans.append(sim.step(engaged=True))
+    assert len(plans) < 400
+  assert str(plans[-1].goCertified.cause) == 'turnRelease' and all(p.reason != NOTE for p in plans)
