@@ -3,8 +3,8 @@ unprotected left, the map controls, the turn skip and the stop-sign decider's Fr
 does nothing in shadow mode, and a component made afresh mid-frame (a reset on a fault or a handback) has it at once.
 Step S2, stands and stalls, closed loop: a release the model doesn't follow (ST-04, ST-11, ST-13, ST-06's follow-up, ST-12),
 a cap-only hold (ST-08), a stall in a curb-side turn (LEFT-21), a queue in a turn (ST-09 (stalls)), a stand at a signal
-(ST-07 (stops)), a release where no signal is mapped (LEFT-20), section 4.5's unstick lift, and the crosswalk hold's standoff
-(SC-02, unconditional)."""
+(ST-07 (stops)), a release where no signal is mapped (LEFT-20), section 4.5's unstick lift, the stop-sign memory both read
+(metres driven since a forward run's box, never seconds standing), and the crosswalk hold's standoff (SC-02, unconditional)."""
 import math
 from unittest import mock
 
@@ -30,7 +30,8 @@ from openpilot.selfdrive.turnpilot.turnpilotd import (LEAD_STAND_MAX_S, LIGHT_GR
                                                       NO_MOVE_REASON, NO_MOVE_S, PED_NOTE_S, PED_WAITING_NOTE, PED_WAITING_REASON, QUEUE_STILL_MAX_S,
                                                       RELEASE_GOES, RELEASE_LIFT_M, STALLED_REASON, STALL_LIFTS, STALL_LIFT_GAP_S, STALL_LIFT_REASON,
                                                       STALL_MIN_DEG, STALL_PROMPT_S, STALL_REPULSE_S, STANDSTILL_SPEED, STOPPED_HANDBACK_S,
-                                                      STOPPED_NOTE, STOPPED_NOTE_S, TurnPilot, UNSTICK_S)
+                                                      SIGN_CLEAR_M, SIGN_RUN_FRESH_S, STOPPED_NOTE, STOPPED_NOTE_S, TurnPilot,
+                                                      UNSTICK_S)
 
 Desire = log.Desire
 
@@ -596,20 +597,37 @@ def camera_heads(*heads):
 NO_HEADS = camera_heads()
 
 
-def released_where_no_signal_is(on: bool, status='ok', controls=(), lights=NO_HEADS, signs=False):
+SIGN_BOX = ((0., 2., 0.8),)  # a stop-sign box's (bearing, elevation, conf)
+
+
+def sign_runs(signs, camera='road'):
+  """The detector's forward run of each frame (sim.raw), a full pass on camera, for signs: False, no stop-sign box; True, a
+  box in every run; 'approach', a box in every run while the car moves (STANDSTILL_SPEED or more) and none once it stands
+  (the sign beside the car at the line, out of the road camera's view); 'wide', the road camera's run with no box and the
+  wide camera's with the approach's box on alternate frames (as modeld alternates them in a turn)."""
+  if signs == 'wide':
+    return lambda s: RawFrame([], 'wide', s.t, signs=SIGN_BOX if s.v >= STANDSTILL_SPEED else ()) if round(s.t / DT_MDL) % 2 else \
+      RawFrame([], 'road', s.t)
+  if signs == 'approach':
+    return lambda s: RawFrame([], camera, s.t, signs=SIGN_BOX if s.v >= STANDSTILL_SPEED else ())
+  return lambda s: RawFrame([], camera, s.t, signs=SIGN_BOX if signs else ())
+
+
+def released_where_no_signal_is(on: bool, status='ok', controls=(), lights=NO_HEADS, signs=False, hold_s=2., camera='road'):
   """RIGHT_AT_A_CORNER (no signal there), navd's controls status status, the model stopping the car short of the corner and
-  holding it (plannerd in the loop) while a walker crosses in front; they clear and TurnPilot's hold lets go. lights: the
-  camera's reads; signs: each road run has a stop-sign box. Returns the plans from the walker clearing."""
+  holding it (plannerd in the loop) while a walker crosses in front for hold_s; they clear and TurnPilot's hold lets go.
+  lights: the camera's reads; signs: the forward runs' stop-sign boxes (sign_runs, on camera). Returns the plans from the
+  walker clearing."""
   sim = Sim(RIGHT_AT_A_CORNER, controls=list(controls), controls_status=status)
   sim.tp.always_drive, sim.go_taps = on, False
   sim.lights = lights
-  sim.raw = lambda s: RawFrame([], 'road', s.t, signs=((0., 2., 0.8),) if signs else ())
+  sim.raw = sign_runs(signs, camera)
   sim.accel = model_stops_at(289.)
   while not (sim.v < 0.05 and sim.s > 280.):
     sim.step(engaged=True)
     assert sim.t < 80.
   attach_planner(sim, holding)
-  held = [sim.step(WALKER, engaged=True) for _ in range(round(2. / DT_MDL))]
+  held = [sim.step(WALKER, engaged=True) for _ in range(round(hold_s / DT_MDL))]
   assert held[-1].shouldStop
   return [sim.step(engaged=True) for _ in range(round(3. / DT_MDL))]
 
@@ -632,16 +650,34 @@ def test_a_release_where_no_signal_is_mapped_is_lifted_only_under_section_4_5s_c
   assert certified_causes(released_where_no_signal_is(True, controls=[(315., 'yield')])) == set()
 
 
+@pytest.mark.parametrize('signs, camera', [('approach', 'road'), ('approach', 'wide'), ('wide', 'road')])
+def test_a_stop_sign_seen_only_on_the_approach_bars_the_unsignalized_release(signs, camera):
+  """LEFT-20's stop-sign check is for an unmapped stop sign, which at the line stands beside the car, out of the road
+  camera's view: a box seen only while the car drove up to it, on the road camera's full pass or the wide camera's (alone,
+  or between road runs with none), bars the release's lift however long the car has stood (the walker's 6 s hold here is past
+  the 5 s the check used to forget it in); the same release with no box seen, on the same camera's runs, is lifted."""
+  assert certified_causes(released_where_no_signal_is(True, signs=signs, hold_s=6., camera=camera)) == set()
+  assert certified_causes(released_where_no_signal_is(True, hold_s=6., camera=camera)) == {'turnRelease'}
+
+
 # --- section 4.5 (owner's yes, under the switch): the unstick lift on a model stop off any hold ---
 
+# m: where stood_off_any_hold's and stood_at's model stands the car on STRAIGHT, past SIGN_CLEAR_M of road from turnpilotd's
+# start (which counts as a stop sign just seen)
+STAND_AT_M = 160.
+
+
 def stood_off_any_hold(on: bool, seconds: float, status='ok', lights=NO_HEADS, signs=False, controls=(), **kw):
-  """The model stands the car on a straight with nothing of TurnPilot's holding it (a model stop off any hold), navd's controls
-  status status, the camera's reads lights, a stop-sign box in every road run with signs. Returns the plans of the stand."""
+  """The model stands the car at STAND_AT_M on a straight with nothing of TurnPilot's holding it (a model stop off any hold),
+  navd's controls status status, the camera's reads lights, the forward runs' stop-sign boxes signs (sign_runs). Returns the
+  plans of the stand."""
   sim = Sim(STRAIGHT, controls=list(controls), controls_status=status)
   sim.tp.always_drive = on
   sim.lights = lights
-  sim.raw = lambda s: RawFrame([], 'road', s.t, signs=((0., 2., 0.8),) if signs else ())
-  sim.run(1.)
+  sim.raw = sign_runs(signs)
+  while sim.s < STAND_AT_M:
+    sim.step()
+    assert sim.t < 60.
   return sim, stand(sim, seconds, **kw)
 
 
@@ -663,10 +699,88 @@ def test_a_model_stop_off_any_hold_gets_one_unstick_lift_at_10_s_under_section_4
   assert any(str(q.controlAlert) == 'unstickLift' for q in plans[first - 2:first + 2])
   assert plans[-1].controlPrompt == 'carStoppedTakeControl' and not any(q.shouldStop for q in plans)
   for kw in ({'on': False}, {'status': 'partial'}, {'lights': camera_heads(('unknown', 60.))}, {'lights': None}, {'signs': True},
-             {'controls': [(25., 'yield')]}, {'lead_prob': 0.9, 'lead_x': GO_CLEAR_M - 5.}):
+             {'signs': 'approach'}, {'signs': 'wide'}, {'controls': [(STAND_AT_M + 12., 'yield')]},
+             {'lead_prob': 0.9, 'lead_x': GO_CLEAR_M - 5.}):
     args = {'on': True, **kw}
     _, plans = stood_off_any_hold(args.pop('on'), UNSTICK_S + 4., **args)
     assert not unstick_spans(plans), kw
+
+
+def stood_at(raw, seconds=UNSTICK_S + 2., long_control=lambda s: True, at_m=STAND_AT_M):
+  """Under the switch, controls ok, the camera's reader live with no head: the car driven on STRAIGHT from turnpilotd's start
+  to at_m with raw(sim) the forward run of each frame (None: none came) and long_control(sim) whether openpilot controls the
+  speed (False: TurnPilot's plan is a disabled one, update() never reached), then the model stands it seconds. Returns the
+  stand's plans."""
+  sim = Sim(STRAIGHT, controls_status='ok')
+  sim.tp.always_drive = True
+  sim.lights = NO_HEADS
+  sim.raw = raw
+  while sim.s < at_m:
+    sim.long_control = long_control(sim)
+    sim.step(engaged=True)
+    assert sim.t < 60.
+  sim.long_control = True
+  return stand(sim, seconds)
+
+
+@pytest.mark.parametrize('behind_m', [SIGN_CLEAR_M - 10., SIGN_CLEAR_M + 10.])
+def test_the_stop_sign_memory_is_metres_driven_never_seconds_standing(behind_m):
+  """unsignalized_why's stop sign (LEFT-20, section 4.5): a box last seen behind_m before the car stands bars the unstick lift
+  for the whole stand when that is under SIGN_CLEAR_M (standing wears none of it: the stand here runs to the 60 s handback),
+  and doesn't once the car drove SIGN_CLEAR_M past it with forward runs that had none."""
+  def raw(s):
+    return RawFrame([], 'road', s.t, signs=SIGN_BOX if s.s < STAND_AT_M - behind_m else ())
+  plans = stood_at(raw, STOPPED_HANDBACK_S + 1.)
+  assert bool(unstick_spans(plans)) == (behind_m > SIGN_CLEAR_M), behind_m
+  assert plans[-1].controlPrompt == 'carStoppedTakeControl'
+
+
+@pytest.mark.parametrize('behind_m', [SIGN_CLEAR_M - 10., SIGN_CLEAR_M + 10.])
+def test_metres_driven_with_no_forward_run_never_clear_the_stop_sign_memory(behind_m):
+  """A stretch of road the car drove with no forward run for SIGN_RUN_FRESH_S (30 m, about 2.3 s: the detector down) can have
+  hidden a stop sign, so it counts as one seen there: a stand under SIGN_CLEAR_M past it gets no unstick lift, one past
+  SIGN_CLEAR_M of road the runs saw does; runs stopping while the car stands (here from the stand's start) change nothing."""
+  end = STAND_AT_M - behind_m
+  assert 30. / Sim(STRAIGHT).cruise > SIGN_RUN_FRESH_S
+  def raw(s):
+    return None if end - 30. <= s.s < end or s.v < STANDSTILL_SPEED else RawFrame([], 'road', s.t)
+  assert bool(unstick_spans(stood_at(raw))) == (behind_m > SIGN_CLEAR_M), behind_m
+
+
+@pytest.mark.parametrize('sign', [True, False])
+def test_a_stop_sign_passed_while_turnpilot_isnt_planning_is_remembered(sign):
+  """The stop-sign memory follows every frame, a disabled plan's too (no longitudinal control here, so update() isn't
+  reached): a box seen then, inside SIGN_CLEAR_M of the stand, still bars the unstick lift once TurnPilot plans again; with no
+  box the same drive gets it."""
+  def raw(s):
+    return RawFrame([], 'road', s.t, signs=SIGN_BOX if sign and s.s < STAND_AT_M - 30. else ())
+  plans = stood_at(raw, long_control=lambda s: s.s >= STAND_AT_M - 20.)
+  assert bool(unstick_spans(plans)) != sign, sign
+
+
+@pytest.mark.parametrize('at_m', [SIGN_CLEAR_M - 10., SIGN_CLEAR_M + 10.])
+def test_turnpilotds_start_counts_as_a_stop_sign_just_seen(at_m):
+  """turnpilotd started (a restart, say) with the car short of an unmapped stop sign it can no longer see: nothing seen of the
+  road behind, so the stop-sign memory starts as a box just seen, and a stand under SIGN_CLEAR_M from the start gets no unstick
+  lift; one past SIGN_CLEAR_M of road the runs saw does, on the wide camera's runs as on the road camera's."""
+  for camera in ('road', 'wide'):
+    plans = stood_at(sign_runs(False, camera), at_m=at_m)
+    assert bool(unstick_spans(plans)) == (at_m > SIGN_CLEAR_M), (at_m, camera)
+
+
+def test_the_stop_sign_memory_reads_every_forward_run_of_the_tick():
+  """watch_signs reads this tick's runs from the tracker (runs_now) beside the frame's raw run: a box on the wide camera's full
+  pass (key 'full') that came with a road run without one is seen; a box only on a far crop or a side view is not a forward
+  run's, and the frame's metres count as seen with the road run there."""
+  tp = TurnPilot()
+  road = RawFrame([], 'road', 0.)
+  for runs, seen in (([('full', 0., RawFrame([], 'wide', 0., signs=SIGN_BOX), None)], True),
+                     ([('road', 0., RawFrame([], 'road', 0., signs=SIGN_BOX), None)], True),
+                     ([('far', 0., RawFrame([], 'road', 0., 'far', signs=SIGN_BOX), None),
+                       ('sideLeft', 0., RawFrame([], 'wide', 0., 'sideLeft', signs=SIGN_BOX), None)], False)):
+    tp.runs_now, tp.sign_clear_m = runs, 2. * SIGN_CLEAR_M
+    tp.watch_signs(road, 10.)
+    assert tp.sign_clear_m == (0. if seen else 2. * SIGN_CLEAR_M + 10. * DT_MDL), runs
 
 
 def test_a_stand_in_a_turn_never_gets_the_unstick_lift():
