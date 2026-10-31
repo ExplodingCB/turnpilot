@@ -75,6 +75,7 @@ class FakeLights:
 
 class FakeModelState:
   frames = ['host0', 'host1']
+  chestnut = False  # the small model's device: no native pkl, so a native load is the far crop
 
 
 class PM:
@@ -97,6 +98,7 @@ def make_detector(cameras=None, det_time=0.005):
   det.paint_times = deque(maxlen=TIME_WINDOW)
   det.light_times = deque(maxlen=TIME_WINDOW)
   det.since_run, det.wide_until = RUN_EVERY, -1.0
+  det.bus = None  # __init__'s frame_bus, which the far crop's, the side views' and the native loads take
   return det
 
 

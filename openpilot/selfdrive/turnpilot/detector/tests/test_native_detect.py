@@ -75,11 +75,12 @@ def statuses(pm):
 
 class TestNativeDetect(OpenpilotTestCase):
   def test_param(self):
-    assert native_detect_mode(Params()) == 'off'  # unset: the default
+    assert native_detect_mode(Params()) == 'full'  # unset: the default, Kellen's ship call (35.7 ms step, under the 45 ms budget)
     assert native_detect_mode(Params('strip')) == 'strip' and native_detect_mode(Params(b'full')) == 'full'
     assert native_detect_mode(Params('full\n')) == 'full'
-    assert native_detect_mode(Params('off')) == native_detect_mode(Params('both')) == native_detect_mode(Params('')) == 'off'
-    assert native_detect_mode(Params(unknown=True)) == 'off'  # a build whose params predate the key
+    assert native_detect_mode(Params('off')) == native_detect_mode(Params(b'off\n')) == 'off'  # only off, set, is off
+    assert native_detect_mode(Params('both')) == native_detect_mode(Params('')) == 'full'
+    assert native_detect_mode(Params(unknown=True)) == 'full'  # a build whose params predate the key
 
   def test_the_strips_cover_the_frame(self):
     top, bottom = native_strips(W, H, 'full')
@@ -247,13 +248,13 @@ class TestNativeDetect(OpenpilotTestCase):
 
     class Model:
       chestnut = True
-    for mode, want in ((None, []), ('off', []), ('full', ['full']), ('strip', ['strip'])):
+    for mode, want in ((None, ['full']), ('off', []), ('full', ['full']), ('strip', ['strip'])):
       model, loaded = Model(), []
       load = FakeLoad({model})
       host = DetectorHost(FakeParams(True, native=mode), 1344, 760, False, True, [model], load_fn=load)
       host.load_fn = lambda m, *args, load=load, loaded=loaded: setattr(det := load(m, *args), 'load_native', loaded.append) or det
       host.step(FarPM(), model, 0.01, 0., 0, [Meta(0), Meta(1)], False)
-      assert loaded == want and host.native_mode == (mode or 'off')
+      assert loaded == want and host.native_mode == (mode or 'full')  # unset: the default
 
   def test_no_native_pkl_is_the_far_crop(self):
     class Model:

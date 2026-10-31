@@ -33,6 +33,7 @@ SATURDAY = {
   'TurnPilotCameraLights': ('STRING', 'shadow', 'shadow'),
   'TurnPilotCameraStopSigns': ('STRING', 'shadow', 'shadow'),
   'TurnPilotFarCrop': ('BOOL', '1', True),
+  'TurnPilotNativeDetect': ('STRING', 'full', 'full'),  # the whole frame natively in the far crop's slot (35.7 ms step)
   'TurnPilotLanePaintActive': ('BOOL', '1', True),
   'TurnPilotYellowDecel': ('FLOAT', '2.0', 2.),
   'TurnPilotStopLaunch': ('FLOAT', '0.5', 0.5),

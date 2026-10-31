@@ -49,11 +49,13 @@ def drive(det, pm, model_time=0.010):
 
 
 def golden_detector():
-  """The far crop detector of the golden drive (today's code paths only)."""
+  """The far crop detector of the golden drive (today's code paths only), TurnPilotNativeDetect off as DetectorHost sets it
+  from the param (unset is full now, NATIVE_DEFAULT)."""
   from openpilot.selfdrive.turnpilot.detector.tests.test_far_crop import far_detector
   from openpilot.selfdrive.turnpilot.detector.tests.test_modeld_detector import FakeLights, with_lights
   det = with_lights(far_detector())
   det.far.lights = FakeLights()
+  det.native_mode = 'off'
   return det
 
 

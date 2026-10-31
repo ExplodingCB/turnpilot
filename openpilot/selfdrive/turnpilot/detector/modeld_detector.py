@@ -38,8 +38,8 @@ for the drive, logged, said by every full pass message (farStatus disabled, whic
 the full pass's (its runs, its backoff) changes. Its class-9 boxes go to a light reader of its own, always in shadow.
 TurnPilotFarCrop off, or no far pkl, runs none (farStatus off).
 
-The native schedule (TurnPilotNativeDetect, NativeStrips; off by default, and then nothing here differs from the far crop
-alone): Kellen's whole camera frame at native resolution, in the far crop's slot. strip runs graph.NATIVE_SIZES' 1344x384
+The native schedule (TurnPilotNativeDetect, NativeStrips; full by default, Kellen's ship call; off and nothing here differs
+from the far crop alone): Kellen's whole camera frame at native resolution, in the far crop's slot. strip runs graph.NATIVE_SIZES' 1344x384
 full-width strip of the road frame with the horizon at FAR_HORIZON_ROW (graph.crop_at, so every bearing at once: the plan's
 aim moves nothing); full runs two 1344x512 strips, the frame's top (rows 0-511) and bottom (248-759), alternating, so the
 whole frame natively every 200 ms and the horizon band, in both, every 100 ms. Its runs are the far crop's message
@@ -157,7 +157,7 @@ FAR_CROP_DEFAULT = True    # TurnPilotFarCrop unset or unknown to this build
 # the native schedule (NativeStrips). Chestnut, 2026-10-31, beside the big model: the 1344x384 strip 10.73 ms median, a 1344x512
 # strip 12.02 ms (alone 8.29 and 9.06 ms); a median run over NATIVE_BUDGET_S sends it back to the far crop for the drive
 NATIVE_BUDGET_S = 0.015
-NATIVE_DEFAULT = 'off'     # TurnPilotNativeDetect unset, unknown to this build, or not one of NATIVE_MODES
+NATIVE_DEFAULT = 'full'    # TurnPilotNativeDetect unset, unknown to this build, or not one of NATIVE_MODES (35.7 ms step)
 # the stop sweep (SideViews). Chestnut, 2026-10-28, yolo26n on the 768x512 side view alone: 7.0 ms (the full pass 5.9 ms alone,
 # 7.9 ms beside the big model)
 SWEEPS = ('stopSweep', 'stopSweepGo')
@@ -220,12 +220,12 @@ def far_crop_on(params) -> bool:
 
 
 def native_detect_mode(params) -> str:
-  """TurnPilotNativeDetect: off (NATIVE_DEFAULT), strip or full; unset, unknown to this build's params (said) or anything
-  else is off."""
+  """TurnPilotNativeDetect: off, strip or full (NATIVE_DEFAULT); unset, unknown to this build's params (said) or anything
+  else is full. A load that can't serve it (no pkl, no strip for the camera, a failed run, an overrun) is the far crop."""
   try:
     value = params.get("TurnPilotNativeDetect")
   except UnknownKeyName:
-    cloudlog.error("turnpilot: TurnPilotNativeDetect unknown to this build's params, native schedule off; run scons")
+    cloudlog.error(f"turnpilot: TurnPilotNativeDetect unknown to this build's params, native schedule {NATIVE_DEFAULT}; run scons")
     return NATIVE_DEFAULT
   value = (value.decode() if isinstance(value, bytes) else value or '').strip()
   return value if value in NATIVE_MODES else NATIVE_DEFAULT
