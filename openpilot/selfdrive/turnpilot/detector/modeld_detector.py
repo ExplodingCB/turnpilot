@@ -12,7 +12,7 @@ while the full pass looks through the wide camera (a turn, a curve, their WIDE_H
 between reads it on that road frame, behind the far crop's boxes, where the step has room (read_odd_paint), and the next
 wide run's message carries it (lanePaintStatus read): the wrong-side guard's paint on a turn's approach and exit (PF-03).
 On comma's public comma four routes (lane_paint.py's, 37 turns), the guard's line was read on none of the moving approach,
-turn and exit steps before and on 29%, 13% and 37% of them so, with no wrong-side fire added in any; without lane_paint's
+turn and exit steps before and on 27%, 13% and 37% of them so, with no wrong-side fire added in any; without lane_paint's
 chromaticity test it added two, in a turn and an exit.
 It costs about 1.5-2 ms on a Mac and has its own budget: a read slower than PAINT_BUDGET_S (median) turns the paint off
 for the drive, loudly, and the detector, which the pedestrian holds need, keeps running.
