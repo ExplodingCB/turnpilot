@@ -1,6 +1,6 @@
 # Install TurnPilot on a comma four
 
-This guide takes a comma four with a chestnut eGPU from stock openpilot to a TurnPilot install that is ready for the first shadow-mode drive. It is written for Chase's car, a 2017 Model 3 with HW3. The drives are in [SHADOW_CHECKLIST.md](SHADOW_CHECKLIST.md).
+This guide takes a comma four with a chestnut eGPU from stock openpilot to a TurnPilot install that is ready to drive: TurnPilot on and live, with Saturday's params as its defaults. It is written for Chase's car, a 2017 Model 3 with HW3. The drives are in [SHADOW_CHECKLIST.md](SHADOW_CHECKLIST.md).
 
 Run every command on the comma from `/data/openpilot` over SSH, unless the step says it runs on your computer.
 
@@ -29,9 +29,11 @@ openpilot decides what a branch is from its name. `RELEASE_BRANCHES` in `openpil
 2. The branch has no `prebuilt` file, so the comma runs the build on every boot, and the first boot compiles openpilot from source, including the panda firmware. Later boots finish in seconds, until an update changes files. The panda build without `RELEASE=1` defines `ALLOW_DEBUG`, and the Tesla safety code only accepts longitudinal control in that build (`tesla.h`). The first boot reflashes the panda with the debug firmware.
 3. The comma shows "WARNING: This branch is not tested" at startup. That is expected.
 
-## Install from the Mac (private opendbc)
+## Install from the Mac (fallback)
 
-The installer path in "Install" below can't install this build. The build's `opendbc_repo` gitlink is a commit in the private repo `github.com/kaileh57/turnpilot-opendbc`, and the installer clones over unauthenticated https with its submodules, so the clone fails at opendbc. No credential goes on the comma or into the repo, so the fix is to build the tree on Kellen's Mac and copy it over SSH. Until opendbc is public, use this section in place of steps 2 to 5 of "Install". The comma fetches nothing from GitHub.
+The comma's own installer ("Install" below) is the install path. Every submodule in `.gitmodules` is public, `github.com/kaileh57/turnpilot-opendbc` included, so the installer's unauthenticated clone gets them all, and every git-lfs file the device reads is on the `.lfsconfig` server (comma's Hugging Face LFS repo). Use this section only when the installer can't be used, in place of steps 2 to 5 of "Install". It builds the tree on Kellen's Mac and copies it over SSH, and the comma fetches nothing from GitHub.
+
+With `--map-key` the script also writes the map server's API key from the Mac's `~/turnpilot_data/mapserver/client/key` into the comma's `TurnPilotMapKey`. `--map-key-only` writes only the key, onroad or off, and changes nothing else. The key travels over SSH's standard input, never on a command line, and the script never prints it. Without either flag it never opens the key file.
 
 `openpilot/tools/turnpilot/deploy_to_comma.py` does the whole job and prints each step. It runs with the Mac's `python3` and needs `git-lfs` on the Mac.
 
@@ -127,7 +129,9 @@ Do this at home on Wi-Fi, with the comma powered for the whole first boot. The c
 5. Wait for the install. The screen shows a percentage while the comma clones the branch and its submodules and pulls the big driving model from comma's Hugging Face LFS server.
 6. The comma restarts into the first boot. A progress bar shows the compile. This takes a while; nobody has timed it for this branch. Do not cut power. If the compile fails, the screen shows the compiler output.
 
-When the comma shows the road view, the install is done.
+When the comma shows the road view, the install is done. TurnPilot is on and live, with Saturday's params as its defaults; the map server's API key is the one thing left to enter, in the phone app's Map server section.
+
+What the installer gets was checked from a Mac on 2026-10-31 at 263065a: every one of the 253 git-lfs objects is on the `.lfsconfig` server; `github.com/kaileh57/openpilot.git` redirects to this repo; and a fresh depth-1 clone of the branch with its submodules from their public URLs, then `git lfs pull`, leaves no LFS pointer anywhere, every submodule at its gitlink. A Mac can't check that AGNOS's git runs git-lfs's smudge filter during the installer's clone (stock openpilot's own LFS files rely on it too), that `/data` has room for the 776 MB big model and git-lfs's second copy of it, or how long the first compile takes.
 
 ## Turn on SSH
 
@@ -153,22 +157,24 @@ The `car` line shows `tesla TESLA_MODEL_3` once the comma has identified the car
 
 ## Set the toggles
 
+In this fork the toggles below are on by default, along with `TurnPilotEnabled` and the rest of Saturday's params, so a fresh install needs none of this section: the manager writes each param's default at boot when it is unset, and uninstalling openpilot clears every param. A device that kept its params from an earlier install keeps the values it had; turn them on there.
+
 On the comma screen, in **Settings > Developer**:
 
 - Turn on **alpha longitudinal** and confirm. The comma cycles its driving processes to apply it. Without it, openpilot does not control speed on the Tesla, and TurnPilot's stops and speed caps do nothing.
 - Turn on **navigation (alpha)**. This is the `NavigationEnabled` param. It starts navd, which routes, and mapsd, which draws the map.
 - Turn on **Disengage on accelerator pedal**. This is the `DisengageOnAccelerator` param. Any gas press must disengage, because TurnPilot never takes a gas press as its go. A device that had this toggle off for an earlier TurnPilot keeps it off until you turn it on, and while it is off TurnPilot shows "TurnPilot Unavailable: turn on Disengage on accelerator pedal" and does nothing. Preflight's `gas disengages` line fails while it is off.
 
-Over SSH, turn on TurnPilot in shadow mode. The stock params tool can't write boolean params, so use preflight:
+TurnPilot is on and live by default. For a drive in shadow mode, set it over SSH. The stock params tool can't write boolean params, so use preflight:
 
 ```
-python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotEnabled=1 --set TurnPilotShadowMode=1
+python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotShadowMode=1
 ```
 
 | Param | Value | What it does |
 | --- | --- | --- |
 | `TurnPilotEnabled` | 1 | Starts `turnpilot_web` (the phone app) within a few seconds, makes `turnpilotd` produce a plan, and makes modeld load the detector the next time the car turns on. |
-| `TurnPilotShadowMode` | 1 | TurnPilot computes the plan and publishes it marked as shadow. modeld and the planner ignore it, so the car drives as stock openpilot. Set it to 0 only from the second rung of the car ladder. |
+| `TurnPilotShadowMode` | 0 | 1: TurnPilot computes the plan and publishes it marked as shadow. modeld and the planner ignore it, so the car drives as stock openpilot. 0, the default: live. |
 | `TurnPilotMapHost` | `https://<ip>` | TurnPilot's map server. Set it in the phone app's Map server section. |
 | `TurnPilotMapKey` | the API key | Sent as a Bearer token. Set it in the phone app, which never shows it again (only its last 4 characters). |
 | `TurnPilotMapCert` | PEM | The server's self-signed certificate. Every request is verified against it. |
@@ -199,15 +205,17 @@ In the BeamNG sim the car signals by default: `launch_openpilot.sh` and `run_bri
 
 ## Let the car go by itself at stop signs
 
-By default (`auto`) every stop sign and yield hands back after a 1 s full stop: `auto` acts only on a camera fit and a junction survey, and neither exists for this car yet. `vision` makes the car go by itself from what the cameras see live. It stops fully at the line, looks for 2.5 s with every view fresh and nothing in a conflicting lane, chimes "Going", and goes. Where a cross road is over 25 mph, or its speed isn't known, it looks for 4 s and says "Look both ways" first, so check both ways yourself. If you brake or press the gas at the line and then re-engage, it still says "Going" (or "Look both ways") for 1 s before it goes, never going the moment you re-engage. It hands back after 1 s, saying why, at night, at dusk, in low sun, with the sun ahead, with the side cameras off, without the stop-sign map data, and at a divided road, a roundabout or a rail crossing.
+By default (`vision`) the car goes by itself from what the cameras see live. (`auto` acts only on a camera fit and a junction survey, neither of which exists for this car yet, so under `auto` every stop sign and yield hands back after a 1 s full stop.) Under `vision` the car stops fully at the line, looks for 2.5 s with every view fresh and nothing in a conflicting lane, chimes "Going", and goes. Where a cross road is over 25 mph, or its speed isn't known, it looks for 4 s and says "Look both ways" first, so check both ways yourself. If you brake or press the gas at the line and then re-engage, it still says "Going" (or "Look both ways") for 1 s before it goes, never going the moment you re-engage. It hands back after 1 s, saying why, at night, at dusk, in low sun, with the sun ahead, with the side cameras off, without the stop-sign map data, and at a divided road, a roundabout or a rail crossing.
+
+To have every stop sign and yield hand back instead (Saturday's fallback when preflight's `stop-sign go` line warns):
 
 ```
-python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotStopSignGo=vision
+python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotStopSignGo=off
 ```
 
 | Param | Value | What it does |
 | --- | --- | --- |
-| `TurnPilotStopSignGo` | `auto` | `off` and `shadow`: every stop sign and yield hands back after 1 s. `auto` and `trial`: the go only at a surveyed, validated junction with the camera fit, so on this car they act as `shadow`. `vision`: the go from the live cameras (above). Any other value acts as `shadow`, logged. Read every second. |
+| `TurnPilotStopSignGo` | `vision` | `off` and `shadow`: every stop sign and yield hands back after 1 s. `auto` and `trial`: the go only at a surveyed, validated junction with the camera fit, so on this car they act as `shadow`. `vision`: the go from the live cameras (above). Any other value acts as `shadow`, logged. Read every second. |
 | `TurnPilotAvoidStops` | 1 | navd routes around the stops and yields TurnPilot can't take. Under `vision` it keeps every one vision can take on the route, and avoids the rest (the ones it would hand back). Off, every stop stays on the route and the ones vision can't take hand back at the line. |
 
 ## Install Valhalla for offline routing
@@ -252,16 +260,16 @@ The page shows the route, the next maneuver, and TurnPilot's state. To start nav
 
 ## Let TurnPilot drive on where it is unsure
 
-`TurnPilotAlwaysDrive` is the always-drive switch. Off, the default, TurnPilot hands back, skips or waits wherever it is unsure. On, it drives on in those places, and hands back, loudly, only where it made a mistake. It does nothing in shadow mode. The ALWAYS_DRIVE plan's steps S2 to S5 add what it changes; on a build without them the switch is read and printed and changes nothing. Set it parked, with the no-move limit Saturday uses:
+`TurnPilotAlwaysDrive` is the always-drive switch. On, the default, TurnPilot drives on where it is only unsure, and hands back, loudly, only where it made a mistake. Off, it hands back, skips or waits wherever it is unsure. It does nothing in shadow mode. Its default comes with the no-move limit Saturday uses, 20 s. To turn it off, parked:
 
 ```
-python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotAlwaysDrive=1 --set TurnPilotNoMoveS=20
+python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotAlwaysDrive=0 --set TurnPilotNoMoveS=2
 ```
 
 | Param | Value | What it does |
 | --- | --- | --- |
-| `TurnPilotAlwaysDrive` | 0 | 1: always drive (above). turnpilotd reads it every second, and navd reads it each time it routes. |
-| `TurnPilotNoMoveS` | 2 | Seconds a turn TurnPilot let go of at a standstill waits for the car to pull away before "Can't start the turn: take control", 2 to 20. An unprotected left's 1 s is fixed. Read every second. |
+| `TurnPilotAlwaysDrive` | 1 | 1: always drive (above). turnpilotd reads it every second, and navd reads it each time it routes. |
+| `TurnPilotNoMoveS` | 20 | Seconds a turn TurnPilot let go of at a standstill waits for the car to pull away before "Can't start the turn: take control", 2 to 20. An unprotected left's 1 s is fixed. Read every second. |
 
 The switch doesn't set or change `TurnPilotStopSignGo`. The car goes by itself at stop signs and yields only with `TurnPilotStopSignGo=vision`, which you set on its own (see "Let the car go by itself at stop signs"). With the switch on, every stop-sign mode, `vision` included, stops, waits, goes and hands back exactly as it does with the switch off, and navd keeps and avoids the same stops.
 
@@ -290,7 +298,7 @@ Each line starts with PASS, FAIL, WARN or INFO. A FAIL line is followed by a `fi
 | `chestnut` | The chestnut is present with its firmware and a USB 3 link |
 | `web token`, `pairing URL`, `web server` | The token exists, the comma has a network address, and `turnpilot_web` answers on port 8088 |
 
-`shadow mode` and `route source` are INFO lines. `route source` warns when `TurnPilotValhallaTiles` is set, since the car should use the map server.
+`shadow mode` and `route source` are INFO lines. `shadow mode` warns when it is on, since TurnPilot then drives nothing. `route source` warns when `TurnPilotValhallaTiles` is set, since the car should use the map server.
 
 ## Update
 
@@ -300,13 +308,13 @@ The comma pulls from the `turnpilot` branch of `github.com/kaileh57/openpilot`, 
 2. Open **Settings > Software** and tap **check for update**. If it offers **download update**, tap that. When the download finishes, **install now** appears (the car must be off). The comma restarts and recompiles, which takes several minutes.
 3. Run preflight.
 
-The updater applies a downloaded update at the next boot, and the comma boots every time the car wakes. On a test day, stop surprise updates with:
+This fork sets `DisableUpdates` to 1 by default, so no update lands on a test day, and **check for update** finds nothing until you turn updates back on:
 
 ```
-python3 -m openpilot.selfdrive.turnpilot.preflight --set DisableUpdates=1
+python3 -m openpilot.selfdrive.turnpilot.preflight --set DisableUpdates=0
 ```
 
-Set it to 0 when you want to update. The files in `/data/turnpilot` (pyvalhalla and the maps) stay through updates, but not through an uninstall.
+The updater applies a downloaded update at the next boot, and the comma boots every time the car wakes. Set it back to 1 afterwards. The files in `/data/turnpilot` (pyvalhalla and the maps) stay through updates, but not through an uninstall.
 
 ## When something fails
 
