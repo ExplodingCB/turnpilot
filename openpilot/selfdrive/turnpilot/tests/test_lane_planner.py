@@ -1281,12 +1281,13 @@ def assert_blocked_at_the_end(drive, frames):
 TWO_LANE_RIGHT = maneuver("turn", "right", TWO_LANES_RIGHT_TURN)
 
 
-def test_a_change_the_lane_list_still_wants_at_the_windows_end_is_blocked_for_any_reason_but_no_lane():
+@pytest.mark.parametrize("always_drive", [False, True])
+def test_a_change_the_lane_list_still_wants_at_the_windows_end_is_blocked_for_any_reason_but_no_lane(always_drive):
   """LC-03 (ALWAYS_DRIVE.md 4.11, unconditional): the map's lane list places the car in a lane the right turn doesn't leave
   from, and the change it needs hasn't gone by the window's end, whatever held it: the turn is skipped and rerouted
   (turnpilotd, skipReason laneBlocked), never pulsed from that lane. Each reason here: a car in the blind spot, a car in the
   target lane, too slow for DesireHelper (never offered), no signal from the driver, DesireHelper waiting too long, the
-  lane parked, the line solid."""
+  lane parked, the line solid. With TurnPilotAlwaysDrive off as well as on (step S4)."""
   beside = scene([{'cls': 'car', 'x': -3., 'y': -3.6, 'vx': 15.}]).objects
   parked = scene([{'cls': 'car', 'x': 50., 'y': -3.6, 'vx': 0.}]).objects
   cases = {
@@ -1298,12 +1299,14 @@ def test_a_change_the_lane_list_still_wants_at_the_windows_end_is_blocked_for_an
     'lineNotBroken': (Drive(0, 1, paint=lambda left, right: paint(right=SW)), {}),
   }
   for why, (drive, kw) in cases.items():
+    drive.lp.always_drive = always_drive
     frames = through_the_window(drive, TWO_LANE_RIGHT, lane_change_window(drive.v)[0] + 30., **kw)
     assert not drive.requests or why == 'noSignal', why
     assert drive.lp.changes == 0, why
     assert_blocked_at_the_end(drive, frames)
   # DesireHelper never starting the change it was asked for (timedOut), on the planner alone
   lp = LanePlanner()
+  lp.always_drive = always_drive
   args = {'lanes': model_lanes(*road(0, 1)), 'v_ego': 15., 'left_blinker': False, 'right_blinker': False, 'objects': (),
           'driver_signals': False, 'right_hand_traffic': True, 'dt': DT_MDL, 'paint': paint(right=BW)}
   distance, decisions = 320., []
@@ -1325,21 +1328,26 @@ def test_no_lane_that_way_is_never_blocked():
   assert not any(x.blocked for _, x in frames)
 
 
-def test_without_a_lane_list_the_car_is_placed_only_by_a_travel_lane_seen_that_way():
+@pytest.mark.parametrize("always_drive", [False, True])
+def test_without_a_lane_list_the_car_is_placed_only_by_a_travel_lane_seen_that_way(always_drive):
   """No lane list: the car is placed in a lane the turn doesn't leave from only by a frame of the window on which the model
   read the lane that way and change_blocker found it a travel lane. A curb lane before a right (solid white beyond, or no
-  lane), a bike lane behind solid white or a parked strip never places it: the turn goes as today."""
+  lane), a bike lane behind solid white or a parked strip never places it: the turn goes as today. With TurnPilotAlwaysDrive
+  off as well as on (step S4: 4.10's less than paint is never solid white)."""
+  def made(drive):
+    drive.lp.always_drive = always_drive
+    return drive
   m = maneuver("turn", "right")
   start = lane_change_window(15.)[0] + 30.
-  drive = Drive(0, 1)
+  drive = made(Drive(0, 1))
   frames = through_the_window(drive, m, start, blindspot=LaneChange.right)
   assert not drive.offers and {x.wait for d, x in frames if 100. < d < 280.} == {'blindspot'}
   assert_blocked_at_the_end(drive, frames)
-  drive = Drive(0, 1, v=7.)  # too slow, a travel lane read that way: never offered, blocked
+  drive = made(Drive(0, 1, v=7.))  # too slow, a travel lane read that way: never offered, blocked
   assert_blocked_at_the_end(drive, through_the_window(drive, m, lane_change_window(7.)[0] + 20.))
-  for drive, kw in ((Drive(0, 0), {}),  # the curb lane: solid white beyond it
-                    (Drive(0, 1, paint=lambda left, right: paint(right=SW)), {}),  # a bike lane behind solid white
-                    (Drive(0, 1), {'objects': scene([{'cls': 'car', 'x': 50., 'y': -3.6, 'vx': 0.}]).objects})):  # a parked strip
+  for drive, kw in ((made(Drive(0, 0)), {}),  # the curb lane: solid white beyond it
+                    (made(Drive(0, 1, paint=lambda left, right: paint(right=SW))), {}),  # a bike lane behind solid white
+                    (made(Drive(0, 1)), {'objects': scene([{'cls': 'car', 'x': 50., 'y': -3.6, 'vx': 0.}]).objects})):  # a parked strip
     frames = through_the_window(drive, m, start, **kw)
     assert not any(x.blocked for _, x in frames), {x.wait for _, x in frames}
 
