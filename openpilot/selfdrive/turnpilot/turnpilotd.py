@@ -192,7 +192,7 @@ from openpilot.selfdrive.turnpilot.lane_planner import (SAMPLE_IDX, LanePlanner,
 from openpilot.selfdrive.turnpilot.route_follower import (KEEP, LEFT, RIGHT, SAME_TURN_M, TURN, UNCERTAIN_M, Maneuver, RouteFollower,
                                                            same_junction, turn_angle)
 from openpilot.selfdrive.turnpilot.route_notice import RouteNotices
-from openpilot.selfdrive.turnpilot.scene.lane_paint import lane_paint_from_msg
+from openpilot.selfdrive.turnpilot.scene.lane_paint import LINE_PROB_MIN as PAINT_LINE_PROB_MIN, UNKNOWN as UNKNOWN_PAINT, lane_paint_from_msg
 from openpilot.selfdrive.turnpilot.scene.tracker import (MAX_COAST_S, STALE_S, SWEEP_COAST_S, RawFrame, SceneTracker, default_yaw_rate,
                                                           predicted_path)
 from openpilot.selfdrive.turnpilot.scene.tracker_b import TrackerB
@@ -363,6 +363,13 @@ WRONG_SIDE_BEYOND_M = 1.
 WRONG_SIDE_EDGE_STD_MAX = 2.  # an edge the model sees at all (the demo route's right edge 0.7-0.8; none there reads 20-60)
 WRONG_SIDE_GAP_S = 1.  # no read this long and the count starts over
 WRONG_SIDE_REASON = "Wrong side of the road: take control"
+# a yellow read on a line the model gives under the reader's LINE_PROB_MIN (scene/lane_paint.py COLOR_PROB_MIN: yellow only,
+# kind unknown) counts only with the car in the road's leftmost lane, the left road edge seen (std under
+# WRONG_SIDE_EDGE_STD_MAX) no more than this past the car's left line; otherwise it is no read. The Saturday re-run's
+# route_demo held the oncoming lane 110 m with its left edge 0.3-0.85 m past that line; on comma's public comma four
+# route 79d0f04c82980004/00000003 (California, on its own side) segment 4 read such a line yellow 0.6-1.0 for 4 s at 5-9 m/s
+# with the left edge 4-7 m past the left line
+WRONG_SIDE_UNSURE_EDGE_M = 1.5
 # an off-route turn is a mess-up said loudly (SAT_VALIDATION row 1, route_demo: the route went straight on, TurnPilot sent no
 # desire, and the model turned right on its own, 6.6 m into the oncoming lane with every paint read unknown, into a roadside
 # object; the follower dead-reckons, so the turn read as on route). Engaged, moving, with a route: the car's heading changing
@@ -553,16 +560,29 @@ def yellow_on_the_right(paint, line_ys, line_probs, edge_ys, edge_stds) -> tuple
   from the lane paint of modelV2's four lines and the lines' and road edges' y (positive right), probs and stds at one
   distance ahead (WRONG_SIDE_*). The ego right line, or the next one out where the ego line reads unpainted (kind none).
   Not with the car's left line yellow too (a two-way left-turn lane), nor without a road edge seen WRONG_SIDE_BEYOND_M
-  beyond it (a yellow kerb has no road past it). Unknown paint, or fewer than four lines, is no read."""
+  beyond it (a yellow kerb has no road past it). Unknown paint, or fewer than four lines, is no read; so is a line the
+  model is unsure of (under the reader's LINE_PROB_MIN) unless the left road edge is within WRONG_SIDE_UNSURE_EDGE_M."""
   if len(paint) != 4 or len(line_ys) != 4 or len(edge_ys) != 2:
     return False, False
   i = 3 if paint[2].kind == 'none' else 2
   p = paint[i]
   if p.color == 'unknown':
     return False, False
+  if p.kind == 'unknown' and len(line_probs) == 4 and line_probs[i] < PAINT_LINE_PROB_MIN and \
+     not (edge_stds[0] < WRONG_SIDE_EDGE_STD_MAX and line_ys[1] - edge_ys[0] <= WRONG_SIDE_UNSURE_EDGE_M):
+    return False, False  # an unsure line's yellow, the car not in the leftmost lane (WRONG_SIDE_UNSURE_EDGE_M)
   yellow = p.color == 'yellow' and p.confidence >= WRONG_SIDE_CONF and not (i == 2 and paint[1].color == 'yellow') and \
     edge_stds[1] < WRONG_SIDE_EDGE_STD_MAX and edge_ys[1] - line_ys[i] >= WRONG_SIDE_BEYOND_M
   return yellow, True
+
+
+def sure_paint(paint, line_probs) -> tuple:
+  """paint with the yellow read on each line the model gives under the reader's LINE_PROB_MIN (kind unknown, COLOR_PROB_MIN)
+  taken out: the lane planner's paint. Empty paint, or probs not four, as given."""
+  if len(paint) != 4 or len(line_probs) != 4:
+    return tuple(paint)
+  return tuple(UNKNOWN_PAINT if p.kind == 'unknown' and p.color == 'yellow' and q < PAINT_LINE_PROB_MIN else p
+               for p, q in zip(paint, line_probs, strict=True))
 
 
 def model_lines_at(model):
@@ -1229,6 +1249,8 @@ class TurnPilot:
     lanes = model_lanes_from_msg(model)
     # a keep goes only where it may (lane_planner.keep_blocker: a lane line that way, and toward the far side a lane of ours
     # beyond it, no yellow line read there now or held); one that can't go by keep_last is said
+    # the lane planner plans on the paint of lines the model is sure of: an unsure line's yellow is the wrong-side guard's alone
+    wrong_side_paint, paint = paint, sure_paint(paint, model.laneLineProbs)
     keep_paint = self.lanes.yellow.apply(paint)
     keep_why = {side: keep_blocker(lanes, side, right_hand_traffic, keep_paint) for side in (LEFT, RIGHT)}
     # the stop-sign ladder's other turn (stop_go: 7.1 rung 2, O12) decides this junction: its synthesized turn is the desire
@@ -1512,7 +1534,7 @@ class TurnPilot:
     abandoned = self.turn_abandoned(sm, cs, v_ego, acting)
     if self.straight_cleared:  # R8b's fire: the turn's desire out of the model's queue from this very plan on
       plan.desire = self.last_desire = CLEAR_DESIRE
-    wrong_side = self.wrong_side(sm, cs, v_ego, acting, paint, right_hand_traffic)
+    wrong_side = self.wrong_side(sm, cs, v_ego, acting, wrong_side_paint, right_hand_traffic)
     person_front = self.scene.person_front
     off_route = self.off_route_turn(sm, cs, v_ego, acting, rf, upcoming, default_yaw_rate(cs, model))
     if self.person_front_handback(acting, person_front):  # WF-13: held by it PERSON_FRONT_MAX_S, nobody seen leaving

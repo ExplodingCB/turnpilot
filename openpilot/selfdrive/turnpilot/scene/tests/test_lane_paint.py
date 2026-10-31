@@ -413,6 +413,56 @@ def test_the_centre_line_under_a_line_the_model_is_unsure_of_reads_yellow_and_th
   fired = wrong_side_rows([(t, v, True, [(q.kind, q.color, q.confidence) for q in p], ys, probs, eys, stds)
                            for (t, v, ys, probs, eys, stds), p in zip(rows, paint, strict=True)])
   assert fired and fired[0] <= rows[0][0] + 2., fired
+  # the planner never plans on an unsure line's yellow: the guard's alone
+  from openpilot.selfdrive.turnpilot.turnpilotd import sure_paint
+  assert all(sure_paint(p, r[3])[2] == UNKNOWN for p, r in zip(paint, rows, strict=True))
+
+
+# comma's public comma four route 79d0f04c82980004/00000003--fb0b5d9cfc (California), segment 4, 50.2-54.0 s, the car on
+# its own side at 5-9 m/s: its right line at 0.2-0.37 read yellow 0.6-1.0 (the reader at COLOR_PROB_MIN), the left road
+# edge 5.5-8.5 m out past a solid white left line. The reads every 0.2 s: (t, v, paint conf, line ys, probs, edge ys, stds)
+TESLA_4_OWN_SIDE = (
+  (50.2, 5.1, 0.62, (-4.21, -1.15, 1.88, 4.59), (0.22, 0.74, 0.37, 0.1), (-6.97, 6.23), (1.72, 1.13)),
+  (50.4, 5.3, 0.61, (-4.25, -1.15, 1.97, 4.24), (0.22, 0.72, 0.27, 0.04), (-7.28, 5.56), (1.6, 1.02)),
+  (50.6, 5.5, 0.63, (-4.15, -1.17, 1.92, 4.57), (0.19, 0.65, 0.32, 0.07), (-7.15, 5.97), (1.75, 1.15)),
+  (50.8, 5.8, 0.67, (-4.34, -1.2, 1.88, 4.44), (0.21, 0.66, 0.39, 0.08), (-7.54, 5.85), (1.71, 1.14)),
+  (51.0, 6.0, 0.65, (-4.21, -1.17, 1.92, 4.36), (0.2, 0.61, 0.35, 0.07), (-7.16, 5.63), (1.69, 1.13)),
+  (51.2, 6.3, 0.68, (-4.08, -1.19, 1.82, 4.08), (0.19, 0.54, 0.33, 0.05), (-7.39, 5.27), (1.62, 1.12)),
+  (51.4, 6.5, 0.7, (-4.21, -1.18, 1.81, 4.5), (0.18, 0.52, 0.29, 0.07), (-7.2, 5.79), (1.75, 1.11)),
+  (51.6, 6.8, 0.81, (-4.23, -1.21, 1.87, 4.52), (0.15, 0.44, 0.24, 0.04), (-7.5, 5.61), (1.75, 1.09)),
+  (51.8, 7.1, 0.85, (-4.37, -1.26, 1.77, 4.44), (0.17, 0.52, 0.28, 0.05), (-7.82, 5.79), (1.85, 1.17)),
+  (52.0, 7.3, 0.81, (-4.47, -1.33, 1.8, 4.74), (0.13, 0.47, 0.23, 0.05), (-7.09, 6.0), (1.77, 1.18)),
+  (52.2, 7.5, 0.64, (-4.38, -1.33, 1.71, 4.59), (0.11, 0.39, 0.25, 0.04), (-7.47, 6.03), (1.69, 1.18)),
+  (52.4, 7.8, 1.0, (-4.25, -1.34, 1.71, 4.57), (0.11, 0.35, 0.23, 0.04), (-6.9, 6.02), (1.73, 1.26)),
+  (52.6, 7.9, 1.0, (-4.29, -1.35, 1.73, 4.25), (0.14, 0.38, 0.2, 0.03), (-7.12, 5.53), (1.68, 1.34)),
+  (52.8, 8.1, 1.0, (-4.44, -1.55, 1.6, 4.23), (0.08, 0.36, 0.24, 0.04), (-6.6, 5.9), (1.89, 1.42)),
+  (53.0, 8.4, 1.0, (-4.35, -1.58, 1.81, 4.05), (0.09, 0.35, 0.21, 0.03), (-6.71, 5.87), (1.62, 1.25)),
+  (53.2, 8.6, 1.0, (-4.44, -1.67, 1.68, 4.07), (0.08, 0.37, 0.22, 0.03), (-6.77, 5.88), (1.79, 1.25)),
+  (53.4, 8.8, 1.0, (-4.21, -1.61, 1.65, 3.79), (0.05, 0.27, 0.2, 0.02), (-6.27, 5.59), (1.66, 1.19)),
+  (53.6, 9.0, 1.0, (-4.06, -1.54, 1.64, 3.7), (0.08, 0.36, 0.22, 0.03), (-5.8, 5.54), (1.47, 1.2)),
+  (53.8, 9.2, 1.0, (-4.19, -1.63, 1.48, 3.85), (0.05, 0.24, 0.19, 0.03), (-6.08, 5.76), (1.64, 1.34)),
+  (54.0, 9.4, 1.0, (-3.89, -1.48, 1.51, 3.78), (0.08, 0.3, 0.24, 0.04), (-5.54, 5.86), (1.58, 1.24)),
+)
+
+
+def test_an_unsure_lines_yellow_with_the_left_road_edge_far_is_no_wrong_side():
+  """The reader's unsure yellow alone is not enough for the wrong-side handback: on comma's California route the car on
+  its own side read its unsure right line yellow for 4 s, the left road edge 5.5-8.5 m out, and nothing may fire. The same
+  reads with the left road edge where R8's was (0.3-0.85 m past the left line: the leftmost lane) do fire."""
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import wrong_side_rows
+  from openpilot.selfdrive.turnpilot.turnpilotd import WRONG_SIDE_UNSURE_EDGE_M
+  def rows(left_edge_past=None):
+    out = []
+    for t, v, conf, ys, probs, eys, stds in TESLA_4_OWN_SIDE:
+      eys = eys if left_edge_past is None else (ys[1] - left_edge_past, eys[1])
+      for dt in (0., 0.1):  # the reader's 10 Hz
+        out.append((t + dt, v, True, [('unknown', 'unknown', 0.), ('solid', 'white', 0.9), ('unknown', 'yellow', conf),
+                                      ('unknown', 'unknown', 0.)], ys, probs, eys, stds))
+    return out
+  assert wrong_side_rows(rows()) == []
+  assert wrong_side_rows(rows(left_edge_past=WRONG_SIDE_UNSURE_EDGE_M + 0.5)) == []
+  fired = wrong_side_rows(rows(left_edge_past=0.85))
+  assert fired and fired[0] <= TESLA_4_OWN_SIDE[0][0] + 1.5, fired
 
 
 def test_a_line_the_model_is_unsure_of_reads_only_yellow():
