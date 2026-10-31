@@ -322,13 +322,17 @@ def test_main_writes_nothing_when_it_refuses(tmp_path, monkeypatch):
   assert list(out.parent.iterdir()) == []
 
 
-def test_main_end_to_end_on_synthetic_logs_writes_the_three_files(tmp_path, monkeypatch, capsys):
-  """run()'s orchestration with the I/O replaced: S1's logs and detections, the drive's frames and their luma."""
-  lens = true_lens()
-  dw = dwells_for(lens, 0.15)
-  dets = [(d.t0 + 0.25 * i, d.view, d.u, d.v, 0.8) for d in dw for i in range(int((d.t1 - d.t0) / 0.25) + 1)]
+def s1_dets() -> list[tuple]:
+  """S1's person detections for the true lens: each dwell's feet point at 4 Hz."""
+  dw = dwells_for(true_lens(), 0.15)
+  return [(d.t0 + 0.25 * i, d.view, d.u, d.v, 0.8) for d in dw for i in range(int((d.t1 - d.t0) / 0.25) + 1)]
+
+
+def fake_run(tmp_path, monkeypatch, drive, detect) -> list[str]:
+  """camera_fit's arguments, but --out, for a run with its I/O replaced: S1 parked and calibrated at CAL, the drive's
+  frames from drive(), both recordings' luma (a dark static strip down the drive's left edge) and the detection by detect."""
   s1_seg, drive_seg = tmp_path / 's1' / 'r--0', tmp_path / 'drive' / 'r--1'
-  monkeypatch.setattr(cf, 'segments', lambda paths: [s1_seg] if any('s1' in p for p in paths) else [drive_seg])
+  monkeypatch.setattr(cf, 'segments', lambda paths: [s1_seg] if paths == [str(s1_seg.parent)] else [drive_seg])
 
   def read(p):
     lg = cf.SegmentLog(p, 'mici', 'os04c10', (W, H))
@@ -336,9 +340,9 @@ def test_main_end_to_end_on_synthetic_logs_writes_the_three_files(tmp_path, monk
       lg.car, lg.cal = list(S1_CAR), list(S1_CAL)
     return lg
   monkeypatch.setattr(cf, 'read_segment', read)
-  monkeypatch.setattr(cf, 'detect', lambda paths, logs, cal: dets)
+  monkeypatch.setattr(cf, 'detect', detect)
   parked = [cf.FrameMeta(t=i * 0.5, v=0., heading=None, sun_el=30., exposure=5., calibrated=True, calib=CAL) for i in range(60)]
-  monkeypatch.setattr(cf, 'frame_metas', lambda lg, i, step: drive_frames() if lg.path == drive_seg else parked)
+  monkeypatch.setattr(cf, 'frame_metas', lambda lg, i, step: drive() if lg.path == drive_seg else parked)
   rng = np.random.default_rng(4)
 
   def accumulate(paths, groups, step):
@@ -353,12 +357,19 @@ def test_main_end_to_end_on_synthetic_logs_writes_the_three_files(tmp_path, monk
       accs[k] = acc
     return accs
   monkeypatch.setattr(cf, 'accumulate', accumulate)
-  tape, marks, out = tmp_path / 'tape.json', tmp_path / 'marks.json', tmp_path / 'out' / 'visibility.json'
-  out.parent.mkdir()
+  tape, marks = tmp_path / 'tape.json', tmp_path / 'marks.json'
   tape.write_text(json.dumps({'cameraSetbackM': TAPE.setback, 'lateralOffsetM': TAPE.lateral, 'heightM': TAPE.height, 'date': TAPE.date}))
   marks.write_text(json.dumps({'rangeM': 10, 'marks': [{'side': m.side, 'bearingDeg': m.bearing} for m in ORDER]}))
-  assert cf.main(['--tape', str(tape), '--marks', str(marks), '--s1', str(tmp_path / 's1'), '--drive', str(tmp_path / 'drive'),
-                  '--out', str(out)]) == 0
+  return ['--tape', str(tape), '--marks', str(marks), '--s1', str(s1_seg.parent), '--drive', str(drive_seg.parent)]
+
+
+def test_main_end_to_end_on_synthetic_logs_writes_the_three_files(tmp_path, monkeypatch, capsys):
+  """run()'s orchestration with the I/O replaced: S1's logs and detections, the drive's frames and their luma."""
+  dets = s1_dets()
+  args = fake_run(tmp_path, monkeypatch, drive_frames, lambda paths, logs, cal: dets)
+  out = tmp_path / 'out' / 'visibility.json'
+  out.parent.mkdir()
+  assert cf.main(args + ['--out', str(out)]) == 0
   assert sorted(p.name for p in out.parent.iterdir()) == ['visibility.json', 'visibility.provenance.json', 'visibility.report.txt']
   got = json.loads(out.read_text())
   v = vt.load(out)
@@ -369,3 +380,30 @@ def test_main_end_to_end_on_synthetic_logs_writes_the_three_files(tmp_path, monk
   assert 70 in left and not any(b in left for b in range(80, 90))  # the strip masks the left edge
   assert max(b for b, _, _ in got['mask']['right']) <= got['lens']['edgeDeg']['right'] - sr.EDGE_MARGIN_DEG
   assert 'camera measurements ready' in capsys.readouterr().out
+
+
+def test_a_later_drive_day_refits_from_the_saved_detections_and_refuses_a_moved_calibration(tmp_path, monkeypatch, capsys):
+  """STOPS_STEPS.md step N2: Saturday's fit goes on the comma only on a later drive day, after camera_fit runs again with
+  Saturday's S1 recording and its saved detections (no YOLO) against that day's drive. Every calibrated frame of it within
+  CALIB_MOVE_DEG (0.3 deg) of S1's calibration passes; one that far refuses and writes nothing, because a re-mounted comma
+  or a moved calibration voids Saturday's lens and mask."""
+  moved = {'deg': 0.31}
+
+  def later_day():
+    cal = cf.Calib((CAL.rpy[0], CAL.rpy[1] + math.radians(moved['deg']), CAL.rpy[2]), CAL.euler)
+    return [cf.FrameMeta(**{**f.__dict__, 'calib': cal}) for f in drive_frames()]
+
+  def no_detection(paths, logs, cal):
+    raise AssertionError('--detections runs no detection')
+  args = fake_run(tmp_path, monkeypatch, later_day, no_detection)
+  saved = tmp_path / 'detections.json'
+  saved.write_text(json.dumps({'tool': 'camera_fit.py', 'segments': [str(tmp_path / 's1' / 'r--0')], 'dets': s1_dets()}))
+  out = tmp_path / 'out' / 'recheck.json'
+  out.parent.mkdir()
+  assert cf.main(args + ['--detections', str(saved), '--out', str(out)]) == 1
+  assert 'refused: the calibration moved 0.31 deg between S1 and the drive' in capsys.readouterr().err
+  assert list(out.parent.iterdir()) == []
+  moved['deg'] = 0.29
+  assert cf.main(args + ['--detections', str(saved), '--out', str(out)]) == 0
+  assert 'camera measurements ready' in capsys.readouterr().out
+  assert vt.load(out).camera_ready() == (True, [])
