@@ -11,7 +11,7 @@ from openpilot.cereal import custom, log
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, CLEAR_DESIRE, SPEED_CAP_ACCEL_MIN, TAKE_CONTROL_PROMPTS, lane_change_events, plan_accel
 from openpilot.selfdrive.turnpilot.lane_planner import LANE_UNKNOWN_REASON, LC_WARN_S, lane_change_window
-from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN, LinePaint
+from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN, LinePaint, fill_lane_paint
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, NO_ACCEL_CAP, ONCOMING_TTA_S, PED_STOP_GAP_M
 from openpilot.selfdrive.turnpilot.tests.synthetic import FakeNavd, car_control, car_state, junction_of, model_v2, nav_instruction, scene
 from openpilot.selfdrive.turnpilot.desire_timing import TURN_DESIRE_LEAD_M
@@ -24,7 +24,7 @@ from openpilot.selfdrive.turnpilot.turnpilotd import (CAR_UNKNOWN_REASON, DETECT
                                                        STALLED_REASON, TURN_ABANDON_CURV, TURN_ABANDON_S, TURN_ABANDONED_REASON,
                                                        WRONG_SIDE_MIN_SPEED, WRONG_SIDE_REASON, WRONG_SIDE_S, yellow_on_the_right,
                                                        STOPPED_CONTROL_M, STOPPED_HANDBACK_S, STOPPED_LEAD_M, STOPPED_NOTE, STOPPED_NOTE_S, STOPPED_REASON,
-                                                       TURN_MISSED_REASON, WAITING_REASON, TurnPilot, long_control_for)
+                                                       TURN_MISSED_REASON, WAITING_REASON, TurnPilot, long_control_for, plan_paint)
 from openpilot.selfdrive.turnpilot.handback import Handback
 from openpilot.selfdrive.turnpilot.scene.tracker import STALE_S
 
@@ -3263,6 +3263,36 @@ def test_a_turn_whose_lane_change_never_went_is_skipped_out_loud_never_turned_fr
   sim.run(40.)
   plans, first = skipped_for_its_lane(sim, 300.)
   assert not any(p.laneChangeOffer != LaneChange.none for p in plans)
+
+
+def detections_paint(status, filled=None):
+  """turnpilotDetections as modeld sends it: lanePaint filled with these four (none when None), and its lanePaintStatus."""
+  msg = messaging.new_message('turnpilotDetections')
+  if filled is not None:
+    fill_lane_paint(msg.turnpilotDetections.init('lanePaint', 4), filled)
+  msg.turnpilotDetections.lanePaintStatus = status
+  return msg.as_reader().turnpilotDetections
+
+
+@pytest.mark.parametrize("status, filled", [('noModel', [UNKNOWN] * 4), ('wideCamera', None), ('sweep', None), ('disabled', None)])
+def test_a_curb_side_change_on_less_than_paint_never_goes_on_paint_nobody_read(status, filled):
+  """ad-s4's block on 4.10, through turnpilotd's paint (plan_paint): under TurnPilotAlwaysDrive, a right turn with no lane list
+  and a lane the model counts to the right. The curb line the reader read as unknown (lanePaintStatus read) is 4.10's less
+  than paint: the change is offered and goes. The same four unknowns from a message the reader never read (a road camera frame
+  with no modelV2 for it, filled; the wide camera, a stop sweep, the paint off for the drive: none, which lane_paint_from_msg
+  makes four unknowns of) are no paint read: never offered, lineNotBroken, as off the switch."""
+  def drive(det, on=True):
+    sim = Sim([(400., 'turn', 'right'), (2000., 'turn', 'left')], cruise=15., model_lanes=(0, 1), paint=plan_paint(det, True))
+    sim.tp.always_drive = on
+    sim.run(16.)
+    return [p for _, _, p in sim.trace]
+  read = drive(detections_paint('read', [UNKNOWN, LinePaint('solid', 'yellow', 0.875, 0.9375), UNKNOWN, UNKNOWN]))
+  assert any(p.laneChangeOffer == LaneChange.right for p in read) and any(p.laneChange == LaneChange.right for p in read)
+  for on in (True, False):
+    unread = drive(detections_paint(status, filled), on)
+    assert not any(p.laneChangeOffer != LaneChange.none or p.laneChange != LaneChange.none for p in unread), on
+    assert {str(p.laneChangeWait) for p in unread} == {'beforeWindow', 'lineNotBroken'}, on
+    assert not any(p.tooFastToTurn for p in unread), on  # nothing places the car (LC-03), as off the switch
 
 
 def test_a_turn_whose_desire_went_out_is_never_skipped_for_its_lane():

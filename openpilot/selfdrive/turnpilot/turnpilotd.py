@@ -2,9 +2,10 @@
 """turnpilotd: turns the active route and the scene into desire pulses, lane-change requests and longitudinal limits.
 
 modeld takes the plan's desire and lane change, plannerd its accel and speed caps (see hooks.py). The lane paint the
-detector reads comes in with its detections, and is used only while those are fresh (the scene is available); none read
-is unknown paint, and no lane change. The lane planner plans lane changes only with TurnPilotLanePaintActive set; without
-it a second planner publishes what it would have asked for in laneChangePaintRule, so drives can be scored. In shadow mode
+detector reads comes in with its detections, and is used only while those are fresh (the scene is available) and the
+message's lanePaintStatus is read (plan_paint); none read is unknown paint, and no lane change. The lane planner plans
+lane changes only with TurnPilotLanePaintActive set; without it a second planner publishes what it would have asked for
+in laneChangePaintRule, so drives can be scored. In shadow mode
 (TurnPilotShadowMode) everything is computed and published with shadow=True, and nothing acts on it.
 It runs onroad only while TurnPilotEnabled. The manager doesn't restart a process that died, and a dead one
 soft-disables openpilot for the rest of the drive (processNotRunning), so an exception in the plan or the scene is
@@ -2637,6 +2638,20 @@ class DetectionDrain:
     return sorted(out, key=lambda d: d.timestampEof)
 
 
+def plan_paint(det, scene_available: bool) -> tuple:
+  """The lane paint for the plan from the latest turnpilotDetections (None before the first): its four lines only while the
+  scene is available and this message's lanePaintStatus is read, else () (none read: unknown paint, no lane change). A
+  LinePaint can't tell a line read unknown from one nobody read: a run on the wide camera, a stop sweep, the paint off for
+  the drive (a budget overrun, an exception) and a road camera frame with no modelV2 for it all come as four unknowns
+  (lane_paint_from_msg) or none, and only the status says which. A curb-side change on less than paint (ALWAYS_DRIVE.md
+  4.10, lane_planner.curb_lane_unpainted) goes only on paint the reader read; every other rule plans () and four unknowns
+  the same."""
+  if det is None or not scene_available or det.lanePaintStatus != custom.TurnpilotDetections.LanePaintStatus.read or \
+     len(det.lanePaint) != 4:
+    return ()
+  return lane_paint_from_msg(det.lanePaint)
+
+
 def main():
   params = Params()
   pm = messaging.PubMaster(['turnpilotPlan', 'turnpilotScene'])
@@ -2710,7 +2725,7 @@ def main():
     pm.send('turnpilotScene', scene_msg)
 
     scene = scene_msg.as_reader().turnpilotScene
-    paint = lane_paint_from_msg(sm['turnpilotDetections'].lanePaint) if scene.available and sm.seen['turnpilotDetections'] else ()
+    paint = plan_paint(sm['turnpilotDetections'] if sm.seen['turnpilotDetections'] else None, scene.available)
     # the lane planner takes this frame's checks (an offered change aborts at once); the plan's valid has a grace
     valid = sm.all_checks(['carState', 'modelV2'])
     # this frame's run for the unprotected left: its road camera run when one came (the left reads only the road's), else
