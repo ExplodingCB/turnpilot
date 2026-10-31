@@ -57,6 +57,8 @@ details { margin-top: 28px; } summary { min-height: 44px; font-weight: 600; }
   color: var(--fg); font: 15px ui-monospace, Menlo, monospace; border-radius: 0; }
 #mapform textarea { min-height: 120px; }
 #mapform button { margin-top: 12px; width: 100%; }
+#keyform { display: block; }
+#keyform[hidden] { display: none; }
 #keybox input { width: 100%; min-height: 44px; padding: 8px; border: 2px solid var(--line); background: var(--bg); color: var(--fg);
   font: 15px ui-monospace, Menlo, monospace; border-radius: 0; }
 #keybox button { margin-top: 12px; width: 100%; }
@@ -334,12 +336,13 @@ function renderMap(s) {
   if (m.override) {
     problems = [];
   } else {
-    if (m.missing.length) problems.push(m.missing.length === 1 && m.missing[0] === "API key" ?
-      "No map key yet. Paste it in Map key above." : "Map server not set up: no " + m.missing.join(", ") + ". Open Map server below.");
+    var keyOnly = m.missing.length === 1 && m.missing[0] === "API key";  // the comma has the address and certificate
+    if (m.missing.length) problems.push(keyOnly ? "No map key yet. Paste it in Map key above." :
+      "Map server not set up: no " + m.missing.join(", ") + ". Open Map server below.");
     if (m.refresh && m.refresh.ok === false && m.refresh.code === "unauthorized") {
       $("keybox").hidden = false; $("keyform").hidden = false;  // a wrong key: paste the right one in the same place
     }
-    if (m.coverage_error) problems.push(m.coverage_error);
+    if (m.coverage_error && !keyOnly) problems.push(m.coverage_error);  // with no key yet, the key is the one thing to do
     else if (m.car_outside) problems.push(m.outside_message.replace("Outside", "The car is outside"));
     // the cached area still shows, but the server refused the last update (a new key or certificate, the server down)
     if (m.refresh && m.refresh.ok === false && !m.missing.length) problems.push("Can't update the mapped area: " + m.refresh.error);
@@ -404,10 +407,10 @@ $("keyform").onsubmit = function () {
       if (d.coverage_ok) {
         var s = await api("/api/status");
         var names = s.map && s.map.coverage ? s.map.coverage.names : "";
-        keyResult("Key works. TurnPilot can drive around " + (names || "its mapped area") + ". The comma moves on by itself.", false);
+        keyResult("Key works. TurnPilot can drive around " + (names || "its mapped area") + ". Now tap next on the comma.", false);
         $("keyform").hidden = true;
       } else {
-        keyResult("Saved, but it didn't work: " + d.coverage_error, true);
+        keyResult("That key didn't work. " + d.coverage_error, true);
       }
       await poll();
     } catch (e) {
