@@ -405,7 +405,8 @@ class StopEvidence:
     seen_every = (self.newest_t is None or self.newest_t - last.t <= CYCLE_GAP_S) and all(g <= CYCLE_GAP_S + 1e-9 for g in gaps)
     # a cross approach of more than one lane: which lane the car is in isn't known (assign's ground x), so it shields none
     # (skeptic SG3b q2b: a lane-1 car read in lane 2 shielded the lane it hides) until SG4b resolves the lane index
-    shield = (ln.stopping or (self.vision_shield and sr.stop_mapped(ln.approach))) and at_line and sr.shield_lane_ok(ln.approach) and len(self.cross_lanes_of(ln)) == 1 and \
+    stops = ln.stopping or (self.vision_shield and sr.stop_mapped(ln.approach))
+    shield = stops and at_line and sr.shield_lane_ok(ln.approach) and len(self.cross_lanes_of(ln)) == 1 and \
       sr.shield_ok(last.cls, stopped_s, fit.v_hi, len([s for s in here if s.t >= last.t - sr.VEL_TRUST_S - 1e-9]), front_from_line,
                    seen_every, moved)
     through = self._through(st, ln, here, s_nom, line, last.cls, cross)
