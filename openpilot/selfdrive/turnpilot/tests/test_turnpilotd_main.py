@@ -442,3 +442,18 @@ def test_only_paint_the_reader_read_goes_to_the_plan(status, paint):
   assert not errors and len(got) == 3
   assert all(available for available, _ in got)
   assert all(p == (tuple(READ_PAINT) if status == 'read' else ()) for _, p in got), got[0][1]
+
+
+def test_paint_is_none_read_with_the_scene_unavailable_or_before_the_first_message():
+  """plan_paint's other guards: the reader's read paint goes to the plan only while the scene is fresh (its detections are,
+  so the paint is too), and nothing before the first turnpilotDetections; with four lines the reader read, never fewer."""
+  msg = messaging.new_message('turnpilotDetections')
+  fill_lane_paint(msg.turnpilotDetections.init('lanePaint', 4), READ_PAINT)
+  msg.turnpilotDetections.lanePaintStatus = 'read'
+  det = msg.as_reader().turnpilotDetections
+  assert turnpilotd.plan_paint(det, True) == tuple(READ_PAINT)
+  assert turnpilotd.plan_paint(det, False) == () and turnpilotd.plan_paint(None, True) == ()
+  short = messaging.new_message('turnpilotDetections')
+  fill_lane_paint(short.turnpilotDetections.init('lanePaint', 2), READ_PAINT[:2])
+  short.turnpilotDetections.lanePaintStatus = 'read'
+  assert turnpilotd.plan_paint(short.as_reader().turnpilotDetections, True) == ()
