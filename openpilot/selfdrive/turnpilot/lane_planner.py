@@ -72,8 +72,11 @@ skips the turn, said each time; a stale DAS_status fails carState's CAN check (i
 Monitor Unavailable' once waits on opendbc carrying SNA (ALWAYS_DRIVE.md S7). The owner's yes to 4.10: toward the curb only,
 a change may go on less than paint (curb_lane_unpainted): the line that way read short of broken white but not solid, yellow
 or no line, on no frame of the window solid or yellow, the model's next line out a lane's width beyond it with a trusted
-edge, the lane not parked, no car in it and the blind spot clear, the countdown said first as for any change. Toward the far
-side the paint rule stands, and so does a far-side keep's (keep_blocker).
+edge, the lane not parked, no car in it and the blind spot clear, the countdown said first as for any change. Only on a
+frame whose paint the reader read: turnpilotd hands over none unless the detector's lanePaintStatus is read (plan_paint),
+and the planner looks before the yellow hold, which gives a frame with none read four lines, the held one yellow and the
+rest unknown (YellowHold.apply). An offer of it aborts lineNotBroken on the first frame with none. Toward the far side the
+paint rule stands, and so does a far-side keep's (keep_blocker).
 
 A map stop between the car and the maneuver (stop_d: MapControlPolicy.stop_ahead) inside the window (BeamNG lane_change on
 the signal tiles, 2026-10-28: a signal 164 m before the turn, and braking for it kept the car under DesireHelper's speed
@@ -439,8 +442,11 @@ def curb_lane_unpainted(direction: int, lanes: ModelLanes, paint, right_hand_tra
   TurnPilotAlwaysDrive): the ego line toward the curb read short of broken white but never solid, yellow or no line (its kind
   unknown, or broken under BROKEN_WHITE_CONF_MIN; its colour white or unknown: held yellow is yellow), and the model's next line
   out painted 0.85-1.5 lane widths beyond it with a trusted road edge (a lane counted that way, the count known). The paint has
-  to have been read: with none (no detector, the wide camera, a stale scene) nothing checks the lane for parked or passing
-  cars. Never toward the far side, where the room beyond the centre line is the oncoming lane (R11), nor a far-side keep."""
+  to have been read: with none (no detector, the wide camera, a stop sweep, the paint off for the drive, a road frame the
+  reader had no modelV2 for, a stale scene) nothing read the line. Four lines of kind and colour unknown can be paint nobody
+  read, so the caller says whether this frame's was read: turnpilotd passes () unless the reader's lanePaintStatus is read
+  (plan_paint), and LanePlanner asks this only on a frame whose paint came in four lines, before the yellow hold pads it.
+  Never toward the far side, where the room beyond the centre line is the oncoming lane (R11), nor a far-side keep."""
   if direction != (RIGHT if right_hand_traffic else LEFT) or len(paint) != 4:
     return False
   ego = paint[1 if direction == LEFT else 2]
@@ -699,6 +705,7 @@ class LanePlanner:
     if maneuver_id != self._judged_id:
       self._blocked = False
     changing = lc_state in (LaneChangeState.laneChangeStarting, LaneChangeState.laneChangeFinishing)
+    read = len(paint) == 4  # this frame's paint read (turnpilotd.plan_paint), before the hold gives a frame with none four lines
     paint = self.yellow.update(paint, v_ego, dt, changing)
     if changing and self._lc_dir is None:
       self.lines.reset()
@@ -743,7 +750,8 @@ class LanePlanner:
     if len(paint) == 4 and 0. < distance < start:  # 4.10: a curb-side line read solid or yellow is never less than paint
       ego = paint[2 if right_hand_traffic else 1]
       self._curb_marked = self._curb_marked or _yellow(ego) or (ego.kind == 'solid' and ego.confidence >= SOLID_WHITE_CONF_MIN)
-    unpainted = self.always_drive and not self._curb_marked  # a curb-side change on less than paint (curb_lane_unpainted)
+    # a curb-side change on less than paint (curb_lane_unpainted), only on paint read this frame
+    unpainted = self.always_drive and not self._curb_marked and read
     room = offer_room_s(v_ego, lead_m if not driver_signals else None)
     win_start, win_end, stop_wait = stop_window(v_ego, distance, stop_d, abs(wanted), room)
     self._want = wanted
@@ -789,7 +797,7 @@ class LanePlanner:
         self._offer_driver = True  # the car's signal failed mid-offer: the driver's path, prompted
       return self._follow_up(maneuver, maneuver_id, distance, end, want_dir, fast, lanes, paint, objects, lc_state, v_ego,
                              left_blinker, right_blinker, left_blindspot, right_blindspot, self._offer_driver, right_hand_traffic, dt,
-                             inputs_valid, lit_m, lead_m, car_block)
+                             inputs_valid, lit_m, lead_m, car_block, unpainted)
 
     self._wait = 'none' if maneuver is None else 'paintRuleOff' if not self.paint_rule else \
       'inputsInvalid' if not inputs_valid else 'laneUnknown' if self.lane_unknown else 'none' if not wanted else \
@@ -835,8 +843,9 @@ class LanePlanner:
 
   def _follow_up(self, maneuver, maneuver_id, distance, end, want_dir, fast, lanes, paint, objects, lc_state, v_ego,
                  left_blinker, right_blinker, left_blindspot, right_blindspot, driver_signals, right_hand_traffic, dt,
-                 inputs_valid, lit_m=math.inf, lead_m=None, car_block=False) -> LaneDecision:
-    """An offered change, every frame until DesireHelper starts it: still wanted, still valid, still clear, still signaled."""
+                 inputs_valid, lit_m=math.inf, lead_m=None, car_block=False, unpainted=False) -> LaneDecision:
+    """An offered change, every frame until DesireHelper starts it: still wanted, still valid, still clear, still signaled.
+    unpainted: a curb-side change may go on less than paint this frame (update's: under the switch, on paint read)."""
     d = _direction(self.offer)
     if not self.paint_rule:
       return self._abort('turnedOff')
@@ -849,8 +858,7 @@ class LanePlanner:
     if distance <= end:
       return self._abort('tooLate')
     reason = change_blocker(d, lanes, paint, objects, right_hand_traffic,
-                            nav_room(maneuver, lanes, d, right_hand_traffic, paint, self.done, self._start),
-                            self.always_drive and not self._curb_marked)
+                            nav_room(maneuver, lanes, d, right_hand_traffic, paint, self.done, self._start), unpainted)
     if reason:
       return self._abort(reason)
     if want_dir != d:

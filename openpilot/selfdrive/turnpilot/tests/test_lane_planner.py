@@ -161,7 +161,8 @@ def test_every_change_needs_broken_white_into_a_travel_lane():
   assert change_blocker(LEFT, lanes, paint(left=BW), right_hand_traffic=False) == ''
 
 
-# less than paint, never solid, yellow or no line: the kind unknown, or broken short of the bar, white or of unknown colour
+# less than paint, never solid, yellow or no line: the kind unknown, or broken short of the bar, white or of unknown colour,
+# on a frame whose paint was read (a read line can come back UNKNOWN; paint nobody read is ())
 LESS_THAN_PAINT = (UNKNOWN, LinePaint('unknown', 'white', 0.9, 0.3), UNSURE_BW, COLORLESS)
 
 
@@ -792,6 +793,43 @@ def test_the_planner_changes_toward_the_curb_on_less_than_paint_only_under_the_s
   drive = always(Drive(1, 0, paint=lambda left, right: paint(left=UNKNOWN if left else SY, right=SW)))
   drive.run(maneuver("turn", "left"), 290., 8.)
   assert not drive.offers and drive.decisions[-1].wait == 'lineNotBroken'
+
+
+def test_a_curb_side_change_on_less_than_paint_needs_this_frames_paint_read():
+  """ad-s4's block on 4.10, in the planner: the yellow hold (YellowHold.apply) gives a frame with no paint read four entries, the
+  held line yellow and the rest unknown. So with a centre line read yellow on the car's left, then nothing read (turnpilotd's
+  plan_paint: the wide camera on a bend or with a turn desire out, a stop sweep, the paint off for the drive), the curb line came
+  out 'unknown' on paint nobody read, and 4.10 changed lanes on it. 4.10 needs this frame's paint read, before the hold: no
+  offer (lineNotBroken), and LC-03 doesn't place the car on such frames, as off the switch. An offer of it under way aborts
+  lineNotBroken on the first frame nothing is read, as a change on broken white does on such a frame."""
+  m = maneuver("turn", "right")
+  start, end = lane_change_window(15.)
+  def yellow_then_unread(frames):
+    def read(left, right):  # read on the first three frames, 30 m before the window: the hold runs 100 m into it
+      frames['n'] += 1
+      return paint(left=SY, right=UNKNOWN) if frames['n'] <= 3 else ()
+    return read
+  for on in (False, True):
+    drive = Drive(0, 1, paint=yellow_then_unread({'n': 0}))
+    drive.lp.always_drive = on
+    drive.run(m, start + 30., 8.)
+    assert not drive.offers and drive.lp.changes == 0 and drive.decisions[-1].wait == 'lineNotBroken', on
+    # the blind spot occupied through the window, so the change never goes: nothing read placed the car that way (LC-03),
+    # so the window's end skips nothing, under the switch as off it
+    drive = Drive(0, 1, paint=yellow_then_unread({'n': 0}))
+    drive.lp.always_drive = on
+    distance = drive.run(m, start + 30., 17., blindspot=LaneChange.right)
+    assert distance < end and not drive.offers and not drive.decisions[-1].blocked, on
+  # the curb line read unknown on every frame (4.10's less than paint), the blind spot held: placed, and skipped at the end
+  drive = always(Drive(0, 1, paint=lambda left, right: paint(left=SY, right=UNKNOWN)))
+  assert drive.run(m, start + 30., 17., blindspot=LaneChange.right) < end
+  assert not drive.offers and drive.decisions[-1].blocked
+  # an offer on less than paint under way: the first frame with nothing read aborts it, never requested
+  drive = always(Drive(0, 1))
+  drive.paint = lambda left, right: paint(left=SY, right=UNKNOWN) if not drive.offers else ()
+  drive.run(m, start - 10., 2.)
+  assert len(drive.offers) == 1 and [a for a, _ in drive.aborts] == ['lineNotBroken'] and not drive.requests
+  assert drive.aborts[0][1] - drive.offers[0][2] == pytest.approx(DT_MDL, abs=0.5 * DT_MDL)
 
 
 def test_driver_lane_change_gets_a_cooldown_too():
