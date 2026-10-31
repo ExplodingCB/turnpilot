@@ -13,9 +13,15 @@ all it can do is a "pedestrian in path" stop on the STOP_DECEL 1.5 m/s^2 curve: 
 turnpilotScene, scene.available, path_blocker, go_blocked, the left's raw runs and the goes' views stay tracker A's; with the far
 crop off for the drive or aimed at the left's band, B adds fewer people or none, and the car has A's perception, nothing worse.
 
-Measured (peds r2, replay_g.py g:C with the trust guards, 56 public comma four segments, 0.93 h): people tracked 87 to 110,
-near-path people first published at a median 28.1 m instead of 20.0 m, false person units 1.11 to 1.44 per km, A's
-confirmation, hard tier and handbacks identical; the S10 step-out Monte Carlo's contact at 29 km/h 32.5/36.0% to 8.0/11.0%.
+Replayed as it ships (this module, update_tiles and ScenePolicy.update's extra_objects, no patches: peds/trackerb's replay_b.py,
+TurnPilotFarPeds off then on, over replay_g.py's ticks; tick for tick and track for track the peds r2 study's g:C+ghn run on all
+56 segments). 56 public comma four segments (27.8 km, 0.93 h): people tracked 87 to 110, all 58 confirmed people confirmed at the
+same frame, near-path people first published at a median 28.15 m instead of 20.0 m (n 36), false person units 1.08 to 1.44 per km,
+hard-tier ticks 4 and 4, tracker A's rows and hard tier identical on and off on every tick; B-only stop asks below -0.3 m/s^2 19
+ticks, every one a labelled person, none harder than -1.5, no curb cap. comma's demo route (14 segments, 12.8 km): people 9 to 12,
+no false track in the path. KITTI tracking (21 sequences at comma four scale): people first labelled 25 m eq or more first
+published at a median 34.9 m eq instead of 29.5 (n 114). The S10 step-out Monte Carlo (n 400 a case): contact at 29 km/h
+32.5/36.0% to 8.0/11.0% (held / held-joint), at 40 km/h 73.8/75.7% to 44.3/44.3%.
 
 TrackerB.step times B's update and merge each frame; turnpilot.tracker_b logs their p50 and p95 every LOG_PERIOD_S with the count
 of B-only objects that asked for a stop, and turnpilot.tracker_b_stop each B-only object's first stop ask, with where its box was,
