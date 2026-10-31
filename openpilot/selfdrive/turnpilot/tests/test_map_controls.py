@@ -7,6 +7,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, SPEED_CAP_ACCEL_MIN, plan_accel
 from openpilot.selfdrive.turnpilot.map_controls import (COMMIT_SPEED, DRIVEN_THROUGH_M, STOP_SIGN_HANDBACK_S, GREEN_STEADY_S, LIGHT_STALE_S,
                                                          MAP_DECEL_MAX, NO_LIGHTS,
+                                                         OFF_ROUTE_DRIVE_REASON, OFF_ROUTE_DRIVE_SPEED,
                                                          OFF_ROUTE_REASON, OFF_ROUTE_SPEED, T_LAT, UNPROTECTED, YIELD_SPEED, CameraLights,
                                                          Lights, MapControlPolicy, StopCommand, engage_distance, light_input, unprotected_turn)
 from openpilot.selfdrive.turnpilot.route_follower import make_maneuver
@@ -871,6 +872,62 @@ def test_off_route_with_the_stops_ahead_unknown_caps_the_speed_and_says_so():
   car.nav_valid = True  # rerouted
   out, dec, _ = car.run(1.5)
   assert out.alert == 'none' and not any(s.reason == OFF_ROUTE_REASON for s in out.stops)
+
+
+class LimitCar(Car):
+  """A Car whose navd says its road's limit (navInstruction.speedLimit, m/s) on every message, valid or not."""
+  speed_limit = 0.
+
+  def nav(self):
+    b = super().nav().as_builder()
+    b.speedLimit = self.speed_limit
+    return b.as_reader()
+
+
+@pytest.mark.parametrize("limit, floor", [(0., OFF_ROUTE_DRIVE_SPEED), (8.9, 8.9), (20., OFF_ROUTE_DRIVE_SPEED)])
+def test_off_route_under_always_drive_the_cap_is_25_mph_or_the_last_limit_and_it_keeps_saying_so(limit, floor):
+  """ALWAYS_DRIVE.md R17 (S3), under TurnPilotAlwaysDrive: off the route with the stops ahead unknown the cap comes down to
+  11.2 m/s (25 mph), or to the last valid navInstruction.speedLimit before the route was lost where that is lower (none, 0,
+  is unknown), not to 5 m/s: the crawl that makes the driver take over. Said once at onset (offRouteStopsUnknown, held
+  ABORT_HOLD_S), then a status line (mapControlsUnavailable) for as long as it lasts; the words still say the map stops are
+  unknown and the car won't stop for signs or signals there, and no longer say take control. Never braked harder than the
+  gentle ramp, never a stop."""
+  car = LimitCar([(400., 'signal')], v=15.)
+  car.policy.always_drive = True
+  car.speed_limit = limit
+  car.run(2.)
+  car.nav_valid, car.off_route, car.off_status = False, [], 'failed'
+  car.speed_limit = 30.  # off the route navd's messages are invalid: whatever they carry is no limit
+  out, dec, _ = car.run(1.)
+  assert out.alert == 'none'  # the grace, as with the switch off
+  onset = car.run_until(lambda out, dec: out.alert != 'none', max_s=3.)[0]
+  assert onset.alert == 'offRouteStopsUnknown' and onset.reason == OFF_ROUTE_DRIVE_REASON
+  start = len(car.rows)
+  car.run(25.)
+  alerts = [r[5].alert for r in car.rows[start - 1:]]
+  said = alerts.index('mapControlsUnavailable')
+  assert abs(said * DT_MDL - ABORT_HOLD_S) <= 2 * DT_MDL and set(alerts[:said]) == {'offRouteStopsUnknown'}
+  assert set(alerts[said:]) == {'mapControlsUnavailable'}  # the status line from then on: no second onset
+  reasons = {r[5].reason for r in car.rows[start:]}
+  assert reasons == {OFF_ROUTE_DRIVE_REASON}
+  assert 'map stops unknown' in OFF_ROUTE_DRIVE_REASON.lower() and "won't stop for signs or signals" in OFF_ROUTE_DRIVE_REASON
+  assert 'take control' not in OFF_ROUTE_DRIVE_REASON.lower()
+  assert OFF_ROUTE_DRIVE_REASON in [s.reason for s in car.rows[-1][5].stops]
+  assert abs(car.v - floor) < 0.3, (limit, car.v)
+  assert min(r[2] for r in car.rows[start:]) > floor - 0.3 and not any(r[4].should_stop for r in car.rows)
+  assert all(r[3] >= -1.0 - 1e-6 for r in car.rows)
+  car.nav_valid = True  # rerouted: nothing off the route, the cap gone
+  car.speed_limit = limit
+  out, dec, _ = car.run(1.5)
+  assert out.alert == 'none' and not any(s.reason == OFF_ROUTE_DRIVE_REASON for s in out.stops)
+  # the switch off: 5 m/s, offRouteStopsUnknown for as long as it lasts, the take-control words
+  car = LimitCar([(400., 'signal')], v=15.)
+  car.speed_limit = limit
+  car.run(2.)
+  car.nav_valid, car.off_route, car.off_status = False, [], 'failed'
+  car.run(28.)
+  assert abs(car.v - OFF_ROUTE_SPEED) < 0.3
+  assert car.rows[-1][5].alert == 'offRouteStopsUnknown' and car.rows[-1][5].reason == OFF_ROUTE_REASON
 
 
 def test_no_destination_is_not_off_route():

@@ -14,8 +14,8 @@ from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.locationd.calibrationd import MIN_SPEED_FILTER
 from openpilot.common.hardware import HARDWARE
 from openpilot.selfdrive.turnpilot.hooks import (ABORT_TEXT, CAR_SIGNAL_EVENTS, CONTROL_ALERT_TEXT, CONTROL_PROMPT_TEXT, CONTROL_STATUS_ALERTS,
-                                               SILENT_PROMPTS, SILENT_STATUS_ALERTS, TAKE_CONTROL_PROMPTS, fresh_plan, lane_change_text, shown_plan,
-                                               too_fast_title)
+                                               KEEP_FOLLOW, KEEP_REROUTED, SILENT_PROMPTS, SILENT_STATUS_ALERTS, TAKE_CONTROL_PROMPTS, fresh_plan,
+                                               lane_change_text, shown_plan, too_fast_title)
 
 AlertSize = log.SelfdriveState.AlertSize
 AlertStatus = log.SelfdriveState.AlertStatus
@@ -315,14 +315,20 @@ def turnpilot_too_fast_to_turn_alert(CP: car.CarParams, CS: car.CarState, sm: me
   turn the car pulled away into from a standstill went straight past its junction (turnpilotPlan.turnMissed, turnpilotd.py):
   missed, and navd reroutes."""
   plan = shown_plan(sm)
+  # a keep the model drives under TurnPilotAlwaysDrive (ALWAYS_DRIVE.md R7, skipReason KEEP_FOLLOW): a status line, no chime;
+  # the skip's chime and 'Rerouting' only once navd recomputes past it (KEEP_REROUTED)
+  if plan is not None and plan.tooFastToTurn and not plan.turnMissed and str(plan.skipReason) == KEEP_FOLLOW:
+    return Alert("Fork: Following the Model", "TurnPilot didn't steer for it", AlertStatus.normal, AlertSize.mid,
+                 Priority.LOWER, VisualAlert.none, AudibleAlert.none, .2)
+  rerouted = plan is not None and str(plan.skipReason) == KEEP_REROUTED
   # a map stop leaving no room to get into the turn's lane, or a change it needed that never went (LC-03, skipReason laneBlocked)
   lane = plan is not None and (str(plan.laneChangeWait) == 'unreachable' or str(plan.skipReason) == 'laneBlocked')
   missed = plan is not None and plan.turnMissed
   blind = plan is not None and str(plan.unprotectedLeft.state) == 'skipped'  # oncoming too fast for the detector's range
   signal = too_fast_title(plan) if plan is not None else None  # the turn signal's skips (car_signals.py: a veto, a side in doubt)
   keep = keep_skip_title(plan) if plan is not None else None
-  return Alert("Turn Missed" if missed else signal if signal else keep if keep else "Can't Reach Turn Lane" if lane else
-               "Can't See Far Enough to Turn" if blind else "Too Fast to Turn", "Rerouting",
+  return Alert("Turn Missed" if missed else "Fork Missed" if rerouted else signal if signal else keep if keep else
+               "Can't Reach Turn Lane" if lane else "Can't See Far Enough to Turn" if blind else "Too Fast to Turn", "Rerouting",
                AlertStatus.userPrompt, AlertSize.mid,
                Priority.LOW, VisualAlert.none, AudibleAlert.tpTooFastTurn, 3.)
 
@@ -401,8 +407,11 @@ def turnpilot_control_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.S
     return Alert(CONTROL_ALERT_TITLE[kind], CONTROL_ALERT_TEXT[kind], AlertStatus.critical, AlertSize.mid, Priority.MID,
                  VisualAlert.steerRequired, AudibleAlert.tpHandback, .1)
   if kind == 'offRouteStopsUnknown':  # while it lasts: the speed is capped, nothing ahead is known to stop for
-    return Alert(CONTROL_ALERT_TITLE[kind], CONTROL_ALERT_TEXT[kind], AlertStatus.userPrompt, AlertSize.mid, Priority.LOW,
-                 VisualAlert.steerRequired, AudibleAlert.prompt, .1)
+    # TurnPilotAlwaysDrive's onset (ALWAYS_DRIVE.md R17): the plan's words, the car driving on, nothing to take control for
+    from openpilot.selfdrive.turnpilot.map_controls import OFF_ROUTE_DRIVE_REASON
+    drive = plan.reason == OFF_ROUTE_DRIVE_REASON
+    return Alert(CONTROL_ALERT_TITLE[kind], plan.reason if drive else CONTROL_ALERT_TEXT[kind], AlertStatus.userPrompt, AlertSize.mid,
+                 Priority.LOW, VisualAlert.none if drive else VisualAlert.steerRequired, AudibleAlert.prompt, .1)
   if kind in CONTROL_STATUS_ALERTS:
     return Alert(CONTROL_ALERT_TITLE[kind], plan.reason or CONTROL_ALERT_TEXT[kind], AlertStatus.normal, AlertSize.mid,
                  Priority.LOWER, VisualAlert.none, AudibleAlert.none if kind in SILENT_STATUS_ALERTS else AudibleAlert.prompt, .2)

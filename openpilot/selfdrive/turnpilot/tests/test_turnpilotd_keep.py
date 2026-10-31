@@ -6,6 +6,7 @@ from unittest import mock
 from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.desire_timing import keep_lead, keep_last
+from openpilot.selfdrive.turnpilot.hooks import KEEP_FOLLOW, KEEP_REROUTED
 from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN, LinePaint
 from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Sim
@@ -171,3 +172,61 @@ def test_no_keep_left_across_a_yellow_line():
   assert not any(p.desire == Desire.keepLeft for _, _, p in sim.trace)
   said = [p for _, _, p in sim.trace if p.tooFastToTurn]
   assert said and str(said[0].skipReason) == 'keepFarSide'
+
+
+def follow_sim(**road):
+  sim = keep_sim(**road)
+  sim.tp.always_drive = True
+  return sim
+
+
+def test_a_keep_that_cant_be_sent_under_always_drive_is_a_status_line_while_the_model_drives_the_fork():
+  """ALWAYS_DRIVE.md R7 (S3), under TurnPilotAlwaysDrive: the keep the model sees no lane line for is still never sent, and
+  still navd's skip at keep_last (tooFastToTurn: past the fork navd moves on if the model took the route's branch, or
+  reroutes), its corner cap kept to its pass, logged once with its reason; but it is said as a status line (skipReason
+  keepFollow), not the skip's chime and 'Rerouting'. The model taking the branch (navd moving on to the next step) says
+  nothing more."""
+  sim = follow_sim(line_prob=0.1)
+  with mock.patch('openpilot.selfdrive.turnpilot.turnpilotd.cloudlog.event') as event:
+    run_keep(sim, KEEP_J + 40.)
+  assert not any(p.desire == Desire.keepRight for _, _, p in sim.trace)
+  said = [i for i, (_, _, p) in enumerate(sim.trace) if p.tooFastToTurn]
+  assert said
+  first_s, first_v, first = sim.trace[said[0]]
+  assert abs(first.maneuverDistance - keep_last(first_v)) < 1. and str(first.skipReason) == KEEP_FOLLOW
+  on_keep = [p for s, _, p in sim.trace if s >= first_s and str(p.maneuverModifier) == 'slight right' and p.routeValid]
+  assert on_keep and all(p.tooFastToTurn and str(p.skipReason) == KEEP_FOLLOW for p in on_keep)
+  assert all(p.speedCap < NO_SPEED_CAP for p in on_keep if p.maneuverDistance > 0.)  # the corner cap to its pass
+  assert not any(str(p.skipReason) == KEEP_REROUTED or p.turnMissed for _, _, p in sim.trace)  # navd moved on: nothing more
+  logged = keep_events(event)
+  assert len(logged) == 1 and logged[0].kwargs['reason'] == 'keepNoLine' and logged[0].kwargs['follow'] is True, logged
+
+
+def test_a_keep_followed_under_always_drive_chimes_rerouting_only_once_navd_recomputes():
+  """R7: past the fork the car went the other way and navd recomputes (a new route): only now the skip's chime and
+  'Rerouting' (skipReason keepRerouted for MISSED_HOLD_S), with no skip mark for the new route (tooFastToTurn false: navd
+  would read one as the new route's first step skipped) and no turnMissed (the turn signal would end the new route's turn)."""
+  from openpilot.selfdrive.turnpilot.tests.synthetic import FakeNavd
+  from openpilot.selfdrive.turnpilot.turnpilotd import MISSED_HOLD_S
+  sim = follow_sim(line_prob=0.1)
+  run_keep(sim, KEEP_J + 2.)
+  assert sim.trace[-1][2].tooFastToTurn and str(sim.trace[-1][2].skipReason) == KEEP_FOLLOW
+  s0 = sim.s
+  sim.navd = FakeNavd([(s0 + 400., "turn", "left", junction_of("left")), (s0 + 1500., "turn", "right", junction_of("right"))],
+                      route_count=1)
+  start = len(sim.trace)
+  run_keep(sim, s0 + 80.)
+  after = [p for _, _, p in sim.trace[start:]]
+  rerouted = [i for i, p in enumerate(after) if str(p.skipReason) == KEEP_REROUTED]
+  assert rerouted and abs(len(rerouted) * DT_MDL - MISSED_HOLD_S) <= 2 * DT_MDL
+  assert rerouted == list(range(rerouted[0], rerouted[0] + len(rerouted)))  # once
+  assert not any(after[i].tooFastToTurn or after[i].turnMissed for i in rerouted)
+  assert not any(p.tooFastToTurn for p in after[rerouted[0]:])  # the new route's turn ahead is never skipped by it
+
+
+def test_a_keep_that_cant_be_sent_with_the_switch_off_is_the_skip_as_before():
+  sim = keep_sim(line_prob=0.1)
+  run_keep(sim, KEEP_J + 40.)
+  said = [p for _, _, p in sim.trace if p.tooFastToTurn]
+  assert said and all(str(p.skipReason) == 'keepNoLine' for p in said)
+  assert not any(str(p.skipReason) in (KEEP_FOLLOW, KEEP_REROUTED) for _, _, p in sim.trace)
