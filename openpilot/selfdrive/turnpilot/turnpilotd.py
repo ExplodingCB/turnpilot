@@ -2035,18 +2035,21 @@ class TurnPilot:
       return None
     self.oracle_t = getattr(self, 'oracle_t', 0.) + DT_MDL
     t = self.oracle_t
-    tracks, objs = [], []
+    tracks, objs, hits = [], [], {}
     for c in msg.cross:
       x, y, vx, vy, cls = float(c.x), float(c.y), float(c.vx), float(c.vy), str(c.cls)
+      hits[int(c.id)] = getattr(self, 'oracle_hits', {}).get(int(c.id), CONFIRM_STEADY_HITS - 1) + 1
       r = max(math.hypot(x, y), 0.5)
       b = math.degrees(math.atan2(y, x))
       half = math.degrees(math.atan2(0.9, r))
       view = 'full' if abs(b) < 40. else 'sideLeft' if b > 0. else 'sideRight'
       tracks.append(SimpleNamespace(track_id=ORACLE_ID + int(c.id), t_seen=t, bearing_seen=b, width_seen=1.8 * 904. / r, view=view,
                                     cls=ORACLE_CLASS.get(cls, 2), x=np.array([x, y, vx, vy]), span_seen=(b - half, b + half), hits=5))
-      # ground truth, so a confirmed track's (scene_policy.confirmed_track's hits) for the decider's in-path rail (SAT-11)
-      objs.append(SimpleNamespace(trackId=ORACLE_ID + int(c.id), cls=cls, x=x, y=y, vx=vx, vy=vy, age=CONFIRM_STEADY_HITS, conf=1.,
+      # ground truth, so a confirmed track's hits for the decider's in-path rail (SAT-11): scene_policy.confirmed_track's at
+      # first sight, one more each frame it is published, so its evidence stays steady (TrackEvidence's CONFIRM_RECENT_HITS)
+      objs.append(SimpleNamespace(trackId=ORACLE_ID + int(c.id), cls=cls, x=x, y=y, vx=vx, vy=vy, age=hits[int(c.id)], conf=1.,
                                   missedRuns=0))
+    self.oracle_hits = hits  # a car gone from the message and back starts afresh
     runs = tuple((v, t, RawFrame([], 'road' if v == 'road' else 'wide', t, v if v.startswith('side') else 'full'), None)
                  for v in ('road', 'full', 'sideLeft', 'sideRight'))
     return OracleLive(float(msg.crossRangeM)), tuple(tracks), runs, objs, 'running'

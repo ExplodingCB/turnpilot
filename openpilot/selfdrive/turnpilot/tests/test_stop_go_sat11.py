@@ -12,8 +12,11 @@ for a vehicle, and the model drove into it.
 The fix, under vision: every vehicle standing at the go is watched for its start by its ground point (ego motion and our yaw
 removed) and its ground speed toward our path, without waiting for its speed's trust (StopGo._watch_starts); a start before
 the commit withdraws the go (the capped abort, the window again), after it the band's threat test sees it; and from the commit
-on, a vehicle confirmed in our path corridor ahead on RAIL_FRAMES frames is the in-path rail: the car stopped short of it, "Car
-crossing" said loudly (carCrossing), allowed in a cross lane because a car is entering our own path."""
+on, a vehicle confirmed in our path corridor ahead on RAIL_HITS detector matches is the in-path rail: the car stopped short of it,
+"Car crossing" said loudly (carCrossing), allowed in a cross lane because a car is entering our own path. Only a vehicle whose
+ground point was seen moving across toward our path (ego motion and the camera's drift on a standing car we pass taken out) has
+its body across our corridor, never one on its vy alone (skeptic round 1: a car waiting at the opposite line, one parked at the
+exit kerb)."""
 import json
 import math
 from pathlib import Path
@@ -27,6 +30,7 @@ from openpilot.selfdrive.turnpilot import stop_go as sg
 from openpilot.selfdrive.turnpilot import stop_rules as sr
 from openpilot.selfdrive.turnpilot import visibility_table
 from openpilot.selfdrive.turnpilot.junction_watch import junction_from_info
+from openpilot.selfdrive.turnpilot.scene_policy import CONFIRM_STEADY_HITS, CONFIRM_WINDOW_S, NO_ACCEL_CAP, PATH_HALF_WIDTH_M
 from openpilot.selfdrive.turnpilot.scene.tracker import RawFrame
 from openpilot.selfdrive.turnpilot.stop_evidence import CAR_HALF_LEN_M
 from openpilot.selfdrive.turnpilot.tests.test_stop_go import first_go
@@ -56,6 +60,7 @@ def replay(frames=None, until=None):
   odo, t_or = 0., 0.
   released = False
   out = []
+  hits, sr_hits0 = {}, CONFIRM_STEADY_HITS - 1
   for fr in data['frames'] if frames is None else frames:
     t = fr['t']
     if until is not None and t > until:
@@ -71,7 +76,9 @@ def replay(frames=None, until=None):
       view = 'full' if abs(b) < 40. else 'sideLeft' if b > 0. else 'sideRight'
       tracks.append(SimpleNamespace(track_id=ORACLE_ID + cid, t_seen=t_or, bearing_seen=b, width_seen=1.8 * 904. / r, view=view,
                                     cls=ORACLE_CLASS['car'], x=np.array([x, y, vx, vy]), span_seen=(b - half, b + half), hits=5))
-      objs.append(SimpleNamespace(trackId=ORACLE_ID + cid, cls='car', x=x, y=y, vx=vx, vy=vy, age=10, conf=1.))
+      # the oracle's hits as turnpilotd's cross_oracle counts them: one more each frame it is published (ground truth)
+      hits[cid] = hits.get(cid, sr_hits0) + 1
+      objs.append(SimpleNamespace(trackId=ORACLE_ID + cid, cls='car', x=x, y=y, vx=vx, vy=vy, age=hits[cid], conf=1., missedRuns=0))
     runs = tuple((k, t_or, RawFrame([], 'road' if k == 'road' else 'wide', t_or, k if k.startswith('side') else 'full'), None)
                  for k in ('road', 'full', 'sideLeft', 'sideRight'))
     state = fr['state']
@@ -181,7 +188,8 @@ def scene_car(tid, role, d_fn, w, frac=0.5, age=20, conf=0.9, v_fn=None):
   s = ln.s_min + frac * (ln.s_max - ln.s_min) - pos
   side = 1. if role == 'left' else -1.
   vy = -side * (v_fn(t) if v_fn is not None else (d_fn(t - DT_MDL) - dd) / DT_MDL)
-  return SimpleNamespace(trackId=tid, cls='car', x=s, y=side * dd, vx=0., vy=vy, age=age, conf=conf, inPath=False)
+  # its hits rising one a detector update (every other frame), as the tracker counts them
+  return SimpleNamespace(trackId=tid, cls='car', x=s, y=side * dd, vx=0., vy=vy, age=age + w.k // 2, conf=conf, inPath=False, missedRuns=0)
 
 
 def lane_axis_m(w, role, frac=0.5):
@@ -273,8 +281,9 @@ def test_a_car_entering_our_path_after_the_commit_stops_us_short_of_it_saying_ca
 
 
 def crossing_y(kind, t):
-  """(y left of our axis, vy) of the rail tests' scene car t s after it appears: from 5 m left at 2.5 m/s across our path
-  ('crossing'), or the same but standing across our lane from 2 s to 5 s ('stops': a car stopped in our path)."""
+  """(y left of our axis, vy) of the rail tests' scene car t s after the go reaches the stage: 5 m left then, at 2.5 m/s across
+  our path, on its way since earlier (t < 0: further out on its line) ('crossing'), or the same but standing across our lane
+  from 2 s to 5 s ('stops': a car stopped in our path)."""
   if kind == 'stops':
     if t < 2.:
       return 5. - 2.5 * t, -2.5
@@ -284,37 +293,53 @@ def crossing_y(kind, t):
   return 5. - 2.5 * t, -2.5
 
 
-@pytest.mark.parametrize('kind', ['crossing', 'stops'])
-@pytest.mark.parametrize('stage', ['committed', 'inLane'])
-def test_the_in_path_rail_a_confirmed_car_entering_our_corridor_stops_us_short_and_says_car_crossing_loudly(tmp_path, stage, kind):
-  # a scene car (no lane track: nothing the band's threat test reads), its near side 9 m ahead of the bumper, coming in from
-  # 5 m left at 2.5 m/s, first seen the frame the go reaches the stage (the band, or past the in-lane point at 5 m/s): the rail
-  # stops the car short of it, "Car crossing" said while it holds; past the commit point that stop may be in a cross lane,
-  # because a car is entering our own path. One that stands across our lane is stood short of until it has gone; then the
-  # crossing goes on (the stall's lift if the model won't), never a handback
+def stage_at(tmp_path, stage):
+  """(frame, position_m) of the frame the go first reaches stage in vdrive's run with nothing in the scene (the harness is
+  deterministic, and the rail's car changes nothing before the stage's frame but the rail itself)."""
   w = vdrive(tmp_path, 25, behaviour='goes')
-  car = {}
+  for k in range(round(25. / DT_MDL)):
+    d = w.step()
+    if d.state == stage:
+      return k, d.position_m
+  raise AssertionError(stage)
+
+
+@pytest.mark.parametrize('kind', ['crossing', 'stops'])
+@pytest.mark.parametrize('stage,seen_s', [('committed', 0.), ('inLane', sg.RAIL_HIST_S)])
+def test_the_in_path_rail_a_confirmed_car_entering_our_corridor_stops_us_short_and_says_car_crossing_loudly(tmp_path, stage, seen_s, kind):
+  # a scene car (no lane track: nothing the band's threat test reads), its near side 9 m ahead of the bumper and 5 m left the
+  # frame the go reaches the stage (the band, or past the in-lane point at 5 m/s), coming across at 2.5 m/s, tracked since
+  # seen_s before: the rail stops the car short of it, "Car crossing" said while it holds; past the commit point that stop may
+  # be in a cross lane, because a car is entering our own path. One that stands across our lane is stood short of until it
+  # has gone; then the crossing goes on (the stall's lift if the model won't), never a handback. In the band it is first seen
+  # at the stage (seen any earlier, it withdraws the go): its motion across is measured first (RAIL_MOVE_S, RAIL_MOVE_HITS
+  # matches: about 0.7 s), which at the band's 2.5 m/s still leaves room to stop. Past the in-lane point it is tracked from 1 s
+  # before, through the band (on a collision course its bearing holds: in the camera's view all along); first seen only there,
+  # 9 m out at 5-6 m/s, that 0.7 s takes the room to stop (the stop comes about 5 m out), the trade for never trusting its vy
+  k_stage, pos_stage = stage_at(tmp_path / 'pre', stage)
+  w = vdrive(tmp_path, 25, behaviour='goes')
+  car = {'x': pos_stage + SETBACK + 9., 'k_on': k_stage - round(seen_s / DT_MDL)}
 
   def objs(ww):
-    if 't' not in car:
+    if ww.k <= car['k_on']:
       return []
-    y, vy = crossing_y(kind, ww.t_cam - 100. - car['t'])
+    y, vy = crossing_y(kind, (ww.k - 1 - k_stage) * DT_MDL)
     if y < -8.:
       return []
-    pos = ww.sg.pos_ref + (ww.odo - ww.sg.odo_ref)
-    return [SimpleNamespace(trackId=77, cls='car', x=car['x'] - pos, y=y, vx=0., vy=vy, age=20, conf=0.9, inPath=abs(y) < 1.5)]
+    pos = ww.sg.pos_ref + (ww.odo - ww.sg.odo_ref) if ww.sg.token is not None else -ww.control.d
+    return [SimpleNamespace(trackId=77, cls='car', x=car['x'] - pos, y=y, vx=0., vy=vy, age=detector_age(ww, car), conf=0.9,
+                            inPath=abs(y) < 1.5, missedRuns=0)]
   w.objects = objs
   out, gaps = [], []
-  for _ in range(round(25. / DT_MDL)):
+  for k in range(round(25. / DT_MDL)):
     d = w.step()
     out.append(d)
-    if 't' not in car and d.state == stage:
-      car.update(t=w.t_cam - 100., x=d.position_m + SETBACK + 9.)
-    if 't' in car:
-      y, _ = crossing_y(kind, w.t_cam - 100. - car['t'])
+    if k == k_stage:
+      assert d.state == stage and abs(d.position_m - pos_stage) < 1e-6  # the run before the stage as the empty one
+    if k >= k_stage:
+      y, _ = crossing_y(kind, (k - k_stage) * DT_MDL)
       gaps.append((car['x'] - SETBACK - d.position_m, y, w.v))
-  k = next(k for k, d in enumerate(out) if d.state == stage)
-  after = out[k:]
+  after = out[k_stage:]
   said = [d for d in after if d.alert == 'carCrossing']
   assert said and said[0].reason == sg.CROSSING_REASON
   assert any(s.reason == sg.CROSSING_REASON and s.confirmed for d in after for s in d.stops)
@@ -327,19 +352,142 @@ def test_the_in_path_rail_a_confirmed_car_entering_our_corridor_stops_us_short_a
   assert any(d.state == 'done' for d in after) and not any(d.fault for d in after)
 
 
-def test_the_rail_never_brakes_for_a_phantom_a_vehicle_in_the_corridor_for_fewer_than_rail_frames(tmp_path):
-  # a confirmed-looking box in our corridor 6 m ahead for RAIL_FRAMES - 1 frames, then gone: no stop, no alert
+def rail_car_run(tmp_path, stage, seen_s, y_fn, hits_fn=None, seconds=25.):
+  """vdrive with the rail tests' scene car (trackId 77, its near side 9 m ahead of the bumper the frame the go reaches stage, on
+  y_fn(t s from then) -> (y, vy) or None, tracked from seen_s before), its hits rising a detector update unless hits_fn(state,
+  frame) says otherwise ((age, missedRuns)). Returns (w, decisions, k_stage, [(gap, y, v)] from the stage on)."""
+  k_stage, pos_stage = stage_at(tmp_path / 'pre', stage)
+  w = vdrive(tmp_path, 25, behaviour='goes')
+  car = {'x': pos_stage + SETBACK + 9., 'k_on': k_stage - round(seen_s / DT_MDL)}
+  out, gaps = [], []
+
+  def objs(ww):
+    yv = y_fn((ww.k - 1 - k_stage) * DT_MDL) if ww.k > car['k_on'] else None
+    if yv is None:
+      return []
+    pos = ww.sg.pos_ref + (ww.odo - ww.sg.odo_ref) if ww.sg.token is not None else -ww.control.d
+    age, missed = hits_fn(car, ww, out) if hits_fn is not None else (detector_age(ww, car), 0)
+    return [SimpleNamespace(trackId=77, cls='car', x=car['x'] - pos, y=yv[0], vx=0., vy=yv[1], age=age, conf=0.9, inPath=abs(yv[0]) < 1.5,
+                            missedRuns=missed)]
+  w.objects = objs
+  for k in range(round(seconds / DT_MDL)):
+    d = w.step()
+    out.append(d)
+    if k >= k_stage:
+      yv = y_fn((k - k_stage) * DT_MDL)
+      gaps.append((car['x'] - SETBACK - d.position_m, yv[0] if yv is not None else None, w.v))
+  return w, out, k_stage, gaps
+
+
+def railed(d) -> list:
+  return [s for s in d.stops if s.reason == sg.CROSSING_REASON]
+
+
+def test_the_rail_s_hard_tier_is_scene_policy_s_confirmed_a_stalled_detector_s_track_brakes_on_the_curve(tmp_path):
+  # the 'stops' car taken by the rail in the band; then the detector stalls (its hits stop rising, no run missed: published,
+  # never matched again). The rail's stop stays, but its hard tier goes once the track is no longer steady (scene_policy's
+  # CONFIRM_RECENT_HITS in CONFIRM_WINDOW_S): the comfortable curve from there, as every other confirmed stop's
+  froze = {}
+
+  def hits(car, ww, out):
+    age = detector_age(ww, car)
+    if 'k' not in froze and out and railed(out[-1]):
+      froze.update(k=ww.k, age=age)
+    return (froze['age'], 0) if 'k' in froze else (age, 0)
+  w, out, k_stage, _ = rail_car_run(tmp_path, 'committed', 0., lambda t: crossing_y('stops', t), hits_fn=hits, seconds=12.)
+  k0 = next(k for k, d in enumerate(out) if railed(d))
+  assert all(s.confirmed for s in railed(out[k0]))
+  lost = round((CONFIRM_WINDOW_S + 0.1) / DT_MDL)
+  later = [d for d in out[k0 + lost:k0 + lost + 20] if railed(d)]
+  assert later and not any(s.confirmed for d in later for s in railed(d))
+  assert all(s.accel_cap >= NO_ACCEL_CAP - 1e-6 for d in later for s in railed(d))  # no accel cap: the curve only
+
+
+def test_the_rail_lets_go_of_a_car_parked_past_our_path_whatever_its_vy_says(tmp_path):
+  # the 'stops' car stood across our lane, then drove on across and parked 5 m right of our axis (its body clear of our
+  # corridor), its tracker vy there reading noise (sd 0.6) toward us and away: the rail lets go RAIL_RELEASE_S after its body
+  # left our corridor (its ground point making no progress back toward our path), and the crossing goes on to done
+  rng = np.random.default_rng(9)
+  noise = {}
+
+  def y_fn(t):
+    if t < 5.:
+      return crossing_y('stops', t)
+    y = max(-2.5 * (t - 5.), -5.)
+    if y > -5.:
+      return y, -2.5
+    k = round(t / 0.1)
+    noise.setdefault(k, rng.normal(0., 0.6))
+    return -5., noise[k]
+  w, out, k_stage, gaps = rail_car_run(tmp_path, 'committed', 0., y_fn, seconds=25.)
+  assert any(railed(d) for d in out[k_stage:])
+  # the frame its body left our corridor (its near end past PATH_HALF_WIDTH_M) for good
+  left = next(n for n in range(len(gaps)) if all(y is not None and y < -(PATH_HALF_WIDTH_M + sg.RAIL_HALF_LEN_M) for _, y, _ in gaps[n:]))
+  last_rail = max(k for k, d in enumerate(out) if railed(d)) - k_stage
+  assert last_rail <= left + round((sg.RAIL_RELEASE_S + 0.3) / DT_MDL), (left, last_rail)
+  assert any(d.state == 'done' for d in out[k_stage:]) and not any(d.fault for d in out)
+
+
+def test_a_car_that_crossed_toward_us_and_stopped_with_its_nose_in_our_path_holds_the_rail(tmp_path):
+  # the 'crossing' car stops with its centre 2.6 m left (its nose 0.25 m short of our axis, its ground point outside the
+  # narrow corridor) and stands there 6 s, then goes on across: seen moving across it stays across (the latch), so the rail
+  # holds the car short of it all the while it stands, and lets the crossing go on once it has passed
+  def y_fn(t):
+    if t < 0.96:
+      return 5. - 2.5 * t, -2.5
+    if t < 6.96:
+      return 2.6, 0.
+    return 2.6 - 2.5 * (t - 6.96), -2.5
+  w, out, k_stage, gaps = rail_car_run(tmp_path, 'committed', 0., y_fn, seconds=32.)
+  standing = [k for k in range(len(gaps)) if 1.5 <= k * DT_MDL < 6.9]
+  assert all(railed(out[k_stage + k]) for k in standing)
+  assert min(g for g, y, _ in gaps if y is not None and abs(y) <= CAR_HALF_LEN_M + CAR_HALF_W) > 0.3
+  assert any(gaps[k][2] < 0.05 for k in standing)  # at rest short of it
+  assert any(d.state == 'done' for d in out[k_stage:]) and not any(d.fault for d in out)
+
+
+@pytest.mark.parametrize('side', [1., -1.])
+def test_a_fast_car_crossing_ahead_first_seen_past_the_in_lane_point_is_stopped_short_of(tmp_path, side):
+  # past the in-lane point at 5-6 m/s, a car first seen 9 m ahead and 6 m to the side crossing at 6 m/s (skeptic round 1's
+  # rail_each_side): its bearing closes (it crosses ahead of us), so its motion is judged on the noise allowance alone, never
+  # the camera's drift allowance for a car we pass: latched within its first few matches and stopped short of
+  w, out, k_stage, gaps = rail_car_run(tmp_path, 'inLane', 0., lambda t: (side * (6. - 6. * t), -side * 6.) if t < 3. else None, seconds=20.)
+  assert any(railed(d) for d in out[k_stage:])
+  across = [g for g, y, _ in gaps if y is not None and abs(y) <= CAR_HALF_LEN_M + CAR_HALF_W]
+  assert across and min(across) > 0.3
+
+
+@pytest.mark.parametrize('y0,u', [(4., 1.5), (4., 2.), (5., 2.)])
+def test_a_car_on_a_collision_course_past_the_in_lane_point_is_judged_without_the_drift_allowance(tmp_path, y0, u):
+  # past the in-lane point at about 5.5 m/s, a car tracked from 1 s before, its ground point 9 m ahead and y0 left at the stage,
+  # coming across at u (1.5-2 m/s: under a third of our speed). Its bearing holds or closes as it comes (nearly a collision
+  # course), so it is judged on the noise allowance alone and stopped short of. Were the camera's drift allowance for a car
+  # we pass (RAIL_DRIFT_FRAC of the metres driven) applied to it, its motion would read as a standing car's and the car would
+  # drive into it. Slower still, or further out with its bearing opening (1.5 m/s from 5-6 m, 2 m/s from 6 m), it is within
+  # that drift and the rail doesn't take it before its ground point is in our corridor: the trade for never braking for a
+  # standing car we pass
+  w, out, k_stage, gaps = rail_car_run(tmp_path, 'inLane', sg.RAIL_HIST_S, lambda t: (y0 - u * t, -u) if y0 - u * t > -8. else None,
+                                       seconds=20.)
+  assert any(railed(d) for d in out[k_stage:])
+  across = [g for g, y, _ in gaps if y is not None and abs(y) <= CAR_HALF_LEN_M + CAR_HALF_W]
+  assert across and min(across) > 0.3
+
+
+def test_the_rail_never_brakes_for_a_phantom_a_vehicle_in_the_corridor_for_fewer_than_rail_hits(tmp_path):
+  # a confirmed-looking box in our corridor 6 m ahead for RAIL_HITS - 1 detector matches (published, held, over the frames between
+  # them, as the tracker does), then gone: no stop, no alert
   w = vdrive(tmp_path, 25, behaviour='goes')
   seen = {'n': 0}
 
   def objs(ww):
-    if ww.sg.state != 'committed' or seen['n'] >= sg.RAIL_FRAMES - 1:
+    if ww.sg.state != 'committed' or seen['n'] >= 2 * (sg.RAIL_HITS - 1):
       return []
     seen['n'] += 1
-    return [SimpleNamespace(trackId=88, cls='car', x=SETBACK + 6., y=0.2, vx=0., vy=0., age=20, conf=0.9, inPath=True)]
+    return [SimpleNamespace(trackId=88, cls='car', x=SETBACK + 6., y=0.2, vx=0., vy=0., age=20 + (seen['n'] - 1) // 2, conf=0.9, inPath=True,
+                            missedRuns=0)]
   w.objects = objs
   out = w.run(16.)
-  assert seen['n'] == sg.RAIL_FRAMES - 1
+  assert seen['n'] == 2 * (sg.RAIL_HITS - 1)
   assert not any(d.alert == 'carCrossing' for d in out)
   assert not any(s.reason == sg.CROSSING_REASON for d in out for s in d.stops)
   assert any(d.state == 'done' for d in out)
@@ -408,7 +556,8 @@ def test_a_car_that_passes_far_ahead_after_the_commit_never_brakes_us(tmp_path, 
     y = y0 + vy * t
     if abs(y) > 45.:
       return []
-    return [SimpleNamespace(trackId=90, cls='car', x=car['x'] + vx * t - pos, y=y, vx=vx, vy=vy, age=30, conf=0.95, inPath=abs(y) < 1.5)]
+    return [SimpleNamespace(trackId=90, cls='car', x=car['x'] + vx * t - pos, y=y, vx=vx, vy=vy, age=detector_age(ww, car, 30), conf=0.95,
+                            inPath=abs(y) < 1.5, missedRuns=0)]
   w.objects = objs
   out = []
   for _ in range(round(16. / DT_MDL)):
@@ -428,8 +577,8 @@ def test_the_start_watch_and_the_rail_are_vision_s_alone(tmp_path, mode):
   # no rail runs, so a confirmed car in the corridor after the commit is never braked for by the decider there
   from openpilot.selfdrive.turnpilot.tests.test_stop_go import Drive
   w = Drive(tmp_path, behaviour=lambda ww: 'goes', mode=mode)
-  w.objects = lambda ww: [SimpleNamespace(trackId=91, cls='car', x=SETBACK + 6., y=0., vx=0., vy=0., age=30, conf=0.95, inPath=True)] \
-    if ww.sg.state in ('committed', 'inLane') else []
+  w.objects = lambda ww: [SimpleNamespace(trackId=91, cls='car', x=SETBACK + 6., y=0., vx=0., vy=0., age=30 + ww.k // 2, conf=0.95, inPath=True,
+                                          missedRuns=0)] if ww.sg.state in ('committed', 'inLane') else []
   out = w.run(16.)
   assert any(d.state == 'committed' for d in out)
   assert not any(d.alert == 'carCrossing' for d in out)
@@ -513,10 +662,226 @@ class OracleSM:
 
 
 def test_the_oracle_s_objects_are_confirmed_tracks_for_the_rail(tmp_path):
-  # turnpilotd's cross_oracle gives its road users a confirmed track's hits (ground truth), so the decider's rail reads them
+  # turnpilotd's cross_oracle gives its road users a confirmed track's hits (ground truth), one more each frame it publishes
+  # them, so the decider's own evidence (scene_policy's TrackEvidence, steadiness included) confirms them for the rail; a car
+  # gone from the message and back starts afresh
   from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_stop import oracle_msg
   sim = oracle_sim(tmp_path)
-  out = sim.tp.cross_oracle(OracleSM(oracle_msg([(4, 8., 0.5, 0., -3., 'car')])))
-  assert out is not None
-  (o,) = out[3]
-  assert sg.StopGo._rail_confirmed(o) and o.trackId == ORACLE_ID + 4
+  dec = sg.StopGo()
+  ages = []
+  for k in range(round(3. / DT_MDL)):
+    out = sim.tp.cross_oracle(OracleSM(oracle_msg([(4, 8. - 0.1 * k, 0.5, 0., -3., 'car')])))
+    assert out is not None
+    (o,) = out[3]
+    ages.append(o.age)
+    dec.t += DT_MDL
+    dec._rail_feed(sg.Frame(objects=(o,), odo_m=0.))
+    assert dec._rail_confirmed(o) and o.trackId == ORACLE_ID + 4, (k, o.age)
+  assert ages == list(range(CONFIRM_STEADY_HITS, CONFIRM_STEADY_HITS + len(ages)))
+  sim.tp.cross_oracle(OracleSM(oracle_msg([])))
+  (o,) = sim.tp.cross_oracle(OracleSM(oracle_msg([(4, 8., 0.5, 0., -3., 'car')])))[3]
+  assert o.age == CONFIRM_STEADY_HITS
+
+
+# ------------------------------------------------------- the rail's phantoms: cars beside our path (skeptic round 1)
+
+def detector_age(ww, st, base=20, ages='advancing'):
+  """A scene object's hits (TrackedObject.age): base at first sight, then one more per detector update (every other frame,
+  the forward camera's 10 Hz), as the tracker counts them; 'constant': base on every frame (the probe's held count)."""
+  st.setdefault('k0', ww.k)
+  return base if ages == 'constant' else base + (ww.k - st['k0']) // 2
+
+
+def junction_stand_s(w) -> float:
+  """s the car stood (under 0.05 m/s) past its commit point (committed, inLane): in the junction."""
+  return sum(1 for c in w.cmds if c[1] < 0.05 and c[6] in ('committed', 'inLane')) * DT_MDL
+
+
+def assert_never_railed(w, out):
+  rail = [k for k, d in enumerate(out) if any(s.reason == sg.CROSSING_REASON for s in d.stops)]
+  assert not rail, (rail[:3], [out[k].state for k in rail[:3]], [round(w.cmds[k][1], 2) for k in rail[:3]])
+  assert not any(d.alert == 'carCrossing' for d in out)
+  assert all(s.accel_cap >= -2. - 1e-9 for d in out for s in d.stops)
+  assert junction_stand_s(w) == 0.
+  assert any(d.state == 'done' for d in out) and not any(d.fault for d in out)
+
+
+# (k, sd, y0, seed): the camera's lateral speed for a car standing at the opposite approach's line, 20 m past our stop point and
+# y0 left of our axis, reading toward our path in proportion to our speed (vy = -k v_ego, X_left_g30_h10_r150: -0.36 to -1.31
+# m/s at 7.6-8 m/s passing cars standing 5 m left) plus noise sd. opp_k0.1 is the probe that fired the rail in inLane at 5.5
+# m/s and commanded -7.25 m/s^2, the car then standing 2.6 s in the cross road saying 'Car Crossing'
+OPPOSITE_WAITING = {
+  'opp_k0.1': (0.1, 0.1, 2.6, 11),
+  'opp_k0.15_y3.2': (0.15, 0.2, 3.2, 11),
+  'opp_k0.15_y2.6_s12': (0.15, 0.1, 2.6, 12),
+  'opp_k0.3_y3.2_s13': (0.3, 0.2, 3.2, 13),
+}
+
+
+@pytest.mark.parametrize('ages', ['advancing', 'constant'])
+@pytest.mark.parametrize('case', list(OPPOSITE_WAITING))
+def test_a_car_waiting_at_the_opposite_line_as_we_pass_is_never_the_rail_s(tmp_path, case, ages):
+  # after the commit we drive past a car standing at the opposite approach's line: a real car that never enters our path. Its
+  # ground point never moves (y0 throughout); only its tracker vy reads toward us. The rail never stops for it, no "Car
+  # crossing", nothing harder than -2.0, the car never standing in the junction, and the crossing done
+  k, sd, y0, seed = OPPOSITE_WAITING[case]
+  w = vdrive(tmp_path, 25, behaviour='goes')
+  rng = np.random.default_rng(seed)
+  st = {'k': 0, 'vy': 0., 'vx': 0.}
+
+  def objs(ww):
+    if ww.sg.state not in ('committed', 'inLane', 'done') and 'k0' not in st:
+      return []
+    pos = ww.sg.pos_ref + (ww.odo - ww.sg.odo_ref)
+    st['k'] += 1
+    if st['k'] % 2 == 1:
+      st['vy'] = -k * ww.v + rng.normal(0., sd)
+      st['vx'] = rng.normal(0., 0.3)
+    return [SimpleNamespace(trackId=66, cls='car', x=20. + SETBACK - pos, y=y0, vx=st['vx'], vy=st['vy'], age=detector_age(ww, st, 40, ages),
+                            conf=0.85, inPath=False, missedRuns=0)]
+  w.objects = objs
+  out = w.run(20.)
+  assert any(d.state == 'committed' for d in out)
+  assert_never_railed(w, out)
+
+
+# (y0 right of our axis, sd of its ground point's lateral noise, sd of its vy, seed): a car parked at the exit kerb 7 m past our
+# stop point, the camera's noise on it. parked_sd0.6 is the probe that fired the rail at 2.0 m/s and held the car standing
+# 29.9 s at the first cross lane's edge saying 'Car Crossing', then H5
+PARKED = {
+  'parked_sd0.6': (-3.0, 0.3, 0.6, 3),
+  'parked_sd0.6_y2.6': (-2.6, 0.15, 0.6, 4),
+  'parked_sd1.0_y3.5': (-3.5, 0.3, 1.0, 5),
+  'parked_sd0.6_s6': (-3.0, 0.3, 0.6, 6),
+}
+
+
+@pytest.mark.parametrize('ages', ['advancing', 'constant'])
+@pytest.mark.parametrize('case', list(PARKED))
+def test_a_car_parked_at_the_exit_kerb_with_the_camera_s_noise_is_never_the_rail_s(tmp_path, case, ages):
+  # a parked car beside our exit, its track's ground point jittering about y0 and its vy noise (the logged camera's: vy -0.36
+  # to -1.31 m/s on a car standing 5 m left), held between detector updates: never the rail's, the crossing done
+  y0, sd_y, sd_vy, seed = PARKED[case]
+  w = vdrive(tmp_path, 25, behaviour='goes')
+  rng = np.random.default_rng(seed)
+  st = {'k': 0, 'y': y0, 'vy': 0.}
+
+  def objs(ww):
+    if ww.sg.state not in ('committed', 'inLane', 'done') and 'k0' not in st:
+      return []
+    pos = ww.sg.pos_ref + (ww.odo - ww.sg.odo_ref)
+    st['k'] += 1
+    if st['k'] % 2 == 0:  # a detector update every other frame: held between them
+      st['y'] = y0 + rng.normal(0., sd_y)
+      st['vy'] = rng.normal(0., sd_vy)
+    return [SimpleNamespace(trackId=55, cls='car', x=7. + SETBACK - pos, y=st['y'], vx=rng.normal(0., 0.2), vy=st['vy'],
+                            age=detector_age(ww, st, 40, ages), conf=0.8, inPath=False, missedRuns=0)]
+  w.objects = objs
+  out = w.run(45.)
+  assert any(d.state == 'committed' for d in out)
+  assert_never_railed(w, out)
+
+
+@pytest.mark.parametrize('y0', [2.0, 2.43, 3.0, 3.8])
+@pytest.mark.parametrize('vy', [-3., -1., 1.5])
+def test_no_ground_point_outside_our_path_is_in_it_on_its_vy_alone(tmp_path, y0, vy):
+  # a confirmed car standing y0 left of our axis 9 m past the stop point, its ground point never moving, its tracker vy saying it
+  # moves across at vy (toward our path when negative): beyond PATH_HALF_WIDTH_M nothing of its vy puts it in our corridor or
+  # entering it, so never the rail's
+  w = vdrive(tmp_path, 25, behaviour='goes')
+  st = {}
+
+  def objs(ww):
+    if ww.sg.state not in ('committed', 'inLane', 'done') and 'k0' not in st:
+      return []
+    pos = ww.sg.pos_ref + (ww.odo - ww.sg.odo_ref)
+    return [SimpleNamespace(trackId=57, cls='car', x=9. + SETBACK - pos, y=y0, vx=0., vy=vy, age=detector_age(ww, st, 30), conf=0.9,
+                            inPath=False, missedRuns=0)]
+  w.objects = objs
+  out = w.run(20.)
+  assert_never_railed(w, out)
+
+
+# ------------------------------------------------------------ the rail on the logged camera's own objects (open loop)
+
+CAMERA_FIXTURE = Path(__file__).parent / 'sat11_camera_rail.json'
+
+
+def rail_on_log(clip, armed=lambda fr: 0.3 < fr['v'] < 8., standing_x=None):
+  """The decider's in-path rail (StopGo._rail_feed every frame, _rail_pick on the frames armed(frame) says) on a logged clip's
+  camera scene objects (tests/sat11_camera_rail.json), along the logged trajectory: the odometer from vEgo, turned_deg from the
+  model's yaw rate. standing_x: that track's x made a standing car's (its median ground x less the odometer, the logged range
+  noise taken out; its y as logged). Returns ([(t, trackId, crossing)] of each pick, the decider)."""
+  frames = json.loads(CAMERA_FIXTURE.read_text())['clips'][clip]['frames']
+  odos, odo, last_t = [], 0., None
+  for fr in frames:
+    odo += max(fr['v'], 0.) * (DT_MDL if last_t is None else min(max(fr['t'] - last_t, 0.01), 0.2))
+    last_t = fr['t']
+    odos.append(odo)
+  gx = float(np.median([o[2] + odo for fr, odo in zip(frames, odos, strict=True) for o in fr['objs'] if o[0] == standing_x] or [0.]))
+  dec = sg.StopGo()
+  turned = 0.
+  last_t, picks = None, []
+  for fr, odo in zip(frames, odos, strict=True):
+    dt = DT_MDL if last_t is None else min(max(fr['t'] - last_t, 0.01), 0.2)
+    last_t = fr['t']
+    v = max(fr['v'], 0.)
+    turned += math.degrees(fr['yr'] * dt)
+    objs = tuple(SimpleNamespace(trackId=o[0], cls=o[1], x=gx - odo if o[0] == standing_x else o[2], y=o[3], vx=o[4], vy=o[5], age=o[6], conf=o[7],
+                                 missedRuns=o[8], inPath=False) for o in fr['objs'])
+    dec.t += dt
+    f = sg.Frame(objects=objs, v_ego=v, a_ego=fr['a'], odo_m=odo, turned_deg=turned, dt=dt)
+    dec._rail_feed(f)
+    if not armed(fr):
+      dec.rail_count = {}
+      continue
+    best, _ = dec._rail_pick(f)
+    if best is not None:
+      picks.append((fr['t'], best[1].trackId, dec.rail_tracks[best[1].trackId].crossing))
+  return picks, dec
+
+
+@pytest.mark.parametrize('standing_x', [None, 6])
+def test_the_rail_on_the_logged_camera_never_takes_the_standing_cars_we_pass(standing_x):
+  # X_left_g30_h10_r150's camera, as if the rail were armed on every frame we move: track 6, a car standing 5.1 m left (the
+  # oracle), read y 4.6 -> 2.6 and vy -0.36 to -1.31 as we passed at 7.5-8.7 m/s, its ground point drifting 1.1-1.6 m toward
+  # our axis (the would-be rail fire at 730030.48 on the old vy test). Its bearing opened all the while: the drift is the
+  # camera's (RAIL_DRIFT_FRAC), never crossing, never the rail's; nor is any other car of the clip. With its logged x the range
+  # noise (its ground x 4 m about) reads it moving along as much as across too; with a standing car's x (standing_x) only the
+  # drift allowance tells its drift from a crossing
+  picks, dec = rail_on_log('x_left_track6', standing_x=standing_x)
+  assert not picks
+  assert 6 in dec.rail_tracks and not any(r.crossing for r in dec.rail_tracks.values())
+
+
+@pytest.mark.parametrize('clip,track,commit_t,by_t', [
+  ('run11_camera', 2, 728380.42, 728382.25),  # run 11: the rail's take by 19.95 s on the report's clock (contact about 21 s)
+  ('x6_camera', 1, 730309.14, 730310.0),      # X_out_of_turn_r2: within 0.9 s of its commit
+])
+def test_the_rail_on_the_logged_camera_takes_the_out_of_turn_car_crossing_into_our_path(clip, track, commit_t, by_t):
+  # the logged runs' own camera objects from their commit on (the rail armed as in committed and inLane): the car from the left
+  # going out of turn is latched crossing by its ground point's measured motion (its bearing closing: never the drift
+  # allowance's) and taken by the rail before by_t, the first car the rail takes
+  picks, dec = rail_on_log(clip, armed=lambda fr: fr['t'] >= commit_t - 1e-3)
+  assert picks, [(tid, r.crossing, r.run, r.lat) for tid, r in dec.rail_tracks.items()]
+  t, tid, crossing = picks[0]
+  assert tid == track and crossing and t <= by_t, picks[:3]
+
+
+@pytest.mark.parametrize('clip', ['far_settling', 'far_oncoming'])
+def test_far_tracks_range_noise_never_latches_one_crossing(monkeypatch, clip):
+  # far out a mono track's ground point is range noise: new tracks settling from 40-76 m (one read its lateral 16.5 -> 6.9 m in
+  # 1.2 s on a car standing 7.9 m left) and an oncoming car 40-55 m out reading 4-18 m/s across. The motion test runs only on a
+  # window within the rail's look (and RAIL_LATCH_EXTRA_M), and only on motion more across than along: none of them is ever
+  # latched crossing (the tracks the clip ends with, and any it dropped), so none passing beside us later has its body across
+  # our corridor
+  latched = []
+  orig = sg.StopGo._rail_motion
+
+  def spy(self, r, o, odo):
+    orig(self, r, o, odo)
+    if r.crossing:
+      latched.append(o.trackId)
+  monkeypatch.setattr(sg.StopGo, '_rail_motion', spy)
+  picks, dec = rail_on_log(clip)
+  assert not picks and not latched
