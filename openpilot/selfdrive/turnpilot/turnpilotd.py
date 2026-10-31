@@ -2142,6 +2142,10 @@ class TurnPilot:
     Not past the maneuver point (the follower's distance under 0), where a red's line never is: a stand there, the turn's
     desire out, is in the junction from its start (BUILD_FINDINGS D2 fix (1); skeptic SIMFIX: 10-15 deg into a right 8-10 m
     past its point, a status note at 5 s and carStoppedTakeControl at 60 s).
+    A route turn R8b's fire cleared under TurnPilotAlwaysDrive (straight_fired, to the follower's pass) is the stall's as a
+    committed one is, though its desire is done: the model stood in the junction box after choosing straight, where with the
+    switch off R8's handback has it at once (ad-s3 skeptic: past the point, the note at 5 s and the handback only at 60 s).
+    turned there is the angle the fire froze, under MISSED_TURN_DEG while straight_fired holds, so it counts past the point.
     The stop line it left is close behind it, so stopped_unheld would wait NEAR_CONTROL_STAND_S. A model lead holds it only
     as far as the scene corroborates it, LEAD_STAND_MAX_S at most (watch_lead)."""
     d, rf = self.desires, self.follower
@@ -2150,8 +2154,8 @@ class TurnPilot:
     # TurnPilot's go for this turn (49359b2's gate): its desire out or already cleared at its angle
     go_turn = went and self.go_id == d.maneuver_id and \
       (self.go_in_junction or not self.go_at_line(rf.distance) or STALL_MIN_DEG <= turned)
-    # the model's own stand in a turn in progress: partway round, or past the maneuver point at any angle
-    model_turn = self.turn_committed and (STALL_MIN_DEG <= turned or rf.distance < 0.)
+    # the model's own stand in a turn in progress (or one R8b's fire cleared): partway round, or past the maneuver point
+    model_turn = (self.turn_committed or self.straight_fired) and (STALL_MIN_DEG <= turned or rf.distance < 0.)
     in_turn = turned <= STALL_MAX_DEG and (go_turn or model_turn)
     standing = acting and in_turn and sm['carControl'].enabled and v_ego < STANDSTILL_SPEED and not decision.should_stop and \
       not self.go_withdrawn and \

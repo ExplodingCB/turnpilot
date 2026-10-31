@@ -10,9 +10,10 @@ import pytest
 from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.hooks import CLEAR_DESIRE
-from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import RIGHT_AT_A_CORNER, Sim, into_a_right
-from openpilot.selfdrive.turnpilot.turnpilotd import (MISSED_HOLD_S, TURN_ABANDON_S, TURN_ABANDONED_REASON, TURN_MISSED_AWAY_DEG,
-                                                       TURN_MISSED_CURV, TURN_MISSED_REASON)
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import RIGHT_AT_A_CORNER, Sim, into_a_right, stand
+from openpilot.selfdrive.turnpilot.turnpilotd import (MISSED_HOLD_S, STALL_PROMPT_S, STALLED_REASON, TURN_ABANDON_S,
+                                                       TURN_ABANDONED_REASON, TURN_MISSED_AWAY_DEG, TURN_MISSED_CURV,
+                                                       TURN_MISSED_REASON)
 
 Desire = log.Desire
 JUNCTION = 300.  # RIGHT_AT_A_CORNER's right
@@ -68,6 +69,35 @@ def test_a_right_driven_straight_inside_the_bounds_after_r8_fires_is_missed_at_t
   held = [p for p in plans[missed:] if p.turnMissed]
   assert abs(len(held) * DT_MDL - MISSED_HOLD_S) <= 2 * DT_MDL and all(p.reason == TURN_MISSED_REASON for p in held)
   assert not any(p.shouldStop for p in plans) and sim.tp.post_go is None
+
+
+@pytest.mark.parametrize("always_drive", [False, True])
+@pytest.mark.parametrize("past", [1., 3.2, 8.])
+def test_a_stand_in_the_junction_after_r8bs_fire_is_the_stall_handback_at_3_s(always_drive, past):
+  """ad-s3 skeptic (blocking): R8b's fire cancels the turn's desire, so turn_committed is False to the pass, and the stall
+  watch keyed on it alone stopped watching the turn. The model standing in the junction past the turn's point after the fire
+  got only stopped_unheld: the 5 s note and carStoppedTakeControl at 60 s (90 s near a mapped control), silent in the junction
+  box, where before S3 R8's handback had it at once. A fired straight (straight_fired) is the stall's as a committed turn is:
+  stalledTakeControl at STALL_PROMPT_S, held while it stands, never the note, and the turn's desire never sent again. With
+  the switch off, R8's handback throughout, as today."""
+  sim = right_sim(always_drive)
+  into_a_right(sim, 7.)
+  plans = drive(sim, sim.s + 0.05, curvature=-0.0092)
+  while sim.tp.follower.distance > -past:
+    plans += drive(sim, sim.s + 0.05, curvature=-0.0092)
+  assert -past - 1. < sim.tp.follower.distance and not sim.tp.follower.passed and not any(p.turnMissed for p in plans)
+  st = stand(sim, STALL_PROMPT_S + 7.)
+  if not always_drive:
+    assert all(p.controlPrompt == 'turnAbandonedTakeControl' for p in st)
+    return
+  assert any(p.desire == CLEAR_DESIRE for p in plans) and sim.tp.straight_fired and not sim.tp.turn_committed
+  assert 'turnAbandonedTakeControl' not in prompts(plans + st)
+  stalled = next(i for i, p in enumerate(st) if p.controlPrompt == 'stalledTakeControl')
+  assert abs(stalled * DT_MDL - STALL_PROMPT_S) <= 2 * DT_MDL
+  assert all(p.controlPrompt == 'none' for p in st[:stalled])
+  assert all(p.controlPrompt == 'stalledTakeControl' and p.reason == STALLED_REASON for p in st[stalled:])
+  assert not any(p.controlAlert == 'carStoppedNote' for p in st)
+  assert not any(p.desire in (Desire.turnRight, Desire.turnLeft) for p in st)  # the turn R8b cleared is never pulsed again
 
 
 @pytest.mark.parametrize("always_drive", [False, True])
