@@ -425,6 +425,7 @@ def test_two_boxes_where_the_car_could_be_end_its_chain():
   pair = [s for s in result.samples if s.road_why == 'ambiguous']
   assert pair and all(s.road_m < 90. for s in pair)
   assert result.road.range_m == floor10(min(s.road_m for s in result.samples))
+  assert f"ambiguous {len(pair)}" in text(result) and "come singly" in text(result)
 
 
 def late_car_stream(spacing=SPACING_S):

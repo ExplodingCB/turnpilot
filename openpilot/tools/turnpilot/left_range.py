@@ -565,6 +565,11 @@ def render(res: Result) -> list[str]:
                f"{np.percentile(road, 5):.0f} m, median {np.median(road):.0f} m, longest {road[-1]:.0f} m")
     out.append(f"  (those boxes' own ground range, not used: median {np.median([s.road_ground_m for s in res.samples]):.0f} m; " +
                f"near_m takes the box bottom {NEAR_PX:.0f} px lower, as the left's gap rule does)")
+    ends = Counter(s.road_why for s in res.samples)
+    out.append("  road chains ended: " + ', '.join(f"{why} {n}" for why, n in ends.most_common()))
+    if ends['ambiguous']:
+      out.append("  (ambiguous: another box where the car could be, so no credit past there. Each one is that car's range, so " +
+                 "drive where oncoming cars come singly, a few seconds apart, past no cars parked by the oncoming lanes)")
     out.append("  the shortest five:")
     out += [sample_line(s, drives=drives) for s in sorted(res.samples, key=lambda s: s.road_m)[:5]]
     if f.get('far'):
