@@ -56,6 +56,22 @@ def test_shadow():
   assert live.status == WARN and "TurnPilotShadowMode=1" in live.fix
 
 
+def test_always_drive():
+  """TurnPilotAlwaysDrive (ALWAYS_DRIVE.md section 1) is printed on every run: INFO whatever it is, but a WARN when TurnPilot
+  is live (on, not in shadow mode) with it off, or when this build's params don't know it (then off)."""
+  on = preflight.check_always_drive(True, False, True)
+  assert on.status == INFO and on.name == "always drive" and on.detail.startswith("on")
+  for enabled, shadow in ((False, False), (True, True)):
+    for value in (None, False):
+      assert preflight.check_always_drive(enabled, shadow, value).status == INFO
+  assert preflight.check_always_drive(True, True, True).status == INFO and 'shadow' in preflight.check_always_drive(True, True, True).detail
+  for value in (None, False):
+    live = preflight.check_always_drive(True, False, value)
+    assert live.status == WARN and live.detail.startswith("off") and "TurnPilotAlwaysDrive=1" in live.fix
+  unknown = preflight.check_always_drive(True, False, preflight.UNKNOWN_KEY)
+  assert unknown.status == WARN and "unknown to this build" in unknown.detail and unknown.fix
+
+
 def test_pyvalhalla_is_always_needed():
   assert preflight.check_pyvalhalla(None).status == FAIL
   assert preflight.check_pyvalhalla("3.9.1").status == PASS
@@ -214,6 +230,7 @@ def test_collect_runs():
   names = [c.name for c in checks]
   assert len(names) == len(set(names))
   assert {"non-release branch", "car", "alpha longitudinal", "valhalla tiles", "detector pkl", "far crop", "chestnut", "pairing URL"} <= set(names)
+  assert "always drive" in names
   assert all(c.status in (PASS, FAIL, WARN, INFO) for c in checks)
   assert preflight.render(checks)
 

@@ -1293,6 +1293,21 @@ class TestStopAvoidance(unittest.TestCase):
     self.assertEqual(len(router.reroute_calls), 2)
     self.assertEqual(router.status.method_calls, [])
 
+  def test_the_route_keeps_the_always_drive_switch_it_was_made_under(self):
+    """TurnPilotAlwaysDrive (ALWAYS_DRIVE.md section 1, step S1): read at route time for R1 to R3 (step S6), the route
+    keeping the value it was made under; unset, off or unreadable is off."""
+    self.start([])
+    self.assertIs(self.engine.route_always_drive, False)
+    for value, on in ((True, True), (b'1', True), ('1', True), (False, False), (b'0', False), ('0', False), (None, False)):
+      self.values['TurnPilotAlwaysDrive'] = value
+      self.start([])
+      self.assertIs(self.engine.route_always_drive, on, value)
+    self.values['TurnPilotAlwaysDrive'] = True
+    get = self.engine.params.get.side_effect
+    self.engine.params.get.side_effect = lambda key: (_ for _ in ()).throw(KeyError(key)) if key == 'TurnPilotAlwaysDrive' else get(key)
+    self.start([])
+    self.assertIs(self.engine.route_always_drive, False)
+
   def test_avoid_stops_off_certifies_but_excludes_nothing(self):
     self.values['TurnPilotAvoidStops'] = False
     a = self.stop(1, 60.)

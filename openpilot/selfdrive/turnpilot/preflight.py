@@ -93,6 +93,28 @@ def check_shadow(enabled: bool, shadow: bool) -> Check:
                "use shadow mode on the first drives: preflight --set TurnPilotShadowMode=1")
 
 
+UNKNOWN_KEY = object()  # a param this build's params library doesn't know (collect)
+
+
+def check_always_drive(enabled: bool, shadow: bool, value) -> Check:
+  """TurnPilotAlwaysDrive (ALWAYS_DRIVE.md section 1): on, TurnPilot drives on where it is only unsure and hands back where it
+  messed up; off, today's behaviour. value: the param, None unset, UNKNOWN_KEY unknown to this build. A WARN while TurnPilot
+  is live (on, not in shadow mode) with it off, or with this build not knowing it; never a failure."""
+  name = "always drive"
+  fix = "preflight --set TurnPilotAlwaysDrive=1"
+  if value is UNKNOWN_KEY:
+    return Check(name, WARN, "TurnPilotAlwaysDrive is unknown to this build's params: off", "rebuild (scons) or update the branch")
+  if isinstance(value, (bytes, str)):
+    value = (value.decode(errors="replace") if isinstance(value, bytes) else value).strip() == "1"
+  if value:
+    if enabled and shadow:
+      return Check(name, INFO, "on, but in shadow mode nothing acts on it")
+    return Check(name, INFO, "on: TurnPilot drives on where it is only unsure, and hands back loudly where it messed up")
+  if enabled and not shadow:
+    return Check(name, WARN, "off: TurnPilot is live and hands back, skips or waits wherever it is unsure", fix)
+  return Check(name, INFO, "off: every handback, skip and wait as without always drive")
+
+
 def check_route_source(mode: str | None, override: str | None) -> Check:
   """Routes come from TurnPilot's map server, or from local tiles when TurnPilotValhallaTiles is set. Mapbox is gone."""
   name = "route source"
@@ -303,6 +325,10 @@ def collect(params) -> list[Check]:
   except MapError as e:
     coverage, coverage_error = None, e.message
   token = params.get("TurnPilotWebToken")
+  try:
+    always = params.get("TurnPilotAlwaysDrive")
+  except Exception:  # Params raises UnknownKeyName
+    always = UNKNOWN_KEY
   valhalla = import_valhalla()
   where = locate(tiles)
 
@@ -314,6 +340,7 @@ def collect(params) -> list[Check]:
     check_toggle("TurnPilot", "TurnPilotEnabled", enabled, "preflight --set TurnPilotEnabled=1, then turn the car off and on"),
     check_gas_disengages(params.get_bool("DisengageOnAccelerator")),
     check_shadow(enabled, shadow),
+    check_always_drive(enabled, shadow, always),
     check_route_source(mode, tiles),
     check_map_server(missing_config(params), coverage.names() if coverage else None, coverage_error, tiles, params.get(COVERAGE_STATUS)),
     check_pyvalhalla(getattr(valhalla, "__version__", "imported") if valhalla else None),

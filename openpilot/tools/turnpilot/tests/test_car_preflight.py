@@ -50,7 +50,7 @@ GOOD_PARAMS = {
   "TurnPilotEnabled": True, "NavigationEnabled": True, "AlphaLongitudinalEnabled": True, "DisengageOnAccelerator": True,
   "TurnPilotCarSignals": "off", "TurnPilotCameraLights": "shadow", "TurnPilotCameraStopSigns": "shadow",
   "TurnPilotStopSignGo": "off", "TurnPilotAvoidStops": True, "TurnPilotCurbPedCap": True, "TurnPilotLeftRangeM": 0.,
-  "TurnPilotShadowMode": True, "DisableUpdates": True, "TurnPilotAutoLeft": "auto",
+  "TurnPilotShadowMode": True, "DisableUpdates": True, "TurnPilotAutoLeft": "auto", "TurnPilotAlwaysDrive": True,
   "TurnPilotMapHost": "maps.turnpilot.test", "TurnPilotMapKey": "not-a-real-key", "TurnPilotMapCert": "not-a-real-cert",
   "IsReleaseBranch": False,
 }
@@ -63,6 +63,7 @@ GO_LINES = ["branch", "car", "EPS", "3-bit firmware", "DAS_settings", "longitudi
             "car health", *REQUIRED_KEYS, *MAP_KEYS]
 INFO_LINES = ["fingerprint source", "turn-signal frame", "X179 add-on", "VIN", "TurnPilotShadowMode", "DisableUpdates",
               "TurnPilotLeftFarRangeM", "TurnPilotAutoLeft", "TurnPilotGoOverride", "TurnPilotNoMoveS", "TurnPilotCarSignalsVinless",
+              "TurnPilotAlwaysDrive",
               "panda build", "Tesla software", "outside lamps", "mount"]
 CAN_LINES = ["3-bit firmware", "panda honours long", "turn-signal frame", "driver's blinker", "X179 add-on"]
 TURNPILOT_LINES = ["car signals", "detector", "TurnPilot faults"]
@@ -720,6 +721,20 @@ def test_param_wrong_or_default(tmp_path):
   assert s["TurnPilotValhallaTiles"] == NO_GO
   assert s["TurnPilotShadowMode"] == WARN and s["DisableUpdates"] == WARN
   assert cpf.exit_code(lines) == 1
+
+
+def test_always_drive_is_printed_and_off_warns(tmp_path):
+  """TurnPilotAlwaysDrive (ALWAYS_DRIVE.md section 1; CHASE_CAR_CHECKLIST step 14's read-back): printed, INFO on, and a WARN
+  off or unset, with the fix (Saturday sets 1 at step 12). Never NO-GO: off is today's behaviour."""
+  lines = run_live(tmp_path)
+  assert statuses(lines)["TurnPilotAlwaysDrive"] == INFO and line(lines, "TurnPilotAlwaysDrive").detail.startswith("1:")
+  for value in (False, None):
+    params = {**GOOD_PARAMS, "TurnPilotAlwaysDrive": value} if value is not None else \
+      {k: v for k, v in GOOD_PARAMS.items() if k != "TurnPilotAlwaysDrive"}
+    lines = run_live(tmp_path, params=params)
+    off = line(lines, "TurnPilotAlwaysDrive")
+    assert off.status == WARN and "TurnPilotAlwaysDrive=1" in off.fix, off
+    assert cpf.exit_code(lines) == 0
 
 
 def test_map_key_unset_live(tmp_path):

@@ -106,7 +106,7 @@ REQUIRED = (  # (key, the value Saturday needs, None for unset, how to set it)
   ("TurnPilotValhallaTiles", None, f"{PREFLIGHT_SET} TurnPilotValhallaTiles= (empty clears it)"),
 )
 NOTED = ("TurnPilotShadowMode", "DisableUpdates", "TurnPilotLeftFarRangeM", "TurnPilotAutoLeft", "TurnPilotGoOverride", "TurnPilotNoMoveS",
-         "TurnPilotCarSignalsVinless")
+         "TurnPilotCarSignalsVinless", "TurnPilotAlwaysDrive")
 MAP_PARAMS = ("TurnPilotMapHost", "TurnPilotMapKey", "TurnPilotMapCert")
 DONT_LOG = ("TurnPilotMapKey", "TurnPilotMapCert")  # params_keys.h: loggerd logs them with no value; kept equal by a test
 OTHER_PARAMS = ("IsReleaseBranch", "TurnPilotCarSignalsVerified", "ChestnutLoading", "DongleId")  # DongleId: read, never printed
@@ -953,6 +953,10 @@ def noted(p: Param) -> Line:
       Line(key, WARN, f"{text}: off turns the skip into a handback at the line", f"{PREFLIGHT_SET} TurnPilotAutoLeft=auto")
   if key == "TurnPilotGoOverride":
     return Line(key, INFO, f"{text}: TurnPilot's certified go from a standstill (plannerd's bounded lift)")
+  if key == "TurnPilotAlwaysDrive":  # ALWAYS_DRIVE.md section 1: off is today's behaviour, never NO-GO
+    return Line(key, INFO, f"{text}: always drive, TurnPilot drives on where it is only unsure and hands back where it messed up") \
+      if v is True else Line(key, WARN, f"{text}: TurnPilot hands back, skips or waits wherever it is unsure",
+                             f"{PREFLIGHT_SET} TurnPilotAlwaysDrive=1")
   if key == VINLESS:
     return Line(key, INFO, f"{text}: a car-signal record matches by VIN only, so never on a car whose VIN reads as zeros") if not v else \
       Line(key, WARN, f"{text}: the owner's opt-in: with the VIN unreadable a car-signal record matches without a VIN, on this " +

@@ -39,6 +39,7 @@ OFF_ROUTE_MATCH_M = 20.  # TurnPilot: a lookup's control this close to one of th
 # MAX_AVOID_ITER (8) iterations take 3.8 s.
 AVOID_TIME_S = 4.0
 AVOID_PARAM = 'TurnPilotAvoidStops'
+ALWAYS_DRIVE_PARAM = 'TurnPilotAlwaysDrive'  # TurnPilot: read at route time for R1 to R3 (ALWAYS_DRIVE.md section 1, step S6)
 
 
 def wall_clock() -> float | None:
@@ -91,6 +92,7 @@ class RouteJob(threading.Thread):
     # with, and what the avoidance loop did (routing/avoid.py)
     self.avoid = engine.avoid_set(destination)
     self.avoid_on = engine.avoid_stops_on()
+    self.always_drive = engine.always_drive_on()
     self.runtime = engine.runtime_inputs()
     self.avoid_status, self.avoided, self.avoid_added_s = 'none', 0, 0.
 
@@ -192,6 +194,7 @@ class RouteEngine:
     self.avoid_status, self.avoided, self.avoid_added_s = 'none', 0, 0.
     self.route_runtime = None
     self.avoid_rerun = False
+    self.route_always_drive = False  # TurnPilotAlwaysDrive as the route was made under it (always_drive_on; R1 to R3, S6)
 
     self.last_position = None  # (longitude, latitude)
     self.last_bearing = None
@@ -298,6 +301,18 @@ class RouteEngine:
     if isinstance(value, bytes):
       value = value.decode(errors='replace')
     return value not in (False, 0, '0', 'false', 'False', 'off')
+
+  def always_drive_on(self) -> bool:
+    """TurnPilot: TurnPilotAlwaysDrive, read at route time (ALWAYS_DRIVE.md section 1). Off unless set to 1; a build whose
+    params don't know it is off, said."""
+    try:
+      value = self.params.get(ALWAYS_DRIVE_PARAM)
+    except Exception as e:
+      cloudlog.warning(f"navd: {ALWAYS_DRIVE_PARAM} unreadable ({type(e).__name__}): off")
+      return False
+    if isinstance(value, (bytes, str)):
+      return (value.decode(errors='replace') if isinstance(value, bytes) else value).strip() == '1'
+    return bool(value)
 
   def runtime_inputs(self) -> certify.Runtime:
     """TurnPilot: what the certifier reads at route time besides the files: the mode turnpilotd acts in and whether its side
@@ -442,6 +457,7 @@ class RouteEngine:
     self.controls, self.controls_status = job.controls, job.controls_status
     self.opposing = job.opposing
     self.avoid_status, self.avoided, self.avoid_added_s = job.avoid_status, job.avoided, job.avoid_added_s
+    self.route_always_drive = job.always_drive
     self.route_runtime, self.avoid_rerun = self.runtime_key(job.runtime), False
     self.route_count += 1
     self.route_geometry = [np.array(step['geometry']['coordinates'], dtype=np.float64).reshape((-1, 2)) for step in self.route]
