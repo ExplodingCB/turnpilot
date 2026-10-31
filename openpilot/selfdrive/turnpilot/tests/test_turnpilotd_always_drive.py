@@ -1,6 +1,10 @@
 """TurnPilotAlwaysDrive (ALWAYS_DRIVE.md section 1, step S1): turnpilotd hands the switch every frame to the lane planner, the
 unprotected left, the map controls, the turn skip and the stop-sign decider's Frame, which act on it from steps S2 to S5; it
-does nothing in shadow mode, and a component made afresh mid-frame (a reset on a fault or a handback) has it at once."""
+does nothing in shadow mode, and a component made afresh mid-frame (a reset on a fault or a handback) has it at once.
+Step S2, stands and stalls, closed loop: a release the model doesn't follow (ST-04, ST-11, ST-13, ST-06's follow-up, ST-12),
+a cap-only hold (ST-08), a stall in a curb-side turn (LEFT-21), a queue in a turn (ST-09 (stalls)), a stand at a signal
+(ST-07 (stops)), a release where no signal is mapped (LEFT-20), section 4.5's unstick lift, and the crosswalk hold's standoff
+(SC-02, unconditional)."""
 import math
 from unittest import mock
 

@@ -2150,6 +2150,8 @@ class TurnPilot:
       why = self.release_blocked(distance, gc.cause)
     if not why and gc.id == self.stall_lift_id:
       why = self.stall_veto(sm['modelV2'], objects)
+      if why == 'person':
+        cloudlog.event("turnpilot.stall_lift_person", go_id=gc.id, person=self.person_near_turn(objects, sm['modelV2']))
     if not why and gc.id == self.unstick_id:
       why = self.unstick_veto()
     if why:
@@ -2322,7 +2324,8 @@ class TurnPilot:
     if why:
       if why != self.stall_why:
         cloudlog.event("turnpilot.stall_lift_refused", why=why, lifts=self.stall_lifts, lifted_m=round(self.rel_lift_m, 2),
-                       turned_deg=round(self.desires.turned_deg, 1))
+                       turned_deg=round(self.desires.turned_deg, 1),
+                       person=self.person_near_turn(objects, sm['modelV2']) if why == 'person' else '')
       self.stall_why = why
       return True
     if self.stall_gap_s < STALL_LIFT_GAP_S - 1e-6 or gc.active:
