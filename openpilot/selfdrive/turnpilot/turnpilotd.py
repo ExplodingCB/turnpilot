@@ -123,7 +123,7 @@ them only by a launch (left_launch): short of LEFT_LAUNCH_SPEED with LEFT_LAUNCH
 withdrawn and handed back, never a coast across them on the lift's speed.
 Standing engaged with nothing of TurnPilot's holding the car (no shouldStop, no cap biting), no lead from the model within
 STOPPED_LEAD_M that the live scene corroborates (one further on doesn't hold a standing car, nor one nothing in the scene
-shows: a phantom, a mailbox), gas and brake off, the model stopped on its own: said on the
+shows: a phantom, a mailbox), gas and brake off, the model stopped on its own: said, with one info chime a stand (carStoppedNote), on the
 status line after STOPPED_NOTE_S (STOPPED_NOTE), and handed back loudly (controlPrompt carStoppedTakeControl) after
 STOPPED_HANDBACK_S, or NEAR_CONTROL_STAND_S with a map control within STOPPED_CONTROL_M (CRITIQUE REQUIRED 6: a model
 stall at a mapped signal TurnPilot doesn't hold for is never silent, and a red the map doesn't know, the car first in
@@ -1206,6 +1206,8 @@ class TurnPilot:
       plan.controlPrompt, plan.reason = 'stalledTakeControl', STALLED_REASON
     elif stopped == STOPPED_NOTE:
       plan.reason = plan.reason or STOPPED_NOTE
+      if self.stopped_s < STOPPED_NOTE_S + ABORT_HOLD_S - 1e-6 and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS:
+        plan.controlAlert = 'carStoppedNote'  # PF-14: the note's info chime, once a stand (stopped_s starts over with it)
     elif stopped:
       plan.controlPrompt, plan.reason = 'carStoppedTakeControl', stopped
     # the route's stop signs (route_notice.py, STOP_SIGNS.md 3.4): at its start, and 300 m before each it couldn't avoid; said

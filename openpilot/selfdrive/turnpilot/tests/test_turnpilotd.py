@@ -1930,6 +1930,62 @@ def test_a_lead_too_far_ahead_to_hold_the_car_doesnt_keep_it_standing_silently()
   assert 6. < STOPPED_LEAD_M < 21.  # past long_mpc.STOP_DISTANCE, short of the recorded lead
 
 
+def note_chimes(plans):
+  """The runs of plans carrying the stopped note's chime (controlAlert carStoppedNote), as (first index, length)."""
+  runs: list[list[int]] = []
+  for i, p in enumerate(plans):
+    if p.controlAlert == 'carStoppedNote':
+      if runs and sum(runs[-1]) == i:
+        runs[-1][1] += 1
+      else:
+        runs.append([i, 1])
+  return [tuple(r) for r in runs]
+
+
+def test_the_stopped_note_chimes_once_a_stand_and_the_handback_comes_as_before():
+  """PERF_BACKLOG PF-14: standing on an empty road the note was a status line only, for up to 60 s (90 s near a map
+  control) before the handback. Now the note comes with selfdrived's info chime: carStoppedNote on the plan for
+  ABORT_HOLD_S from the note's first frame, once a stand (the stopped clock's: the driver taking over, or a lead that holds
+  the car, starts it over). Owner decision (4)'s timers, the handback's frame, its prompt and its reason are as before."""
+  hold = int(round(ABORT_HOLD_S / DT_MDL))
+  sim = Sim([(2000., 'turn', 'left', T_LEFT)])
+  sim.run(1.)
+  plans = stand(sim, STOPPED_HANDBACK_S + 0.2)
+  note = next(i for i, p in enumerate(plans) if p.reason == STOPPED_NOTE)
+  back = next(i for i, p in enumerate(plans) if p.controlPrompt != 'none')
+  assert note_chimes(plans) == [(note, hold)]
+  assert all(p.reason == STOPPED_NOTE and p.controlAlert == 'none' for p in plans[note + hold:back])  # the status line, silent
+  assert plans[back].controlPrompt == 'carStoppedTakeControl' and plans[back].reason == STOPPED_REASON
+  assert (back - note) * DT_MDL == pytest.approx(STOPPED_HANDBACK_S - STOPPED_NOTE_S, abs=1.5 * DT_MDL)
+  # the driver takes over (the press disengages): the next stand's note chimes once, and its handback comes as before
+  sim.step(engaged=False, gas=True)
+  plans = stand(sim, STOPPED_HANDBACK_S + 0.2)
+  (start, n), = note_chimes(plans)
+  back = next(i for i, p in enumerate(plans) if p.controlPrompt != 'none')
+  assert n == hold and (back - start) * DT_MDL == pytest.approx(STOPPED_HANDBACK_S - STOPPED_NOTE_S, abs=1.5 * DT_MDL)
+
+  # a car pulls in ahead and holds ours (a lead the live scene shows), then drives off with ours still standing: the stopped
+  # clock starts over, and so does the note's chime
+  sim = Sim([(2000., 'turn', 'left', T_LEFT)])
+  sim.run(1.)
+  queue = ({'cls': 'car', 'x': 7., 'y': 0., 'vx': 0., 'vy': 0., 'inPath': True},)
+  first = stand(sim, STOPPED_NOTE_S + 2. * ABORT_HOLD_S)
+  held = stand(sim, 2., lead_prob=0.9, lead_x=7., objects=queue)
+  again = stand(sim, STOPPED_NOTE_S + 2. * ABORT_HOLD_S + 2.)
+  assert len(note_chimes(first)) == 1 and not note_chimes(held) and held[-1].reason != STOPPED_NOTE
+  assert len(note_chimes(again)) == 1
+
+  # near a map control the note chimes at the same STOPPED_NOTE_S, and the handback still waits NEAR_CONTROL_STAND_S
+  sim = Sim([(2000., 'turn', 'left', T_LEFT)], controls=[(20., 'signal')])
+  sim.run(0.2)
+  plans = stand(sim, NEAR_CONTROL_STAND_S + 0.2)
+  (start, n), = note_chimes(plans)
+  back = next(i for i, p in enumerate(plans) if p.controlPrompt != 'none')
+  assert n == hold and plans[back].controlPrompt == 'carStoppedTakeControl' and plans[back].reason == SIGNAL_STOPPED_REASON
+  assert (back - start) * DT_MDL == pytest.approx(NEAR_CONTROL_STAND_S - STOPPED_NOTE_S, abs=1.5 * DT_MDL)
+  assert all(p.controlAlert != 'carStoppedNote' for p in plans[back:])
+
+
 def test_a_turn_lane_a_map_stop_leaves_no_room_for_is_skipped_out_loud_never_turned_from_the_wrong_lane():
   """The map's lane list puts the car two lanes right of the left turn's lane, and a red 100 m before the turn leaves no
   room to change before it at speed nor after its go: the turn is skipped as too fast to turn is (navd reroutes), the plan
