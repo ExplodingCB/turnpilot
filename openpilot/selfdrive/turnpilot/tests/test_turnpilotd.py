@@ -3278,21 +3278,25 @@ def detections_paint(status, filled=None):
 def test_a_curb_side_change_on_less_than_paint_never_goes_on_paint_nobody_read(status, filled):
   """ad-s4's block on 4.10, through turnpilotd's paint (plan_paint): under TurnPilotAlwaysDrive, a right turn with no lane list
   and a lane the model counts to the right. The curb line the reader read as unknown (lanePaintStatus read) is 4.10's less
-  than paint: the change is offered and goes. The same four unknowns from a message the reader never read (a road camera frame
-  with no modelV2 for it, filled; the wide camera, a stop sweep, the paint off for the drive: none, which lane_paint_from_msg
-  makes four unknowns of) are no paint read: never offered, lineNotBroken, as off the switch."""
+  than paint: the change is offered and requested, and with no DesireHelper here it never goes, so at the window's end LC-03
+  skips the turn, the car placed by that lane. The same four unknowns from a message the reader never read (a road camera
+  frame with no modelV2 for it, filled; the wide camera, a stop sweep, the paint off for the drive: none, which
+  lane_paint_from_msg makes four unknowns of) are no paint read: never offered (lineNotBroken), and past the window's end
+  nothing placed the car, so nothing is skipped, as off the switch."""
   def drive(det, on=True):
     sim = Sim([(400., 'turn', 'right'), (2000., 'turn', 'left')], cruise=15., model_lanes=(0, 1), paint=plan_paint(det, True))
     sim.tp.always_drive = on
-    sim.run(16.)
+    sim.run(24.)  # past the window's end, the car slowed for the turn
     return [p for _, _, p in sim.trace]
   read = drive(detections_paint('read', [UNKNOWN, LinePaint('solid', 'yellow', 0.875, 0.9375), UNKNOWN, UNKNOWN]))
   assert any(p.laneChangeOffer == LaneChange.right for p in read) and any(p.laneChange == LaneChange.right for p in read)
+  assert any(p.tooFastToTurn for p in read)
   for on in (True, False):
     unread = drive(detections_paint(status, filled), on)
     assert not any(p.laneChangeOffer != LaneChange.none or p.laneChange != LaneChange.none for p in unread), on
-    assert {str(p.laneChangeWait) for p in unread} == {'beforeWindow', 'lineNotBroken'}, on
-    assert not any(p.tooFastToTurn for p in unread), on  # nothing places the car (LC-03), as off the switch
+    waits = {str(p.laneChangeWait) for p in unread}
+    assert 'lineNotBroken' in waits and 'pastWindow' in waits and waits <= {'beforeWindow', 'lineNotBroken', 'tooSlow', 'pastWindow'}, on
+    assert not any(p.tooFastToTurn for p in unread), on  # LC-03 judged at the window's end: nothing placed the car
 
 
 def test_a_turn_whose_desire_went_out_is_never_skipped_for_its_lane():
