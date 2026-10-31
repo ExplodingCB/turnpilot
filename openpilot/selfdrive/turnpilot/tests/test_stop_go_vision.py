@@ -137,6 +137,34 @@ def test_vision_a_cross_road_over_25_mph_or_unknown_goes_after_the_4_s_long_look
   assert w.sg.long_look and out[i].log['longLook']
 
 
+def test_vision_an_unknown_speed_lane_is_watched_as_a_fast_one(tmp_path):
+  # assumedLimit 0 (unmatched): its floor is the long look's 25 mph, but a raw box down the lane, an untrusted track's speed
+  # and the band's threat take it as UNKNOWN_CLASS_MPH, never 0 (a raw car 20 m down the near lane, then a car seen 30 m down
+  # it whose speed isn't trusted yet, each hold the go; it comes after both are gone)
+  w = vworld(tmp_path, 0)
+  ln = vlanes(w.j)['left']
+  x0, y0 = ln.point(20., 'min')
+  x1, y1 = ln.point(20., 'max')
+  x, y = (x0 + x1) / 2. + 0.5, -(y0 + y1) / 2.
+
+  def boxes(w):
+    t = w.t_cam - 100.
+    if 1.2 <= t < 3.:
+      b = raw_box(math.degrees(math.atan2(y, x)), conf=0.5, xy=(x, y), view='sideLeft')
+      return {'full': [b], 'sideLeft': [b]}
+    return {}
+  w.boxes = boxes
+  w.tracks = vcars((8, 'left', lambda t: 30. if 4. <= t < 4.6 else None))
+  out = w.run(12.)
+  assert all(x.r_req == pytest.approx(sr.reach_needed_vision(25 * MPH)) for x in out[-1].lanes if x.role == 'left')
+  assert all(ln.limit == pytest.approx(sr.UNKNOWN_CLASS_MPH * MPH) for ln in w.sg.junction_lanes(w.frame()))
+  holds = {h.key.split(':')[0] for d in out for h in d.holds}
+  assert 'raw' in holds and 'tracked' in holds, holds
+  i = first_go(out)
+  last = max(k for k in range(len(out) if i is None else i) if out[k].holds)
+  assert i is not None and (i - last) * DT_MDL >= sr.VISION_LONG_CLEAR_S - 0.06
+
+
 def test_vision_the_long_look_applies_to_the_maneuvers_union_off_the_route(tmp_path):
   j = vision_junction(15)
   j.approaches[2].assumed_limit = 35 * MPH  # the opposite approach (our own road's far side) 35 mph

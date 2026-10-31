@@ -181,11 +181,17 @@ def _geometry(j: sr.Junction, maneuver: str, moves: list) -> Verdict | None:
   return None
 
 
+def vision_lane(ln: sr.Lane) -> sr.Lane:
+  """A conflicting lane as vision judges it: possibly not stopping (stopping False, whatever its tier), and an unknown limit
+  (assumedLimit 0) taken as UNKNOWN_CLASS_MPH for every speed-driven check (the tracked test's untrusted speed, a raw box's
+  reach down the lane, the band's threat); its floor stays the 25 mph long look's (reach_needed_vision)."""
+  return replace(ln, stopping=False, limit=ln.limit if ln.limit > 0. else sr.UNKNOWN_CLASS_MPH * sr.MPH)
+
+
 def vision_lanes(j: sr.Junction, maneuver: str, setback: float, yaw_deg: float = 0.) -> list[sr.Lane]:
-  """The conflicting lanes as vision judges them: every approach as possibly not stopping (stopping False, whatever its
-  tier), placed on the unsurveyed edge band."""
+  """The conflicting lanes as vision judges them (vision_lane), placed on the unsurveyed edge band."""
   edges = sr.edge_band(j.stop_point_distance, cross_lanes(j), None)
-  return [replace(ln, stopping=False) for ln in sr.conflict_lanes(j, maneuver, edges, setback, yaw_deg)]
+  return [vision_lane(ln) for ln in sr.conflict_lanes(j, maneuver, edges, setback, yaw_deg)]
 
 
 def long_look(j: sr.Junction, maneuver: str, yaw_deg: float = 0.) -> list[tuple[str, float]]:

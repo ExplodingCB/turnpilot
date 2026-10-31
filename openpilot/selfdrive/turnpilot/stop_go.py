@@ -544,7 +544,7 @@ class StopGo:
     self.edges = sr.edge_band(j.stop_point_distance, ce.cross_lanes(j), self.lane_edge)
     self.lanes_all = junction_lanes(j, 'unknown', self.setback, self.lane_edge)
     if vision:
-      self.lanes_all = [replace(ln, stopping=False) for ln in self.lanes_all]
+      self.lanes_all = [ce.vision_lane(ln) for ln in self.lanes_all]
     self.watch_lanes = sr.wrong_way_lanes(j, self.edges, self.setback)
     lines = {}
     for ln in self.lanes_all + self.watch_lanes:
@@ -1301,7 +1301,7 @@ class StopGo:
     if j is None or j.status != 'ok':
       return []
     lanes = junction_lanes(j, f.maneuver, self.setback, self.lane_edge, f.approach_yaw_deg)
-    return [replace(ln, stopping=False) for ln in lanes] if self.vision else lanes
+    return [ce.vision_lane(ln) for ln in lanes] if self.vision else lanes
 
   def certified(self, f: Frame, probe: bool = False):
     """routing/certify.assess at the line (the same function navd runs at route time; its mode and launch checks are _mode's):
