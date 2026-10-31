@@ -6,7 +6,8 @@ import numpy as np
 
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
-from openpilot.selfdrive.turnpilot.scene.lane_paint import (UNKNOWN, LanePaintClassifier, LinePaint, fill_lane_paint, lane_paint_from_msg,
+from openpilot.selfdrive.turnpilot.scene.lane_paint import (COLOR_PROB_MIN, LINE_PROB_MIN, MIN_FRAMES, UNKNOWN, LanePaintClassifier, LinePaint,
+                                                            fill_lane_paint, lane_paint_from_msg,
                                                             project, runs, PAINT, ROAD, INVALID)
 from openpilot.selfdrive.turnpilot.scene.ranging import calib_from_view, road_lens
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
@@ -341,3 +342,96 @@ class TestAdversarialFootage(OpenpilotTestCase):
     paint = drive([None, solid((200., 124., 129.)), dashed(WHITE), None])
     assert paint[1].color == 'unknown' and paint[1].kind == 'solid', paint
     assert kinds(paint)[2] == ('broken', 'white'), paint
+
+
+# The Saturday re-run's route_demo at 6ba8582 (sim/rerun/runs/R8_route_demo/route_demo-20261031-125919): out of the
+# reroute's third right the model held the oncoming lane, 3.9-4.1 m past the divider, at 5.1 down to 3.0 m/s on the road
+# camera, every lanePaint read unknown, the right line's laneLineProbs 0.22-0.47. modelV2's four lines and two road edges at
+# SAMPLE_IDX (12 m), laneLineProbs and roadEdgeStds of each road camera read from 120.45 s to 123.06 s, with carState's
+# vEgo: (t, v, line ys, probs, edge ys, edge stds). The wrong-side handback came at 144.2 s, 109.9 m on, once the prob rose
+# past 0.5 and the reader read the line yellow 1.0 within three frames
+R8_ROUTE_DEMO_ONCOMING = (
+  (120.45, 5.1, (-4.26, -1.78, 1.45, 4.27), (0.0, 0.33, 0.36, 0.28), (-2.3, 4.86), (0.51, 0.69)),
+  (120.55, 5.12, (-4.18, -1.75, 1.43, 4.0), (0.0, 0.26, 0.32, 0.17), (-2.16, 4.33), (0.54, 0.72)),
+  (120.67, 5.14, (-4.27, -1.77, 1.54, 4.09), (0.0, 0.35, 0.44, 0.2), (-2.27, 5.07), (0.54, 0.71)),
+  (120.75, 5.16, (-4.05, -1.73, 1.42, 3.95), (0.0, 0.36, 0.47, 0.21), (-2.22, 4.79), (0.59, 0.78)),
+  (120.86, 5.18, (-4.1, -1.7, 1.51, 4.05), (0.0, 0.29, 0.34, 0.22), (-2.06, 4.9), (0.57, 0.88)),
+  (120.95, 5.16, (-4.02, -1.71, 1.57, 4.0), (0.0, 0.27, 0.36, 0.11), (-2.18, 4.66), (0.66, 0.87)),
+  (121.06, 5.13, (-4.19, -1.73, 1.73, 4.37), (0.0, 0.39, 0.44, 0.25), (-2.35, 5.33), (0.69, 0.82)),
+  (121.16, 5.11, (-4.2, -1.76, 1.88, 4.66), (0.0, 0.2, 0.36, 0.19), (-2.24, 5.56), (0.57, 0.81)),
+  (121.25, 4.98, (-4.32, -1.76, 1.94, 4.75), (0.0, 0.3, 0.31, 0.19), (-2.35, 5.31), (0.63, 0.85)),
+  (121.35, 4.71, (-4.21, -1.76, 1.61, 4.2), (0.0, 0.31, 0.26, 0.09), (-2.29, 4.74), (0.62, 0.74)),
+  (121.46, 4.4, (-4.11, -1.73, 1.63, 4.18), (0.0, 0.26, 0.28, 0.06), (-2.2, 5.0), (0.65, 0.89)),
+  (121.56, 4.2, (-4.29, -1.75, 1.71, 4.46), (0.0, 0.25, 0.24, 0.11), (-2.25, 5.29), (0.59, 0.95)),
+  (121.65, 4.0, (-4.18, -1.76, 1.72, 4.18), (0.0, 0.3, 0.32, 0.13), (-2.15, 5.26), (0.57, 0.85)),
+  (121.76, 3.91, (-4.18, -1.78, 1.72, 4.22), (0.0, 0.25, 0.31, 0.17), (-2.4, 5.32), (0.59, 0.8)),
+  (121.86, 3.84, (-4.37, -1.73, 1.8, 4.61), (0.0, 0.31, 0.33, 0.31), (-2.36, 5.79), (0.55, 0.77)),
+  (121.96, 3.84, (-4.27, -1.67, 1.79, 4.54), (0.0, 0.33, 0.26, 0.21), (-2.41, 5.46), (0.58, 0.76)),
+  (122.05, 3.81, (-4.36, -1.76, 1.89, 4.68), (0.0, 0.26, 0.33, 0.25), (-2.57, 5.76), (0.6, 0.8)),
+  (122.16, 3.76, (-4.46, -1.78, 1.89, 4.77), (0.0, 0.23, 0.32, 0.25), (-2.6, 5.82), (0.59, 0.81)),
+  (122.26, 3.71, (-4.26, -1.76, 1.89, 4.51), (0.0, 0.19, 0.3, 0.24), (-2.44, 5.18), (0.65, 0.77)),
+  (122.35, 3.61, (-4.27, -1.79, 1.92, 4.6), (0.0, 0.27, 0.26, 0.19), (-2.49, 4.85), (0.6, 0.7)),
+  (122.45, 3.5, (-4.48, -1.81, 2.03, 4.75), (0.0, 0.25, 0.35, 0.25), (-2.5, 6.33), (0.61, 0.92)),
+  (122.56, 3.43, (-4.47, -1.82, 1.98, 4.74), (0.0, 0.22, 0.27, 0.19), (-2.43, 5.84), (0.59, 0.9)),
+  (122.65, 3.35, (-4.45, -1.82, 1.88, 4.58), (0.0, 0.2, 0.27, 0.19), (-2.34, 5.78), (0.6, 0.98)),
+  (122.76, 3.26, (-4.33, -1.77, 1.82, 4.66), (0.0, 0.17, 0.22, 0.18), (-2.3, 5.68), (0.58, 0.89)),
+  (122.86, 3.2, (-4.37, -1.76, 1.79, 4.59), (0.0, 0.22, 0.26, 0.17), (-2.29, 5.68), (0.58, 0.96)),
+  (122.96, 3.12, (-4.45, -1.78, 1.79, 4.47), (0.0, 0.23, 0.32, 0.24), (-2.28, 5.8), (0.6, 0.9)),
+  (123.06, 3.02, (-4.32, -1.76, 1.78, 4.43), (0.0, 0.21, 0.25, 0.16), (-2.12, 5.43), (0.6, 0.9)),
+)
+CENTRE_Y = 1.75  # the run's centre line, where its right line sat (1.42-2.03 m, inside SEARCH_HALF_M of it on every read)
+
+
+def read_rows(rows, marks_at, probs_of=lambda probs: probs):
+  """The reader over the rows' own lines and probs (probs_of may change them), the paint fixed on the road at marks_at's
+  (mark, y) and the car moving at each row's v: the reader's four LinePaints per row."""
+  clf, s, out = LanePaintClassifier(LENS), 0., []
+  for k, (t, v, line_ys, probs, _edge_ys, _stds) in enumerate(rows):
+    if k:
+      s += v * (t - rows[k - 1][0])
+    extra = [(lambda x, y, m=m, y0=y0: m(x, y - y0)) for m, y0 in marks_at]
+    frame, _ = render([None] * 4, s, seed=k, extra=extra)
+    out.append(clf.update(t, frame, STRIDE, Y_HEIGHT, RPY, True, lines_xyz(line_ys), list(probs_of(probs))))
+  return out
+
+
+def test_the_centre_line_under_a_line_the_model_is_unsure_of_reads_yellow_and_the_wrong_side_handback_comes():
+  """R8 route_demo at 6ba8582: after a right, the model held the oncoming lane for 109.9 m and stood in it, the yellow centre
+  line on its right under a right line the model gave 0.2-0.47, and the reader read no line under LINE_PROB_MIN, so the
+  wrong-side handback waited 25 s for the prob to pass 0.5 (it read yellow at once then). Yellow is the cautious answer:
+  a line the model gives COLOR_PROB_MIN or more reads yellow when its paint is yellow, kind unknown, and the handback
+  comes on the run's own lines, probs, edges and speeds within 2 s of the first read, before the car stood at 128 s."""
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import wrong_side_rows
+  from openpilot.selfdrive.turnpilot.turnpilotd import WRONG_SIDE_CONF
+  rows = R8_ROUTE_DEMO_ONCOMING
+  paint = read_rows(rows, [(double(YELLOW), CENTRE_Y)])
+  assert all(max(r[3]) < LINE_PROB_MIN for r in rows)  # every line under the old floor on every read
+  yellow = [p[2] for p in paint if p[2].color == 'yellow']
+  assert len(yellow) >= len(rows) - 6 and all(p.kind == 'unknown' for p in yellow), paint
+  assert max(p.confidence for p in yellow) >= WRONG_SIDE_CONF
+  assert all(p[i] == UNKNOWN for p in paint for i in (0, 1, 3)), paint  # nothing painted there: nothing read
+  fired = wrong_side_rows([(t, v, True, [(q.kind, q.color, q.confidence) for q in p], ys, probs, eys, stds)
+                           for (t, v, ys, probs, eys, stds), p in zip(rows, paint, strict=True)])
+  assert fired and fired[0] <= rows[0][0] + 2., fired
+
+
+def test_a_line_the_model_is_unsure_of_reads_only_yellow():
+  """Under LINE_PROB_MIN a line reads its paint's colour only when that is yellow (the cautious answer: never crossed,
+  the wrong-side guard's), always kind unknown: white or no paint there reads unknown as before, and under COLOR_PROB_MIN
+  nothing. The kind of a line the model is sure of comes from its sure frames only, as before."""
+  rows = R8_ROUTE_DEMO_ONCOMING
+  for mark in (solid(WHITE), dashed(WHITE)):
+    assert all(p[2] == UNKNOWN for p in read_rows(rows, [(mark, CENTRE_Y)])), mark
+  low = read_rows(rows, [(double(YELLOW), CENTRE_Y)], lambda probs: [min(q, COLOR_PROB_MIN - 0.01) for q in probs])
+  assert all(p[2] == UNKNOWN for p in low), low
+  # unsure reads of the centre line, then the model sure of it: its kind and colour wait for MIN_FRAMES of the sure reads,
+  # as they did when unsure reads were never kept
+  sure_from, clf, s = 15, LanePaintClassifier(LENS), 0.
+  for k, (t, v, line_ys, probs, _edge_ys, _stds) in enumerate(rows):
+    s += v * (t - rows[k - 1][0]) if k else 0.
+    frame, _ = render([None] * 4, s, seed=k, extra=[lambda x, y: double(YELLOW)(x, y - CENTRE_Y)])
+    sure = [probs[0], probs[1], 0.9 if k >= sure_from else probs[2], probs[3]]
+    paint = clf.update(t, frame, STRIDE, Y_HEIGHT, RPY, True, lines_xyz(line_ys), sure)
+    if sure_from <= k < sure_from + MIN_FRAMES - 1:
+      assert paint[2] == UNKNOWN, (k, paint)
+  assert paint[2].color == 'yellow' and paint[2].kind != 'broken', paint

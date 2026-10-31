@@ -29,7 +29,8 @@ cycle) covers a quarter to a half, with marks of DASH_MIN_M to DASH_MAX_M and a 
 Shorter marks are not lane lines: parking stall T-marks (a 0.6-1.2 m bar every 6-7 m, a parking strip beyond) and
 crosswalk or stop bars crossed in an intersection. The color is read whatever the kind, so a line too worn or hidden to
 tell broken from solid can still read yellow. A line is unknown, never a guess, when its samples fall outside the frame
-or under a detected vehicle, its probability is low (under BROKEN_PROB_MIN it never reads broken: crack sealant and seams
+or under a detected vehicle, its probability is low (under LINE_PROB_MIN it reads no kind, and no colour but yellow from
+COLOR_PROB_MIN on, yellow being the cautious answer; under BROKEN_PROB_MIN it never reads broken: crack sealant and seams
 are what the model is unsure of), calibration is invalid, the frames are stale, or there aren't
 enough samples. A line jumping sideways (the model renumbering them in a lane change) starts its window over.
 
@@ -93,6 +94,9 @@ YELLOW_SHARE = 0.3                    # yellow takes this share of the painted s
 WHITE_SHARE, WHITE_MAX_YELLOW = 0.7, 0.1  # white this share, with no more than this share yellow
 COLOR_MIN_PAINT = 20                  # painted samples in the window before a color is read
 LINE_PROB_MIN = 0.5
+COLOR_PROB_MIN = 0.15                 # a line the model is less sure of than LINE_PROB_MIN but this sure reads yellow (kind
+                                      # unknown) when its paint is, and nothing else: the Saturday re-run's route_demo held the
+                                      # oncoming lane 110 m with the centre line under a right line at 0.2-0.47
 BROKEN_PROB_MIN = 0.65                # a line the model is less sure of than this never reads broken (it reads unknown): crack
                                       # sealant on the demo route (s15, line prob 0.56-0.62) read broken white at 0.62-0.88
 WINDOW_S = 1.5                        # paint is accumulated over this long
@@ -144,6 +148,7 @@ class _Frame:
   long_run_m: float      # the longest painted run
   white: int             # painted samples read white,
   yellow: int            # and yellow
+  sure: bool = True      # the model's line prob LINE_PROB_MIN or more: only these read a kind (or white)
 
 
 @dataclass
@@ -325,12 +330,19 @@ class LanePaintClassifier:
       line.y = y
       while line.frames and t - line.frames[0].t > WINDOW_S:
         line.frames.popleft()
-      if line_probs[i] >= LINE_PROB_MIN:
+      sure = line_probs[i] >= LINE_PROB_MIN
+      if line_probs[i] >= COLOR_PROB_MIN:
         s = state[i]
         long_run, gap = runs(s)
         line.frames.append(_Frame(t, int((s != INVALID).sum()), int((s == PAINT).sum()), gap, long_run,
-                                  int((color[i] == WHITE).sum()), int((color[i] == YELLOW).sum())))
-      p = classify(line.frames) if line_probs[i] >= LINE_PROB_MIN else UNKNOWN
+                                  int((color[i] == WHITE).sum()), int((color[i] == YELLOW).sum()), sure))
+      if sure:  # a kind from the frames the model was sure of, as ever
+        p = classify([f for f in line.frames if f.sure])
+      elif line_probs[i] >= COLOR_PROB_MIN:  # unsure: yellow from every frame, or nothing (COLOR_PROB_MIN)
+        q = classify(line.frames)
+        p = LinePaint('unknown', 'yellow', q.confidence, q.coverage) if q.color == 'yellow' else UNKNOWN
+      else:
+        p = UNKNOWN
       out.append(LinePaint('unknown', p.color, p.confidence, p.coverage) if p.kind == 'broken' and line_probs[i] < BROKEN_PROB_MIN else p)
     return out
 
