@@ -476,3 +476,23 @@ def test_a_turn_whose_first_pulse_is_its_go():
   # and the car gets STANDSTILL_REARM_S to move off on it
   out = [dt_.update(LEFT_TURN, 9., 1, False, 0., 0., True, True, DT_MDL, 0.) for _ in range(int(1.5 / DT_MDL))]
   assert set(out) == {Desire.turnLeft}
+
+
+def test_a_stall_pulse_is_one_fresh_edge_of_the_turn_in_progress_whatever_it_has_turned():
+  """ALWAYS_DRIVE.md LEFT-21: turnpilotd's stall watch asks for one fresh pulse of a turn the car stands partway round (past
+  STANDSTILL_REPULSE_MAX_DEG, where no standstill pulse goes): the next update sends the turn's desire as a new rising edge,
+  once; a turn already done (cleared at its angle) gets none, nor one never started."""
+  dt_ = DesireTiming()
+  out = step_through(dt_, [(2., 1, RIGHT_TURN, 30., 8., 0., False),       # the approach: pulsed
+                           (1.5, 1, RIGHT_TURN, 14., 4., -0.6, False)])   # into the turn, ~50 deg round
+  assert dt_.started and not dt_.done and 30. < dt_.turned_deg < 70.
+  out = step_through(dt_, [(4., 1, RIGHT_TURN, 5., 0., 0., False)])      # standing in it: re-armed to none
+  assert out[-1] == Desire.none
+  assert dt_.stall_pulse()
+  out = step_through(dt_, [(1., 1, RIGHT_TURN, 5., 0., 0., False)])
+  assert out[0] == Desire.turnRight and rising_edges([(0., 0., d) for d in out], Desire.turnRight) and \
+    sum(1 for a, b in zip([Desire.none] + out, out, strict=False) if b == Desire.turnRight and a != Desire.turnRight) == 1
+  done = DesireTiming()
+  step_through(done, [(2., 1, RIGHT_TURN, 30., 8., 0., False), (3., 1, RIGHT_TURN, 14., 4., -0.8, False)])
+  assert done.done and not done.stall_pulse()
+  assert not DesireTiming().stall_pulse()

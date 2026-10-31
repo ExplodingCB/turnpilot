@@ -113,6 +113,17 @@ class DesireTiming:
     self._rearmed = False     # re-armed by a standstill, since the last pulse
     self._abandoned = False   # abandon()ed: TurnPilot handed back
     self._held_none = 0       # frames of none while a hold had the car standing, since the last pulse
+    self._stall_pulse = False  # stall_pulse() asked for one fresh pulse at the next standing update
+
+  def stall_pulse(self) -> bool:
+    """One fresh pulse of the turn in progress for a car standing partway round it, whatever it has turned, at the next
+    update that stands the car with openpilot steering (turnpilotd's stall watch under TurnPilotAlwaysDrive, ALWAYS_DRIVE.md
+    LEFT-21: a new rising edge has restarted the model before). None for a turn not started or done (its clear out: a pulse
+    then turns the car on past the exit road). Whether it is asked."""
+    if not self.started or self.done or self.side == 0:
+      return False
+    self._stall_pulse = True
+    return True
 
   def _turn_over(self):
     """The maneuver was passed or replaced: clear its turn desire now, or once the car has turned CLEAR_MIN_DEG."""
@@ -241,6 +252,16 @@ class DesireTiming:
 
     if v_ego < STANDSTILL_SPEED:
       self._stopped_t += dt
+      if self._stall_pulse and turn and self.started:
+        # stall_pulse(): a fresh edge now, the standstill clock started over (STANDSTILL_REARM_S of it, then none again)
+        self._stall_pulse, self._stopped_t = False, 0.
+        self.pulses += 1
+        self._since_pulse = 0.
+        if self.active:
+          self._gap = PULSE_GAP_FRAMES  # out still: none for the gap, then the desire again
+        else:
+          self.active, self._rearmed, self._held, self._held_none = True, False, False, 0
+          return desire
       if go and turn and not self.started and may_start:
         # a turn whose first pulse is its go (an unprotected left taken from its hold line with no pulse on the approach,
         # turnpilotd): now, standing, and the car gets STANDSTILL_REARM_S to move off on it
@@ -267,7 +288,7 @@ class DesireTiming:
         self._rearmed = True
         return Desire.none
     else:
-      self._stopped_t = 0.
+      self._stopped_t, self._stall_pulse = 0., False  # a stall pulse is for a standing car only
       self._moving_t += dt
       if self._moving_t > DESIRE_TIMEOUT_S and not turn:
         self.done, self.active = True, False

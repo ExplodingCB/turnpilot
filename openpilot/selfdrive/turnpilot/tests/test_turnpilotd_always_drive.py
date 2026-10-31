@@ -1,22 +1,26 @@
 """TurnPilotAlwaysDrive (ALWAYS_DRIVE.md section 1, step S1): turnpilotd hands the switch every frame to the lane planner, the
 unprotected left, the map controls, the turn skip and the stop-sign decider's Frame, which act on it from steps S2 to S5; it
 does nothing in shadow mode, and a component made afresh mid-frame (a reset on a fault or a handback) has it at once."""
+import math
 from unittest import mock
 
 import pytest
 
 from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.turnpilot.go_override import GO_CLEAR_M, GO_END_SPEED, TAKEOVER_S
 from openpilot.selfdrive.turnpilot.scene.tracker import RawFrame
 from openpilot.selfdrive.turnpilot.scene_policy import NO_ACCEL_CAP, SceneDecision
 from openpilot.selfdrive.turnpilot.stop_go import Frame
 from openpilot.selfdrive.turnpilot.tests.test_go_override import WARM_S
-from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, RIGHT_AT_A_CORNER, T_LEFT, Sim, go_from_a_red, oracle_lights, stand, stop_at,
-                                                              walker_stops_the_car)
+from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of, model_v2
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, RIGHT_AT_A_CORNER, T_LEFT, Sim, go_from_a_red,
+                                                                 model_stands_in_the_turn, oracle_lights, stand, stop_at, walker_stops_the_car)
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_go import attach_planner, holding, raw_person
-from openpilot.selfdrive.turnpilot.turnpilotd import (NO_MOVE_MAX_S, NO_MOVE_REASON, NO_MOVE_S, RELEASE_GOES, RELEASE_LIFT_M, STANDSTILL_SPEED,
-                                                       STOPPED_NOTE, TurnPilot)
+from openpilot.selfdrive.turnpilot.turnpilotd import (NO_MOVE_MAX_S, NO_MOVE_REASON, NO_MOVE_S, RELEASE_GOES, RELEASE_LIFT_M, STALL_LIFT_GAP_S,
+                                                       STALL_LIFT_REASON, STALL_LIFTS, STALL_PROMPT_S, STALL_REPULSE_S, STALLED_REASON,
+                                                       STANDSTILL_SPEED, STOPPED_NOTE, TurnPilot)
 
 Desire = log.Desire
 
@@ -311,3 +315,144 @@ def test_a_cap_only_hold_the_car_came_to_rest_under_is_a_go_when_it_drops():
       q = stand(sim, DT_MDL)[0]
     assert (sim.tp.go_id == sim.tp.follower.maneuver_id) is on, on
     assert (q.desire == Desire.turnRight) is on, on
+
+
+# --- LEFT-21 (ST-03 (stalls)): a stall in a curb-side turn: a fresh pulse at 2 s, clearBox lifts from 3 s, then the handback ---
+
+def stalled_right(on: bool, deg=45., **kw):
+  """RIGHT_AT_A_CORNER's right driven deg in, then the model stands the car there (no TurnPilot hold, no go of its own)."""
+  sim = Sim(RIGHT_AT_A_CORNER, cruise=8., **kw)
+  sim.tp.always_drive = on
+  model_stands_in_the_turn(sim, deg)
+  return sim
+
+
+def lifts_of(plans):
+  """[(first index, last index)] of each clearBox go out in plans, by id."""
+  spans = {}
+  for i, q in enumerate(plans):
+    if str(q.goCertified.cause) == 'clearBox':
+      spans.setdefault(int(q.goCertified.id), [i, i])[1] = i
+  return [tuple(v) for _, v in sorted(spans.items())]
+
+
+def edges_of(plans, desire):
+  """Indexes of desire's rising edges in plans (one already out at the first plan is no edge)."""
+  return [i for i, q in enumerate(plans) if i > 0 and q.desire == desire and plans[i - 1].desire != desire]
+
+
+def test_a_stall_in_a_curb_side_turn_is_pulsed_lifted_from_a_standstill_then_handed_back():
+  """ALWAYS_DRIVE.md LEFT-21: under the switch a stand partway round a curb-side turn with nothing holding the car gets one
+  fresh turn pulse at STALL_REPULSE_S and a clearBox lift from STALL_PROMPT_S (said: 'Stalled: finishing the turn' with a
+  chime), up to STALL_LIFTS lifts STALL_LIFT_GAP_S apart, each from a standstill; then 'Stalled in the turn: take control',
+  never a hold. Switch off: the handback at STALL_PROMPT_S, no pulse, no lift, as today."""
+  sim = stalled_right(True)
+  plans = stand(sim, 25.)
+  pulses = edges_of(plans, Desire.turnRight)
+  assert len(pulses) == 1 and abs(pulses[0] * DT_MDL - STALL_REPULSE_S) <= 0.15, [p * DT_MDL for p in pulses]
+  spans = lifts_of(plans)
+  assert len(spans) == STALL_LIFTS, spans
+  assert abs(spans[0][0] * DT_MDL - STALL_PROMPT_S) <= 0.15
+  assert all((b[0] - a[1]) * DT_MDL >= STALL_LIFT_GAP_S - 1e-6 for a, b in zip(spans, spans[1:], strict=False)), spans
+  for start, _ in spans:
+    assert str(plans[start].controlAlert) == 'stallLift' and plans[start].reason == STALL_LIFT_REASON
+  handed = next(i for i, q in enumerate(plans) if q.controlPrompt == 'stalledTakeControl')
+  assert handed > spans[-1][1] and plans[handed].reason == STALLED_REASON
+  assert not any(q.controlPrompt == 'stalledTakeControl' for q in plans[:spans[-1][1]])
+  assert not any(q.shouldStop for q in plans)
+  assert all(str(sim.trace[len(sim.trace) - len(plans) + s][2].goCertified.cause) == 'clearBox' for s, _ in spans)
+
+  sim = stalled_right(False)
+  plans = stand(sim, STALL_PROMPT_S + 2.)
+  assert not lifts_of(plans) and not edges_of(plans, Desire.turnRight)
+  first = next(i for i, q in enumerate(plans) if q.controlPrompt == 'stalledTakeControl')
+  assert abs(first * DT_MDL - STALL_PROMPT_S) < 0.15
+
+
+def test_the_stalls_lifts_share_the_releases_2_25_m():
+  """ALWAYS_DRIVE.md LEFT-21, ST-13: the stall's lifts move the car RELEASE_LIFT_M in all with any lift of the go that put it
+  there: 1.5 m already lifted, the stall's lift is withdrawn ('budget') about 0.75 m on, and no more go with the car standing
+  again: the handback."""
+  sim = stalled_right(True)
+  stand(sim, 1.)
+  sim.tp.rel_lift_m = 1.5  # the release's lift that put the car in the junction
+  attach_planner(sim, holding)
+  plans = [sim.step(engaged=True) for _ in range(round(14. / DT_MDL))]
+  spans = lifts_of(plans)
+  assert len(spans) == 1 and sim.tp.go_cert.end == 'budget', (spans, sim.tp.go_cert.end)
+  lifted = sum(sim.trace[len(sim.trace) - len(plans) + i][0] - sim.trace[len(sim.trace) - len(plans) + i - 1][0]
+               for i in range(spans[0][0], spans[0][1] + 1))
+  assert 0.5 < lifted <= RELEASE_LIFT_M - 1.5 + 0.1, lifted  # lifted metres; the model's own coast after it is the model's
+  assert any(q.controlPrompt == 'stalledTakeControl' for q in plans[spans[0][1]:]) and not any(q.shouldStop for q in plans)
+
+
+def car_frame(sim, xr, yr):
+  """The car's (x, y left) of a point (xr along the approach, yr left of it) in the road's frame (scene_policy.road_frame) of a
+  right turn the car has yawed approach_yaw_deg into."""
+  a = math.radians(sim.tp.approach_yaw_deg) * -1
+  c, s = math.cos(a), math.sin(a)
+  return xr * c + yr * s, -xr * s + yr * c
+
+
+def test_a_person_near_the_turn_bars_the_stalls_lift():
+  """ALWAYS_DRIVE.md LEFT-21's person veto: go_blocked can't see the people a model stops for partway round. A person track of
+  1 hit, or a raw person box alone, in the right's crosswalk zone in the road's frame 60 deg into the turn, or 4 m off the
+  model's curved path 20 m on: no clearBox lift, the handback at STALL_PROMPT_S as today."""
+  def run(objects=(), raw=None, model=None, deg=60.):
+    sim = stalled_right(True, deg)
+    d = sim.tp.follower.distance
+    x, y = car_frame(sim, d + 3., -12.)
+    assert math.hypot(x, y) > 5. and abs(y) > 4.6, (x, y)  # in the zone, clear of the straight corridor and the path
+    if raw == 'box':
+      sim.raw = lambda s: RawFrame([raw_person(x, y)], 'road', s.t)
+    if model is not None:
+      sim.model = model
+    obj = [{'cls': 'pedestrian', 'x': x, 'y': y, 'vx': 0., 'vy': 0., 'inPath': False, 'age': 1}] if objects == 'zone' else list(objects)
+    plans = stand(sim, STALL_PROMPT_S + 2., objects=obj)
+    return plans
+  for kind in ({'objects': 'zone'}, {'raw': 'box'}):
+    plans = run(**kind)
+    assert not lifts_of(plans), kind
+    first = next(i for i, q in enumerate(plans) if q.controlPrompt == 'stalledTakeControl')
+    assert abs(first * DT_MDL - STALL_PROMPT_S) < 0.15, kind
+
+  def curved(sim):
+    m = model_v2(holds=True).as_builder()
+    xs = [float(v) for v in ModelConstants.X_IDXS]
+    m.position.x = xs
+    m.position.y = [0.02 * x * x for x in xs]  # modelV2's y is right: curving right, 8 m right of the axis 20 m on
+    return m.as_reader()
+  person = {'cls': 'pedestrian', 'x': 20., 'y': -4., 'vx': 0., 'vy': 0., 'inPath': False}  # 4 m left of the path there
+  plans = run(objects=[person], model=curved, deg=30.)
+  assert not lifts_of(plans)
+  assert any(q.controlPrompt == 'stalledTakeControl' for q in plans)
+  plans = run(objects=[dict(person, y=4.)], model=curved, deg=30.)  # 12 m off the path, out of the zone: lifted
+  assert lifts_of(plans)
+
+
+def test_a_person_coming_near_the_turn_mid_lift_withdraws_it():
+  sim = stalled_right(True, 60.)
+  plans = stand(sim, STALL_PROMPT_S + 0.5)
+  assert lifts_of(plans) and str(plans[-1].goCertified.cause) == 'clearBox'
+  x, y = car_frame(sim, sim.tp.follower.distance + 3., -12.)
+  person = [{'cls': 'pedestrian', 'x': x, 'y': y, 'vx': 0., 'vy': 0., 'inPath': False, 'age': 1}]
+  q = stand(sim, DT_MDL, objects=person)[0]
+  assert str(q.goCertified.cause) == 'none' and sim.tp.go_cert.end == 'person'
+  plans = stand(sim, 6., objects=person)
+  assert not lifts_of(plans) and any(p.controlPrompt == 'stalledTakeControl' for p in plans)
+
+
+def test_a_stall_with_a_model_lead_or_in_a_far_side_turn_is_never_lifted():
+  """ALWAYS_DRIVE.md LEFT-21, ST-10: a model lead within 15 m (the g62 phantom, the s20 mailbox) refuses the lift, the handback
+  at STALL_PROMPT_S as now; a far-side turn stalled in the junction is never lifted (nothing the lift checks sees the oncoming
+  lanes), nor pulsed."""
+  sim = stalled_right(True)
+  plans = stand(sim, STALL_PROMPT_S + 2., lead_prob=0.95, lead_x=8.)
+  assert not lifts_of(plans)
+  assert abs(next(i for i, q in enumerate(plans) if q.controlPrompt == 'stalledTakeControl') * DT_MDL - STALL_PROMPT_S) < 0.15
+  sim = Sim([(300., "turn", "left", T_LEFT), (1500., "turn", "right", junction_of("right"))], cruise=8.)
+  sim.tp.always_drive = True
+  model_stands_in_the_turn(sim, 45., side=1)
+  plans = stand(sim, STALL_PROMPT_S + 2.)
+  assert not lifts_of(plans) and not edges_of(plans, Desire.turnLeft)
+  assert any(q.controlPrompt == 'stalledTakeControl' for q in plans)

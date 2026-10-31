@@ -227,6 +227,9 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     # PERF_BACKLOG PF-14: the model standing the car with nothing of TurnPilot's holding it (turnpilotd.py stopped_unheld),
     # at the status line's note (STOPPED_NOTE_S), for ABORT_HOLD_S: the note's info chime, once a stand; the handback after is unchanged
     carStoppedNote @24;
+    # ALWAYS_DRIVE.md LEFT-21 (TurnPilotAlwaysDrive): a clearBox lift for a stand partway round a curb-side turn, nothing ahead
+    # and nobody near its path (turnpilotd.py stalled_in_turn): "Stalled: finishing the turn", a chime, at each lift
+    stallLift @25;
   }
   mapControl @24 :MapControlStatus;
   controlPrompt @25 :ControlPrompt;

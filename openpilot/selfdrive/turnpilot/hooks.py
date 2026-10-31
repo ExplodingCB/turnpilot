@@ -54,7 +54,7 @@ def limits_plan(sm, now: float | None = None):
 # above too fast to turn. The stop-sign decider's (stop_go.py): a cross vehicle met in a lane, the cross-traffic camera paused
 # while held, stalled past the in-lane point: said with a chime, never a handback themselves
 CONTROL_ALERT_FIRST = ('hardBrake', 'cannotStopComfortably', 'offRouteStopsUnknown', 'oncomingHolding', 'crossTrafficAfterCommit',
-                       'cameraPaused', 'stalledInJunction', 'overrideWriteFailed', 'otherTurn')
+                       'cameraPaused', 'stalledInJunction', 'overrideWriteFailed', 'otherTurn', 'stallLift')
 # handbacks: the car held while the driver is told to take control (map_controls.py, turnpilotd.py), above too fast to turn
 TAKE_CONTROL_PROMPTS = ('stopSignTakeControl', 'unprotectedTurnTakeControl', 'carStoppedTakeControl', 'stalledTakeControl',
                         'cantStartTakeControl', 'leftUndecidedTakeControl', 'signalUnseenTakeControl',
@@ -173,6 +173,7 @@ CONTROL_ALERT_TEXT = {
   'crossTrafficAfterCommit': 'Cross traffic: carrying on through the junction',
   'cameraPaused': 'Cross-traffic camera paused: holding',
   'stalledInJunction': 'Stalled in the junction: going again',
+  'stallLift': 'Stalled: finishing the turn',  # under TurnPilotAlwaysDrive, a lift for a stand in a curb-side turn (LEFT-21)
   'overrideWriteFailed': 'Stop sign junction not saved: the route may use it again',
   'otherTurn': "The route's turn can't be checked here: rerouting after it",
   # the route's stop signs (route_notice.py): their own text is turnpilotPlan.routeNotice, these stand in without it
