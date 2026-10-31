@@ -43,6 +43,28 @@ def test_unreadable_car_params_fail_safe():
   assert turnpilotd.driver_signals_for(turnpilotd.custom.TurnpilotPlan.TurnSignal.Status.off)
 
 
+
+def test_unverified_why_follows_the_vinless_opt_in():
+  """turnpilotd says why mode on found no record ("Car Signals Not Verified") as card's resolver decided it: on a zero VIN,
+  unreadable with TurnPilotCarSignalsVinless off; with it on, matched on the DongleId, the firmware's exact fingerprint and
+  the exact carFw list, and void when the comma or the firmware differs."""
+  from openpilot.selfdrive.turnpilot.car_signals import fw_list
+  fw = [{'ecu': 'eps', 'address': 0x730, 'fwVersion': b'TeM3_E014p10_0.0.0 (35),E014.21.2', 'brand': 'tesla'}]
+  cp = car.CarParams.new_message(carVin="0" * 17, carFingerprint='TESLA_MODEL_3', fingerprintSource='fw', carFw=fw).as_reader()
+  record = {'onReason': 9, 'gear': 'P', 'onSeparates': False, 'vin': "0" * 17, 'fw': fw_list(cp.carFw), 'exteriorConfirmed': 1.,
+            'dongleId': "0123456789abcdef", 'carFingerprint': 'TESLA_MODEL_3'}
+  params = FakeParams(TurnPilotCarSignalsVerified=record, DongleId="0123456789abcdef")
+  assert turnpilotd.unverified_why_for(params, cp) == "Car's VIN unreadable: can't match the record"
+  params['TurnPilotCarSignalsVinless'] = False
+  assert turnpilotd.unverified_why_for(params, cp) == "Car's VIN unreadable: can't match the record"
+  params['TurnPilotCarSignalsVinless'] = True
+  assert turnpilotd.unverified_why_for(params, cp) == ""
+  params['DongleId'] = "fedcba9876543210"
+  assert turnpilotd.unverified_why_for(params, cp) == "Recorded on another comma: run the check"
+  params['DongleId'] = "0123456789abcdef"
+  updated = car.CarParams.new_message(carVin="0" * 17, carFw=[{**fw[0], 'fwVersion': b'TeM3_E014p10_0.0.0 (24),E014.20.2'}]).as_reader()
+  assert turnpilotd.unverified_why_for(params, updated) == "Car software changed: run the check again"
+
 def test_error_log_is_throttled():
   log = turnpilotd.ErrorLog()
   with mock.patch.object(turnpilotd.cloudlog, 'exception') as exception, mock.patch.object(turnpilotd.time, 'monotonic') as now:

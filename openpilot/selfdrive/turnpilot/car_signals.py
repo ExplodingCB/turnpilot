@@ -29,9 +29,18 @@ carry_veto, end()). Once the turn has started (moving into it with its desire ou
 force, or TurnPilot's go from a standstill out into it and not spent) it finishes, said ("Turn Signal Changed"), and a
 stop that then has the car never skips it: one veto, one decision per maneuver. A wrongSide fault with the other side's
 lamp lit (ours on the wrong side, or the driver's) is a veto too: the car never turns with the other side lit.
+
+The verified record matches the car's VIN and its exact firmware. Every Tesla's VIN reads as 17 zeros (opendbc has no
+Tesla VIN query), so on a Tesla a record can't match unless the owner opts in with TurnPilotCarSignalsVinless (default
+off): then, with the car's VIN all zeros or unreadable, a record the check made without a VIN matches on the comma's
+DongleId, the platform the firmware fingerprints exactly and the exact carFw list, all as the check recorded them, and
+only from a check in Park, so the ignition re-check proves the lamps at every start. Any of them differing (a Tesla
+update, another comma, the comma in another car whose firmware differs) voids it, said as every other mismatch is. A
+readable VIN matches by VIN only. With the opt-in off nothing differs from a build without it.
 """
 import datetime
 import json
+import os
 import secrets
 from dataclasses import dataclass
 
@@ -58,6 +67,8 @@ LAMP_GAP_S = 0.35           # opendbc car_signal.LAMP_GAP_S: the longest dark ru
 TURN_STARTED_DEG = 15.      # desire_timing.TURN_STARTED_DEG
 READY_PORT = ('ready', 'requesting', 'lit', 'releasing')
 MODES = ('off', 'check', 'on')
+VINLESS_KEY = "TurnPilotCarSignalsVinless"   # the owner's opt-in: a record may match without a VIN (match_record)
+UNREGISTERED_DONGLE_ID = "UnregisteredDevice"  # system/athena/registration.py's: the same on every comma, never an identity
 SIDE_NAME = {LaneChange.left: 'left', LaneChange.right: 'right'}
 
 
@@ -139,21 +150,100 @@ def fw_list(car_fw) -> list:
   return sorted([[str(f.ecu), int(f.address), int(f.subAddress), bytes(f.fwVersion).hex()] for f in car_fw])
 
 
-def record_matches(record, vin: str, car_fw, simulation: bool = False) -> tuple[bool, str]:
-  """Whether a TurnPilotCarSignalsVerified record is this car's, and why not."""
+@dataclass(frozen=True)
+class CarIdentity:
+  """What a record made without a VIN matches on besides the exact carFw list (TurnPilotCarSignalsVinless on): the comma's
+  DongleId and the platform its firmware fingerprints exactly, '' when it doesn't (fw_fingerprint)."""
+  dongle_id: str
+  car_fingerprint: str
+
+
+def fw_fingerprint(vin: str, car_fw) -> str:
+  """The platform get_car takes from this firmware (opendbc car_helpers.fingerprint, fingerprintSource fw): the one car it
+  matches exactly. '' when it matches none, two, or only fuzzily (get_car falls to the CAN fingerprint), when nothing
+  answered, and with a FINGERPRINT override (get_car's fixed source): no platform the firmware picked."""
+  if os.environ.get('FINGERPRINT', ''):
+    return ''
+  from opendbc.car.fw_versions import match_fw_to_car  # every brand's tables: loaded only for the opt-in
+  exact, matches = match_fw_to_car(list(car_fw), vin, allow_fuzzy=False, log=False)
+  return str(next(iter(matches))) if exact and len(matches) == 1 else ''
+
+
+def read_vinless(params) -> bool:
+  """TurnPilotCarSignalsVinless, the owner's opt-in to match a record without a VIN: off unless set, and off on a params
+  library that predates the key."""
+  try:
+    return bool(params.get(VINLESS_KEY))
+  except Exception:  # UnknownKeyName
+    cloudlog.error(f"turnpilot: {VINLESS_KEY} unknown to this build's params, records match by VIN only; run scons")
+    return False
+
+
+def identity_for(params, vin: str, car_fw) -> CarIdentity | None:
+  """This car's CarIdentity for a record without a VIN, or None with TurnPilotCarSignalsVinless off: a record then
+  matches by VIN only, as it always has. card's resolver and check, turnpilotd and the preflight all form it here."""
+  if not read_vinless(params):
+    return None
+  try:
+    dongle = params.get("DongleId") or ''
+  except Exception:
+    dongle = ''
+  return CarIdentity(str(dongle), fw_fingerprint(vin, car_fw))
+
+
+def match_record(record, vin: str, car_fw, simulation: bool = False, identity: CarIdentity | None = None) -> tuple[bool, str, str]:
+  """Whether a TurnPilotCarSignalsVerified record is this car's, why not, and which way it matched: 'vin' (the car's VIN
+  and firmware), 'vinless' (identity given and the car's VIN unreadable: _match_vinless) or 'sim' (a simulator record
+  in the sim); '' when it didn't. identity None (the opt-in off) is the match as it always was."""
   if not record:
-    return False, "Run the turn signal check"
+    return False, "Run the turn signal check", ''
   if record.get('sim') and not simulation:
-    return False, "A simulator record: run the check on the car"
+    return False, "A simulator record: run the check on the car", ''
   if not record.get('sim') and not vin_valid(vin):
-    return False, "Car's VIN unreadable: can't match the record"
+    if identity is None:
+      return False, "Car's VIN unreadable: can't match the record", ''
+    return _match_vinless(record, car_fw, identity)
   if record.get('vin') != vin:
-    return False, "Recorded for another car: run the check"
+    return False, "Recorded for another car: run the check", ''
   if record.get('fw') != fw_list(car_fw):
-    return False, "Car software changed: run the check again"
+    return False, "Car software changed: run the check again", ''
   if not record.get('exteriorConfirmed'):
-    return False, "Confirm the outside lamps on the phone"
-  return True, ""
+    return False, "Confirm the outside lamps on the phone", ''
+  return True, "", 'sim' if record.get('sim') else 'vin'
+
+
+def _match_vinless(record, car_fw, identity: CarIdentity) -> tuple[bool, str, str]:
+  """A car whose VIN reads as zeros or fails its check digit, with the owner's opt-in: a record the check made without a
+  VIN matches on the comma's DongleId (a registered one), the exact carFw list (every ECU and version string, the EPS's
+  included) and the platform that firmware fingerprints exactly, all as the check recorded them; and only from a check
+  in P, so the port's 8 s re-check in P (DESIGN 7.5) proves the lamps at every ignition. A record made with a VIN
+  matches only that VIN. The DongleId names the comma, not the car: a comma moved to another car of the same platform
+  and firmware matches, and only the re-check sees that car's lamps."""
+  if vin_valid(record.get('vin')):
+    return False, "Car's VIN unreadable: can't match the record", ''
+  if record.get('dongleId') is None or record.get('carFingerprint') is None:
+    return False, "Checked before VIN-less was on: run it again", ''
+  if identity.dongle_id in ('', UNREGISTERED_DONGLE_ID):
+    return False, "No dongle ID: can't match without a VIN", ''
+  if record['dongleId'] != identity.dongle_id:
+    return False, "Recorded on another comma: run the check", ''
+  if record.get('fw') != fw_list(car_fw):
+    return False, "Car software changed: run the check again", ''
+  if not identity.car_fingerprint:
+    return False, "No exact firmware fingerprint: can't match", ''
+  if record['carFingerprint'] != identity.car_fingerprint:
+    return False, "Recorded for another car: run the check", ''
+  if record.get('gear') != 'P':
+    return False, "Checked in Drive: without a VIN, check in P", ''
+  if not record.get('exteriorConfirmed'):
+    return False, "Confirm the outside lamps on the phone", ''
+  return True, "", 'vinless'
+
+
+def record_matches(record, vin: str, car_fw, simulation: bool = False, identity: CarIdentity | None = None) -> tuple[bool, str]:
+  """Whether a TurnPilotCarSignalsVerified record is this car's, and why not (match_record)."""
+  ok, why, _ = match_record(record, vin, car_fw, simulation, identity)
+  return ok, why
 
 
 def wall_time() -> str:
@@ -190,6 +280,9 @@ def promote(params) -> None:
   if verdict == 'yes':
     record = {**check['record'], 'vin': check.get('vin'), 'fw': check.get('fw'), 'checkId': check_id,
               'exteriorConfirmed': wall_time(), 'when': check.get('when'), 'opendbc': check.get('opendbc', '')}
+    for key in ('dongleId', 'carFingerprint'):  # the identity a check with TurnPilotCarSignalsVinless on recorded
+      if key in check:
+        record[key] = check[key]
     if check.get('sim'):
       record['sim'] = True
     params.put("TurnPilotCarSignalsVerified", record)
@@ -220,18 +313,24 @@ def resolver(params, simulation: bool = False):
       record = params.get("TurnPilotCarSignalsVerified")
     except Exception:
       record = None
-    ok, why = record_matches(record, vin, car_fw, simulation)
+    ok, why, how = match_record(record, vin, car_fw, simulation, identity_for(params, vin, car_fw))
     if not ok:
       cloudlog.error(f"turnpilot: car signals on but not verified for this car: {why}")
       return CarSignalsConfig()
+    if how == 'vinless':
+      cloudlog.warning(f"turnpilot: car signals on without a VIN ({VINLESS_KEY}): the record matched this comma's DongleId, " +
+                       "the firmware's exact fingerprint and the exact carFw list")
     return CarSignalsConfig(mode='on', on_reason=int(record.get('onReason', 8)), recheck=record.get('gear') == 'P',
                             on_separates=bool(record.get('onSeparates')))
   return resolve
 
 
-def check_record(result: dict, vin: str, car_fw, sim: bool = False) -> dict:
-  """What card writes to TurnPilotCarSignalsCheck from a finished check (opendbc LampCheck.result)."""
+def check_record(result: dict, vin: str, car_fw, sim: bool = False, identity: CarIdentity | None = None) -> dict:
+  """What card writes to TurnPilotCarSignalsCheck from a finished check (opendbc LampCheck.result); with identity (the
+  opt-in on at the check, identity_for) also what a record without a VIN matches on."""
   out = {**result, 'vin': vin, 'fw': fw_list(car_fw), 'when': wall_time()}
+  if identity is not None:
+    out['dongleId'], out['carFingerprint'] = identity.dongle_id, identity.car_fingerprint
   if result.get('pass'):
     out['checkId'] = secrets.token_hex(4)
     out['exterior'] = 'pending'

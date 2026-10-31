@@ -97,6 +97,8 @@ On a Tesla, TurnPilot can work the car's own turn signal through `DAS_bodyContro
 2. When it passes, the card asks whether the front, side and rear lamps flashed outside on each side. Answer it, then set the mode to **on**.
 3. At the next ignition the car checks the record against its VIN and firmware. A record from a check in Park also blinks each side once in Park before the first drive. A Tesla update that changes the firmware voids the record: run the check again.
 
+A Tesla's VIN reads as 17 zeros (opendbc has no Tesla VIN query), so on a Tesla the record can't match by VIN and the car signal stays off. To match it without a VIN, set `TurnPilotCarSignalsVinless` to 1 **before** the check (`python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotCarSignalsVinless=1`), then run the check in Park. The record then fits only this comma (its registered dongle ID), the platform the car's firmware fingerprints exactly, and the exact firmware list. A record from a check in Drive never matches this way, and neither does a record from a check run before the setting was on. A Tesla update, another comma, or the comma moved to a car whose firmware differs voids the record, and the car says why ("Car Signals Not Verified"). The dongle ID names the comma, not the car: moved to another car of the same model and firmware, the record still fits, and only the Park re-check at each ignition tests that car's lamps. A car whose VIN does read matches by VIN only.
+
 | Param | Value | What it does |
 | --- | --- | --- |
 | `TurnPilotCarSignals` | `off` | `off`: the driver signals, prompted, and no 0x3E9 is ever sent. `check`: the lamp check runs on the next ignition, and the comma writes `off` back as soon as it reads it. `on`: the car signals TurnPilot's turns and lane changes, if this car has a verified record. Any other value is `off`, logged as an error. Read once per ignition. |
@@ -104,6 +106,7 @@ On a Tesla, TurnPilot can work the car's own turn signal through `DAS_bodyContro
 | `TurnPilotCarSignalsCheck` | written by the comma | The last check's result, pass or fail, with every measurement and the step that failed. |
 | `TurnPilotCarSignalsCheckNow` | set by the phone | One-shot "Start check in Drive". Cleared at every ignition. |
 | `TurnPilotCarSignalsExterior` | set by the phone | Your answer to the outside-lamp question, for the pending check only. |
+| `TurnPilotCarSignalsVinless` | 0 | 1: the owner's opt-in. With the car's VIN unreadable, as on every Tesla, a check records this comma's dongle ID and the car's firmware fingerprint, and a record from a check in Park matches on those and the exact firmware list instead of the VIN. 0: a record matches by VIN only. Read once per ignition. |
 
 In the BeamNG sim the car signals by default: `launch_openpilot.sh` and `run_bridge.py` write `on` and a sim record that the comma accepts only with `SIMULATION=1`. `run_bridge.py --no-car-signals` (with `TURNPILOT_CAR_SIGNALS=0` for `launch_openpilot.sh`) writes `off`.
 

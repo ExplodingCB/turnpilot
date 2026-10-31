@@ -22,6 +22,11 @@ messages sit on turnpilotPlan's, turnpilotDetections' and turnpilotFarDetections
 carState.carSignal; its events are numbered differently, so their names are listed, not judged; fingerprintSource fixed is
 its vehicle selector, and the EPS line decides whether this fork would match the car.
 
+With TurnPilotCarSignals on, the car signals line says whether the verified record matches as card's resolver matches it
+(car_signals.match_record) and which way: by VIN and firmware, or, with the owner's TurnPilotCarSignalsVinless on and the
+VIN unreadable, without a VIN on this comma's DongleId, the firmware's exact fingerprint and the exact carFw list. It reads
+DongleId and never prints it.
+
 Exit 0 when every line is GO, WARN or INFO; 1 on any NO-GO; 2 on any UNKNOWN without a NO-GO. A route can't show the map key
 and certificate (DONT_LOG), so a route never exits 0.
 
@@ -100,10 +105,12 @@ REQUIRED = (  # (key, the value Saturday needs, None for unset, how to set it)
   ("TurnPilotLeftRangeM", 0., f"{PREFLIGHT_SET} TurnPilotLeftRangeM=0"),
   ("TurnPilotValhallaTiles", None, f"{PREFLIGHT_SET} TurnPilotValhallaTiles= (empty clears it)"),
 )
-NOTED = ("TurnPilotShadowMode", "DisableUpdates", "TurnPilotLeftFarRangeM", "TurnPilotAutoLeft", "TurnPilotGoOverride", "TurnPilotNoMoveS")
+NOTED = ("TurnPilotShadowMode", "DisableUpdates", "TurnPilotLeftFarRangeM", "TurnPilotAutoLeft", "TurnPilotGoOverride", "TurnPilotNoMoveS",
+         "TurnPilotCarSignalsVinless")
 MAP_PARAMS = ("TurnPilotMapHost", "TurnPilotMapKey", "TurnPilotMapCert")
 DONT_LOG = ("TurnPilotMapKey", "TurnPilotMapCert")  # params_keys.h: loggerd logs them with no value; kept equal by a test
-OTHER_PARAMS = ("IsReleaseBranch", "TurnPilotCarSignalsVerified", "ChestnutLoading")
+OTHER_PARAMS = ("IsReleaseBranch", "TurnPilotCarSignalsVerified", "ChestnutLoading", "DongleId")  # DongleId: read, never printed
+VINLESS = "TurnPilotCarSignalsVinless"  # car_signals.VINLESS_KEY, kept equal by a test
 PARAM_KEYS = tuple(k for k, _, _ in REQUIRED) + NOTED + MAP_PARAMS + OTHER_PARAMS
 SUNNYPILOT_CONTEXT = ("AlphaLongitudinalEnabled", "DisengageOnAccelerator", "Mads")  # how sunnypilot was set, said on its log
 
@@ -343,6 +350,28 @@ def di_span(f: Facts, tt: int) -> float:
 def vin_valid(vin: str) -> bool:
   from openpilot.selfdrive.turnpilot.car_signals import vin_valid as valid
   return valid(vin)
+
+
+def vinless_on(pv: ParamView) -> bool:
+  """TurnPilotCarSignalsVinless, the owner's opt-in to match a car-signal record without a VIN; off for a library without it."""
+  p = pv.get(VINLESS)
+  return p.state != "unknown" and bool(p.value)
+
+
+class ParamValues:
+  """A ParamView as the params car_signals.identity_for reads: each key's value, None for one this build lacks."""
+  def __init__(self, pv: ParamView):
+    self.pv = pv
+
+  def get(self, key: str):
+    p = self.pv.get(key)
+    return None if p.state in ("unknown", "unlogged") else p.value
+
+
+def signal_identity(f: Facts, pv: ParamView):
+  """The identity card's resolver forms for this car (car_signals.identity_for): None with the opt-in off."""
+  from openpilot.selfdrive.turnpilot.car_signals import identity_for
+  return identity_for(ParamValues(pv), f.cp.carVin, f.cp.carFw) if f.cp is not None and vinless_on(pv) else None
 
 
 def fw_text(cp) -> str:
@@ -597,7 +626,7 @@ def check_panda_long(f: Facts) -> list[Line]:
   return lines
 
 
-def check_turn_signal_frame(f: Facts) -> Line:
+def check_turn_signal_frame(f: Facts, pv: ParamView) -> Line:
   name = "turn-signal frame"
   tt, why = can_window(f)
   if tt is None:
@@ -622,7 +651,9 @@ def check_turn_signal_frame(f: Facts) -> Line:
     text = (f"present on src 2 at {hz:.1f} Hz ({len(src2)} frames, dlc {dlc}); {len(src128)} forwarded on src 128{equal}; " +
             f"openpilot sent {len(f.sent[DAS_BODY_CONTROLS])}; HAS_BODY_CONTROLS {'set' if body else 'clear'}" +
             (" (sunnypilot's port never sets it)" if f.sunnypilot else "") + ": a lamp check can run")
-    if not vin_ok:
+    if not vin_ok and vinless_on(pv):
+      text += f", and with the VIN unreadable car signals turn on only from a record made without a VIN ({VINLESS} on)"
+    elif not vin_ok:
       text += ", but car signals can't turn on while the VIN is unreadable"
   else:
     text = f"absent on src 2 in {span:.0f} s: the car can't signal, the driver signals"
@@ -675,25 +706,45 @@ def check_car_signals(f: Facts, pv: ParamView) -> Line:
     return Line(name, status, f'off{default}: the driver signals when prompted ("Signal Left", "Signal Right"){tail}')
   fix = f"{PREFLIGHT_SET} TurnPilotCarSignals=off"
   if mode == "check":
-    return Line(name, WARN, f"check: this ignition runs the lamp check; Saturday plans for off{tail}", fix)
+    record = ""
+    if f.cp is not None and not vin_valid(f.cp.carVin):
+      vin = "zero VIN" if set(f.cp.carVin) <= {"0"} else "unreadable VIN"
+      record = f"; its record keeps this comma's DongleId and the firmware's fingerprint ({VINLESS} on)" if vinless_on(pv) else \
+               f"; its record can't match this car's {vin} ({VINLESS} off)"
+    return Line(name, WARN, f"check: this ignition runs the lamp check; Saturday plans for off{record}{tail}", fix)
   if mode == "on":
-    from openpilot.selfdrive.turnpilot.car_signals import record_matches
-    record = pv.get("TurnPilotCarSignalsVerified").value
-    ok, why = record_matches(record, f.cp.carVin, f.cp.carFw) if f.cp is not None else (False, "no carParams")
-    return Line(name, WARN, f"on: Saturday plans for off; the verified record {'matches' if ok else 'does not match: ' + why}{tail}", fix)
+    return Line(name, WARN, f"on: Saturday plans for off; the verified record {record_said(f, pv)}{tail}", fix)
   return Line(name, WARN, f"{mode!r} isn't off, check or on: read as off{tail}", fix)
 
 
-def check_vin(f: Facts) -> Line:
+def record_said(f: Facts, pv: ParamView) -> str:
+  """Whether the verified record matches this car as card's resolver matches it (car_signals.match_record), and which way:
+  by VIN and firmware, or without a VIN on the opt-in's identity; why not when it doesn't. Never the DongleId or VIN."""
+  from openpilot.selfdrive.turnpilot.car_signals import match_record
+  if f.cp is None:
+    return "does not match: no carParams"
+  identity = signal_identity(f, pv)
+  ok, why, how = match_record(pv.get("TurnPilotCarSignalsVerified").value, f.cp.carVin, f.cp.carFw, identity=identity)
+  if ok and how == "vinless":
+    return f"matches without a VIN ({VINLESS}): this comma's DongleId, {identity.car_fingerprint} by its firmware and the exact carFw list"
+  if ok:
+    return "matches by VIN and firmware" if how == "vin" else "matches as a simulator record"
+  if identity is None and why == "Car's VIN unreadable: can't match the record":
+    return f"does not match: {why} ({VINLESS} off: a record matches by VIN only)"
+  return f"does not match: {why}"
+
+
+def check_vin(f: Facts, pv: ParamView) -> Line:
   name = "VIN"
   if f.cp is None:
     return Line(name, UNKNOWN, "no carParams")
   vin = f.cp.carVin
   if vin_valid(vin):
     return Line(name, INFO, "valid, check digit passes (not printed)")
+  can = f"a car-signal record matches only without a VIN ({VINLESS} on)" if vinless_on(pv) else "a car-signal record can't match"
   if not vin or set(vin) <= {"0"}:
-    return Line(name, INFO, "all zeros, as on every Tesla (opendbc has no Tesla VIN query): a car-signal record can't match")
-  return Line(name, INFO, "unreadable, the check digit fails: a car-signal record can't match")
+    return Line(name, INFO, f"all zeros, as on every Tesla (opendbc has no Tesla VIN query): {can}")
+  return Line(name, INFO, f"unreadable, the check digit fails: {can}")
 
 
 def check_calibration(f: Facts) -> Line:
@@ -902,6 +953,11 @@ def noted(p: Param) -> Line:
       Line(key, WARN, f"{text}: off turns the skip into a handback at the line", f"{PREFLIGHT_SET} TurnPilotAutoLeft=auto")
   if key == "TurnPilotGoOverride":
     return Line(key, INFO, f"{text}: TurnPilot's certified go from a standstill (plannerd's bounded lift)")
+  if key == VINLESS:
+    return Line(key, INFO, f"{text}: a car-signal record matches by VIN only, so never on a car whose VIN reads as zeros") if not v else \
+      Line(key, WARN, f"{text}: the owner's opt-in: with the VIN unreadable a car-signal record matches without a VIN, on this " +
+           "comma's DongleId, the firmware's exact fingerprint and the exact carFw list, from a check in P",
+           f"{PREFLIGHT_SET} {VINLESS}=0 unless the owner chose it")
   return Line(key, INFO, f"{text}: seconds a standstill turn waits for the car to pull away before it hands back")
 
 
@@ -941,8 +997,8 @@ def check_params(f: Facts, pv: ParamView) -> list[Line]:
 
 def evaluate(f: Facts, pv: ParamView) -> list[Line]:
   lines = [check_branch(f, pv), check_car(f), *check_eps(f), check_source(f), check_three_bit(f), check_das_settings(f),
-           check_longitudinal(f, pv), check_panda(f), *check_panda_long(f), check_turn_signal_frame(f), *check_stalk(f),
-           check_car_signals(f, pv), check_vin(f), check_calibration(f), check_camera(f), check_big_model(f),
+           check_longitudinal(f, pv), check_panda(f), *check_panda_long(f), check_turn_signal_frame(f, pv), *check_stalk(f),
+           check_car_signals(f, pv), check_vin(f, pv), check_calibration(f), check_camera(f), check_big_model(f),
            check_detector(f, pv), check_faults(f), check_health(f), *check_params(f, pv)]
   return lines + [Line(name, INFO, how) for name, how in BY_HAND]
 
