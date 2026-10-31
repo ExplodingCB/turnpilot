@@ -99,7 +99,7 @@ REQUIRED = (  # (key, the value Saturday needs, None for unset, how to set it)
   ("TurnPilotCarSignals", "off", f"{PREFLIGHT_SET} TurnPilotCarSignals=off"),
   ("TurnPilotCameraLights", "shadow", f"{PREFLIGHT_SET} TurnPilotCameraLights=shadow"),
   ("TurnPilotCameraStopSigns", "shadow", f"{PREFLIGHT_SET} TurnPilotCameraStopSigns=shadow"),
-  ("TurnPilotStopSignGo", "off", f"{PREFLIGHT_SET} TurnPilotStopSignGo=off"),
+  ("TurnPilotStopSignGo", "vision", f"{PREFLIGHT_SET} TurnPilotStopSignGo=vision"),
   ("TurnPilotAvoidStops", True, f"{PREFLIGHT_SET} TurnPilotAvoidStops=1"),
   ("TurnPilotCurbPedCap", True, f"{PREFLIGHT_SET} TurnPilotCurbPedCap=1"),
   ("TurnPilotLeftRangeM", 0., f"{PREFLIGHT_SET} TurnPilotLeftRangeM=0"),
@@ -939,9 +939,9 @@ def check_health(f: Facts) -> Line:
 
 def noted(p: Param) -> Line:
   key, v, text = p.key, p.value, shown(p)
-  if key == "TurnPilotShadowMode":
-    return Line(key, INFO, f"{text}: TurnPilot computes and nothing acts") if v else \
-      Line(key, WARN, f"{text}: TurnPilot is live, it takes turns, changes lanes and brakes", f"{PREFLIGHT_SET} TurnPilotShadowMode=1 for the first drives")
+  if key == "TurnPilotShadowMode":  # Saturday runs live from the first drive: 0, the default
+    return Line(key, INFO, f"{text}: TurnPilot is live, it takes turns, changes lanes and brakes") if not v else \
+      Line(key, WARN, f"{text}: TurnPilot computes and nothing acts", f"{PREFLIGHT_SET} TurnPilotShadowMode=0 to drive live")
   if key == "DisableUpdates":
     return Line(key, INFO, f"{text}: no update can land mid-test") if v else \
       Line(key, WARN, f"{text}: the updater can fetch another build on a test day", f"{PREFLIGHT_SET} DisableUpdates=1")
@@ -979,6 +979,9 @@ def check_params(f: Facts, pv: ParamView) -> list[Line]:
     ok = p.value in (None, "") if want is None else p.value == want and type(p.value) is type(want)
     if ok:
       lines.append(Line(key, GO, shown(p)))
+    elif key == "TurnPilotStopSignGo" and p.value == "off":  # Saturday's fallback when preflight's stop-sign go line WARNs
+      lines.append(Line(key, WARN, f"{shown(p)}: every stop sign and yield hands back after 1 s; Saturday runs vision unless " +
+                        "preflight's stop-sign go line WARNs", fix))
     else:
       need = "unset" if want is None else shown(Param(key, "set", want))
       lines.append(Line(key, NO_GO, f"{shown(p)}, Saturday needs {need}", fix))

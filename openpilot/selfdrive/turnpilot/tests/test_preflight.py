@@ -50,10 +50,12 @@ def test_alpha_long():
 
 
 def test_shadow():
+  # Saturday runs live from the first drive (TurnPilotShadowMode 0, the default): live is INFO, shadow mode the WARN
   assert preflight.check_shadow(False, False).status == INFO
-  assert preflight.check_shadow(True, True).status == INFO
   live = preflight.check_shadow(True, False)
-  assert live.status == WARN and "TurnPilotShadowMode=1" in live.fix
+  assert live.status == INFO and "live" in live.detail and not live.fix
+  shadow = preflight.check_shadow(True, True)
+  assert shadow.status == WARN and "nothing acts" in shadow.detail and "TurnPilotShadowMode=0" in shadow.fix
 
 
 def test_always_drive():

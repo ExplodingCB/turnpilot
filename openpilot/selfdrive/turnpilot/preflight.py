@@ -84,13 +84,13 @@ def check_gas_disengages(enabled: bool) -> Check:
 
 
 def check_shadow(enabled: bool, shadow: bool) -> Check:
+  """TurnPilotShadowMode: off (the default) is live from the first drive, as Saturday runs; on, nothing TurnPilot plans acts."""
   name = "shadow mode"
   if not enabled:
     return Check(name, INFO, "TurnPilot is off")
   if shadow:
-    return Check(name, INFO, "on: TurnPilot computes its plan and nothing acts on it")
-  return Check(name, WARN, "OFF: TurnPilot will take turns, change lanes and brake",
-               "use shadow mode on the first drives: preflight --set TurnPilotShadowMode=1")
+    return Check(name, WARN, "on: TurnPilot computes its plan and nothing acts on it", "to drive live: preflight --set TurnPilotShadowMode=0")
+  return Check(name, INFO, "off: TurnPilot is live, it takes turns, changes lanes and brakes")
 
 
 UNKNOWN_KEY = object()  # a param this build's params library doesn't know (collect)
