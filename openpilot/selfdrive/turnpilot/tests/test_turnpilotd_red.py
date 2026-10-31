@@ -51,3 +51,26 @@ def test_no_turn_desire_lift_or_go_comes_on_a_red(maneuver, overrun):
     go.append(sim.step(engaged=True))
     assert len(go) < 100
   assert go[-1].desire == want  # the go's pulse at standstill on the green (none straight on)
+
+
+def test_the_cameras_shadow_red_alone_holds_the_turn_desire_until_it_reads_green():
+  # Saturday's car: no source TurnPilot accepts reads the light (the model alone stops for it), the camera's shadow reader
+  # reads it red. No turn desire while it does, standing or rolling; it reads green and the turn's desire goes out
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_go import RIGHT_AT_A_SIGNAL, camera_reads, model_stops_at
+  sim = Sim(RIGHT_AT_A_SIGNAL, controls=[(S_SIGNAL, 'signal')])
+  sim.go_taps = False
+  state = {'s': 'red'}
+  sim.lights = lambda sim: camera_reads(state['s'])(sim)
+  sim.accel = model_stops_at(289.)
+  plans = []
+  while not (sim.v < 0.05 and sim.s > 280.):
+    plans.append(sim.step(engaged=True))
+    assert sim.t < 90.
+  plans += [sim.step(engaged=True) for _ in range(int(10. / DT_MDL))]
+  sim.accel = lambda sim, plan: min(1., (sim.cruise - sim.v) / 2.)  # the model pulls away, the camera still red
+  while sim.s < 291.:
+    plans.append(sim.step(engaged=True))
+  assert not any(p.desire in TURNS for p in plans), "a turn desire on the camera's red"
+  state['s'] = 'green'
+  later = [sim.step(engaged=True) for _ in range(int(1.5 / DT_MDL))]
+  assert any(p.desire == Desire.turnRight for p in later)
