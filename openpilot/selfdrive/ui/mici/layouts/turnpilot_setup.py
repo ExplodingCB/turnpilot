@@ -187,7 +187,10 @@ class PhoneStep(SetupStep):
     return [self._qr, self._url_card]
 
   def step_state(self):
-    return ss.phone_state(ui_state.params, wall_time())
+    state = ss.phone_state(ui_state.params, wall_time())
+    if state.state != ss.GOOD and shown_url(self._url) == "no network":
+      return ss.StepState(ss.WAITING, "no network", "join Wi-Fi or the\nphone's hotspot")
+    return state
 
   def _update_state(self):
     super()._update_state()
