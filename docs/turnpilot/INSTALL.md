@@ -237,6 +237,21 @@ Turn the car off and on. modeld reads `TurnPilotEnabled` when it starts, and it 
 
 The page shows the route, the next maneuver, and TurnPilot's state. To start navigating, search for a place and tap Navigate. Place search needs internet through the hotspot.
 
+## Let TurnPilot drive on where it is unsure
+
+`TurnPilotAlwaysDrive` is the always-drive switch. Off, the default, TurnPilot hands back, skips or waits wherever it is unsure. On, it drives on in those places, and hands back, loudly, only where it made a mistake. It does nothing in shadow mode. The ALWAYS_DRIVE plan's steps S2 to S5 add what it changes; on a build without them the switch is read and printed and changes nothing. Set it parked, with the no-move limit Saturday uses:
+
+```
+python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotAlwaysDrive=1 --set TurnPilotNoMoveS=20
+```
+
+| Param | Value | What it does |
+| --- | --- | --- |
+| `TurnPilotAlwaysDrive` | 0 | 1: always drive (above). turnpilotd reads it every second, and navd reads it each time it routes. |
+| `TurnPilotNoMoveS` | 2 | Seconds a turn TurnPilot let go of at a standstill waits for the car to pull away before "Can't start the turn: take control", 2 to 20. An unprotected left's 1 s is fixed. Read every second. |
+
+Whatever the switch says, a lane change the turn needs that hasn't happened by 60 to 120 m before the turn skips the turn ("Can't Reach Turn Lane", "Rerouting"), and navd reroutes. The turn isn't made from the wrong lane. openpilot changes no lanes under 20 mph, so in slow traffic every turn that needs a lane change is skipped.
+
 ## Run preflight before every drive
 
 ```
@@ -251,6 +266,7 @@ Each line starts with PASS, FAIL, WARN or INFO. A FAIL line is followed by a `fi
 | `car` | The comma has identified the car, and it is not in dashcam mode |
 | `alpha longitudinal` | The toggle is on, and the last drive started with it |
 | `navigation`, `TurnPilot` | `NavigationEnabled` and `TurnPilotEnabled` are on |
+| `always drive` | An INFO line saying whether `TurnPilotAlwaysDrive` is on. It warns while TurnPilot is live with it off, and when the build's params don't know it |
 | `map server` | The address, key and certificate are set and the mapped area has been fetched |
 | `pyvalhalla`, `valhalla tiles`, `routing test` | pyvalhalla imports; with `TurnPilotValhallaTiles` set, those tiles are usable and a real route comes back |
 | `big driving model` | The 775 MB pickle and both warps are real files, not LFS pointers. If they are pointers, modeld quietly runs the small model |
