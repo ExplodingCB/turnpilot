@@ -67,7 +67,9 @@ RETIRED_PROMPTS = ('stopSignGo', 'signalGo', 'unprotectedTurnGo', 'carStoppedGo'
 RETIRED_ALERTS = ('goingOnRed',)
 CONTROL_ALERT_EVENTS = ('stopOverrun', 'proceedingOnYellow', 'junctionUncertain', 'carStoppedNote',  # below the prompt, above a lane change
                         'lightGreenNotMoving', 'unstickLift', 'pedestrianWaiting')
-CONTROL_STATUS_ALERTS = ('mapControlsUnavailable', 'lightSourceRejected', 'farViewOff', 'sideCamerasOff')  # last of all, a status line
+CONTROL_STATUS_ALERTS = ('mapControlsUnavailable', 'lightSourceRejected', 'farViewOff', 'sideCamerasOff',  # last of all, a status line
+                         'mapControlsUnavailableSilent')
+SILENT_STATUS_ALERTS = ('mapControlsUnavailableSilent',)  # ...that line with no sound (MC-03)
 # the route's stop signs (route_notice.py, STOP_SIGNS.md 3.4): said engaged or not (turnpilotRouteNotice, a permanent alert), the
 # text in turnpilotPlan.routeNotice; all but routeAvoidsStops with a chime
 ROUTE_NOTICES = ('routeAvoidsStops', 'routeDetour', 'stopsNeedYou', 'firstStopNeedsYou', 'stopRoutingFailed', 'stopAheadNeedsYou')
@@ -165,6 +167,7 @@ CONTROL_ALERT_TEXT = {
   'stopOverrun': 'Passed the stop line without stopping',
   'proceedingOnYellow': 'Too close to stop for the yellow',
   'mapControlsUnavailable': 'Map stops and signals unavailable',
+  'mapControlsUnavailableSilent': 'Map stops and signals unavailable',  # its status said already (MC-03): no sound
   'lightSourceRejected': 'Light source not accepted: lights unknown',
   'junctionUncertain': 'GPS unsure where the junction is: slow, may stop short of it',
   'offRouteStopsUnknown': 'Map stops unknown: take control or wait for reroute',

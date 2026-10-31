@@ -243,6 +243,9 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     # ALWAYS_DRIVE.md SC-02: the crosswalk hold has stood the car PED_NOTE_S (turnpilotd.py crosswalk_standoff): "Waiting for
     # pedestrian", a chime, once a hold
     pedestrianWaiting @28;
+    # ALWAYS_DRIVE.md MC-03 (TurnPilotAlwaysDrive): mapControlsUnavailable's line with no sound, once its status has been said
+    # (map_controls.py): its later onsets, after an alert covered it, are silent
+    mapControlsUnavailableSilent @29;
   }
   mapControl @24 :MapControlStatus;
   controlPrompt @25 :ControlPrompt;

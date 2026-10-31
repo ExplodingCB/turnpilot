@@ -14,7 +14,8 @@ from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.locationd.calibrationd import MIN_SPEED_FILTER
 from openpilot.common.hardware import HARDWARE
 from openpilot.selfdrive.turnpilot.hooks import (ABORT_TEXT, CAR_SIGNAL_EVENTS, CONTROL_ALERT_TEXT, CONTROL_PROMPT_TEXT, CONTROL_STATUS_ALERTS,
-                                               SILENT_PROMPTS, TAKE_CONTROL_PROMPTS, fresh_plan, lane_change_text, shown_plan, too_fast_title)
+                                               SILENT_PROMPTS, SILENT_STATUS_ALERTS, TAKE_CONTROL_PROMPTS, fresh_plan, lane_change_text, shown_plan,
+                                               too_fast_title)
 
 AlertSize = log.SelfdriveState.AlertSize
 AlertStatus = log.SelfdriveState.AlertStatus
@@ -349,6 +350,7 @@ CONTROL_PROMPT_TITLE = {'yieldAhead': "Yield Ahead", 'stopSignTakeControl': "Sto
 CONTROL_ALERT_TITLE = {'cannotStopComfortably': "Take Control", 'stopOverrun': "Stop Line Passed",
                        'proceedingOnYellow': "Proceeding on Yellow",
                        'mapControlsUnavailable': "Map Stops Unavailable", 'lightSourceRejected': "Light Source Rejected",
+                       'mapControlsUnavailableSilent': "Map Stops Unavailable",
                        'junctionUncertain': "Junction Position Uncertain", 'offRouteStopsUnknown': "Off Route",
                        'hardBrake': "Braking Hard", 'oncomingHolding': "Oncoming: Holding", 'farViewOff': "Far View Off",
                        'sideCamerasOff': "Side Cameras Off", 'crossTrafficAfterCommit': "Cross Traffic", 'cameraPaused': "Camera Paused",
@@ -403,7 +405,7 @@ def turnpilot_control_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.S
                  VisualAlert.steerRequired, AudibleAlert.prompt, .1)
   if kind in CONTROL_STATUS_ALERTS:
     return Alert(CONTROL_ALERT_TITLE[kind], plan.reason or CONTROL_ALERT_TEXT[kind], AlertStatus.normal, AlertSize.mid,
-                 Priority.LOWER, VisualAlert.none, AudibleAlert.prompt, .2)
+                 Priority.LOWER, VisualAlert.none, AudibleAlert.none if kind in SILENT_STATUS_ALERTS else AudibleAlert.prompt, .2)
   if kind == 'otherTurn':
     return Alert(OTHER_TURN_TITLE.get(str(plan.stopGo.maneuver), "Taking Another Turn"), CONTROL_ALERT_TEXT[kind], AlertStatus.userPrompt,
                  AlertSize.mid, Priority.LOW, VisualAlert.none, AudibleAlert.prompt, TURNPILOT_CONTROL_ALERT_S)

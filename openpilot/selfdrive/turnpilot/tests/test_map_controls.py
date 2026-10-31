@@ -4,7 +4,7 @@ import math
 import pytest
 
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_ACCEL_MIN, plan_accel
+from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, SPEED_CAP_ACCEL_MIN, plan_accel
 from openpilot.selfdrive.turnpilot.map_controls import (COMMIT_SPEED, DRIVEN_THROUGH_M, STOP_SIGN_HANDBACK_S, GREEN_STEADY_S, LIGHT_STALE_S,
                                                          MAP_DECEL_MAX, NO_LIGHTS,
                                                          OFF_ROUTE_REASON, OFF_ROUTE_SPEED, T_LAT, UNPROTECTED, YIELD_SPEED, CameraLights,
@@ -1894,3 +1894,31 @@ def test_a_re_engage_the_latch_takes_up_is_never_let_go_on_a_later_frame(gas_acc
     assert not released or released[0] == 0, (gas_to, released[:1])
     if not released:
       assert car.policy.held is not None and car.v < 0.05 and 250. - car.s > ONCOMING_ENTRY_M, (gas_to, 250. - car.s)
+
+
+def test_the_map_stops_status_chimes_once_a_status_and_again_only_worse_under_always_drive():
+  """ALWAYS_DRIVE.md MC-03: under TurnPilotAlwaysDrive 'Map stops and signals unavailable' chimes once a drive for each status
+  navd reports (mapControlsUnavailable, ABORT_HOLD_S), and again only when the status gets worse; otherwise it is the same line
+  with no sound (mapControlsUnavailableSilent), so its later onsets, after an alert covered it, are silent. Switch off: the
+  chiming alert all along, as today."""
+  def alerts_for(car, seconds):
+    return [car.step()[0].alert for _ in range(round(seconds / DT_MDL))]
+  hold = round(ABORT_HOLD_S / DT_MDL)
+  car = Car([], status='partial')
+  car.policy.always_drive = True
+  seen = alerts_for(car, 20.)
+  assert seen[:hold] == ['mapControlsUnavailable'] * hold and set(seen[hold + 1:]) == {'mapControlsUnavailableSilent'}
+  car.status = 'failed'  # worse: chimes
+  seen = alerts_for(car, 4.)
+  first = seen.index('mapControlsUnavailable')
+  assert first <= 21 and seen[first:first + hold] == ['mapControlsUnavailable'] * hold and seen[-1] == 'mapControlsUnavailableSilent'
+  car.status = 'partial'  # better, and said already: silent
+  assert 'mapControlsUnavailable' not in alerts_for(car, 4.)
+  car.status = 'ok'
+  assert set(alerts_for(car, 2.)[21:]) == {'none'}
+  car.status = 'partial'  # back, said already, no worse than the last: silent
+  assert 'mapControlsUnavailable' not in alerts_for(car, 4.)
+  car.status = 'failed'  # worse than the last again: chimes
+  assert 'mapControlsUnavailable' in alerts_for(car, 4.)
+  off = Car([], status='partial')
+  assert set(alerts_for(off, 20.)) == {'mapControlsUnavailable'}
