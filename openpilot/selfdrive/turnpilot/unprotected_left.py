@@ -2,15 +2,17 @@
 traffic of the road ahead (map_controls.unprotected_turn), taken from its hold line with no gas tap.
 
 Kellen, 2026-10-28: "No it has to ship taking the turn", and for this version no intervention. So while the car can judge
-the junction it waits at the hold line for a gap it can certify, however long the traffic takes, as a careful driver does,
-and never hands back for ordinary waiting. A handback (UNDECIDED: leftUndecidedTakeControl, the handback chime, the car
-held) is only for a fault: road camera frames stale, the junction's position unknown, its reach past the detector's proven
+the junction it waits at the hold line for a gap it can certify, as a careful driver does, up to STAND_UNDECIDED_S (DESIGN's
+UNDECIDED row, no gap in 45 s: owner decision (ii), 2026-10-30, Kellen's delegate), and never hands back for a shorter wait.
+A handback (UNDECIDED: leftUndecidedTakeControl, the handback chime, the car held) is only for a fault: road camera frames
+stale, the junction's position unknown, its reach past the detector's proven
 range (route time should have rerouted it: turnpilotd), the car standing yawed past YAW_UNDECIDED_DEG, the view still
 blocked BLOCKED_UNDECIDED_S after the full creep, a creep the car hasn't made after standing CREEP_STALL_S in it with
 nothing else holding it (the model holding a standstill), a far-needed left waiting FAR_BLOCKED_UNDECIDED_S on the far
 crop's boxes alone (farBlocked: a car standing far up the road can't be told from one coming), or waiting STAND_UNDECIDED_S
-on something the tracker says stands, in the band or the exit zones (standing: a parked car never clears). A missing frame
-is never clear.
+at its line for a gap, whatever the tracker says (noGap; standing where it says something stands in the band or the exit
+zones: a parked car never clears, and one seen only as raw boxes can't be told from traffic), the car held, never let go.
+A missing frame is never clear.
 
 TurnPilotAutoLeft (turnpilotd) picks the mode: auto (the default), announce (the car stops at the hold line and says
 whether it would go, then hands back as before: debugging only), or off (the hold line's handback, G1's).
@@ -89,11 +91,30 @@ line or standing held, is a 'position' fault.
 Committed, nothing here ever stops the car (a pedestrian in the path still does: scene_policy). A go the car hasn't moved
 on within turnpilotd's LEFT_NO_MOVE_S is withdrawn and handed back there (the model holding the car; G5's bounded go is the
 remedy).
+The left's own hold after a withdrawn go (hold_here: the band, the position fault, a veto) has the latch's release rule
+(map_controls._held; owner decisions (a), (b), (c), 2026-10-30), position-free: the car moved by the driver (openpilot
+disengaged: the gas, or the brake let off) past where TurnPilot's stop asked it to stand by more than LATCH_PAST_M (metres
+inside the ask are TurnPilot's, whoever drove them) or into the oncoming lanes (the room to ONCOMING_ENTRY_M read where the
+hold began), or moved by the driver and re-engaged so far on, or so fast, that the hold taken up there could no longer
+stand it short of the oncoming lanes (from the re-engage's own speed as the hold's braking takes it, hold_caps through
+map_controls.reengage_stop_m), is the driver's: never held again (a re-engage there is never a hold in the oncoming lanes or
+the junction), and its crossing is said (crossed: map_controls raises its Driven, the take-control up until the car is
+through, turnpilotd's turnMissed for one driven straight on). The lanes are judged at the re-engage, never on the driver's
+frames before it: a car the driver brakes to a stand short of the lanes is held there on the re-engage, the full check
+going on (c) (skeptic round 2: judged on the driver's frame from the speed then, it was let go for good, and a re-engage
+standing short of the lanes pulled the car away across them). Engaged past the re-engage, the plan is TurnPilot's: however
+far its own stop carries the car is never the driver's and nothing is let go on it, so a re-engage short of all that is
+held there and the full check goes on (c) (skeptic round 1: a re-engage inside the ask was let go a frame or two on, on
+TurnPilot's braking, and openpilot drove the car into the junction). So driven, or its hold line's latch let go as the
+driver's (driven: the map's Driven for its maneuver), the left is done: undecided ('driven'), no stop, no go, no turn pulse
+(TurnPilot never pulses a left nobody checked, and a pulse of a withdrawn go still out comes out of the model's queue under
+TURN_STARTED_DEG into it: turnpilotd.clear_driven_left, the car going straight on, missed), the crossing's prompt said.
 """
 import math
 from dataclasses import dataclass, field
 
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.turnpilot.map_controls import LATCH_PAST_M, reengage_stop_m
 from openpilot.selfdrive.turnpilot.route_follower import UNCERTAIN_M
 from openpilot.selfdrive.turnpilot.scene_policy import (CROSSWALK_X_AFTER_M, CROSSWALK_X_BEFORE_M, ONCOMING_ENTRY_M, ONCOMING_PAST_M,
                                                         ONCOMING_Y_FAR_M, ONCOMING_Y_NEAR_M, STOP_DECEL, VEHICLES, box_overlap,
@@ -136,14 +157,16 @@ FAR_BLOCKED_UNDECIDED_S = 35.
 FAR_BLOCK_RECENT_S = CLEAR_WINDOW_S  # a far box in the band this recently keeps that count going (the far crop finds a far
                                     # car on one run in several; further apart, the window fills between them instead)
 YAW_UNDECIDED_DEG = 15.    # standing yawed further either way (after a withdrawn go): the road camera isn't up the oncoming approach
-# waiting at its line this long on something standing (skeptic g4c, SIMFIX: a car parked 50 m up the oncoming curb, or at
-# the curb 6 m past the junction in its box, held the car at the line for a 240 s run, 'waitingForGap' only, no sound): the
-# 'standing' fault (DESIGN's UNDECIDED row, 'no gap in 45 s'), never an endless silent wait. Traffic that moves is ordinary
-# waiting, however long (Kellen: no intervention), and never counts. Standing is what the tracker says stands (stands_still():
-# velocity trusted, under STAND_SPEED): a band box matched to such a vehicle track (a dropout of its box up to
-# CLEAR_WINDOW_S keeps it), or such tracks alone in the exit crosswalk and the junction box. Counted only waiting with
-# nothing else holding the car (a red, a stop sign, no lamp pause it). A raw box nothing tracks can't be told standing from
-# coming by range alone (a stream 3 s apart always has a car near any range): it stays traffic
+# waiting at its line for a gap this long, whatever the tracker says: the noGap fault (DESIGN's UNDECIDED row, 'no gap in
+# 45 s'; owner decision (ii), 2026-10-30, Kellen's delegate), the car held, never let go, never an endless silent wait.
+# Skeptic g4c, SIMFIX: a car parked 50 m up the oncoming curb, or at the curb 6 m past the junction in its box, held the car
+# at the line for a 240 s run, 'waitingForGap' only, no sound; 154bdaa bounded only what the tracker says stands, so the same
+# car seen only as raw boxes (a box nothing tracks can't be told standing from coming), a stream with no gap, or a car moving
+# in the junction box, was still waited on with no limit. Said as 'standing' where the tracker says something stands
+# (stands_still(): velocity trusted, under STAND_SPEED): a band box matched to such a vehicle track (a dropout of its box up
+# to CLEAR_WINDOW_S keeps it), or such tracks alone in the exit crosswalk and the junction box. Counted waiting or creeping at
+# its line or its own hold, from the hold and from a go; another hold keeping the car where it is (a red, a stop sign, no
+# lamp) is no wait for a gap and pauses it (their own bounds: LIGHT_RED_MAX_S, LEFT_SIGNAL_WAIT_S)
 STAND_UNDECIDED_S = 45.
 
 STAND_SPEED = 1.           # m/s: a velocity-trusted track slower than this stands
@@ -198,6 +221,7 @@ GO_PROMPT_S = 1.5          # leftGo is shown this long
 # that for an accel past the cap or a step in the follower's distance. Inside the margin a veto finishes the turn, said
 VETO_MARGIN_M = 1.
 ALERT_S = 2.               # oncomingHolding
+DRIVEN = 'driven'          # undecided's why once the driver took the car past its line or its own hold (module docstring)
 VIEW_FROM_M = 60.          # the road camera from this far out (the window starts on the approach)
 
 OFF, AUTO, ANNOUNCE = 'off', 'auto', 'announce'
@@ -237,7 +261,9 @@ class LeftInput:
                                  # freshness is judged here (FAR_FRESH_S, farStale)
   straight_m: float = math.inf   # m from the junction the opposing road stays in the band straight on from our approach
                                  # (navInstruction maneuverOpposingStraightM; turnpilotd passes 0 when not known)
-  enabled: bool = True           # openpilot engaged (carControl.enabled): disengaged (the driver's pedal) it never goes
+  enabled: bool = True           # openpilot engaged (carControl.enabled): disengaged (the driver's pedal) it never goes, and
+                                 # the car's metres on its own hold then are the driver's
+  driven: bool = False           # its hold line's latch was let go as the driver's (map_controls.Driven for this maneuver)
 
 
 @dataclass
@@ -264,6 +290,14 @@ class LeftDecision:
   far_bearing: float = 0.         # where the far crop is to look (far_aim): deg left of the calibrated axis
   far_range_m: float = 0.         # the far crop's proven range while it reads, else 0
   withdrawable: bool = False      # go: a veto read next frame still withdraws it short of the oncoming lanes (VETO_MARGIN_M)
+  crossed: str = ''               # the frame the driver took the car past its own hold: the cause (map_controls.Driven's)
+
+
+def hold_caps(v: float) -> tuple[float, float]:
+  """Its own hold's (accel cap, speed cap) at v m/s, as a re-engage takes it up (map_controls.reengage_stop_m): waitGap's
+  and _undecided's stop(v, 0, confirmed=False), STOP_DECEL down to STOP_DECEL x SPEED_CAP_TAU, its speed cap's -v/tau under it."""
+  s = stop(v, 0., '', confirmed=False)
+  return s.accel_cap, s.speed_cap
 
 
 def t_clear(path_m: float) -> float:
@@ -447,6 +481,12 @@ class UnprotectedLeft:
     self.verdict = ''
     self.hold_here = False        # its own hold, after a withdrawn go
     self.hold_reason = WITHDRAWN_REASON['band']  # ...and what it says
+    self.hold_m = 0.              # ...m the car moved since it began (position-free)...
+    self.hold_drv_m = 0.          # ...of them with openpilot disengaged (the driver's)...
+    self.hold_drv_past = 0.       # ...of those, the ones past where its stop asked the car to stand...
+    self.hold_asked = 0.          # ...m on to where its stop asked the car to stand (the comfortable curve's from there)...
+    self.hold_entry = 0.          # ...and to the oncoming lanes (ONCOMING_ENTRY_M), read where it began...
+    self.hold_drv_frame = False   # ...and a driver's frame (disengaged) since the last engaged one: the next is a re-engage
     self.roll_stall = 0.          # s standing in a roll-up to the line
     self.light_s = 0.             # s at its line with its signal's light not green (unknown, or red and yellow)
     self.unsignalled_s = 0.       # s standing at its line with no lamp on its side (LEFT_GO_NEEDS_SIGNAL)
@@ -460,6 +500,7 @@ class UnprotectedLeft:
     self.band_stand_age = math.inf  # s since a road run's band box matched a standing track (STAND_UNDECIDED_S)
     self.band_stand_s = 0.        # s waiting at its line with the band so blocked
     self.exit_stand_s = 0.        # s waiting at its line with the exit zones blocked by standing tracks alone
+    self.wait_s = 0.              # s waiting at its line (or its own hold) for a gap, nothing else holding the car
 
   def update(self, inp: LeftInput, dt: float) -> LeftDecision:
     if inp.mode not in (AUTO, ANNOUNCE):
@@ -536,6 +577,17 @@ class UnprotectedLeft:
     if self.alert_t > 0.:
       out.alert = 'oncomingHolding'
 
+    # the driver took the car past its own hold, or past its line (the latch let go as theirs): theirs, never held or gone
+    # again (owner decisions (a), (b); module docstring)
+    if self.hold_here:
+      cause = self._hold_driven(inp, dt)
+      if cause:
+        return self._driven(inp, out, cause)
+    if inp.driven and self.why != DRIVEN:
+      return self._driven(inp, out, '')
+    if self.why == DRIVEN:
+      return self._undecided(out, DRIVEN)
+
     standing = inp.held or self.hold_here
     # committed by its own go and motion, or by the driver driving it (their release, moving): never by a reading before its
     # go (skeptic G4: a reading 6 m nearer while held at the line committed the scene, and the left stopped judging with the
@@ -566,7 +618,7 @@ class UnprotectedLeft:
     if self.latch_d is None:
       # held at the line: the window starts here (hold, then judge), never carried over from the approach
       self.latch_d, self.clear_s, self.far_stale, self.far_only_s = inp.distance, 0., 0., 0.
-      self.band_stand_s = self.exit_stand_s = 0.
+      self.band_stand_s = self.exit_stand_s = self.wait_s = 0.
       out.clear_s = 0.
     certified = self.clear_s >= CLEAR_WINDOW_S - 1e-6 and not blocked_view and crosswalk and inp.scene_clear and not held_else
     out.view = 'roadAndWide'
@@ -633,6 +685,19 @@ class UnprotectedLeft:
       # never while openpilot is disengaged (the driver's pedal): a go then would let go of the latch under the driver, a
       # crossing nobody certified (owner decision (b), 2026-10-30). The window goes on counting: re-engaged, it goes on it
       return self._go(inp, out, rreq)
+    # every wait at its line for a gap, whatever the tracker says, ends at STAND_UNDECIDED_S out loud, the car held (owner
+    # decision (ii)); 'standing' where the tracker says something stands. Another hold keeping the car pauses it
+    if not held_else:
+      self.wait_s += dt
+      band_standing = self.blocked and self.band_stand_age <= CLEAR_WINDOW_S
+      self.band_stand_s = self.band_stand_s + dt if band_standing else 0.
+      self.exit_stand_s = self.exit_stand_s + dt if exits and all(stands_still(o) for o in exits) else 0.
+      if self.wait_s >= STAND_UNDECIDED_S - 1e-6:
+        why = 'standing' if max(self.band_stand_s, self.exit_stand_s) > 0. else 'noGap'
+        cloudlog.event("turnpilot.left_no_gap", error=True, why=why, wait_s=round(self.wait_s, 1), band_s=round(self.band_stand_s, 1),
+                       exit_s=round(self.exit_stand_s, 1), blockers=len(raw_blockers or ()), hold=self.hold_here,
+                       exits=[(str(o.cls), round(float(o.x), 1), round(float(o.y), 1)) for o in exits])
+        return self._undecided(out, why, inp.v_ego)
     if blocked_view and not self.blocked and not self.hold_here and not held_else:
       self.creep_to = creep_max
       done = crept >= creep_max - CREEP_DONE_M
@@ -657,16 +722,6 @@ class UnprotectedLeft:
     self.far_only_s = self.far_only_s + dt if far_only else 0.
     if self.far_only_s >= FAR_BLOCKED_UNDECIDED_S - 1e-6:
       return self._undecided(out, 'farBlocked')
-    # on something standing (STAND_UNDECIDED_S), nothing else holding the car (which pauses the count): out loud, never an
-    # endless silent wait
-    if not held_else:
-      band_standing = self.blocked and self.band_stand_age <= CLEAR_WINDOW_S
-      self.band_stand_s = self.band_stand_s + dt if band_standing else 0.
-      self.exit_stand_s = self.exit_stand_s + dt if exits and all(stands_still(o) for o in exits) else 0.
-      if max(self.band_stand_s, self.exit_stand_s) >= STAND_UNDECIDED_S - 1e-6:
-        cloudlog.event("turnpilot.left_standing", error=True, band_s=round(self.band_stand_s, 1), exit_s=round(self.exit_stand_s, 1),
-                       exits=[(str(o.cls), round(float(o.x), 1), round(float(o.y), 1)) for o in exits])
-        return self._undecided(out, 'standing')
     self.creep_to = min(self.creep_to, max(crept, 0.))
     out.state = self.state = 'waitGap'
     out.prompt, out.reason, out.creep_m = 'waitingForGap', NO_SIGNAL_REASON if no_signal else "Waiting for a gap", self.creep_to
@@ -676,7 +731,7 @@ class UnprotectedLeft:
 
   def _go(self, inp: LeftInput, out: LeftDecision, rreq: float) -> LeftDecision:
     self.went, self.moved, self.hold_here, self.go_t, self.far_only_s = True, False, False, 0., 0.
-    self.band_stand_s = self.exit_stand_s = 0.
+    self.band_stand_s = self.exit_stand_s = self.wait_s = 0.
     cloudlog.event("turnpilot.left_go", distance=round(inp.distance, 1), r_req=round(rreq, 1), clear_s=round(self.clear_s, 1),
                    v_limit=round(out.v_limit, 1), heading_deg=round(inp.heading_deg, 1))
     out.state = self.state = 'go'
@@ -702,8 +757,7 @@ class UnprotectedLeft:
       # (HELD_MIN_M): never on, withdrawn where the car stands (it can always stay) and handed back, held
       cloudlog.event("turnpilot.left_go_withdrawn", error=True, why='position', first_motion=False, distance=round(inp.distance, 1),
                      v=round(inp.v_ego, 2), spread=round(inp.spread_m, 1), r_req=round(out.r_req, 1))
-      self.went, self.moved, self.hold_here, self.clear_s = False, False, True, 0.
-      self.hold_reason, self.latch_d = UNDECIDED_REASON['position'], inp.distance
+      self._hold(inp, inp.v_ego ** 2 / (2. * STOP_DECEL), UNDECIDED_REASON['position'])
       return self._undecided(out, 'position', inp.v_ego)
     first_motion = not self.moved and inp.v_ego >= 0.3
     self.moved = self.moved or first_motion
@@ -717,8 +771,7 @@ class UnprotectedLeft:
       if can_stop or inp.go_withdrawn:
         cloudlog.event("turnpilot.left_go_withdrawn", error=True, why='driverSignal', veto=inp.signal_veto,
                        first_motion=first_motion, distance=round(inp.distance, 1), v=round(inp.v_ego, 2), r_req=round(out.r_req, 1))
-        self.went, self.moved, self.hold_here, self.clear_s = False, False, True, 0.
-        self.hold_reason, self.latch_d = UNDECIDED_REASON['driverSignal'], inp.distance
+        self._hold(inp, stop_m, UNDECIDED_REASON['driverSignal'])
         return self._undecided(out, 'driverSignal', inp.v_ego)
       # past VETO_MARGIN_M's frame: never a stop in the oncoming lanes, the turn finishes (its request already ended)
       cloudlog.event("turnpilot.left_veto_past_return", error=True, veto=inp.signal_veto, distance=round(inp.distance, 1),
@@ -730,8 +783,7 @@ class UnprotectedLeft:
     reason = WITHDRAWN_REASON[why]
     cloudlog.event("turnpilot.left_go_withdrawn", error=True, why=why, first_motion=first_motion, distance=round(inp.distance, 1),
                    v=round(inp.v_ego, 2), blockers=blockers, r_req=round(out.r_req, 1))
-    self.went, self.moved, self.hold_here, self.clear_s, self.hold_reason = False, False, True, 0., reason
-    self.latch_d = inp.distance
+    self._hold(inp, stop_m, reason)
     out.state = self.state = 'waitGap'
     out.prompt, out.reason, out.view, out.clear_s = 'waitingForGap', reason, 'roadAndWide', 0.
     if why == 'band':
@@ -740,13 +792,73 @@ class UnprotectedLeft:
     out.stops = [stop(inp.v_ego, stop_m, reason, confirmed=False)]
     return out
 
+  def _hold(self, inp: LeftInput, stop_m: float, reason: str) -> None:
+    """Its own hold from here (hold_here: after a withdrawn go), its stop stop_m on, saying reason; never a go standing on
+    it (a fresh window), its release rule's metres from here (_hold_driven)."""
+    self.went, self.moved, self.hold_here, self.clear_s, self.hold_reason = False, False, True, 0., reason
+    self.latch_d = inp.distance
+    self.hold_m = self.hold_drv_m = self.hold_drv_past = 0.
+    self.hold_asked, self.hold_entry = max(stop_m, 0.), inp.distance - ONCOMING_ENTRY_M
+    self.hold_drv_frame = False
+
+  def _hold_driven(self, inp: LeftInput, dt: float) -> str:
+    """Its own hold's release rule (module docstring; map_controls._held's, owner decisions (a), (c)): the driver's crossing's
+    cause, on the driver's own frames (openpilot disengaged), once they have moved the car past where TurnPilot's stop asked
+    it to stand by more than LATCH_PAST_M or into the oncoming lanes; or at the re-engage after them, judged from its frame's
+    speed and where the car is, the driver having moved it, once the hold taken up there could no longer stand it short of
+    the oncoming lanes (reengage_stop_m, its own braking); '' while the hold stands. Position-free (the car's metres, never a
+    reading). Engaged past the re-engage, the plan is TurnPilot's: however far its own stop carries the car is never the
+    driver's, and nothing is let go on it (skeptic round 1: a re-engage inside the ask was let go a frame or two later on
+    TurnPilot's braking metres, and openpilot drove the car on into the junction, the full check (c) skipped)."""
+    v = max(inp.v_ego, 0.)
+    self.hold_m += v * dt
+    cause = 'driverWent' if self.state == 'undecided' else 'drivenOff'
+    if not inp.enabled:
+      self.hold_drv_m += v * dt
+      self.hold_drv_frame = True
+      # only what the driver moves it past the ask: metres inside it are TurnPilot's, whoever drove them, and so are those
+      # TurnPilot's own stop carried it past the ask, engaged (never counted here); the driver's own from there on count
+      self.hold_drv_past += max(min(v * dt, self.hold_m - self.hold_asked), 0.)
+      # past the ask by the reach of the driver's own metres, or taken into the oncoming lanes by them (a hold there could
+      # only stand the car in them, and it never comes back short of them): theirs, for good
+      if self.hold_drv_past > LATCH_PAST_M or (self.hold_drv_m > 0. and self.hold_m > self.hold_entry):
+        return cause
+      return ''
+    if not self.hold_drv_frame:
+      return ''
+    # the re-engage, the first frame TurnPilot's plan applies after the driver's: the invariant, never a TurnPilot hold that
+    # stands the car in the oncoming lanes on a re-engage, judged from this frame's speed and where the car is, before the hold
+    # brakes it (never on TurnPilot's own metres: skeptic round 1). Too fast to stand short of them (keeping the speed inside
+    # a stop asked late in a launch: e93750b stood it 0.5 m inside them): let go; short of that, held for the full check (c),
+    # whatever the speed on the driver's frames before (skeptic round 2: judged there, a car braked to a stand short of the
+    # lanes after it was let go, and a re-engage pulled it away from rest across them uncertified)
+    self.hold_drv_frame = False
+    if self.hold_drv_m > 0. and self.hold_m + reengage_stop_m(v, hold_caps) > self.hold_entry:
+      return cause
+    return ''
+
+  def _driven(self, inp: LeftInput, out: LeftDecision, cause: str) -> LeftDecision:
+    """The driver took the car past its own hold (cause: its crossing, said by map_controls' Driven) or past its line (the
+    latch let go as theirs, already said): done, undecided (DRIVEN), never a stop, a go or a turn pulse again."""
+    cloudlog.event("turnpilot.left_driven", error=True, cause=cause or 'line', hold=self.hold_here, distance=round(inp.distance, 1),
+                   v=round(inp.v_ego, 2), hold_m=round(self.hold_m, 2), driver_m=round(self.hold_drv_m, 2),
+                   driver_past_m=round(self.hold_drv_past, 2), asked_m=round(self.hold_asked, 2), was=self.state)
+    out.crossed = cause
+    self.went = self.moved = self.hold_here = False
+    self.alert_t = 0.
+    return self._undecided(out, DRIVEN)
+
   def _undecided(self, out: LeftDecision, why: str, v_ego: float = 0.) -> LeftDecision:
     """The fault's handback, the car held. After a withdrawn go (hold_here) its own hold where the comfortable curve stops
-    the car from v_ego (a car still rolling is never told shouldStop), as waitGap's after a withdrawal."""
+    the car from v_ego (a car still rolling is never told shouldStop), as waitGap's after a withdrawal. DRIVEN: the driver's
+    crossing, no hold, its prompt the crossing's (map_controls.Driven)."""
     if self.state != 'undecided':
       cloudlog.event("turnpilot.left_undecided", error=True, why=why, r_req=round(out.r_req, 1), clear_s=round(out.clear_s, 1))
     self.state, self.why = 'undecided', why
     out.state, out.why, out.view = 'undecided', why, 'roadAndWide'
+    if why == DRIVEN:
+      out.alert = 'none'
+      return out
     out.prompt, out.reason = 'leftUndecidedTakeControl', UNDECIDED_REASON.get(why, "Can't judge oncoming traffic: take control")
     if self.hold_here:
       out.stops = [stop(v_ego, 0., self.hold_reason, confirmed=False)]
@@ -780,6 +892,7 @@ UNDECIDED_REASON = {
   'farStale': "Far camera not seeing oncoming traffic: take control",
   'farBlocked': "Can't tell if far traffic is coming: take control",
   'standing': "Blocked by something standing: take control",
+  'noGap': "No gap in oncoming traffic: take control",
   'position': "Junction position unsure: take control",
   'curve': "Oncoming road curves out of view: take control",
   'stale': "Camera not seeing oncoming traffic: take control",
