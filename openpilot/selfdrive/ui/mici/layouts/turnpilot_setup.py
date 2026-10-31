@@ -255,8 +255,7 @@ class EngineStep(SetupStep):
     return ss.engine_state(ui_state.params, self._installed())
 
   def _on_retry(self):
-    ui_state.params.put_bool(ss.RETRY_PARAM, True)
-    ui_state.params.put(ss.INSTALL_PARAM, {'state': 'installing', 'progress': 0., 'stage': 'starting', 'at': wall_time()})
+    ui_state.params.put_bool(ss.RETRY_PARAM, True)  # turnpilot_web's installer takes it within LOOP_S
 
 
 class DoneStep(SetupStep):

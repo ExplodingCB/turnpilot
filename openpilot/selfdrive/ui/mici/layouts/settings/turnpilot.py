@@ -6,7 +6,6 @@ from openpilot.selfdrive.turnpilot.web.pairing import pairing_url
 from openpilot.selfdrive.turnpilot.web.store import last_gps_position
 from openpilot.selfdrive.ui.lib.turnpilot import mapped_area_text
 from openpilot.selfdrive.turnpilot import setup_state as ss
-from openpilot.selfdrive.turnpilot.maps.paths import wall_time
 from openpilot.selfdrive.ui.mici.widgets.button import BigButton, BigParamControl, BigToggle, GreyBigButton
 from openpilot.selfdrive.ui.mici.widgets.qr import QR
 from openpilot.selfdrive.ui.ui_state import ui_state
@@ -147,8 +146,7 @@ class TurnPilotSettingsLayout(NavScroller):
 
   def _on_engine(self):
     if ss.engine_state(ui_state.params, self._installed()).state == ss.ERROR:
-      ui_state.params.put_bool(ss.RETRY_PARAM, True)
-      ui_state.params.put(ss.INSTALL_PARAM, {'state': 'installing', 'progress': 0., 'stage': 'starting', 'at': wall_time()})
+      ui_state.params.put_bool(ss.RETRY_PARAM, True)  # turnpilot_web's installer takes it within LOOP_S
 
   def _on_setup(self):
     from openpilot.selfdrive.ui.mici.layouts.turnpilot_setup import setup_window
