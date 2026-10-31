@@ -70,3 +70,20 @@ class TestSetupWiring(OpenpilotTestCase):
     classes = [ts.IntroStep, ts.PhoneStep, ts.KeyStep, ts.EngineStep, ts.SignalsStep, ts.DoneStep]
     assert [c.STEP for c in classes] == list(STEPS)
     assert all(c.STEP in ts.ICON for c in classes)
+
+
+class TestScreenshots(OpenpilotTestCase):
+  def test_the_screenshots_draw_a_fresh_install(self):
+    """The device's manager_init writes every unset param's default before the UI starts, so a fresh install shows
+    always drive, stop-sign go and far pedestrians on; the screenshots draw what Chase sees, not empty params."""
+    import os
+    from unittest import mock
+    with mock.patch.dict(os.environ):  # the script sets SCALE for its own window; keep it out of this process
+      from openpilot.selfdrive.ui.tests.turnpilot_setup_screenshots import fresh_install
+    params = BlockingParams()
+    assert not params.get_bool("TurnPilotAlwaysDrive")  # nothing written yet: Params.get reads no default
+    fresh_install(params)
+    for key in ("TurnPilotEnabled", "NavigationEnabled", "TurnPilotAlwaysDrive", "TurnPilotFarPeds", "AlphaLongitudinalEnabled"):
+      assert params.get_bool(key), key
+    assert params.get("TurnPilotStopSignGo") == "vision" and not params.get_bool("TurnPilotShadowMode")
+    assert params.get("TurnPilotMapKey") is None and not params.get_bool("TurnPilotSetupDone")

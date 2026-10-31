@@ -3,7 +3,8 @@
 
   python -m openpilot.selfdrive.ui.tests.turnpilot_setup_screenshots OUT_DIR
 
-Each setup step in its waiting, good and error states (set through the params the steps read), settings > turnpilot,
+The params start as a fresh install's (fresh_install: every default written, as manager_init does at boot). Each setup
+step in its waiting, good and error states (set through the params the steps read), settings > turnpilot,
 the home screen's readiness alert, and the stock terms and toggles pages beside them for comparison. One 536x240 PNG per
 scene, named in flow order. Nothing here talks to a network: the map key's states are the status param the web app's
 refresh writes, and the map engine's are the installer's.
@@ -23,6 +24,16 @@ SETTLE = 75  # frames: scroll and grow animations settle within about a second
 NOW_REGIONS = [{'id': 'indianapolis', 'name': 'Indianapolis area'}, {'id': 'seattle', 'name': 'Seattle area'}]
 
 
+def fresh_install(params):
+  """A fresh install's params as the UI first reads them: manager_init's own loop writes every unset key's default before
+  any process starts, so the switches show this fork's defaults (TurnPilot, always drive, stop-sign go vision, far
+  pedestrians and the stock navigation and alpha longitudinal on), not empty params."""
+  for k in params.all_keys():  # manager_init's "set unset params to their default value"
+    default_value = params.get_default_value(k)
+    if default_value is not None and params.get(k) is None:
+      params.put(k, default_value, block=True)
+
+
 def screenshots(out_dir: str):
   from openpilot.common.version import terms_version, training_version
   from openpilot.selfdrive.turnpilot import setup_state as ss
@@ -35,8 +46,7 @@ def screenshots(out_dir: str):
   params = ui_state.params
   params.put("HasAcceptedTerms", terms_version, block=True)
   params.put("CompletedTrainingVersion", training_version, block=True)
-  for k in ("TurnPilotEnabled", "NavigationEnabled"):
-    params.put_bool(k, True, block=True)
+  fresh_install(params)
 
   rl.set_config_flags(rl.ConfigFlags.FLAG_WINDOW_HIDDEN)
   gui_app.init_window("turnpilot setup screenshots", fps=FPS)
