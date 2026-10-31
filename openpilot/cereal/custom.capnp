@@ -45,6 +45,8 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     turnOnlyGoingStraight @1;  # the car is in a lane that only turns, at an intersection the route goes straight through
     wrongLaneForTurn @2;       # the route turns at the junction ahead and the car's lane doesn't turn that way
     laneUnknown @3;            # the car's lane in the map's lane list can't be confirmed, so the lane planner changes none
+    laneUnknownQuiet @4;       # laneUnknown again for a maneuver whose first onset chimed (R12, TurnPilotAlwaysDrive): the
+                               # same line, no sound
   }
   state @0 :State;
   desire @1 :UInt8;               # index into log.Desire; modeld uses it while DesireHelper is idle

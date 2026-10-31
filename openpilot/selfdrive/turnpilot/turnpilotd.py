@@ -669,6 +669,8 @@ class TurnPilot:
     self.paint_rule_lanes = LanePlanner(paint_rule=True)  # what the lane planner would ask for, while it's turned off
     self.mismatch = LaneMismatch.none
     self._mismatch_candidate, self._mismatch_frames = LaneMismatch.none, 0
+    self._unknown_onset = self._unknown_heard = None  # (maneuver id,): laneUnknown's onset under way, the last one said (R12)
+    self._unknown_quiet = False
     self.acting = False
     self.last_desire = Desire.none
     self.hand_always_drive()  # the components made afresh here have the switch at once, mid-frame too (a fault's reset)
@@ -759,6 +761,20 @@ class TurnPilot:
                        through_distance=round(rf.through_distance, 1))
       self.mismatch = found
     return self.mismatch
+
+  def unknown_sound(self, mismatch, maneuver_id) -> int:
+    """The plan's laneMismatch from _lane_mismatch's (R12, ALWAYS_DRIVE.md step S4): under the switch 'Can't Confirm Lane' chimes
+    once a maneuver, its first onset of laneUnknown for a maneuver id published as it is (selfdrived's chime) for as long as it
+    lasts, every later onset for that maneuver as laneUnknownQuiet (the same line, no sound), the next maneuver's chiming again;
+    it is the one sound saying the car may turn from a lane it can't place, so never silent for a maneuver. Off it, or in
+    shadow mode, every onset as today; every other mismatch as it is."""
+    if mismatch != LaneMismatch.laneUnknown:
+      self._unknown_onset = None
+      return mismatch
+    if self._unknown_onset != (maneuver_id,):  # an onset, or the next maneuver under the line
+      self._unknown_quiet = self.always_drive_on and self._unknown_heard == (maneuver_id,)
+      self._unknown_onset = self._unknown_heard = (maneuver_id,)
+    return LaneMismatch.laneUnknownQuiet if self._unknown_quiet else mismatch
 
   def stop(self, reason: str) -> None:
     """TurnPilot goes disabled (turned off, or a fault: reason turnedOff or fault) and resets: an offered lane change is
@@ -1071,7 +1087,7 @@ class TurnPilot:
       if acting else LaneMismatch.none  # handback outranks it, and with the maneuver dropped it would misread the lane
     if found == LaneMismatch.none and acting and self.lanes.lane_unknown:
       found = LaneMismatch.laneUnknown  # no change from a lane it can't place: said instead
-    plan.laneMismatch = self._lane_mismatch(found)
+    plan.laneMismatch = self.unknown_sound(self._lane_mismatch(found), rf.maneuver_id)
     plan.accelCap = decision.accel_cap
     # past a bend or a straight-on step, the turn after it is slowed for already (route_follower.py: ahead), and still
     # once the step is dead-reckoned past, until navd moves on to the turn

@@ -175,6 +175,16 @@ def test_lane_not_confirmed_is_said_with_a_chime():
   assert a.alert_text_1 == "Wrong Lane" and a.audible_alert == AudibleAlert.none
 
 
+def test_lane_not_confirmed_again_for_its_maneuver_is_the_same_line_with_no_chime():
+  """R12 (ALWAYS_DRIVE.md S4, TurnPilotAlwaysDrive): 'Can't Confirm Lane' chimes once a maneuver; turnpilotd publishes every
+  later onset for that maneuver as laneUnknownQuiet, raised and shown the same, silent."""
+  from openpilot.selfdrive.turnpilot.hooks import plan_events
+  a, = alerts(EventName.turnpilotWrongLane, FakeSM(plan(laneMismatch='laneUnknownQuiet')))
+  assert a.alert_text_1 == "Can't Confirm Lane" and a.alert_text_2 == "TurnPilot won't change lanes, check the lane for the turn"
+  assert a.audible_alert == AudibleAlert.none
+  assert plan_events(FakeSM(plan(laneMismatch='laneUnknownQuiet'))) == ['turnpilotWrongLane']
+
+
 def test_map_control_prompts_hand_back_loudly_and_yield_is_silent():
   a, = alerts(EventName.turnpilotControlPrompt, FakeSM(plan(controlPrompt='stopSignTakeControl', reason='Stop sign: take control to proceed')))
   assert a.alert_text_1 == 'Stop sign: take control to proceed' and a.alert_text_2 == "TurnPilot can't check cross traffic"

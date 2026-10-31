@@ -421,6 +421,35 @@ def test_lane_not_confirmed_is_said_not_changed():
 
 
 @pytest.mark.parametrize("always_drive", [False, True])
+def test_cant_confirm_lane_chimes_once_a_maneuver_under_the_switch(always_drive):
+  """R12 (ALWAYS_DRIVE.md S4): under TurnPilotAlwaysDrive 'Can't Confirm Lane' keeps one chime per maneuver: the first onset of
+  laneUnknown for a maneuver id goes out as it is (its chime) for as long as it lasts, every later onset for that maneuver as
+  laneUnknownQuiet (the same line, no sound), and the next maneuver's first onset chimes again, under the line or not. Every
+  other mismatch passes as it is. Off the switch every onset as today."""
+  tp = TurnPilot()
+  tp.always_drive = always_drive
+  LM = custom.TurnpilotPlan.LaneMismatch
+  U, N, Q, W = LM.laneUnknown, LM.none, LM.laneUnknownQuiet, LM.wrongLaneForTurn
+  seq = [(U, 3)] * 5 + [(N, 3)] * 4 + [(U, 3)] * 5 + [(W, 3)] * 2 + [(U, 3)] * 3 + [(U, 4)] * 3 + [(N, 4)] + [(U, 4)] * 2 + \
+    [(N, None)] + [(U, None)] * 2 + [(N, None)] + [(U, None)]
+  out = [tp.unknown_sound(m, i) for m, i in seq]
+  if not always_drive:
+    assert out == [m for m, _ in seq]
+  else:
+    assert out == [U] * 5 + [N] * 4 + [Q] * 5 + [W] * 2 + [Q] * 3 + [U] * 3 + [N] + [Q] * 2 + [N] + [U] * 2 + [N] + [Q]
+  tp.shadow = True  # the switch does nothing in shadow mode
+  assert [tp.unknown_sound(m, i) for m, i in [(N, 7), (U, 7), (N, 7), (U, 7)]] == [N, U, N, U]
+  # closed loop: the lane the planner can't place, said with its chime on the drive's one onset
+  sim = Sim([(500., "turn", "left"), (2000., "turn", "right")], cruise=15., nav_lanes={0: THREE_LANES_LEFT_TURN}, model_lanes=(1, 0),
+            paint=(UNKNOWN, BW, BW, UNKNOWN))
+  sim.tp.always_drive = always_drive
+  sim.model_kw = {'shoulder': 4.}
+  sim.run(25.)
+  said = [str(plan.laneMismatch) for _, _, plan in sim.trace if plan.laneMismatch != N]
+  assert said and set(said) == {"laneUnknown"}
+
+
+@pytest.mark.parametrize("always_drive", [False, True])
 def test_a_blind_spot_under_an_offer_is_waited_out_and_its_release_said_again(always_drive):
   """LC-01 closed loop: a two-lane right turn, the car one lane left of the turn's lane; a car sits in its right blind spot from
   1 s into the offer for 6 s. Under TurnPilotAlwaysDrive: one offer, never an abort, no request while it lasts (laneChangeHold
