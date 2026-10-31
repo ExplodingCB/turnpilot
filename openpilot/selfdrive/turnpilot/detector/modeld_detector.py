@@ -790,10 +790,12 @@ class ModeldDetector:
   def read_odd_paint(self, model_state, metas: list, boxes: np.ndarray, used_s: float) -> None:
     """While the full pass looks through the wide camera (a turn, a curve, their WIDE_HOLD_S), the lane paint on the far
     crop's road frame, behind the far crop's boxes, kept in odd_paint for the next full run's message, where the step has
-    room for it (used_s: the step's time so far). Its failures and budget are the paint's own (read_lane_paint's)."""
+    room for it (used_s: the step's time so far; with no paint time yet, as when the drive starts in a turn, a read is taken
+    to cost PAINT_BUDGET_S, the most one may). Its failures and budget are the paint's own (read_lane_paint's)."""
     if self.last_cam != 'wide' or self.lane_paint is None or 'road' not in self.cameras:
       return
-    if self.paint_times and used_s + float(np.median(self.paint_times)) > STEP_BUDGET_S:
+    estimate = float(np.median(self.paint_times)) if self.paint_times else PAINT_BUDGET_S
+    if used_s + estimate > STEP_BUDGET_S:
       return  # no room: this wide run's message says wideCamera, as before
     t0 = time.perf_counter()
     try:

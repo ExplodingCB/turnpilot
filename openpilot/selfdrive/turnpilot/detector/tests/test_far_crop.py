@@ -9,7 +9,7 @@ from openpilot.common.test import OpenpilotTestCase
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.selfdrive.turnpilot.detector.decoder import CAR, TRAFFIC_LIGHT
 from openpilot.selfdrive.turnpilot.detector.graph import FAR_HORIZON_ROW, Crop
-from openpilot.selfdrive.turnpilot.detector.modeld_detector import (FAR_BUDGET_S, FAR_STATUS_S, FORCE_RUN_FRAMES, RUN_EVERY,
+from openpilot.selfdrive.turnpilot.detector.modeld_detector import (FAR_BUDGET_S, FAR_STATUS_S, FORCE_RUN_FRAMES, PAINT_BUDGET_S, RUN_EVERY,
                                                                     STEP_BUDGET_S, TIME_WINDOW, FarCrop, LanePaintStatus, LightStatus)
 from openpilot.selfdrive.turnpilot.detector.tests.test_modeld_detector import FakeLights, FakeOutput, Meta, make_detector
 from openpilot.selfdrive.turnpilot.scene.ranging import road_lens
@@ -225,6 +225,16 @@ class TestOddPaint(OpenpilotTestCase):
     det.steps += 1
     self.turn(det, pm, 1, start=20)
     assert len(pm.full) == 2 and pm.full[1].lanePaintStatus == LanePaintStatus.wideCamera and len(pm.full[1].lanePaint) == 0
+
+  def test_the_first_read_is_checked_against_the_paint_budget(self):
+    # no paint time yet (the drive started in a turn): the room check takes PAINT_BUDGET_S, the most a read may take
+    det = far_detector()
+    det.last_cam = 'wide'
+    assert len(det.paint_times) == 0
+    det.read_odd_paint(det.model_state, [Meta(2), Meta(3)], np.zeros((0, 6), np.float32), STEP_BUDGET_S - PAINT_BUDGET_S + 0.001)
+    assert det.lane_paint.calls == [] and det.odd_paint is None
+    det.read_odd_paint(det.model_state, [Meta(2), Meta(3)], np.zeros((0, 6), np.float32), STEP_BUDGET_S - PAINT_BUDGET_S - 0.001)
+    assert det.lane_paint.calls == [('host0', 2, 0)] and det.odd_paint is not None and len(det.paint_times) == 1
 
   def test_paint_failure_on_the_far_frame_turns_only_the_paint_off(self):
     det, pm = far_detector(), FarPM()
