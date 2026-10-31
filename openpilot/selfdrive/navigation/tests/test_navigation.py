@@ -1359,3 +1359,55 @@ class TestStopAvoidance(unittest.TestCase):
     self.engine.certifier = certify
     self.start([self.stop(1, 55.6), self.stop(2, self.STEP + 55.6)])
     self.assertEqual([(i, round(t - self.now, 1)) for i, t in seen], [(1, 5.), (2, 15.)])
+
+  # --- TurnPilotStopSignGo=vision (tp/vision-go): navd's avoidance keeps every stop and yield vision can take ---
+
+  def vision_stop(self, n, route_m, mph=25, kind='stop', divided=False):
+    """A control on the shipped files as Saturday's car meets it: no survey, the map's tiers (an all-way), each approach mph."""
+    from openpilot.selfdrive.turnpilot.routing.junctions import Approach, Junction
+    from openpilot.selfdrive.turnpilot.stop_rules import MPH
+    c = self.stop(n, route_m, kind=kind)
+    legs = [(270., -90., 'left', 11), (90., 90., 'right', 12), (0., 0., 'opposite', 13)]
+    c.junction_info = Junction(osm_node_id=4242, lat=39.7684, lon=-86.1581, stop_point_distance=13., rail_distance=-1., surveyed=False,
+                               sidecar=True, divided=divided, approaches=[
+                                 Approach(b, rel, role, 'residential', 'road', True, True, 1, 1, 'stop', 'stop', 'mapStrong', mph * MPH,
+                                          mph * MPH, 'tagged', way) for b, rel, role, way in legs])
+    return c
+
+  def vision_engine(self, side_views=True):
+    """The real certifier on the shipped files, 15:00 EDT, turnpilotd publishing mode vision and its side views."""
+    from openpilot.selfdrive.turnpilot.routing.tests.test_certify import ETA
+    self.values['TurnPilotStopSignGo'] = 'vision'
+    self.now = ETA - 30.
+    self.engine = self.make_engine(certifier=None)
+    plan = SimpleNamespace(stopGo=SimpleNamespace(mode='vision', sideViewsLive=side_views))
+    self.sm.data = {'turnpilotPlan': plan}
+    self.sm.valid['turnpilotPlan'] = True
+    self.sm.__getitem__.side_effect = lambda key: plan if key == 'turnpilotPlan' else MagicMock()
+
+  def test_vision_keeps_a_25_mph_stop_and_yield_and_the_long_looks_35_mph_one_on_the_route(self):
+    self.vision_engine()
+    self.assertEqual(self.engine.runtime_inputs().mode, 'vision')
+    a, y, fast = self.vision_stop(1, 60.), self.vision_stop(2, 150., kind='yield'), self.vision_stop(3, 170., mph=35)
+    router = self.start([a, y, fast])
+    self.assertEqual(router.reroute_calls, [])
+    self.assertEqual([c.certification for c in (a, y, fast)], ['certifiable'] * 3)
+    self.assertIn('long look', fast.junction_info.cert_detail)
+    ni = self.instruction()
+    self.assertEqual((str(ni.avoidStatus), ni.avoidedControls), ('clean', 0))
+    self.assertEqual(len(self.engine.controls), 3)
+
+  def test_vision_still_routes_around_what_it_would_hand_back(self):
+    self.vision_engine()
+    keep, divided = self.vision_stop(1, 60.), self.vision_stop(2, 150., divided=True)
+    router = self.start([keep, divided], reroutes=[[keep]])
+    self.assertEqual((divided.certification, divided.cert_reason), ('uncertifiable', 'geometry'))
+    self.assertEqual(len(router.reroute_calls), 1)
+    self.assertEqual(len(router.reroute_calls[0][4]), 1)  # only the divided one excluded
+
+  def test_vision_with_the_side_views_off_avoids_every_stop(self):
+    self.vision_engine(side_views=False)
+    a, y = self.vision_stop(1, 60.), self.vision_stop(2, 150., kind='yield')
+    router = self.start([a, y], reroutes=[[]])
+    self.assertEqual([c.cert_reason for c in (a, y)], ['sideViews', 'sideViews'])
+    self.assertEqual(len(router.reroute_calls[0][4]), 2)

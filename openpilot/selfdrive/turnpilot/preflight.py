@@ -195,6 +195,38 @@ def check_far_crop(path: Path, far_range_m: float, on: bool) -> Check:
   return Check(name, PASS, f"{path.name} ({size / 1e6:.1f} MB), proven range {far_range_m:.0f} m")
 
 
+VISION_SAYS = ' '.join(("vision: goes by itself at stop signs and yields with every cross road 25 mph or less after a 2.5 s clear",
+                        "look (4 s and 'Look both ways' where one is faster or of unknown speed), in daylight with the sun not ahead,",
+                        "side views on; everything else hands back after 1 s"))
+
+
+def check_stop_sign_go(mode: str, known: bool, avoid_on: bool, camera_ready: bool, side_pkl: Path) -> Check:
+  """TurnPilotStopSignGo as this build acts on it (stop_go.py): vision goes by itself from the live cameras, which needs the
+  side views' pkl (PF-07) and keeps on the route only the stops it can take while TurnPilotAvoidStops is on; auto and trial
+  act only with step S1's camera measurements (none on the shipped file), else as shadow; off and shadow hand every stop
+  back. Never a failure: the car drives whatever it says, the stops handed back."""
+  name = "stop-sign go"
+  if not known:
+    why = f"TurnPilotStopSignGo {mode!r} is unknown to this build: acts as shadow, every stop sign and yield hands back after 1 s"
+    return Check(name, WARN, why, "preflight --set TurnPilotStopSignGo=off (or vision)")
+  if mode == 'vision':
+    size = side_pkl.stat().st_size if side_pkl.is_file() else 0
+    if size <= MIN_PKL_BYTES:
+      why = "empty or a pointer" if side_pkl.is_file() else "missing"
+      return Check(name, WARN, f"vision, but {side_pkl.name} is {why}: no side views, so every vision stop hands back after 1 s (PF-07)",
+                   "update to a branch that carries it (compile_detector.py --side builds it on the Mac)")
+    if not avoid_on:
+      return Check(name, WARN, "vision with TurnPilotAvoidStops off: the stops vision can't take stay on the route and hand back",
+                   "preflight --set TurnPilotAvoidStops=1")
+    return Check(name, INFO, VISION_SAYS)
+  if mode in ('off', 'shadow'):
+    return Check(name, INFO, f"{mode}: every stop sign and yield hands back after 1 s")
+  if not camera_ready:
+    why = f"{mode} acts as shadow: no camera measurements (step S1), so every stop sign and yield hands back after 1 s"
+    return Check(name, WARN, why, "preflight --set TurnPilotStopSignGo=vision, or off")
+  return Check(name, INFO, f"{mode}: goes by itself at certified stops")
+
+
 def check_chestnut(devices: list[dict]) -> Check:
   name = "chestnut"
   seen = [d for d in devices if is_chestnut_usb_id(d["vendorId"], d["productId"], include_bootloader=True)]
@@ -279,7 +311,9 @@ def collect(params) -> list[Check]:
   from openpilot.common.git import get_short_branch
   from openpilot.common.hardware.usb import get_usb_state
   from openpilot.selfdrive.modeld.helpers import chestnut_compiled
-  from openpilot.selfdrive.turnpilot.detector.graph import detector_pkl_path, far_detector_pkl_path
+  from openpilot.selfdrive.turnpilot import visibility_table
+  from openpilot.selfdrive.turnpilot.detector.graph import detector_pkl_path, far_detector_pkl_path, side_detector_pkl_path
+  from openpilot.selfdrive.turnpilot.stop_go import mode_for
   from openpilot.selfdrive.turnpilot.detector.modeld_detector import far_crop_on
   from openpilot.selfdrive.turnpilot.turnpilotd import left_far_range_for
   from openpilot.selfdrive.turnpilot.maps.client import MapError, missing_config
@@ -326,10 +360,17 @@ def collect(params) -> list[Check]:
       checks.append(check_route(None, sum(s["distance"] for s in steps), time.monotonic() - t0))
     except Exception as e:
       checks.append(check_route(f"{type(e).__name__}: {e}", 0., 0.))
+  raw_stop = params.get("TurnPilotStopSignGo")
+  stop_mode, stop_known = mode_for(raw_stop)
+  if not stop_known:
+    stop_mode = raw_stop.decode(errors='replace') if isinstance(raw_stop, bytes) else str(raw_stop)
+  vis = visibility_table.cached(visibility_table.SHIPPED)
   checks += [
     check_big_model(chestnut_compiled()),
     check_detector(detector_pkl_path(*CAR_CAMERA, chestnut), chestnut),
     check_far_crop(far_detector_pkl_path(*CAR_CAMERA, chestnut), left_far_range_for(params), far_crop_on(params)),
+    check_stop_sign_go(stop_mode, stop_known, params.get_bool("TurnPilotAvoidStops"), vis is not None and vis.camera_ready()[0],
+                       side_detector_pkl_path(*CAR_CAMERA, chestnut)),
     check_chestnut(devices),
     check_token(token),
     check_pairing_url(token, local_ip(), PORT),
