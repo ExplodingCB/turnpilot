@@ -1572,3 +1572,26 @@ def test_after_a_go_withdrawn_in_its_launch_a_left_let_go_as_the_drivers_is_neve
     assert any(p.turnMissed for _, p in rows) or JUNCTION - sim.s > -2., "driven straight through, never missed"
   standing = [p for (_, p), (s, v, _) in zip(rows, sim.trace[-len(rows):], strict=True) if v < 0.05]
   assert not any(p.desire == Desire.turnLeft for p in standing)
+
+
+def test_a_left_the_driver_has_turned_into_when_it_is_let_go_keeps_its_desire_to_finish():
+  """turnpilotd.clear_driven_left takes a withdrawn go's pulse out of the model's queue only under TURN_STARTED_DEG into the
+  left: the driver turning the left themselves from the left's own hold (under the gas, disengaged, a 6 m radius), let go
+  as theirs about 20 deg round, is a turn under way. Its desire is never cleared there (a re-engage then finishes the turn,
+  as one the driver started on re-engaging always does), the crossing said all the same."""
+  from openpilot.selfdrive.turnpilot.desire_timing import TURN_STARTED_DEG
+  sim = withdrawn_go()
+  sim.accel = lambda sim, plan: 0.5 if sim.v < 1.5 else 0.
+  let_go = None
+  for _ in range(int(10. / DT_MDL)):
+    p = sim.step(engaged=False, gas=True, yaw_rate=sim.v / 6.)
+    if not sim.tp.left.hold_here:
+      let_go = p
+      break
+  assert let_go is not None and str(let_go.unprotectedLeft.why) == 'driven'
+  d = sim.tp.desires
+  assert d.started and d.turned_deg >= TURN_STARTED_DEG + 2., d.turned_deg
+  assert not d.done and let_go.desire != CLEAR_DESIRE
+  plans = [sim.step(engaged=False, gas=True, yaw_rate=sim.v / 6.) for _ in range(5)]
+  assert not any(p.desire == CLEAR_DESIRE for p in plans) and not d.done
+  assert str(plans[-1].controlPrompt) == 'unprotectedTurnTakeControl'

@@ -1841,3 +1841,56 @@ def test_a_nudge_from_the_lefts_full_creep_braked_short_of_the_lanes_is_held_on_
   rows = [car.step(left=creep) for _ in range(int(5. / DT_MDL))]  # re-engaged standing
   assert car.policy.held is not None and car.policy.driven is None, f"stood {at:.2f} m out, re-engaged: let go"
   assert all(dec.should_stop and out.prompt == 'none' for out, dec, _ in rows) and junction - car.s == at
+
+
+def test_a_nudge_from_the_lefts_full_creep_into_the_lanes_is_said_as_it_enters_them_short_of_the_reach():
+  """The latch's lanes on the driver's own frame: after the left's full creep (5 m from the centre, 1 m short of the
+  oncoming entry, the reach 1 m inside them), the driver's gas (disengaged) crawls the car on into the oncoming lanes. A hold
+  there could only stand the car in them and it never comes back short of them: theirs as it enters them (drivenOff, the
+  crossing said), before the reach and before any re-engage, never 'waiting for a gap' inside them."""
+  from openpilot.selfdrive.turnpilot.map_controls import LATCH_PAST_M
+  from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M
+  junction = 250.
+  car = left_car(at=junction)
+  held_left(car, left_cmd(reason="Waiting for a gap"))
+  creep = left_cmd(creep_m=4., reason="Creeping for a view")
+  run_left(car, 12., creep)
+  assert abs(junction - car.s - 5.) < 0.35 and car.v < 0.05
+  stood, let_go = car.s, None
+  while junction - car.s > ONCOMING_ENTRY_M - 0.5:
+    out, _, _ = car.step(gas=True, accel=0.4 if car.v < 0.6 else 0., left=creep)
+    if let_go is None and car.policy.held is None:
+      let_go = junction - car.s
+      assert out.prompt == 'unprotectedTurnTakeControl' and car.policy.driven.cause == 'drivenOff'
+  assert let_go is not None and ONCOMING_ENTRY_M - 0.1 < let_go < ONCOMING_ENTRY_M, let_go  # a frame or so inside them
+  assert junction - let_go - stood < LATCH_PAST_M - 0.5  # well short of the reach
+
+
+@pytest.mark.parametrize("gas_accel", [0.6, 1.0, 1.5, 2.5])
+def test_a_re_engage_the_latch_takes_up_is_never_let_go_on_a_later_frame(gas_accel):
+  """The latch's lanes test is the re-engage's alone (skeptic rounds 1, 2): the driver's gas inside the left's 2 m creep
+  over a sweep of distances, then a re-engage rolling, the car keeping its speed REENGAGE_LAG_S (the plan's frame, the
+  actuator's delay) before the latch brakes it. Let go at the re-engage itself or held: a latch taken up there stands the car
+  short of the oncoming lanes, and the frames after it never let it go (judged again on them, the lag taken again with the
+  car still at its speed, it let go on the latch's own metres)."""
+  from openpilot.selfdrive.turnpilot.map_controls import REENGAGE_LAG_S
+  from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M
+  for k in range(15):
+    gas_to = 0.6 + 0.1 * k
+    car = left_car()
+    cmd = left_cmd(creep_m=0.)
+    car.run_until(held, left=cmd)
+    car.run(2., left=cmd)
+    s_held = car.s
+    cmd = left_cmd(creep_m=2., reason="Creeping for a view")
+    while car.s - s_held < 0.5:
+      car.step(left=cmd)
+    while car.s - s_held < gas_to and car.policy.held is not None:
+      car.step(left=cmd, gas=True, accel=gas_accel)
+    assert car.policy.held is not None, gas_to
+    rows = [car.step(left=cmd, accel=0., engaged=True) for _ in range(round(REENGAGE_LAG_S / DT_MDL))]
+    rows += [car.step(left=cmd) for _ in range(int(6. / DT_MDL))]
+    released = [i for i, r in enumerate(car.rows[-len(rows):]) if r[5].driven]
+    assert not released or released[0] == 0, (gas_to, released[:1])
+    if not released:
+      assert car.policy.held is not None and car.v < 0.05 and 250. - car.s > ONCOMING_ENTRY_M, (gas_to, 250. - car.s)

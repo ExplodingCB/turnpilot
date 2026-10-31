@@ -1058,3 +1058,26 @@ def test_the_lefts_own_hold_is_judged_for_the_lanes_at_the_re_engage_so_a_car_br
   assert j.left.hold_here and j.v == 0. and j.left.hold_m < entry
   # held, waiting for its gap, or standing under HELD_MIN_M its position handback, held
   assert all(d.stops and (d.state, d.why) in (('waitGap', ''), ('undecided', 'position')) for d in ds[n:])
+
+
+@pytest.mark.parametrize("v", [1.5, 2.38])
+def test_a_re_engage_the_lefts_own_hold_takes_up_is_never_let_go_on_a_later_frame(v):
+  """The lanes test is the re-engage's alone (skeptic rounds 1, 2): the go withdrawn in its launch at v, the driver keeps the
+  speed disengaged over a sweep of distances and re-engages rolling, the car keeping its speed REENGAGE_LAG_S (the plan's
+  frame, the actuator's delay) before the hold brakes it. Let go at the re-engage itself or held: a hold taken up there
+  stands the car short of the oncoming lanes, and the frames after it never let it go, however narrow the room it had
+  (reengage_stop_m judged again on them takes the lag again, the car still at its speed, and lets go on TurnPilot's metres)."""
+  from openpilot.selfdrive.turnpilot.map_controls import REENGAGE_LAG_S
+  for k in range(int(round(1.5 / 0.05)) + 1):
+    keep_m = 0.05 * k
+    j = Junction()
+    j.distance = 7.6
+    withdrawn(j, v)
+    entry = j.left.hold_entry
+    ds = roll(j, keep_m / v, v, enabled=False)
+    n = len(ds)
+    ds += roll(j, REENGAGE_LAG_S, v) + under_the_hold(j, 6.)
+    crossed = [i for i, d in enumerate(ds) if d.crossed]
+    assert crossed in ([], [n]), (keep_m, crossed, n)
+    if not crossed:
+      assert j.left.hold_here and j.v == 0. and j.left.hold_m < entry and ds[-1].stops, (keep_m, j.left.hold_m, entry)
