@@ -107,6 +107,19 @@ On a Tesla, TurnPilot can work the car's own turn signal through `DAS_bodyContro
 
 In the BeamNG sim the car signals by default: `launch_openpilot.sh` and `run_bridge.py` write `on` and a sim record that the comma accepts only with `SIMULATION=1`. `run_bridge.py --no-car-signals` (with `TURNPILOT_CAR_SIGNALS=0` for `launch_openpilot.sh`) writes `off`.
 
+## Let the car go by itself at stop signs
+
+By default (`auto`) every stop sign and yield hands back after a 1 s full stop: `auto` acts only on a camera fit and a junction survey, and neither exists for this car yet. `vision` makes the car go by itself from what the cameras see live. It stops fully at the line, looks for 2.5 s with every view fresh and nothing in a conflicting lane, chimes "Going", and goes. Where a cross road is over 25 mph, or its speed isn't known, it looks for 4 s and says "Look both ways" first, so check both ways yourself. It hands back after 1 s, saying why, at night, at dusk, in low sun, with the sun ahead, with the side cameras off, without the stop-sign map data, and at a divided road, a roundabout or a rail crossing.
+
+```
+python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotStopSignGo=vision
+```
+
+| Param | Value | What it does |
+| --- | --- | --- |
+| `TurnPilotStopSignGo` | `auto` | `off` and `shadow`: every stop sign and yield hands back after 1 s. `auto` and `trial`: the go only at a surveyed, validated junction with the camera fit, so on this car they act as `shadow`. `vision`: the go from the live cameras (above). Any other value acts as `shadow`, logged. Read every second. |
+| `TurnPilotAvoidStops` | 1 | navd routes around the stops and yields TurnPilot can't take. Under `vision` it keeps every one vision can take on the route, and avoids the rest (the ones it would hand back). Off, every stop stays on the route and the ones vision can't take hand back at the line. |
+
 ## Install Valhalla for offline routing
 
 The system Python on the comma is read-only, so pyvalhalla goes into `/data/turnpilot/pyvalhalla`, which survives updates. The comma needs internet once for the 35 MB wheel, from home Wi-Fi or the hotspot:
@@ -165,6 +178,7 @@ Each line starts with PASS, FAIL, WARN or INFO. A FAIL line is followed by a `fi
 | `pyvalhalla`, `valhalla tiles`, `routing test` | pyvalhalla imports; with `TurnPilotValhallaTiles` set, those tiles are usable and a real route comes back |
 | `big driving model` | The 775 MB pickle and both warps are real files, not LFS pointers. If they are pointers, modeld quietly runs the small model |
 | `detector pkl` | `big_detector_1344x760_tinygrad.pkl` exists. Without it the planner holds every left turn |
+| `stop-sign go` | An INFO line saying what `TurnPilotStopSignGo` does on this build. It warns under `vision` when the side-view pkl is missing or a pointer (every stop hands back) or `TurnPilotAvoidStops` is off, and under `auto` or `trial` without the camera fit (they act as `shadow`) |
 | `chestnut` | The chestnut is present with its firmware and a USB 3 link |
 | `web token`, `pairing URL`, `web server` | The token exists, the comma has a network address, and `turnpilot_web` answers on port 8088 |
 
