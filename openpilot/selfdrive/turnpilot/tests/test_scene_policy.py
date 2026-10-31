@@ -1,4 +1,5 @@
 import math
+from types import SimpleNamespace
 from unittest import mock
 
 from openpilot.common.realtime import DT_MDL
@@ -7,7 +8,7 @@ from openpilot.selfdrive.turnpilot.route_follower import NOMINAL_ANGLE_DEG, Mane
 from openpilot.selfdrive.turnpilot.scene_policy import (ACCEL_CAP_JERK, COMMIT_SPEED, CONFIRM_HITS, CROSSWALK_LEAVING_FRAMES, GAS_RELEASE_M, HARD_MISSED_RUNS,
                                                         HOLD_LINE_M, LOST_CLOSE_M,
                                                         NO_ACCEL_CAP, NO_SPEED_CAP, ONCOMING_ASSUMED_SPEED, ONCOMING_ENTRY_M, ONCOMING_TTA_S,
-                                                        PED_STOP_GAP_M, STOP_DECEL, VEL_TRUST_HITS, ScenePolicy, Stop, scene_policy)
+                                                        PED_MAX_SPEED, PED_STOP_GAP_M, STOP_DECEL, VEL_TRUST_HITS, ScenePolicy, Stop, scene_policy)
 from openpilot.selfdrive.turnpilot.tests.synthetic import scene
 
 LEFT_TURN = Maneuver(*classify("turn", "left"), "turn", "left", NOMINAL_ANGLE_DEG["left"])
@@ -303,16 +304,19 @@ def test_closed_loop_stop_with_growing_evidence():
 
 
 def test_cyclist_riding_away_is_followed():
-  # a person 60 m ahead riding away at 6 m/s, closing at 25 m/s: a moving lead, not a wall
+  # a person 60 m ahead riding away at 6 m/s, closing at 25 m/s: a moving lead, not a wall, on one frame on its own
+  # (scene_policy). ScenePolicy reads a pedestrian track that fast as standing (PED_MAX_SPEED, peds P2)
   moving = policy([ped(60., 0.2, vx=6., in_path=True)], v_ego=25.)
   standing = policy([ped(60., 0.2, in_path=True)], v_ego=25.)
   assert moving.reason == "following pedestrian" and not moving.should_stop
   assert moving.accel_cap > standing.accel_cap and moving.speed_cap > standing.speed_cap
-  sp = ScenePolicy()
-  # matched on every detector run (10 Hz): confirmation is re-earned every frame from recent hits (update_evidence)
-  v, s, ds = drive(sp, int(30. / DT_MDL), 25., 0., lambda s, t: (ped(60. + 6. * t - s, 0.2, vx=6., in_path=True, age=10 + int(t / 0.1)),))
-  gap = 60. + 6. * 30. - s
-  assert not any(d.should_stop for d in ds) and abs(v - 6.) < 0.5 and PED_STOP_GAP_M < gap < PED_STOP_GAP_M + 6. * 3.
+  # through ScenePolicy at a person's speed, a jogger 3 m/s away, matched on every detector run (10 Hz): confirmation is
+  # re-earned every frame from recent hits (update_evidence)
+  sp, jog = ScenePolicy(), 3.
+  assert jog < PED_MAX_SPEED
+  v, s, ds = drive(sp, int(30. / DT_MDL), 15., 0., lambda s, t: (ped(60. + jog * t - s, 0.2, vx=jog, in_path=True, age=10 + int(t / 0.1)),))
+  gap = 60. + jog * 30. - s
+  assert not any(d.should_stop for d in ds) and abs(v - jog) < 0.5 and PED_STOP_GAP_M < gap < PED_STOP_GAP_M + jog * 3.
 
 
 def test_rider_on_a_moving_two_wheeler_is_not_a_pedestrian():
@@ -902,3 +906,50 @@ def test_the_curb_cap_is_logged_once_per_track():
     curb_run(steady_curb_walker(35., 3.8), secs=4.)
   calls = [c for c in log.event.call_args_list if c.args[0] == 'turnpilot.curb_ped_cap']
   assert len(calls) == 1 and {'x', 'y', 'conf', 'hits', 'track_id'} <= set(calls[0].kwargs), calls
+
+
+# --- a pedestrian's velocity is trusted only at a person's speed (peds P2) ---
+
+def plain_ped(x, y, vx=0., vy=0., track_id=0, **fields):
+  """A tracked pedestrian as a plain object, to see that the policy never writes to the objects it reads."""
+  f = {'trackId': track_id, 'cls': 'pedestrian', 'conf': 0.9, 'x': x, 'y': y, 'vx': vx, 'vy': vy, 'age': 10, 'inPath': False, 'camera': 'road',
+       'box': [], 'missedRuns': 0, **fields}
+  return SimpleNamespace(**f)
+
+
+def test_a_pedestrian_faster_than_a_run_has_no_velocity_the_policy_trusts():
+  # public comma four route 5afee5161ea1dcde/00000003--b8ae16aae0 segment 26: walkers behind a guardrail on a curve read
+  # vx -5 to -10 m/s (range noise and ego motion), the entering rule took one as walking into the path and the hard tier ramped
+  # to -7.25 m/s^2 at 37 km/h. A pedestrian track faster than PED_MAX_SPEED reads as standing to ScenePolicy.update
+  # 20 m out, 6 m to the left, read crossing in at 4 m/s: the entering rule's |6 - 4 x 1.5| < 1.5, no longer
+  sc = scene([ped(20., 6., vy=-4.)])
+  d = ScenePolicy().update(sc.objects, True, None, 1000., 6.)
+  assert not d.holding and d.reason == "" and d.speed_cap == NO_SPEED_CAP
+  # a crossing walker at 1.4 m/s still walks into the path, and is stopped for on the comfortable curve
+  sc = scene([ped(20., 3., vy=-1.4)])
+  d = ScenePolicy().update(sc.objects, True, None, 1000., 6.)
+  assert d.holding and d.reason == "pedestrian in path" and d.rest_d == 20. - PED_STOP_GAP_M
+  assert d.accel_cap == NO_ACCEL_CAP and not d.hard_brake and plan_accel(d.accel_cap, d.speed_cap, 6.) >= -STOP_DECEL
+  # what the policy reads is never written back: turnpilotScene keeps the tracker's velocity for everyone else
+  objects = [plain_ped(20., 6., vy=-4.), plain_ped(20., 3., vy=-1.4, track_id=1), plain_ped(12., 0., vx=5., track_id=2)]
+  sp = ScenePolicy()
+  for _ in range(5):
+    sp.update(objects, True, RIGHT_TURN, 20., 6.)
+  assert [(o.vx, o.vy) for o in objects] == [(0., -4.), (0., -1.4), (5., 0.)]
+
+
+def test_a_confirmed_pedestrian_faster_than_a_run_is_stopped_for_never_followed():
+  # 12 m ahead in the path, confirmed, read moving on at 5 m/s: a person at that speed is range noise or a rider without a
+  # bicycle box, so the policy stops short of them as if they stood, rather than following them into a 2 m gap
+  sp = ScenePolicy()
+  sc = scene([ped(12., 0., vx=5.)])
+  for _ in range(3):
+    d = sp.update(sc.objects, True, None, 1000., 8.)
+  assert d.reason == "pedestrian in path" and d.rest_d == 12. - PED_STOP_GAP_M
+  assert sp.tracks[0].confirmed and d.hard_brake
+  # under PED_MAX_SPEED (a jogger) it is followed as today
+  sp = ScenePolicy()
+  sc = scene([ped(12., 0., vx=3.)])
+  for _ in range(3):
+    d = sp.update(sc.objects, True, None, 1000., 8.)
+  assert d.reason == "following pedestrian" and d.rest_d is None

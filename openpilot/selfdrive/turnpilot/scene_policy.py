@@ -14,7 +14,9 @@ two-hit false positive, or a burst the tracker coasts on, slows the car on the c
 instead of stopping it hard, and the accel cap ramps in at a bounded jerk rather than stepping. A confirmed person moving
 along the path is followed like a lead, not stopped for, and one on a confirmed, moving bicycle or motorcycle is its
 rider, left to the driving model like any vehicle; an unconfirmed track's velocity is mostly range noise, so it never
-turns a stop into a follow. A crosswalk hold needs a steadily detected track with enough hits. It holds for anyone who
+turns a stop into a follow. Nor is any pedestrian track's velocity faster than a person runs (PED_MAX_SPEED): ScenePolicy
+reads such a track as standing, so it is neither walking into the path nor followed (turnpilotScene keeps the tracker's
+velocity for everyone else). A crosswalk hold needs a steadily detected track with enough hits. It holds for anyone who
 might step into the turn's crosswalk, standing or moving: only a confirmed track walking away from it (on past the
 maneuver point, or away down the cross street) is let go. A track's evidence is kept while the tracker may still match
 it again under the same id (KEEP_EVIDENCE_S), not just while it is published.
@@ -120,6 +122,12 @@ ENTER_MAX_X_M = 40.         # this close: farther out a mono track's lateral spe
 PED_STOP_GAP_M = 5.0        # stop this far (camera to pedestrian) short of a pedestrian in the path
 MOVING_PED_VX = 1.0         # m/s: a person moving along the path faster than this is followed, not stopped for,
 FOLLOW_GAP_S = 1.0          # with this many seconds of their speed added to the gap
+# A pedestrian track read moving faster than this over the ground is read standing by ScenePolicy.update (trusted_velocity): a
+# mono track's velocity that fast is range noise or ego-motion error, or a rider without a bicycle box. Public comma four route
+# 5afee5161ea1dcde/00000003--b8ae16aae0 segment 26: walkers behind a guardrail on a curve read vx -5 to -10 m/s, the entering
+# rule took one as walking into the path and the hard tier ramped to -7.25 m/s^2 at 37 km/h (peds P2). turnpilotScene keeps
+# the tracker's velocity: only this policy's rules read it so
+PED_MAX_SPEED = 3.5         # m/s
 RIDER_OVERLAP = 0.3         # a person box this much inside a cyclist or motorcycle box (of the smaller box) is its rider,
 RIDER_MIN_SPEED = 2.0       # m/s, when the two-wheeler moves faster than this: someone walking a bike stays a pedestrian
 
@@ -323,6 +331,24 @@ def leaving_crosswalk(obj, distance: float, side: int) -> bool:
   return on_past or down_cross_street
 
 
+class StillPedestrian:
+  """A pedestrian track faster than PED_MAX_SPEED as ScenePolicy.update reads it: standing, vx and vy 0. Every other field is
+  the track's own; nothing is written to the track."""
+  __slots__ = ('obj',)
+  vx = vy = 0.
+
+  def __init__(self, obj):
+    self.obj = obj
+
+  def __getattr__(self, name):
+    return getattr(self.obj, name)
+
+
+def trusted_velocity(objects) -> list:
+  """objects with each pedestrian moving faster than PED_MAX_SPEED read standing (StillPedestrian)."""
+  return [StillPedestrian(obj) if str(obj.cls) == "pedestrian" and math.hypot(obj.vx, obj.vy) > PED_MAX_SPEED else obj for obj in objects]
+
+
 class RoadFrame:
   """A tracked object seen in the road's frame: the car's calibrated frame turned back by the car's heading change toward the
   turn (x along the approach, y left of it). Every other field is the object's own."""
@@ -471,7 +497,7 @@ class ScenePolicy:
     far_side = far_side_turn(maneuver, right_hand_traffic)
     self.t += dt
     if available:
-      objects = list(objects)
+      objects = trusted_velocity(objects)  # before any rule reads them: no pedestrian faster than PED_MAX_SPEED
       self.update_evidence(objects)
       for obj in objects:
         ev = self.tracks[obj.trackId]
