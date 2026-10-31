@@ -64,3 +64,31 @@ def test_inactive_port_does_nothing():
   card.CI.CS.car_signal.active = False
   Car.car_signals_tick(card)
   assert not started and 'TurnPilotCarSignalsVerified' in card.params
+
+
+ZERO_VIN = "0" * 17
+DONGLE = "0123456789abcdef"
+CHASE_EPS = b'TeM3_E014p10_0.0.0 (35),E014.21.2'
+CHECK_KEYS = {'pass', 'step', 'record', 'vin', 'fw', 'when', 'checkId', 'exterior'}
+
+
+def chase_card(params):
+  check = types.SimpleNamespace(result={'pass': True, 'step': 'done', 'record': {'onReason': 9, 'gear': 'P', 'onSeparates': False}})
+  card, _ = fake_card(check, params=params)
+  card.CP.carVin, card.CP.carFingerprint, card.CP.fingerprintSource = ZERO_VIN, 'TESLA_MODEL_3', structs.CarParams.FingerprintSource.fw
+  card.CP.carFw = [structs.CarParams.CarFw(ecu='eps', address=0x730, subAddress=0, fwVersion=CHASE_EPS, brand='tesla')]
+  return card
+
+
+def test_check_result_keeps_the_identity_only_with_vinless_on():
+  """TurnPilotCarSignalsVinless off (unset or 0): the check card writes is be3c0ed's. On: it also keeps this comma's
+  DongleId and the platform the car's firmware fingerprints exactly, what a record without a VIN matches on."""
+  for params in (FakeParams(DongleId=DONGLE), FakeParams(DongleId=DONGLE, TurnPilotCarSignalsVinless=False)):
+    card = chase_card(params)
+    Car.car_signals_tick(card)
+    assert set(card.params['TurnPilotCarSignalsCheck']) == CHECK_KEYS
+  card = chase_card(FakeParams(DongleId=DONGLE, TurnPilotCarSignalsVinless=True))
+  Car.car_signals_tick(card)
+  written = card.params['TurnPilotCarSignalsCheck']
+  assert set(written) == CHECK_KEYS | {'dongleId', 'carFingerprint'}
+  assert (written['vin'], written['dongleId'], written['carFingerprint']) == (ZERO_VIN, DONGLE, 'TESLA_MODEL_3')

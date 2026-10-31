@@ -1,9 +1,15 @@
-"""TurnPilot's turn signal intent, status, prompt, veto and the verified record (car_signals.py, DESIGN phase4/blinker 11.3)."""
+"""TurnPilot's turn signal intent, status, prompt, veto and the verified record (car_signals.py, DESIGN phase4/blinker 11.3),
+and the owner's opt-in to match a record without a VIN (TurnPilotCarSignalsVinless)."""
+import itertools
+import re
 import types
+from pathlib import Path
+from unittest import mock
 
 import pytest
 
 from opendbc.car import structs
+from opendbc.car.car_signal import CarSignalsConfig
 from opendbc.car.tesla.values import TeslaFlags
 from openpilot.cereal import custom, messaging
 from openpilot.selfdrive.controls.lib.desire_helper import LANE_CHANGE_SPEED_MIN
@@ -654,6 +660,239 @@ def test_refusal():
 def test_failed_check_has_no_id():
   check = check_record({'pass': False, 'step': 'release', 'why': 'x'}, VIN, fws())
   assert 'checkId' not in check and 'exterior' not in check
+
+
+# ------------------------------------------------------------------------- a record without a VIN (TurnPilotCarSignalsVinless)
+
+ZERO_VIN = "0" * 17                                  # every Tesla's carVin: opendbc has no Tesla VIN query
+BAD_VIN = VIN[:8] + "5" + VIN[9:]                    # 17 characters, the check digit fails: unreadable too
+DONGLE = "0123456789abcdef"
+OTHER_DONGLE = "fedcba9876543210"
+CHASE_EPS = b'TeM3_E014p10_0.0.0 (35),E014.21.2'    # Chase's EPS (ROUTE_FACTS.md): exactly TESLA_MODEL_3 by its firmware
+UPDATED_EPS = b'TeM3_E014p10_0.0.0 (24),E014.20.2'  # another TESLA_MODEL_3 string: a Tesla update
+UNLISTED_EPS = b'TeM3_E014p10_0.0.0 (35),EL014.21.2'  # in no list: no exact fingerprint
+DID = "Car's VIN unreadable: can't match the record"
+VINLESS_ON = {'TurnPilotCarSignalsVinless': True, 'DongleId': DONGLE}
+RESULT = {'pass': True, 'step': 'done', 'record': {'onReason': 9, 'gear': 'P', 'onSeparates': False}}
+CHECK_KEYS = {'pass', 'step', 'record', 'vin', 'fw', 'when', 'checkId', 'exterior'}  # be3c0ed's TurnPilotCarSignalsCheck
+RECORD_KEYS = {'onReason', 'gear', 'onSeparates', 'vin', 'fw', 'checkId', 'exteriorConfirmed', 'when', 'opendbc'}
+
+
+def tesla_fws(eps=CHASE_EPS, brand='tesla'):
+  return [structs.CarParams.CarFw(ecu='eps', address=0x730, subAddress=0, fwVersion=eps, brand=brand)]
+
+
+def vinless_record(**kw):
+  r = {'onReason': 9, 'gear': 'P', 'onSeparates': False, 'vin': ZERO_VIN, 'fw': fw_list(tesla_fws()), 'exteriorConfirmed': 1.,
+       'dongleId': DONGLE, 'carFingerprint': 'TESLA_MODEL_3'}
+  r.update(kw)
+  return r
+
+
+def on_params(record, **kw):
+  return FakeParams(TurnPilotCarSignals='on', TurnPilotCarSignalsVerified=record, **kw)
+
+
+def legacy_record_matches(record, vin, car_fw, simulation=False):
+  """record_matches as it stood at be3c0ed, frozen: with the opt-in off, the record must match exactly as it did."""
+  if not record:
+    return False, "Run the turn signal check"
+  if record.get('sim') and not simulation:
+    return False, "A simulator record: run the check on the car"
+  if not record.get('sim') and not vin_valid(vin):
+    return False, "Car's VIN unreadable: can't match the record"
+  if record.get('vin') != vin:
+    return False, "Recorded for another car: run the check"
+  if record.get('fw') != fw_list(car_fw):
+    return False, "Car software changed: run the check again"
+  if not record.get('exteriorConfirmed'):
+    return False, "Confirm the outside lamps on the phone"
+  return True, ""
+
+
+def legacy_config(record, vin, car_fw, simulation=False):
+  ok, _ = legacy_record_matches(record, vin, car_fw, simulation)
+  if not ok:
+    return CarSignalsConfig()
+  return CarSignalsConfig(mode='on', on_reason=int(record.get('onReason', 8)), recheck=record.get('gear') == 'P',
+                          on_separates=bool(record.get('onSeparates')))
+
+
+GRID_RECORDS = [None, {}, record(), record(gear='D', onSeparates=True), record(vin=OTHER_VIN), record(exteriorConfirmed=None),
+                record(sim=True), record(sim=True, vin=ZERO_VIN, fw=[]), vinless_record(), vinless_record(gear='D'),
+                vinless_record(vin=VIN, fw=fw_list(fws())), record(fw=fw_list(tesla_fws()))]
+GRID_VINS = [VIN, OTHER_VIN, ZERO_VIN, BAD_VIN, "", "5YJ3E1EA7KF00000"]
+GRID_FWS = [fws, tesla_fws, lambda: tesla_fws(UPDATED_EPS), list]
+
+
+@pytest.mark.parametrize("off", [{}, {'TurnPilotCarSignalsVinless': False}, {'TurnPilotCarSignalsVinless': None}])
+def test_with_the_opt_in_off_nothing_changes(off):
+  """The default, byte-for-byte: every record, VIN and firmware matches as at be3c0ed, the resolver gives the same config
+  and the same error, writes nothing, and no identity is formed, whatever the DongleId."""
+  for r, vin, fw, sim in itertools.product(GRID_RECORDS, GRID_VINS, GRID_FWS, (False, True)):
+    want = legacy_record_matches(r, vin, fw(), sim)
+    params = on_params(r, DongleId=DONGLE, **off)
+    assert cs_mod.identity_for(params, vin, fw()) is None
+    assert record_matches(r, vin, fw(), sim) == want
+    assert record_matches(r, vin, fw(), sim, cs_mod.identity_for(params, vin, fw())) == want
+    before = dict(params)
+    with mock.patch.object(cs_mod.cloudlog, 'error') as error, mock.patch.object(cs_mod.cloudlog, 'warning') as warning:
+      assert resolver(params, sim)(vin, fw()) == legacy_config(r, vin, fw(), sim)
+    assert dict(params) == before
+    assert [c.args for c in error.call_args_list] == ([] if want[0] else [(f"turnpilot: car signals on but not verified for this car: {want[1]}",)])
+    assert not warning.called
+
+
+@pytest.mark.parametrize("off", [{}, {'TurnPilotCarSignalsVinless': False}])
+def test_zero_vin_with_the_opt_in_off_stays_off(off):
+  """Chase's car as it is: a record the check wrote with the identity, the comma's DongleId, an exact firmware fingerprint,
+  and still off, said as today, unless the owner opts in."""
+  params = on_params(vinless_record(), DongleId=DONGLE, **off)
+  assert cs_mod.identity_for(params, ZERO_VIN, tesla_fws()) is None
+  with mock.patch.object(cs_mod.cloudlog, 'error') as error:
+    assert resolver(params)(ZERO_VIN, tesla_fws()) == CarSignalsConfig()
+  assert error.call_args.args[0] == f"turnpilot: car signals on but not verified for this car: {DID}"
+  assert record_matches(vinless_record(), ZERO_VIN, tesla_fws()) == (False, DID)
+
+
+@pytest.mark.parametrize("vin", [ZERO_VIN, BAD_VIN, ""])
+def test_zero_vin_with_the_opt_in_on_matches(vin):
+  r = vinless_record()
+  params = on_params(r, **VINLESS_ON)
+  ident = cs_mod.identity_for(params, vin, tesla_fws())
+  assert ident == cs_mod.CarIdentity(DONGLE, 'TESLA_MODEL_3')
+  assert cs_mod.match_record(r, vin, tesla_fws(), identity=ident) == (True, "", 'vinless')
+  assert record_matches(r, vin, tesla_fws(), identity=ident) == (True, "")
+  with mock.patch.object(cs_mod.cloudlog, 'warning') as warning:
+    config = resolver(params)(vin, tesla_fws())
+  assert (config.mode, config.on_reason, config.recheck, config.on_separates) == ('on', 9, True, False)
+  assert any("without a VIN" in c.args[0] for c in warning.call_args_list)  # said, in the log: which way it matched
+
+
+@pytest.mark.parametrize("change, why", [
+  ({'fw': tesla_fws(UPDATED_EPS)}, "Car software changed: run the check again"),             # a Tesla update
+  ({'fw': tesla_fws() + [structs.CarParams.CarFw(ecu='fwdRadar', address=0x764, subAddress=0, fwVersion=b'r1', brand='tesla')]},
+   "Car software changed: run the check again"),                                             # another ECU answers
+  ({'dongle': OTHER_DONGLE}, "Recorded on another comma: run the check"),                    # another comma, or params copied
+  ({'dongle': None}, "No dongle ID: can't match without a VIN"),
+  ({'dongle': ""}, "No dongle ID: can't match without a VIN"),
+  ({'dongle': "UnregisteredDevice"}, "No dongle ID: can't match without a VIN"),
+  ({'record': {'carFingerprint': 'TESLA_MODEL_Y'}}, "Recorded for another car: run the check"),
+  ({'fw': tesla_fws(UNLISTED_EPS), 'record': {'fw': fw_list(tesla_fws(UNLISTED_EPS))}}, "No exact firmware fingerprint: can't match"),
+  ({'fw': tesla_fws(brand=''), 'record': {'fw': fw_list(tesla_fws(brand=''))}}, "No exact firmware fingerprint: can't match"),
+  ({'fw': [], 'record': {'fw': []}}, "No exact firmware fingerprint: can't match"),
+  ({'record': {'carFingerprint': ''}, 'fw': tesla_fws()}, "Recorded for another car: run the check"),
+  ({'record': {'vin': VIN}}, DID),                                                           # recorded with a VIN: only that VIN
+  ({'record': {'dongleId': None}}, "Checked before VIN-less was on: run it again"),
+  ({'drop': 'dongleId'}, "Checked before VIN-less was on: run it again"),
+  ({'drop': 'carFingerprint'}, "Checked before VIN-less was on: run it again"),
+  ({'record': {'gear': 'D'}}, "Checked in Drive: without a VIN, check in P"),
+  ({'record': {'exteriorConfirmed': None}}, "Confirm the outside lamps on the phone"),
+  ({'record': {'sim': True}}, "A simulator record: run the check on the car"),
+])
+def test_a_vinless_record_is_void_the_moment_anything_differs(change, why):
+  """Any of the comma's DongleId, the platform the firmware fingerprints exactly, or the carFw list (every ECU and string,
+  the EPS's included) differs from the check's: the record is void, said by the resolver's loud path (off, the error, and
+  turnpilotd's unverified why through record_matches)."""
+  r = {**vinless_record(), **change.get('record', {})}
+  r.pop(change.get('drop'), None)
+  params = on_params(r, TurnPilotCarSignalsVinless=True)
+  if change.get('dongle', DONGLE) is not None:
+    params['DongleId'] = change.get('dongle', DONGLE)
+  fw = change.get('fw', tesla_fws())
+  ident = cs_mod.identity_for(params, ZERO_VIN, fw)
+  assert ident is not None
+  assert cs_mod.match_record(r, ZERO_VIN, fw, identity=ident) == (False, why, '')
+  assert record_matches(r, ZERO_VIN, fw, identity=ident) == (False, why)
+  with mock.patch.object(cs_mod.cloudlog, 'error') as error:
+    assert resolver(params)(ZERO_VIN, fw) == CarSignalsConfig()
+  assert error.call_args.args[0] == f"turnpilot: car signals on but not verified for this car: {why}"
+
+
+def test_a_real_vin_still_has_to_match():
+  """With the opt-in on, a readable VIN matches as it always did: its own record by VIN, never a record for another VIN or
+  one recorded without a VIN, whatever the DongleId, fingerprint and firmware say."""
+  ident = cs_mod.CarIdentity(DONGLE, 'TESLA_MODEL_3')
+  by_vin = vinless_record(vin=VIN)
+  assert cs_mod.match_record(by_vin, VIN, tesla_fws(), identity=ident) == (True, "", 'vin')
+  for r in (vinless_record(vin=OTHER_VIN), vinless_record()):
+    assert cs_mod.match_record(r, VIN, tesla_fws(), identity=ident) == (False, "Recorded for another car: run the check", '')
+    with mock.patch.object(cs_mod.cloudlog, 'error') as error:
+      assert resolver(on_params(r, **VINLESS_ON))(VIN, tesla_fws()) == CarSignalsConfig()
+    assert error.call_args.args[0].endswith("Recorded for another car: run the check")
+  assert resolver(on_params(by_vin, **VINLESS_ON))(VIN, tesla_fws()).mode == 'on'
+  assert cs_mod.match_record(by_vin, VIN, tesla_fws(UPDATED_EPS), identity=ident) == (False, "Car software changed: run the check again", '')
+  assert cs_mod.match_record(record(sim=True, vin=ZERO_VIN, fw=[]), ZERO_VIN, [], True, ident) == (True, "", 'sim')
+
+
+def test_the_firmware_fingerprint():
+  """The platform get_car takes from the firmware: exactly one car, exactly; '' for none, two, a fuzzy match, no answer, or a
+  FINGERPRINT override (get_car's fixed source)."""
+  assert cs_mod.fw_fingerprint(ZERO_VIN, tesla_fws()) == 'TESLA_MODEL_3'
+  assert cs_mod.fw_fingerprint(ZERO_VIN, tesla_fws(UPDATED_EPS)) == 'TESLA_MODEL_3'
+  assert cs_mod.fw_fingerprint(ZERO_VIN, tesla_fws(b'TeM3_E014p10_0.0.0 (16),Y002.18.00')) == 'TESLA_MODEL_Y'
+  for fw in (tesla_fws(UNLISTED_EPS), tesla_fws(brand=''), fws(), []):
+    assert cs_mod.fw_fingerprint(ZERO_VIN, fw) == ''
+  with mock.patch.dict('os.environ', {'FINGERPRINT': 'TESLA_MODEL_3'}):
+    assert cs_mod.fw_fingerprint(ZERO_VIN, tesla_fws()) == ''
+
+
+def test_identity_needs_the_opt_in():
+  assert cs_mod.identity_for(FakeParams(DongleId=DONGLE), ZERO_VIN, tesla_fws()) is None
+  assert cs_mod.identity_for(FakeParams(**VINLESS_ON), ZERO_VIN, tesla_fws()) == cs_mod.CarIdentity(DONGLE, 'TESLA_MODEL_3')
+  assert cs_mod.identity_for(FakeParams(TurnPilotCarSignalsVinless=True), ZERO_VIN, tesla_fws()) == cs_mod.CarIdentity('', 'TESLA_MODEL_3')
+
+  class Old(FakeParams):
+    def get(self, key):
+      if key == 'TurnPilotCarSignalsVinless':
+        raise KeyError(key)  # UnknownKeyName: a params library that predates the key
+      return super().get(key)
+  with mock.patch.object(cs_mod.cloudlog, 'error') as error:
+    assert cs_mod.identity_for(Old(**VINLESS_ON), ZERO_VIN, tesla_fws()) is None
+  assert "TurnPilotCarSignalsVinless" in error.call_args.args[0]
+
+
+def test_check_records_the_identity_only_with_the_opt_in():
+  assert set(check_record(RESULT, ZERO_VIN, tesla_fws())) == CHECK_KEYS
+  assert set(check_record(RESULT, ZERO_VIN, tesla_fws(), identity=None)) == CHECK_KEYS
+  check = check_record(RESULT, ZERO_VIN, tesla_fws(), identity=cs_mod.CarIdentity(DONGLE, 'TESLA_MODEL_3'))
+  assert set(check) == CHECK_KEYS | {'dongleId', 'carFingerprint'}
+  assert (check['dongleId'], check['carFingerprint']) == (DONGLE, 'TESLA_MODEL_3')
+  failed = check_record({'pass': False, 'step': 'release', 'why': 'x'}, ZERO_VIN, tesla_fws(), identity=cs_mod.CarIdentity(DONGLE, ''))
+  assert failed['carFingerprint'] == '' and 'checkId' not in failed
+
+
+def test_promotion_keeps_the_identity_and_the_record_matches_without_a_vin():
+  """The whole path on Chase's car: the check written with the identity, Kellen's yes promoted, mode on at the next
+  ignition, matched without a VIN; without the opt-in at the check, the record is be3c0ed's and never matches so."""
+  params = FakeParams(**VINLESS_ON)
+  check = check_record(RESULT, ZERO_VIN, tesla_fws(), identity=cs_mod.identity_for(params, ZERO_VIN, tesla_fws()))
+  params.update(TurnPilotCarSignalsCheck=check, TurnPilotCarSignalsExterior=f"yes:{check['checkId']}", TurnPilotCarSignals='on')
+  config = resolver(params)(ZERO_VIN, tesla_fws())
+  assert config.mode == 'on' and config.recheck
+  r = params['TurnPilotCarSignalsVerified']
+  assert set(r) == RECORD_KEYS | {'dongleId', 'carFingerprint'}
+  assert (r['dongleId'], r['carFingerprint'], r['vin']) == (DONGLE, 'TESLA_MODEL_3', ZERO_VIN)
+
+  params = FakeParams(**VINLESS_ON)
+  check = check_record(RESULT, ZERO_VIN, tesla_fws())  # the check ran with the opt-in off
+  params.update(TurnPilotCarSignalsCheck=check, TurnPilotCarSignalsExterior=f"yes:{check['checkId']}", TurnPilotCarSignals='on')
+  assert resolver(params)(ZERO_VIN, tesla_fws()) == CarSignalsConfig()
+  assert set(params['TurnPilotCarSignalsVerified']) == RECORD_KEYS
+
+
+def test_the_unregistered_dongle_id_is_registrations():
+  from openpilot.system.athena.registration import UNREGISTERED_DONGLE_ID
+  assert cs_mod.UNREGISTERED_DONGLE_ID == UNREGISTERED_DONGLE_ID
+
+
+def test_the_opt_in_is_a_persistent_bool_default_off(tmp_path):
+  header = (Path(__file__).parents[3] / 'common' / 'params_keys.h').read_text()
+  assert re.search(r'\{"TurnPilotCarSignalsVinless", \{PERSISTENT, BOOL, "0"\}\}', header)
+  from openpilot.common.params import Params, ParamKeyType
+  lib = Params(str(tmp_path / "params"))
+  assert lib.get_type(cs_mod.VINLESS_KEY) == ParamKeyType.BOOL and lib.get_default_value(cs_mod.VINLESS_KEY) is False
+  assert lib.get(cs_mod.VINLESS_KEY) is None and not lib.get_bool(cs_mod.VINLESS_KEY)
 
 
 def test_module_constants():
