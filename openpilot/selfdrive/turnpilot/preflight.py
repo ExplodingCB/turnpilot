@@ -145,11 +145,22 @@ def check_map_server(missing: list[str], coverage_names: str | None, error: str 
   return Check(name, PASS, f"mapped area: {coverage_names}")
 
 
-def check_pyvalhalla(version: str | None, needed: bool = True) -> Check:
+def check_pyvalhalla(version: str | None, needed: bool = True, install: dict | None = None) -> Check:
+  """install is TurnPilotValhallaInstall, the self-install's state (valhalla_install.py)."""
   name = "pyvalhalla"
   if not needed:
     return Check(name, INFO, "not needed")
   if version is None:
+    state = (install or {}).get("state") if isinstance(install, dict) else None
+    if state == "installing":
+      progress = install.get("progress")
+      pct = f" {progress * 100:.0f}%" if isinstance(progress, (int, float)) else ""
+      return Check(name, FAIL, f"installing itself{pct} ({install.get('stage') or 'starting'})", "keep the comma online; it finishes by itself")
+    if state == "offline":
+      return Check(name, FAIL, "waiting for internet to install itself", "connect the comma to the internet")
+    if state == "failed":
+      return Check(name, FAIL, f"self-install failed: {install.get('why') or install.get('short')}",
+                   "settings > turnpilot > map engine to retry, or bash /data/openpilot/tools/turnpilot/install_valhalla_device.sh")
     return Check(name, FAIL, "not importable", "bash /data/openpilot/tools/turnpilot/install_valhalla_device.sh")
   return Check(name, PASS, version)
 
@@ -377,7 +388,7 @@ def collect(params) -> list[Check]:
     check_always_drive(enabled, shadow, always),
     check_route_source(mode, tiles),
     check_map_server(missing_config(params), coverage.names() if coverage else None, coverage_error, tiles, params.get(COVERAGE_STATUS)),
-    check_pyvalhalla(getattr(valhalla, "__version__", "imported") if valhalla else None),
+    check_pyvalhalla(getattr(valhalla, "__version__", "imported") if valhalla else None, install=params.get("TurnPilotValhallaInstall")),
     check_tiles(tiles, where, needed),
   ]
   if needed and valhalla is not None and where is not None:
