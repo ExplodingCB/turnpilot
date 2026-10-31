@@ -55,18 +55,18 @@ TurnPilot setup opens by itself when the training ends. It uses the stock cards 
    2. Turn the car off and on, with hands off the stalk [33]. The car blinks each side.
    3. Step out and watch each side's lamps [34], then answer on the phone whether they flashed [35, 37]. The page's **Car turn signal** section opens the question by itself.
    4. If they flashed, try the wipers, the headlights, the high beams and both stalk signals [38]. Tap **they all work** [39], then turn the car off and on once more [41]. The car signals its own turns from then on. **something's wrong** [40], or any failed check, turns car signals off again [42].
-6. **ready to drive** [43-49]. "1. Drive straight above 15 mph for a few minutes. The camera calibrates." "2. Engage with the cruise stalk." "3. Enter a destination on the phone." "TurnPilot starts live: it drives the route." [47]. With car signals off it adds the stalk line [48]. Tap **done** [49].
+6. **ready to drive** [43-51]. "1. In the car, turn on your phone's hotspot. Join it in settings > network." [44] "2. Scan the code again in settings > turnpilot > pair phone." [45] ("First drive" below says why.) "3. Drive straight above 15 mph for a few minutes. The camera calibrates." "4. Engage with the cruise stalk." "5. Enter a destination on the phone." "TurnPilot starts live: it drives the route." [49]. With car signals off it adds the stalk line [50]. Tap **done** [51].
 
-Setup opens again at every boot, at the first step that isn't finished, until **done** is tapped. While anything is missing, the home screen counts one more alert [61], "TurnPilot is not ready to drive", which says what is missing and where to fix it [60]. It goes away once nothing is missing [62]. A fresh install also shows the stock "Finish setup. Pair your device with comma connect" alert, which TurnPilot doesn't need.
+Setup opens again at every boot, at the first step that isn't finished, until **done** is tapped. While anything is missing, the home screen counts one more alert [63], "TurnPilot is not ready to drive", which says what is missing and where to fix it [62]. It goes away once nothing is missing [64]. A fresh install also shows the stock "Finish setup. Pair your device with comma connect" alert, which TurnPilot doesn't need.
 
-**Settings > turnpilot** [50-57] has **pair phone**, **watch only** (off: live), **always drive**, **stop-sign go** and **far pedestrians** (the last three on), the map engine's state, and **run setup again**.
+**Settings > turnpilot** [52-59] has **pair phone**, **watch only** (off: live), **always drive**, **stop-sign go** and **far pedestrians** (the last three on), the map engine's state, and **run setup again**.
 
 ### First drive
 
 Setup stays up while the car is parked with the comma on, and closes once the car moves.
 
 1. In the car the comma needs internet for each drive's map, and the phone has to reach the comma. Turn on the phone's hotspot, then on the comma open **Settings > Network** and join it. The comma remembers it for later drives.
-2. The page's address changes on the hotspot. Open **Settings > turnpilot > pair phone** [51] and scan the QR code again.
+2. The page's address changes on the hotspot. Open **Settings > turnpilot > pair phone** [53] and scan the QR code again. A bookmark of the home address doesn't load there, and the page opened without the code says "Not paired" and where the code is. The ready to drive screen says steps 1 and 2 [44, 45].
 3. When the car turns on, the comma shows "WARNING: This branch is not tested". That is expected on this branch.
 4. Drive straight above 15 mph for a few minutes, so the camera calibrates. The uninstall erased sunnypilot's calibration.
 5. Engage with the cruise stalk, then search for a destination on the phone page and tap Navigate. Place search needs the hotspot's internet.
