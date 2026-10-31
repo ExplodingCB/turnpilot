@@ -1490,3 +1490,46 @@ def test_after_a_go_withdrawn_in_its_launch_a_stop_short_of_the_lanes_and_a_re_e
   assert sim.tp.left.hold_here and sim.tp.map_controls.driven is None, states
   assert {s for s, _ in states} <= {'waitGap', 'undecided'} and ('undecided', 'driven') not in states, states
   assert not any(p.desire == Desire.turnLeft for p in plans)
+
+
+def test_a_nudge_from_the_lefts_full_creep_braked_short_of_the_lanes_and_re_engaged_standing_is_held():
+  """Skeptic round 2 (tp/left-hold), through turnpilotd: LEFT_25 creeping for a view (a car parked in the junction box
+  blocks it), the full creep made, the car standing about 5 m from the centre. The driver's gas nudges it 0.35 m at up to
+  1.2 m/s, they brake it to a stop 0.6 m short of the oncoming entry and re-engage standing: the latch's lanes test, judged
+  on the gas frame from its speed, had let go for good, and the car drove off 14.7 m through the junction at 5.1 m/s, no
+  stop on any frame (e93750b held it). Owner decision (c): judged at the re-engage, standing short of the lanes, held there
+  for the full check, never driven on unchecked."""
+  sim = Sim(LEFT_25)
+  sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps = 'auto', TEST_RANGE_M, False
+  sim.answers_prompt = True
+
+  def objects(sim):
+    return ({'cls': 'car', 'x': JUNCTION + 6. - sim.s, 'y': 3.6, 'vx': 0., 'vy': 0., 'age': 40, 'trackId': 7,
+             'conf': 0.8, 'camera': 'road'},)
+  frame = [0]
+
+  def raw(sim):
+    frame[0] += 1
+    return None if frame[0] % 2 else RawFrame([raw_box(JUNCTION + 6. - sim.s, 3.6)], 'road', sim.t)
+  sim.raw = raw
+  while not (sim.s > LINE + 3.5 and sim.v < 0.02 and str(sim.tp.left_now.state) == 'creep'):
+    sim.step(objects(sim), engaged=True)
+    assert sim.t < 60.
+  for _ in range(10):
+    sim.step(objects(sim), engaged=True)
+  s0 = sim.s
+  sim.accel = lambda sim, plan: 2.0 if sim.v < 1.2 else 0.
+  while sim.s < s0 + 0.35:
+    sim.step(objects(sim), engaged=False, gas=True)
+  sim.accel = lambda sim, plan: -3.5
+  while sim.v > 0.:
+    sim.step(objects(sim), engaged=False)
+  at = JUNCTION - sim.s
+  assert at > ONCOMING_ENTRY_M + 0.4
+  sim.accel = None
+  plans = [sim.step(objects(sim), engaged=True) for _ in range(int(6. / DT_MDL))]
+  moved = at - (JUNCTION - sim.s)
+  states = sorted({(str(p.unprotectedLeft.state), str(p.unprotectedLeft.why)) for p in plans})
+  assert moved < 0.05 and all(p.shouldStop for p in plans[5:]), f"re-engaged standing {at:.2f} m out: moved {moved:.2f} m, {states}"
+  assert sim.tp.map_controls.driven is None and ('undecided', 'driven') not in states, states
+  assert not any(p.desire == Desire.turnLeft for p in plans)

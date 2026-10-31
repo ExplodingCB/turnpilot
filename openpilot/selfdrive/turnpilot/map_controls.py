@@ -26,15 +26,17 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   past both, with openpilot disengaged or under the gas (update()'s engaged): inside the ask they are TurnPilot's, whoever
   drove them, and with openpilot engaged the plan is TurnPilot's, so the latch's own stop carrying a car re-engaged rolling
   is never theirs, in whatever order the two come. A peek-creep past the line is never held again in the crossing lanes on
-  a re-engage. At an unprotected turn so is a car the driver has moved this hold, past both or not, once a hold could no
-  longer stand it short of the oncoming lanes (from its speed as the latch's own braking takes it, reengage_stop_m, to
-  ONCOMING_ENTRY_M before the junction as latched): after the left's full creep the reach lies inside them, and the
-  driver's gas inside a creep can leave the car too fast to stand short. Either is decided only on the driver's own frame,
-  so before any re-engage: never let go engaged, on TurnPilot's metres (skeptic round 1: a re-engage inside the creep let
-  go a frame on, and openpilot drove the car into the junction). Short of either nothing is let go (owner decision (a),
-  2026-10-30): a gas nudge inside a roll-up or a creep is TurnPilot's metres, a handback the car doesn't move from lets
-  nothing go (the car is held, the handback said), and a re-engage short of the line goes back to the full check (c). The
-  autonomous left's own hold after a withdrawn go (unprotected_left: hold_here, the latch already let go by the go) has the
+  a re-engage. At an unprotected turn so is a car the driver has moved this hold, past both or not, once it is in the
+  oncoming lanes (ONCOMING_ENTRY_M before the junction as latched), or at the re-engage once a hold could no longer stand
+  it short of them (from the re-engage's own speed as the latch's own braking takes it, reengage_stop_m): after the left's
+  full creep the reach lies inside them, and the driver's gas inside a creep can leave the car too fast to stand short.
+  The reach and the lanes are decided on the driver's own frame, a car too fast for a hold at the re-engage itself, before
+  the latch brakes it: never let go engaged on TurnPilot's metres (skeptic round 1: a re-engage inside the creep let go a
+  frame on, and openpilot drove the car into the junction), and never for good on a driver's frame's speed (skeptic round
+  2: braked to a stand short of the lanes after, the car was free to pull away into the junction). Short of either nothing
+  is let go (owner decision (a), 2026-10-30): a gas nudge inside a roll-up or a creep is TurnPilot's metres, a handback
+  the car doesn't move from lets nothing go (the car is held, the handback said), and a re-engage short of the line goes
+  back to the full check (c). The autonomous left's own hold after a withdrawn go (unprotected_left: hold_here, the latch already let go by the go) has the
   same rule there, its crossing said here (update()'s left, LeftCommand.crossed: Driven). A stop's or an unprotected turn's line crossed with no go
   (let go so, or overrun) is never silent (owner decision (b)): its take-control (DRIVEN_PROMPT) stays up, engaged or not,
   until the car is DRIVEN_THROUGH_M past the stop point (Driven), and turnpilotd misses an unprotected turn so driven
@@ -490,6 +492,7 @@ class ControlState:
   gas_moved_m: float = 0.       # held: m moved under the driver's gas this hold
   driver_m: float = 0.          # held: m moved with openpilot disengaged or under the gas this hold (the driver's)
   driver_past_m: float = 0.     # held: of those, m moved past both its stop point and the furthest asked (_held)
+  drivers_frame: bool = False   # held: the last frame was the driver's (the next one the plan applies on is a re-engage)
   done: str = ''              # 'released', 'passed', 'overrun', 'dropped'
   cause: str = ''               # released: why (gap, clear, green, or the car's motion: CROSSED_CAUSES)
   action: str = 'none'
@@ -929,6 +932,9 @@ class MapControlPolicy:
     # the driver's own frame: openpilot disengaged (the plan not applied) or under the gas. Engaged, the plan is TurnPilot's:
     # the latch's own stop carrying the car on is never the driver's, and nothing is let go on its metres
     drivers_frame = gas_pressed or not getattr(self, '_engaged', None)
+    # the re-engage: the first frame the plan applies after the driver's (the lanes test below is judged on it)
+    reengage = st.drivers_frame and not drivers_frame
+    st.drivers_frame = drivers_frame
     if drivers_frame:
       st.driver_m += v * dt
     what = description(c, self.turn_name)
@@ -999,17 +1005,21 @@ class MapControlPolicy:
     # held again 3-8 m past the line on the re-engage). Never a prompt being up alone (the car must have moved), never
     # TurnPilot's own metres (asked_m), and never at a signal: its stop is the light's, which a crawl doesn't change
     # (residual-check-1, d)
-    # at an unprotected turn, short of the reach too once a hold could no longer stand the car short of the oncoming lanes
-    # (ONCOMING_ENTRY_M before its junction, HOLD_LINE_M + MAP_MARGIN_M past the stop point as latched; a hold taken up by a
-    # re-engage carries a rolling car on as reengage_stop_m, the latch's own braking): the left's full creep stands the car
-    # CREEP_SHORT_M short of them, where the reach (LATCH_PAST_M past it) is 1 m inside them (the invariant: never a
-    # TurnPilot hold there). Inside the ask too, the driver having moved the car this hold: their gas inside a creep can
-    # leave it too fast for any hold to stand it short (skeptic round 1)
+    # at an unprotected turn, short of the reach too, the driver having moved the car this hold, once it is in the oncoming
+    # lanes (ONCOMING_ENTRY_M before its junction, HOLD_LINE_M + MAP_MARGIN_M past the stop point as latched) or a hold
+    # taken up by a re-engage could no longer stand it short of them (it carries a rolling car on as reengage_stop_m, the
+    # latch's own braking): the left's full creep stands the car CREEP_SHORT_M short of them, where the reach (LATCH_PAST_M
+    # past it) is 1 m inside them (the invariant: never a TurnPilot hold there). Inside the ask too: the driver's gas inside
+    # a creep can leave the car too fast for any hold to stand it short (skeptic round 1)
+    room = c.d + HOLD_LINE_M + MAP_MARGIN_M - ONCOMING_ENTRY_M
+    # the reach and the lanes reached only on the driver's own frame, a car too fast for a hold only at the re-engage, judged
+    # from its frame's speed and where the car is before the latch brakes it: never let go engaged on the latch's own
+    # metres, which drove a car re-engaged inside the creep on into the junction, the full check (c) skipped (skeptic round
+    # 1), and never on the speed of a driver's frame, for good: a car braked to a stand short of the lanes after it is held
+    # there on the re-engage, never free to pull away into the junction (skeptic round 2: e93750b held it)
     lanes = c.kind == UNPROTECTED and st.driver_m > 0. and \
-      st.moved_m + reengage_stop_m(v, latch_hold_caps) > c.d + HOLD_LINE_M + MAP_MARGIN_M - ONCOMING_ENTRY_M
-    # either only on the driver's own frame, so before a re-engage: never let go engaged on the latch's own metres, which
-    # drove a car re-engaged inside the creep on into the junction, the full check (c) skipped (skeptic round 1)
-    drivers = stop_like and drivers_frame and (drv > LATCH_PAST_M or lanes)
+      ((drivers_frame and st.moved_m > room) or (reengage and st.moved_m + reengage_stop_m(v, latch_hold_caps) > room))
+    drivers = stop_like and ((drivers_frame and drv > LATCH_PAST_M) or lanes)
     if cause is None and drivers:
       # handed back: theirs, said already (driverWent); else lifting must not stop the car in the junction (drivenOff), nor
       # a re-engage after a roll with no gas (movedOff): said either way (Driven)
@@ -1174,6 +1184,7 @@ class MapControlPolicy:
       self.held, c.held = c.key, True
       st.dwell_t, st.moved_m, st.infeasible, st.unseen_t = 0., 0., False, 0.
       st.asked_m, st.gas_moved_m, st.driver_m, st.driver_past_m = 0., 0., 0., 0.
+      st.drivers_frame = False
       cloudlog.event("turnpilot.map_stop_held", kind=c.kind, key=list(c.key), d=round(c.d, 1), light=st.light)
       if c.kind == 'stop' and getattr(self, '_signs', None) is not None:
         self._sign_evidence(c)

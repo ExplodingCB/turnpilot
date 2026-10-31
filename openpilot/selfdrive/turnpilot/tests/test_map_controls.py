@@ -1773,15 +1773,19 @@ def test_the_latch_never_counts_its_own_stop_past_the_creep_as_the_drivers_whate
   assert car.policy.driven is not None and car.policy.driven.cause == 'drivenOff'
 
 
-def test_the_latch_reengaged_too_fast_inside_its_creep_is_let_go_on_the_drivers_frame_never_engaged():
+def test_the_latch_reengaged_too_fast_inside_its_creep_is_let_go_at_the_re_engage_never_on_its_own_braking():
   """The invariant, never a TurnPilot hold that stands the car in the oncoming lanes on a re-engage, without a release on
   TurnPilot's metres: the driver's gas inside the creep to about 3.5 m/s, from where the latch taken up by a re-engage stands
   the car inside the lanes. The lanes test was reached only past the creep, so the latch was let go engaged, on its own
-  braking. Let go on the driver's own frame, inside the creep, before the re-engage, its crossing said (Driven)."""
+  braking. Let go at the re-engage itself, judged from its frame's speed before the latch brakes the car (skeptic round 2:
+  never for good on a driver's frame), its decision no stop, its crossing said (Driven)."""
   car, s_held, rows = creep_then_gas(4.5)
   first = next(k for k, (_, latched, _) in enumerate(rows) if not latched)
-  engaged, _, row = rows[first]
-  assert not engaged and row[1] - s_held < 2., (engaged, round(row[1] - s_held, 2))  # inside the creep, the driver's frame
+  reengage = next(k for k, (engaged, _, _) in enumerate(rows) if engaged)
+  _, _, row = rows[first]
+  # the re-engage, lifted about where the creep ends, far short of the reach: only the lanes test lets it go
+  assert first == reengage and rows[first - 1][2][1] - s_held < 2.2, (first, reengage)
+  assert not any(r[4].should_stop or r[4].speed_cap < r[2] - 0.5 for _, _, r in rows[first:])  # never braked by the latch
   assert row[5].driven and row[5].prompt == 'unprotectedTurnTakeControl'
   inside = [r for e, _, r in rows[first:] if e and r[1] < 250. - HOLD_LINE_M - 1. + DRIVEN_THROUGH_M - 1.]
   assert inside and all(r[5].prompt == 'unprotectedTurnTakeControl' and not r[4].should_stop for r in inside)
@@ -1809,3 +1813,31 @@ def test_metres_the_driver_moved_past_the_latch_that_a_later_creep_takes_in_are_
     car.step(left=creep, gas=True, accel=0.4 if car.v < 0.5 else 0.)
   out, dec, _ = car.run(4., left=creep)
   assert car.policy.held is not None and car.policy.driven is None and held(out, dec) and out.prompt == 'none'
+
+
+@pytest.mark.parametrize("v_gas", [0.8, 1.2, 1.6])
+@pytest.mark.parametrize("nudge", [0.2, 0.35])
+def test_a_nudge_from_the_lefts_full_creep_braked_short_of_the_lanes_is_held_on_the_re_engage(nudge, v_gas):
+  """Skeptic round 2 (tp/left-hold): the latch's lanes test (8cf3b40) was judged on the driver's frame from the speed then,
+  and its let-go was for good. After the left's full creep (5 m from the centre, 1 m short of the oncoming entry) a 0.35 m
+  gas nudge at 1.2 m/s let the latch go; the driver braked the car to a stop 0.6 m short of the entry, far under the
+  latch's reach, and re-engaged standing: no hold, the car free to pull away into the junction (e93750b held it). Owner
+  decision (c), the invariant: judged at the re-engage, from its frame's speed and where the car is; standing short of the
+  lanes, held there for the full check, never let go, nothing said for a crossing that never was."""
+  from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M
+  junction = 250.
+  car = left_car(at=junction)
+  held_left(car, left_cmd(reason="Waiting for a gap"))
+  creep = left_cmd(creep_m=4., reason="Creeping for a view")
+  run_left(car, 12., creep)
+  assert abs(junction - car.s - 5.) < 0.35 and car.v < 0.05
+  s0 = car.s
+  while car.s < s0 + nudge:
+    car.step(gas=True, accel=2.0 if car.v < v_gas else 0., left=creep)
+  while car.v > 0.:
+    car.step(accel=-4.0, left=creep)  # the driver's brake, disengaged
+  at = junction - car.s
+  assert at > ONCOMING_ENTRY_M + 0.5
+  rows = [car.step(left=creep) for _ in range(int(5. / DT_MDL))]  # re-engaged standing
+  assert car.policy.held is not None and car.policy.driven is None, f"stood {at:.2f} m out, re-engaged: let go"
+  assert all(dec.should_stop and out.prompt == 'none' for out, dec, _ in rows) and junction - car.s == at
