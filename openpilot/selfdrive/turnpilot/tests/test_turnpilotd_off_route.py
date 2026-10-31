@@ -105,11 +105,17 @@ ROADS = {
 }
 
 
+# navd's place on the route against the car's (Sim's lag, m behind): its 1 Hz fix 0.5 s behind, or ahead of the car, as GPS's
+# along-track error and along_path's bias at a bend put it
+PLACES = {'lag_0.5s': lambda v: 0.5 * v, 'ahead_5m': lambda v: -5., 'ahead_10m': lambda v: -10.}
+
+
+@pytest.mark.parametrize("place", sorted(PLACES))
 @pytest.mark.parametrize("v", [8., 15.])
 @pytest.mark.parametrize("road", sorted(ROADS))
-def test_a_bend_the_road_makes_with_no_maneuver_never_fires(road, v):
+def test_a_bend_the_road_makes_with_no_maneuver_never_fires(road, v, place):
   bearing = ROADS[road]
-  sim = Sim([(2000., "turn", "left")], cruise=v, shape=polyline(bearing, 2100.), lag=0.5 * v)
+  sim = Sim([(2000., "turn", "left")], cruise=v, shape=polyline(bearing, 2100.), lag=PLACES[place](v))
   sim.v = v
   assert not fired(drive(sim, bearing, 800.))
 

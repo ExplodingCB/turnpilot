@@ -372,8 +372,12 @@ OFF_ROUTE_BEND_MARGIN_DEG = 10.
 # S-bend, a street turning 90 deg with no junction) is no off-route turn when the route turns that way, within the margin,
 # over some OFF_ROUTE_SHAPE_WINDOW_M of it from OFF_ROUTE_TURN_M + OFF_ROUTE_SHAPE_BEHIND_M behind the car's place on it to
 # OFF_ROUTE_SHAPE_AHEAD_M ahead (the place dead-reckoned from navd's 1 Hz fix, which lags the car: its latency, and the
-# shape is of where the fix was). No shape (a navd before it, an invalid message): the step's bend alone, as before
-OFF_ROUTE_SHAPE_BEHIND_M = 5.
+# shape is of where the fix was). The place is as often ahead of the car: GPS's along-track error at suburban speeds is more
+# than the lag's few metres, and along_path (the nearest segment's start plus the straight line to the fix) puts it ahead
+# by up to the lateral error at a bend; BEHIND_M 15 keeps a no-maneuver bend excused with the place up to 10 m ahead (at
+# 5, 29 of 48 synthetic bends fired with it 5 m ahead), and row 1 fires at the same metre from 10 m ahead to 15 m behind.
+# No shape (a navd before it, an invalid message): the step's bend alone, as before
+OFF_ROUTE_SHAPE_BEHIND_M = 15.
 OFF_ROUTE_SHAPE_AHEAD_M = 20.
 OFF_ROUTE_SHAPE_WINDOW_M = OFF_ROUTE_TURN_M + 10.
 OFF_ROUTE_TURN_REASON = "Off route: take control"
