@@ -169,8 +169,8 @@ def _compile_far(cam_w: int, cam_h: int, model: str, out: Path, runs: int, retar
     run(luma=luma, chroma=chroma).realize()
     Device.default.synchronize()
     times.append((time.perf_counter() - st) * 1e3)
-  print(f'{"native" if native else "far"} {model} {cam_w}x{cam_h} crop {w}x{h} on {Device.DEFAULT}: min {min(times):.2f} ms, '
-        f'median {np.median(times):.2f} ms')
+  kind = 'native' if native else 'far'
+  print(f'{kind} {model} {cam_w}x{cam_h} crop {w}x{h} on {Device.DEFAULT}: min {min(times):.2f} ms, median {np.median(times):.2f} ms')
 
   if retargetable:
     make_retargetable(run)

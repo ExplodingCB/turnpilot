@@ -38,6 +38,23 @@ for the drive, logged, said by every full pass message (farStatus disabled, whic
 the full pass's (its runs, its backoff) changes. Its class-9 boxes go to a light reader of its own, always in shadow.
 TurnPilotFarCrop off, or no far pkl, runs none (farStatus off).
 
+The native schedule (TurnPilotNativeDetect, NativeStrips; off by default, and then nothing here differs from the far crop
+alone): Kellen's whole camera frame at native resolution, in the far crop's slot. strip runs graph.NATIVE_SIZES' 1344x384
+full-width strip of the road frame with the horizon at FAR_HORIZON_ROW (graph.crop_at, so every bearing at once: the plan's
+aim moves nothing); full runs two 1344x512 strips, the frame's top (rows 0-511) and bottom (248-759), alternating, so the
+whole frame natively every 200 ms and the horizon band, in both, every 100 ms. Its runs are the far crop's message
+(turnpilotFarDetections, its crop the strip's rect, boxes in road frame pixels), so tracker B, the left's far reach, the far
+lights and the odd paint read take them as they take the far crop's. Where the strips meet, a near object taller than the
+264 shared rows is cut in both: the top strip's bottom edge is no frame edge, so a box there is one tracker B's crop-edge
+rule drops (scene/tracker.py tile_boxes), and the bottom strip holds its feet with only its head cut, which that rule keeps;
+every ground object's bottom is whole in one strip. It is loaded with the detector, for the mode the param says then (a
+change mid-drive to another mode takes effect at the next load; to off, at once), and has its own budget: a run only where
+the model's time and its estimate fit STEP_BUDGET_S (else the far crop takes that frame if it fits: never nothing); a
+failure, a median run over NATIVE_BUDGET_S, or FAR_OVERRUNS of its last TIME_WINDOW runs pushing the step past
+STEP_BUDGET_S send it back to the far crop for the drive, logged and said by every full pass message (nativeStatus
+fallback), the far crop then on its own budget as without it. Measured on the chestnut beside the big model (models/
+README.md): the step 34.86 ms median with strip, 35.71 ms with full, against 33.39 ms with the far crop.
+
 The stop sweep (STOP_SIGNS.md section 1.3, SideViews): turnpilotPlan.detectorView stopSweep (held at a stop or yield) or
 stopSweepGo (crossing, from the commit point), read through fresh_plan, shadow too. Its even steps (the full pass's, every
 RUN_EVERY) run the forward views: the full wide pass and the road camera alternating when held, the full wide pass every
@@ -87,8 +104,9 @@ from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.common.params import UnknownKeyName
 from openpilot.selfdrive.turnpilot.detector.decoder import (decode, decode_far, decode_far_lights, decode_lights, decode_side,
                                                            decode_signs, fill_detections, fill_far, fill_signs)
-from openpilot.selfdrive.turnpilot.detector.graph import (SIDE_INPUT_SIZE, Crop, crop_at, crop_views, detector_pkl_path,
-                                                         far_detector_pkl_path, letterbox, side_detector_pkl_path, side_input_specs)
+from openpilot.selfdrive.turnpilot.detector.graph import (FAR_CROP_SIZE, NATIVE_MODES, NATIVE_SIZES, SIDE_INPUT_SIZE, Crop, crop_at,
+                                                         crop_views, detector_pkl_path, far_detector_pkl_path, letterbox,
+                                                         native_detector_pkl_path, side_detector_pkl_path, side_input_specs)
 from openpilot.selfdrive.turnpilot.detector.light_state import LIGHT_MODE_DEFAULT, LightHead, LightReader, camera_lights_mode
 from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN, LanePaintClassifier, LinePaint, fill_lane_paint
 from openpilot.selfdrive.turnpilot.detector.sideview import (RECALIB_DEG, SIDE_VIEWS, SectorQuality, SideGeometry, SideMap,
@@ -129,6 +147,10 @@ FAR_OVERRUNS = 3           # of its last TIME_WINDOW runs pushing the step past 
 FAR_STATUS_S = 0.5         # farStatus read: it ran within this
 FAR_VIEW_CACHE = 64        # device views kept, one per crop position (graph.crop_at aligns them to a coarse grid)
 FAR_CROP_DEFAULT = True    # TurnPilotFarCrop unset or unknown to this build
+# the native schedule (NativeStrips). Chestnut, 2026-10-31, beside the big model: the 1344x384 strip 10.73 ms median, a 1344x512
+# strip 12.02 ms (alone 8.29 and 9.06 ms); a median run over NATIVE_BUDGET_S sends it back to the far crop for the drive
+NATIVE_BUDGET_S = 0.015
+NATIVE_DEFAULT = 'off'     # TurnPilotNativeDetect unset, unknown to this build, or not one of NATIVE_MODES
 # the stop sweep (SideViews). Chestnut, 2026-10-28, yolo26n on the 768x512 side view alone: 7.0 ms (the full pass 5.9 ms alone,
 # 7.9 ms beside the big model)
 SWEEPS = ('stopSweep', 'stopSweepGo')
@@ -143,6 +165,7 @@ LanePaintStatus = custom.TurnpilotDetections.LanePaintStatus
 LightStatus = custom.TurnpilotDetections.LightStatus
 FarStatus = custom.TurnpilotDetections.FarStatus
 SideViewStatus = custom.TurnpilotDetections.SideViewStatus
+NativeStatus = custom.TurnpilotDetections.NativeStatus
 
 
 def frame_view(model_state, index: int):
@@ -187,6 +210,27 @@ def far_crop_on(params) -> bool:
   if isinstance(value, (bytes, str)):
     return (value.decode() if isinstance(value, bytes) else value).strip() == '1'
   return bool(value)
+
+
+def native_detect_mode(params) -> str:
+  """TurnPilotNativeDetect: off (NATIVE_DEFAULT), strip or full; unset, unknown to this build's params (said) or anything
+  else is off."""
+  try:
+    value = params.get("TurnPilotNativeDetect")
+  except UnknownKeyName:
+    cloudlog.error("turnpilot: TurnPilotNativeDetect unknown to this build's params, native schedule off; run scons")
+    return NATIVE_DEFAULT
+  value = (value.decode() if isinstance(value, bytes) else value or '').strip()
+  return value if value in NATIVE_MODES else NATIVE_DEFAULT
+
+
+def native_strips(cam_w: int, cam_h: int, mode: str) -> list[Crop] | None:
+  """The full mode's strips (the frame's top and bottom, graph.NATIVE_SIZES), None for strip (aimed, FarCrop.aim) or off."""
+  size = NATIVE_SIZES.get((cam_w, cam_h), {}).get(mode)
+  if mode != 'full' or size is None:
+    return None
+  w, h = size
+  return [Crop(cam_w, cam_h, 0, 0, w, h), Crop(cam_w, cam_h, 0, (cam_h - h) // 2 * 2, w, h)]
 
 
 def camera_stop_signs_mode(params) -> str:
@@ -280,9 +324,16 @@ class CameraLightReader:
 
 class FarCrop:
   """The far crop pass (module docstring): its compiled graph run(luma=, chroma=), views (Crop -> the two device views),
-  its aim from the bus's calibration, its own time estimate and budget, and its own light reader."""
+  its aim from the bus's calibration, its own time estimate and budget, and its own light reader. The native schedule's
+  strips are one too (NativeStrips): its window's size, its budget, and fixed strips taken in turn instead of the aim."""
+  size = FAR_CROP_SIZE
+  budget_s = FAR_BUDGET_S
+  mode = 'off'                     # the TurnPilotNativeDetect mode it serves (off: the far crop)
+  strips: list[Crop] | None = None  # fixed windows taken in turn, one a run, instead of the aim (None: aimed)
+
   def __init__(self, run, cam_w: int, cam_h: int, views, sm=None):
     self.run, self.cam_w, self.cam_h, self.views_fn, self.sm = run, cam_w, cam_h, views, sm
+    self.next = 0                   # the strip the next run takes (strips' index)
     self.lens: Lens | None = None
     self.times: deque[float] = deque(maxlen=TIME_WINDOW)
     self.overruns: deque[bool] = deque(maxlen=TIME_WINDOW)
@@ -315,10 +366,13 @@ class FarCrop:
     return calib_from_view(list(rpy)).T @ np.array([np.cos(b), -np.sin(b), 0.])  # calib frame: x forward, y right, z down
 
   def aim(self, bearing_deg: float, rpy) -> Crop:
-    """The crop centred on the horizon bearing_deg left of the calibrated forward axis (graph.crop_at)."""
+    """The crop centred on the horizon bearing_deg left of the calibrated forward axis (graph.crop_at), at its size; with
+    fixed strips, the next one."""
+    if self.strips:
+      return self.strips[self.next % len(self.strips)]
     assert self.lens is not None
     u, v = self.lens.project(self.view_ray(bearing_deg, rpy))
-    return crop_at(self.cam_w, self.cam_h, float(u), float(v))
+    return crop_at(self.cam_w, self.cam_h, float(u), float(v), self.size)
 
   def views(self, crop: Crop):
     key = (crop.x0, crop.y0)
@@ -349,12 +403,28 @@ class FarCrop:
   def ran(self, now: float, dt: float, overran: bool) -> None:
     """A run of dt s at now; overran: with the model's time it pushed the step past STEP_BUDGET_S."""
     self.last_run_t = now
+    self.next += 1
     self.times.append(dt)
     self.overruns.append(overran)
-    if len(self.times) == TIME_WINDOW and float(np.median(self.times)) > FAR_BUDGET_S:
+    if len(self.times) == TIME_WINDOW and float(np.median(self.times)) > self.budget_s:
       self.disable(f"over budget ({np.median(self.times) * 1e3:.1f} ms)")
     elif sum(self.overruns) >= FAR_OVERRUNS:
       self.disable(f"pushed the step past {STEP_BUDGET_S * 1e3:.0f} ms {sum(self.overruns)} times in {len(self.overruns)} runs")
+
+
+class NativeStrips(FarCrop):
+  """The native schedule (module docstring): a FarCrop of the mode's strip size and NATIVE_BUDGET_S, aimed (strip) or its
+  fixed strips in turn (full); off for the drive means back to the far crop, said."""
+  budget_s = NATIVE_BUDGET_S
+
+  def __init__(self, run, cam_w: int, cam_h: int, views, sm=None, mode: str = 'strip'):
+    super().__init__(run, cam_w, cam_h, views, sm)
+    self.mode, self.size, self.strips = mode, NATIVE_SIZES[(cam_w, cam_h)][mode], native_strips(cam_w, cam_h, mode)
+
+  def disable(self, why: str) -> None:
+    if not self.disabled:
+      cloudlog.error(f"turnpilot native schedule ({self.mode}) {why}: back to the far crop for this drive")
+    self.disabled = True
 
 
 def upload_maps(name: str, side_map: SideMap, device: str | None = None) -> tuple:
@@ -521,6 +591,8 @@ class ModeldDetector:
   view_runs = 0                   # runs under the roadAndWide view, for its one wide run in WIDE_EVERY
   far: FarCrop | None = None      # the far crop (None: no road camera, no far pkl, or it failed to load)
   far_on = FAR_CROP_DEFAULT       # TurnPilotFarCrop, set by DetectorHost
+  native: NativeStrips | None = None  # the native schedule loaded with it (None: off at load, no pkl, or it failed to load)
+  native_mode = NATIVE_DEFAULT    # TurnPilotNativeDetect, set by DetectorHost
   side: SideViews | None = None   # the side views (None: no wide camera, no side pkl, or it failed to load)
   signs_mode = STOP_SIGNS_DEFAULT  # TurnPilotCameraStopSigns, set by DetectorHost
   sweep: str | None = None        # the stop sweep running (SWEEPS), or None
@@ -555,6 +627,7 @@ class ModeldDetector:
     bus = frame_bus()
     self.lane_paint = LanePaintReader(cam_w, cam_h, bus) if 'road' in cameras else None
     self.lights = CameraLightReader(bus) if 'road' in cameras else None
+    self.bus = bus
     self.far = load_far(model_state, cam_w, cam_h, cameras['road'], bus) if 'road' in cameras else None
     self.side = load_side(model_state, cam_w, cam_h, cameras['wide'], bus) if 'wide' in cameras else None
 
@@ -664,6 +737,7 @@ class ModeldDetector:
         fill_signs(td, signs, model_state.frames[self.cameras[cam]], self.lb.cam_w, self.lb.cam_h)
       td.farStatus = self.far_status()
       td.sideViewStatus = self.side_status(gated)
+      td.nativeStatus = self.native_status()
       pm.send('turnpilotDetections', msg)
       self.failures = 0
     except Exception:
@@ -676,14 +750,55 @@ class ModeldDetector:
     """Whether a road run reads the lights' colour: always, but during a sweep only with a signal mapped near."""
     return self.sweep is None or self.signal_near
 
+  def load_native(self, mode: str) -> None:
+    """The native schedule for mode (TurnPilotNativeDetect at the load; DetectorHost), on the road camera; None if off."""
+    self.native = load_native(self.model_state, self.lb.cam_w, self.lb.cam_h, self.cameras['road'], mode, self.bus) \
+      if mode != 'off' and 'road' in self.cameras else None
+
+  def active_native(self) -> NativeStrips | None:
+    """The native schedule when it takes the far crop's slot: loaded for the param's mode and not back to the far crop."""
+    native = self.native
+    if native is None or native.disabled or self.native_mode != native.mode:
+      return None
+    return native
+
+  def native_status(self) -> int:
+    """nativeStatus for the full pass's messages (the schema's NativeStatus)."""
+    if self.native_mode == 'off':
+      return NativeStatus.off
+    native = self.native
+    if native is None or native.mode != self.native_mode:
+      return NativeStatus.unavailable
+    if native.disabled:
+      return NativeStatus.fallback
+    return NativeStatus.full if native.mode == 'full' else NativeStatus.strip
+
   def far_status(self) -> int:
     """farStatus for the full pass's messages: off with TurnPilotFarCrop off or no far crop, sweep while a stop sweep
-    suspends it, else the far crop's own."""
+    suspends it, else the far crop's own; with the native schedule in its slot, the slot's (native_far_status)."""
+    if self.active_native() is not None:
+      return self.native_far_status()
     if self.far is None or (not self.far_on and not self.far.disabled):
       return FarStatus.off
     if self.sweep is not None and not self.far.disabled:
       return FarStatus.sweep
     return self.far.status(time.monotonic())
+
+  def native_far_status(self) -> int:
+    """farStatus while the native schedule holds the far crop's slot: off with TurnPilotFarCrop off, sweep in a stop sweep,
+    read when it or the far crop (on a frame it had no room for) ran within FAR_STATUS_S, else why it didn't."""
+    native = self.active_native()
+    assert native is not None
+    if not self.far_on:
+      return FarStatus.off
+    if self.sweep is not None:
+      return FarStatus.sweep
+    now = time.monotonic()
+    status = native.status(now)
+    far = self.far
+    if status != FarStatus.read and far is not None and not far.disabled and far.status(now) == FarStatus.read:
+      return FarStatus.read
+    return status
 
   def side_status(self, gated: bool) -> int:
     """sideViewStatus for every message: off with no side views, else theirs (SideViews.status)."""
@@ -729,6 +844,7 @@ class ModeldDetector:
       td.lanePaintStatus = LanePaintStatus.sweep if self.lane_paint is not None else LanePaintStatus.disabled
       td.lightStatus = self.light_status() if self.light_status() != LightStatus.read else LightStatus.wideCamera
       td.farStatus, td.sideViewStatus = self.far_status(), SideViewStatus.running
+      td.nativeStatus = self.native_status()
       pm.send('turnpilotDetections', msg)
       side.ran(name, time.monotonic(), dt, model_execution_time + dt + quality_dt > STEP_BUDGET_S)
     except Exception:
@@ -757,20 +873,30 @@ class ModeldDetector:
     return dt
 
   def far_step(self, pm, model_state, model_execution_time: float, metas: list, bearing: float) -> None:
-    """The far crop on this frame between the full runs, where it has room (module docstring). Its failures turn it off for
-    the drive and touch nothing of the full pass's."""
+    """The far crop on this frame between the full runs, where it has room (module docstring), or the native schedule in its
+    place; a frame the native schedule has no room for is the far crop's if it fits. Their failures turn them off for the
+    drive (the native schedule back to the far crop) and touch nothing of the full pass's."""
+    native = self.active_native()
+    if native is not None and self.far_on:
+      if self.far_run(native, pm, model_state, model_execution_time, metas, bearing) != FarStatus.noRoom:
+        return
     far = self.far
     if far is None or far.disabled or not self.far_on:
       return
+    self.far_run(far, pm, model_state, model_execution_time, metas, bearing)
+
+  def far_run(self, far: FarCrop, pm, model_state, model_execution_time: float, metas: list, bearing: float) -> int:
+    """One run of far (the far crop, or the native schedule) on this frame where it has room: FarStatus read if it ran, else
+    why not (disabled when it failed, which turns it off for the drive)."""
     try:
       rpy = far.calibration()
       if rpy is None:
         far.why = FarStatus.noCalibration
-        return
+        return far.why
       lights_on = far.lights is not None and self.light_mode != 'off'
       if model_execution_time + far.estimate(lights_on) > STEP_BUDGET_S:
         far.why = FarStatus.noRoom
-        return
+        return far.why
       crop = far.aim(bearing, rpy)
       luma, chroma = far.views(crop)
       t0 = time.perf_counter()
@@ -781,14 +907,15 @@ class ModeldDetector:
       msg = messaging.new_message('turnpilotFarDetections', valid=bool(np.isfinite(raw).all()))
       boxes = decode_far(raw, crop)
       fill_far(msg.turnpilotFarDetections, boxes, crop, bearing, meta.frame_id, meta.timestamp_eof, dt)
-      light_dt = self.read_far_lights(msg.turnpilotFarDetections.run, model_state, metas, raw, crop)
+      light_dt = self.read_far_lights(msg.turnpilotFarDetections.run, model_state, metas, raw, crop, far)
       pm.send('turnpilotFarDetections', msg)
       far.ran(time.monotonic(), dt, model_execution_time + dt + light_dt > STEP_BUDGET_S)
     except Exception:
-      cloudlog.exception("turnpilot far crop failed")
+      cloudlog.exception("turnpilot native schedule failed" if far.mode != 'off' else "turnpilot far crop failed")
       far.disable("failed")
-      return
+      return FarStatus.disabled
     self.read_odd_paint(model_state, metas, boxes, model_execution_time + dt + light_dt)
+    return FarStatus.read
 
   def read_odd_paint(self, model_state, metas: list, boxes: np.ndarray, used_s: float) -> None:
     """While the full pass looks through the wide camera (a turn, a curve, their WIDE_HOLD_S), the lane paint on the far
@@ -812,10 +939,11 @@ class ModeldDetector:
     self.odd_paint = (paint, status, dt, self.steps)
     self.paint_over_budget(dt)
 
-  def read_far_lights(self, td, model_state, metas: list, raw: np.ndarray, crop: Crop) -> float:
+  def read_far_lights(self, td, model_state, metas: list, raw: np.ndarray, crop: Crop, far: FarCrop | None = None) -> float:
     """The far crop's class-9 boxes through its own reader, always shadow: td.lights, lightStatus, lightTime. A failure or
-    reads over LIGHT_BUDGET_S turn off only the far crop's lights, for the drive. Returns the time it took."""
-    far = self.far
+    reads over LIGHT_BUDGET_S turn off only the far crop's lights, for the drive. Returns the time it took. far: the pass
+    that ran (the native schedule's lights are its own), default the far crop."""
+    far = self.far if far is None else far
     assert far is not None
     if far.lights_failed:
       td.lightStatus = LightStatus.disabled
@@ -934,6 +1062,44 @@ def load_far(model_state, cam_w: int, cam_h: int, index: int, bus) -> FarCrop | 
     return None
 
 
+def load_native(model_state, cam_w: int, cam_h: int, index: int, mode: str, bus) -> NativeStrips | None:
+  """The native schedule (mode strip or full) for the road camera, packed frame `index`, or None: no strip for this camera
+  size or no native pkl for this device (logged), or it failed to load (logged); the far crop runs in its slot either way."""
+  try:
+    from tinygrad.engine.realize import lower_and_compile
+    from openpilot.selfdrive.modeld.helpers import load_oob
+    size = NATIVE_SIZES.get((cam_w, cam_h), {}).get(mode)
+    if size is None:
+      cloudlog.warning(f"turnpilot native schedule: no {mode} strip for {cam_w}x{cam_h} frames, the far crop")
+      return None
+    path = native_detector_pkl_path(cam_w, cam_h, size, model_state.chestnut)
+    if not path.is_file():
+      cloudlog.warning(f"turnpilot native schedule: no {path.name}, the far crop")
+      return None
+    art = load_oob(path, model_state.chestnut)
+    strips = native_strips(cam_w, cam_h, mode) or [crop_at(cam_w, cam_h, cam_w / 2, cam_h / 2, size)]
+    (_, ln), (_, cn) = crop_views(strips[0])
+    specs = art['input_specs']
+    if (art['metadata'].get('kind') != 'native' or tuple(art['metadata'].get('input_size', ())) != size or specs['luma'][0] != (ln,) or
+        specs['chroma'][0] != (cn,)):
+      raise ValueError(f"native strip compiled for {art['metadata']}, {specs}; this camera's {size} views are {ln} and {cn} bytes")
+    run = art['run']
+    run.captured._linear = lower_and_compile(run.captured._linear)
+    native = NativeStrips(run, cam_w, cam_h, crop_frame_views(model_state, index), bus, mode)
+    times = []
+    for k in range(4):  # warm up (each strip), and a first time estimate
+      t0 = time.perf_counter()
+      run(**dict(zip(('luma', 'chroma'), native.views(strips[k % len(strips)]), strict=True))).numpy()
+      times.append(time.perf_counter() - t0)
+    native.warmup_s = float(np.median(times))
+    native.lights = CameraLightReader(bus)
+    cloudlog.warning(f"turnpilot native schedule {mode} loaded ({size[0]}x{size[1]}, {1e3 * native.warmup_s:.1f} ms warm)")
+    return native
+  except Exception:
+    cloudlog.exception("turnpilot native schedule failed to load, the far crop")
+    return None
+
+
 def check_side_specs(art: dict, frame_size: int) -> None:
   """A side-view pkl's input_specs and metadata against what modeld gives it (graph.side_input_specs): the wide
   frame's view and a SIDE_INPUT_SIZE view's maps, by shape and dtype. Raises ValueError on a mismatch."""
@@ -1015,6 +1181,8 @@ class DetectorHost:
     self.enabled = False
     self.light_mode = LIGHT_MODE_DEFAULT  # TurnPilotCameraLights, read with TurnPilotEnabled
     self.far_on = FAR_CROP_DEFAULT        # TurnPilotFarCrop, read with TurnPilotEnabled
+    self.native_mode = NATIVE_DEFAULT     # TurnPilotNativeDetect, read with TurnPilotEnabled
+    self.native_said: str | None = None   # a mode the loaded detectors lack, said once
     self.signs_mode = STOP_SIGNS_DEFAULT  # TurnPilotCameraStopSigns, read with TurnPilotEnabled
     self.next_check = 0.0
     self.missing = None  # the driving model last reported as having no detector
@@ -1026,6 +1194,7 @@ class DetectorHost:
       self.enabled = self.params.get_bool("TurnPilotEnabled")
       self.light_mode = camera_lights_mode(self.params)
       self.far_on = far_crop_on(self.params)
+      self.native_mode = native_detect_mode(self.params)
       self.signs_mode = camera_stop_signs_mode(self.params)
       if self.sim:
         self.sim_drop(now)
@@ -1049,6 +1218,10 @@ class DetectorHost:
 
   def load(self) -> None:
     self.detectors = [(m, self.load_fn(m, *self.args)) for m in self.models]
+    if self.native_mode != 'off':
+      for _, det in self.detectors:
+        if det is not None:
+          det.load_native(self.native_mode)
 
   def step(self, pm, model_state, model_execution_time: float, desired_curvature: float, desire: int, metas: list,
            engaged: bool, view: str = 'auto', far_bearing: float = 0., v_ego: float | None = None, signal_near: bool = False) -> None:
@@ -1069,6 +1242,11 @@ class DetectorHost:
           cloudlog.warning("turnpilot detector: none for the driving model modeld is running, detector off")
         return
       det.light_mode, det.far_on, det.signs_mode = self.light_mode, self.far_on, self.signs_mode
+      det.native_mode = self.native_mode
+      native = getattr(det, 'native', None)
+      if self.native_mode != 'off' and (native is None or native.mode != self.native_mode) and self.native_said != self.native_mode:
+        self.native_said = self.native_mode
+        cloudlog.warning(f"turnpilot native schedule: TurnPilotNativeDetect {self.native_mode} isn't loaded, the far crop until the next load")
       det.step(pm, model_state, model_execution_time, desired_curvature, desire, metas, view, far_bearing, v_ego, signal_near)
       self.failures = 0
     except Exception:

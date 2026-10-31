@@ -589,6 +589,17 @@ struct TurnpilotDetections @0xaedffd8f31e7b55d {
   lightBoxes @16 :List(Detection);  # every forward run's traffic light boxes (COCO 9), read or not: a signal head at a junction
   lens @17 :Text;                   # the wide lens a side view was mapped with (ranging.Lens.spec); empty on forward runs
   sectorTime @18 :Float32;          # s spent on sectorQuality in this step
+  # TurnPilotNativeDetect (detector/modeld_detector.py, the native schedule): what runs in the far crop's slot, said by every
+  # full pass message as farStatus is (farStatus says how that slot's runs go, whichever runs in it)
+  enum NativeStatus {
+    off @0;          # TurnPilotNativeDetect off, or a log from before the field: the far crop, as before
+    strip @1;        # the native 1344x384 strip at the horizon in the far crop's place
+    full @2;         # the native 1344x512 strips, the frame's top and bottom alternating, in the far crop's place
+    fallback @3;     # it failed, or ran over its budget or the step's: the far crop for the drive (logged)
+    unavailable @4;  # on, but no native pkl for this device and camera, it failed to load, or the param has changed since the
+                     # detector loaded: the far crop
+  }
+  nativeStatus @19 :NativeStatus;
 }
 
 struct TurnpilotScene @0xf35cc4560bbf6ec2 {
