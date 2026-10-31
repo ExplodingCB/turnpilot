@@ -47,7 +47,7 @@ The measurement comes from checklist step 17, the shadow drive. To give it enoug
 - Finish calibration first (step 16). Runs before calibration can't be ranged.
 - Drive straight two-way roads with steady oncoming traffic, where oncoming cars come singly, a few seconds apart, and no cars are parked along the oncoming side. On curves the full pass moves to the wide camera and the chain breaks. Cars close together end their chains early (`ambiguous`), and the shortest car sets the range.
 - Drive no faster than traffic needs. The faster Chase's car goes past an oncoming car, the shorter the gap in its boxes that is allowed.
-- Plan for at least 60 oncoming cars that come within 80 m in the oncoming lanes. That can take more than one drive. Each drive can go in one run: the tool splits the logs into drives wherever log time goes back (a reboot) or jumps more than 5 s (another route), and measures each drive on its own time base. The report says how many cars it found.
+- Plan for at least 60 oncoming cars that come within 80 m in the oncoming lanes. That can take more than one drive. Each drive can go in one run. The tool starts a new drive at each new route's initData, and wherever log time goes back more than 10 s (a reboot) or jumps ahead more than 5 s. It measures each drive on its own time base. The report says how many cars it found.
 
 After the drive, parked, copy every segment of the route off the comma and run the tool on the Mac from this worktree:
 
