@@ -1059,7 +1059,8 @@ class StopGo:
         d.withdraw = self.creep_end[0]
       self.creep_end = None
     need_s = self._need_s()
-    creeping = self.view_creep is not None and self.view_creep.get('phase') == 'creep'
+    # vision's: the window runs from where a creep stands; auto and trial judge it as base did
+    creeping = self.vision and self.view_creep is not None and self.view_creep.get('phase') == 'creep'
     go = not holds and self.clear_s >= need_s - 1e-6 and not creeping
     self.would_go = go
     if go and not self.would_go_logged:
