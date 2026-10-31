@@ -927,3 +927,54 @@ def test_a_walker_seen_leaving_the_path_before_her_track_ends_is_no_loss():
   assert sim.tp.lost_person is not None
   sim.step(engaged=False, gas=True)
   assert sim.tp.lost_person is None
+
+
+# --- ST-04 after a creep (SAT_VALIDATION run 2, red_right at 263065a: 90 s standing at a green) ---
+
+def crept_and_stood_again_at_a_green(creep_s=6., creep_v=0.4):
+  """SAT_VALIDATION run 2: a right at a signal, released on its green 10.8 m short of the junction; the model's phantom lead
+  (13 m, p 0.87, nothing in the scene) ended every lift at once (lead); the model then crept 0.2-0.45 m/s for 6 s with turnRight
+  out, 5.8 deg into the turn, 7.9 m short of the junction (go_spent), and stood again behind the same phantom. Returns the sim
+  after the creep, the car at rest again."""
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_go import RIGHT_AT_A_SIGNAL
+  sim = Sim(RIGHT_AT_A_SIGNAL, controls=[(290., 'signal')])
+  sim.tp.always_drive = True
+  sim.model_kw = {'lead_prob': 0.87, 'lead_x': 13.}
+  go_from_a_red(sim, desire=Desire.turnRight)
+  stand(sim, 3., lead_prob=0.87, lead_x=13.)  # the lifts end for the lead, as in the run's three
+  for _ in range(round(creep_s / DT_MDL)):  # the model creeps on its own, its plan going, the lead still out
+    sim.model_kw = {'lead_prob': 0.87, 'lead_x': 13.}
+    sim.v = creep_v
+    sim.step(engaged=True)
+  assert sim.tp.go_wait_s is None, "the creep counted as the model following the release"
+  return sim
+
+
+def test_a_release_the_model_creeps_on_and_stalls_again_short_of_the_junction_hands_back_at_20_s_not_90():
+  """SAT_VALIDATION run 2 (red_right at 263065a): the creep counted as the model following the release (its no-move clock
+  ended), the go was spent short of the junction (go_spent at 7.9 m), and nothing bounded the stand after it but the signal's
+  NEAR_CONTROL_STAND_S: "Stopped at the signal: take control" 90 s into it, the car standing at a green with nothing in the road.
+  ALWAYS_DRIVE.md ST-04: a release the model doesn't follow hands back at NO_MOVE_MAX_S, no hold. A creep that comes back to rest
+  short of the junction (the go spent) is no following: the release's no-move clock runs again from the stand, and the same
+  loud no-hold handback (cantStartTakeControl) comes NO_MOVE_MAX_S into it."""
+  sim = crept_and_stood_again_at_a_green()
+  plans = stand(sim, NO_MOVE_MAX_S + 1., lead_prob=0.87, lead_x=13.)
+  assert sim.tp.go_spent and sim.tp.follower.distance > 5.
+  first = next((i for i, q in enumerate(plans) if q.controlPrompt == 'cantStartTakeControl'), None)
+  assert first is not None, "handed back within NO_MOVE_MAX_S of the stand, not the signal's 90 s"
+  assert abs((first + 1) * DT_MDL - NO_MOVE_MAX_S) <= 3 * DT_MDL + 1e-6, first * DT_MDL
+  assert plans[first].reason == NO_MOVE_REASON and not any(q.shouldStop for q in plans), "loud, never a hold"
+  # the model drives off under it: the handback clears as the release's does
+  plans = [sim.step(engaged=True) for _ in range(round(4. / DT_MDL))]
+  assert plans[-1].controlPrompt == 'none' and sim.v > 1.
+
+
+def test_the_clock_run_again_after_a_creep_adds_no_lift():
+  """The same stand with the phantom gone after the creep: the restarted no-move clock bounds the stand and nothing more. No
+  release lift is certified from it (before the restart none could be: the clock had ended, and relift needs it running), so
+  the handback at NO_MOVE_MAX_S is the only thing the restart brings."""
+  sim = crept_and_stood_again_at_a_green()
+  sim.model_kw = {}
+  plans = stand(sim, NO_MOVE_MAX_S + 1.)
+  assert all(go_id_of(q) is None for q in plans), "no lift from the stand after the creep"
+  assert any(q.controlPrompt == 'cantStartTakeControl' for q in plans) and not any(q.shouldStop for q in plans)

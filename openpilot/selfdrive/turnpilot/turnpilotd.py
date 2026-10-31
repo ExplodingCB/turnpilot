@@ -801,6 +801,7 @@ class TurnPilot:
       self.go_id: int | None = None  # the turn a hold let go of at standstill: checked for a miss and a stall
       self.go_rolled = False         # ...the car has rolled since that go (STANDSTILL_SPEED or more)
       self.go_spent = False          # ...and then come to rest again short of the hold line: no longer under way (went)
+      self.go_clock_again = False    # ...its release's no-move clock run again from that stand (go_spent): a bound, no relift
       self.post_go: PostGo | None = None  # ...and driven under its post-go profile (start_post_go)
       self.no_move_limit = NO_MOVE_S       # ...withdrawn if the car hasn't moved this long after it (no_move)
       self.go_wait_s: float | None = None  # s stood since TurnPilot's go, nothing else holding the car; None: moved, or no go
@@ -1214,7 +1215,7 @@ class TurnPilot:
     d = self.desires
     turn_go = self.release_go and d.maneuver_id == rf.maneuver_id and d.started and d.side != 0 and not d.done and upcoming is not None
     if turn_go:
-      self.go_id, self.stall_s, self.go_rolled, self.go_spent = rf.maneuver_id, 0., False, False
+      self.go_id, self.stall_s, self.go_rolled, self.go_spent, self.go_clock_again = rf.maneuver_id, 0., False, False, False
       self.go_in_junction = not self.go_at_line(rf.distance)
       if sm['carControl'].enabled and not took_over:  # TurnPilot's go; the driver driving off a hold is the driver's
         self.start_post_go(upcoming, rf.distance, d.turned_deg, right_hand_traffic)
@@ -1229,7 +1230,7 @@ class TurnPilot:
       # (ALWAYS_DRIVE.md ST-12: release_distance)
       self.go_wait_s, self.go_withdrawn, self.go_moved, self.go_lifted, self.go_in_junction = 0., False, False, False, False
       self.go_lead_s, self.go_left, self.rel_gap_s, self.go_straight = 0., False, 0., True
-      self.no_move_limit, self.go_cert_id = self.no_move_s, None
+      self.no_move_limit, self.go_cert_id, self.go_clock_again = self.no_move_s, None, False
       cloudlog.event("turnpilot.post_go", profile='none', unprotected=False, turned_deg=0., distance=round(rf.distance, 1), at_line=True)
       if self.always_drive_on:
         self.certify_go(sm, cs, available, objects, raw, decision, took_over, self.release_distance(rf.distance), None,
@@ -1318,7 +1319,17 @@ class TurnPilot:
         self.go_rolled = True
       elif self.go_rolled and rf.distance >= GO_LINE_M:
         self.go_spent = True
-        cloudlog.event("turnpilot.go_spent", distance=round(rf.distance, 1), turned_deg=round(self.desires.turned_deg, 1))
+        # ALWAYS_DRIVE.md ST-04 under the switch (SAT_VALIDATION run 2, red_right at 263065a): a release the model crept on (its
+        # no-move clock ended as followed, no_move) and came back to rest short of the junction wasn't followed; its clock runs
+        # again from this stand to the same loud no-hold handback at NO_MOVE_MAX_S, never only the signal's NEAR_CONTROL_STAND_S
+        # (the run stood 90 s at a green behind the model's phantom lead with nothing in the road). A bound only: no relift
+        # from it (go_clock_again), as none could come once the clock had ended
+        again = self.always_drive_on and not self.go_left and self.go_wait_s is None and not self.go_withdrawn and \
+          not self.go_in_junction and not self.cant_start_unheld
+        if again:
+          self.go_wait_s, self.go_lead_s, self.go_moved, self.go_clock_again = 0., 0., False, True
+        cloudlog.event("turnpilot.go_spent", distance=round(rf.distance, 1), turned_deg=round(self.desires.turned_deg, 1),
+                       clock_again=again)
     went = self.go_id == rf.maneuver_id and not self.go_withdrawn and not self.go_spent
     at_rest = v_ego < STANDSTILL_SPEED and rf.distance > -PROTECT_PAST_M and self.desires.turned_deg < TURN_STARTED_DEG and \
       not went and rf.maneuver_id not in (self.scene.committed_id, self.scene.released_id)
@@ -2177,7 +2188,7 @@ class TurnPilot:
     self.no_move_limit, self.go_withdrawn = (LEFT_NO_MOVE_S if left else self.no_move_s), False
     self.go_wait_s = 0. if at_line else None  # in the junction: never withdrawn, the stall's handback covers it
     self.go_lead_s, self.go_left, self.rel_gap_s, self.go_straight = 0., left, 0., False
-    self.go_moved = False
+    self.go_moved, self.go_clock_again = False, False
     # the left's go from its line followed into the oncoming lanes only by a launch (left_launch)
     self.left_launch_armed = left and at_line and distance - ONCOMING_ENTRY_M >= LEFT_LIFT_ROOM_M
     cloudlog.event("turnpilot.post_go", profile=name, unprotected=left, turned_deg=round(turned_deg, 1), distance=round(distance, 1),
@@ -2304,7 +2315,7 @@ class TurnPilot:
     running (a go from the line, not the left's), no go out, the car standing (under STANDSTILL_SPEED) RELIFT_GAP_S after the
     release's last go ended, its goes and lifted metres left and nothing refusing it (go_refused), turnRelease again under a
     new id, a relift (GoCertifier: its speed end isn't followed)."""
-    if not (self.always_drive_on and acting and self.go_wait_s is not None and not self.go_left):
+    if not (self.always_drive_on and acting and self.go_wait_s is not None and not self.go_left) or self.go_clock_again:
       return
     gc = self.go_cert
     if gc.active:
