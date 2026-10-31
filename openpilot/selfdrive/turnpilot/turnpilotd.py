@@ -1816,7 +1816,7 @@ class TurnPilot:
     driven = self.map_controls.driven
     inp = LeftInput(mode, rf.maneuver_id, upcoming.side, rf.distance, v_ego, held or stray, raw, objects, self.approach_yaw_deg,
                     upcoming.opposing_speed or None, upcoming.opposing_lanes or None, self.left_range_m,
-                    scene_clear=scene.junction is None and not scene.carried,
+                    scene_clear=scene.junction is None and not scene.carried and scene.person_front is None,
                     junction_uncertain=rf.junction_spread > UNCERTAIN_M or stray,
                     go_withdrawn=self.go_withdrawn, committed=rf.maneuver_id == scene.committed_id,
                     released=rf.maneuver_id == scene.released_id,
@@ -1969,7 +1969,7 @@ class TurnPilot:
                 go_active=self.go_cert.cause, go_taken_over=self.go_cert.taken_over, go_end=self.go_cert.end,
                 mode=self.stop_sign_mode if acting else 'shadow', mode_known=self.stop_sign_known, approach_lanes=ours,
                 rightmost=model_lanes.measured and model_lanes.right_known and model_lanes.right == 0, signal_veto=self.sg_veto,
-                skip_union=skip_union, always_drive=self.always_drive_on)
+                skip_union=skip_union, always_drive=self.always_drive_on, person_front=self.scene.person_front is not None)
       self.sg_veto = ''  # read once: the go it vetoed is withdrawn on it
       d = self.stop_go.update(f)
       self.sg_last, self.sg_carried = d, 0
@@ -2179,6 +2179,8 @@ class TurnPilot:
     something else's below it is a hold."""
     if not sm['carControl'].enabled or took_over or cs.gasPressed or cs.brakePressed:
       return 'driver'
+    if self.scene.person_front is not None:
+      return 'personFront'  # a person TurnPilot saw may be in front (scene_policy.person_front): no go of TurnPilot's at all
     if not available:
       return 'scene'
     if decision.should_stop or (decision.holding and (own_cap is None or decision.speed_cap < own_cap - OWN_CAP_TOL)):

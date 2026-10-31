@@ -298,6 +298,9 @@ class Frame:
   approach_lanes: int = 0        # our approach's lanes toward the junction (navd's lane guidance for a turn here), 0 unknown
   rightmost: bool = False        # the car is in the rightmost lane (the model sees no lane to its right)
   always_drive: bool = False     # TurnPilotAlwaysDrive, never in shadow (turnpilotd.always_drive_on; ALWAYS_DRIVE.md section 1)
+  # the scene's person-may-be-in-front latch (scene_policy.person_front, WARGAME_FIXES WF-13): a person TurnPilot saw lost in
+  # front of the car, read as the front zone occupied (P6: no go, H7 at FRONT_ZONE_MAX_S)
+  person_front: bool = False
   dt: float = DT_MDL
 
 
@@ -2095,7 +2098,8 @@ class StopGo:
   def _front_zone(self, f: Frame) -> list[Hold]:
     """P6: a person track that entered the 0-3 m zone ahead of the bumper and wasn't seen leaving, across views: a track that
     ended at its side edge moving sideways over FRONT_LEAVE_V, then within FRONT_LEAVE_S a person track starting outside the
-    zone on that side, is the same person leaving. FRONT_ZONE_MAX_S of it is H7."""
+    zone on that side, is the same person leaving. FRONT_ZONE_MAX_S of it is H7. The scene's person-may-be-in-front latch
+    (Frame.person_front) is the zone occupied while it is set, whatever the tracks here say."""
     now = {}
     for o in f.objects or ():
       if class_name(o.cls) == PERSON:
@@ -2125,7 +2129,7 @@ class StopGo:
         if abs(rec['y']) >= FRONT_ZONE_HALF_W - FRONT_EDGE_M and rec['vy'] * rec['y'] > 0. and abs(rec['vy']) > FRONT_LEAVE_V:
           self.front_ended.append((self.t, rec['y']))
     self.front_ended = [(t, s) for t, s in self.front_ended if self.t - t <= FRONT_LEAVE_S]
-    occupied = any(r['in'] for r in self.front.values())
+    occupied = any(r['in'] for r in self.front.values()) or f.person_front
     self.front_s = self.front_s + f.dt if occupied else 0.
     return [Hold('front', "a person may be in front of the car", FAULT)] if occupied else []
 

@@ -213,6 +213,70 @@ def test_a_fault_keeps_it_and_its_hold():
     plans = [sim.step(gas=True, engaged=False) for _ in range(3)]
   assert not plans[-1].shouldStop and sim.tp.scene.person_front is None
 
+def test_every_go_of_turnpilots_is_barred_while_it_is_set():
+  """With the latch set and nothing else holding the car (a bare decision: no hold, no lead, no pedal, the scene live): S2's
+  release and its relifts (turnRelease), the left's go (unprotectedLeft), the stall's clearBox lift, the unstick lift and the
+  stop-sign decider's go are refused, 'personFront'; a go already out is withdrawn for it."""
+  from openpilot.selfdrive.turnpilot.scene_policy import SceneDecision
+  from openpilot.selfdrive.turnpilot.stop_go import StopGoDecision
+  sim, w = run6(True)
+  lose_her(sim, w)
+  tp, sm = sim.tp, sim.sm
+  cs, free = sm['carState'], SceneDecision()
+  assert tp.scene.person_front is not None and sm['carControl'].enabled
+  assert tp.go_blocked(sm, cs, True, [], None, free, False) == 'personFront'
+  for cause in ('turnRelease', 'unprotectedLeft'):
+    assert tp.go_refused(sm, cs, True, [], None, free, False, 20., cause) == 'personFront', cause
+  assert tp.stall_refused(sm, cs, 0., free, [], None, True, False) == 'personFront'
+  tp.unstick(sm, cs, 0., free, [], None, True, False, True)
+  tp.certify_stop_go(sm, cs, True, [], None, free, False, StopGoDecision(go_cause='stopSign', state='going'))
+  tp.certify_go(sm, cs, True, [], None, free, False, 20.)
+  assert not tp.go_cert.active
+  tp.go_cert.start('turnRelease')  # one out as it is set (the lift mid-window): withdrawn on the frame
+  tp.withdraw_go(sm, cs, True, True, [], None, free, False, 20.)
+  assert not tp.go_cert.active and tp.go_cert.end == 'personFront'
+
+
+def test_the_stop_sign_decider_reads_it_as_its_front_zone():
+  """turnpilotd hands the latch to the stop-sign decider's Frame every frame (its front zone occupied: no go, H7 at 30 s)."""
+  from unittest import mock
+  sim, w = run6(True)
+  with mock.patch.object(sim.tp.stop_go, 'update', wraps=sim.tp.stop_go.update) as update:
+    lose_her(sim, w)
+    sim.step(engaged=True)
+  frames = [c.args[0] for c in update.call_args_list]
+  assert not frames[0].person_front and frames[-1].person_front
+
+
+def test_the_autonomous_left_never_goes_while_it_is_set():
+  """At the autonomous left's line, a walker in the path 6 m ahead from the left's go for 3 s, then lost there: the go is
+  withdrawn and no other comes (its scene_clear false: the window never counts), the car held, the note said; 30 s on, the
+  loud handback. (Seen walking clear instead, test_turnpilotd_left's fresh go after the hold.)"""
+  from unittest import mock
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import left_sim, run_objects
+  st = {'go_t': None}
+
+  def ped(sim):
+    if st['go_t'] is None and sim.tp.left_now is not None and sim.tp.left_now.state == 'go':
+      st['go_t'] = sim.t
+    if st['go_t'] is not None and sim.t < st['go_t'] + 3.:
+      return ({'cls': 'pedestrian', 'x': 6., 'y': 0., 'vx': 0., 'vy': 0., 'age': 40 + round(10 * (sim.t - st['go_t'])), 'trackId': 5,
+               'conf': 0.8, 'inPath': True, 'camera': 'road'},)
+    return ()
+  sim = left_sim()
+  with mock.patch.object(sim.tp.left, 'update', wraps=sim.tp.left.update) as update:
+    plans = run_objects(sim, 30., ped)
+    while st['go_t'] is None or sim.t < st['go_t'] + 3. + 32.:
+      plans += run_objects(sim, 1., ped)
+      assert sim.t < 120.
+  gos = [i for i, p in enumerate(plans) if str(p.controlPrompt) == 'leftGo' and str(plans[i - 1].controlPrompt) != 'leftGo']
+  lost = round((st['go_t'] + 3.) / DT_MDL)
+  assert len(gos) == 1 and gos[0] < lost, gos
+  assert all(v < 0.05 for _, v, _ in sim.trace[lost + 20:]) and all(p.shouldStop for p in plans[lost + 1:])
+  assert all(p.reason == NOTE for p in plans[lost + 1:lost + round(29. / DT_MDL)])
+  assert not any(c.args[0].scene_clear for c in update.call_args_list[lost + 2:] if c.args[0].mode != 'off')
+
+
 def seen_back_walking_out(sim, seconds=6.):
   """After the loss: 1 s of nothing, a new track where she was for 1 s, then walking out to 3.5 m right and standing there."""
   for _ in range(round(1. / DT_MDL)):
