@@ -19,7 +19,8 @@ narrow dip in U (the NV12 UV plane) below the road on both sides is paint too, a
 smaller dip in U (worn yellow). Either needs the paint's chromaticity, (U - 128) / (Y - 16) and (V - 128) / (Y - 16), off
 the road's beside it (YELLOW_CU_MAX, YELLOW_CV_MIN): in low or warm sun white paint takes the light's tint and, being
 bright, dips in U as far as worn yellow does, but a neutral surface keeps the light's chromaticity whatever its brightness.
-Luma paint with U near the road's and V not above it is white.
+A sample with the U dip but not the chromaticity votes neither colour, so a yellow line the light washes out (the sun
+ahead) reads colour-unknown, never white. Luma paint with U near the road's and V not above it is white.
 
 Per frame a line has paint at some share of its samples, in marks: painted runs with less than GAP_MIN_M of road between
 them, so a worn dash makes one mark. Over WINDOW_S that share, the longest mark and the
@@ -43,13 +44,14 @@ the lane planner also needs the model to see a lane beyond the line, and the dri
 
 The chromaticity test (YELLOW_CU_MAX, YELLOW_CV_MIN) is from comma's public comma four routes with video, 2026-10-30: a
 Model 3 in California (79d0f04c82980004/00000003), a car in a European city (49d0fc1df3e7320b/00000002), one in Australia
-(5afee5161ea1dcde/00000003) and the demo route, 1.35 h moving. The ego right line, never yellow on those drives, read
-yellow at 0.5 or more on 11.6% of 45119 moving 10 Hz reads without it and on 0.2% with it, and turnpilotd's wrong-side
-guard, replayed on them, fired 9 times in the 41 min of right-hand traffic without it (white bike-lane and edge lines in
-low sun read yellow) and once with it. 2022 reads of lines labelled yellow read yellow 86% and 84% of the time; none read
-white but a white gore line inside a labelled span.
-
-Only the road (narrow) camera, a pinhole, is read; 8 m is the nearest ground clear of a comma four's view of the hood.
+(5afee5161ea1dcde/00000003) and the demo route, 81 min moving, 41 of them in right-hand traffic. There the ego right line,
+never yellow on those drives, read yellow at 0.5 or more on 6.1% of 20969 moving 10 Hz reads without it and on 0.4% with
+it, and turnpilotd's wrong-side guard, replayed, fired 9 times without it (white bike-lane and edge lines in low sun read
+yellow) and once with it. 2004 reads of lines labelled yellow read yellow 86% and 85% of the time, and none white. Of the
+18371 line reads yellow at 0.5 or more without it, 6 read white with it, all in Australia, where every line is white. The
+thresholds were chosen on the same footage, with no held-out set; over 1.5 s windows of it the ego right line read yellow
+in 1955 of 14985 without the test, and in 43 to 113 with any of -0.05 to -0.08 and 0.02 to 0.04 (55 as set), the
+labelled yellow in 93-98% (96%).
 """
 from collections import deque
 from dataclasses import dataclass, field
@@ -209,11 +211,11 @@ def sample_lines(nv12: np.ndarray, stride: int, y_height: int, lens: Lens, rpy_c
   y_paint, y_flank = np.maximum(_at(luma, dip_idx) - 16, 1), np.maximum(0.5 * np.add(*y_road) - 16, 1)
   cu = (u_dip - 128) / y_paint - (0.5 * np.add(*u_road) - 128) / y_flank
   cv = (v_dip - 128) / y_paint - (0.5 * np.add(*v_road) - 128) / y_flank
-  yellow = ((dip <= YELLOW_DU) | (bright & ~wide & (dip <= WORN_YELLOW_DU))) & (dv >= YELLOW_DV_MIN) & \
-    (cu <= YELLOW_CU_MAX) & (cv >= YELLOW_CV_MIN)
+  tint = ((dip <= YELLOW_DU) | (bright & ~wide & (dip <= WORN_YELLOW_DU))) & (dv >= YELLOW_DV_MIN)  # the paint's or the light's
+  yellow = tint & (cu <= YELLOW_CU_MAX) & (cv >= YELLOW_CV_MIN)
   du_peak = _at(chroma_u, peak_idx) - 0.5 * np.add(*_median_flanks(chroma_u, peak_idx))
   dv_peak = _at(chroma_v, peak_idx) - 0.5 * np.add(*_median_flanks(chroma_v, peak_idx))
-  white = bright & ~wide & ~yellow & (du_peak >= WHITE_DU) & (dv_peak <= WHITE_DV_MAX)
+  white = bright & ~wide & ~tint & (du_peak >= WHITE_DU) & (dv_peak <= WHITE_DV_MAX)  # a tint without yellow's chromaticity: neither
 
   ok &= road < LUMA_SATURATED
   if boxes is not None and len(boxes):

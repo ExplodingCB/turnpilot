@@ -333,3 +333,11 @@ class TestAdversarialFootage(OpenpilotTestCase):
     # a worn double yellow in neutral light (the demo route's: U 4-10 below the road) still reads yellow
     paint = drive([double((120., 121., 134.)), dashed(WHITE), solid(WHITE), None])
     assert kinds(paint)[0] == ('solid', 'yellow'), paint
+
+  def test_a_tint_without_yellows_chromaticity_reads_neither_colour(self):
+    # the same public route, segment 17, the sun ahead: its double yellow centre line washed out to a U dip of 4 below the
+    # road at a bright peak, which yellow's chromaticity test refuses. It must read colour-unknown, never white: white would
+    # let the lane planner treat a centre line as a lane line
+    paint = drive([None, solid((200., 124., 129.)), dashed(WHITE), None])
+    assert paint[1].color == 'unknown' and paint[1].kind == 'solid', paint
+    assert kinds(paint)[2] == ('broken', 'white'), paint
