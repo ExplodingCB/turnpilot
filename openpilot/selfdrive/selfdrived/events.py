@@ -396,8 +396,11 @@ def turnpilot_control_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.S
     return Alert(CONTROL_ALERT_TITLE[kind], CONTROL_ALERT_TEXT[kind], AlertStatus.critical, AlertSize.mid, Priority.MID,
                  VisualAlert.steerRequired, AudibleAlert.tpHandback, .1)
   if kind == 'offRouteStopsUnknown':  # while it lasts: the speed is capped, nothing ahead is known to stop for
-    return Alert(CONTROL_ALERT_TITLE[kind], CONTROL_ALERT_TEXT[kind], AlertStatus.userPrompt, AlertSize.mid, Priority.LOW,
-                 VisualAlert.steerRequired, AudibleAlert.prompt, .1)
+    # TurnPilotAlwaysDrive's onset (ALWAYS_DRIVE.md R17): the plan's words, the car driving on, nothing to take control for
+    from openpilot.selfdrive.turnpilot.map_controls import OFF_ROUTE_DRIVE_REASON
+    drive = plan.reason == OFF_ROUTE_DRIVE_REASON
+    return Alert(CONTROL_ALERT_TITLE[kind], plan.reason if drive else CONTROL_ALERT_TEXT[kind], AlertStatus.userPrompt, AlertSize.mid,
+                 Priority.LOW, VisualAlert.none if drive else VisualAlert.steerRequired, AudibleAlert.prompt, .1)
   if kind in CONTROL_STATUS_ALERTS:
     return Alert(CONTROL_ALERT_TITLE[kind], plan.reason or CONTROL_ALERT_TEXT[kind], AlertStatus.normal, AlertSize.mid,
                  Priority.LOWER, VisualAlert.none, AudibleAlert.prompt, .2)

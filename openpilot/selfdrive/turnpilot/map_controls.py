@@ -128,7 +128,11 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   rules. With nothing known ahead past the tracker's grace (off_route_unknown: the lookup pending, failed, unsupported,
   partial, or stale), the car never drives on silently: a speed cap comes down from its speed at OFF_ROUTE_DECEL to
   OFF_ROUTE_SPEED, and offRouteStopsUnknown says so ("Off route, map stops unknown"), for as long as it lasts. Never a stop:
-  nothing is known to stop for, and the driver is asked to take control or wait for the reroute.
+  nothing is known to stop for, and the driver is asked to take control or wait for the reroute. Under TurnPilotAlwaysDrive
+  (ALWAYS_DRIVE.md R17) the model drives on as stock openpilot would: the cap comes down only to OFF_ROUTE_DRIVE_SPEED (25
+  mph), or the last valid navInstruction.speedLimit before the route was lost where lower, offRouteStopsUnknown is said for
+  OFF_ROUTE_ALERT_S at its onset and the map status line (mapControlsUnavailable) after, saying the car won't stop for signs
+  or signals there, and nothing says take control.
 - navd's controlsStatus other than ok (navd always sets it; none is a navd from before controls) raises
   mapControlsUnavailable and keeps "Map stops/signals: <status>" in the reason: no controls on tiles without control
   data is never shown as clear.
@@ -190,6 +194,12 @@ SIGNAL_GO, SIGNAL_STOP, SIGNAL_COMMITTED = 'go', 'stop', 'committed'  # a signal
 OFF_ROUTE_SPEED = 5.          # m/s: off the route with the stops ahead unknown, the speed is capped to this...
 OFF_ROUTE_DECEL = 1.0         # m/s^2: ...coming down from the car's speed this gently
 OFF_ROUTE_REASON = "Off route, map stops unknown — take control or wait for reroute"
+# TurnPilotAlwaysDrive (ALWAYS_DRIVE.md R17): the model drives on as stock openpilot does off a route, the cap coming down only
+# to OFF_ROUTE_DRIVE_SPEED (25 mph), or to the last valid navInstruction.speedLimit before the route was lost where that is
+# lower; said once at onset (offRouteStopsUnknown, OFF_ROUTE_ALERT_S), then the map status line (mapControlsUnavailable)
+OFF_ROUTE_DRIVE_SPEED = 11.2  # m/s
+OFF_ROUTE_ALERT_S = ABORT_HOLD_S
+OFF_ROUTE_DRIVE_REASON = "Off route, map stops unknown — won't stop for signs or signals"
 
 UNPROTECTED = 'unprotectedTurn'  # MapControlStatus.Kind's name for it
 UNPROTECTED_ROUTE = -1        # its key is (UNPROTECTED_ROUTE, maneuver id): a maneuver's, not a route's control
@@ -528,6 +538,8 @@ class MapControlPolicy:
     self.turn_name = 'left'
     self._protected_id: int | None = None  # the maneuver a stop sign, signal or yieldStop of its junction protected: it stays so
     self._off_cap: float | None = None  # m/s: the off-route cap while the stops ahead are unknown (module docstring)
+    self._off_t = 0.  # s into the off-route stretch with the stops ahead unknown (the switch's onset alert, OFF_ROUTE_ALERT_S)
+    self._route_limit: float | None = None  # m/s: the last valid navInstruction's speedLimit, None for none (R17)
     self._camera_would: dict = {}  # signal key -> what the camera would have it do, as last logged
     self._camera_unmapped: tuple = ()  # the unmapped camera states last logged
     self._camera_off_said = False
@@ -768,6 +780,9 @@ class MapControlPolicy:
     if self.left.mode == 'auto' and self.left.go and self.turn is not None:
       self._release_req = (self.turn.key, 'gap')
     v = max(v_ego, 0.)
+    if updated and valid and nav is not None:  # on the route: off it navd's messages are invalid and say no limit
+      limit = float(getattr(nav, 'speedLimit', 0.))
+      self._route_limit = limit if limit > 0. else None
     controls = self.tracker.update(nav, updated, valid, v, dt)
     if self.held is not None and all(c.key != self.held for c in controls) and \
        not (self.turn is not None and self.turn.key == self.held):
@@ -821,11 +836,16 @@ class MapControlPolicy:
 
     unknown = self.tracker.off_route_unknown
     if unknown:
+      floor, off_reason = OFF_ROUTE_SPEED, OFF_ROUTE_REASON
+      if self.always_drive:
+        floor, off_reason = min(OFF_ROUTE_DRIVE_SPEED, self._route_limit or OFF_ROUTE_DRIVE_SPEED), OFF_ROUTE_DRIVE_REASON
       if self._off_cap is None:
-        self._off_cap = max(v, OFF_ROUTE_SPEED)
-        cloudlog.event("turnpilot.off_route_stops_unknown", error=True, status=self.tracker.off_status, v=round(v, 2))
-      self._off_cap = max(self._off_cap - OFF_ROUTE_DECEL * dt, OFF_ROUTE_SPEED)
-      out.stops.append(Stop(NO_ACCEL_CAP, self._off_cap, False, OFF_ROUTE_REASON, 0.))
+        self._off_cap, self._off_t = max(v, floor), 0.
+        cloudlog.event("turnpilot.off_route_stops_unknown", error=True, status=self.tracker.off_status, v=round(v, 2),
+                       floor=round(floor, 2))
+      self._off_cap = max(self._off_cap - OFF_ROUTE_DECEL * dt, floor)
+      self._off_t += dt
+      out.stops.append(Stop(NO_ACCEL_CAP, self._off_cap, False, off_reason, 0.))
     elif self._off_cap is not None:
       self._off_cap = None
       cloudlog.event("turnpilot.off_route_stops_known", route=self.tracker.route, status=self.tracker.off_status)
@@ -854,14 +874,15 @@ class MapControlPolicy:
     if status_bad:
       out.reason = f"Map stops/signals: {self.tracker.status}"
     if unknown:
-      out.reason = OFF_ROUTE_REASON
+      out.reason = OFF_ROUTE_DRIVE_REASON if self.always_drive else OFF_ROUTE_REASON
     self._alert_t = max(self._alert_t - dt, 0.)
     if infeasible:
       out.alert = 'cannotStopComfortably'
     elif self._alert_t > 0.:
       out.alert = self._alert
     elif unknown:
-      out.alert = 'offRouteStopsUnknown'
+      onset = not self.always_drive or self._off_t <= OFF_ROUTE_ALERT_S + 1e-6
+      out.alert = 'offRouteStopsUnknown' if onset else 'mapControlsUnavailable'  # the switch's status line after its onset
     elif status_bad:
       out.alert = 'mapControlsUnavailable'
     elif lights.rejected:

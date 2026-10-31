@@ -179,6 +179,23 @@ def test_map_control_alerts():
   assert a.alert_text_1 == 'TAKE CONTROL' and a.audible_alert == AudibleAlert.tpHandback
 
 
+def test_off_route_under_always_drive_is_said_once_then_a_status_line_without_take_control():
+  """ALWAYS_DRIVE.md R17 (S3): under TurnPilotAlwaysDrive the off-route onset (offRouteStopsUnknown, map_controls holds it
+  ABORT_HOLD_S) chimes and shows the plan's own words, which say the stops are unknown and the car won't stop for signs or
+  signals, with no take-control hint and no steering-wheel visual; the status line after it (mapControlsUnavailable) shows
+  the same words at the lowest priority. With any other reason (the switch off) the onset alert is today's."""
+  from openpilot.selfdrive.selfdrived.events import Priority
+  from openpilot.selfdrive.turnpilot.map_controls import OFF_ROUTE_DRIVE_REASON, OFF_ROUTE_REASON
+  a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='offRouteStopsUnknown', reason=OFF_ROUTE_DRIVE_REASON)))
+  assert a.alert_text_1 == 'Off Route' and a.alert_text_2 == OFF_ROUTE_DRIVE_REASON and 'take control' not in a.alert_text_2.lower()
+  assert a.audible_alert == AudibleAlert.prompt and a.visual_alert == VisualAlert.none
+  a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='mapControlsUnavailable', reason=OFF_ROUTE_DRIVE_REASON)))
+  assert a.alert_text_2 == OFF_ROUTE_DRIVE_REASON and a.alert_status == log.SelfdriveState.AlertStatus.normal
+  assert a.priority == Priority.LOWER  # the status line's own, as for any map status
+  a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='offRouteStopsUnknown', reason=OFF_ROUTE_REASON)))
+  assert 'take control or wait for reroute' in a.alert_text_2 and a.visual_alert == VisualAlert.steerRequired
+
+
 def test_cannot_stop_outranks_and_the_handback_chimes_while_it_lasts():
   slot = AlertSlot()
   a = slot.step(plan(controlAlert='cannotStopComfortably', tooFastToTurn=True))
