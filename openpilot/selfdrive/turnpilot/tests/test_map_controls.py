@@ -1707,3 +1707,80 @@ def test_a_holds_braking_after_a_re_engage_is_modelled_on_what_it_asks_never_on_
   # the skeptic's two re-engages, well short of 0.5 m/s^2's 3.7 and 4.5 m
   assert reengage_stop_m(1.92, hold_caps) < 2.4 and reengage_stop_m(2.12, latch_hold_caps) < 2.6
   assert reengage_stop_m(0., hold_caps) == 0.
+
+
+def creep_then_gas(gas_accel, gas_to=1.9, creep_m=2., seconds=8.):
+  """left_car held at its line, then the left asking a creep_m creep for a view; 0.5 m into it the driver's gas (openpilot
+  disengaged) at gas_accel takes the car on to gas_to m past where it latched, and they lift and re-engage rolling, the left
+  still asking its creep, for seconds. (car, s where it latched, rows from the gas on: (engaged, still latched, the row))"""
+  car = left_car()
+  cmd = left_cmd(creep_m=0.)
+  car.run_until(held, left=cmd)
+  car.run(2., left=cmd)
+  s_held = car.s
+  cmd = left_cmd(creep_m=creep_m, reason="Creeping for a view")
+  while car.s - s_held < 0.5:
+    car.step(left=cmd)
+  rows = []
+  while car.s - s_held < gas_to and car.policy.held is not None:
+    car.step(left=cmd, gas=True, accel=gas_accel)
+    rows.append((False, car.policy.held is not None, car.rows[-1]))
+  for _ in range(int(seconds / DT_MDL)):
+    car.step(left=cmd)
+    rows.append((True, car.policy.held is not None, car.rows[-1]))
+  return car, s_held, rows
+
+
+def test_the_latch_reengaged_inside_its_creep_is_never_let_go_on_its_own_metres():
+  """Skeptic round 1 (tp/left-hold): the driver's gas (disengaged) inside the left's 2 m creep, then a re-engage rolling at
+  2.1 m/s 1.96 m past the latch: drv = min(past, driver_m) took the latch's own stop past the creep (engaged) for the
+  driver's metres, since the driver had banked metres inside it, and the lanes test at 0.5 m/s^2 let go at the first engaged
+  frame, 3.09 m short of the oncoming lanes; the car drove off at cruise into the junction, the full check (c) skipped.
+  e93750b held it 1.75 m short of them. Held, standing short of the lanes, waiting; never let go engaged."""
+  from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M
+  car, s_held, rows = creep_then_gas(1.5)
+  lift = [r for engaged, _, r in rows if not engaged][-1]
+  assert 1.9 <= lift[1] - s_held < 2. and 2. < lift[2] < 2.2  # inside the creep, rolling at about 2.1 m/s
+  assert all(latched for _, latched, _ in rows), "re-engaged inside its creep: let go on the latch's own metres"
+  assert car.v < 0.05 and 250. - ONCOMING_ENTRY_M - car.s > 1. and car.policy.driven is None
+  assert all(r[5].prompt == 'none' for _, _, r in rows[-20:]) and rows[-1][2][4].should_stop
+
+
+def test_the_latch_never_counts_its_own_stop_past_the_creep_as_the_drivers_whatever_the_order():
+  """Skeptic round 1 (tp/left-hold), the order the earlier tests missed: the driver's metres inside the creep, the latch's
+  own stop (engaged) carrying the car on past it, then a nudge of the driver's under the reach. drv = min(past, driver_m)
+  added up the two and let go 1.1 m into the nudge. Owner decision (a): the driver's metres are those they move the car
+  past the furthest TurnPilot asked of the latch, never inside it nor TurnPilot's own stop: held for the full check (c),
+  let go only once their own metres beyond it pass the reach (LATCH_PAST_M) or the oncoming lanes come too near."""
+  from openpilot.selfdrive.turnpilot.map_controls import LATCH_PAST_M
+  car, s_held, rows = creep_then_gas(0.6, gas_to=1.95, seconds=5.)
+  carried = car.s - s_held - 2.
+  assert all(latched for _, latched, _ in rows) and car.v < 0.05 and 0.6 < carried < 1.2, carried  # stood past the creep
+  stood = car.s
+  cmd = left_cmd(creep_m=2., reason="Creeping for a view")
+  while car.s < stood + 1.4:
+    car.step(left=cmd, gas=True, accel=0.4 if car.v < 0.5 else 0.)
+  nudged = car.s - stood
+  car.run(4., left=cmd)  # re-engaged: the latch stops the nudge, its own metres
+  assert car.policy.held is not None and car.policy.driven is None and car.v < 0.05
+  assert carried + nudged > LATCH_PAST_M  # what min(past, driver_m) let go on
+  stood, let_go = car.s, None
+  while car.s < stood + 3. and let_go is None:
+    car.step(left=cmd, gas=True, accel=0.4 if car.v < 0.5 else 0.)
+    let_go = nudged + car.s - stood if car.policy.held is None else None  # the driver's own metres past the creep
+  assert let_go is not None and LATCH_PAST_M < let_go < LATCH_PAST_M + 0.1, let_go
+  assert car.policy.driven is not None and car.policy.driven.cause == 'drivenOff'
+
+
+def test_the_latch_reengaged_too_fast_inside_its_creep_is_let_go_on_the_drivers_frame_never_engaged():
+  """The invariant, never a TurnPilot hold that stands the car in the oncoming lanes on a re-engage, without a release on
+  TurnPilot's metres: the driver's gas inside the creep to about 3.5 m/s, from where the latch taken up by a re-engage stands
+  the car inside the lanes. The lanes test was reached only past the creep, so the latch was let go engaged, on its own
+  braking. Let go on the driver's own frame, inside the creep, before the re-engage, its crossing said (Driven)."""
+  car, s_held, rows = creep_then_gas(4.5)
+  first = next(k for k, (_, latched, _) in enumerate(rows) if not latched)
+  engaged, _, row = rows[first]
+  assert not engaged and row[1] - s_held < 2., (engaged, round(row[1] - s_held, 2))  # inside the creep, the driver's frame
+  assert row[5].driven and row[5].prompt == 'unprotectedTurnTakeControl'
+  inside = [r for e, _, r in rows[first:] if e and r[1] < 250. - HOLD_LINE_M - 1. + DRIVEN_THROUGH_M - 1.]
+  assert inside and all(r[5].prompt == 'unprotectedTurnTakeControl' and not r[4].should_stop for r in inside)

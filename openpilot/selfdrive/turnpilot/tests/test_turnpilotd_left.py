@@ -1375,3 +1375,72 @@ def test_after_a_withdrawn_go_a_nudge_short_of_the_holds_reach_goes_back_to_the_
   plans = drive(sim, 40.)
   assert any(p.desire == Desire.turnLeft for p in plans) and sim.s > JUNCTION + 10.
   assert not any(p.turnMissed for p in plans) and sim.tp.map_controls.driven is None
+
+
+def late_withdrawn_go(v_w):
+  """LEFT_25 at its line through four oncoming cars 6 s apart; the go certified, and later in its launch, at about v_w - 0.35
+  m/s, a car 90 m up the oncoming lane at the limit withdraws it while the car can still stop short of the oncoming lanes:
+  the left's own hold (hold_here) from there, TurnPilot's stop asking about v^2 / (2 STOP_DECEL) m on (skeptic round 1)."""
+  stream = [JUNCTION + 60. + k * 6. * V_25 for k in range(4)]
+  t0, late = [None], {}
+
+  def cars(sim):
+    if t0[0] is None and JUNCTION - sim.s < 60.:
+      t0[0] = sim.t
+    dt = sim.t - t0[0] if t0[0] is not None else 0.
+    out = [(s - V_25 * dt, 3.6) for s in stream]
+    if late:
+      out.append((late['s'] - V_25 * (sim.t - late['t']), 3.6))
+    return out
+  sim = left_sim(cars)
+  while not (sim.tp.left_now is not None and sim.tp.left_now.state == 'go'):
+    sim.step(engaged=True)
+    assert sim.t < 120.
+  while sim.v < v_w - 0.35:
+    sim.step(engaged=True)
+  late['s'], late['t'] = sim.s + 90., sim.t
+  while sim.tp.left_now.state == 'go':
+    sim.step(engaged=True)
+  assert sim.tp.left.hold_here and sim.v > 1. and JUNCTION - sim.s > ONCOMING_ENTRY_M + sim.tp.left.hold_asked
+  return sim
+
+
+@pytest.mark.parametrize("gas", [True, False])
+@pytest.mark.parametrize("frac", [0.6, 0.9])
+@pytest.mark.parametrize("v_w", [1.8, 2.3, 2.7])
+def test_after_a_go_withdrawn_in_its_launch_a_re_engage_is_held_short_of_the_lanes_or_let_go_before_it(v_w, frac, gas):
+  """Skeptic round 1 (tp/left-hold): the go withdrawn later in its launch, the driver (openpilot disengaged: the gas, or a
+  cancel and a coast) keeps the car's speed over frac of the stop TurnPilot asked, then re-engages rolling. The left's own
+  hold let go a frame or two into the re-engage, engaged, on TurnPilot's own braking metres: past = min(hold_m - asked,
+  driver metres) took them for the driver's past the ask, and the lanes test at 0.5 m/s^2 for one the hold couldn't stop
+  short. Openpilot then drove the car on into the junction under only the take-control, the full check (c) skipped, where
+  the hold would have stood it 4.83-5.21 m from the centre (e93750b). At 2.7 e93750b stood it 3.47 and 2.83 m out, inside
+  the lanes. Never let go engaged: held short of the lanes, waiting for its gap, where the hold can stand the car there;
+  let go on the driver's own frame, before the re-engage, where it can't (the invariant), its crossing said; never standing
+  in the oncoming lanes."""
+  from openpilot.selfdrive.turnpilot.map_controls import DRIVEN_THROUGH_M
+  sim = late_withdrawn_go(v_w)
+  asked = sim.tp.left.hold_asked
+  s0, rows = sim.s, []  # (openpilot engaged, the left's own hold still standing after it, the plan)
+  sim.accel = lambda sim, plan: 0.
+  while sim.s - s0 < frac * asked - 1e-3 and sim.tp.left.hold_here:
+    p = sim.step(engaged=False, gas=gas)
+    rows.append((False, sim.tp.left.hold_here, p))
+  sim.accel = None
+  n = len(sim.trace)
+  for _ in range(int(8. / DT_MDL)):
+    p = sim.step(engaged=True)
+    rows.append((True, sim.tp.left.hold_here, p))
+  after = sim.trace[n:]
+  stood = [JUNCTION - s for s, v, _ in after if v < 0.05]
+  assert not [d for d in stood if abs(d) < ONCOMING_ENTRY_M], f"held standing in the oncoming lanes: {stood[:1]}"
+  let_go = next((k for k, (_, here, _) in enumerate(rows) if not here), None)
+  if v_w > 2.5:  # from where no hold can stand it short of the lanes: the driver's, on their own frame
+    assert let_go is not None and not rows[let_go][0], "let go on an engaged frame, on TurnPilot's own metres"
+    assert crossing_said(after, LINE + DRIVEN_THROUGH_M - 1.), sorted({(str(p.controlPrompt), p.reason) for *_, p in after})
+  else:  # held where it stands, short of the lanes, the full check going on
+    assert let_go is None, f"let go {'engaged' if rows[let_go][0] else 'disengaged'}: the full check (c) skipped"
+    assert stood and stood[0] > ONCOMING_ENTRY_M and sim.v < 0.05
+    plans = [p for e, _, p in rows if e]
+    assert all(str(p.unprotectedLeft.state) == 'waitGap' for p in plans[:int(3. / DT_MDL)])
+    assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)

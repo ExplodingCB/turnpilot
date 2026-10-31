@@ -940,3 +940,76 @@ def test_every_wait_at_the_line_for_a_gap_ends_in_the_loud_handback_at_45_s_neve
   assert d.state == 'waitGap' and d.stops
   d = j.wait(6., boxes=[raw(100., 3.6)], v=0.)
   assert d.state == 'undecided' and d.why == 'noGap' and d.stops  # held, its own hold
+
+
+def under_the_hold(j, seconds):
+  """openpilot engaged for seconds, the car braking as the left's decisions ask (their stops through plan_accel, as the sims
+  apply them: shouldStop's -1 m/s^2 floor), a car in the band (no fresh go)."""
+  from openpilot.selfdrive.turnpilot.hooks import plan_accel
+  from openpilot.selfdrive.turnpilot.scene_policy import decide
+  out, d = [], j.decisions[-1]
+  for _ in range(round(seconds / DT_MDL)):
+    a = 0.
+    if d.stops:
+      dec = decide(d.stops, j.v)
+      a = plan_accel(dec.accel_cap, dec.speed_cap, j.v)
+      a = min(a, -1.) if dec.should_stop else a
+    v = max(j.v + a * DT_MDL, 0.)
+    d = j.step([raw(100., 3.6)], v=v, distance=j.distance - v * DT_MDL)
+    out.append(d)
+  return out
+
+
+def test_the_lefts_own_hold_never_counts_turnpilots_stop_past_its_ask_as_the_drivers_whatever_the_order():
+  """Skeptic round 1 (tp/left-hold): past = min(hold_m - hold_asked, hold_drv_m) took the driver's metres inside TurnPilot's
+  asked stop for metres past it once TurnPilot's own braking (engaged) had carried the car past the ask: the driver keeps the
+  speed 0.6 m inside a 0.75 m ask, re-engages, the hold stands the car 1.1 m past the ask, and a 1.5 m nudge on (under the
+  reach) let it go. Owner decision (a): the driver's metres are only those they move the car past where TurnPilot's stop put
+  it; inside the ask they are TurnPilot's, and whatever TurnPilot's stop carries, engaged, is never theirs. Held for the
+  full check (c), let go only past the reach by the driver's own metres beyond the ask."""
+  from openpilot.selfdrive.turnpilot.map_controls import LATCH_PAST_M
+  j = Junction()
+  withdrawn(j, 1.5)
+  asked = j.left.hold_asked
+  assert abs(asked - 0.75) < 0.01
+  ds = roll(j, 0.6 / 1.5, 1.5, enabled=False)  # the driver keeps the speed inside the ask, disengaged
+  ds += under_the_hold(j, 4.)  # re-engaged rolling: TurnPilot's hold stands the car past its ask
+  assert j.v == 0. and j.left.hold_m - asked > 1., j.left.hold_m
+  stood = j.distance
+  ds += roll(j, 1.5 / 0.5, 0.5, enabled=False) + roll(j, 1., 0., enabled=False) + under_the_hold(j, 2.)  # nudged on 1.5 m
+  assert not any(d.crossed for d in ds) and j.left.hold_here and ds[-1].stops and ds[-1].state == 'waitGap'
+  # on: past it by more than the reach of the driver's own metres beyond where TurnPilot's stop put it, theirs
+  ds = roll(j, 1.5, 0.5, enabled=False)
+  crossed = [k for k, d in enumerate(ds) if d.crossed]
+  assert len(crossed) == 1 and not j.left.hold_here
+  at = stood - (j.distance + 0.5 * DT_MDL * (len(ds) - 1 - crossed[0]))
+  assert LATCH_PAST_M < at < LATCH_PAST_M + 0.1, at
+
+
+def test_the_lefts_own_hold_is_never_let_go_on_a_frame_openpilot_is_engaged():
+  """Skeptic round 1 (tp/left-hold): the go withdrawn later in its launch (2.38 m/s, 7.03 m from the junction: TurnPilot's
+  stop asks 1.89 m), the driver keeps the speed disengaged inside the ask and re-engages: the lanes test was reached only once
+  TurnPilot's own braking had carried the car past the ask, so the hold was let go a frame or two into the re-engage,
+  engaged, on TurnPilot's metres (and so too where those metres would have stood the car short of the lanes). Let go only
+  on the driver's own frames (openpilot disengaged): there, once a hold could no longer stand the car short of the oncoming
+  lanes (the invariant), before the re-engage; a re-engage short of that is held, never let go engaged."""
+  from openpilot.selfdrive.turnpilot.map_controls import reengage_stop_m
+  from openpilot.selfdrive.turnpilot.unprotected_left import hold_caps
+  for keep_m, theirs in ((1.1, True), (1.7, True), (0.3, False)):
+    j = Junction()
+    j.distance = 7.6
+    withdrawn(j, 2.38)
+    entry = j.left.hold_entry
+    assert j.left.hold_asked > 1.8 and abs(entry - 3.5) < 0.1
+    ds = roll(j, keep_m / 2.38, 2.38, enabled=False)
+    n = len(ds)
+    ds += under_the_hold(j, 6.)
+    crossed = [k for k, d in enumerate(ds) if d.crossed]
+    if theirs:
+      assert len(crossed) == 1 and crossed[0] < n, (keep_m, crossed, n)  # on a disengaged frame, before the re-engage
+      # the first frame a hold taken up there could no longer stand the car short of the lanes, inside the ask
+      stand = reengage_stop_m(2.38, hold_caps)
+      assert j.left.hold_m - 2.38 * DT_MDL + stand <= entry < j.left.hold_m + stand and j.left.hold_m < j.left.hold_asked
+    else:
+      assert not crossed and j.left.hold_here and j.v == 0. and j.left.hold_m < entry, (keep_m, j.left.hold_m, entry)
+      assert ds[-1].state == 'waitGap' and ds[-1].stops
