@@ -71,6 +71,12 @@ never the hard tier. It holds while such a track is published and lets go CURB_P
 (turnpilot.curb_ped_cap). The track is kept as any other, so her confirmation is warm if she steps out; nothing about
 confirmation, the tracker or what stops the car changes. Replayed over 16.4 min of public comma four footage through the real
 tracker it took no false track (the nearest, a roadside object, came 2.38 m off the path with 4 hits) and one real person.
+
+Tracker B's people (TurnPilotFarPeds, scene/tracker_b.py; PERCEPTION_PLAN item 5, peds P3 variant g:C): ScenePolicy.update takes
+them after the scene's (extra_objects), each b_only, its trackId offset by B_ID and its age 0. A b_only object is never confirmed
+or earned (no hard tier, no following stop) and never a crosswalk walker or a curb-cap track, whatever its fields say, so all
+it can ever do is a "pedestrian in path" stop on the STOP_DECEL curve: a TurnPilot veto for a person the far crop saw first,
+never a gate. The pedestrian velocity trust (trusted_velocity) reads it as it reads the scene's.
 """
 import math
 from collections import deque
@@ -183,6 +189,8 @@ CURB_PED_DECEL = STOP_DECEL  # m/s^2: nothing from the cap asks for more
 CURB_PED_HOLD_S = 1.        # the cap lets go this long after the last such track
 CURB_PED_REASON = "pedestrian by the road"
 
+B_ID = 1_000_000  # tracker B's objects' trackIds are offset by this (scene/tracker_b.py), apart from tracker A's (module docstring)
+
 
 @dataclass
 class SceneDecision:
@@ -235,6 +243,11 @@ def stop(v_ego: float, d_stop: float, reason: str, confirmed: bool = True, v_lea
   if not confirmed and accel_cap < NO_ACCEL_CAP:
     accel_cap, speed_cap = NO_ACCEL_CAP, max(speed_cap, v_ego - STOP_DECEL * SPEED_CAP_TAU)
   return Stop(accel_cap, speed_cap, should_stop and v_lead <= 0., reason, d_stop, v_lead, confirmed, evidence, v_lead <= 0.)
+
+
+def b_only(obj) -> bool:
+  """Tracker B's object (module docstring): never confirmed, never a walker or a curb-cap track."""
+  return bool(getattr(obj, 'b_only', False))
 
 
 def velocity_trusted(obj) -> bool:
@@ -489,15 +502,16 @@ class ScenePolicy:
 
   def update(self, objects, available: bool, maneuver, distance: float, v_ego: float, right_hand_traffic: bool = True,
              maneuver_id: int | None = None, gas_pressed: bool = False, dt: float = DT_MDL, extra_stops=(),
-             heading_deg: float = 0., path=None) -> SceneDecision:
+             heading_deg: float = 0., path=None, extra_objects=()) -> SceneDecision:
     """As scene_policy(), plus maneuver_id (RouteFollower.maneuver_id), once per frame dt apart. gas_pressed: the driver
     taking over (turnpilotd: carState.gasPressed with openpilot disengaged), never a go. extra_stops: the map's stop signs
     and signals (map_controls.py), composed with the scene's like any other stop. heading_deg: as scene_policy()'s. path:
-    the model's path ahead (scene.tracker.predicted_path: x, y left), None straight ahead, for the curb cap."""
+    the model's path ahead (scene.tracker.predicted_path: x, y left), None straight ahead, for the curb cap. extra_objects:
+    tracker B's b_only objects (module docstring), taken after the scene's, and like them only while it is available."""
     far_side = far_side_turn(maneuver, right_hand_traffic)
     self.t += dt
     if available:
-      objects = trusted_velocity(objects)  # before any rule reads them: no pedestrian faster than PED_MAX_SPEED
+      objects = trusted_velocity(list(objects) + list(extra_objects))  # before any rule reads them: no pedestrian faster than PED_MAX_SPEED
       self.update_evidence(objects)
       for obj in objects:
         ev = self.tracks[obj.trackId]
@@ -551,7 +565,7 @@ class ScenePolicy:
     near = None
     for obj in objects:
       ev = self.tracks.get(obj.trackId)
-      if str(obj.cls) != "pedestrian" or ev is None or not ev.walker or not 0. < obj.x <= CURB_PED_X_M or \
+      if str(obj.cls) != "pedestrian" or ev is None or not ev.walker or b_only(obj) or not 0. < obj.x <= CURB_PED_X_M or \
          is_rider(obj, objects, lambda o: self.tracks[o.trackId].confirmed if o.trackId in self.tracks else False):
         continue
       path_y = float(np.interp(obj.x, path[0], path[1])) if path is not None and len(path[0]) else 0.
@@ -619,6 +633,8 @@ class ScenePolicy:
       lost_close = ev.confirmed and ev.hit_x < LOST_CLOSE_M
       ev.confirmed = ev.earned and ((steady and seen) or lost_close)
       ev.walker = ev.walker or (crosswalk_walker(obj) and self.recent_hits(ev, CROSSWALK_STEADY_S) >= CROSSWALK_STEADY_HITS)
+      if b_only(obj):  # tracker B's (module docstring): age 0 already earns none of these; never, whatever it says
+        ev.earned = ev.confirmed = ev.walker = False
       tracks[obj.trackId] = ev
     self.tracks = tracks
 

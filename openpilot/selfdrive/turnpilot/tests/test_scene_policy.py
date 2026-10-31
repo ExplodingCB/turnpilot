@@ -953,3 +953,77 @@ def test_a_confirmed_pedestrian_faster_than_a_run_is_stopped_for_never_followed(
   for _ in range(3):
     d = sp.update(sc.objects, True, None, 1000., 8.)
   assert d.reason == "following pedestrian" and d.rest_d is None
+
+
+# --- tracker B's people (TurnPilotFarPeds, scene/tracker_b.py; PERCEPTION_PLAN item 5, peds P3 variant g:C) ---
+
+def b_ped(x, y, vx=0., vy=0., track_id=1, **fields):
+  """Tracker B's pedestrian as turnpilotd hands it to the policy: b_only, trackId offset by B_ID. Its fields here are a confirmed
+  walker's (many hits, high confidence) unless given: whatever they say, a b_only object never confirms."""
+  from openpilot.selfdrive.turnpilot.scene_policy import B_ID
+  return plain_ped(x, y, vx, vy, B_ID + track_id, **{'age': 30, 'conf': 0.9, 'b_only': True, **fields})
+
+
+def test_tracker_bs_person_in_the_path_stops_on_the_comfortable_curve_only():
+  # 14 m ahead at 12 m/s: a confirmed track would brake at -144/18 = -8 m/s^2 through the accel cap; a b_only one never does
+  sp = ScenePolicy()
+  for _ in range(20):
+    d = sp.update([], True, None, 1000., 12., extra_objects=[b_ped(14., 0., inPath=True)])
+    assert d.reason == "pedestrian in path" and d.holding and d.rest_d == 14. - PED_STOP_GAP_M
+    assert d.accel_cap == NO_ACCEL_CAP and not d.hard_brake and plan_accel(d.accel_cap, d.speed_cap, 12.) >= -STOP_DECEL - 1e-9
+  ev = next(iter(sp.tracks.values()))
+  assert not ev.confirmed and not ev.earned and not ev.walker
+  # the same fields on tracker A's object: confirmed, the hard tier (b_only is what keeps it from both)
+  sp = ScenePolicy()
+  for _ in range(3):
+    d = sp.update([b_ped(14., 0., inPath=True, b_only=False)], True, None, 1000., 12.)
+  assert d.hard_brake and next(iter(sp.tracks.values())).confirmed
+  # moving on along the path: never followed (a following stop is a confirmed track's), stopped for on the curve
+  sp = ScenePolicy()
+  for _ in range(5):
+    d = sp.update([], True, None, 1000., 8., extra_objects=[b_ped(20., 0., vx=2., inPath=True)])
+  assert d.reason == "pedestrian in path" and d.rest_d == 20. - PED_STOP_GAP_M
+  # and the pedestrian velocity trust reads it as the scene's: 20 m out, 6 m left, read crossing in at 4 m/s, stands
+  d = ScenePolicy().update([], True, None, 1000., 6., extra_objects=[b_ped(20., 6., vy=-4.)])
+  assert not d.holding and d.speed_cap == NO_SPEED_CAP
+
+
+def test_tracker_bs_person_is_never_a_crosswalk_walker_nor_a_curb_cap():
+  # a right turn's crosswalk zone (test_crosswalk_hold_on_right_turn's walker), and a steady person by the road
+  sp = ScenePolicy()
+  for k in range(20):
+    d = sp.update([], True, RIGHT_TURN, 20., 5., maneuver_id=0, extra_objects=[b_ped(23., -6., age=2 + k)])
+    assert d.reason != "pedestrian in crosswalk" and not d.holding
+  sp, v = ScenePolicy(), 13.
+  for k in range(60):
+    d = sp.update([], True, None, 1000., v, maneuver_id=0, extra_objects=[b_ped(35., 3.8, age=2 + k)])
+    assert d.speed_cap == NO_SPEED_CAP and d.reason == ""
+  assert sp.curb_t == float('inf') and not sp.curb_logged
+  # the same objects as tracker A's: the crosswalk hold and the curb cap (b_only is what keeps them from both)
+  sp = ScenePolicy()
+  for k in range(20):
+    d = sp.update([b_ped(23., -6., age=2 + k, b_only=False)], True, RIGHT_TURN, 20., 5., maneuver_id=0)
+  assert d.reason == "pedestrian in crosswalk"
+  sp = ScenePolicy()
+  for k in range(60):
+    d = sp.update([b_ped(35., 3.8, age=2 + k, b_only=False)], True, None, 1000., 13., maneuver_id=0)
+  assert d.reason == "pedestrian by the road" and sp.curb_logged
+
+
+def test_tracker_bs_objects_count_only_while_the_scene_is_available_and_never_move_tracker_as():
+  # unavailable: no evidence either way, the stops in force carried; B's objects are no evidence then either
+  sp = ScenePolicy()
+  d = sp.update([], False, None, 1000., 10., extra_objects=[b_ped(20., 0., inPath=True)])
+  assert not d.holding and sp.tracks == {}
+  # tracker A's confirmed person and tracker B's: A's evidence, stops and hard tier are what they are without B's
+  def run(with_b):
+    sp, out = ScenePolicy(), []
+    for k in range(30):
+      a = scene([ped(18. - 0.3 * k, 0.2, in_path=True, age=5 + k, trackId=3)]).objects
+      extra = [b_ped(30., -0.5, inPath=True, age=0, conf=0.49)] if with_b else []
+      d = sp.update(a, True, RIGHT_TURN, 60., 9., maneuver_id=0, extra_objects=extra)
+      ev = sp.tracks[3]
+      a_stops = [(s.accel_cap, s.speed_cap, s.confirmed, s.reason) for s in sp.carried if s.evidence['track_id'] == 3]
+      out.append((ev.confirmed, ev.earned, ev.walker, ev.hits, a_stops, d.hard_brake, d.accel_cap))
+    return out
+  assert run(True) == run(False) and any(r[5] for r in run(True))
