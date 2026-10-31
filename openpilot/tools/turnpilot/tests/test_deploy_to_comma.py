@@ -47,6 +47,7 @@ host="$1"; shift
 cmd="$*"
 action=$(printf '%s' "$cmd" | awk '{for (i = 1; i <= NF; i++) if ($i == "deploy_to_comma") {print $(i + 1); exit}}')
 echo "host=$host action=${action:-$cmd}" >> "$FAKE_COMMA_LOG"
+printf '%s\n' "$host $cmd" >> "$FAKE_COMMA_LOG.argv"  # every command line the comma (and ps there) would see
 if [ "$cmd" = "sudo reboot" ]; then echo REBOOT >> "$FAKE_COMMA_LOG"; exit 0; fi
 export PATH="$FAKE_COMMA_BIN:${FAKE_COMMA_PATH:-$PATH}"
 # the comma's git never reads this Mac's config: none at all by default (git-lfs installed, its filter not set up)
@@ -601,3 +602,97 @@ def test_real_commit(comma):
                             'GIT_CONFIG_NOSYSTEM': '1'}).stdout.strip().splitlines()[-1]
   channel, _, commit, dirty = json.loads(out)
   assert (channel, commit, dirty) == ('turnpilot', head, False)
+
+
+# --map-key: the map server's API key (the one secret; the repo is public) from the Mac's file into TurnPilotMapKey
+FAKE_KEY = 'tpk_' + 'Zq7' * 20  # shaped like the real one: one word of letters, digits and punctuation
+
+
+def key_file(tmp_path, text=FAKE_KEY + '\n'):
+  path = tmp_path / 'mapserver_client_key'
+  path.write_text(text)
+  path.chmod(0o600)
+  return path
+
+
+def nowhere_but_the_param(r, env, root, key=FAKE_KEY):
+  """The key is in TurnPilotMapKey and in nothing printed, logged or put on a command line."""
+  assert key not in r.stdout and key not in r.stderr
+  log = Path(env['FAKE_COMMA_LOG'])
+  assert key not in log.read_text() and key not in Path(str(log) + '.argv').read_text()
+  assert not list((root / 'params').glob('.tmp_value_deploy_*'))
+
+
+def test_map_key_with_a_deploy(source, comma, tmp_path):
+  src, _, second, panda1 = source
+  root, env = comma
+  r = deploy(src, root, env, '--stamp', '20261031-080000', '--map-key', '--map-key-file', str(key_file(tmp_path)))
+  assert r.returncode == 0, r.stdout
+  check_deployed(root / 'openpilot', second, panda1)
+  param = root / 'params/d/TurnPilotMapKey'
+  assert param.read_text() == FAKE_KEY  # stripped of the file's newline, as the web app saves it
+  assert param.stat().st_mode & 0o077 == 0
+  assert (root / 'params/d/DisableUpdates').read_text() == '1'
+  assert 'TurnPilotMapKey: set (not printed)' in r.stdout
+  nowhere_but_the_param(r, env, root)
+
+
+def test_no_flag_no_key(source, comma, tmp_path):
+  src, *_ = source
+  root, env = comma
+  r = deploy(src, root, env, '--stamp', '20261031-080000', '--map-key-file', str(key_file(tmp_path)))
+  assert r.returncode == 0, r.stdout
+  assert not (root / 'params/d/TurnPilotMapKey').exists()
+  assert 'set_secret' not in Path(env['FAKE_COMMA_LOG']).read_text()
+
+
+def test_map_key_only_changes_nothing_else(comma, tmp_path):
+  root, env = comma
+  (root / 'params/d/IsOffroad').write_text('0')  # onroad: the key alone can go in
+  (root / 'params/d/TurnPilotMapKey').write_text('old-key')
+  before = snapshot(root)
+  r = deploy(tmp_path / 'no-repo', root, env, '--map-key-only', '--map-key-file', str(key_file(tmp_path)))
+  assert r.returncode == 0, r.stdout
+  after = snapshot(root)
+  changed = {k for k in before.keys() | after.keys() if before.get(k) != after.get(k)}
+  assert changed == {'params/d_abc123/TurnPilotMapKey'}, changed
+  assert (root / 'params/d/TurnPilotMapKey').read_text() == FAKE_KEY
+  assert 'old-key' not in r.stdout
+  nowhere_but_the_param(r, env, root)
+  assert {line.split('action=')[1] for line in Path(env['FAKE_COMMA_LOG']).read_text().splitlines()} == {'probe', 'set_secret'}
+
+
+def test_map_key_dry_runs_change_nothing(source, comma, tmp_path):
+  src, *_ = source
+  root, env = comma
+  before = snapshot(root)
+  path = key_file(tmp_path)
+  for args in (['--map-key-only', '--dry-run'], ['--map-key', '--dry-run']):
+    r = deploy(src, root, env, *args, '--map-key-file', str(path))
+    assert r.returncode == 0, r.stdout
+    assert 'TurnPilotMapKey' in r.stdout and str(path) in r.stdout
+    nowhere_but_the_param(r, env, root)
+  assert snapshot(root) == before
+
+
+@pytest.mark.parametrize("text,why", [(None, "can't read"), ('', 'empty'), ('\n', 'empty'),
+                                      ('-----BEGIN PRIVATE KEY-----\nMIIsecret\n-----END PRIVATE KEY-----\n', 'PEM'),
+                                      ('two words\n', 'one word')])
+def test_map_key_refused_before_anything_changes(source, comma, tmp_path, text, why):
+  src, *_ = source
+  root, env = comma
+  path = tmp_path / 'missing' if text is None else key_file(tmp_path, text)
+  before = snapshot(root)
+  for args in (['--map-key-only'], ['--map-key', '--stamp', '20261031-080000']):
+    r = deploy(src, root, env, *args, '--map-key-file', str(path))
+    assert r.returncode == 2 and why in r.stdout and 'Nothing on the comma changed' in r.stdout, r.stdout
+    assert 'MIIsecret' not in r.stdout and 'two words' not in r.stdout
+  assert snapshot(root) == before
+
+
+def test_map_key_flags_refuse_other_modes(comma, tmp_path):
+  root, env = comma
+  for args in (['--map-key-only', '--rollback'], ['--map-key-only', '--commit', 'abc'], ['--map-key', '--rollback'],
+               ['--reboot', '--map-key'], ['--map-key-only', '--map-key']):
+    r = deploy(tmp_path, root, env, *args)
+    assert r.returncode == 2 and 'usage' in r.stderr, args
