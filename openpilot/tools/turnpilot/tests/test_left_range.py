@@ -7,6 +7,7 @@ car parked by the road (not oncoming), a stretch with no road runs (unknown is n
 sunnypilot log. The tool only reads, and never prints a position."""
 import ast
 import math
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -285,6 +286,35 @@ def test_a_car_boxed_late_or_lost_for_a_while_sets_the_range_and_is_listed():
   assert result.road.range_m == floor10(min(by_id[11].road_m, by_id[31].road_m))
   out = text(result)
   assert "track 11" in out and "track 31" in out
+
+
+def drop_runs(c, at_m, n):
+  """Car c unboxed on n road runs in a row from where it is at_m m out: its boxes (n + 1) x 0.1 s apart there. Returns the
+  time of its first box after them."""
+  t_start = first_road_run(c.t0 + (c.x0 - at_m) / (c.speed + EGO_V))
+  c.gaps = ((t_start - 0.01, t_start + (n - 1) * 0.1 + 0.01),)
+  return round(t_start + n * 0.1, 6)
+
+
+@pytest.mark.parametrize("ego_v, speed, missed, bridged", (
+  (0., 15., 6, False),   # 0.7 s: at the left's 2 road runs in 3 the same 6 misses take 1.05 s
+  (15., 10., 4, False),  # 0.5 s: at the left the car closes at 10 m/s, not 25: that stretch takes 1.25 s
+  (10., 15., 3, True),   # 0.4 s: 0.6 s at the left's schedule, 0.67 s at its closing: under CLEAR_WINDOW_S / 3
+), ids=("stopped, 6 runs missed", "faster than it, 4 missed", "3 missed"))
+def test_a_dropout_counts_as_long_as_it_would_be_at_the_left(monkeypatch, ego_v, speed, missed, bridged):
+  """The drive's runs are on the road camera every time, held at the line the left's are 2 in WIDE_EVERY (roadAndWide), and
+  an oncoming car closes on the moving car at its own speed and ours, on the waiting one at its own: a gap of boxes on the
+  drive counts as the longer of what the same missed runs, and the same stretch of road, would be at the left."""
+  monkeypatch.setattr(sys.modules[__name__], 'EGO_V', ego_v)
+  cars = stream(60, far_from=0., speed=speed)
+  c = cars[30]
+  t_after = drop_runs(c, 115., missed)
+  msgs, truth = drive(cars, far=False, end=cars[-1].t0 + 25.)
+  s = {s.track_id: s for s in run(msgs).samples}[31]
+  if bridged:
+    assert s.road_m == pytest.approx(truth[30]['road'], abs=0.01)
+  else:
+    assert s.road_why == 'unboxed' and s.road_m == pytest.approx(near_of(box_at(x_at(c, t_after), c.y)), abs=0.01)
 
 
 def test_allow_misses_takes_the_wilks_order_statistic_and_lists_what_fell_short():
