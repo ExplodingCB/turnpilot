@@ -346,13 +346,15 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
       shadow @1;
       trial @2;
       auto @3;
+      vision @4;     # the go from the live camera alone: no survey, stamp, camera fields or launch stamp (tp/vision-go)
     }
     struct Lane {
       role @0 :Text;       # left, right, opposite (where its traffic comes from)
       index @1 :UInt8;     # 1 nearest
       approach @2 :UInt8;  # its approach's index in the control's junctionInfo.approaches
-      rSeen @3 :Float32;   # m seen down it from our conflict point, less v_c T_LAT (at the go position once going)
-      rReq @4 :Float32;    # m it needs (all-way or two-way)
+      rSeen @3 :Float32;   # m seen down it from our conflict point, less v_c T_LAT (at the go position once going); under
+                           # vision the walk's reach itself
+      rReq @4 :Float32;    # m it needs (all-way or two-way); under vision the vision floor (stop_rules.reach_needed_vision)
       binding @5 :Text;    # what ended its reach walk (stop_rules.reach_walk_why), or why it isn't walked
       shielded @6 :Bool;   # a vehicle stopped at its line satisfies it (section 2.3)
     }
@@ -371,7 +373,8 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     creptM @12 :Float32;      # m the car moved on from where it latched (a roll-up)
     sideViewsLive @13 :Bool;  # the side views run (turnpilotDetections.sideViewStatus running or noRoom, fresh)
     mapsValid @14 :Bool;      # the side views' maps match the calibration (sideViewStatus not mapsStale)
-    mode @15 :Mode;           # TurnPilotStopSignGo as acted on: auto without its data acts as shadow (H4, H8)
+    mode @15 :Mode;           # TurnPilotStopSignGo as acted on: auto without its data acts as shadow (H4, H8); vision's gate
+                              # failing is H9 (stopGo.fault), its mode still vision
     clearS @16 :Float32;      # s the go conditions have held
     goT @17 :Float32;         # s since the decider's go, 0 with none
     takeoverS @18 :Float32;   # s from the go to the model's takeover (go_override.model_takes_over held TAKEOVER_S), -1 not yet
