@@ -107,8 +107,9 @@ def test_run_6_her_track_ends_in_front_of_the_standing_car_and_nothing_goes(alwa
 @pytest.mark.parametrize('always_drive', [True, False])
 def test_seen_again_and_walking_out_of_the_corridor_the_release_goes_2_s_after(always_drive):
   """She comes back into view (a new track, standing where she was), then walks out of the car's path to the kerb, seen on
-  every run: the latch lets go 2 s after she is clear of the corridor by its margin with nothing person-like in it, and then
-  the release is today's (the switch on: turnRelease at the green; off: the model's own go)."""
+  every run: once she is seen leaving (PERSON_FRONT_LEAVING_HITS new hits in a row clear of the corridor by its margin, 0.4 s
+  from the first) the latch lets go 2 s after with nothing person-like in it, and then the release is today's (the switch on:
+  turnRelease at the green; off: the model's own go)."""
   sim, w = run6(always_drive)
   lose_her(sim, w)
   for _ in range(round(1. / DT_MDL)):  # nothing seen
@@ -118,16 +119,19 @@ def test_seen_again_and_walking_out_of_the_corridor_the_release_goes_2_s_after(a
   y = LAST_HIT[1]
   for _ in range(round(1. / DT_MDL)):  # seen again where she was
     plans.append(sim.step(back.seen(LAST_HIT[0], y), engaged=True))
-  clear_k = None
+  clear_k = left_k = None
   for _ in range(round(6. / DT_MDL)):  # walks to the kerb at 1.2 m/s and stands there, seen
     y = max(y - 1.2 * DT_MDL, -3.5)
     plans.append(sim.step(back.seen(LAST_HIT[0], y, vy=-1.2 if y > -3.5 else 0.), engaged=True))
     if clear_k is None and y <= -2.5 - 1e-9:
       clear_k = len(plans) - 1
-  assert clear_k is not None
+    if left_k is None and (sim.tp.scene.person_front is None or sim.tp.scene.person_front.left):
+      left_k = len(plans) - 1
+  assert clear_k is not None and left_k is not None
+  assert (left_k - clear_k) * DT_MDL == pytest.approx(0.4, abs=0.06), (left_k - clear_k) * DT_MDL
   first_free = next(k for k, p in enumerate(plans) if not p.shouldStop)
   assert all(p.shouldStop for p in plans[:first_free])
-  assert (first_free - clear_k) * DT_MDL == pytest.approx(2., abs=0.11), (first_free - clear_k) * DT_MDL
+  assert (first_free - left_k) * DT_MDL == pytest.approx(2., abs=0.11), (first_free - left_k) * DT_MDL
   assert all(p.reason == NOTE for p in plans[:first_free])
   after = plans[first_free:]
   if always_drive:
@@ -311,6 +315,79 @@ def test_a_raw_person_box_in_front_keeps_it_set(box, held):
   sim.raw = raw
   plans = seen_back_walking_out(sim)
   assert all(p.shouldStop for p in plans) is held, [p.shouldStop for p in plans][-40:]
+
+
+def moved_since(sim, k0):
+  return sim.trace[-1][0] - sim.trace[k0][0]
+
+
+@pytest.mark.parametrize('always_drive', [True, False])
+@pytest.mark.parametrize('cross_x', [4., 6., 7.5])
+def test_a_second_person_crossing_in_front_and_gone_never_clears_it_for_her(cross_x, always_drive):
+  """B1 (skeptic round 1, second_person): run 6, she lost and still standing unseen below the bonnet line; 1 s on, a second
+  walker (a new track, first seen at the left kerb 4 m left) crosses cross_x ahead to the right kerb, seen on every run, and
+  is gone. Someone else, never her seen leaving: nothing of TurnPilot's goes and the car stays held, the switch on or off. At
+  ed9e31d it let go 2 s after he was clear, and the car passed her spot at 6.4 m/s."""
+  sim, w = run6(always_drive)
+  lose_her(sim, w)
+  for _ in range(round(1. / DT_MDL)):
+    sim.step(engaged=True)
+  k0 = len(sim.trace) - 1
+  other, y, plans = Walker(track_id=10, age=2), 4., []
+  while y > -4.:
+    y -= 1.2 * DT_MDL
+    plans.append(sim.step(other.seen(cross_x, y, vy=-1.2), engaged=True))
+  plans += [sim.step(engaged=True) for _ in range(round(10. / DT_MDL))]
+  assert not certified(plans), certified(plans)
+  assert all(p.shouldStop and p.reason == NOTE for p in plans)
+  assert moved_since(sim, k0) < 0.05 and sim.tp.scene.person_front is not None
+
+
+@pytest.mark.parametrize('always_drive', [True, False])
+def test_one_outlier_hit_clear_of_the_corridor_is_not_her_seen_leaving(always_drive):
+  """B1's one-hit form (skeptic round 1, flicker_with_one_outlier_hit): after run 6's loss a short track where she was, one
+  of its hits 2.7 m right (an outlier), then short tracks where she was 2.5 s apart: held throughout, nothing goes."""
+  sim, w = run6(always_drive)
+  lose_her(sim, w)
+  k0 = len(sim.trace) - 1
+  b, plans = Walker(track_id=30, age=2), []
+  plans += [sim.step(b.seen(*LAST_HIT), engaged=True) for _ in range(2)]
+  plans += [sim.step(b.seen(LAST_HIT[0], -2.7), engaged=True) for _ in range(2)]
+  for tid in range(31, 35):
+    plans += [sim.step(engaged=True) for _ in range(round(2.5 / DT_MDL))]
+    f = Walker(track_id=tid, age=2)
+    plans += [sim.step(f.seen(*LAST_HIT), engaged=True) for _ in range(4)]
+  assert not certified(plans) and all(p.shouldStop for p in plans)
+  assert moved_since(sim, k0) < 0.05 and sim.tp.scene.person_front is not None
+
+
+def test_at_a_stop_sign_under_vision_a_second_person_crossing_never_lets_the_decider_go(tmp_path):
+  """B1 at a stop sign (skeptic round 1, vision_stop her_y=-1.4): under TurnPilotStopSignGo=vision, standing at the line, a
+  walker steps in front 3.31 m ahead and 1.4 m right (outside the decider's own front zone, FRONT_ZONE_HALF_W, inside the
+  latch's corridor), seen 2 s, coasts 3 s, and her track ends; a second walker crosses 6 m ahead from the left kerb and is
+  gone. The latch stays set, so the decider's front zone stays occupied: no stopSign go, the car never moves toward her. At
+  ed9e31d the latch cleared on him and the decider went, driving 17 m through her spot."""
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_stop import run_to_line
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_vision import vsim
+  sim = vsim(tmp_path, mph=25.)
+  run_to_line(sim)
+  her_s, her_y = sim.s + LAST_HIT[0], -1.4
+  w = Walker(age=6)
+  for _ in range(round(2. / DT_MDL)):
+    sim.step(w.seen(her_s - sim.s, her_y))
+  for _ in range(round(COAST_S / DT_MDL)):
+    sim.step(w.coasting(her_s - sim.s, her_y, 0., 0.))
+  k0 = len(sim.trace) - 1
+  plans = [sim.step() for _ in range(round(1. / DT_MDL))]
+  assert sim.tp.scene.person_front is not None
+  other, y = Walker(track_id=10, age=2), 4.
+  while y > -4.:
+    y -= 1.2 * DT_MDL
+    plans.append(sim.step(other.seen(6., y, vy=-1.2)))
+  plans += [sim.step() for _ in range(round(10. / DT_MDL))]
+  assert not certified(plans), certified(plans)
+  assert all(p.shouldStop for p in plans) and moved_since(sim, k0) < 0.05
+  assert sim.tp.scene.person_front is not None
 
 
 @pytest.mark.parametrize('always_drive', [True, False])

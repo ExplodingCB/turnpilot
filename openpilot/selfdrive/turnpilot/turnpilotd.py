@@ -142,9 +142,9 @@ with the car at 2 m/s or slower): the scene's stop holds the car standing, or br
 "Person may be in front" is the status line from that frame. Every go of TurnPilot's is barred on it (go_blocked: 'personFront',
 so S2's releases and relifts, the unstick and clearBox lifts and the stop-sign decider's certified go; the decider's own go
 through its front zone, the left's through its scene_clear). It ends on the driver (openpilot disengaged, or the gas) or once
-she is seen again and seen walking clear of the corridor, then nothing person-like in front 2 s; PERSON_FRONT_MAX_S on it is
-handed back loudly (personFrontTakeControl, PERSON_FRONT_REASON) with the car still held. TurnPilotAlwaysDrive changes none of
-it.
+she is seen again where she was lost and seen walking clear of the corridor (someone else crossing in front is not her), then
+nothing person-like in front 2 s; PERSON_FRONT_MAX_S on it is handed back loudly (personFrontTakeControl, PERSON_FRONT_REASON)
+with the car still held. TurnPilotAlwaysDrive changes none of it.
 A lane change a map stop leaves no room for, before it or after its go, with the map's lane list placing the car in a lane
 the maneuver doesn't leave from (lane_planner.py: unreachable), skips the maneuver as too fast to turn does: said
 (turnpilotTooFastToTurn, "Can't Reach Turn Lane" by laneChangeWait unreachable) and rerouted, unless its desire went out.
