@@ -10,7 +10,8 @@ from openpilot.selfdrive.turnpilot.tests.synthetic import scene
 from openpilot.selfdrive.turnpilot.unprotected_left import (BLOCKED_UNDECIDED_S, CLEAR_WINDOW_S, CREEP_MAX_M, CREEP_SHORT_M, CREEP_STALL_S, HELD_MIN_M,
                                                            LIGHT_RED_MAX_S, LIGHT_UNKNOWN_S, PET_S, RAW_CONF,
                                                            ROAD_FRESH_S, SPEED_MARGIN, STALE_UNDECIDED_S, LeftInput, RawBox, RawFrame,
-                                                           UnprotectedLeft, band_blockers, r_req, t_clear, t_req)
+                                                           UnprotectedLeft, WIDTH_FLOOR_M, band_blockers, nearest_range, r_req, t_clear,
+                                                           t_req)
 
 HOLD_D = 9.     # m from the hold line (map_controls: HOLD_LINE_M + MAP_MARGIN_M) to the maneuver point
 V_25 = 11.18    # m/s, 25 mph
@@ -86,6 +87,27 @@ def test_band_counts_raw_boxes_ranged_or_not_never_tracks():
   x, y = 80. * math.cos(a) + 3.6 * math.sin(a), -80. * math.sin(a) + 3.6 * math.cos(a)
   assert band_blockers([raw(x, y)], 30., LEFT, r, HOLD_D)
   assert not band_blockers([raw(x, y)], 0., LEFT, r, HOLD_D)
+
+
+def test_band_reach_floored_by_box_width():
+  r = 140.
+  # a car truly 120 m up the oncoming lane whose box bottom reads 250 m (the road climbing, the car pitched): its 1.8 m wide
+  # box floors its nearest range to 1.5 m's, 100 m, inside reach, so it blocks
+  car = raw(120., 3.6)
+  far_read = dataclasses.replace(car, xy=(250., 7.5), near_m=240.)
+  assert car.near_m <= r and far_read.near_m > r
+  assert band_blockers([far_read], 0., LEFT, r, HOLD_D)
+  assert abs(nearest_range(far_read) - 1.5 / 1.8 * math.hypot(120., 3.6)) < 0.5
+  # the floor never lifts a box's range: one nearer by near_m keeps it
+  assert nearest_range(dataclasses.replace(car, near_m=50.)) == 50.
+  # a car wide enough to be 1.5 m only past reach doesn't block
+  assert not band_blockers([raw(200., 3.6)], 0., LEFT, r, HOLD_D)
+  # a motorcycle's box is narrow: its floor is its own class's (0.6 m), so it blocks no further out than a car's would
+  moto = raw(120., 3.6, cls='motorcycle', width=0.8)
+  assert band_blockers([dataclasses.replace(moto, xy=(250., 7.5), near_m=240.)], 0., LEFT, r, HOLD_D)
+  assert not band_blockers([dataclasses.replace(raw(400., 3.6, cls='motorcycle', width=0.8), near_m=390.)], 0., LEFT, r, HOLD_D)
+  # an unranged box is as before: on the turn side it blocks on its bearing
+  assert band_blockers([raw(300., 4., ranged=False)], 0., LEFT, r, HOLD_D)
 
 
 class Junction:
@@ -190,8 +212,10 @@ def test_a_gap_stream_goes_on_a_long_gap_and_waits_through_short_ones():
     assert went is not None, headway  # after the last car
     after_last = went - (arrive[-1] - HOLD_D / V_25)
     assert after_last > 0., headway   # never between two of them
-  # a gap of the rule's own need goes between two cars, leaving the next one at least T_req + PET out
-  need = (r_req(V_25, t_req(HOLD_D, 1), HOLD_D) - HOLD_D) / V_25 + CLEAR_WINDOW_S + 1.
+  # a gap of the rule's own need goes between two cars, leaving the next one at least T_req + PET out. A 1.8 m car's box
+  # reads its width floor (WIDTH_FLOOR_M, a 1.5 m car) at 1.5/1.8 of its range, so it blocks from 1.8/1.5 x R_req out
+  reach = r_req(V_25, t_req(HOLD_D, 1), HOLD_D) * 1.8 / WIDTH_FLOOR_M['car']
+  need = (reach - HOLD_D) / V_25 + CLEAR_WINDOW_S + 1.
   went, arrive, conflict = stream(need, n=2)
   assert arrive[0] < went < arrive[1]
   assert conflict[1] - went >= SPEED_MARGIN * t_req(HOLD_D, 1) - 0.1  # the next car, at the limit, at the conflict point

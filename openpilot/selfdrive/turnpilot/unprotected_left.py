@@ -120,6 +120,14 @@ ROAD_RANGE_M = 0.
 PROVISIONAL_RANGE_M = 150.
 
 RAW_CONF = 0.35            # a raw box at the decoder's floor confidence counts (CRITIQUE REQUIRED 2)
+# a box's width floors its nearest plausible range (nearest_range): the narrowest vehicle of its class, m across. On comma's
+# public demo route (a comma four on a Ford whose radar gave the true range), near_m alone (NEAR_PX, 3 px, about 0.15 deg)
+# read past the true range on 27-39% of the full pass's runs on oncoming cars at 20-120 m, since the car's pitch and the
+# road's grade move a far box's bottom by up to about 20 px; floored by a 1.5 m car's width, on 0-6.5% (none past 60 m).
+# YOLO's car boxes ran 1.2-1.4 times a 1.8 m car's width there, so the floor reads 0.3-0.65 of the true range: more waiting
+# for far traffic, never a car inside R_req read outside it by its box bottom alone
+WIDTH_FLOOR_M = {'car': 1.5, 'truck': 1.5, 'bus': 1.5, 'motorcycle': 0.6, 'cyclist': 0.4}
+WIDTH_FLOOR_DEFAULT_M = 0.4
 BAND_TOL_DEG = 2.          # the band's near edge widens with range by this (heading error, the road's curve)
 CLEAR_WINDOW_S = 2.5       # the band clear on road runs this long (CRITIQUE REQUIRED 2: 2-3 s, 3x the longest dropout)
 ROAD_FRESH_S = 0.3         # road runs further apart than this start the window over
@@ -308,9 +316,20 @@ def turn_bearing(bearing_deg: float, heading_deg: float, side: int) -> float:
   return bearing_deg * side + heading_deg
 
 
+def nearest_range(b) -> float:
+  """A ranged vehicle box's nearest plausible range for the reach test: its near_m (the box bottom NEAR_PX lower on flat
+  ground), or the range at which its angular width (span_deg) is the narrowest vehicle of its class (WIDTH_FLOOR_M),
+  whichever is nearer. It is only ever nearer than near_m, so it only adds blockers."""
+  lo, hi = sorted(b.span_deg)
+  ang = math.radians(hi - lo)
+  if ang <= 1e-6:
+    return b.near_m
+  return min(b.near_m, WIDTH_FLOOR_M.get(b.cls, WIDTH_FLOOR_DEFAULT_M) / (2. * math.tan(ang / 2.)))
+
+
 def band_blockers(boxes, heading_deg: float, side: int, reach_m: float, distance: float, exempt=()) -> list:
-  """The road camera's raw vehicle boxes at RAW_CONF or more in the oncoming band within reach_m (module docstring).
-  exempt: boxes that are an occluder's (not traffic)."""
+  """The road camera's raw vehicle boxes at RAW_CONF or more in the oncoming band within reach_m (module docstring), by
+  their nearest plausible range (nearest_range). exempt: boxes that are an occluder's (not traffic)."""
   out = []
   for b in boxes:
     if b.camera != 'road' or b.cls not in VEHICLES or b.conf < RAW_CONF or b in exempt:
@@ -324,7 +343,7 @@ def band_blockers(boxes, heading_deg: float, side: int, reach_m: float, distance
     rng = math.hypot(*b.xy)
     lat_far, lat_near = rng * math.sin(math.radians(edges[1])), rng * math.sin(math.radians(edges[0]))
     x = rng * math.cos(math.radians(turn_bearing(b.bearing_deg, heading_deg, side)))
-    if b.near_m <= reach_m and x > distance - ONCOMING_PAST_M and lat_far > ONCOMING_Y_NEAR_M - rng * math.tan(tol) and \
+    if nearest_range(b) <= reach_m and x > distance - ONCOMING_PAST_M and lat_far > ONCOMING_Y_NEAR_M - rng * math.tan(tol) and \
        lat_near < ONCOMING_Y_FAR_M + rng * math.tan(tol):
       out.append(b)
   return out
