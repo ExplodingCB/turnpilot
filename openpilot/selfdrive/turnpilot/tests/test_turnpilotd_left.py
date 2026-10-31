@@ -1574,6 +1574,34 @@ def test_after_a_go_withdrawn_in_its_launch_a_left_let_go_as_the_drivers_is_neve
   assert not any(p.desire == Desire.turnLeft for p in standing)
 
 
+@pytest.mark.parametrize("lat_active", [False, True])
+@pytest.mark.parametrize("deg", [10., 13.])
+def test_a_left_let_go_as_the_drivers_short_of_turn_started_deg_has_its_pulse_cleared(deg, lat_active):
+  """The other side of TURN_STARTED_DEG (tp/left-hold's recheck, round 1, follow-up 1): the driver turns into the left from
+  the left's own hold (under the gas, disengaged) and it is let go as theirs 10 to 13 deg round, under TURN_STARTED_DEG.
+  The withdrawn go's turnLeft comes out of the model's queue on the let-go frame (CLEAR_DESIRE) and never goes out again,
+  re-engaged too: the left is the driver's, never an uncertified one on the go's pulse. A clear only under 5 deg passed
+  every other test."""
+  from openpilot.selfdrive.turnpilot.desire_timing import TURN_STARTED_DEG
+  sim = withdrawn_go()
+  sim.accel = lambda sim, plan: 0.6 if sim.v < 1.5 else 0.
+  radius = 2.03 / math.radians(deg)  # the reach lets the hold go about 2 m on: deg turned by then
+  let_go = None
+  for _ in range(int(10. / DT_MDL)):
+    p = sim.step(engaged=False, gas=True, yaw_rate=sim.v / radius, lat_active=lat_active)
+    if not sim.tp.left.hold_here:
+      let_go = p
+      break
+  assert let_go is not None and str(let_go.unprotectedLeft.why) == 'driven'
+  turned = sim.tp.desires.turned_deg
+  assert 7. < turned < TURN_STARTED_DEG, turned
+  assert let_go.desire == CLEAR_DESIRE
+  plans = [sim.step(engaged=False, gas=True, lat_active=lat_active) for _ in range(int(0.5 / DT_MDL))]
+  sim.accel = None
+  plans += [sim.step(engaged=True) for _ in range(int(8. / DT_MDL))]
+  assert not any(p.desire == Desire.turnLeft for p in plans)
+
+
 def test_a_left_the_driver_has_turned_into_when_it_is_let_go_keeps_its_desire_to_finish():
   """turnpilotd.clear_driven_left takes a withdrawn go's pulse out of the model's queue only under TURN_STARTED_DEG into the
   left: the driver turning the left themselves from the left's own hold (under the gas, disengaged, a 6 m radius), let go
