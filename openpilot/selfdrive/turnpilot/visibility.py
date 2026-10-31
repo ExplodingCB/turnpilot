@@ -15,6 +15,9 @@ turnpilotd's clock, so a detector that stops leaves nothing fresh). lanes() then
   an approach, that side's side-view sectors (lowSun); night and dusk have no table, so nothing.
 - The footprint mask from visibility.json (stop_rules.footprint_ok, a car-sized footprint, not a ground point); a file
   without a mask (before step S1) sees nothing (noMask): a missing mask never leaves the pillar and housing at full reach.
+  Under TurnPilotStopSignGo=vision (lanes(vision=True)) the walk runs without it, on the optimistic row, with no survey,
+  stamp or rule 5: the side views' sector quality stands in for the mask, and a pillar or housing that cuts the footprint
+  above or below the horizon band is the residual vision accepts (STOP_SIGNS.md 7.2 residual 4).
 - Occluders from every track, moving or not, and from every raw box held steady (STEADY_S with STEADY_SAMPLES runs of its
   view, bearing within STEADY_BEARING_DEG, width within STEADY_WIDTH): its bearing span caps each lane where it meets the
   lane at sLaneMin (a stopped car caps its own lane at itself and every lane behind it). A track's or box's ground range is
@@ -195,7 +198,7 @@ class LiveVisibility:
 
   def lanes(self, lanes_at_stop: list, d_stop: float, vis, *, rot_deg: float, edges: sr.Edges, lighting: str = 'day',
             low_sun_sides=(), entry: dict | None = None, stamp: dict | None = None, tracks=(), evidence: dict | None = None,
-            cam_height: float | None = None, a_launch: float = sr.A_LAUNCH_PLAN, ahead_m: float = 0.) -> Report:
+            cam_height: float | None = None, a_launch: float = sr.A_LAUNCH_PLAN, ahead_m: float = 0., vision: bool = False) -> Report:
     """Each lane's reach now (module docstring). lanes_at_stop: the held control's conflicting lanes seen from its stop
     point (stop_evidence.junction_lanes); d_stop: m our car stands short of the stop point; vis: visibility_table's
     Visibility; lighting: day, sunAhead, dusk or night at the line; low_sun_sides: the sides with low sun along an approach;
@@ -203,14 +206,18 @@ class LiveVisibility:
     tracks: the tracker's tracks; evidence: stop_evidence's; edges: the edge band from the stop point (stop_rules.edge_band;
     a non-stopping lane's two-way need reads its far end). ahead_m: predict the walk from that much further on (the
     stop-sign decider's creep for a view, STOP_SIGNS.md 2.5): d_stop already the nearer point's, and every occluder with a
-    ground position re-seen from there (occluders()); the views, sectors and sun as they are now."""
+    ground position re-seen from there (occluders()); the views, sectors and sun as they are now. vision
+    (TurnPilotStopSignGo=vision): the PV1 optimistic row, and no mask, survey, stamp or rule 5 needed: the walk runs with the
+    file's mask where it has one (none on the shipped file: the side views' sector quality is the live stand-in, a dark or
+    static bearing zeroed), its frame edge (DEFAULT_EDGE_DEG without a lens fit) and every live rule (the sun, low sun, the
+    sectors, freshness, occluders); need_m stays the two-way need, which blockers() reads."""
     height = cam_height if cam_height is not None else (vis.height if vis.height is not None else 1.3)
     lns = [replace(ln, s_min=ln.s_min + d_stop, s_max=ln.s_max + d_stop) for ln in lanes_at_stop]
     edges_now = sr.Edges(edges.d_min + d_stop, edges.d_max + d_stop, None if edges.nominal is None else edges.nominal + d_stop)
     occ = self.occluders(tracks, ahead_m)
     fresh = {k: self.fresh_key(k) for k in ('road', 'full', 'sideLeft', 'sideRight')}
     veil_ok = vis.veil in sr.VEIL_OK
-    rows = vis.views(lighting, use='allWay') if lighting in ('day', 'sunAhead') else {}
+    rows = vis.views(lighting, bound='optimistic' if vision else 'conservative', use='allWay') if lighting in ('day', 'sunAhead') else {}
 
     def zero(side: str, bearing: float):
       if lighting == 'sunAhead' and not veil_ok and sr.sun_ahead_zero(side, bearing):
@@ -227,7 +234,9 @@ class LiveVisibility:
     out = []
     for ln in lns:
       need = lane_need(ln, edges_now, a_launch)
-      if not vis.mask or vis.height is None:
+      if vision:
+        reach, why = sr.reach_walk_why(ln, sight, rot_deg) if self.available else (0., 'noView')
+      elif not vis.mask or vis.height is None:
         reach, why = 0., 'noMask'
       elif not self.available:
         reach, why = 0., 'noView'
