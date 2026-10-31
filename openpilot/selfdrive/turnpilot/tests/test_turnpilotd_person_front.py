@@ -9,9 +9,10 @@ her at 3.5 m/s 0.93 m off her centre: on a road, the right front corner and the 
 
 Here the same timeline on the point-mass Sim: the car brakes for her, stands, she stands 3.31 m ahead and 1.14 m right with
 hits for 2 s, her track coasts 3 s with no hits and ends. Nothing of TurnPilot's goes and the car stays held, whatever the
-switch says; she is said to be maybe in front on the status line from that frame; seen again and seen walking out of the
-corridor, the release goes 2 s after she is clear; the driver's gas is the driver's go; 30 s on it hands back loudly with the car
-held. A person who walks clear of the path while tracked releases as today."""
+switch says; she is said to be maybe in front on the status line from that frame; seen again where she was and seen leaving the
+corridor (five new hits in a row clear of it), the release goes 2 s after; someone else crossing in front and gone, or one
+outlier hit, is not her leaving; the driver's gas is the driver's go; 30 s on it hands back loudly with the car held. A person
+who walks clear of the path while tracked releases as today, and a blip seen while something else held the car sets nothing."""
 import pytest
 
 from openpilot.common.realtime import DT_MDL
