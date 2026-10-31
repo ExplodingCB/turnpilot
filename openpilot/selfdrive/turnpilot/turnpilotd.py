@@ -190,7 +190,7 @@ from openpilot.common.time_helpers import system_time_valid
 from openpilot.selfdrive.turnpilot.scene_policy import (CROSSWALK_X_AFTER_M, CROSSWALK_X_BEFORE_M, CROSSWALK_Y_FAR_M, CROSSWALK_Y_NEAR_M,
                                                          CURB_PED_CAP_DEFAULT, CURB_PED_EDGE_M, CURB_PED_X_M, HOLD_LINE_M, NO_ACCEL_CAP,
                                                          ONCOMING_ENTRY_M, PATH_HALF_WIDTH_M, STOP_DECEL, VEHICLES, ScenePolicy, far_side_turn,
-                                                         in_path)
+                                                         in_path, velocity_trusted)
 from openpilot.selfdrive.turnpilot.turn_skip import SkipState, TurnSkip, can_make_turn
 from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
 from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, DRIVEN, LINE_D, OFF, ROAD_RANGE_M,
@@ -333,6 +333,11 @@ LEAD_CORROBORATE_M = 3.
 LEAD_BEARING_TOL_DEG = 3.
 LEAD_SEEN_HOLD_S = 1.
 LEAD_STAND_MAX_S = 20.
+# TurnPilotAlwaysDrive (ALWAYS_DRIVE.md ST-09 (stalls)): a queue is the model's, so in a turn such a lead keeps the stand with no
+# bound while a vehicle track at it, its velocity trusted, has moved (QUEUE_MOVING_SPEED or faster) within QUEUE_STILL_MAX_S; one
+# that stood still that long (something parked in the turn's path), or nothing moving at it, hands back at QUEUE_STILL_MAX_S
+QUEUE_STILL_MAX_S = 60.
+QUEUE_MOVING_SPEED = 1.  # m/s: unprotected_left.STAND_SPEED, slower than which a velocity-trusted track stands
 # not at STANDSTILL_SPEED this long after TurnPilot's go, nothing else holding the car: the model is holding it (DESIGN phase 4
 # section 2-3; G0, 2026-10-28: 14 of 24 tapless goes stood 20 s). Withdrawn and handed back; an unprotected turn's sooner
 NO_MOVE_S = 2.
@@ -669,6 +674,7 @@ class TurnPilot:
     self.lead_seen_s = float('inf')  # since the live scene last corroborated modelV2's close lead (watch_lead)
     self.lead_why = ''             # ...what did
     self.lead_held = False         # this frame: a close lead the scene corroborates, within LEAD_SEEN_HOLD_S (watch_lead)
+    self.lead_still_s = 0.         # ...s since a vehicle track at it was last seen moving (QUEUE_MOVING_SPEED), while close
     self.missed_t = 0.             # turnMissed is held while this counts down
     self.notices = RouteNotices()  # the route's stop signs said at its start and 300 m before each it couldn't avoid (3.4)
     if not keep_turn:
@@ -2185,9 +2191,13 @@ class TurnPilot:
       not self.go_withdrawn and not self.release_stand and \
       not decision.holding and not cs.gasPressed and not cs.brakePressed and not map_handback(mapd)
     self.stall_stand_s = self.stall_stand_s + DT_MDL if standing else 0.
-    lead_keeps = self.lead_held and self.stall_stand_s < LEAD_STAND_MAX_S - 1e-6
+    # a lead the scene corroborates keeps the stand LEAD_STAND_MAX_S; under the switch while its queue has moved within
+    # QUEUE_STILL_MAX_S (ALWAYS_DRIVE.md ST-09 (stalls))
+    lead_bound = (self.lead_still_s >= QUEUE_STILL_MAX_S - 1e-6) if self.always_drive_on else self.stall_stand_s >= LEAD_STAND_MAX_S - 1e-6
+    lead_keeps = self.lead_held and not lead_bound
     self.stall_s = self.stall_s + DT_MDL if standing and not lead_keeps else 0.
-    now = standing and (self.stall_s > STALL_PROMPT_S or self.stall_stand_s >= LEAD_STAND_MAX_S - 1e-6)
+    now = standing and (self.stall_s > STALL_PROMPT_S or (self.lead_held and lead_bound) or
+                        (not self.always_drive_on and self.stall_stand_s >= LEAD_STAND_MAX_S - 1e-6))
     if self.always_drive_on:
       now = self.finish_turn(now, standing and not lead_keeps, sm, cs, v_ego, decision, objects, raw, available, took_over,
                              right_hand_traffic)
@@ -2362,6 +2372,13 @@ class TurnPilot:
     else:
       self.lead_seen_s, self.lead_why = float('inf'), ''
     self.lead_held = close and self.lead_seen_s <= LEAD_SEEN_HOLD_S + 1e-6
+    if close:  # a queue moving on ahead (ST-09 (stalls)): a velocity-trusted vehicle track at the lead, moving
+      x = float(model.leadsV3[0].x[0])
+      moving = any(str(o.cls) in VEHICLES and abs(o.x - x) <= LEAD_CORROBORATE_M and in_path(o) and velocity_trusted(o) and
+                   math.hypot(o.vx, o.vy) >= QUEUE_MOVING_SPEED for o in objects)
+      self.lead_still_s = 0. if moving else self.lead_still_s + DT_MDL
+    else:
+      self.lead_still_s = 0.
 
   def lead_log(self, model) -> dict:
     """modelV2's lead and its corroboration, for a stand handback's log line."""

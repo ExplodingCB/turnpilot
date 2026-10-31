@@ -10,6 +10,7 @@ from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.turnpilot.go_override import GO_CLEAR_M, GO_END_SPEED, TAKEOVER_S
+from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.scene.tracker import RawFrame
 from openpilot.selfdrive.turnpilot.scene_policy import NO_ACCEL_CAP, SceneDecision
 from openpilot.selfdrive.turnpilot.stop_go import Frame
@@ -18,9 +19,9 @@ from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of, model_v2
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, RIGHT_AT_A_CORNER, T_LEFT, Sim, go_from_a_red,
                                                                  model_stands_in_the_turn, oracle_lights, stand, stop_at, walker_stops_the_car)
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_go import attach_planner, holding, raw_person
-from openpilot.selfdrive.turnpilot.turnpilotd import (NO_MOVE_MAX_S, NO_MOVE_REASON, NO_MOVE_S, RELEASE_GOES, RELEASE_LIFT_M, STALL_LIFT_GAP_S,
-                                                       STALL_LIFT_REASON, STALL_LIFTS, STALL_PROMPT_S, STALL_REPULSE_S, STALLED_REASON,
-                                                       STANDSTILL_SPEED, STOPPED_NOTE, TurnPilot)
+from openpilot.selfdrive.turnpilot.turnpilotd import (LEAD_STAND_MAX_S, NO_MOVE_MAX_S, QUEUE_STILL_MAX_S, NO_MOVE_REASON, NO_MOVE_S, RELEASE_GOES,
+                                                      RELEASE_LIFT_M, STALL_LIFT_GAP_S, STALL_LIFT_REASON, STALL_LIFTS, STALL_PROMPT_S,
+                                                      STALL_REPULSE_S, STALLED_REASON, STANDSTILL_SPEED, STOPPED_NOTE, TurnPilot)
 
 Desire = log.Desire
 
@@ -456,3 +457,34 @@ def test_a_stall_with_a_model_lead_or_in_a_far_side_turn_is_never_lifted():
   plans = stand(sim, STALL_PROMPT_S + 2.)
   assert not lifts_of(plans) and not edges_of(plans, Desire.turnLeft)
   assert any(q.controlPrompt == 'stalledTakeControl' for q in plans)
+
+
+# --- ST-09 (stalls): a queue in a turn ---
+
+def queued(sim, seconds, moves_every=None):
+  """The model stands the car in its turn behind a lead 6 m ahead that a vehicle track in the path corroborates (its velocity
+  trusted). moves_every: the car ahead creeps on at 1.5 m/s for 1 s this often (a queue); None: it stands still."""
+  plans, t0 = [], sim.t
+  for _ in range(round(seconds / DT_MDL)):
+    k = sim.t - t0
+    vx = 1.5 if moves_every is not None and k % moves_every < 1. else 0.
+    car = ({'cls': 'car', 'x': 6., 'y': 0.2, 'vx': vx, 'vy': 0., 'inPath': True, 'age': 40},)
+    plans += stand(sim, DT_MDL, lead_prob=0.95, lead_x=6., objects=car)
+  return plans
+
+
+def test_a_queue_in_a_turn_behind_a_moving_lead_has_no_bound_and_a_still_one_hands_back_at_60_s():
+  """ALWAYS_DRIVE.md ST-09 (stalls): under the switch a lead the live scene corroborates whose vehicle track moved within the
+  last QUEUE_STILL_MAX_S keeps a stand in a turn with no bound (queueing is the model's); one still that long hands back
+  ('Stalled in the turn'). Switch off: LEAD_STAND_MAX_S, as today."""
+  sim = stalled_right(True, 30.)
+  plans = queued(sim, 120., moves_every=20.)
+  assert not any(q.controlPrompt in TAKE_CONTROL_PROMPTS for q in plans)
+  sim = stalled_right(True, 30.)
+  plans = queued(sim, QUEUE_STILL_MAX_S + 2.)
+  first = next(i for i, q in enumerate(plans) if q.controlPrompt == 'stalledTakeControl')
+  assert abs(first * DT_MDL - QUEUE_STILL_MAX_S) < 0.2, first * DT_MDL
+  sim = stalled_right(False, 30.)
+  plans = queued(sim, LEAD_STAND_MAX_S + 2., moves_every=5.)
+  first = next(i for i, q in enumerate(plans) if q.controlPrompt == 'stalledTakeControl')
+  assert abs(first * DT_MDL - LEAD_STAND_MAX_S) < 0.2
