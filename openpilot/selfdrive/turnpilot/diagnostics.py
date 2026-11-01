@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 
 from openpilot.common.basedir import BASEDIR
 from openpilot.selfdrive.turnpilot.maps.paths import wall_time
@@ -24,6 +25,10 @@ EVENTS_PARAM = "TurnPilotDiagEvents"
 EVENTS_KEPT = 10       # the last events the report lists, newest first
 REPEAT_S = 60.         # the same event again within this is counted on the last one, not listed again
 WHY_MAX = 200          # characters of an event's text
+BIG_WHY_MAX = 600      # a big model failure's: its exception, its timings and its traceback's last frames
+BIG_WHAT = "big model"  # the prefix of modeld's big model events (note_big_model)
+BIG_TB_FRAMES = 3      # the traceback's last frames a big model failure keeps
+CHESTNUT_PARAMS = ("ChestnutLoading", "ChestnutActive", "ChestnutRetry")
 PREFLIGHT_TIMEOUT_S = 60.
 PREFLIGHT_CACHE_S = 30.  # a second Copy or refresh within this reuses the last run
 DROPPED_CHECKS = ("pairing URL", "web token")  # they carry or concern the web token
@@ -102,9 +107,23 @@ class EventLog:
     if (found := log_event(record)) is not None:
       self.add(*found)
 
+  def merge_saved(self) -> None:
+    """Take in the events another process saved since (modeld's big model failures, note_big_model). Under self.lock."""
+    try:
+      saved = self.params.get(EVENTS_PARAM)
+    except Exception:
+      return
+    if not isinstance(saved, list):
+      return
+    mine = {(e.get("t"), e.get("what")) for e in self.events}
+    theirs = [e for e in saved if isinstance(e, dict) and (e.get("t"), e.get("what")) not in mine and str(e.get("what", "")).startswith(BIG_WHAT)]
+    if theirs:
+      self.events = sorted([*self.events, *theirs], key=lambda e: e.get("t", 0.))[-EVENTS_KEPT:]
+
   def add(self, what: str, why: str) -> None:
     why = scrub(why)[:WHY_MAX]  # never a position in the saved param
     with self.lock:
+      self.merge_saved()  # a write from modeld isn't lost to this one
       now, last = self.now(), self.events[-1] if self.events else None
       if last is not None and last.get("what") == what and last.get("why") == why and now - last.get("t", 0.) < REPEAT_S:
         last["n"], last["t"] = last.get("n", 1) + 1, now
@@ -118,7 +137,48 @@ class EventLog:
 
   def get(self) -> list[dict]:
     with self.lock:
+      self.merge_saved()
       return [dict(e) for e in self.events]
+
+
+def short_traceback(exc: BaseException, frames: int = BIG_TB_FRAMES) -> str:
+  """The exception's last frames as 'file:line in func', paths from the repo (or the bare file name outside it)."""
+  out = []
+  for fr in traceback.extract_tb(exc.__traceback__)[-frames:]:
+    path = fr.filename
+    if path.startswith(BASEDIR):
+      path = os.path.relpath(path, BASEDIR)
+    elif "site-packages/" in path:
+      path = path.split("site-packages/", 1)[1]
+    else:
+      path = os.path.basename(path)
+    out.append(f"{path}:{fr.lineno} in {fr.name}")
+  return " < ".join(reversed(out))
+
+
+def big_model_why(kind: str, exc: BaseException | None, took_s: float, retry: bool, waited_s: float | None, wait_error: str | None) -> str:
+  """kind: 'timed out', 'failed to load' or 'failed while running'. Durations at one decimal, never read as a position."""
+  head = f"{type(exc).__name__}: {str(exc).strip().splitlines()[0] if str(exc).strip() else ''}".rstrip(": ") if exc is not None else ""
+  how = f"timed out after {took_s:.1f} s" if kind == "timed out" else f"raised after {took_s:.1f} s"
+  wait = (f"chestnut enumerated in {waited_s:.1f} s" if waited_s is not None else
+          f"wait_for_chestnut raised {wait_error}" if wait_error else "wait_for_chestnut didn't return")
+  parts = [p for p in (head, how, "the ChestnutRetry try" if retry else "the first try", wait) if p]
+  tb = short_traceback(exc) if exc is not None and exc.__traceback__ is not None else ""
+  return "; ".join(parts) + (f"; at {tb}" if tb else "")
+
+
+def note_big_model(params, kind: str, exc: BaseException | None = None, took_s: float = 0., retry: bool = False,
+                   waited_s: float | None = None, wait_error: str | None = None, now=wall_time) -> None:
+  """modeld's record of a big model failure in TurnPilotDiagEvents, for the report's events and its driving model line.
+  Called only from modeld's except and timeout paths; never raises."""
+  try:
+    why = scrub(big_model_why(kind, exc, took_s, retry, waited_s, wait_error), secrets_of(params))[:BIG_WHY_MAX]
+    saved = params.get(EVENTS_PARAM)
+    events = [e for e in saved if isinstance(e, dict)] if isinstance(saved, list) else []
+    events = [*events, {"t": now(), "what": f"{BIG_WHAT} {kind}", "why": why}][-EVENTS_KEPT:]
+    params.put(EVENTS_PARAM, events, block=True)
+  except Exception:
+    pass
 
 
 class Preflight:
@@ -184,11 +244,45 @@ def settings_line(params, agnos: str | None) -> str:
   return f"build {build_text(params)}, AGNOS {agnos or 'unknown'}. The full report, with a copy button, is on the phone page."
 
 
-def model_text(live: dict | None) -> list[str]:
+def read_param(params, key):
+  try:
+    return params.get(key)
+  except Exception:
+    return None
+
+
+def chestnut_line(params) -> str:
+  words = {True: "1", False: "0", None: "unset"}
+  return "chestnut params: " + ", ".join(f"{k} {words.get(read_param(params, k), read_param(params, k))}" for k in CHESTNUT_PARAMS)
+
+
+def small_model_why(params, events: list[dict]) -> str:
+  """Why the small model drives: modeld's ChestnutActive (False: it had a chestnut and the big model isn't running) and
+  its newest big model event."""
+  if params is None:
+    return "(no chestnut)"
+  active = read_param(params, "ChestnutActive")
+  if active is not False:
+    if read_param(params, "ChestnutRetry") and read_param(params, "ChestnutLoading") is not True:
+      return "(the big model failed once, retrying after an onroad cycle; see events)"
+    return "(modeld saw no chestnut when it started)" if active is None else "(no chestnut)"
+  last = next((e for e in reversed(events or []) if str(e.get("what", "")).startswith(BIG_WHAT)), None)
+  if last is None:
+    return "(big model not running, no reason recorded)"
+  what, why = last["what"], str(last.get("why", ""))
+  if what.endswith("timed out"):
+    took = re.search(r"timed out after (\d+(?:\.\d)?) s", why)
+    return f"(big model timed out after {took.group(1) if took else '?'} s; see events)"
+  if what.endswith("failed while running"):
+    return "(big model failed while driving, fell back; see events)"
+  return "(big model failed to load; see events)"
+
+
+def model_text(live: dict | None, params=None, events: list[dict] | None = None) -> list[str]:
   """The driving model and the detector as they run now: live is the status reader's (status.read_live)."""
   if not live or live.get("model_big") is None:
     return ["driving model: not running (the car is off or modeld is down)"]
-  where = "the big model on the chestnut" if live["model_big"] else "the small model on the comma (no chestnut)"
+  where = "the big model on the chestnut" if live["model_big"] else f"the small model on the comma {small_model_why(params, events or [])}"
   out = [f"driving model: {where}"]
   if live.get("native") is not None:
     out.append(f"native detect: {NATIVE_WORDS.get(live['native'], live['native'])}; far crop: {live.get('far') or 'unknown'}")
@@ -215,7 +309,8 @@ def report(params, live: dict | None, events: list[dict], preflight_lines: list[
   lines = [f"TurnPilot diagnostics, {time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime(now))}",
            f"build: {build_text(params)}" + (f" ({params.get('Version')})" if params.get("Version") else ""),
            f"AGNOS: {agnos or 'unknown'}",
-           *model_text(live),
+           *model_text(live, params, events),
+           chestnut_line(params),
            "", "preflight:", *(f"  {ln}" for ln in preflight_lines if ln.strip()),
            "", "recent TurnPilot events (newest first):", *event_lines(events)]
   secrets = secrets_of(params)

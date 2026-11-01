@@ -50,6 +50,16 @@ MIN_LAT_CONTROL_SPEED = 0.3
 BIG_MODEL_TIMEOUT = 60
 
 
+def note_big_model(params, kind, exc, took_s, retry, waited_s, wait_error) -> None:
+  """TurnPilot diagnostics: one TurnPilotDiagEvents event for a big model failure, so the phone's report says why it is
+  the small model. Called on the failure paths only; never raises."""
+  try:
+    from openpilot.selfdrive.turnpilot.diagnostics import note_big_model as note
+    note(params, kind, exc, took_s, retry, waited_s, wait_error)
+  except Exception:
+    pass
+
+
 def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
                           lat_action_t: float, long_action_t: float, v_ego: float) -> log.ModelDataV2.Action:
   if 'action' not in model_output:
@@ -280,21 +290,36 @@ def main(demo=False):
   st = time.monotonic()
   cloudlog.warning("loading model")
   model = None
+  retry = False  # TurnPilot diagnostics: this load is the onroad cycle's retry
+  load: dict = {"waited_s": None, "wait_error": None}
   if CHESTNUT:
     big_model = None
+    retry = params.get_bool("ChestnutRetry")
     def load_big():
       nonlocal big_model
+      t0 = time.monotonic()
       try:
-        wait_for_chestnut()
+        try:
+          wait_for_chestnut()
+        except Exception as e:
+          load["wait_error"] = type(e).__name__
+          raise
+        load["waited_s"] = time.monotonic() - t0
         m = ModelState(vipc_client_main.width, vipc_client_main.height, True)
         m.warmup()
         big_model = m
-      except Exception:
+      except Exception as e:
         cloudlog.exception("big model load failed")
+        if not loader_timed_out.is_set():  # TurnPilot diagnostics: after the timeout, that event says it
+          note_big_model(params, "failed to load", e, time.monotonic() - t0, retry, load["waited_s"], load["wait_error"])
+    loader_timed_out = threading.Event()
     loader = threading.Thread(target=load_big, daemon=True)
     loader.start()
     loader.join(BIG_MODEL_TIMEOUT)
     model = big_model
+    if model is None and loader.is_alive():
+      loader_timed_out.set()
+      note_big_model(params, "timed out", None, BIG_MODEL_TIMEOUT, retry, load["waited_s"], load["wait_error"])
     if model is None and not params.get_bool("ChestnutRetry"):
       # a crank can cut the chestnut power during the load, retry once with an onroad cycle
       cloudlog.error("big model load failed, cycling onroad to retry")
@@ -308,6 +333,7 @@ def main(demo=False):
     model = small_model
   params.put_bool("ChestnutLoading", False)
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
+  loaded_at = time.monotonic()
 
   # TurnPilot: YOLO26 after modelV2, on the frames already uploaded. The host loads it now or once TurnPilotEnabled is set
   # mid-drive, for the small model too; with it unset or no pkl nothing runs, and None (an import failure) changes nothing
@@ -458,11 +484,12 @@ def main(demo=False):
       send_chestnut = (chestnut_state is not None and
                        run_count % round(ModelConstants.MODEL_RUN_FREQ / SERVICE_LIST['chestnutGpuState'].frequency) == 0)
       model_output = model.run(bufs, transforms, inputs, chestnut_state.send if send_chestnut else None)
-    except Exception:
+    except Exception as e:
       if not model.chestnut:
         raise
       # fallback to small model
       cloudlog.exception("big model failed, fall back to small")
+      note_big_model(params, "failed while running", e, time.monotonic() - loaded_at, retry, load["waited_s"], load["wait_error"])
       params.put_bool("ChestnutActive", False)
       model = small_model
       if chestnut_state is not None:
