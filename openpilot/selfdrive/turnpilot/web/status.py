@@ -9,7 +9,10 @@ from openpilot.selfdrive.navigation.helpers import latest_gps_source
 from openpilot.selfdrive.turnpilot.control_text import DECIDER_ACTIONS, hold_text, is_map_reason
 
 SERVICES = ["deviceState", "navInstruction", "turnpilotPlan", "gpsLocation", "gpsLocationExternal",
-            "modelV2", "turnpilotDetections", "turnpilotFarDetections"]  # the last three for the diagnostics' model and step times
+            "modelV2", "turnpilotDetections", "turnpilotFarDetections",  # these three for the diagnostics' model and step times
+            "managerState"]  # and this for its GPS section: which GPS daemons run
+GPS_SERVICES = ("gpsLocation", "gpsLocationExternal")
+GPS_DAEMONS = ("ubloxd", "pigeond", "qcomgpsd")
 TIME_SAMPLES = 20  # snapshots each step time's median is over (10 s at SNAPSHOT_PERIOD)
 SNAPSHOT_PERIOD = 0.5  # s between snapshots; the page polls every 2 s, so 2 Hz is plenty
 SERVICE_TIMEOUT = 3.  # s since a service last published before it counts as not running
@@ -71,6 +74,27 @@ def read_live(sm, samples: dict[str, deque]) -> dict:
     **{key: statistics.median(v) for key, v in samples.items() if v},
     "samples": len(samples.get("model_s", ())),
   }
+
+
+def read_gps(sm) -> dict:
+  """The diagnostics' GPS section, never a coordinate: each GPS daemon's managerState running (None: managerState isn't
+  publishing), and for gpsLocation and gpsLocationExternal whether it publishes, valid, hasFix, the last message's age and
+  the fields that say how good a fix is."""
+  procs = {}
+  if service_up(sm, "managerState"):
+    running = {p.name: bool(p.running) for p in sm["managerState"].processes}
+    procs = {d: running.get(d) for d in GPS_DAEMONS}
+  services = {}
+  for s in GPS_SERVICES:
+    if not sm.seen[s]:
+      services[s] = {"seen": False}
+      continue
+    g = sm[s]
+    services[s] = {"seen": True, "up": service_up(sm, s), "valid": bool(sm.valid[s]), "fix": bool(g.hasFix),
+                   "age_s": time.monotonic() - sm.recv_time[s], "source": str(g.source), "satellites": int(g.satelliteCount),
+                   "h_acc": float(g.horizontalAccuracy), "v_acc": float(g.verticalAccuracy), "speed_acc": float(g.speedAccuracy),
+                   "bearing_acc": float(g.bearingAccuracyDeg)}
+  return {"procs": procs, "services": services}
 
 
 def format_distance(meters: float, metric: bool) -> str:
@@ -178,6 +202,7 @@ class StatusReader(threading.Thread):
         sm.update(0)  # the sockets conflate, so this takes the newest message of each service
         snap = read_services(sm)
         snap["live"] = read_live(sm, self.samples)
+        snap["gps_diag"] = read_gps(sm)
         with self.lock:
           self.snapshot = snap
         if self.events is not None:

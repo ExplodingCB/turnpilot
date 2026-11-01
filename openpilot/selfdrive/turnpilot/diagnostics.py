@@ -3,7 +3,8 @@
 It says the build (GitCommit, GitBranch), the AGNOS version, the driving model and the detector as they run now (modelV2.big:
 the big model on the chestnut; the step's times; nativeStatus), preflight's lines (python -m openpilot.selfdrive.turnpilot.
 preflight, run apart so turnpilot_web never imports the planner), and the last few TurnPilot events: its handbacks and
-faults (turnpilotPlan) and the errors its code logged (errorLogMessage), kept in TurnPilotDiagEvents across reboots.
+faults (turnpilotPlan) and the errors its code logged (errorLogMessage), kept in TurnPilotDiagEvents across reboots. Its GPS
+section says which GPS daemon runs, each GPS message's state and quality and whether LastGPSPosition is saved.
 
 It never says the map key, the web token or the pairing URL that carries it, or any position: preflight's pairing and token
 lines are dropped, and every line is scrubbed of the saved key and token and of any number with four or more decimals (a
@@ -40,6 +41,9 @@ FAULT_ALERTS = frozenset((
   "overrideWriteFailed", "stopRoutingFailed", "carCrossing",
 ))
 TURNPILOT_DAEMONS = frozenset(("turnpilotd", "turnpilot_web"))
+GPS_SERVICES = ("gpsLocation", "gpsLocationExternal")
+GPS_DAEMONS = ("ubloxd", "pigeond", "qcomgpsd")
+QCOM_NO_FIX_V_ACC = 500.  # qcomgpsd: the modem clips verticalAccuracy at 500, and hasFix is False there
 NATIVE_WORDS = {"off": "off (the far crop)", "strip": "strip", "full": "full (the whole frame natively)",
                 "fallback": "fell back to the far crop for the drive", "unavailable": "on, but not loaded: the far crop"}
 
@@ -304,13 +308,100 @@ def event_lines(events: list[dict]) -> list[str]:
   return out
 
 
-def report(params, live: dict | None, events: list[dict], preflight_lines: list[str], agnos: str | None, now: float | None = None) -> str:
+def gps_daemon_rule() -> bool | None:
+  """process_config's rule: True runs ubloxd and pigeond (/dev/ttyHS0 and no use-quectel-gps), False qcomgpsd, None unknown."""
+  try:
+    from openpilot.system.manager.process_config import ublox_available
+    return bool(ublox_available())
+  except Exception:
+    return None
+
+
+def clock_valid() -> bool | None:
+  try:
+    from openpilot.common.time_helpers import system_time_valid
+    return bool(system_time_valid())
+  except Exception:
+    return None
+
+
+def saved_position_text(params, now: float) -> str:
+  """LastGPSPosition present or not, which message it holds and how old its fix is: never its value."""
+  raw = read_param(params, "LastGPSPosition")
+  if not raw:
+    return "none (only a saved fix fills the offroad position)"
+  try:
+    from openpilot.cereal import log
+    with log.Event.from_bytes(raw) as evt:
+      which = evt.which()
+      ms = getattr(evt, which).unixTimestampMillis if which in GPS_SERVICES else 0
+  except Exception:
+    return "present, unreadable"
+  if not ms:
+    return f"present ({which})"
+  return f"present ({which}, {source_age_text(now - ms / 1e3)} old)"
+
+
+def source_age_text(seconds: float) -> str:
+  if seconds < 120:
+    return f"{seconds:.0f} s"
+  if seconds < 2 * 3600:
+    return f"{seconds / 60:.0f} min"
+  return f"{seconds / 3600:.0f} h" if seconds < 2 * 86400 else f"{seconds / 86400:.0f} days"
+
+
+def gps_service_text(name: str, g: dict | None) -> str:
+  if not g or not g.get("seen"):
+    return f"  {name}: never received since the web app started"
+  state = "publishing" if g["up"] else f"stopped, last {source_age_text(g['age_s'])} ago"
+  parts = [state, f"valid {'yes' if g['valid'] else 'no'}", f"hasFix {'yes' if g['fix'] else 'no'}", f"age {g['age_s']:.1f} s",
+           f"source {g.get('source', '?')}"]
+  qcom = g.get("source") == "qcomdiag"  # qcomgpsd sets neither satelliteCount nor horizontalAccuracy
+  parts.append("satellites not reported" if qcom else f"satellites {g['satellites']}")
+  if not qcom:
+    parts.append(f"horizontal accuracy {g['h_acc']:.1f} m")
+  vertical = f"vertical accuracy {g['v_acc']:.1f}"
+  if qcom and g["v_acc"] == QCOM_NO_FIX_V_ACC:
+    vertical += " (qcomgpsd's no-fix value)"
+  parts += [vertical, f"speed accuracy {g['speed_acc']:.2f} m/s", f"bearing accuracy {g['bearing_acc']:.0f} deg"]
+  return f"  {name}: " + ", ".join(parts)
+
+
+def gps_text(gps: dict | None, params, ublox: bool | None, clock: bool | None, now: float) -> list[str]:
+  """The GPS section: which daemon runs, each GPS message's state and quality, the assistance qcomgpsd gets and
+  LastGPSPosition, never a coordinate. gps is the status reader's (status.read_gps); ublox is gps_daemon_rule()'s."""
+  rule = {True: "ubloxd and pigeond (/dev/ttyHS0 is there)", False: "qcomgpsd (no /dev/ttyHS0, or use-quectel-gps)",
+          None: "unknown"}[ublox]
+  saved = read_param(params, "UbloxAvailable")
+  out = ["GPS:", f"  daemon by process_config's rule: {rule}; UbloxAvailable {({True: '1', False: '0'}).get(saved, 'unset')}"]
+  if gps is None:
+    out.append("  status reader not running: no GPS messages read")
+  else:
+    procs = gps.get("procs") or {}
+    if not procs:
+      out.append("  running: unknown (managerState isn't publishing)")
+    else:
+      words = {True: "running", False: "not running", None: "not managed"}
+      out.append("  running: " + ", ".join(f"{d} {words[procs.get(d)]}" for d in GPS_DAEMONS))
+    services = gps.get("services") or {}
+    out += [gps_service_text(s, services.get(s)) for s in GPS_SERVICES]
+  if ublox is not True:
+    valid = {True: 'yes', False: 'no'}.get(clock, 'unknown')
+    out.append("  assistance (qcomgpsd): this build downloads no assistance data; at its start it sets the modem's time only " +
+               f"if the clock is valid (clock valid now: {valid}), so a fix can be a cold start")
+  out.append(f"  LastGPSPosition: {saved_position_text(params, now)}")
+  return out
+
+
+def report(params, live: dict | None, events: list[dict], preflight_lines: list[str], agnos: str | None, now: float | None = None,
+           gps: dict | None = None, ublox=gps_daemon_rule, clock=clock_valid) -> str:
   now = wall_time() if now is None else now
   lines = [f"TurnPilot diagnostics, {time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime(now))}",
            f"build: {build_text(params)}" + (f" ({params.get('Version')})" if params.get("Version") else ""),
            f"AGNOS: {agnos or 'unknown'}",
            *model_text(live, params, events),
            chestnut_line(params),
+           "", *gps_text(gps, params, ublox(), clock(), now),
            "", "preflight:", *(f"  {ln}" for ln in preflight_lines if ln.strip()),
            "", "recent TurnPilot events (newest first):", *event_lines(events)]
   secrets = secrets_of(params)

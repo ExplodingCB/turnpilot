@@ -34,7 +34,7 @@ def ensure_token(params) -> str:
 
 
 def last_gps_position(params):
-  """(latitude, longitude) of the last GPS fix saved by ubloxd, or None."""
+  """(latitude, longitude) of the last GPS fix ubloxd or qcomgpsd saved (both as a gpsLocationExternal event), or None."""
   raw = params.get("LastGPSPosition")
   if not raw:
     return None

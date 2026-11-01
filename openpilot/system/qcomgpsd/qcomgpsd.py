@@ -13,6 +13,7 @@ from struct import unpack_from, calcsize, pack
 from openpilot.cereal import log
 import openpilot.cereal.messaging as messaging
 from openpilot.common.gpio import gpio_init, gpio_set
+from openpilot.common.params import Params
 from openpilot.common.utils import retry
 from openpilot.common.time_helpers import system_time_valid
 from openpilot.common.hardware.comma.pins import GPIO
@@ -164,6 +165,20 @@ def teardown_quectel(diag):
   try_setup_logs(diag, [])
 
 
+POSITION_SAVE_S = 60.  # as ubloxd: LastGPSPosition at most this often
+
+
+def save_position(params, msg) -> None:
+  """TurnPilot: a fix saved to LastGPSPosition the way ubloxd saves one, as a gpsLocationExternal event, so pigeond and the
+  phone app read it unchanged; its source stays qcomdiag. Never raises: a params failure mustn't stop the GPS."""
+  try:
+    saved = messaging.new_message('gpsLocationExternal', valid=True)
+    saved.gpsLocationExternal = msg.gpsLocation
+    params.put("LastGPSPosition", saved.to_bytes())
+  except Exception:
+    cloudlog.exception("qcomgpsd.save_position_failed")
+
+
 def wait_for_modem():
   cloudlog.warning("waiting for modem to come up")
   while not os.path.exists(AT_PORT):
@@ -218,6 +233,8 @@ def main() -> NoReturn:
   gpio_set(GPIO.GNSS_PWR_EN, True)
 
   pm = messaging.PubMaster(['qcomGnss', 'gpsLocation'])
+  params = Params()
+  last_position_save = float('-inf')
 
   while 1:
     opcode, payload = diag.recv()
@@ -313,6 +330,9 @@ def main() -> NoReturn:
       # quectel gps verticalAccuracy is clipped to 500, set invalid if so
       gps.hasFix = gps.verticalAccuracy != 500
       pm.send('gpsLocation', msg)
+      if gps.hasFix and time.monotonic() - last_position_save > POSITION_SAVE_S:
+        save_position(params, msg)
+        last_position_save = time.monotonic()
 
     elif log_type == LOG_GNSS_OEMDRE_SVPOLY_REPORT:
       msg = messaging.new_message('qcomGnss', valid=True)

@@ -5,12 +5,16 @@ import os
 import subprocess
 import sys
 import textwrap
+from unittest import mock
 
+from openpilot.cereal import log, messaging
 from openpilot.common.params import Params
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.turnpilot import diagnostics, preflight
 from openpilot.selfdrive.turnpilot.diagnostics import (BIG_WHY_MAX, EVENTS_KEPT, EVENTS_PARAM, REPEAT_S, EventLog, Preflight, chestnut_line,
                                                         log_event, model_text, note_big_model, report)
+from openpilot.selfdrive.turnpilot.web.store import last_gps_position
+from openpilot.system.qcomgpsd import qcomgpsd
 
 KEY = "tpk_live_7f3a9c2e5b1d8046"
 SHA = "691321d4c0ffee5e1f2a3b4c5d6e7f8091a2b3c4"
@@ -238,3 +242,86 @@ class TestBigModel(OpenpilotTestCase):
     text = report(params, small, params.get(EVENTS_PARAM), [], None)
     assert "chestnut params: ChestnutLoading 1, ChestnutActive 0, ChestnutRetry 1" in text
     assert "big model failed while running: RuntimeError: chestnut failed with 7; raised after 90.0 s" in text
+
+
+def gps_snapshot(**services):
+  return {"procs": {"ubloxd": None, "pigeond": None, "qcomgpsd": True}, "services": services}
+
+
+def qcom_no_fix():
+  return {"seen": True, "up": True, "valid": True, "fix": False, "age_s": 0.4, "source": "qcomdiag", "satellites": 0,
+          "h_acc": 0., "v_acc": 500., "speed_acc": 0.31, "bearing_acc": 180.}
+
+
+class TestGps(OpenpilotTestCase):
+  """The GPS section: which daemon runs, each GPS message's state and quality, qcomgpsd's assistance and LastGPSPosition,
+  never a coordinate."""
+  def test_a_qcom_device_without_a_fix(self):
+    params = BlockingParams()
+    text = "\n".join(diagnostics.gps_text(gps_snapshot(gpsLocation=qcom_no_fix(), gpsLocationExternal={"seen": False}),
+                                          params, False, True, 1_761_940_000.))
+    assert "daemon by process_config's rule: qcomgpsd (no /dev/ttyHS0, or use-quectel-gps); UbloxAvailable unset" in text
+    assert "running: ubloxd not managed, pigeond not managed, qcomgpsd running" in text
+    assert ("gpsLocation: publishing, valid yes, hasFix no, age 0.4 s, source qcomdiag, satellites not reported, " +
+            "vertical accuracy 500.0 (qcomgpsd's no-fix value), speed accuracy 0.31 m/s, bearing accuracy 180 deg") in text
+    assert "horizontal accuracy" not in text  # qcomgpsd never sets it
+    assert "gpsLocationExternal: never received since the web app started" in text
+    assert "downloads no assistance data" in text and "clock valid now: yes" in text
+    assert "LastGPSPosition: none" in text
+
+  def test_a_ublox_device_with_a_fix_and_a_saved_position(self):
+    params = BlockingParams()
+    params.put_bool("UbloxAvailable", True)
+    msg = messaging.new_message("gpsLocationExternal", valid=True)
+    msg.gpsLocationExternal.latitude, msg.gpsLocationExternal.longitude = 39.768403, -86.158102
+    msg.gpsLocationExternal.unixTimestampMillis = int((1_761_940_000. - 3 * 3600) * 1e3)
+    params.put("LastGPSPosition", msg.to_bytes())
+    ext = {"seen": True, "up": True, "valid": True, "fix": True, "age_s": 0.1, "source": "ublox", "satellites": 11,
+           "h_acc": 2.4, "v_acc": 3.1, "speed_acc": 0.12, "bearing_acc": 4.}
+    gps = {"procs": {"ubloxd": True, "pigeond": True, "qcomgpsd": None}, "services": {"gpsLocationExternal": ext}}
+    text = report(params, None, [], [], "12.8", now=1_761_940_000., gps=gps, ublox=lambda: True, clock=lambda: True)
+    assert "daemon by process_config's rule: ubloxd and pigeond (/dev/ttyHS0 is there); UbloxAvailable 1" in text
+    assert "gpsLocationExternal: publishing, valid yes, hasFix yes, age 0.1 s, source ublox, satellites 11, horizontal accuracy 2.4 m" in text
+    assert "gpsLocation: never received" in text and "assistance" not in text
+    assert "LastGPSPosition: present (gpsLocationExternal, 3 h old)" in text
+    for pos in ("39.7", "86.1", "39.768403", "-86.158102"):
+      assert pos not in text, pos
+
+  def test_no_reader_or_manager(self):
+    text = "\n".join(diagnostics.gps_text(None, BlockingParams(), None, None, 0.))
+    assert "daemon by process_config's rule: unknown" in text and "status reader not running" in text and "clock valid now: unknown" in text
+    text = "\n".join(diagnostics.gps_text({"procs": {}, "services": {}}, BlockingParams(), False, False, 0.))
+    assert "running: unknown (managerState isn't publishing)" in text and "clock valid now: no" in text
+
+  def test_the_rule_is_process_configs(self):
+    from openpilot.system.manager import process_config
+    for present, want in (({"/dev/ttyHS0"}, True), ({"/dev/ttyHS0", "/persist/comma/use-quectel-gps"}, False), (set(), False)):
+      with mock.patch.object(os.path, "exists", lambda p, present=present: p in present):
+        assert diagnostics.gps_daemon_rule() is want is process_config.ublox_available()
+
+
+class TestQcomSavedPosition(OpenpilotTestCase):
+  """qcomgpsd saves its fix to LastGPSPosition as ubloxd does, a gpsLocationExternal event, so the phone app's offroad
+  position and pigeond read it unchanged."""
+  def fix(self):
+    msg = messaging.new_message("gpsLocation", valid=True)
+    gps = msg.gpsLocation
+    gps.latitude, gps.longitude, gps.hasFix = 39.768403, -86.158102, True
+    gps.unixTimestampMillis, gps.source = 1_761_940_000_000, log.GpsLocationData.SensorSource.qcomdiag
+    return msg
+
+  def test_the_store_reads_it_and_the_source_stays(self):
+    params = BlockingParams()
+    qcomgpsd.save_position(params, self.fix())
+    assert last_gps_position(params) == (39.768403, -86.158102)
+    with log.Event.from_bytes(params.get("LastGPSPosition")) as evt:
+      assert evt.which() == "gpsLocationExternal"  # what pigeond's send_position reads
+      assert evt.gpsLocationExternal.source == log.GpsLocationData.SensorSource.qcomdiag
+      assert evt.gpsLocationExternal.unixTimestampMillis == 1_761_940_000_000
+    assert "present (gpsLocationExternal" in diagnostics.saved_position_text(params, 1_761_940_060.)
+
+  def test_a_params_failure_never_raises(self):
+    class Broken:
+      def put(self, *a):
+        raise OSError("read-only")
+    qcomgpsd.save_position(Broken(), self.fix())

@@ -111,11 +111,13 @@ class App:
   def diagnostics(self) -> dict:
     """The diagnostics report as plain text (diagnostics.py): never the map key, the token or a position."""
     snap = self.reader.get() if self.reader else None
-    live = snap.get("live") if snap and time.monotonic() - snap["at"] < STALE_AFTER else None
+    fresh = bool(snap) and time.monotonic() - snap["at"] < STALE_AFTER
+    live = snap.get("live") if fresh else None
+    gps = snap.get("gps_diag") if fresh else None
     events = self.reader.events.get() if self.reader is not None and getattr(self.reader, "events", None) is not None else []
     preflight = self.preflight.get()
     with self.store.lock:
-      text = diagnostics.report(self.store.params, live, events, preflight, diagnostics.agnos_version())
+      text = diagnostics.report(self.store.params, live, events, preflight, diagnostics.agnos_version(), gps=gps)
     return {"text": text}
 
   # TurnPilot's mapped area (the geofence) and its map server

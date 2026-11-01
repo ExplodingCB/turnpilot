@@ -1144,6 +1144,38 @@ class TestDiagnostics(WebTestCase):
     assert "handback stalledTakeControl: Stalled in the turn" in text and "error turnpilotd" in text and "KeyError: 'lead'" in text
     assert [e["what"] for e in self.params.get("TurnPilotDiagEvents")].count("handback stalledTakeControl") == 1  # its onset, once
 
+  def test_the_reader_brings_the_gps_daemons_and_fixes_never_a_position(self):
+    self.prepare()
+    reader = status.StatusReader(self.diagnostics.EventLog(self.params))
+    self.app.reader = reader
+    reader.start()
+    self.addCleanup(reader.stop)
+    pm = messaging.PubMaster(["gpsLocation", "managerState"])
+
+    def publish():
+      msg = messaging.new_message("gpsLocation", valid=True)
+      gps = msg.gpsLocation
+      gps.latitude, gps.longitude, gps.hasFix, gps.verticalAccuracy = 39.768403, -86.158102, False, 500.
+      gps.source = "qcomdiag"
+      pm.send("gpsLocation", msg)
+      msg = messaging.new_message("managerState", valid=True)
+      msg.managerState.init("processes", 2)
+      for p, (name, running) in zip(msg.managerState.processes, (("qcomgpsd", True), ("ubloxd", False)), strict=True):
+        p.name, p.running = name, running
+      pm.send("managerState", msg)
+
+    text, deadline = "", time.monotonic() + 10
+    while time.monotonic() < deadline:
+      publish()
+      time.sleep(0.3)
+      text = self.call("GET", "/api/diagnostics")[1]["text"]
+      if "qcomgpsd running" in text and "gpsLocation: publishing" in text:
+        break
+    assert "running: ubloxd not running, pigeond not managed, qcomgpsd running" in text
+    assert "gpsLocation: publishing, valid yes, hasFix no" in text and "(qcomgpsd's no-fix value)" in text
+    assert "gpsLocationExternal: never received" in text and "LastGPSPosition: none" in text
+    assert "39.76" not in text and "86.15" not in text
+
   def test_the_page_collects_on_open_and_copies_plain_text(self):
     page = server.INDEX.read_text()
     assert '<details id="diag">' in page and 'id="diagtext" readonly' in page and 'id="diagcopy"' in page
