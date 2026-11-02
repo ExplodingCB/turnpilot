@@ -398,6 +398,13 @@ OFF_ROUTE_SHAPE_BEHIND_M = 15.
 OFF_ROUTE_SHAPE_AHEAD_M = 20.
 OFF_ROUTE_SHAPE_WINDOW_M = OFF_ROUTE_TURN_M + 10.
 OFF_ROUTE_TURN_REASON = "Off route: take control"
+# GPS loss (navigation/hold.py): navd carries the route through a GPS gap on the car's own travel, its message valid with
+# positionSource deadReckoned, which nothing here treats otherwise. Past the hold's limits, or with the car off the route it
+# carried (a turn missed, the car's heading off the route's), navd can't place the car (positionSource lost): its message is
+# invalid with the route kept, so the maneuver in hand is dropped unless its turn is committed (held to its end through the
+# gap, route_follower.py), and that is handed back loudly (gpsLostTakeControl, GPS_LOST_REASON) from its first frame engaged
+# and acting, once a spell, held until the driver takes over or navd has the car again: no braking, no steering
+GPS_LOST_REASON = "GPS lost: take control"
 LEAD_CORROBORATE_M = 3.
 LEAD_BEARING_TOL_DEG = 3.
 LEAD_SEEN_HOLD_S = 1.
@@ -828,6 +835,8 @@ class TurnPilot:
     self.or_near_odo = -1e9        # odometer where a route maneuver or a turn desire last was near
     self.or_id, self.or_after, self.or_prev_after = None, None, None  # the maneuver, its bearing out, the last one's
     self.or_on = False             # handed back for an off-route turn, until the driver takes over
+    self.gps_lost_on = False       # handed back for navd's position lost (gps_lost), until the driver takes over or it's back
+    self.gps_lost_said = False     # ...said this spell of it
     self.abandoned_id: int | None = None  # ...the maneuver handed back for it, until the driver takes over
     self.straight: StraightDrive | None = None  # R8b's watch over a committed turn driven straight (watch_straight)
     self.straight_cleared = False  # ...R8b's fire cleared the turn's desire this frame (CLEAR_DESIRE in this very plan)
@@ -1538,6 +1547,7 @@ class TurnPilot:
     wrong_side = self.wrong_side(sm, cs, v_ego, acting, wrong_side_paint, right_hand_traffic)
     person_front = self.scene.person_front
     off_route = self.off_route_turn(sm, cs, v_ego, acting, rf, upcoming, default_yaw_rate(cs, model))
+    gps_lost = self.gps_lost(sm, acting)
     if self.person_front_handback(acting, person_front):  # WF-13: held by it PERSON_FRONT_MAX_S, nobody seen leaving
       plan.controlPrompt, plan.reason = 'personFrontTakeControl', PERSON_FRONT_REASON
     elif withdrawn or self.cant_start_unheld:  # the switch's has no hold: the model drives on under it (no_move)
@@ -1550,6 +1560,8 @@ class TurnPilot:
       plan.controlPrompt, plan.reason = 'wrongSideTakeControl', WRONG_SIDE_REASON
     elif off_route:
       plan.controlPrompt, plan.reason = 'offRouteTakeControl', OFF_ROUTE_TURN_REASON
+    elif gps_lost:
+      plan.controlPrompt, plan.reason = 'gpsLostTakeControl', GPS_LOST_REASON
     elif stalled:
       plan.controlPrompt, plan.reason = 'stalledTakeControl', STALLED_REASON
     elif stopped in (STOPPED_NOTE, LIGHT_WAIT_NOTE):
@@ -2907,6 +2919,25 @@ class TurnPilot:
     self.or_on, self.or_win = True, []
     cloudlog.event("turnpilot.off_route_turn", error=True, v=round(v_ego, 2), turned_deg=round(right, 1), bend_deg=round(bend, 1),
                    shape_deg=None if shape is None else round(shape, 1), distance=round(rf.distance, 1), maneuver_id=rf.maneuver_id)
+    return True
+
+  def gps_lost(self, sm, acting: bool) -> bool:
+    """navd can't place the car on its route (navInstruction.positionSource lost; GPS_LOST_REASON): handed back from its first
+    frame engaged and acting, once a spell of it, held until the driver takes over (openpilot disengaged) or navd has the car
+    again. Nothing here steers or brakes."""
+    enabled = sm['carControl'].enabled
+    ni = sm['navInstruction']
+    if sm.valid['navInstruction'] or str(ni.positionSource) != 'lost':  # navd sends lost only on invalid messages
+      self.gps_lost_on = self.gps_lost_said = False
+      return False
+    if self.gps_lost_on:
+      self.gps_lost_on = enabled
+      return self.gps_lost_on
+    if self.gps_lost_said or not (acting and enabled):
+      return False
+    self.gps_lost_on = self.gps_lost_said = True
+    cloudlog.event("turnpilot.gps_lost", error=True, gps_lost_s=round(ni.gpsLostS, 1), uncertainty_m=round(ni.positionUncertainty, 1),
+                   committed=self.turn_committed, maneuver_id=self.follower.maneuver_id)
     return True
 
   def route_shape_turn(self, right: float) -> float | None:

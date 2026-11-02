@@ -2523,6 +2523,20 @@ struct NavInstruction {
   routeTurns @33 :List(Float32);
   routeTurnsStart @34 :Float32;
   routeTurnsStep @35 :Float32;
+  # TurnPilot (GPS loss): where navd's position comes from, on every message, valid or not (navigation/hold.py). gps: a trusted
+  # fix (held standing: GPS jitter at a light never moves it), and from a navd before the field; deadReckoned: no trusted fix,
+  # the position carried along the route by the car's own travel and the route held; lost: past the hold's limits, or the car
+  # left the route while carried: the message is invalid with the route kept, and turnpilotd hands back (gpsLostTakeControl).
+  # positionUncertainty: m, the last fix's accuracy grown with the distance carried; gpsLostS: s since the last trusted fix
+  positionSource @36 :PositionSource;
+  positionUncertainty @37 :Float32;
+  gpsLostS @38 :Float32;
+
+  enum PositionSource {
+    gps @0;
+    deadReckoned @1;
+    lost @2;
+  }
 
   enum Opposing {
     unknown @0;  # no intersection data for the junction (or a navd from before the field)
