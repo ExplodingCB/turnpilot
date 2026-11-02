@@ -1277,7 +1277,8 @@ class TurnPilot:
                                  not keep_why[LEFT], not keep_why[RIGHT], DT_MDL, default_yaw_rate(cs, model),
                                  lat_active=lat_active, replaced=d_replaced,
                                  may_start=skip.feasible_now and not held and not hold_pulse, go=self.release_go,
-                                 holding=decision.should_stop or withdrawn or red_here)
+                                 holding=decision.should_stop or withdrawn or red_here,
+                                 far=d_dist + (rf.junction_spread if d_id == rf.maneuver_id else 0.))
     if red_here and desire in (Desire.turnLeft, Desire.turnRight) and self.desires.turned_deg < TURN_STARTED_DEG:
       desire = Desire.none
     self._yaw_ticked = True

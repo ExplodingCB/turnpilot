@@ -25,6 +25,9 @@ import numpy as np
 from openpilot.selfdrive.navigation.route import along_path
 
 MAX_MANEUVERS = 10  # allManeuvers is for the planner's lookahead; a long route would otherwise send every step each second
+WRONG_WAY_WINDOW_M = 60.  # m before a turn's junction a wrong-way opening is looked for (wrong_way_before): past the turn
+                          # desire's 40 m lead (desire_timing.TURN_DESIRE_LEAD_M), with room for navd's distance noise
+WRONG_WAY_SIDE_DEG = 60.  # deg either side of square to the turn's side such an opening's road lies within
 CONTROLS_BEHIND_M, CONTROLS_AHEAD_M = 15., 400.  # navInstruction.controls: the stop signs, yields and signals this near
 MAX_CONTROLS = 8
 OPPOSING_DEG = 45.  # a road leaving the junction this close to straight on is the oncoming approach
@@ -145,6 +148,41 @@ def approach_line(steps, step_idx) -> tuple[float, float, float, int] | None:
   return lat, lon, ahead, side
 
 
+def wrong_way_before(steps, step_idx) -> float:
+  """m before the junction of the maneuver that ends step step_idx (navd's maneuverDistance frame) of the opening nearest it,
+  within WRONG_WAY_WINDOW_M, that the turn's desire could take the car into the wrong way: at an intersection the route goes
+  straight through on that step, a road on the turn's side (within WRONG_WAY_SIDE_DEG of square to it) that OSRM's entry says
+  the car may not enter, a one-way coming toward it. 0 for none, for a maneuver with no side, or without intersection data.
+  Valhalla routes one-ways right (on the region's tiles 299 of 300 sampled one-way streets refused the wrong way), but its
+  turn's junction is often just past such an opening: on 300 downtown routes 90 of 747 lefts had one, 82 within 40 m and most
+  8 to 20 m before (a divided road's near carriageway, the left at its far one), and 26 of 908 rights. The turn's desire went
+  out 40 m before the junction, and again as the car pulled away from a red light standing at the opening. The driving model
+  takes a turn desire at the first opening on that side: the left onto a one-way the first drive's owner saw planned at a red
+  light. turnpilotd holds the turn's first pulse until the car is past it (desire_timing: wrong_way_wait)."""
+  if step_idx + 1 >= len(steps):
+    return 0.
+  modifier = str(((steps[step_idx + 1].get('maneuver') or {}).get('modifier')) or '')
+  side = -1 if 'left' in modifier else 1 if 'right' in modifier else 0
+  step = steps[step_idx]
+  coordinates = (step.get('geometry') or {}).get('coordinates') or []
+  if side == 0 or len(coordinates) < 2:
+    return 0.
+  path = np.array(coordinates, dtype=np.float64).reshape((-1, 2))
+  nearest = 0.
+  for x in (step.get('intersections') or [])[1:]:  # the first is the maneuver that starts the step, which turns there
+    bearings, entry, i_in, i_out = x.get('bearings') or [], x.get('entry') or [], x.get('in'), x.get('out')
+    if not x.get('location') or i_in is None or not 0 <= i_in < len(bearings) or len(entry) != len(bearings):
+      continue
+    before = float(step['distance']) - along_path(path, x['location'])[0]
+    if not 1. < before <= WRONG_WAY_WINDOW_M or (nearest and before >= nearest):
+      continue
+    toward = (float(bearings[i_in]) + 180. + 90. * side) % 360.  # square to the turn's side of straight on
+    if any(not entry[i] and abs((float(b) - toward + 180.) % 360. - 180.) <= WRONG_WAY_SIDE_DEG
+           for i, b in enumerate(bearings) if i not in (i_in, i_out)):
+      nearest = before
+  return nearest
+
+
 def through_lanes(steps, step_idx, distance_to_maneuver) -> tuple[list[dict], float]:
   """(lanes, m to it) for the next intersection ahead on the current step with a lane list of two or more, which the
   route goes straight through; ([], 0) if there is none before the maneuver."""
@@ -181,7 +219,8 @@ def upcoming_maneuvers(steps, step_idx, distance_to_maneuver, opposing=None) -> 
                       'opposing': junction['opposing'] if junction else 'unknown',
                       'opposingSpeed': float(opposing.get(step_idx + i, (0., 0))[0]),
                       'opposingLanes': min(int(opposing.get(step_idx + i, (0., 0))[1]), 255),
-                      'opposingStraightM': straight_of(opposing.get(step_idx + i))})
+                      'opposingStraightM': straight_of(opposing.get(step_idx + i)),
+                      'wrongWayM': wrong_way_before(steps, step_idx + i)})
     distance += ahead['distance']
   return maneuvers
 
@@ -202,7 +241,18 @@ def fill_guidance(instruction, steps, step_idx, distance_to_maneuver, opposing=N
     instruction.maneuverBearingAfter = junction['after']
     instruction.maneuverBranches = min(junction['branches'], 255)
   instruction.maneuverOpposing = junction['opposing'] if junction is not None else 'unknown'
+  instruction.maneuverWrongWayM = wrong_way_before(steps, step_idx)
   instruction.throughLanes, instruction.throughLanesDistance = through_lanes(steps, step_idx, distance_to_maneuver)
+
+
+def speed_limit_at(limits, car_along: float) -> float:
+  """navInstruction.speedLimit (m/s) for the car car_along m along the route (navd's step frame): the limit of the edge it
+  is on, the first of limits [(end m, m/s)] (routing/controls.py: limit_segments) that ends past it, the last one's past the
+  route's end; 0 (unknown: turnpilotd's signal then leads 300 ft) with none."""
+  for end_m, limit in limits or []:
+    if car_along < end_m:
+      return float(limit)
+  return float(limits[-1][1]) if limits else 0.
 
 
 def control_msg(c, distance: float, ident: int) -> dict:

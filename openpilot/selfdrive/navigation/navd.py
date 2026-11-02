@@ -15,7 +15,7 @@ from openpilot.selfdrive.navigation.helpers import latest_gps_source
 from openpilot.selfdrive.navigation.route import ROUTE_TURNS_STEP_M, along_path, local_meters, route_turns
 from openpilot.selfdrive.turnpilot.routing.controls import haversine
 from openpilot.selfdrive.turnpilot.routing.guidance import (CONTROLS_AHEAD_M, CONTROLS_BEHIND_M, MAX_CONTROLS, control_msg, fill_controls,
-                                                            fill_guidance)
+                                                            fill_guidance, speed_limit_at)
 from openpilot.selfdrive.turnpilot.maps.client import MapError
 from openpilot.selfdrive.turnpilot.maps import surveys
 from openpilot.selfdrive.turnpilot import stop_rules, visibility_table
@@ -88,6 +88,7 @@ class RouteJob(threading.Thread):
     self.controls: list = []  # TurnPilot: the route's stop signs, yields and signals (turnpilot/routing/controls.py)
     self.controls_status = 'none'
     self.opposing: dict = {}  # TurnPilot: {step index: (m/s, lanes)} of the roads across its maneuvers (routing/controls.py)
+    self.limits: list = []  # TurnPilot: [(end m, m/s)] of its edges, tagged else the class default (navInstruction.speedLimit)
     # TurnPilot (stop signs): the destination's exclusions, whether to avoid, the runtime inputs the route is certified
     # with, and what the avoidance loop did (routing/avoid.py)
     self.avoid = engine.avoid_set(destination)
@@ -130,6 +131,12 @@ class RouteJob(threading.Thread):
       except Exception:
         cloudlog.exception("navd: route opposing roads failed")
         self.opposing = {}
+      # the kept route's speed limits (navInstruction.speedLimit): unknown on a failure, so the signal leads 300 ft
+      try:
+        self.limits = router.limits(self.steps) if hasattr(router, 'limits') else []
+      except Exception:
+        cloudlog.exception("navd: route speed limits failed")
+        self.limits = []
 
 
   def avoid_stops(self, router):
@@ -160,6 +167,8 @@ class RouteJob(threading.Thread):
                        deadline=engine.monotonic() + AVOID_TIME_S, monotonic=engine.monotonic, enabled=self.avoid_on, headings=headings)
     self.steps, self.controls, self.controls_status = result.steps, result.controls, result.controls_status
     self.avoid_status, self.avoided, self.avoid_added_s = result.status, result.avoided, result.added_s
+    if hasattr(router, 'serve_again'):  # a kept earlier route is the served one again, for its opposing roads and limits
+      router.serve_again(self.steps)
 
 
 class AheadJob(threading.Thread):
@@ -207,6 +216,7 @@ class RouteEngine:
     self.controls: list = []  # TurnPilot: the route's stop signs, yields and signals, and Valhalla's status for them
     self.controls_status = 'none'
     self.opposing: dict = {}  # TurnPilot: the route's opposing roads' speeds and lanes (RouteJob.opposing)
+    self.limits: list = []  # TurnPilot: the route's speed limits along it (RouteJob.limits)
     # TurnPilot: off the route with a destination, the controls ahead of the car (AheadJob), [(id, Control)] on the road
     # looked up (an (n, 2) array of (longitude, latitude)), and the lookup's status: navInstruction.offRouteControls
     self.off_controls: list = []
@@ -456,6 +466,7 @@ class RouteEngine:
     self.route = job.steps
     self.controls, self.controls_status = job.controls, job.controls_status
     self.opposing = job.opposing
+    self.limits = job.limits
     self.avoid_status, self.avoided, self.avoid_added_s = job.avoid_status, job.avoided, job.avoid_added_s
     self.route_always_drive = job.always_drive
     self.route_runtime, self.avoid_rerun = self.runtime_key(job.runtime), False
@@ -525,6 +536,8 @@ class RouteEngine:
     msg.navInstruction.routeTurns, msg.navInstruction.routeTurnsStep = turns, ROUTE_TURNS_STEP_M
     # TurnPilot: the controls in maneuverDistance's frame, the steps' distances and then along this step's geometry
     car_along = sum(s['distance'] for s in self.route[:self.step_idx]) + along_geometry
+    # TurnPilot: the limit of the edge the car is on, tagged else its class default (turnpilotd's signal lead: 200 ft under 50 mph)
+    msg.navInstruction.speedLimit = speed_limit_at(self.limits, car_along)
     fill_controls(msg.navInstruction, self.controls, self.controls_status, car_along)
     self.check_eta_drift(car_along)
 

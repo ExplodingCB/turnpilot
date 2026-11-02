@@ -181,6 +181,14 @@ class Opposing:
   roads: dict | None = None
 
 
+@dataclass
+class Limits:
+  """route_controls' out-parameter: the route's speed limits [(end m in navd's step frame, m/s)] per trace edge, in route
+  order (limit_segments), read off the trace it already makes; None until that trace ran (unsupported tiles, an early
+  failure: route_limits alone then)."""
+  segments: list | None = None
+
+
 class LocateCache:
   """Q1's and Q2's locate answers by edge id, for navd's lookups ahead of the car every second (controls_ahead), which
   mostly repeat: Q1's matched candidate per edge, Q2's answers per junction (its edges' ids), and signal_behind's verdict
@@ -495,8 +503,50 @@ def opposing_roads(call, steps) -> dict[int, tuple[float, int, float]]:
     return {}
 
 
+def edge_end(pts, cum, tpts, tcum, scale: float, e) -> float:
+  """m along the route's own shape (pts, cum) where trace edge e ends: its end projected near where the trace says."""
+  expect = tcum[e['end_shape_index']] * scale
+  end_m = project(pts, cum, tpts[e['end_shape_index']], expect - 30., expect + 30.)
+  return expect if end_m is None else end_m
+
+
+def edge_limit(e) -> float:
+  """m/s on trace edge e for navInstruction.speedLimit: its tagged maxspeed (Valhalla's speed_limit, km/h), else decision
+  D8's default for its road class (junctions.class_limit: stop_rules.CLASS_LIMIT_MPH, never Valhalla's classified speed), 0
+  only for an edge with no road class at all, where nothing is known. The class default is what turnpilotd's signal lead
+  needs (car_signals.lead_m: 200 ft under 50 mph): an untagged residential street is 30 mph, not "unknown, so 300 ft"."""
+  tagged = jn.kph(e.get('speed_limit'))
+  if tagged > 0.:
+    return tagged
+  return jn.class_limit(e.get('road_class'), e.get('use')) if e.get('road_class') else 0.
+
+
+def limit_segments(edges, ends_m, starts) -> list[tuple[float, float]]:
+  """[(end m in navd's step frame, m/s)] per trace edge (edge_limit), in route order: ends_m is each edge's end along the
+  route's own shape (edge_end), starts the steps' frame (step_frame)."""
+  return [(to_step(starts, max(end_m, 0.))[2], edge_limit(e)) for e, end_m in zip(edges, ends_m, strict=True)]
+
+
+def route_limits(call, steps) -> list[tuple[float, float]]:
+  """The route's speed limits (limit_segments) from a trace of its own: for a route whose controls didn't read them
+  (route_controls' Limits). [] on any failure, logged: navd then sends 0, unknown, and turnpilotd's signal leads 300 ft."""
+  try:
+    pts = route_shape(steps)
+    if len(pts) < 2:
+      return []
+    cum = cumulative(pts)
+    t, _ = trace(call, pts)
+    tpts = decode6(t['shape']) if isinstance(t.get('shape'), str) else [(p['lat'], p['lon']) for p in t.get('shape', [])]
+    tcum = cumulative(tpts)
+    scale = cum[-1] / tcum[-1] if tcum and tcum[-1] > 0. else 1.
+    return limit_segments(t['edges'], [edge_end(pts, cum, tpts, tcum, scale, e) for e in t['edges']], step_frame(steps, pts, cum))
+  except Exception:
+    cloudlog.exception("turnpilot speed limits: failed")
+    return []
+
+
 def route_controls(call, steps, tiles_dir=None, sidecar_dir=None, audit: list | None = None, opposing: Opposing | None = None,
-                   context: jn.Context | None = None) -> tuple[list[Control], str]:
+                   context: jn.Context | None = None, limits: Limits | None = None) -> tuple[list[Control], str]:
   """(controls along the route nearest first, status). call(endpoint, request) -> response: actor_call or http_call.
   tiles_dir: the local tiles' directory, for the controls_built marker and the sim sidecar; None for tiles built from
   real OSM, which carry their own controls. sidecar_dir: the directory holding the OSM sidecar (osm_controls/) and the
@@ -504,11 +554,12 @@ def route_controls(call, steps, tiles_dir=None, sidecar_dir=None, audit: list | 
   but the tiles have no directory, None when none is (module docstring). audit: a list every trace edge is appended to,
   as a dict with its span on the route and both sources' stops and yields there (route_audit.py). opposing: given, its
   roads are read in the junctions' batched locate (opposing_roads' answer, one call for both). context: the surveys and
-  overrides the junctions are read against (routing/junctions.py), none by default."""
+  overrides the junctions are read against (routing/junctions.py), none by default. limits: given, the route's speed limits
+  are read off the same trace (limit_segments), so a route makes no second one for them."""
   try:
     if tiles_dir is not None and not (Path(tiles_dir) / MARKER).exists():
       return [], 'unsupported'
-    return _route_controls(call, steps, tiles_dir, sidecar_dir, audit=audit, opposing=opposing, context=context)
+    return _route_controls(call, steps, tiles_dir, sidecar_dir, audit=audit, opposing=opposing, context=context, limits=limits)
   except Exception:
     cloudlog.exception("turnpilot controls: failed")
     return [], 'failed'
@@ -853,10 +904,11 @@ def rail_distance(osm, pts, cum, begin_m: float, end_m: float, node) -> float:
 
 
 def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = False, audit: list | None = None, opposing: Opposing | None = None,
-                    context: jn.Context | None = None, cache: LocateCache | None = None) -> tuple[list[Control], str]:
+                    context: jn.Context | None = None, cache: LocateCache | None = None,
+                    limits: Limits | None = None) -> tuple[list[Control], str]:
   """ahead: the road ahead of the car (controls_ahead), not a route: its end is no destination, and its junctions have no
   maneuver. opposing: filled from Q2's batched locate (a route's). context: surveys and overrides (none: neither). cache:
-  Q1 and Q2 by edge id (controls_ahead's)."""
+  Q1 and Q2 by edge id (controls_ahead's). limits: filled from the trace (a route's: limit_segments)."""
   context = context if context is not None else jn.Context()
   pts = route_shape(steps)
   if len(pts) < 2:
@@ -868,6 +920,9 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
   tcum = cumulative(tpts)
   scale = cum[-1] / tcum[-1] if tcum and tcum[-1] > 0. else 1.
   edges = t['edges']  # internal-intersection edges too: a control in a median is the junction's before it
+  edge_ends = [edge_end(pts, cum, tpts, tcum, scale, e) for e in edges]
+  if limits is not None:  # from this trace, before anything else can fail: the limits don't wait on the controls
+    limits.segments = limit_segments(edges, edge_ends, starts)
   located = _q1(call, edges, tpts, tcum, cache)
   sim = load_sidecar(tiles_dir)
   osm = osm_sidecar.load(sidecar_dir, pts) if sidecar_dir is not None else None
@@ -886,10 +941,7 @@ def _route_controls(call, steps, tiles_dir, sidecar_dir=None, ahead: bool = Fals
       candidate = {}
     end_i, begin_i = e['end_shape_index'], e['begin_shape_index']
     span = (tcum[end_i] - tcum[begin_i]) * scale
-    # where the edge ends on the route's own shape, near where the trace says
-    expect = tcum[end_i] * scale
-    end_m = project(pts, cum, tpts[end_i], expect - 30., expect + 30.)
-    end_m = expect if end_m is None else end_m
+    end_m = edge_ends[i]
     key = f"{e.get('way_id')}:{'f' if e.get('forward') else 'b'}"
     ends.append((end_m, span, key, e.get('end_node') or {}))
     valhalla = (['signal'] if e.get('traffic_signal') or (e.get('end_node') or {}).get('traffic_signal') else []) + \

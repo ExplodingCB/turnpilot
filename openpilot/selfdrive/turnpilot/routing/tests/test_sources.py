@@ -576,6 +576,20 @@ class TestReroute(RouterCase):
     self.assertIsNone(self.router.reroute(outside, DESTINATION, 90, 'en', self.EXCLUDE))  # the car off the corridor
     self.assertEqual((self.params.writes, len(self.server.corridor_requests())), ([], 1))
 
+  def test_the_kept_route_is_served_again(self):
+    """The avoidance loop keeps an earlier route when a reroute fails or costs past its budget (routing/avoid.py), and that
+    reroute had become the served one: navd serves the kept one again, so its opposing roads and speed limits are its own,
+    not unknown."""
+    first = self.router.route(START, DESTINATION, 90, 'en')
+    self.steps = [dict(s) for s in STEPS]
+    second = self.router.reroute(START, DESTINATION, 90, 'en', self.EXCLUDE)
+    self.assertEqual(self.router.opposing(first), {})  # the reroute is served: the first is unknown
+    self.assertTrue(self.router.serve_again(first))
+    self.assertEqual(self.router.opposing(first), {0: (11.11, 1)})
+    self.assertEqual(self.router.controls(second), ([], 'failed'))
+    self.assertFalse(self.router.serve_again([dict(s) for s in STEPS]))  # a route it never gave
+    self.assertEqual(self.router.opposing(first), {0: (11.11, 1)})
+
   def test_a_routing_failure_or_no_route_is_a_failed_iteration(self):
     first = self.router.route(START, DESTINATION, 90, 'en')
     self.params.writes.clear()
@@ -776,6 +790,9 @@ class TestRealCorridor(unittest.TestCase):
       self.assertIsNotNone(engine.route)
       self.assertEqual(engine.route[1]['maneuver']['modifier'], 'left')
       self.assertEqual(read_status(params)['state'], 'ready')
+      # the route's speed limits, off the controls' own trace (tagged, else the class default): one per edge, to its end
+      self.assertTrue(engine.limits and all(ms > 0. for _, ms in engine.limits))
+      self.assertAlmostEqual(engine.limits[-1][0], sum(s['distance'] for s in engine.route), delta=5.)
 
 
 if __name__ == '__main__':

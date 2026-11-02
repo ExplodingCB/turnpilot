@@ -25,7 +25,10 @@ a car the driver sped up isn't sent into the turn again from road speed.
 Nor does a turn's first pulse go out late: gate 1's model took a turn from a pulse 40 m out and not from 10-20 m, and a
 pulse at or past the junction turns the car into the curb or the oncoming lanes. A turn whose desire hasn't gone out by
 MIN_FIRST_PULSE_M (between those two) while openpilot is steering is skipped as above, reason tooLate: one that comes up
-that close (navd moves past a bend or a straight-on step only 10 m beyond it), or one openpilot engages for that late.
+that close (navd moves past a bend or a straight-on step only 10 m beyond it), or one openpilot engages for that late. A
+turn whose pulse waits past an opening on its side it may not enter (desire_timing.wrong_way_wait: a one-way toward it)
+has its deadline moved in to that point less WRONG_WAY_GRACE_M (desire_timing.first_pulse_by): a later pulse beats a
+turn into the one-way, and a turn the model won't take from there is missed and rerouted.
 With openpilot not steering no desire goes out at all, and the driver turning there isn't skipped under them; under
 TurnPilotAlwaysDrive neither is a turn too fast (tooFast, unprotectedStop: ALWAYS_DRIVE.md R4b), its count starting once
 openpilot steers, so a re-engage inside its stopping distance from a speed it can be made at drives it. A pulse
@@ -48,6 +51,7 @@ import math
 from dataclasses import dataclass
 
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.turnpilot.desire_timing import first_pulse_by
 from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_ACCEL_MIN, SPEED_CAP_TAU
 from openpilot.selfdrive.turnpilot.route_follower import LEFT, TURN
 from openpilot.selfdrive.turnpilot.turn_speed import A_LAT_MAX, V_TURN_MAX, corner_tangent
@@ -128,7 +132,8 @@ class TurnSkip:
                        modifier=ahead.modifier, angle_deg=round(ahead.angle_deg, 1), geometry=ahead.geometry,
                        distance=round(ahead_distance, 1), v_ego=round(v_ego, 2))
       return SkipState(False, True, ahead_skipped)
-    if not desire_out and lat_active and distance < MIN_FIRST_PULSE_M and not pulse_at_go:
+    # a turn whose pulse waits past an opening it may not enter (desire_timing.wrong_way_wait) is too late only past that
+    if not desire_out and lat_active and distance < first_pulse_by(maneuver, MIN_FIRST_PULSE_M) and not pulse_at_go:
       self.skip(maneuver, distance, maneuver_id, v_ego, 'tooLate')
       return SkipState(True, False)
     curb_side = (maneuver.side == LEFT) != right_hand_traffic

@@ -369,3 +369,48 @@ class TestFillControls(unittest.TestCase):
                        Control(1, 'signal', 80., 0, 80.)], 'partial', 0.)
     self.assertEqual([(c.junctionInfo.osmNodeId, c.junctionInfo.suspected, str(c.junctionInfo.status)) for c in ni.controls],
                      [(7, True, 'failed'), (0, False, 'none')])
+
+
+def divided_left(openings, modifier='left', left_entry=False, right_entry=True):
+  """Two steps east along the equator (111 m each): the first ends at a turn of modifier (north for a left), and passes
+  straight through an intersection each of openings m before it, whose roads north (the left) and south (the right) the car
+  may enter or not (OSRM's entry). As Valhalla gives a left onto a divided road: its near carriageway, one-way toward the car
+  from the left, crossed first."""
+  m_per_deg = 111195.
+  crossings = [{'location': [round((111.195 - d) / m_per_deg, 9), 0.], 'bearings': [0, 90, 180, 270],
+                'entry': [left_entry, True, right_entry, False], 'in': 3, 'out': 1} for d in openings]
+  first = {'location': [0., 0.], 'bearings': [90], 'entry': [True], 'out': 0}
+  left = 'left' in modifier
+  return [{'geometry': {'coordinates': [[0., 0.], [0.0005, 0.], [0.001, 0.]]}, 'distance': 111.195, 'intersections': [first] + crossings,
+           'maneuver': {'type': 'depart', 'bearing_after': 90}},
+          {'geometry': {'coordinates': [[0.001, 0.], [0.001, 0.001]]}, 'distance': 111.195,
+           'maneuver': {'type': 'turn', 'modifier': modifier, 'bearing_before': 90, 'bearing_after': 0 if left else 180},
+           'intersections': [{'location': [0.001, 0.], 'bearings': [0, 180, 270], 'entry': [True, True, False], 'in': 2,
+                              'out': 0 if left else 1}]}]
+
+
+class TestWrongWay(unittest.TestCase):
+  """guidance.wrong_way_before: an opening on the turn's side the car may not enter, before the turn's junction, which the
+  turn's desire waits past (desire_timing.wrong_way_wait). The first drive's "left onto a one-way at a red light"."""
+
+  def test_a_one_way_toward_the_car_on_the_turns_side_before_it(self):
+    from openpilot.selfdrive.turnpilot.routing.guidance import wrong_way_before
+    self.assertAlmostEqual(wrong_way_before(divided_left([16.]), 0), 16., delta=0.5)
+    self.assertAlmostEqual(wrong_way_before(divided_left([40., 16.]), 0), 16., delta=0.5)  # the one nearest the junction
+    # a road the car may enter there is no wrong way (a turn there is a wrong turn, not a one-way, and is left as it was)
+    self.assertEqual(wrong_way_before(divided_left([16.], left_entry=True), 0), 0.)
+    # on the other side of the turn: none for this one, but it is for a right
+    self.assertEqual(wrong_way_before(divided_left([16.], left_entry=True, right_entry=False), 0), 0.)
+    self.assertAlmostEqual(wrong_way_before(divided_left([16.], 'right', left_entry=True, right_entry=False), 0), 16., delta=0.5)
+    # past the window, no maneuver after the step, a maneuver with no side: none
+    self.assertEqual(wrong_way_before(divided_left([70.]), 0), 0.)
+    self.assertEqual(wrong_way_before(divided_left([16.]), 1), 0.)
+    self.assertEqual(wrong_way_before(divided_left([16.], 'straight'), 0), 0.)
+
+  def test_navd_sends_it_with_the_maneuver_and_turnpilotd_reads_it(self):
+    steps = divided_left([16.])
+    ni = messaging.new_message('navInstruction').navInstruction
+    fill_guidance(ni, steps, 0, 60.)
+    self.assertAlmostEqual(ni.maneuverWrongWayM, 16., delta=0.5)
+    self.assertAlmostEqual(ni.allManeuvers[0].wrongWayM, 16., delta=0.5)
+    self.assertAlmostEqual(maneuver_from_instruction(ni).wrong_way_m, 16., delta=0.5)

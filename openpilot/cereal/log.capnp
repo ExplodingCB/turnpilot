@@ -2523,6 +2523,10 @@ struct NavInstruction {
   routeTurns @33 :List(Float32);
   routeTurnsStart @34 :Float32;
   routeTurnsStep @35 :Float32;
+  # TurnPilot: m before the maneuver's junction of the nearest opening on the turn's side the car may not enter (a one-way
+  # toward it: a divided road's near carriageway), at an intersection the route goes straight through within 60 m
+  # (routing/guidance.py: wrong_way_before); 0 none. The turn's desire waits until the car is past it (desire_timing.py)
+  maneuverWrongWayM @36 :Float32;
 
   enum Opposing {
     unknown @0;  # no intersection data for the junction (or a navd from before the field)
@@ -2749,6 +2753,7 @@ struct NavInstruction {
     opposingSpeed @8 :Float32;  # as maneuverOpposingSpeed and maneuverOpposingLanes
     opposingLanes @9 :UInt8;
     opposingStraightM @10 :Float32;  # as maneuverOpposingStraightM
+    wrongWayM @11 :Float32;  # as maneuverWrongWayM
   }
 }
 

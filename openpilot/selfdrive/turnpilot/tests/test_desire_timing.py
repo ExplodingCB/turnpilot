@@ -496,3 +496,48 @@ def test_a_stall_pulse_is_one_fresh_edge_of_the_turn_in_progress_whatever_it_has
   step_through(done, [(2., 1, RIGHT_TURN, 30., 8., 0., False), (3., 1, RIGHT_TURN, 14., 4., -0.8, False)])
   assert done.done and not done.stall_pulse()
   assert not DesireTiming().stall_pulse()
+
+
+def drive_wrong_way(wrong_way_m, speed_profile, seconds=60.):
+  """drive() for a left at 200 m with an opening on its left the car may not enter wrong_way_m before it (navd's
+  maneuverWrongWayM; 0 none), the car standing where speed_profile(t) is 0 and turning 8 m out; as turnpilotd, the pulse
+  waits by the furthest reading of the junction (far). Returns ([(s, distance, desire)], TurnSkip)."""
+  navd = FakeNavd([(200., "turn", "left", (0., 270., 2)), (900., "turn", "right")], wrong_way={0: wrong_way_m})
+  rf, dt_, skip = RouteFollower(), DesireTiming(), TurnSkip()
+  s, out = 0., []
+  for i in range(int(seconds / DT_MDL)):
+    v = speed_profile(i * DT_MDL)
+    instr = navd.update(s)
+    rf.update(instr, instr is not None, True, v, DT_MDL)
+    yaw = v / 8. if rf.upcoming is not None and rf.distance < 8. else 0.
+    state = skip.update(rf.upcoming, rf.distance, rf.maneuver_id, v, dt_.maneuver_id == rf.maneuver_id and dt_.started)
+    desire = dt_.update(None if state.skipped else rf.upcoming, rf.distance, rf.maneuver_id, rf.passed, v, 90. if yaw else 0., True, True,
+                        DT_MDL, yaw, may_start=state.feasible_now, far=rf.distance + rf.junction_spread)
+    out.append((s, rf.distance, desire))
+    s += v * DT_MDL
+  return out, skip
+
+
+def test_no_turn_pulse_short_of_an_opening_the_car_may_not_enter():
+  """The first drive: at a red light the car planned a left onto a one-way. Valhalla's route was right (its left is at the
+  far carriageway of a divided road, 8 to 20 m on), but the pulse went 40 m out and again as the car pulled away from the
+  light standing at the near carriageway, a one-way toward it, and the model takes a turn desire at the first opening that
+  way. With navd's maneuverWrongWayM the pulse waits until the car is WRONG_WAY_PAST_M past that opening, and the turn isn't
+  skipped as too late for it (turn_skip's deadline moves in with it)."""
+  from openpilot.selfdrive.turnpilot.desire_timing import WRONG_WAY_PAST_M
+  plain, _ = drive_wrong_way(0., lambda t: 5.5)
+  assert rising_edges(plain, Desire.turnLeft)[0][1] > TURN_DESIRE_LEAD_M - 1.5  # as before: from the lead
+  gated, skip = drive_wrong_way(16., lambda t: 5.5)
+  edges = rising_edges(gated, Desire.turnLeft)
+  assert edges and not skip.skipped
+  assert all(desire == Desire.none for s, d, desire in gated if s < 200. - 16. + WRONG_WAY_PAST_M)
+  assert 16. - WRONG_WAY_PAST_M - 1. < edges[0][1] <= 16. - WRONG_WAY_PAST_M  # the first frame past it
+  # standing at the opening's red light, 10 m short of it, for 20 s: no pulse while standing or pulling away, one past it
+  stop_s = 200. - 16. - 10.
+  red, skip = drive_wrong_way(16., lambda t: 8. if t < stop_s / 8. else 0. if t < stop_s / 8. + 20. else 4.)
+  edges = rising_edges(red, Desire.turnLeft)
+  assert edges and not skip.skipped
+  assert all(desire == Desire.none for s, d, desire in red if s < 200. - 16. + WRONG_WAY_PAST_M)
+  # the same light with no such opening: the pulse is out on the approach and again as the car pulls away
+  red, _ = drive_wrong_way(0., lambda t: 8. if t < stop_s / 8. else 0. if t < stop_s / 8. + 20. else 4.)
+  assert sum(1 for s, d in rising_edges(red, Desire.turnLeft) if s < 200. - 16.) >= 2

@@ -149,6 +149,13 @@ class StubRouter:
       raise self.opposing_result
     return self.opposing_result
 
+  def limits(self, steps):
+    """TurnPilot: the route's speed limits [(end m, m/s)] (routing/controls.py: limit_segments), or an exception it raises."""
+    result = getattr(self, 'limits_result', [])
+    if isinstance(result, Exception):
+      raise result
+    return result
+
   def controls_ahead(self, position, bearing):
     self.ahead_calls.append((position, bearing, threading.current_thread().name))
     if isinstance(self.ahead_result, Exception):
@@ -479,6 +486,26 @@ class TestRouteEngine(unittest.TestCase):
     message = self.last_message('navInstruction')
     self.assertTrue(message.valid)
     self.assertEqual(message.navInstruction.maneuverOpposingSpeed, 0.)
+
+  def test_speed_limit_is_the_edge_the_car_is_on(self):
+    # navInstruction.speedLimit: navd never filled it, so turnpilotd took every road as 50 mph or more and lit the signal 300 ft
+    # before every turn and lane change (car_signals.lead_m). The route job reads the kept route's limits once (router.limits:
+    # tagged, else the road class's default), and each instruction carries the limit of the edge the car is on
+    self.engine.router.limits_result = [(60., 13.41), (222.39, 8.94)]
+    self.load_route()
+    self.engine.send_instruction()
+    self.assertAlmostEqual(self.last_message('navInstruction').navInstruction.speedLimit, 13.41, places=2)
+    self.engine.last_position = (0.0015, 0)  # on the second step, past the first edge's end
+    self.engine.send_instruction()
+    self.assertAlmostEqual(self.last_message('navInstruction').navInstruction.speedLimit, 8.94, places=2)
+    # a failure keeps the route, its limit unknown (0: the signal leads 300 ft)
+    self.engine.last_position = (0, 0)
+    self.engine.router.limits_result = RuntimeError("synthetic")
+    self.load_route()
+    self.engine.send_instruction()
+    message = self.last_message('navInstruction')
+    self.assertTrue(message.valid)
+    self.assertEqual(message.navInstruction.speedLimit, 0.)
 
   def test_controls_failure_keeps_the_route(self):
     self.engine.router.controls_result = RuntimeError("synthetic")
@@ -1243,6 +1270,30 @@ class TestStopAvoidance(unittest.TestCase):
     self.assertEqual((b.certification, self.engine.avoid_status), ('unavoidable', 'keptBest'))
     avoid = self.engine.avoid_sets[(0.002, 0)]
     self.assertEqual(avoid.keys(), {self.stop(1, 60.).approach_key})  # the failed batch (b) is dropped from the set
+
+  def test_the_detour_is_bounded_against_the_plain_route(self):
+    """Avoidance took any route around an uncertifiable stop: on the region's real tiles, every stop uncertifiable (the car
+    with no surveys), its kept route was up to 74% slower (+242 s) and 47% longer than the plain one. A reroute adding more
+    than detour_budget_s over the plain route (10% of it, from 30 s to 180 s) is a failed iteration: its batch is dropped
+    and unavoidable, and the best route within the budget is kept (keptBest)."""
+    from openpilot.selfdrive.turnpilot.routing.avoid import detour_budget_s
+    self.assertEqual((detour_budget_s(20.), detour_budget_s(900.), detour_budget_s(3600.)), (30., 90., 180.))
+    a, b = self.stop(1, 60.), self.stop(2, 150.)
+    near, far = self.steps(), self.steps()
+    for s in near:
+      s['duration'] = 15  # +10 s over the plain route's 20 s: within the 30 s floor
+    for s in far:
+      s['duration'] = 60  # +100 s: past it
+    router = self.engine.router
+    router.steps = self.route_with([a])
+    router.reroute_results = [self.route_with([b], near), self.route_with([], far)]
+    self.engine.calculate_route((0.002, 0))
+    self.assertEqual(len(router.reroute_calls), 2)
+    self.assertIs(self.engine.route, near)
+    self.assertEqual(self.engine.controls, [b])
+    self.assertEqual((b.certification, self.engine.avoid_status), ('unavoidable', 'keptBest'))
+    self.assertAlmostEqual(self.engine.avoid_added_s, 10.)
+    self.assertEqual(self.engine.avoid_sets[(0.002, 0)].keys(), {a.approach_key})  # the over-budget batch (b) is dropped
 
   def test_N1_N10_first_last_and_own_edge_are_unavoidable_and_never_excluded(self):
     own = self.stop(3, 100.)

@@ -17,6 +17,12 @@ The loop (run), with route(exclude) the router's status-neutral reroute, which n
   - a failed iteration (no route around, a route off the corridor, any routing error) drops the batch it added from the set,
     keeps the previous steps and controls as a pair and ends 'keptBest', as do RouteJob's cancel, AVOID_TIME_S and
     MAX_AVOID_ITER, each checked between iterations;
+  - so does a reroute that takes more than detour_budget_s longer than the plain route (the first, before any exclusion): a
+    stop is never avoided at any price. With no stop certified yet (no surveys: notSurveyed on every stop), on the region's
+    real tiles the unbounded loop kept routes up to 74% slower (+242 s) and 47% longer than the plain one, 1 in 8 over +20%:
+    the detours the first drive's owner called routes no sensible driver would pick. Under vision stop-go the line's own
+    gate decides an unavoidable stop as any other (stop_go.py V1), so the detour buys little; it is kept to AVOID_ADD_FRAC
+    of the plain route, at least AVOID_ADD_MIN_S (a short trip may still go round a block) and at most AVOID_ADD_MAX_S;
   - otherwise it ends 'clean' (nothing uncertifiable left) or 'unavoidable' (only unavoidable controls left).
 Whatever ends it, every stop and yield still uncertifiable on the kept route becomes unavoidable: the driver needs to know.
 """
@@ -29,6 +35,14 @@ from openpilot.selfdrive.turnpilot.routing.controls import same_edge
 from openpilot.selfdrive.turnpilot.stop_rules import MAX_AVOID_ITER, MAX_EXCLUDE_LOCATIONS
 
 STOP_KINDS = ('stop', 'yield')
+AVOID_ADD_FRAC = 0.10   # the avoidance may add this share of the plain route's time (module docstring)...
+AVOID_ADD_MIN_S = 30.   # ...but at least this much...
+AVOID_ADD_MAX_S = 180.  # ...and never more than this, however long the trip (route_notice chimes from +50% or +5 min)
+
+
+def detour_budget_s(base_s: float) -> float:
+  """s the avoidance may add over the plain route of base_s s: AVOID_ADD_FRAC of it, within AVOID_ADD_MIN_S..AVOID_ADD_MAX_S."""
+  return min(max(AVOID_ADD_FRAC * max(base_s, 0.), AVOID_ADD_MIN_S), AVOID_ADD_MAX_S)
 
 
 def mark(control, certification: str, reason: str | None = None) -> None:
@@ -121,8 +135,10 @@ def run(steps, controls, controls_status: str, avoid: AvoidSet, *, certify: Call
   bool; deadline: monotonic() time it stops by. enabled False (TurnPilotAvoidStops off): certify only, status none.
   headings([(lat, lon, way id, forward)]) -> Valhalla's own heading at each new exclusion point, or None (the route's
   local bearing stays): Valhalla correlates a point against the heading it computes itself, which a short curved approach
-  can put 50 deg off the route's (Indianapolis way 17439639), and drops it, so the stop survives as 'failed'."""
+  can put 50 deg off the route's (Indianapolis way 17439639), and drops it, so the stop survives as 'failed'.
+  A reroute past detour_budget_s of the plain route (steps, as given) is a failed iteration: its batch dropped, the best kept."""
   first = duration(steps)
+  budget = detour_budget_s(first)
   for c in stops(controls):
     certify(c, steps)
   if not enabled:
@@ -171,6 +187,15 @@ def run(steps, controls, controls_status: str, avoid: AvoidSet, *, certify: Call
         mark(c, 'unavoidable')
       status = 'keptBest'
       cloudlog.warning(f"turnpilot avoid: no route around {len(batch)} more stops: the best route is kept, those are unavoidable")
+      break
+    added = duration(new_steps) - first
+    if added > budget:
+      avoid.drop([c.approach_key for c in batch])
+      for c in batch:
+        mark(c, 'unavoidable')
+      status = 'keptBest'
+      cloudlog.warning(f"turnpilot avoid: the route around {len(batch)} more stops adds {added:.0f} s over the plain route's {first:.0f} s, " +
+                       f"past the {budget:.0f} s budget: the best route within it is kept, those are unavoidable")
       break
     excluded |= {c.approach_key for c in bad} & keys
     steps, (controls, controls_status), sent = new_steps, new, keys

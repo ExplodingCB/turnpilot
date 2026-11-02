@@ -15,6 +15,7 @@ the surveys (maps/surveyed_junctions.json) and TurnPilotJunctionOverrides, read 
 """
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,12 +30,14 @@ from openpilot.selfdrive.turnpilot.maps.status import NavStatus
 from openpilot.selfdrive.turnpilot.routing import junctions
 from openpilot.selfdrive.turnpilot.routing.osm_sidecar import NO_DIRECTORY
 from openpilot.selfdrive.turnpilot.routing.valhalla_source import ValhallaSource
+from openpilot.selfdrive.turnpilot.stop_rules import MAX_AVOID_ITER
 
 PACKS_DIR = 'corridors'
 CONFIG_KEYS = ('TurnPilotMapHost', 'TurnPilotMapKey', 'TurnPilotMapCert')
 RETRY_SECONDS = 30.  # between downloads after one that could work on a retry (a network blip)
 REFUSED_RETRY_SECONDS = 300.  # after a refusal (422, bad key, bad TLS, bad pack, comma storage), unless the destination or settings change
 CANCELLED = 'cancelled'
+RECENT_ROUTES = MAX_AVOID_ITER + 2  # served routes serve_again() can go back to: one route job's, the avoidance's reroutes too
 
 
 def local_override(params) -> str:
@@ -84,10 +87,28 @@ class MapRouter:
     self.failure: Failure | None = None
     # (steps, source, tiles_dir, sidecar_dir) of the last route: controls() asks the same source
     self.served: tuple | None = None
+    self.recent: deque = deque(maxlen=RECENT_ROUTES)  # the last few served, for serve_again()
 
   @property
   def packs_dir(self) -> Path:
     return (self.directory or maps_dir()) / PACKS_DIR
+
+  def serve(self, served: tuple) -> None:
+    self.served = served
+    self.recent.append(served)
+
+  def serve_again(self, steps) -> bool:
+    """Make steps, a route this router gave lately, the served one again: the avoidance loop (routing/avoid.py) keeps an
+    earlier route when a reroute fails or costs past its budget, and that reroute became the served one, so opposing() and
+    limits() for the kept route would answer unknown. Whether it was one of them."""
+    if self.served is not None and self.served[0] is steps:
+      return True
+    found = next((s for s in reversed(self.recent) if s[0] is steps), None)
+    if found is None:
+      cloudlog.error("turnpilot: the route to serve again isn't one this router gave lately")
+      return False
+    self.served = found
+    return True
 
   def config(self) -> tuple:
     return tuple(self.params.get(k) for k in CONFIG_KEYS)
@@ -117,6 +138,19 @@ class MapRouter:
       cloudlog.error("turnpilot: opposing roads asked for a route this router didn't give")
       return {}
     return served[1].opposing(steps)
+
+  def limits(self, steps) -> list:
+    """[(end m in navd's step frame, m/s)] of the route's edges, its tagged limits else their class defaults
+    (routing/controls.py: limit_segments; navInstruction.speedLimit), from the source that routed it; [] (unknown) for
+    steps it didn't route, or a source that can't say."""
+    served = self.served
+    if served is None or served[0] is not steps:
+      cloudlog.error("turnpilot: speed limits asked for a route this router didn't give")
+      return []
+    if not hasattr(served[1], 'limits'):
+      cloudlog.warning("turnpilot: the route's source has no speed limits")
+      return []
+    return served[1].limits(steps)
 
   def controls_ahead(self, position, bearing) -> tuple[list, str, list]:
     """(controls, status, road) on the road ahead of the car off the route (routing/controls.py: controls_ahead), from the source
@@ -196,7 +230,7 @@ class MapRouter:
     except Exception as e:
       cloudlog.warning(f"turnpilot reroute failed: {type(e).__name__}: {e}")
       return None
-    self.served = (steps, source, *extra)
+    self.serve((steps, source, *extra))
     return steps
 
   def clear(self):
@@ -233,7 +267,7 @@ class MapRouter:
     steps = self.routed(self.local[1], start, destination, bearing, language, 'the local tiles')
     if not steps:
       raise MapError('no_route', f"Valhalla found no route on the local tiles ({tiles}).", 'No route found')
-    self.served = (steps, *self.local_served(self.local[1]))
+    self.serve((steps, *self.local_served(self.local[1])))
     self.status.set('ready', 'Routing on local tiles (developer override, no geofence).', 'Local tiles', source='local',
                     destination=list(destination))
     return steps
@@ -258,7 +292,7 @@ class MapRouter:
           raise MapError('no_route', "No route on the map for this drive.", 'No route found')
         if current.pack.holds(steps):
           self.ready(current.region, destination)
-          self.served = (steps, current.source, None, current.pack.path)
+          self.serve((steps, current.source, None, current.pack.path))
           return steps
         cloudlog.warning("turnpilot: the reroute leaves the corridor, downloading a new corridor")
       else:
@@ -286,7 +320,7 @@ class MapRouter:
     if cancelled is not None and cancelled():
       raise cancelled_error()
     self.ready(region, destination)
-    self.served = (steps, downloaded.source, None, downloaded.pack.path)
+    self.serve((steps, downloaded.source, None, downloaded.pack.path))
     return steps
 
   def ready(self, region: Region, destination):
