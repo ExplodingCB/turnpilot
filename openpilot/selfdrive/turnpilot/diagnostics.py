@@ -367,6 +367,25 @@ def gps_service_text(name: str, g: dict | None) -> str:
   return f"  {name}: " + ", ".join(parts)
 
 
+def radio_text(radio: dict, now=time.monotonic) -> list[str]:
+  """The u-blox's radio readings (status.see_ublox): what separates no signal at the antenna from noise drowning it."""
+  if not radio:
+    return ["  u-blox radio: no ubloxGnss messages read"]
+  t = now()
+  out = []
+  if "hw" in radio:
+    h = radio["hw"]
+    out.append(f"  u-blox radio: noise {h['noise']} per ms, AGC {h['agc']} of 8191, antenna {h['antenna']}, antenna power " +
+               f"{h['antenna_power']}, jamming {h['jamming']} ({t - h['at']:.0f} s ago)")
+  if "sats" in radio:
+    v = radio["sats"]
+    out.append(f"  u-blox satellites: hears {v['heard']} of {v['listed']} it expects, best signal {v['best_cno']} dB-Hz " +
+               f"({t - v['at']:.0f} s ago)")
+  if "meas" in radio:
+    out.append(f"  u-blox measurements: {radio['meas']['count']} ({t - radio['meas']['at']:.0f} s ago)")
+  return out
+
+
 def gps_text(gps: dict | None, params, ublox: bool | None, clock: bool | None, now: float) -> list[str]:
   """The GPS section: which daemon runs, each GPS message's state and quality, the assistance qcomgpsd gets and
   LastGPSPosition, never a coordinate. gps is the status reader's (status.read_gps); ublox is gps_daemon_rule()'s."""
@@ -385,6 +404,7 @@ def gps_text(gps: dict | None, params, ublox: bool | None, clock: bool | None, n
       out.append("  running: " + ", ".join(f"{d} {words[procs.get(d)]}" for d in GPS_DAEMONS))
     services = gps.get("services") or {}
     out += [gps_service_text(s, services.get(s)) for s in GPS_SERVICES]
+    out += radio_text(gps.get("radio") or {})
   if ublox is not True:
     valid = {True: 'yes', False: 'no'}.get(clock, 'unknown')
     out.append("  assistance (qcomgpsd): this build downloads no assistance data; at its start it sets the modem's time only " +

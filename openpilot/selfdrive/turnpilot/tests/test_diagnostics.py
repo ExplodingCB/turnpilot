@@ -325,3 +325,30 @@ class TestQcomSavedPosition(OpenpilotTestCase):
       def put(self, *a):
         raise OSError("read-only")
     qcomgpsd.save_position(Broken(), self.fix())
+
+
+def test_radio_text_says_what_the_ublox_hears():
+  from openpilot.selfdrive.turnpilot.diagnostics import radio_text
+  def now(): return 100.
+  assert radio_text({}) == ["  u-blox radio: no ubloxGnss messages read"]
+  lines = radio_text({"hw": {"noise": 95, "agc": 3432, "antenna": "ok", "antenna_power": "on", "jamming": "12", "at": 99.},
+                      "sats": {"listed": 20, "heard": 0, "best_cno": 0, "at": 98.}, "meas": {"count": 0, "at": 98.}}, now=now)
+  assert lines[0].startswith("  u-blox radio: noise 95 per ms, AGC 3432 of 8191, antenna ok")
+  assert lines[1] == "  u-blox satellites: hears 0 of 20 it expects, best signal 0 dB-Hz (2 s ago)"
+  assert lines[2] == "  u-blox measurements: 0 (2 s ago)"
+
+
+def test_see_ublox_reads_each_ublox_message_and_never_a_position():
+  from openpilot.cereal import messaging
+  from openpilot.selfdrive.turnpilot.web.status import see_ublox
+  hw = messaging.new_message("ubloxGnss")
+  h = hw.ubloxGnss.init("hwStatus")
+  h.noisePerMS, h.agcCnt = 95, 3432
+  sat = messaging.new_message("ubloxGnss")
+  svs = sat.ubloxGnss.init("satReport").init("svs", 3)
+  svs[0].cno, svs[1].cno, svs[2].cno = 0, 31, 0
+  radio: dict = {}
+  see_ublox(radio, [hw.as_reader(), sat.as_reader()])
+  assert radio["hw"]["noise"] == 95 and radio["hw"]["agc"] == 3432
+  assert radio["sats"]["listed"] == 3 and radio["sats"]["heard"] == 1 and radio["sats"]["best_cno"] == 31
+  assert "latitude" not in str(radio) and "longitude" not in str(radio)

@@ -97,6 +97,25 @@ def read_gps(sm) -> dict:
   return {"procs": procs, "services": services}
 
 
+def see_ublox(radio: dict, msgs) -> None:
+  """The u-blox's own radio readings for the diagnostics, from every ubloxGnss message since the last snapshot: MON-HW's
+  noise and AGC (interference raises the noise; no antenna signal at all leaves it low), its antenna and jamming state,
+  and how many satellites the receiver actually hears (C/N0 above 0) against how many it expects. Never a position."""
+  for m in msgs:
+    g = m.ubloxGnss
+    w = g.which()
+    if w == "hwStatus":
+      h = g.hwStatus
+      radio["hw"] = {"noise": int(h.noisePerMS), "agc": int(h.agcCnt), "antenna": str(h.aStatus), "antenna_power": str(h.aPower),
+                     "jamming": str(h.jamInd), "at": time.monotonic()}
+    elif w == "satReport":
+      svs = g.satReport.svs
+      radio["sats"] = {"listed": len(svs), "heard": sum(1 for sv in svs if sv.cno > 0),
+                       "best_cno": max((int(sv.cno) for sv in svs), default=0), "at": time.monotonic()}
+    elif w == "measurementReport":
+      radio["meas"] = {"count": int(g.measurementReport.numMeas), "at": time.monotonic()}
+
+
 def format_distance(meters: float, metric: bool) -> str:
   if metric:
     if meters < 1000:
@@ -182,6 +201,7 @@ class StatusReader(threading.Thread):
     self.stopped = threading.Event()
     self.events = events
     self.samples: dict[str, deque] = {}
+    self.radio: dict = {}
 
   def stop(self):
     self.stopped.set()
@@ -191,7 +211,7 @@ class StatusReader(threading.Thread):
       return self.snapshot
 
   def run(self):
-    sm, errors, logged = None, None, False
+    sm, errors, ublox, logged = None, None, None, False
     while not self.stopped.is_set():
       try:
         if sm is None:
@@ -199,10 +219,13 @@ class StatusReader(threading.Thread):
           from openpilot.cereal import messaging
           sm = messaging.SubMaster(SERVICES)
           errors = messaging.sub_sock("errorLogMessage", conflate=False) if self.events is not None else None
+          ublox = messaging.sub_sock("ubloxGnss", conflate=False)
         sm.update(0)  # the sockets conflate, so this takes the newest message of each service
         snap = read_services(sm)
         snap["live"] = read_live(sm, self.samples)
         snap["gps_diag"] = read_gps(sm)
+        see_ublox(self.radio, messaging.drain_sock(ublox))
+        snap["gps_diag"]["radio"] = dict(self.radio)
         with self.lock:
           self.snapshot = snap
         if self.events is not None:

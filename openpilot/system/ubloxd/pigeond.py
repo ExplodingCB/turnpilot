@@ -283,6 +283,29 @@ def deinitialize_and_exit(pigeon: TTYPigeon | None):
   set_power(False)
   sys.exit(0)
 
+def cold_start_once(pigeon: TTYPigeon) -> None:
+  """TurnPilot: one cold start of the receiver, the first time pigeond runs on this install (TurnPilotGpsColdStart, default
+  on, cleared after). A receiver whose saved state went bad (its flash backup or battery-backed data) can stay powered,
+  talking and deaf across restarts; clearing that backup and restarting GNSS cold is the u-blox's own recovery. It never
+  touches the port or message config, and it never raises."""
+  params = Params()
+  try:
+    if not params.get_bool("TurnPilotGpsColdStart"):
+      return
+    params.put_bool("TurnPilotGpsColdStart", False)
+    cloudlog.warning("TurnPilot: cold starting the ublox once")
+    # UBX-UPD-SOS clear: delete the flash backup
+    pigeon.send(b"\xB5\x62\x09\x14\x04\x00\x01\x00\x00\x00\x22\xf0")
+    time.sleep(0.5)
+    # UBX-CFG-RST: navBbrMask 0xFFFF (cold start, clear all saved navigation data), resetMode 0x02 (GNSS only)
+    pigeon.send(add_ubx_checksum(b"\xB5\x62\x06\x04\x04\x00\xFF\xFF\x02\x00"))
+    time.sleep(1.0)
+    # UBX-CFG-RST: resetMode 0x09, controlled GNSS start, in case GNSS was left stopped
+    pigeon.send(add_ubx_checksum(b"\xB5\x62\x06\x04\x04\x00\x00\x00\x09\x00"))
+  except Exception:
+    cloudlog.exception("TurnPilot: ublox cold start failed")
+
+
 def init(pigeon: TTYPigeon) -> None:
   # register exit handler
   signal.signal(signal.SIGINT, lambda sig, frame: deinitialize_and_exit(pigeon))
@@ -295,6 +318,7 @@ def init(pigeon: TTYPigeon) -> None:
 
   init_baudrate(pigeon)
   init_pigeon(pigeon)
+  cold_start_once(pigeon)
 
   if system_time_valid():
     try:
