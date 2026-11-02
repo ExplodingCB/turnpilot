@@ -18,8 +18,9 @@ from pathlib import Path
 import requests
 
 from openpilot.common.swaglog import cloudlog
-from openpilot.selfdrive.turnpilot.routing.controls import (Limits, LocateCache, Opposing, actor_call, controls_ahead, exclusion_headings,
-                                                            http_call, opposing_roads, own_edge, route_controls, route_limits)
+from openpilot.selfdrive.turnpilot.routing.controls import (Exits, Limits, LocateCache, Opposing, actor_call, controls_ahead,
+                                                            exclusion_headings, http_call, opposing_roads, own_edge, route_controls,
+                                                            route_exits, route_limits)
 from openpilot.selfdrive.turnpilot.stop_rules import EXCLUDE_HEADING_TOL, MAX_EXCLUDE_LOCATIONS
 
 # tools/turnpilot/install_valhalla_device.sh puts pyvalhalla here, since the system venv is read-only
@@ -107,6 +108,7 @@ class ValhallaSource:
     self.cache = LocateCache()  # Q1 and Q2 for the lookups ahead, by edge id: this source's tiles only
     self.opposing_of: tuple | None = None  # (steps, their opposing roads) from the last controls() that read them
     self.limits_of: tuple | None = None  # (steps, their speed limits) from the last controls() that read them
+    self.exits_of: tuple | None = None  # (steps, their maneuvers' exits) from the last controls() that read them
     if self.url:
       return
     valhalla = import_valhalla()
@@ -156,12 +158,21 @@ class ValhallaSource:
     from real OSM. sidecar_dir: where the OSM stop-sign sidecar and the tiles' stamp are (routing/osm_sidecar.py), always
     given (sources.py), so no route goes without it unsaid. context: the surveys and overrides the junctions are read
     against (routing/junctions.py). The opposing roads are read in the same batched locate, for opposing(), and the speed
-    limits off the same trace, for limits()."""
-    out, limits = Opposing(), Limits()
-    result = route_controls(self._call(), steps, tiles_dir, sidecar_dir, opposing=out, context=context, limits=limits)
+    limits and the maneuvers' exits off the same trace, for limits() and exits()."""
+    out, limits, exits = Opposing(), Limits(), Exits()
+    result = route_controls(self._call(), steps, tiles_dir, sidecar_dir, opposing=out, context=context, limits=limits, exits=exits)
     self.opposing_of = (steps, out.roads) if out.roads is not None else None
     self.limits_of = (steps, limits.segments) if limits.segments is not None else None
+    self.exits_of = (steps, exits.edges) if exits.edges is not None else None
     return result
+
+  def exits(self, steps) -> dict:
+    """{step index: Exit} of the route's maneuvers (routing/controls.py: exit_edges): the last controls()' for these very
+    steps, else read alone (route_exits: tiles with no controls, or other steps)."""
+    done = self.exits_of
+    if done is not None and done[0] is steps:
+      return dict(done[1])
+    return route_exits(self._call(), steps)
 
   def limits(self, steps) -> list:
     """[(end m in navd's step frame, m/s)] of the route's edges (routing/controls.py: limit_segments): the last controls()'

@@ -222,10 +222,10 @@ from openpilot.selfdrive.turnpilot.scene_policy import (CONFIRM_STEADY_HITS, CRO
                                                          far_side_turn, in_path, velocity_trusted)
 from openpilot.selfdrive.turnpilot.turn_skip import SkipState, TurnSkip, can_make_turn
 from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
-from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, DRIVEN, LIGHT_RED_MAX_S, LINE_D, OFF, ROAD_RANGE_M,
+from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, DRIVEN, LIGHT_RED_MAX_S, OFF, ROAD_RANGE_M,
                                                            STAND_UNDECIDED_S,
                                                            ROUTE_REACH_MARGIN_M, LeftInput, UnprotectedLeft, left_mode_for,
-                                                           reach_at_line)
+                                                           left_reach, range_param, reach_at_line, route_range)
 
 FAR_OFF_ALERT_S = ABORT_HOLD_S  # farViewOff is shown this long, once, when the far crop goes off for the drive
 FAR_STATUS_STALE_S = 1.         # the full pass's farStatus older than this: the far crop isn't known to read
@@ -455,7 +455,6 @@ RELIFT_MIN_M = 0.5 * GO_ACCEL * 1. ** 2  # m: a relift needs this much of RELEAS
 # scene not committed to the junction nor the driver having taken over into it. Nearer, the car is in the junction: never
 # held there, the stall's handback covers it (skeptic G3: a walker's hold released 40-50 deg in froze the car there)
 GO_LINE_M = HOLD_LINE_M + MAP_MARGIN_M - LATCH_PAST_M
-LEFT_RANGE_MAX_M = 400.  # TurnPilotLeftRangeM is clamped to 0..this
 LEFT_HOLDS_PULSE = ('approach', 'waitGap', 'creep', 'undecided', 'announce')  # the left's states with no turn pulse yet
 # the junction rules' road frame (scene_policy.road_frame): the car's heading change toward its turn, counted only once the
 # turn's desire has gone out (before it the model follows its lane: its yaw is the road's bend, not the car turning; skeptic
@@ -1219,16 +1218,15 @@ class TurnPilot:
     # on from our approach, skeptic G4), said by its own log line
     # R_req is taken where the car may stand: LINE_D plus the junction's mapped stop line's setback, or ROUTE_REACH_MARGIN_M
     # without one (BUILD_FINDINGS D4); the band straight on from our approach to that reach past where it stands
+    # The check is unprotected_left.route_range, the one navd's routing shares (routing/lefts.py): a route plans no left it fails
     out_of_range = False
     if acting and self.auto_left == AUTO and unprotected_turn(upcoming, right_hand_traffic) and not engaged:
-      setback = self.map_controls.line_setback(rf.distance)
-      margin = ROUTE_REACH_MARGIN_M if setback is None else setback
-      reach = self.route_reach_m = reach_at_line(upcoming.opposing_speed, upcoming.opposing_lanes or None, margin)
-      bent = reach > LINE_D + margin + upcoming.opposing_straight_m
-      out_of_range = reach > self.left_reach_m(route=True) or bent
-      if bent and self.not_straight_id != rf.maneuver_id:
+      rc = route_range(upcoming, self.map_controls.line_setback(rf.distance), self.left_reach_m(route=True), right_hand_traffic,
+                       self.auto_left)
+      self.route_reach_m, out_of_range = rc.reach, rc.out_of_range
+      if rc.bent and self.not_straight_id != rf.maneuver_id:
         self.not_straight_id = rf.maneuver_id
-        cloudlog.event("turnpilot.left_not_straight", error=True, r_req=round(reach, 1), margin=round(margin, 1),
+        cloudlog.event("turnpilot.left_not_straight", error=True, r_req=round(rc.reach, 1), margin=round(rc.margin, 1),
                        straight_m=round(float(upcoming.opposing_straight_m), 1), distance=round(rf.distance, 1))
     self.carry_veto(upcoming, rf, v_ego)
     skip = self.skip.update(None if alt_replaced else upcoming, rf.distance, rf.maneuver_id, v_ego, desire_out, right_hand_traffic, lat_active,
@@ -1970,8 +1968,7 @@ class TurnPilot:
   def left_reach_m(self, route: bool = False) -> float:
     """The range an unprotected left's R_req may reach: the full pass's proven range, or the far crop's while it reads (route:
     while it is on, far_live) and the full pass's is measured (the far crop covers the band only past it)."""
-    far = self.far_live(route) and self.left_range_m > 0.
-    return max(self.left_range_m, self.left_far_range_m) if far else self.left_range_m
+    return left_reach(self.left_range_m, self.left_far_range_m, self.far_live(route))
 
   def unprotected_left(self, turn, upcoming, rf, v_ego: float, acting: bool, objects, raw, raw_far=None,
                        enabled: bool = True) -> LeftCommand | None:
@@ -3346,31 +3343,32 @@ def auto_left_for(params) -> str:
 
 
 def left_range_for(params) -> float:
-  """TurnPilotLeftRangeM, the detector's proven range for oncoming traffic, clamped to 0..LEFT_RANGE_MAX_M; ROAD_RANGE_M
-  (unmeasured: 0, no autonomous left) if unset, not a number (said) or unknown to this build."""
+  """TurnPilotLeftRangeM, the detector's proven range for oncoming traffic, clamped to 0..LEFT_RANGE_MAX_M
+  (unprotected_left.range_param, as navd reads it); ROAD_RANGE_M (unmeasured: 0, no autonomous left) if unset, not a number
+  (said) or unknown to this build."""
   try:
     value = params.get("TurnPilotLeftRangeM")
   except UnknownKeyName:
     log_error("turnpilotd: TurnPilotLeftRangeM unknown to this build's params; run scons")
     return ROAD_RANGE_M
   try:
-    return min(max(float(value), 0.), LEFT_RANGE_MAX_M) if value is not None else ROAD_RANGE_M
+    return range_param(value, ROAD_RANGE_M)
   except (TypeError, ValueError):
     log_error(f"turnpilotd: TurnPilotLeftRangeM {value!r} isn't a number, {ROAD_RANGE_M} m instead")
     return ROAD_RANGE_M
 
 
 def left_far_range_for(params) -> float:
-  """TurnPilotLeftFarRangeM, the far crop's proven range for oncoming traffic, clamped to 0..LEFT_RANGE_MAX_M; 0 (unmeasured:
-  the far crop extends no left's reach) if unset, not a number (said) or unknown to this build."""
+  """TurnPilotLeftFarRangeM, the far crop's proven range for oncoming traffic, clamped to 0..LEFT_RANGE_MAX_M
+  (unprotected_left.range_param); 0 (unmeasured: the far crop extends no left's reach) if unset, not a number (said) or unknown
+  to this build."""
   try:
     value = params.get("TurnPilotLeftFarRangeM")
   except UnknownKeyName:
     log_error("turnpilotd: TurnPilotLeftFarRangeM unknown to this build's params; run scons")
     return 0.
   try:
-    value = value.decode() if isinstance(value, bytes) else value
-    return min(max(float(value), 0.), LEFT_RANGE_MAX_M) if value is not None else 0.
+    return range_param(value, 0.)
   except (TypeError, ValueError):
     log_error(f"turnpilotd: TurnPilotLeftFarRangeM {value!r} isn't a number, unmeasured instead")
     return 0.

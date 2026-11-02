@@ -115,7 +115,7 @@ import math
 from dataclasses import dataclass, field
 
 from openpilot.common.swaglog import cloudlog
-from openpilot.selfdrive.turnpilot.map_controls import LATCH_PAST_M, reengage_stop_m
+from openpilot.selfdrive.turnpilot.map_controls import LATCH_PAST_M, reengage_stop_m, unprotected_turn
 from openpilot.selfdrive.turnpilot.route_follower import UNCERTAIN_M
 from openpilot.selfdrive.turnpilot.scene_policy import (CROSSWALK_X_AFTER_M, CROSSWALK_X_BEFORE_M, ONCOMING_ENTRY_M, ONCOMING_PAST_M,
                                                         ONCOMING_Y_FAR_M, ONCOMING_Y_NEAR_M, STOP_DECEL, VEHICLES, box_overlap,
@@ -344,6 +344,52 @@ def reach_at_line(v_limit: float | None, lanes: int | None, setback: float = 0.)
   v = v_limit if v_limit is not None and v_limit > 0. else DEFAULT_OPPOSING_SPEED
   d = LINE_D + max(setback, 0.)
   return r_req(v, t_req(d, lanes), d)
+
+
+LEFT_RANGE_MAX_M = 400.  # TurnPilotLeftRangeM and TurnPilotLeftFarRangeM are clamped to 0..this
+
+
+def range_param(value, unset: float) -> float:
+  """A TurnPilotLeftRangeM or TurnPilotLeftFarRangeM value as m, clamped to 0..LEFT_RANGE_MAX_M; unset for None. Not a number
+  raises (TypeError, ValueError), for the reader to say: turnpilotd's left_range_for and navd's left config read it alike."""
+  value = value.decode() if isinstance(value, bytes) else value
+  return min(max(float(value), 0.), LEFT_RANGE_MAX_M) if value is not None else unset
+
+
+def left_reach(range_m: float, far_range_m: float, far_on: bool) -> float:
+  """The range an unprotected left's R_req may reach: the full pass's proven range (TurnPilotLeftRangeM), or the far crop's
+  (TurnPilotLeftFarRangeM) where further, while the far crop is on and the full pass's range is measured (the far crop covers
+  the band only past it). turnpilotd's far_on is the full pass's farStatus (far_live, route time's: on, reading or waiting);
+  navd reads no farStatus and takes TurnPilotFarCrop: a far crop off for the drive leaves navd routing a left that turnpilotd
+  then skips out loud, as before any routing knew of it. Both ranges unmeasured (0, the car today): none, either way."""
+  return max(range_m, far_range_m) if far_on and range_m > 0. else range_m
+
+
+@dataclass(frozen=True)
+class RangeCheck:
+  """route_range's verdict on one maneuver."""
+  unprotected: bool = False   # an autonomous unprotected left (map_controls.unprotected_turn, under TurnPilotAutoLeft auto)
+  out_of_range: bool = False  # skipped as soon as it is the maneuver (turn_skip: unprotectedRange) and rerouted
+  reach: float = 0.           # m, its R_req where the car may stand (reach_at_line at LINE_D plus margin)
+  margin: float = 0.          # m past LINE_D that is: the mapped stop line's setback, else ROUTE_REACH_MARGIN_M
+  bent: bool = False          # its opposing road isn't known straight on out to reach (maneuverOpposingStraightM)
+
+
+def route_range(maneuver, setback: float | None, reach_m: float, right_hand_traffic: bool = True, mode: str = AUTO) -> RangeCheck:
+  """Route time's check of a maneuver (route_follower.Maneuver) against the detector's reach_m (left_reach): an autonomous
+  unprotected left (mode auto, the default) whose R_req where the car may stand is past reach_m, or whose opposing road isn't
+  known straight on out to that R_req (the band is straight on from our approach: module docstring), is never attempted. It is
+  the one predicate turnpilotd skips by (turn_skip: unprotectedRange, as soon as it is the maneuver) and navd routes around
+  (routing/lefts.py), so a route never plans a left the car would refuse and the two can't drift apart. setback: m the
+  junction's mapped stop line lies back of the hold line (map_controls.line_setback_at), None without one: then
+  ROUTE_REACH_MARGIN_M (BUILD_FINDINGS D4). In announce or off the left isn't skipped for its range (the hold line hands back
+  instead), so none is out of range. What only the car knows (TurnPilot acting, the left's stop engaged) is turnpilotd's."""
+  if mode != AUTO or not unprotected_turn(maneuver, right_hand_traffic):
+    return RangeCheck()
+  margin = ROUTE_REACH_MARGIN_M if setback is None else setback
+  reach = reach_at_line(maneuver.opposing_speed, maneuver.opposing_lanes or None, margin)
+  bent = reach > LINE_D + margin + maneuver.opposing_straight_m
+  return RangeCheck(True, reach > reach_m or bent, reach, margin, bent)
 
 
 def turn_bearing(bearing_deg: float, heading_deg: float, side: int) -> float:

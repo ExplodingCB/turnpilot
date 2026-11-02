@@ -46,8 +46,8 @@ def meters_between(a, b):
   return float(np.linalg.norm(local_meters(a, b)))
 
 
-def route_engine(tiles, start, bearing):
-  values = {'TurnPilotValhallaTiles': tiles, 'LanguageSetting': 'main_en'}
+def route_engine(tiles, start, bearing, **extra):
+  values = {'TurnPilotValhallaTiles': tiles, 'LanguageSetting': 'main_en', **extra}
   params = MagicMock()
   params.get.side_effect = values.get
   pm = MagicMock()
@@ -146,7 +146,8 @@ class TestWestCoastUSA(unittest.TestCase):
       ValhallaSource(self.tiles).route(NORTH_WEST, (-87.6298, 41.8781), None, None)  # Chicago
 
   def test_drive_the_route_in_navd(self):
-    engine, pm = route_engine(self.tiles, NORTH_WEST, 90)
+    # the route as Valhalla gives it: the autonomous left off, so none of its lefts is routed around (test_lefts_routed_around)
+    engine, pm = route_engine(self.tiles, NORTH_WEST, 90, TurnPilotAutoLeft='off')
     engine.calculate_route(SOUTH_EAST)
     self.assertIsNotNone(engine.route)
     steps = engine.route
@@ -182,6 +183,36 @@ class TestWestCoastUSA(unittest.TestCase):
     self.assertLess(final.distanceRemaining, 60)
     self.assertEqual([m.type for m in final.allManeuvers], ['arrive'])
     self.assertLess(final.allManeuvers[0].distance, 60)
+
+
+  def test_lefts_routed_around(self):
+    """The detector's ranges unmeasured (the car's defaults): the route's one unprotected left the car would skip (its R_req
+    past the reach, its opposing road bending away) is routed around by its exit edge on the real tiles, within the detour
+    budget, and navd's map status says one, never where."""
+    from openpilot.selfdrive.turnpilot.routing.avoid import detour_budget_s, duration
+    from openpilot.selfdrive.turnpilot.routing.lefts import LeftConfig, route_lefts
+    plain, _ = route_engine(self.tiles, NORTH_WEST, 90, TurnPilotAutoLeft='off')
+    plain.calculate_route(SOUTH_EAST)
+    steps = plain.route
+    plain.router.serve_again(steps)
+    skipped = route_lefts(steps, plain.controls, LeftConfig(), lambda: plain.router.opposing(steps), lambda: plain.router.exits(steps))
+    self.assertEqual(len(skipped), 1)
+    self.assertIsNotNone(skipped[0].exclusion)
+    engine, _ = route_engine(self.tiles, NORTH_WEST, 90)
+    engine.calculate_route(SOUTH_EAST)
+    self.assertLess(len(engine.route), len(steps))
+    engine.router.serve_again(engine.route)
+    self.assertEqual(route_lefts(engine.route, engine.controls, LeftConfig(), lambda: engine.router.opposing(engine.route),
+                                 lambda: engine.router.exits(engine.route)), [])
+    self.assertLessEqual(duration(engine.route) - duration(steps), detour_budget_s(duration(steps)))
+    self.assertEqual((engine.lefts_avoided, engine.lefts_unavoidable), (1, 0))
+    status = engine.router.status.last
+    self.assertEqual(status['lefts'], {'avoided': 1, 'unavoidable': 0})
+    self.assertEqual(set(status), {'state', 'message', 'short', 'code', 'source', 'destination', 'lefts'})  # no position added
+    # a measured range past the left's R_req and its road known straight would keep it: here its road bends, so even 400 m
+    far, _ = route_engine(self.tiles, NORTH_WEST, 90, TurnPilotLeftRangeM=400.)
+    far.calculate_route(SOUTH_EAST)
+    self.assertEqual(far.lefts_avoided, 1)
 
 
 @unittest.skipUnless(HAVE_VALHALLA and INDIANA_TILES.is_dir(), 'needs pyvalhalla and the Indiana tiles')

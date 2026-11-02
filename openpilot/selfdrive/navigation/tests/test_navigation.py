@@ -1368,9 +1368,11 @@ class TestStopAvoidance(unittest.TestCase):
     self.assertEqual(router.call_count, 2)  # the new route's window is from now
 
   def test_the_loop_never_sets_the_map_status(self):
+    # the reroutes are status-neutral: navd only notes the taken route's lefts (counts, routing/lefts.py) once it has it
     router = self.start([self.stop(1, 60.)], reroutes=[[self.stop(2, 150.)], None])
     self.assertEqual(len(router.reroute_calls), 2)
-    self.assertEqual(router.status.method_calls, [])
+    self.assertEqual([(c[0], c.args, c.kwargs) for c in router.status.method_calls],
+                     [('note', ((0.002, 0),), {'lefts': {'avoided': 0, 'unavoidable': 0}})])
 
   def test_the_route_keeps_the_always_drive_switch_it_was_made_under(self):
     """TurnPilotAlwaysDrive (ALWAYS_DRIVE.md section 1, step S1): read at route time for R1 to R3 (step S6), the route

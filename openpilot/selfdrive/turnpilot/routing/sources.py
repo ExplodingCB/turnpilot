@@ -152,6 +152,19 @@ class MapRouter:
       return []
     return served[1].limits(steps)
 
+  def exits(self, steps) -> dict:
+    """{step index: Exit} of the route's maneuvers, the edge it leaves each junction by (routing/controls.py: exit_edges), for
+    routing around a left the car won't take (routing/lefts.py), from the source that routed it; {} (none known: no left on it
+    can be routed around) for steps it didn't route, or a source that can't say."""
+    served = self.served
+    if served is None or served[0] is not steps:
+      cloudlog.error("turnpilot: exits asked for a route this router didn't give")
+      return {}
+    if not hasattr(served[1], 'exits'):
+      cloudlog.warning("turnpilot: the route's source has no exits")
+      return {}
+    return served[1].exits(steps)
+
   def controls_ahead(self, position, bearing) -> tuple[list, str, list]:
     """(controls, status, road) on the road ahead of the car off the route (routing/controls.py: controls_ahead), from the source
     that routed the last route, or the local tiles (loaded here if no route has yet: TurnPilotValhallaTiles). position:

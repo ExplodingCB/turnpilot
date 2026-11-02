@@ -344,6 +344,19 @@ async function loadCoverage() {
 
 function percent(x) { return Math.round(x * 100) + "%"; }
 
+// navd's count of the unprotected lefts the car can't judge yet (TurnPilotMapStatus lefts): the ones the route goes around,
+// and the ones it couldn't, which the car skips at the junction and reroutes from. Counts only, never where
+function leftsText(nav) {
+  var l = nav && nav.state === "ready" ? nav.lefts : null;
+  if (!l) return "";
+  function lefts(n) { return n + " unprotected left" + (n === 1 ? "" : "s"); }
+  var text = "";
+  if (l.avoided) text += " Route goes around " + lefts(l.avoided) + ".";
+  if (l.unavoidable) text += " " + lefts(l.unavoidable) + " can't be avoided: the car skips " + (l.unavoidable === 1 ? "it" : "them") +
+    " at the junction and reroutes.";
+  return text;
+}
+
 function renderMap(s) {
   var m = s.map, err = $("maperror"), state = $("mapstate");
   var problems = [];
@@ -367,12 +380,13 @@ function renderMap(s) {
   err.textContent = problems.join(" ");
 
   var text = "", bad = false;
-  if (m.override) text = "Developer override: routing on local tiles (" + m.override + "), no geofence.";
+  var lefts = leftsText(nav);
+  if (m.override) text = "Developer override: routing on local tiles (" + m.override + "), no geofence." + lefts;
   else if (nav && nav.state === "downloading") {
     text = "Downloading map for this drive…" + (nav.progress != null ? " " + percent(nav.progress) : "") +
       (nav.bytes ? " (" + (nav.bytes / 1e6).toFixed(1) + " MB)" : "");
   } else if (nav && nav.state === "checking") text = "Checking the mapped area…";
-  else if (nav && nav.state === "ready") text = "Ready" + (nav.region ? ": map for this drive in the " + nav.region : "");
+  else if (nav && nav.state === "ready") text = "Ready" + (nav.region ? ": map for this drive in the " + nav.region : "") + (lefts ? "." + lefts : "");
   else if (m.car_region) text = "Car is in the " + m.car_region + ".";
   else if (m.coverage && !m.car) text = "Car position unknown.";
   if (nav && nav.state === "error") { text = ""; bad = true; }
