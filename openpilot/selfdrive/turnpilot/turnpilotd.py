@@ -395,6 +395,24 @@ WRONG_SIDE_REASON = "Wrong side of the road: take control"
 # route 79d0f04c82980004/00000003 (California, on its own side) segment 4 read such a line yellow 0.6-1.0 for 4 s at 5-9 m/s
 # with the left edge 4-7 m past the left line
 WRONG_SIDE_UNSURE_EDGE_M = 1.5
+# section 4.5's unstick lift drives the car on from a stand: never where it may be standing left of the centre line (SAT_RERUN
+# R8, route_demo: the model stood itself in the oncoming lane at 129 s after a right's wide exit, every paint read unknown, its
+# left road edge 0.3-0.85 m past the car's left line; "Nothing ahead is holding the car: going on" lifted it at 138 s and the
+# model drove on there at 5-7 m/s for 6 s). The stand is doubted (wrong_side_doubt) on any frame of it that reads
+#  - yellow on the car's right (yellow_on_the_right, the guard's read, which waits for WRONG_SIDE_MIN_SPEED: never standing), or
+#  - the car in the road's leftmost lane with a lane on its right: the left road edge seen (std under WRONG_SIDE_EDGE_STD_MAX)
+#    within WRONG_SIDE_UNSURE_EDGE_M of its left line, and the right edge not seen within UNSTICK_LANE_RIGHT_M of its right
+#    line (a one-lane road has no wrong side to stand on). On its own side of a two-way road the left edge is past the
+#    oncoming lane, 3 m and more away, so a stand there is lifted however the paint reads. Leftmost with a lane on its right
+#    is the wrong side's geometry, or a one-way's or a divided road's left lane, and only the paint tells them apart: a yellow
+#    line on the car's left read at WRONG_SIDE_CONF (MUTCD: a one-way's and a divided road's left edge line, and the centre
+#    line seen from its own side, are yellow; the road's right edge line seen from the wrong side is white) clears it. The
+#    guard never took this geometry (openpilot's demo route reads it on the highway's left lane, 54 of the fixture's 341
+#    frames, on its own side): a false reading there would hand back a car driving on. Here it costs one lift, the stand
+#    handed back at STOPPED_HANDBACK_S as with the switch off; a true one is the car driven on in the oncoming lane.
+# A doubt latches for the stand (the reader's frames come and go) and withdraws a lift out. Right-hand traffic's markings; in
+# left-hand traffic the geometry mirrored, with no paint read for it
+UNSTICK_LANE_RIGHT_M = 2.5  # m: lane_planner's narrowest measured lane
 # an off-route turn is a mess-up said loudly (SAT_VALIDATION row 1, route_demo: the route went straight on, TurnPilot sent no
 # desire, and the model turned right on its own, 6.6 m into the oncoming lane with every paint read unknown, into a roadside
 # object; the follower dead-reckons, so the turn read as on route). Engaged, moving, with a route: the car's heading changing
@@ -605,6 +623,27 @@ def yellow_on_the_right(paint, line_ys, line_probs, edge_ys, edge_stds) -> tuple
   yellow = p.color == 'yellow' and p.confidence >= WRONG_SIDE_CONF and not (i == 2 and paint[1].color == 'yellow') and \
     edge_stds[1] < WRONG_SIDE_EDGE_STD_MAX and edge_ys[1] - line_ys[i] >= WRONG_SIDE_BEYOND_M
   return yellow, True
+
+
+def wrong_side_doubt(paint, line_ys, line_probs, edge_ys, edge_stds, right_hand_traffic: bool = True) -> str:
+  """Why the car may be left of the centre line (right of it in left-hand traffic), '' if nothing says so (UNSTICK_LANE_RIGHT_M's
+  rule): a yellow line read on its right, or the road's leftmost lane with a lane on its right and no yellow read on its left.
+  The lane paint and modelV2's lines and edges as yellow_on_the_right takes them; fewer than four lines or two edges, nothing."""
+  if len(line_ys) != 4 or len(edge_ys) != 2 or len(edge_stds) != 2:
+    return ''
+  if right_hand_traffic and yellow_on_the_right(paint, line_ys, line_probs, edge_ys, edge_stds)[0]:
+    return 'yellow on the right'
+  near, far = (0, 1) if right_hand_traffic else (1, 0)  # the road edge on the centre line's side, and the kerb's
+  edge_gap = line_ys[1] - edge_ys[0] if right_hand_traffic else edge_ys[1] - line_ys[2]
+  kerb_gap = edge_ys[1] - line_ys[2] if right_hand_traffic else line_ys[1] - edge_ys[0]
+  if not (edge_stds[near] < WRONG_SIDE_EDGE_STD_MAX and edge_gap <= WRONG_SIDE_UNSURE_EDGE_M):
+    return ''
+  if edge_stds[far] < WRONG_SIDE_EDGE_STD_MAX and kerb_gap < UNSTICK_LANE_RIGHT_M:
+    return ''  # a one-lane road: no other side of it to stand on
+  left = paint[1] if len(paint) == 4 else None
+  if right_hand_traffic and left is not None and left.color == 'yellow' and left.confidence >= WRONG_SIDE_CONF:
+    return ''  # a yellow line on its left: the centre line, or a one-way's or divided road's left edge, from its own side
+  return f"leftmost lane: the {'left' if right_hand_traffic else 'right'} edge {edge_gap:.1f} m past its line, a lane on the other side"
 
 
 def sure_paint(paint, line_probs) -> tuple:
@@ -845,6 +884,7 @@ class TurnPilot:
     self.unsig_why = ''            # under the switch, why a release where no signal is mapped isn't lifted, as last logged
     self.unstick_done = False      # under the switch, section 4.5's lift went for this release: no second try (stopped_unheld)
     self.unstick_id: int | None = None  # ...as this go (GoCertifier.id)
+    self.side_doubt = ''           # ...why the car may be on the wrong side, '' none: it bars that lift (watch_side)
     self.unstick_alert_t = 0.      # ...s left of its unstickLift alert
     self.ped_hold_s = 0.           # the crosswalk hold has stood the car this long (SC-02, crosswalk_standoff)...
     self.ped_stand_s = 0.          # ...with every walker it is for standing
@@ -1116,6 +1156,7 @@ class TurnPilot:
 
     cs, model = sm['carState'], sm['modelV2']
     v_ego = max(cs.vEgo, 0.)
+    self.watch_side(paint, model, v_ego, right_hand_traffic)
     port = cs.carSignal
     signal_status = self.turn_signal.status_for(self.car_signal_flags, self.car_signal_mode, port, DT_MDL, self.unverified_why)
     signal_forced = driver_signals is not None
@@ -2787,9 +2828,23 @@ class TurnPilot:
 
   def unstick_veto(self) -> str:
     """What bars section 4.5's lift, or withdraws one out, '' if nothing: the car's place not read as no signal with navd's
-    controls ok (release_light 'none'), or unsignalized_why."""
+    controls ok (release_light 'none'), the car maybe on the wrong side (side_doubt, UNSTICK_LANE_RIGHT_M), or
+    unsignalized_why."""
     light = self.map_controls.release_light(0.)
-    return f"light {light}" if light != 'none' else self.unsignalized_why(0.)
+    if light != 'none':
+      return f"light {light}"
+    return 'wrongSide' if self.side_doubt else self.unsignalized_why(0.)
+
+  def watch_side(self, paint, model, v_ego: float, right_hand_traffic: bool) -> None:
+    """side_doubt, every frame (UNSTICK_LANE_RIGHT_M): this frame's wrong_side_doubt while the car moves; standing, latched for
+    the stand, from its last moving frame on, and logged once it is."""
+    doubt = wrong_side_doubt(paint, *model_lines_at(model), right_hand_traffic)
+    if v_ego >= STANDSTILL_SPEED:
+      self.side_doubt = doubt
+      return
+    if doubt and not self.side_doubt:
+      cloudlog.event("turnpilot.side_doubt", why=doubt, paint=[[str(q.kind), str(q.color), round(q.confidence, 2)] for q in paint])
+    self.side_doubt = self.side_doubt or doubt
 
   def crosswalk_standoff(self, sm, v_ego: float, acting: bool, decision) -> bool:
     """The right-turn crosswalk hold's standoff (ALWAYS_DRIVE.md SC-02, unconditional; module constants): its clocks, the note's
