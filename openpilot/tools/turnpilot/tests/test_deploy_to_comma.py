@@ -283,7 +283,7 @@ def test_fresh_deploy_over_sunnypilot(source, comma):
   check_deployed(root / 'openpilot', second, panda1)
   assert prevs(root) == ['openpilot.prev-20261031-080000']
   assert tree_of(root, 'openpilot.prev-20261031-080000') == sunny
-  assert (root / 'params/d/DisableUpdates').read_text() == '1'
+  assert (root / 'params/d/DisableUpdates').read_text() == '0'  # updates on: a pushed fix reaches the comma
   after = snapshot(root)
   assert all(after[k] == v for k, v in before.items() if k.startswith(('media/', 'continue.sh')))
   assert not list(root.glob('openpilot.tp-incoming-*'))
@@ -328,6 +328,19 @@ def test_clean_whatever_the_commas_git_config(source, comma, tmp_path, comma_git
     for rel in LFS_FILES:
       os.utime(tree / rel, (t, t))  # whole seconds away from the index's stat, so the next refresh hashes them again
     assert version_values(tree, config)['dirty'] is False, config
+
+
+def test_updates_stay_on_and_an_earlier_deploys_off_is_undone(source, comma):
+  """SHIP_FINAL: the script forced DisableUpdates 1, so a comma installed from the Mac never got a pushed fix. Updates stay on,
+  as on the installer path: a comma an earlier deploy left at 1 is set back to 0, and the reboot goes with them on. A commit
+  that isn't this Mac's origin/turnpilot is said to be replaced by the branch's tip at the comma's next update."""
+  src, *_ = source
+  root, env = comma
+  (root / 'params/d/DisableUpdates').write_text('1')  # what an earlier version of this script left
+  r = deploy(src, root, env, '--stamp', '20261031-080000', answer='y')
+  assert r.returncode == 0 and rebooted(env), r.stdout
+  assert (root / 'params/d/DisableUpdates').read_text() == '0'
+  assert 'updates on' in r.stdout and "isn't origin/turnpilot" in r.stdout
 
 
 def test_comma_without_git_lfs(source, comma):
@@ -452,12 +465,12 @@ def test_reboot_checks_offroad_again(source, comma):
   assert 'onroad' in r.stdout
   not_rebooted_warning(r)
   assert g(root / 'openpilot', 'rev-parse', 'HEAD', env=os.environ) == second
-  assert (root / 'params/d/DisableUpdates').read_text() == '1'
+  assert (root / 'params/d/DisableUpdates').read_text() == '0'
 
 
 def test_declined_reboot_then_reboot(source, comma):
   """Answering no prints loudly that the car must not be started before the comma reboots, and --reboot reboots it later,
-  checking first that it is offroad, that TurnPilot's DisableUpdates is still 1, and that /data/openpilot is a tree."""
+  checking first that it is offroad and that /data/openpilot is a tree; updates on (DisableUpdates 0) never stop it."""
   src, *_ = source
   root, env = comma
   r = deploy(src, root, env, answer='n')
@@ -469,10 +482,7 @@ def test_declined_reboot_then_reboot(source, comma):
   r = deploy(src, root, env, '--reboot')
   assert r.returncode == 2 and 'onroad' in r.stdout and not rebooted(env), r.stdout
   (root / 'params/d/IsOffroad').write_text('1')
-  (root / 'params/d/DisableUpdates').write_text('0')
-  r = deploy(src, root, env, '--reboot')
-  assert r.returncode == 2 and 'DisableUpdates' in r.stdout and not rebooted(env), r.stdout
-  (root / 'params/d/DisableUpdates').write_text('1')
+  assert (root / 'params/d/DisableUpdates').read_text() == '0'
   r = deploy(src, root, env, '--reboot')
   assert r.returncode == 0 and rebooted(env), r.stdout
 
@@ -632,7 +642,7 @@ def test_map_key_with_a_deploy(source, comma, tmp_path):
   param = root / 'params/d/TurnPilotMapKey'
   assert param.read_text() == FAKE_KEY  # stripped of the file's newline, as the web app saves it
   assert param.stat().st_mode & 0o077 == 0
-  assert (root / 'params/d/DisableUpdates').read_text() == '1'
+  assert (root / 'params/d/DisableUpdates').read_text() == '0'
   assert 'TurnPilotMapKey: set (not printed)' in r.stdout
   nowhere_but_the_param(r, env, root)
 
