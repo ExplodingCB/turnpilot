@@ -462,3 +462,35 @@ def test_the_server_will_not_start_without_a_disk_tmp_dir(tmp_path):
   finally:
     os.chmod(tmp_path / 'ro', 0o700)
   mapserver.check_tmp_dir(tmp_path)
+
+
+def test_logs_upload_list_fetch_and_refusals(tmp_path):
+  from tools.turnpilot.mapserver.logstore import LogStore
+  maps = Maps([], KEY, logs=LogStore(tmp_path / 'logs', 10 ** 6))
+  httpd = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(maps))
+  threading.Thread(target=httpd.serve_forever, daemon=True).start()
+  base = f"http://127.0.0.1:{httpd.server_address[1]}"
+  url = base + '/v1/logs/0123456789abcdef/00000011--24ea9deaa5--16/rlog.zst'
+  data = b'rlog bytes' * 1000
+  digest = {'X-Content-SHA256': hashlib.sha256(data).hexdigest()}
+  try:
+    assert requests.post(url, data=data, headers=digest, timeout=5).status_code == 401
+    r = requests.post(url, data=data, headers={**auth(), **digest}, timeout=5)
+    assert r.status_code == 200 and r.json() == {'ok': True, 'stored': True}
+    r = requests.post(url, data=data, headers={**auth(), **digest}, timeout=5)  # a retry after a lost answer
+    assert r.status_code == 200 and r.json()['stored'] is False
+    assert requests.get(base + '/v1/logs', headers=auth(), timeout=5).json() == \
+      {'0123456789abcdef': {'00000011--24ea9deaa5--16': {'rlog.zst': len(data)}}}
+    assert requests.get(url, headers=auth(), timeout=5).content == data
+    # a body that doesn't match its digest is refused and leaves nothing
+    other = url.replace('rlog.zst', 'qlog.zst')
+    assert requests.post(other, data=b'x' * 10, headers={**auth(), **digest}, timeout=5).status_code == 400
+    assert not (tmp_path / 'logs' / '0123456789abcdef' / '00000011--24ea9deaa5--16' / 'qlog.zst').exists()
+    # nothing outside the store, and nothing past the quota
+    assert requests.get(base + '/v1/logs/..%2F..%2Fetc/x--y--1/rlog.zst', headers=auth(), timeout=5).status_code == 404
+    assert requests.get(base + '/v1/logs/0123456789abcdef/00000011--24ea9deaa5--16/key', headers=auth(), timeout=5).status_code == 404
+    big = b'y' * (10 ** 6)
+    r = requests.post(other, data=big, headers={**auth(), 'X-Content-SHA256': hashlib.sha256(big).hexdigest()}, timeout=5)
+    assert r.status_code == 507
+  finally:
+    httpd.shutdown()

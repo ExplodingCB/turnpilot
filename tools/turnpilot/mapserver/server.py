@@ -5,6 +5,7 @@
   GET  /v1/coverage   the drivable areas as a GeoJSON FeatureCollection, with a "version"
   POST /v1/corridor   {"start": [lon, lat], "destination": [lon, lat], "osm_controls": true}
                       -> a tar of manifest.json, tiles/ and, when asked, osm_controls/
+  POST /v1/logs/...   a car's drive log, and GET /v1/logs to list them and fetch one (logstore.py)
 
 Every /v1 call but health needs "Authorization: Bearer <key>". A corridor is every tile within BUFFER_KM of
 the route, so the car can reroute locally without a connection. With "osm_controls": true it also carries the OSM
@@ -48,9 +49,11 @@ from pathlib import Path
 
 try:
   from tools.turnpilot.mapserver import geo, tiles
+  from tools.turnpilot.mapserver.logstore import LogRefusal, LogStore, parse as parse_log_path
 except ImportError:  # run as a plain script on the server
   import geo  # type: ignore[no-redef]
   import tiles  # type: ignore[no-redef]
+  from logstore import LogRefusal, LogStore, parse as parse_log_path  # type: ignore[no-redef]
 
 BUFFER_KM = 15.0  # with 28 km level-2 tiles this keeps every road within 15-40 km of the route
 GZIP_LEVEL = 3
@@ -61,6 +64,7 @@ HEADER_TIMEOUT = 20.  # s for the whole request (line, headers and body) once th
 REQUEST_TIMEOUT = 60.  # s a client may stall on one socket write while a response goes out (cellular stalls)
 MAX_CONNECTIONS = 32  # open connections; more are closed at once, so idle sockets can't exhaust threads or memory
 MAX_PER_ADDRESS = 4  # open connections from one address: a car needs one or two, and one host can't take all 32
+LOG_BODY_TIMEOUT = 900.  # s for a log upload's body once its headers are in: up to 200 MB over a car's connection
 MAX_CORRIDORS = 2  # corridors built or sent at once; each is a temp file of up to a few hundred MB
 SHARDS = 'osm_controls'  # the OSM stop-sign sidecar's shards (osm_controls.py)
 SEND_CHUNK = 256 * 1024
@@ -133,9 +137,11 @@ class Region:
 
 
 class Maps:
-  def __init__(self, regions: list[Region], key: str, tmp_dir: Path | None = None, max_corridors: int = MAX_CORRIDORS):
+  def __init__(self, regions: list[Region], key: str, tmp_dir: Path | None = None, max_corridors: int = MAX_CORRIDORS,
+               logs: LogStore | None = None):
     self.regions = regions
     self.key = key
+    self.logs = logs
     self.tmp_dir = tmp_dir  # main() requires it; None (tests) is the system's
     self.corridor_slots = threading.BoundedSemaphore(max_corridors)
     blob = json.dumps([[r.meta, r.fence] for r in regions], sort_keys=True).encode()
@@ -324,6 +330,8 @@ def make_handler(maps: Maps, request_timeout: float = REQUEST_TIMEOUT, header_ti
           return self.send_json(200, maps.coverage())
         if method == 'POST' and self.path == '/v1/corridor':
           return self.corridor()
+        if self.path == '/v1/logs' or self.path.startswith('/v1/logs/'):
+          return self.logs(method)
         raise Refusal(404, {'error': 'not_found'})
       except TimeoutError as e:
         log.info("%s: %s (%s); closing the connection", self.address_string(), 'timed out' if self.headers_sent else 'request too slow', e)
@@ -333,7 +341,7 @@ def make_handler(maps: Maps, request_timeout: float = REQUEST_TIMEOUT, header_ti
           log.warning("request failed after its headers were sent (%s: %s); closing the connection", type(e).__name__, e)
           self.close_connection = True
           return
-        if isinstance(e, Refusal):
+        if isinstance(e, (Refusal, LogRefusal)):
           return self.send_json(e.code, e.body)
         log.exception("request failed")
         self.send_json(500, {'error': 'server_error'})
@@ -379,6 +387,30 @@ def make_handler(maps: Maps, request_timeout: float = REQUEST_TIMEOUT, header_ti
           send_file(f, self.wfile)
       finally:
         maps.corridor_slots.release()
+
+    def logs(self, method):
+      if maps.logs is None:
+        raise Refusal(404, {'error': 'not_found'})
+      if method == 'GET' and self.path == '/v1/logs':
+        return self.send_json(200, maps.logs.listing())
+      dongle, segment, name = parse_log_path(self.path)
+      if method == 'POST':
+        self.deadline = time.monotonic() + LOG_BODY_TIMEOUT
+        stored = maps.logs.put(dongle, segment, name, int(self.headers.get('Content-Length') or 0),
+                               self.headers.get('X-Content-SHA256', ''), self.rfile.read)
+        self.request_read()
+        log.info("log %s/%s/%s %s", dongle, segment, name, 'stored' if stored else 'already stored')
+        return self.send_json(200, {'ok': True, 'stored': stored})
+      path = maps.logs.path(dongle, segment, name)
+      if not path.is_file():
+        raise Refusal(404, {'error': 'not_found'})
+      with open(path, 'rb') as f:
+        self.headers_sent = True
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/octet-stream')
+        self.send_header('Content-Length', str(path.stat().st_size))
+        self.end_headers()
+        send_file(f, self.wfile)
 
     def do_GET(self):
       self.handle_request('GET')
@@ -487,6 +519,8 @@ def main():
   ap.add_argument('--key-file', type=Path, default=Path('/etc/turnpilot-maps/key'))
   ap.add_argument('--cert', type=Path, default=Path('/etc/turnpilot-maps/cert.pem'))
   ap.add_argument('--cert-key', type=Path, default=Path('/etc/turnpilot-maps/cert.key'))
+  ap.add_argument('--log-dir', type=Path, default=Path('/srv/turnpilot-maps/logs'), help="where the cars' drive logs are kept")
+  ap.add_argument('--log-quota-gb', type=float, default=20., help="past this the log store refuses new logs (it never deletes)")
   ap.add_argument('--host', default='0.0.0.0')
   ap.add_argument('--port', type=int, default=443)
   ap.add_argument('--tmp-dir', type=Path, required=True,
@@ -502,7 +536,7 @@ def main():
   regions = load_regions(args.regions)
   for region in regions:
     region.load_router()
-  maps = Maps(regions, key, args.tmp_dir)
+  maps = Maps(regions, key, args.tmp_dir, logs=LogStore(args.log_dir, int(args.log_quota_gb * 1e9)))
   log.info("serving %s, coverage version %s", [r.id for r in regions], maps.version)
 
   httpd = make_server(maps, args.host, args.port, args.cert, args.cert_key)

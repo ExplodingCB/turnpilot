@@ -221,8 +221,8 @@ class MapClient:
                      'Map server not set up')
     return cls(params.get('TurnPilotMapHost'), params.get('TurnPilotMapKey'), params.get('TurnPilotMapCert'), directory)
 
-  def request(self, method, path, auth=True, timeout=TIMEOUT, **kwargs) -> requests.Response:
-    headers = {'Authorization': f"Bearer {self.key}"} if auth else {}
+  def request(self, method, path, auth=True, timeout=TIMEOUT, headers=None, **kwargs) -> requests.Response:
+    headers = {**(headers or {}), **({'Authorization': f"Bearer {self.key}"} if auth else {})}
     try:
       resp = self.session.request(method, self.host + path, headers=headers, verify=str(self.cert_path), timeout=timeout, **kwargs)
     except requests.exceptions.SSLError as e:

@@ -106,6 +106,7 @@ procs = [
   PythonProcess("mapsd", "openpilot.selfdrive.navigation.mapsd", navigation),
   PythonProcess("turnpilotd", "openpilot.selfdrive.turnpilot.turnpilotd", and_(only_onroad, turnpilot)),
   PythonProcess("turnpilot_web", "openpilot.selfdrive.turnpilot.web.server", turnpilot),
+  PythonProcess("turnpilot_logs", "openpilot.selfdrive.turnpilot.log_upload", turnpilot),
   PythonProcess("dmonitoringmodeld", "openpilot.selfdrive.modeld.dmonitoringmodeld", driverview, enabled=(WEBCAM or not PC)),
 
   PythonProcess("sensord", "openpilot.system.sensord.sensord", only_onroad, enabled=not PC),
