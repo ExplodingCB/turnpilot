@@ -56,6 +56,7 @@ labelled yellow in 93-98% (96%).
 """
 from collections import deque
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 import numpy as np
 
@@ -121,6 +122,23 @@ _C = len(OFFSETS) // 2
 _SEARCH = np.arange(_C - round(SEARCH_HALF_M / PROFILE_STEP_M), _C + round(SEARCH_HALF_M / PROFILE_STEP_M) + 1)
 _FLANK = np.arange(round(FLANK_M[0] / PROFILE_STEP_M), round(FLANK_M[1] / PROFILE_STEP_M) + 1)
 _WIDTH = np.arange(-round(WIDTH_HALF_M / PROFILE_STEP_M), round(WIDTH_HALF_M / PROFILE_STEP_M) + 1)
+_S0, _S1 = int(_SEARCH[0]), int(_SEARCH[-1]) + 1  # the search window as a slice
+# What sample_lines reads off each profile after its peak (the brightest point in the search window) and its dip (the lowest
+# U there), in one gather: per column, whether it is off the peak (else the dip) and how far. First the four flank windows
+# (left and right of the peak, then of the dip), their k-th points together for k across the window, so the twelve road
+# medians (Y, U and V each) are one median-of-9 network on whole arrays (_median9); then the peak and the dip themselves;
+# then the width window around the peak. The reader's cost is Python call overhead more than arithmetic, the comma four's
+# cores more so: the twelve np.median and nineteen take_along_axis calls this replaces were over half of it
+_NF = len(_FLANK)
+_WINDOWS = ((True, -1), (True, 1), (False, -1), (False, 1))  # (off the peak, else the dip; side)
+_COL_PEAK = np.array([peak for _ in range(_NF) for peak, _ in _WINDOWS] + [True, False] + [True] * len(_WIDTH))
+_COL_OFF = np.array([side * f for f in _FLANK for _, side in _WINDOWS] + [0, 0] + list(_WIDTH))
+_AT, _WIDE_COLS = slice(4 * _NF, 4 * _NF + 2), slice(4 * _NF + 2, None)
+# Paeth's median of 9 as 19 compare-exchanges: 38 whole-array minimum and maximum calls over a frame's 3312 windows take a
+# seventh of np.partition's per-window selects (10 against 68 us on a Mac)
+_MEDIAN9 = ((1, 2), (4, 5), (7, 8), (0, 1), (3, 4), (6, 7), (1, 2), (4, 5), (7, 8), (0, 3), (5, 8), (4, 7), (3, 6), (1, 4), (2, 5),
+            (4, 7), (4, 2), (6, 4), (4, 2))
+assert _NF == 9, "_median9 is a median of 9"
 PAINT, ROAD, INVALID = 1, 0, -1
 NO_COLOR, WHITE, YELLOW = 0, 1, 2
 
@@ -167,59 +185,90 @@ def project(lens: Lens, view_from_calib: np.ndarray, pts: np.ndarray) -> tuple[n
   return cx + lens.f * ray[..., 0] / zs, cy + lens.f * ray[..., 1] / zs, front
 
 
-def _median_flanks(profile: np.ndarray, at: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-  """Median of the profile FLANK_M either side of index `at`, per sample: (left, right)."""
-  return (np.median(np.take_along_axis(profile, at[..., None] - _FLANK, axis=2), axis=2),
-          np.median(np.take_along_axis(profile, at[..., None] + _FLANK, axis=2), axis=2))
+@lru_cache(maxsize=4)
+def _calib_from_view(rpy_calib: tuple) -> np.ndarray:
+  """calib_from_view, once per calibration (it moves at 4 Hz, the reader runs at 10): never written to."""
+  rot = calib_from_view(list(rpy_calib))
+  rot.flags.writeable = False
+  return rot
 
 
-def _at(profile: np.ndarray, idx: np.ndarray) -> np.ndarray:
-  return np.take_along_axis(profile, idx[..., None], axis=2)[..., 0]
+def _median9(p: list) -> np.ndarray:
+  """The elementwise median of nine same-shape arrays (_MEDIAN9's network): exactly one of their values, as np.median's."""
+  p = list(p)
+  for i, j in _MEDIAN9:
+    p[i], p[j] = np.minimum(p[i], p[j]), np.maximum(p[i], p[j])
+  return p[4]
 
 
 def sample_lines(nv12: np.ndarray, stride: int, y_height: int, lens: Lens, rpy_calib, lines_xyz, boxes=None):
   """Per line and sample (len(XS)): its state (PAINT, ROAD, INVALID) and color vote (NO_COLOR, WHITE, YELLOW).
   nv12: camerad's padded NV12 frame, flat uint8. lines_xyz: per line (x, y, z) arrays as in modelV2.laneLines.
-  boxes: (N, >=4) x0 y0 x1 y1 of detected objects in this frame; samples behind them are INVALID."""
+  boxes: (N, >=4) x0 y0 x1 y1 of detected objects in this frame; samples behind them are INVALID.
+  The profiles stay uint8 until their medians and points are taken (the median of an odd window of integers is one of them,
+  so it is the same float32 the float profiles gave), and a profile's points are its centre plus OFFSETS along y, so their
+  rays are the centre's plus OFFSETS times the rotation's y row: no (lines, XS, OFFSETS, 3) array of points to rotate."""
   centers = np.empty((len(lines_xyz), len(XS), 3))
   for i, (x, y, z) in enumerate(lines_xyz):
     centers[i, :, 0] = XS
     centers[i, :, 1] = np.interp(XS, x, y)
     centers[i, :, 2] = np.interp(XS, x, z)
-  pts = np.repeat(centers[:, :, None, :], len(OFFSETS), axis=2)
-  pts[..., 1] += OFFSETS
-  u, v, front = project(lens, calib_from_view(rpy_calib).T, pts)
-  ui, vi = np.rint(u).astype(np.int64), np.rint(v).astype(np.int64)
-  inside = front & (ui >= 0) & (ui < lens.width) & (vi >= 0) & (vi < lens.height)
+  rot = _calib_from_view(tuple(rpy_calib))  # a calibrated point's ray is point @ rot (project's view_from_calib is rot.T)
+  ray = centers @ rot
+  r0, r1, r2 = (ray[..., k, None] + OFFSETS * rot[1, k] for k in range(3))
+  front = r2 > 0.5
+  zs = np.where(front, r2, 1.)
+  cx, cy = lens.center
+  pix = []
+  for r, c in ((r0, cx), (r1, cy)):  # project()'s c + f * r / z, in place
+    r *= lens.f
+    r /= zs
+    r += c
+    pix.append(np.rint(r, out=r).astype(np.int64))
+  ui, vi = pix
+  inside = front & (ui.view(np.uint64) < lens.width) & (vi.view(np.uint64) < lens.height)  # a negative index wraps past either
   ok = inside.all(axis=2)
-  ui, vi = np.where(inside, ui, 0), np.where(inside, vi, 0)
-  luma = nv12[vi * stride + ui].astype(np.float32)
-  uv = (y_height + vi // 2) * stride + (ui // 2) * 2
-  chroma_u, chroma_v = nv12[uv].astype(np.float32), nv12[uv + 1].astype(np.float32)
+  ui *= inside  # a point off the frame reads its corner: its sample is INVALID whatever it reads
+  vi *= inside
+  idx = np.empty((3, *ui.shape), np.int64)  # Y, U and V's flat index in the NV12 frame
+  np.multiply(vi, stride, out=idx[0])
+  idx[0] += ui
+  np.right_shift(vi, 1, out=idx[1])
+  idx[1] += y_height
+  idx[1] *= stride
+  idx[1] += ui & -2
+  np.add(idx[1], 1, out=idx[2])
+  prof = nv12[idx]  # (Y U V, line, sample, offset) uint8
+  peak_idx = np.argmax(prof[0, ..., _S0:_S1], axis=2) + _S0
+  dip_idx = np.argmin(prof[1, ..., _S0:_S1], axis=2) + _S0
+  # (Y U V, column, line, sample), by flat index: a 1-D take is a quarter the cost of the same gather with a slice before it
+  first = np.arange(0, ui.size, len(OFFSETS)).reshape(peak_idx.shape)  # each profile's first point
+  off = (np.arange(0, prof.size, ui.size)[:, None] + _COL_OFF)[..., None, None]  # (channel, column) off the peak or the dip
+  got = prof.ravel()[np.where(_COL_PEAK[:, None, None], peak_idx + first, dip_idx + first) + off]
+  # the median per channel and flank window, (Y U V, window, line, sample): left and right of the peak, then of the dip
+  med = _median9([got[:, 4 * k:4 * k + 4] for k in range(_NF)]).astype(np.float32)
+  at = got[:, _AT].astype(np.float32)  # (Y U V, at the peak or the dip, line, sample)
 
   # luma: a narrow ridge above the road on both sides
-  peak_idx = _SEARCH[np.argmax(luma[..., _SEARCH], axis=2)]
-  road_l, road_r = _median_flanks(luma, peak_idx)
+  road_l, road_r = med[0, 0], med[0, 1]
   road = np.maximum(road_l, road_r)
   step = np.abs(road_l - road_r) > np.maximum(LUMA_MIN, STEP_REL * road)
-  ridge = _at(luma, peak_idx) - road
-  above = np.take_along_axis(luma, peak_idx[..., None] + _WIDTH, axis=2) >= (road + ridge / 2)[..., None]
+  ridge = at[0, 0] - road
+  above = got[0, _WIDE_COLS] >= road + ridge / 2
   bright = ridge >= np.maximum(LUMA_MIN, LUMA_REL * road)
-  wide = bright & (above.sum(axis=2) * PROFILE_STEP_M > WIDTH_MAX_M)
+  wide = bright & (above.sum(axis=0) * PROFILE_STEP_M > WIDTH_MAX_M)
   # chroma: a dip in U below the road on both sides, V not dipping with it; smaller with luma paint (worn yellow)
-  dip_idx = _SEARCH[np.argmin(chroma_u[..., _SEARCH], axis=2)]
-  u_road, v_road, y_road = (_median_flanks(c, dip_idx) for c in (chroma_u, chroma_v, luma))
-  u_dip, v_dip = _at(chroma_u, dip_idx), _at(chroma_v, dip_idx)
-  dip = u_dip - np.minimum(*u_road)
-  dv = v_dip - 0.5 * np.add(*v_road)
+  u_dip, v_dip = at[1, 1], at[2, 1]
+  dip = u_dip - np.minimum(med[1, 2], med[1, 3])
+  dv = v_dip - 0.5 * (med[2, 2] + med[2, 3])
   # chromaticity at the U dip, where the yellow vote is found, against the road's beside it (YELLOW_CU_MAX, YELLOW_CV_MIN)
-  y_paint, y_flank = np.maximum(_at(luma, dip_idx) - 16, 1), np.maximum(0.5 * np.add(*y_road) - 16, 1)
-  cu = (u_dip - 128) / y_paint - (0.5 * np.add(*u_road) - 128) / y_flank
-  cv = (v_dip - 128) / y_paint - (0.5 * np.add(*v_road) - 128) / y_flank
+  y_paint, y_flank = np.maximum(at[0, 1] - 16, 1), np.maximum(0.5 * (med[0, 2] + med[0, 3]) - 16, 1)
+  cu = (u_dip - 128) / y_paint - (0.5 * (med[1, 2] + med[1, 3]) - 128) / y_flank
+  cv = (v_dip - 128) / y_paint - (0.5 * (med[2, 2] + med[2, 3]) - 128) / y_flank
   tint = ((dip <= YELLOW_DU) | (bright & ~wide & (dip <= WORN_YELLOW_DU))) & (dv >= YELLOW_DV_MIN)  # the paint's or the light's
   yellow = tint & (cu <= YELLOW_CU_MAX) & (cv >= YELLOW_CV_MIN)
-  du_peak = _at(chroma_u, peak_idx) - 0.5 * np.add(*_median_flanks(chroma_u, peak_idx))
-  dv_peak = _at(chroma_v, peak_idx) - 0.5 * np.add(*_median_flanks(chroma_v, peak_idx))
+  du_peak = at[1, 0] - 0.5 * (med[1, 0] + med[1, 1])
+  dv_peak = at[2, 0] - 0.5 * (med[2, 0] + med[2, 1])
   white = bright & ~wide & ~tint & (du_peak >= WHITE_DU) & (dv_peak <= WHITE_DV_MAX)  # a tint without yellow's chromaticity: neither
 
   ok &= road < LUMA_SATURATED
@@ -237,11 +286,12 @@ def sample_lines(nv12: np.ndarray, stride: int, y_height: int, lens: Lens, rpy_c
 
 
 def _runs(state: np.ndarray):
-  starts = np.r_[0, np.flatnonzero(np.diff(state)) + 1]
+  bounds = np.flatnonzero(np.concatenate(((True,), state[1:] != state[:-1], (True,))))  # each run's start, and the end
+  starts = bounds[:-1]
   vals = state[starts]
   closed = np.zeros(len(vals), bool)  # a ROAD run with PAINT on both sides
   closed[1:-1] = (vals[1:-1] == ROAD) & (vals[:-2] == PAINT) & (vals[2:] == PAINT)
-  return starts, np.diff(np.r_[starts, len(state)]) * X_STEP_M, vals, closed
+  return starts, np.diff(bounds) * X_STEP_M, vals, closed
 
 
 def runs(state: np.ndarray) -> tuple[float, bool]:
@@ -322,6 +372,8 @@ class LanePaintClassifier:
       self.reset()
       return [UNKNOWN] * 4
     state, color = sample_lines(nv12, stride, y_height, self.lens, rpy_calib, lines_xyz, boxes)
+    valid, paint = (state != INVALID).sum(axis=1), (state == PAINT).sum(axis=1)  # per line, the four lines at once
+    white, yellow = (color == WHITE).sum(axis=1), (color == YELLOW).sum(axis=1)
     out = []
     for i, line in enumerate(self.lines):
       y = float(np.interp(X_MIN_M, lines_xyz[i][0], lines_xyz[i][1]))
@@ -332,10 +384,8 @@ class LanePaintClassifier:
         line.frames.popleft()
       sure = line_probs[i] >= LINE_PROB_MIN
       if line_probs[i] >= COLOR_PROB_MIN:
-        s = state[i]
-        long_run, gap = runs(s)
-        line.frames.append(_Frame(t, int((s != INVALID).sum()), int((s == PAINT).sum()), gap, long_run,
-                                  int((color[i] == WHITE).sum()), int((color[i] == YELLOW).sum()), sure))
+        long_run, gap = runs(state[i])
+        line.frames.append(_Frame(t, int(valid[i]), int(paint[i]), gap, long_run, int(white[i]), int(yellow[i]), sure))
       if sure:  # a kind from the frames the model was sure of, as ever
         p = classify([f for f in line.frames if f.sure])
       elif line_probs[i] >= COLOR_PROB_MIN:  # unsure: yellow from every frame, or nothing (COLOR_PROB_MIN)

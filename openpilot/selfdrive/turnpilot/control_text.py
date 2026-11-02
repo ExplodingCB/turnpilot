@@ -4,6 +4,32 @@ Plain strings in and out, no cereal: the web app's status formatting can't depen
 TAKE_CONTROL = 'take control'
 # turnpilotd's plan.reason while the model stands the car with nothing of TurnPilot's holding it, before its handback
 STOPPED_NOTE = "Car stopped, nothing ahead holding it"
+# turnpilotd's plan.reason while the cameras aren't calibrated (turnpilotd.calibration_wait): the tracker takes no run until
+# they are, so TurnPilot waits, and says it calibrates rather than that the detector isn't running. By calStatus; '' is
+# extrinsicsCalibration never seen (no calibrationd), or calibrated with no rpyCalib
+CALIBRATION_REASONS = {'uncalibrated': 'calibrating cameras', 'recalibrating': 'recalibrating cameras',
+                       'invalid': 'camera calibration invalid', '': 'waiting for camera calibration'}
+CALIBRATION_HINT = {'uncalibrated': 'drive straight above {speed}', 'recalibrating': 'drive straight above {speed}',
+                    'invalid': 'remount the device', '': 'no calibration from calibrationd'}
+CALIBRATION_SPEED = {False: '15 mph', True: '24 km/h'}  # calibrationd's MIN_SPEED_FILTER, by metric: it learns above it alone
+
+
+def calibration_reason(status: str, percent: int) -> str:
+  """The plan's reason for a calibration that isn't done: status its calStatus (CALIBRATION_REASONS), percent its calPerc,
+  said while it counts up ('calibrating cameras: 45%')."""
+  words = CALIBRATION_REASONS.get(status, CALIBRATION_REASONS[''])
+  return f"{words}: {percent}%" if status in ('uncalibrated', 'recalibrating') else words
+
+
+def calibration_text(reason: str, metric: bool = False) -> tuple[str, str] | None:
+  """(title, detail) for the phone of a calibration_reason, None for any other reason: ('Calibrating cameras', '45%, drive
+  straight above 15 mph')."""
+  for status, words in CALIBRATION_REASONS.items():
+    if reason == words or reason.startswith(words + ': '):
+      hint = CALIBRATION_HINT[status].format(speed=CALIBRATION_SPEED[metric])
+      progress = reason[len(words) + 2:]
+      return words[0].upper() + words[1:], f"{progress}, {hint}" if progress else hint
+  return None
 
 
 # the stop-sign decider's actions on the plan's mapControl (stop_go.py through turnpilotd): said whatever the plan's state

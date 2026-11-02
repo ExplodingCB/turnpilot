@@ -6,10 +6,11 @@ from collections import deque
 
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.navigation.helpers import latest_gps_source
-from openpilot.selfdrive.turnpilot.control_text import DECIDER_ACTIONS, hold_text, is_map_reason
+from openpilot.selfdrive.turnpilot.control_text import DECIDER_ACTIONS, calibration_text, hold_text, is_map_reason
 
 SERVICES = ["deviceState", "navInstruction", "turnpilotPlan", "gpsLocation", "gpsLocationExternal",
             "modelV2", "turnpilotDetections", "turnpilotFarDetections",  # these three for the diagnostics' model and step times
+            "extrinsicsCalibration",  # its calibration line
             "managerState"]  # and this for its GPS section: which GPS daemons run
 GPS_SERVICES = ("gpsLocation", "gpsLocationExternal")
 GPS_DAEMONS = ("ubloxd", "pigeond", "qcomgpsd")
@@ -21,7 +22,7 @@ STALE_AFTER = 5.  # s without a new snapshot means the reader thread is stuck or
 STATE_LABELS = {
   "disabled": "Off", "noRoute": "No route", "following": "Following route", "approaching": "Approaching maneuver",
   "turning": "Turning", "laneChange": "Changing lanes", "holding": "Holding", "arrived": "Arrived",
-  "offline": "Not running",
+  "unavailable": "Unavailable", "offline": "Not running",
 }
 MANEUVER_NAMES = {"new name": "continue", "end of road": "turn", "on ramp": "take ramp", "off ramp": "take exit",
                   "rotary": "roundabout", "roundabout turn": "roundabout"}
@@ -50,6 +51,7 @@ def read_services(sm) -> dict:
     "route": route,
     "plan": {"state": str(plan.state), "reason": plan.reason, "shadow": plan.shadow,
              "prompt": str(plan.controlPrompt), "alert": str(plan.controlAlert), "missed": plan.turnMissed,  # the diagnostics' events
+             "handback": str(plan.handback),
              "map": {"kind": str(plan.mapControl.kind), "action": str(plan.mapControl.action), "light": str(plan.mapControl.lightState),
                      "source": str(plan.mapControl.lightSource), "status": str(plan.mapControl.controlsStatus)}}
             if up("turnpilotPlan") else None,
@@ -59,7 +61,8 @@ def read_services(sm) -> dict:
 
 def read_live(sm, samples: dict[str, deque]) -> dict:
   """The driving model and the detector as they run now, for the diagnostics: modelV2.big (the big model on the chestnut),
-  nativeStatus and farStatus, and each step time's median over the last TIME_SAMPLES snapshots that brought a new message."""
+  nativeStatus and farStatus, each step time's median over the last TIME_SAMPLES snapshots that brought a new message, and
+  the cameras' calibration (calStatus and calPerc; None while calibrationd isn't publishing), which the tracker waits for."""
   for s, key, read in (("modelV2", "model_s", lambda m: m.modelExecutionTime), ("turnpilotDetections", "full_s", lambda m: m.executionTime),
                        ("turnpilotFarDetections", "far_s", lambda m: m.run.executionTime)):
     if sm.updated[s]:
@@ -67,10 +70,12 @@ def read_live(sm, samples: dict[str, deque]) -> dict:
     elif not service_up(sm, s):
       samples.pop(key, None)  # stopped: no stale times
   td = sm["turnpilotDetections"] if service_up(sm, "turnpilotDetections") else None
+  cal = sm["extrinsicsCalibration"] if service_up(sm, "extrinsicsCalibration") else None
   return {
     "model_big": bool(sm["modelV2"].big) if service_up(sm, "modelV2") else None,
     "native": str(td.nativeStatus) if td is not None else None,
     "far": str(td.farStatus) if td is not None else None,
+    "calibration": (str(cal.calStatus), int(cal.calPerc)) if cal is not None else None,
     **{key: statistics.median(v) for key, v in samples.items() if v},
     "samples": len(samples.get("model_s", ())),
   }
@@ -163,10 +168,13 @@ def format_status(snap: dict | None, destination, enabled: bool, metric: bool, n
   m = (plan or {}).get("map")
   decider = bool(m) and m["action"] in DECIDER_ACTIONS and m["kind"] in ("stop", "yield")  # the stop-sign decider's (stop_go.py)
   held = hold_text(m["kind"], m["action"], m["light"], m["source"], reason or "") if m and (plan["state"] == "holding" or decider) else None
+  calibrating = calibration_text(reason or "", metric) if plan and plan["state"] == "unavailable" else None
   if held is not None and decider:  # its wait, creep, go and band by its reason, whatever the plan's state
     label, reason = held
   elif held is not None:  # stopped at a stop sign or signal ("Stopped at stop sign", "take control"), or another hold with it
     label, reason = held[0], held[1] if is_map_reason(reason) or not reason else reason
+  elif calibrating is not None:  # waiting for the cameras' calibration, not a detector out ("Calibrating cameras", "45%, ...")
+    label, reason = calibrating
   return {
     "reading": fresh,
     "onroad": snap["onroad"],

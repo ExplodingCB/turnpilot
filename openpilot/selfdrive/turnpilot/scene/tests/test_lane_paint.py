@@ -9,6 +9,8 @@ from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.selfdrive.turnpilot.scene.lane_paint import (COLOR_PROB_MIN, LINE_PROB_MIN, MIN_FRAMES, UNKNOWN, LanePaintClassifier, LinePaint,
                                                             fill_lane_paint, lane_paint_from_msg,
                                                             project, runs, PAINT, ROAD, INVALID)
+from openpilot.selfdrive.turnpilot.scene import lane_paint as lp
+from openpilot.selfdrive.turnpilot.scene.lane_paint import sample_lines
 from openpilot.selfdrive.turnpilot.scene.ranging import calib_from_view, road_lens
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 
@@ -485,3 +487,120 @@ def test_a_line_the_model_is_unsure_of_reads_only_yellow():
     if sure_from <= k < sure_from + MIN_FRAMES - 1:
       assert paint[2] == UNKNOWN, (k, paint)
   assert paint[2].color == 'yellow' and paint[2].kind != 'broken', paint
+
+
+def reference_sample_lines(nv12, stride, y_height, lens, rpy_calib, lines_xyz, boxes=None):
+  """lane_paint.sample_lines as it was before its vectorizing (2026-11-01), every point of every profile rotated and every
+  median and point taken one channel and window at a time: the plain statement of what the fast one must give."""
+  def flanks(profile, at):
+    return (np.median(np.take_along_axis(profile, at[..., None] - lp._FLANK, axis=2), axis=2),
+            np.median(np.take_along_axis(profile, at[..., None] + lp._FLANK, axis=2), axis=2))
+
+  def at_(profile, idx):
+    return np.take_along_axis(profile, idx[..., None], axis=2)[..., 0]
+
+  centers = np.empty((len(lines_xyz), len(lp.XS), 3))
+  for i, (x, y, z) in enumerate(lines_xyz):
+    centers[i, :, 0], centers[i, :, 1], centers[i, :, 2] = lp.XS, np.interp(lp.XS, x, y), np.interp(lp.XS, x, z)
+  pts = np.repeat(centers[:, :, None, :], len(lp.OFFSETS), axis=2)
+  pts[..., 1] += lp.OFFSETS
+  u, v, front = project(lens, calib_from_view(rpy_calib).T, pts)
+  ui, vi = np.rint(u).astype(np.int64), np.rint(v).astype(np.int64)
+  inside = front & (ui >= 0) & (ui < lens.width) & (vi >= 0) & (vi < lens.height)
+  ok = inside.all(axis=2)
+  ui, vi = np.where(inside, ui, 0), np.where(inside, vi, 0)
+  luma = nv12[vi * stride + ui].astype(np.float32)
+  uv = (y_height + vi // 2) * stride + (ui // 2) * 2
+  chroma_u, chroma_v = nv12[uv].astype(np.float32), nv12[uv + 1].astype(np.float32)
+  peak = lp._SEARCH[np.argmax(luma[..., lp._SEARCH], axis=2)]
+  road_l, road_r = flanks(luma, peak)
+  road = np.maximum(road_l, road_r)
+  step = np.abs(road_l - road_r) > np.maximum(lp.LUMA_MIN, lp.STEP_REL * road)
+  ridge = at_(luma, peak) - road
+  above = np.take_along_axis(luma, peak[..., None] + lp._WIDTH, axis=2) >= (road + ridge / 2)[..., None]
+  bright = ridge >= np.maximum(lp.LUMA_MIN, lp.LUMA_REL * road)
+  wide = bright & (above.sum(axis=2) * lp.PROFILE_STEP_M > lp.WIDTH_MAX_M)
+  dip_idx = lp._SEARCH[np.argmin(chroma_u[..., lp._SEARCH], axis=2)]
+  u_road, v_road, y_road = (flanks(c, dip_idx) for c in (chroma_u, chroma_v, luma))
+  u_dip, v_dip = at_(chroma_u, dip_idx), at_(chroma_v, dip_idx)
+  dip = u_dip - np.minimum(*u_road)
+  dv = v_dip - 0.5 * np.add(*v_road)
+  y_paint, y_flank = np.maximum(at_(luma, dip_idx) - 16, 1), np.maximum(0.5 * np.add(*y_road) - 16, 1)
+  cu = (u_dip - 128) / y_paint - (0.5 * np.add(*u_road) - 128) / y_flank
+  cv = (v_dip - 128) / y_paint - (0.5 * np.add(*v_road) - 128) / y_flank
+  tint = ((dip <= lp.YELLOW_DU) | (bright & ~wide & (dip <= lp.WORN_YELLOW_DU))) & (dv >= lp.YELLOW_DV_MIN)
+  yellow = tint & (cu <= lp.YELLOW_CU_MAX) & (cv >= lp.YELLOW_CV_MIN)
+  du_peak = at_(chroma_u, peak) - 0.5 * np.add(*flanks(chroma_u, peak))
+  dv_peak = at_(chroma_v, peak) - 0.5 * np.add(*flanks(chroma_v, peak))
+  white = bright & ~wide & ~tint & (du_peak >= lp.WHITE_DU) & (dv_peak <= lp.WHITE_DV_MAX)
+  ok &= road < lp.LUMA_SATURATED
+  if boxes is not None and len(boxes):
+    b = np.asarray(boxes, dtype=np.float32)[:, :4]
+    row = vi[..., lp._C][..., None]
+    u0, u1 = ui[..., 0][..., None], ui[..., -1][..., None]
+    ok &= ~((row >= b[:, 1]) & (row <= b[:, 3]) & (np.maximum(u0, u1) >= b[:, 0]) & (np.minimum(u0, u1) <= b[:, 2])).any(axis=-1)
+  painted = (bright & ~wide) | yellow
+  state = np.where(~ok | (wide & ~yellow) | (step & ~painted), INVALID, np.where(painted, PAINT, ROAD))
+  return state, np.where(state != PAINT, lp.NO_COLOR, np.where(yellow, lp.YELLOW, np.where(white, lp.WHITE, lp.NO_COLOR)))
+
+
+def random_reads(n, seed=1):
+  """n (frame, rpy, lines, boxes): rendered roads and random bytes, calibrations off nominal, lines straight to sharply
+  curved and off the frame's edge, and boxes over them or none."""
+  rng = np.random.default_rng(seed)
+  frames = [render([double(YELLOW), dashed(WHITE), solid(WHITE), None], 3. * k, seed=k)[0] for k in range(2)]
+  frames += [render([solid(YELLOW_ON_CONCRETE), botts_dots(), dashed(WHITE, phase=5.), None], 3., road=CONCRETE)[0]]
+  frames += [rng.integers(0, 256, frames[0].shape, dtype=np.uint8) for _ in range(2)]  # every branch, whatever the pixels
+  x = np.linspace(0., 100., 33)
+  for k in range(n):
+    rpy = [rng.normal(0, 0.02), rng.normal(0.03, 0.03), rng.normal(0, 0.05)]
+    lines = [(x, y0 + rng.normal(0, 0.5) + rng.normal(0, 0.002) * rng.choice((0, 1, 5)) * x ** 2,
+              HEIGHT + rng.normal(0, 0.1) + rng.normal(0, 0.002) * x) for y0 in LINE_YS]
+    boxes = None
+    if k % 3:
+      us, vs = np.sort(rng.uniform(0, W, (3, 2)), axis=1), np.sort(rng.uniform(300, H, (3, 2)), axis=1)
+      boxes = np.c_[us[:, 0], vs[:, 0], us[:, 1], vs[:, 1], np.ones((3, 2))]
+    yield frames[k % len(frames)], rpy, lines, boxes
+
+
+def test_sample_lines_reads_what_the_reference_reads():
+  """The vectorized reader (one gather, uint8 profiles, the median network, the rays by linearity) against the plain one,
+  sample for sample: rays summed in another order could round a pixel the other way at a half, and never did here."""
+  for frame, rpy, lines, boxes in random_reads(150):
+    got = sample_lines(frame, STRIDE, Y_HEIGHT, LENS, rpy, lines, boxes)
+    want = reference_sample_lines(frame, STRIDE, Y_HEIGHT, LENS, rpy, lines, boxes)
+    assert np.array_equal(got[0], want[0]) and np.array_equal(got[1], want[1]) and got[0].dtype == want[0].dtype
+
+
+def test_the_reader_is_three_times_the_reference():
+  """The comma four read the reference's 0.79 ms (on an M-series Mac) in 7.5-8 ms, over its 5 ms budget, and turned the
+  paint off every drive (detector/modeld_detector.py PAINT_BUDGET_S). The fast reader is about 3x it on any machine (0.21
+  against 0.68 ms, sample_lines alone, on that Mac): a ratio, so a slow CI host doesn't fail it, and 2x, so noise doesn't."""
+  reads = list(random_reads(10, seed=2))
+
+  def best_of(f, n=5):
+    times = []
+    for _ in range(n):
+      t0 = time.perf_counter()
+      for frame, rpy, lines, boxes in reads:
+        f(frame, STRIDE, Y_HEIGHT, LENS, rpy, lines, boxes)
+      times.append(time.perf_counter() - t0)
+    return min(times)
+  best_of(sample_lines, 1)
+  assert best_of(reference_sample_lines) > 2. * best_of(sample_lines)
+
+
+def test_python_calls_per_read():
+  """On the comma four the read is Python call overhead more than arithmetic, so its calls per update (cProfile's count) are
+  a stand-in for its time there that no host's speed moves: 1803 before the vectorizing, 661 after, at a full window."""
+  import cProfile
+  import pstats
+  clf, frame, lines = LanePaintClassifier(LENS), render([double(YELLOW), dashed(WHITE), solid(WHITE), None], 0.)[0], lines_xyz()
+  box = np.array([[600., 400., 700., 470., 0.9, 2.]])
+  for k in range(20):  # a full WINDOW_S of frames
+    clf.update(k * DT, frame, STRIDE, Y_HEIGHT, RPY, True, lines, [0.9] * 4, box)
+  pr = cProfile.Profile()
+  pr.enable()
+  clf.update(20 * DT, frame, STRIDE, Y_HEIGHT, RPY, True, lines, [0.9] * 4, box)
+  pr.disable()
+  assert pstats.Stats(pr).total_calls <= 860  # 661 and 30%, for numpy's own wrappers moving between versions

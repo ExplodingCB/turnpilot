@@ -639,6 +639,21 @@ def test_a_run_before_calibration_is_no_run_never_a_clear_one():
   assert trk.raw_new and len(trk.raw.boxes) == 1 and trk.available
 
 
+def test_runs_before_calibration_are_logged_once_and_as_no_error():
+  # every drive after calibration resets (an OS update) starts with runs before calibration: logged once a spell, never at
+  # error level (cloudlog.event takes any error= as one), where the diagnostics' events would list it as a TurnPilot failure
+  msg = messaging.new_message('extrinsicsCalibration')
+  msg.extrinsicsCalibration.calStatus = 'uncalibrated'
+  trk = SceneTracker(CAMS, 'mici')
+  with mock.patch.object(tracker_module.cloudlog, 'event') as event:
+    for i in range(5):
+      trk.update_runs([detections(trk, 'road', 1. + 0.1 * i, [(CAR, 30., 0., 0.8)], frame_id=i)], msg.as_reader().extrinsicsCalibration,
+                      car_state(), now=1. + 0.1 * i)
+    trk.update_runs([detections(trk, 'road', 2., [(CAR, 30., 0., 0.8)], frame_id=9)], calibration(), car_state(), now=2.)
+  calls = [(c.args[0], c.kwargs) for c in event.call_args_list]
+  assert calls == [("turnpilot.tracker_uncalibrated", {'status': 'uncalibrated'}), ("turnpilot.tracker_calibrated", {})]
+
+
 def person_run(boxes, camera='road', t=1., frame_id=0):
   """A run of person boxes (x0, y0, x1, y1, conf), in the camera's pixels."""
   rows = np.array([[*b[:4], b[4], PERSON] for b in boxes], dtype=np.float32).reshape(-1, 6)

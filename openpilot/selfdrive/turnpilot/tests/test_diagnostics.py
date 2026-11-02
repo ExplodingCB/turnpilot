@@ -116,6 +116,24 @@ class TestEvents(OpenpilotTestCase):
     assert len(kept) == EVENTS_KEPT and kept[-1]["why"] == f"try {EVENTS_KEPT + 1} at [position], [position]"
     assert FIX.split(",", maxsplit=1)[0] not in json.dumps(params.get(EVENTS_PARAM))  # no position in the saved param
 
+  def test_handbacks_and_the_wait_for_calibration_are_events(self):
+    # the detector's handbacks (plan.handback) were in no event; a wait for the cameras' calibration is one, apart from them,
+    # once a spell however its percent counts up, and the tracker's dropped runs while it lasts are no error
+    log = EventLog(BlockingParams(), Clock())
+    for p in (10, 11, 12):
+      log.see_plan({**plan(reason=f"calibrating cameras: {p}%"), "state": "unavailable", "handback": "none"})
+    log.see_plan({**plan(reason="detector not running: take control"), "state": "unavailable", "handback": "noDetector"})
+    log.see_plan({**plan(reason="detector not running: take control"), "state": "unavailable", "handback": "noDetector"})
+    assert [(e["what"], e["why"]) for e in log.get()] == [("waiting for calibration", "calibrating cameras: 10%"),
+                                                        ("handback noDetector", "detector not running: take control")]
+    assert log_event(record({"event": "turnpilot.tracker_uncalibrated", "status": "uncalibrated"}, level=20)) is None
+
+  def test_the_calibration_line(self):
+    assert model_text({"model_big": True, "calibration": ("uncalibrated", 45)})[-1] == \
+      "camera calibration: calibrating cameras: 45% (TurnPilot waits for it; the detector deadline doesn't run)"
+    assert model_text({"model_big": True, "calibration": ("calibrated", 100)})[-1] == "camera calibration: calibrated"
+    assert model_text({"model_big": True, "calibration": None})[-1].startswith("camera calibration: not received")
+
   def test_only_turnpilots_logged_errors(self):
     assert log_event(record("turnpilotd: lane paint off", level=30)) is None  # a warning
     assert log_event(record("thermal zone read failed", daemon="hardwared")) is None

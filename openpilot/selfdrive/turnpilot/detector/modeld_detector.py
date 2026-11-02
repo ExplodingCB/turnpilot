@@ -17,8 +17,11 @@ guard runs), with no wrong-side fire added in any; without lane_paint's chromati
 exit. The far crop's boxes mask only its window, so the replay also read the same frames behind a full road pass's boxes
 on the frame before (which the car doesn't have in a turn): the far side's ego line read broken white (the far-side
 keep's evidence) on 304 of 4591 right-hand-traffic wide steps against 302 so, never where that read yellow.
-It costs about 1.5-2 ms on a Mac and has its own budget: a read slower than PAINT_BUDGET_S (median) turns the paint off
-for the drive, loudly, and the detector, which the pedestrian holds need, keeps running.
+It has its own budget: a read slower than PAINT_BUDGET_S (median) turns the paint off for the drive, loudly, and the
+detector, which the pedestrian holds need, keeps running. A read took 7.5-8 ms on the comma four (0.79 ms on an M-series
+Mac), so the paint went off every drive and the wrong-side guard and the lane changes had none; lane_paint.sample_lines,
+vectorized to the same output (2026-11-01), takes 0.26 ms on that Mac, so about 2.6 ms on the car at the same ratio, an
+estimate until lanePaintTime is read off a drive.
 
 The traffic lights are read the same way (DESIGN phase 4 G2, detector/light_state.py): on road camera runs, from the host
 copy of the frame, on the detector's class-9 boxes (decode_lights, never in the detections), with the frame's calibration
@@ -145,7 +148,11 @@ FORCE_RUN_S = 0.8
 RETRY_S = 1.0              # a failed run is retried after this, doubled for each failure in a row...
 RETRY_MAX_S = 60.          # ...to this
 PARAM_CHECK_S = 1.0        # TurnPilotEnabled is read this often
-PAINT_BUDGET_S = 0.005     # the lane paint read's median over TIME_WINDOW reads above this turns it off for the drive
+# the lane paint read's median over TIME_WINDOW reads above this turns it off for the drive. The most the tighter step has for
+# it: the odd read's (read_odd_paint), the native schedule's 35.7 ms beside the big model, with the lights at LIGHT_BUDGET_S,
+# fits STEP_BUDGET_S with 5.3 ms for the paint (the full pass's road step has more). The read is about 2.6 ms on the comma
+# four (module docstring), so it stays on with half the budget spare
+PAINT_BUDGET_S = 0.005
 LIGHT_BUDGET_S = 0.004     # the light read's median over TIME_WINDOW reads above this turns the lights off for the drive
 # the far crop (FarCrop). Chestnut, 2026-10-28, yolo26n on the 640x384 crop alone: 6.0 ms (the full pass 5.9 ms alone, 7.9 ms
 # beside the big model); a median run over FAR_BUDGET_S is more than the frames between the full runs were measured to hold

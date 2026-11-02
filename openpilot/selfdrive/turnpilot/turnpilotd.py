@@ -24,6 +24,13 @@ TurnPilot acts only while it can do its job (Kellen, 2026-10-27: no degraded mod
 - Once it has run, DETECTOR_DEADLINE_S without fresh results is a stopped detector. modeld's own skips stay inside it: a
   slow spell forces a run every 0.8 s however long it lasts (modeld_detector.FORCE_RUN_S), a failed run retries after
   1 s. A second failure in a row, or a forced run that itself takes too long, is past it.
+- Not while the cameras aren't calibrated (extrinsicsCalibration's calStatus not calibrated, calibration_wait): the
+  tracker takes no run before then (scene/tracker.py: nothing can be ranged), so the scene is unavailable whatever the
+  detector does, and an OS update that reset calibration read "detector not running" for a car that was only calibrating.
+  TurnPilot doesn't act (state unavailable, its reason calibrationd's progress: "calibrating cameras: 45%"), hands nothing
+  back but a model fallback, and neither deadline runs: their clocks hold through it, calibration time being no detector
+  failure, and run on from where they were once it's done. openpilot's own calibration events say it too and keep it from
+  engaging (or soft-disable it, on a recalibration mid-drive, where TurnPilot drops what it was doing as on a handback).
 - A modelV2 from the small model after one from the big model is a fallback (modelV2.big), for the rest of the drive.
   So is modeld's ChestnutActive False (read in main()): it outlives this process, which TurnPilot turned off and on
   restarts, and covers a big model that failed to load.
@@ -174,7 +181,7 @@ from openpilot.common.realtime import DT_MDL, Ratekeeper
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.selfdrive.turnpilot.desire_timing import ENTRY_M, TURN_STARTED_DEG, DesireTiming, keep_last
-from openpilot.selfdrive.turnpilot.control_text import STOPPED_NOTE
+from openpilot.selfdrive.turnpilot.control_text import STOPPED_NOTE, calibration_reason
 from openpilot.selfdrive.turnpilot.go_override import GO_ACCEL, GO_CLEAR_M, GO_WINDOW_S, GoCertifier, Takeover
 from openpilot.selfdrive.turnpilot.handback import Handback
 from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, CLEAR_DESIRE, CONTROL_STATUS_ALERTS, KEEP_FOLLOW, KEEP_REROUTED, TAKE_CONTROL_PROMPTS
@@ -194,7 +201,7 @@ from openpilot.selfdrive.turnpilot.route_follower import (KEEP, LEFT, RIGHT, SAM
 from openpilot.selfdrive.turnpilot.route_notice import RouteNotices
 from openpilot.selfdrive.turnpilot.scene.lane_paint import LINE_PROB_MIN as PAINT_LINE_PROB_MIN, UNKNOWN as UNKNOWN_PAINT, lane_paint_from_msg
 from openpilot.selfdrive.turnpilot.scene.tracker import (MAX_COAST_S, STALE_S, SWEEP_COAST_S, RawFrame, SceneTracker, default_yaw_rate,
-                                                          predicted_path)
+                                                          is_calibrated, predicted_path)
 from openpilot.selfdrive.turnpilot.scene.tracker_b import TrackerB
 from openpilot.selfdrive.turnpilot.visibility import OracleLive
 from openpilot.selfdrive.turnpilot.junction_watch import JunctionWatch, detector_view, junction_from_info, sweep_control, sweep_wanted
@@ -944,14 +951,19 @@ class TurnPilot:
       self.fell_back = True
       self.cancel_route = enabled and self.big_seen
 
-  def handback(self, available: bool, model_running: bool = True, engaged: bool = False) -> int:
+  def handback(self, available: bool, model_running: bool = True, engaged: bool = False, calibrating: bool = False) -> int:
     """Why TurnPilot can't act now, as a Handback: none while it can, and while the detector hasn't started yet, short of
     DETECTOR_START_DEADLINE_S of modeld running (model_running: a modelV2 this frame) once it could load the detector
     (engaged: carControl.enabled; module docstring), nor past DETECTOR_START_DEADLINE_S from the first engaged frame.
-    Once a frame: a fault after update() already ran it takes this frame's."""
+    calibrating: the cameras aren't calibrated (calibration_wait), so the scene is unavailable whatever the detector does:
+    none but a model fallback, and the deadlines' clocks hold. Once a frame: a fault after update() already ran it takes
+    this frame's."""
     if self.handback_now is not None:
       return self.handback_now
     self.detector_seen = self.detector_seen or available
+    if calibrating:
+      self.handback_now = Handback.modelFellBack if self.fell_back else Handback.none
+      return self.handback_now
     self.stale_s = 0. if available else self.stale_s + DT_MDL
     if not self.detector_seen and model_running:
       if not engaged:
@@ -1015,12 +1027,13 @@ class TurnPilot:
       plan.laneChangeAbort = self.stop_abort
 
   def update(self, sm, scene, enabled: bool, shadow: bool, driver_signals: bool | None = None, right_hand_traffic: bool = True, paint=(),
-             paint_rule: bool = True, inputs_valid: bool = True, raw=None, raw_far=None, extra_objects=()):
+             paint_rule: bool = True, inputs_valid: bool = True, raw=None, raw_far=None, extra_objects=(), calibrating: str = ''):
     """A turnpilotPlan message from sm's carState, navInstruction and modelV2, a TurnpilotScene, and the lane paint of
     modelV2's four lane lines (empty when unknown). paint_rule: TurnPilotLanePaintActive; inputs_valid: carState and
     modelV2 pass their checks; raw: the detector run that arrived this frame (scene.tracker.RawFrame), or None; raw_far:
     the far crop's run that arrived this frame (view far), or None; extra_objects: tracker B's b_only pedestrians (main():
     TurnPilotFarPeds, scene/tracker_b.py), for the scene policy alone (ScenePolicy.update): everything else reads the scene's.
+    calibrating: calibration_wait's reason while the cameras aren't calibrated, '' once they are (module docstring).
     driver_signals: None (main) takes it from the turn signal's status, the driver signalling unless the car's own signal
     is ready (car_signals.py); a bool forces it, False then being the openpilot-signals path with no lamp lead gate."""
     self.handback_now = self.scene_now = self.map_now = self.left_now = self.sg_now = None
@@ -1055,12 +1068,12 @@ class TurnPilot:
     available = scene.available
     objects = list(scene.objects) if available else []
 
-    handback = self.handback(available, sm.updated['modelV2'], sm['carControl'].enabled)
+    handback = self.handback(available, sm.updated['modelV2'], sm['carControl'].enabled, bool(calibrating))
     plan.handback = handback
     self.watch_people(raw, raw_far)
     self.rht = right_hand_traffic
     self.watch_lead(model, objects, raw)
-    acting = self.detector_seen and handback == Handback.none
+    acting = self.detector_seen and handback == Handback.none and not calibrating
     lat_active = sm['carControl'].latActive
     if self.acting and not acting and lat_active:
       self.hold_v = v_ego
@@ -1608,7 +1621,7 @@ class TurnPilot:
 
     if not acting:
       plan.state = State.unavailable
-      plan.reason = HANDBACK_REASON.get(handback, WAITING_REASON)
+      plan.reason = calibrating if calibrating and handback == Handback.none else HANDBACK_REASON.get(handback, WAITING_REASON)
     elif decision.holding or withdrawn:
       plan.state = State.holding
     elif not rf.valid:
@@ -3142,7 +3155,7 @@ class TurnPilot:
           log_error("turnpilotd.fault_hold_failed")
       # the detector's deadlines run on: a turnpilotd failing every frame still hands back a stopped detector
       try:
-        handback = self.handback(scene.available, sm.updated['modelV2'], sm['carControl'].enabled)
+        handback = self.handback(scene.available, sm.updated['modelV2'], sm['carControl'].enabled, bool(kwargs.get('calibrating')))
       except Exception:
         log_error("turnpilotd.fault_handback_failed")
         handback = Handback.modelFellBack if self.fell_back else Handback.none
@@ -3500,6 +3513,18 @@ def plan_paint(det, scene_available: bool) -> tuple:
   return lane_paint_from_msg(det.lanePaint)
 
 
+def calibration_wait(calibration) -> str:
+  """The plan's reason while the cameras aren't calibrated, '' once they are: by the tracker's own test (is_calibrated), which
+  takes no run until then. calibration: extrinsicsCalibration, None while it was never seen (calibrationd publishes from
+  its start, so only a calibrationd that isn't running)."""
+  if is_calibrated(calibration):
+    return ''
+  if calibration is None:
+    return calibration_reason('', 0)
+  status = str(calibration.calStatus)
+  return calibration_reason(status if status != 'calibrated' else '', int(calibration.calPerc))  # calibrated, no rpyCalib: waiting
+
+
 def main():
   params = Params()
   pm = messaging.PubMaster(['turnpilotPlan', 'turnpilotScene'])
@@ -3601,8 +3626,9 @@ def main():
     if tracker is not None:
       raw = tracker.raw_by_view.get('road') if 'road' in tracker.new_views else tracker.raw if tracker.raw_new else None
     raw_far = tracker.raw_far if tracker is not None and tracker.raw_far_new else None  # ...and the far crop's
+    calibrating = calibration_wait(sm['extrinsicsCalibration'] if sm.seen['extrinsicsCalibration'] else None)
     msg = tp.plan(sm, scene, enabled, shadow, driver_signals, right_hand_traffic, paint, paint_rule, valid, long_control=long_control,
-                  disengage_on_accel=disengage_on_accel, raw=raw, raw_far=raw_far, extra_objects=extra)
+                  disengage_on_accel=disengage_on_accel, raw=raw, raw_far=raw_far, extra_objects=extra, calibrating=calibrating)
     if tracker_b is not None:
       try:  # the B-only people the plan stopped for, counted and logged (turnpilot.tracker_b, turnpilot.tracker_b_stop)
         tracker_b.after_plan(tp.scene.carried if tp.scene_now is not None else (), max(float(sm['carState'].vEgo), 0.))
