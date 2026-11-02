@@ -857,6 +857,11 @@ class TestStatus(OpenpilotTestCase):
     tp = status.format_status(self.snap(plan=None), None, False, False, now=101.)["turnpilot"]
     assert tp == {"enabled": False, "state": "offline", "label": "Not running", "reason": "TurnPilot is off", "shadow": False}
 
+  def test_an_invalid_plan_is_not_shown_as_followed(self):
+    # 2026-11-02, the second drive: every plan invalid (turnpilotd's input checks), the phone said "Following route"
+    tp = status.format_status(self.snap(plan={**self.PLAN, "valid": False}), None, True, False, now=101.)["turnpilot"]
+    assert (tp["label"], tp["reason"]) == ("Not running", status.INVALID_PLAN_REASON)
+
   def test_offline_reason_names_the_cause(self):
     def reason(onroad, enabled, plan=None, **kw):
       return status.format_status(self.snap(onroad=onroad, plan=plan), None, enabled, False, **{"now": 101., **kw})["turnpilot"]["reason"]
@@ -912,7 +917,7 @@ class TestStatusReader(WebTestCase):
       ni.maneuverPrimaryText, ni.maneuverType, ni.maneuverModifier = "Main Street", "turn", "left"
       ni.maneuverDistance, ni.distanceRemaining, ni.timeRemaining = 250., 5400., 600.
       pm.send("navInstruction", msg)
-      msg = messaging.new_message("turnpilotPlan")  # turnpilotd leaves valid unset
+      msg = messaging.new_message("turnpilotPlan", valid=True)  # turnpilotd sets it from its input checks
       msg.turnpilotPlan.state = "approaching"
       msg.turnpilotPlan.reason = "waiting for oncoming"
       pm.send("turnpilotPlan", msg)

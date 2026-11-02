@@ -3751,7 +3751,7 @@ def main():
       if params.get("ChestnutActive") is False:  # None: no big model expected this drive
         tp.big_model_failed(enabled)
 
-    scene_msg = messaging.new_message('turnpilotScene')
+    scene_msg = messaging.new_message('turnpilotScene', valid=True)
     runs, far = [], None
     try:
       runs = drain.runs()  # every frame, the tracker or not, so nothing piles up

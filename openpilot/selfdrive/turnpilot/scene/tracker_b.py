@@ -131,7 +131,7 @@ class TrackerB:
       trk.update_runs(runs, calibration, car_state, model_v2, now, yaw_rate)
     self.objects = []
     if scene.available:
-      msg = messaging.new_message('turnpilotScene')
+      msg = messaging.new_message('turnpilotScene', valid=True)
       trk.fill_scene(msg.turnpilotScene)
       b_objects = list(msg.as_reader().turnpilotScene.objects)
       self.objects = b_only_objects(scene.objects, b_objects, bike_boxes(tracker_a, b_objects))

@@ -38,7 +38,8 @@ def read_services(sm) -> dict:
   def up(s):
     return service_up(sm, s)
 
-  # navd sends navInstruction with valid=False when it has no route, and turnpilotd doesn't set valid at all
+  # navd sends navInstruction with valid=False when it has no route. turnpilotd sends turnpilotPlan with valid=False when its
+  # car or model inputs fail their checks, and then nothing acts on it: the phone says so (INVALID_PLAN_REASON)
   ni, plan = sm["navInstruction"], sm["turnpilotPlan"]
   route = None
   if up("navInstruction") and sm.valid["navInstruction"]:
@@ -51,7 +52,7 @@ def read_services(sm) -> dict:
     "route": route,
     "plan": {"state": str(plan.state), "reason": plan.reason, "shadow": plan.shadow,
              "prompt": str(plan.controlPrompt), "alert": str(plan.controlAlert), "missed": plan.turnMissed,  # the diagnostics' events
-             "handback": str(plan.handback),
+             "handback": str(plan.handback), "valid": bool(sm.valid["turnpilotPlan"]),
              "map": {"kind": str(plan.mapControl.kind), "action": str(plan.mapControl.action), "light": str(plan.mapControl.lightState),
                      "source": str(plan.mapControl.lightSource), "status": str(plan.mapControl.controlsStatus)}}
             if up("turnpilotPlan") else None,
@@ -147,6 +148,9 @@ def maneuver_text(kind: str, modifier: str, road: str) -> str:
   return f"{words} onto {road}" if words and road else words or road
 
 
+INVALID_PLAN_REASON = "TurnPilot's car or model inputs are failing their checks, so the car isn't acting on the plan"
+
+
 def offline_reason(fresh: bool, onroad: bool, enabled: bool) -> str:
   """Why there is no plan from turnpilotd. It only runs onroad, and publishes while enabled."""
   if not fresh:  # the snapshot is a placeholder, so onroad says nothing
@@ -175,6 +179,8 @@ def format_status(snap: dict | None, destination, enabled: bool, metric: bool, n
     label, reason = held[0], held[1] if is_map_reason(reason) or not reason else reason
   elif calibrating is not None:  # waiting for the cameras' calibration, not a detector out ("Calibrating cameras", "45%, ...")
     label, reason = calibrating
+  if plan and not plan.get("valid", True):  # 2026-11-02: "Following route" on the phone while the car acted on nothing
+    label, reason = STATE_LABELS["offline"], INVALID_PLAN_REASON
   return {
     "reading": fresh,
     "onroad": snap["onroad"],
