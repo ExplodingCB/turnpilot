@@ -135,8 +135,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"TurnPilotValhallaRetry", {CLEAR_ON_MANAGER_START, BOOL}},
     {"TurnPilotNativeDetect", {PERSISTENT, STRING, "full"}},
     {"TurnPilotDiagEvents", {PERSISTENT, JSON}},  // diagnostics.py: the last TurnPilot handbacks, faults and errors, for the phone's report
-    {"TurnPilotGpsColdStart", {PERSISTENT, BOOL, "1"}},  // pigeond.cold_start_once: one ublox cold start on this install
-    {"TurnPilotGpsFactoryReset", {PERSISTENT, BOOL, "1"}},  // pigeond.factory_reset_once: clear the ublox stored config once
+    {"TurnPilotGpsColdStart", {PERSISTENT, BOOL, "0"}},  // pigeond.cold_start_once: one ublox cold start on this install
+    {"TurnPilotGpsFactoryReset", {PERSISTENT, BOOL, "0"}},  // pigeond.factory_reset_once: clear the ublox stored config once
     {"NetworkMetered", {PERSISTENT, BOOL}},
     {"ObdMultiplexingChanged", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, BOOL}},
     {"ObdMultiplexingEnabled", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, BOOL}},
