@@ -29,6 +29,8 @@ MAX_UPLOAD_SIZES = {
   "qcam": 5*1e6,
 }
 
+RLOG_NAMES = ("rlog", "rlog.zst")
+
 allow_sleep = bool(int(os.getenv("UPLOADER_SLEEP", "1")))
 force_wifi = os.getenv("FORCEWIFI") is not None
 fake_upload = os.getenv("FAKEUPLOAD") is not None
@@ -134,6 +136,14 @@ class Uploader:
     for name, key, fn in upload_files:
       if name in self.immediate_priority:
         return name, key, fn
+
+    # TurnPilot: the full log (rlog) goes up by itself, after every qlog, so a drive can be looked at from comma connect
+    # without asking the car for each segment (2026-11-02: the second drive's segments were sent by hand, one at a time).
+    # Only off metered connections: an rlog is about 8 MB a minute, too much for a phone's hotspot
+    if not metered and self.params.get_bool("TurnPilotEnabled"):
+      for name, key, fn in upload_files:
+        if name in RLOG_NAMES:
+          return name, key, fn
 
     return None
 
