@@ -6,6 +6,9 @@ LaneChangeState = log.LaneChangeState
 LaneChangeDirection = log.LaneChangeDirection
 
 LANE_CHANGE_SPEED_MIN = 20 * CV.MPH_TO_MS
+# TurnPilot: its own lane changes are commands, not a blinker read as intent, so they need only a car moving fast enough to
+# move over; the 20 mph floor (a driver's blinker under it is a turn) stays for the driver's
+NAV_LANE_CHANGE_SPEED_MIN = 5 * CV.MPH_TO_MS
 LANE_CHANGE_TIME_MAX = 10.
 LANE_CHANGE_START_TIME = 0.5
 
@@ -23,17 +26,22 @@ class DesireHelper:
 
   def update(self, carstate, lateral_active, lane_change_prob, nav_lane_change=LaneChangeDirection.none):
     v_ego = carstate.vEgo
-    # TurnPilot: a nav lane change request acts as a blinker plus a nudge that way; the blindspot check stays
-    left_blinker = carstate.leftBlinker or nav_lane_change == LaneChangeDirection.left
-    one_blinker = left_blinker != (carstate.rightBlinker or nav_lane_change == LaneChangeDirection.right)
-    below_lane_change_speed = v_ego < LANE_CHANGE_SPEED_MIN
+    # TurnPilot: a nav lane change request is the lane change itself, in its direction, with no blinker, nudge or 20 mph
+    # floor; the blind spot check stays. The driver's blinker the other way cancels it
+    driver_dir = LaneChangeDirection.none if carstate.leftBlinker == carstate.rightBlinker else \
+      self.get_lane_change_direction(carstate.leftBlinker)
+    nav = nav_lane_change != LaneChangeDirection.none and driver_dir in (LaneChangeDirection.none, nav_lane_change)
+    left_blinker = nav_lane_change == LaneChangeDirection.left if nav else carstate.leftBlinker
+    one_blinker = nav or driver_dir != LaneChangeDirection.none
+    below_lane_change_speed = v_ego < (NAV_LANE_CHANGE_SPEED_MIN if nav else LANE_CHANGE_SPEED_MIN)
 
     if not lateral_active or self.lane_change_timer > LANE_CHANGE_TIME_MAX:
       self.lane_change_state = LaneChangeState.off
       self.lane_change_direction = LaneChangeDirection.none
       self.lane_change_timer = 0.0
     else:
-      if self.lane_change_state == LaneChangeState.off and one_blinker and not self.prev_one_blinker and not below_lane_change_speed:
+      if self.lane_change_state == LaneChangeState.off and one_blinker and (nav or not self.prev_one_blinker) and \
+         not below_lane_change_speed:
         self.lane_change_state = LaneChangeState.preLaneChange
         self.lane_change_timer = 0.0
         # Initialize lane change direction to prevent UI alert flicker
@@ -46,7 +54,7 @@ class DesireHelper:
         torque_applied = carstate.steeringPressed and \
                          ((carstate.steeringTorque > 0 and self.lane_change_direction == LaneChangeDirection.left) or
                           (carstate.steeringTorque < 0 and self.lane_change_direction == LaneChangeDirection.right))
-        torque_applied = torque_applied or nav_lane_change == self.lane_change_direction
+        torque_applied = torque_applied or nav
 
         blindspot_detected = ((carstate.leftBlindspot and self.lane_change_direction == LaneChangeDirection.left) or
                               (carstate.rightBlindspot and self.lane_change_direction == LaneChangeDirection.right))

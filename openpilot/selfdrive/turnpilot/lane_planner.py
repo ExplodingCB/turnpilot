@@ -42,8 +42,9 @@ How a change goes (LanePlanner): once the same change is wanted for LC_CONFIRM_F
 ahead: laneChangeOffer says the side (selfdrived raises turnpilotLaneChangeLeft/Right, a chime) and laneChangeCountdown the
 seconds left. On cars where openpilot can't signal (the Tesla: opendbc has no blinker command), the driver's stalk is the
 go-ahead, at any point in the countdown or up to LC_SIGNAL_TIMEOUT_S after it; elsewhere the request goes when the
-countdown ends. The request stands in for the nudge (and, where openpilot signals, the blinker) and DesireHelper still
-waits for the car's own blind spot signal (Tesla DAS_status). Until DesireHelper starts the change, every frame checks it
+countdown ends. The request is the lane change itself: DesireHelper takes it with no blinker or nudge and none of
+the driver's 20 mph floor, only a moving car (NAV_LANE_CHANGE_SPEED_MIN), and still waits for the car's own blind spot
+signal (Tesla DAS_status). Until DesireHelper starts the change, every frame checks it
 again, and any failure aborts it, with laneChangeAbort saying why for ABORT_HOLD_S (selfdrived raises
 turnpilotLaneChangeAborted): the line no longer broken white or the lane no longer valid, the blind spot occupied, a car in
 the target lane, no signal in time (or the blinker off before the change started), the route changed, the change no
@@ -110,7 +111,7 @@ from typing import NamedTuple
 
 from openpilot.cereal import custom, log
 from openpilot.common.swaglog import cloudlog
-from openpilot.selfdrive.controls.lib.desire_helper import LANE_CHANGE_SPEED_MIN
+from openpilot.selfdrive.controls.lib.desire_helper import NAV_LANE_CHANGE_SPEED_MIN
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, ABORT_TEXT
 from openpilot.selfdrive.turnpilot.route_follower import KEEP, LEFT, RIGHT, TURN
@@ -154,7 +155,7 @@ LC_BLOCK_X_M = 15.          # a vehicle in the target lane within this, ahead or
 LC_CLOSING_T_S = 3.         # ...as does one that closes to that distance within this
 LC_LANE_MARGIN_M = 0.5
 # a map stop in the window (module docstring)
-LC_SPEED_MIN = LANE_CHANGE_SPEED_MIN + LC_SPEED_MARGIN  # m/s: the change's speed
+LC_SPEED_MIN = NAV_LANE_CHANGE_SPEED_MIN + LC_SPEED_MARGIN  # m/s: the change's speed
 STOP_CURVE_DECEL = 1.5      # m/s^2: map_controls.MAP_STOP_DECEL, the braking curve to a map stop...
 STOP_CURVE_LAG_S = 1.       # ...after a second's lag (scene_policy.STOP_LAG_S)
 LC_DH_START_S = 1.5         # s from the request to DesireHelper starting the change, blind spot clear

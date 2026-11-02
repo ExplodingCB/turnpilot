@@ -10,7 +10,7 @@ import openpilot.cereal.messaging as messaging
 from openpilot.cereal import custom, log
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, CLEAR_DESIRE, SPEED_CAP_ACCEL_MIN, TAKE_CONTROL_PROMPTS, lane_change_events, plan_accel
-from openpilot.selfdrive.turnpilot.lane_planner import LANE_UNKNOWN_REASON, LC_WARN_S, lane_change_window
+from openpilot.selfdrive.turnpilot.lane_planner import LANE_UNKNOWN_REASON, LC_WARN_S, lane_change_window, slow_zone
 from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN, LinePaint, fill_lane_paint
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, NO_ACCEL_CAP, ONCOMING_TTA_S, PED_STOP_GAP_M
 from openpilot.selfdrive.turnpilot.tests.synthetic import FakeNavd, car_control, car_state, junction_of, model_v2, nav_instruction, scene
@@ -2082,23 +2082,19 @@ def test_the_stopped_notes_chime_is_silent_near_a_mapped_signal(always_drive):
   assert n == hold and next(p for p in plans if p.controlPrompt != 'none').reason == STOPPED_REASON
 
 
-def test_a_turn_lane_a_map_stop_leaves_no_room_for_is_skipped_out_loud_never_turned_from_the_wrong_lane():
-  """The map's lane list puts the car two lanes right of the left turn's lane, and a red 100 m before the turn leaves no
-  room to change before it at speed nor after its go: the turn is skipped as too fast to turn is (navd reroutes), the plan
-  saying why (laneChangeWait unreachable), and its desire never goes out."""
+def test_a_turn_lane_with_a_map_stop_before_it_is_changed_into_before_the_stop():
+  """The map's lane list puts the car two lanes right of the left turn's lane, and a red 100 m before the turn, seen from
+  the start. TurnPilot's own lane changes go down to NAV_LANE_CHANGE_SPEED_MIN, so the stop's braking leaves room to change
+  before it: offered before its slow zone, never waited for after its go, never unreachable. (With stock's 20 mph floor the
+  stop's braking left no room, and the turn was skipped.)"""
   sim = Sim([(400., 'turn', 'left', T_LEFT)], cruise=11., nav_lanes={0: THREE_LANES_LEFT_TURN}, model_lanes=(2, 0),
-            controls=[(300., 'signal')])
+            controls=[(300., 'signal')], paint=BROKEN_WHITE_LEFT)
   sim.tp.oracle_ok = True
   sim.lights = oracle_lights('red', 300.)  # read red from the start: a stop the car makes
   sim.run(25.)
-  plans = [p for _, _, p in sim.trace]
-  first = next(i for i, p in enumerate(plans) if p.tooFastToTurn)
-  s_skip = sim.trace[first][0]
-  assert 400. - s_skip > 150., s_skip  # decided once it was so, well before the junction
-  assert plans[first].laneChangeWait == 'unreachable' and plans[first].laneChangeWant == 2
-  assert any(p.laneChangeWait == 'beforeWindow' for p in plans[:first])
-  assert all(p.desire == Desire.none for p in plans)
-  assert all(p.tooFastToTurn for p in plans[first:] if p.maneuverDistance > 0.)
+  offers = [s for s, _, p in sim.trace if p.laneChangeOffer != LaneChange.none]
+  assert offers and 400. - offers[0] > 100. + slow_zone(11.), offers[:1]
+  assert not any(str(p.laneChangeWait) in ('unreachable', 'afterStop') for _, _, p in sim.trace)
 
 
 # a left at a signal from a T's stem (no oncoming approach: no unprotected-turn stop), read red, then green
@@ -3256,7 +3252,7 @@ def skipped_for_its_lane(sim, turn_s):
 def test_a_turn_whose_lane_change_never_went_is_skipped_out_loud_never_turned_from_the_wrong_lane(always_drive):
   """LC-03 (ALWAYS_DRIVE.md 4.11), unconditional: today the wrong lane is only flagged ('Wrong Lane', silent) and the turn is
   pulsed from the lane the car is in, across the next one. The map's lane list puts the car one lane left of the right turn's
-  lane; a car held in the blind spot through the window, or the car at 15 mph (DesireHelper changes no lanes under 20 mph:
+  lane; a car held in the blind spot through the window, or the car crawling at 4 mph (under NAV_LANE_CHANGE_SPEED_MIN:
   never offered), and the change never goes. At the window's end the turn is skipped out loud and navd reroutes ("Can't Reach
   Turn Lane", skipReason laneBlocked), with the switch off as well as on."""
   sim = Sim([(400., 'turn', 'right'), (2000., 'turn', 'left')], cruise=15., nav_lanes={0: TWO_LANES_RIGHT_TURN}, model_lanes=(0, 1),
@@ -3266,11 +3262,11 @@ def test_a_turn_whose_lane_change_never_went_is_skipped_out_loud_never_turned_fr
   sim.run(26.)
   plans, first = skipped_for_its_lane(sim, 400.)
   assert {str(p.laneChangeWait) for i, p in enumerate(plans[:first]) if 120. < 400. - sim.trace[i][0] < 280.} == {'blindspot'}
-  sim = Sim([(300., 'turn', 'right'), (2000., 'turn', 'left')], cruise=6.7, nav_lanes={0: TWO_LANES_RIGHT_TURN}, model_lanes=(0, 1),
+  sim = Sim([(160., 'turn', 'right'), (2000., 'turn', 'left')], cruise=1.8, nav_lanes={0: TWO_LANES_RIGHT_TURN}, model_lanes=(0, 1),
             paint=BROKEN_WHITE_RIGHT)
   sim.tp.always_drive = always_drive
-  sim.run(40.)
-  plans, first = skipped_for_its_lane(sim, 300.)
+  sim.run(65.)
+  plans, first = skipped_for_its_lane(sim, 160.)
   assert not any(p.laneChangeOffer != LaneChange.none for p in plans)
 
 
@@ -3295,7 +3291,7 @@ def test_a_curb_side_change_on_less_than_paint_never_goes_on_paint_nobody_read(s
   def drive(det, on=True):
     sim = Sim([(400., 'turn', 'right'), (2000., 'turn', 'left')], cruise=15., model_lanes=(0, 1), paint=plan_paint(det, True))
     sim.tp.always_drive = on
-    sim.run(24.)  # past the window's end, the car slowed for the turn
+    sim.run(26.)  # past the window's end, the car slowed for the turn
     return [p for _, _, p in sim.trace]
   read = drive(detections_paint('read', [UNKNOWN, LinePaint('solid', 'yellow', 0.875, 0.9375), UNKNOWN, UNKNOWN]))
   assert any(p.laneChangeOffer == LaneChange.right for p in read) and any(p.laneChange == LaneChange.right for p in read)

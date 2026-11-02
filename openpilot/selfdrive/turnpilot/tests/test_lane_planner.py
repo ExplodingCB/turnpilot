@@ -469,9 +469,9 @@ def test_aborts_before_the_change_starts():
   drive, distance = offered()
   drive.run(None, distance, 1.)
   assert [a for a, _ in drive.aborts] == ['routeChanged']
-  # the car slows below DesireHelper's speed
+  # the car slows below the lane change speed
   drive, distance = offered()
-  drive.v = 7.
+  drive.v = 2.
   drive.run(m, distance, 1.)
   assert [a for a, _ in drive.aborts] == ['tooSlow']
   # inputs go invalid, the planner is turned off
@@ -845,7 +845,7 @@ def test_driver_lane_change_gets_a_cooldown_too():
 
 
 def test_no_request_below_lane_change_speed():
-  drive = Drive(lanes_left=0, lanes_right=2, v=7.)
+  drive = Drive(lanes_left=0, lanes_right=2, v=2.)
   drive.run(maneuver("turn", "right", TWO_LANES_RIGHT_TURN), 200., 10.)
   assert not drive.offers and not drive.requests
 
@@ -1165,9 +1165,10 @@ def test_with_no_room_before_the_stop_the_change_goes_after_its_go():
   (afterStop), and once the car is away and up to speed, offered and made."""
   drive = StopDrive(1, 0, cruise=12., stop_at=175., hold_s=1000.)
   m = maneuver("turn", "left")
-  distance = drive.drive(m, 255., 25.)  # up to the stop and held there
+  distance = drive.drive(m, 215., 25.)  # up to the stop and held there
   assert not drive.offers and drive.v == 0. and drive.held_t > 1.
-  assert {w for d, _, w in drive.waits if d < 250.} == {'afterStop'}
+  waits = {w for d, _, w in drive.waits if d < 210.}  # afterStop at speed, beforeWindow once slow (the window shrinks)
+  assert 'afterStop' in waits and waits <= {'afterStop', 'beforeWindow'}
   drive.cruise, drive.hold_s = 13., 0.
   drive.drive(m, distance, 25.)
   assert drive.offers and drive.lp.changes == 1, (drive.offers, drive.aborts, drive.waits[-1])
@@ -1175,23 +1176,23 @@ def test_with_no_room_before_the_stop_the_change_goes_after_its_go():
 
 
 def test_with_no_room_before_the_stop_nor_after_it_the_lane_is_unreachable_and_said():
-  """A stop 100 m before the turn: not enough road after its go to get up to speed and change. Too close to it at speed
-  for one before it. The turn's lane can't be reached: unreachable, never a late change."""
-  drive = StopDrive(2, 0, cruise=11., stop_at=100.)
+  """A stop 75 m before the turn, seen 45 m ahead: not enough road after its go to get up to speed and change. Too close
+  to it at speed for one before it. The turn's lane can't be reached: unreachable, never a late change."""
+  drive = StopDrive(2, 0, cruise=11., stop_at=75.)
   m = maneuver("turn", "left", THREE_LANES_LEFT_TURN)
-  drive.drive(m, 190., 4.)
+  drive.drive(m, 120., 4.)
   d = drive.decisions[-1]
   assert not drive.offers and d.wait == 'unreachable' and d.unreachable and d.want == 2
   assert 'reach' in d.reason
   # without the map's lane list the car's lane isn't known to be wrong: said, never a skip
-  drive = StopDrive(1, 0, cruise=11., stop_at=100.)
-  drive.drive(maneuver("turn", "left"), 190., 4.)
+  drive = StopDrive(1, 0, cruise=11., stop_at=75.)
+  drive.drive(maneuver("turn", "left"), 120., 4.)
   d = drive.decisions[-1]
   assert d.wait == 'unreachable' and not d.unreachable
 
 
 def test_lane_change_wait_says_why_no_change_is_offered():
-  drive = Drive(1, 0, v=8.)  # below DesireHelper's speed
+  drive = Drive(1, 0, v=2.)  # below the lane change speed (NAV_LANE_CHANGE_SPEED_MIN)
   m = maneuver("turn", "left")
   drive.run(m, 120., 1.)
   assert drive.decisions[-1].wait == 'tooSlow' and drive.decisions[-1].want == 1
@@ -1331,7 +1332,7 @@ def test_a_change_the_lane_list_still_wants_at_the_windows_end_is_blocked_for_an
   cases = {
     'blindspot': (Drive(0, 1), {'blindspot': LaneChange.right}),
     'carInLane': (Drive(0, 1), {'objects': beside}),
-    'tooSlow': (Drive(0, 1, v=7.), {}),
+    'tooSlow': (Drive(0, 1, v=2.), {}),
     'noSignal': (Drive(0, 1, driver_signals=True), {}),
     'laneParked': (Drive(0, 1), {'objects': parked}),
     'lineNotBroken': (Drive(0, 1, paint=lambda left, right: paint(right=SW)), {}),
@@ -1381,7 +1382,7 @@ def test_without_a_lane_list_the_car_is_placed_only_by_a_travel_lane_seen_that_w
   frames = through_the_window(drive, m, start, blindspot=LaneChange.right)
   assert not drive.offers and {x.wait for d, x in frames if 100. < d < 280.} == {'blindspot'}
   assert_blocked_at_the_end(drive, frames)
-  drive = made(Drive(0, 1, v=7.))  # too slow, a travel lane read that way: never offered, blocked
+  drive = made(Drive(0, 1, v=2.))  # too slow, a travel lane read that way: never offered, blocked
   assert_blocked_at_the_end(drive, through_the_window(drive, m, lane_change_window(7.)[0] + 20.))
   for drive, kw in ((made(Drive(0, 0)), {}),  # the curb lane: solid white beyond it
                     (made(Drive(0, 1, paint=lambda left, right: paint(right=SW))), {}),  # a bike lane behind solid white
@@ -1402,16 +1403,16 @@ def test_a_change_made_in_the_window_is_never_blocked():
 def test_blocked_only_with_the_planner_on_and_a_lane_it_can_place():
   """TurnPilotLanePaintActive off plans no change, so blocks none; nor does a lane the list can't place (lane_unknown, 'Can't
   Confirm Lane' instead: R12)."""
-  drive = Drive(0, 1, paint_rule=False, v=7.)
+  drive = Drive(0, 1, paint_rule=False, v=2.)
   assert not any(x.blocked for _, x in through_the_window(drive, TWO_LANE_RIGHT, 200.))
   three_right = maneuver("turn", "right", ((("straight",), False), (("straight",), False), (("right",), True)))
-  drive = Drive(0, 1, curb_unpainted=True, v=7.)
+  drive = Drive(0, 1, curb_unpainted=True, v=2.)
   frames = through_the_window(drive, three_right, 200.)
   assert any(x.wait == 'laneUnknown' for _, x in frames) and not any(x.blocked for _, x in frames)
 
 
 def test_blocked_holds_for_its_maneuver_and_ends_with_it():
-  drive = Drive(0, 1, v=7.)
+  drive = Drive(0, 1, v=2.)
   frames = through_the_window(drive, TWO_LANE_RIGHT, 200.)
   assert frames[-1][1].blocked
   assert not drive.step(TWO_LANE_RIGHT, 300., maneuver_id=1).blocked  # the next maneuver (a reroute's): judged afresh

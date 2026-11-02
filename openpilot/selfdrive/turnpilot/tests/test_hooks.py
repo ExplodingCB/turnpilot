@@ -125,12 +125,22 @@ def test_desire_helper_without_nav_is_upstream():
   assert dh.lane_change_state == LaneChangeState.laneChangeStarting and dh.desire == log.Desire.laneChangeLeft
 
 
-def test_nav_lane_change_is_blinker_plus_nudge():
+def test_nav_lane_change_is_a_command_with_no_blinker_or_20_mph_floor():
   dh = DesireHelper()
   dh.update(car_state(15.), True, 0.5, LaneChangeDirection.right)
   assert (dh.lane_change_state, dh.lane_change_direction) == (LaneChangeState.preLaneChange, LaneChangeDirection.right)
   dh.update(car_state(15.), True, 0.5, LaneChangeDirection.right)
   assert dh.lane_change_state == LaneChangeState.laneChangeStarting and dh.desire == log.Desire.laneChangeRight
+  # at 10 mph, under the driver's 20 mph floor, it still goes
+  dh = DesireHelper()
+  for _ in range(2):
+    dh.update(car_state(4.5), True, 0.5, LaneChangeDirection.left)
+  assert dh.lane_change_state == LaneChangeState.laneChangeStarting and dh.desire == log.Desire.laneChangeLeft
+  # the driver's blinker the other way cancels it
+  dh = DesireHelper()
+  for _ in range(3):
+    dh.update(car_state(15., right_blinker=True), True, 0.5, LaneChangeDirection.left)
+  assert dh.lane_change_direction != LaneChangeDirection.left
 
 
 def test_nav_lane_change_keeps_blindspot_and_speed_checks():
@@ -140,7 +150,7 @@ def test_nav_lane_change_keeps_blindspot_and_speed_checks():
   assert dh.lane_change_state == LaneChangeState.preLaneChange
   dh = DesireHelper()
   for _ in range(5):
-    dh.update(car_state(7.), True, 0.5, LaneChangeDirection.left)
+    dh.update(car_state(2.), True, 0.5, LaneChangeDirection.left)
   assert dh.lane_change_state == LaneChangeState.off
 
 
