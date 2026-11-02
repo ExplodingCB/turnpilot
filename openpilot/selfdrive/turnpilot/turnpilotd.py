@@ -330,6 +330,14 @@ STALL_REPULSE_S = 2.
 STALL_LIFTS = 3
 STALL_LIFT_GAP_S = 3.
 STALL_LIFT_REASON = "Stalled: finishing the turn"
+# ...and once a lift was refused for something seen (a model lead, a person, personFront, inPath: SAT_RERUN R4/R5) the stand is
+# handed back for good (stall_handed): the prompt on every frame, no lift after, until a pedal, a disengage, another turn or the
+# car driving on this far by odometer from where it was handed back. Never on its speed alone: SAT_RERUN C7's lift 2 ended after
+# 0.6 s for the model's lead (the building, 13.2 m, p 0.93) with the car rolling 0.25-0.5 m/s from that lift, so the latch
+# cleared on the roll's first frame at STANDSTILL_SPEED, 'Stalled in the turn: take control' showed 0.1 s, and lift 3 went 3 s
+# later toward the same building. That roll, from a lift ended inside its first second (at most GO_ACCEL), carries the car
+# under half of this; the model driving on passes it in a second at walking pace
+STALL_HANDED_MOVED_M = 1.
 PEOPLE = ('pedestrian', 'cyclist')
 STALL_PERSON_PATH_M = PATH_HALF_WIDTH_M + CURB_PED_EDGE_M  # m of the model's predicted path a person bars the lift within
 PERSON_RUN_HOLD_S = 1.  # a detector run's person boxes stand for that camera's view this long (the last run of each)
@@ -832,6 +840,7 @@ class TurnPilot:
     self.stall_gap_s = math.inf    # ...s since the last one ended
     self.stall_why = ''            # ...why none may go now, as last logged
     self.stall_handed = False      # ...handed back for a refused lift: stays so until the car moves, a pedal or the turn changes
+    self.stall_handed_odo = 0.     # ...odo_m where it was (STALL_HANDED_MOVED_M)
     self.stall_alert_t = 0.        # ...s left of its stallLift alert
     self.unsig_why = ''            # under the switch, why a release where no signal is mapped isn't lifted, as last logged
     self.unstick_done = False      # under the switch, section 4.5's lift went for this release: no second try (stopped_unheld)
@@ -2665,7 +2674,11 @@ class TurnPilot:
     # the model's own stand in a turn in progress (or one R8b's fire cleared): partway round, or past the maneuver point
     model_turn = (self.turn_committed or self.straight_fired) and (STALL_MIN_DEG <= turned or rf.distance < 0.)
     in_turn = turned <= STALL_MAX_DEG and (go_turn or model_turn)
-    standing = acting and in_turn and sm['carControl'].enabled and v_ego < STANDSTILL_SPEED and not decision.should_stop and \
+    if self.stall_handed and (cs.gasPressed or cs.brakePressed or self.odo_m - self.stall_handed_odo >= STALL_HANDED_MOVED_M - 1e-6):
+      self.stall_handed = False  # the driver acted, or the car drove on: the stand it handed back is over
+    # handed back, the refused lift's own roll is no move (STALL_HANDED_MOVED_M, SAT_RERUN C7): the stand and its clocks go on
+    still = v_ego < STANDSTILL_SPEED or self.stall_handed
+    standing = acting and in_turn and sm['carControl'].enabled and still and not decision.should_stop and \
       not self.go_withdrawn and not self.release_stand and \
       not decision.holding and not cs.gasPressed and not cs.brakePressed and not map_handback(mapd)
     self.stall_stand_s = self.stall_stand_s + DT_MDL if standing else 0.
@@ -2696,8 +2709,6 @@ class TurnPilot:
     if self.stall_mid != mid or not sm['carControl'].enabled:  # another turn, or the driver: a stall of its own
       self.stall_mid, self.stall_pulsed, self.stall_lifts, self.stall_gap_s, self.stall_why = mid, False, 0, math.inf, ''
       self.stall_handed = False
-    if v_ego >= STANDSTILL_SPEED or cs.gasPressed or cs.brakePressed:
-      self.stall_handed = False  # the car moved or the driver acted: the stand it handed back is over
     mine = gc.active and gc.id == self.stall_lift_id
     if not mine and self.stall_lift_id is not None:
       self.stall_gap_s += DT_MDL
@@ -2723,7 +2734,8 @@ class TurnPilot:
                        turned_deg=round(self.desires.turned_deg, 1),
                        person=self.person_near_turn(objects, sm['modelV2']) if why == 'person' else '')
       self.stall_why = why
-      self.stall_handed = self.stall_handed or why in ('lead', 'person', 'personFront', 'inPath')  # something seen: never lifted into after
+      if not self.stall_handed and why in ('lead', 'person', 'personFront', 'inPath'):  # something seen: never lifted into after
+        self.stall_handed, self.stall_handed_odo = True, self.odo_m
       return True
     if self.stall_gap_s < STALL_LIFT_GAP_S - 1e-6 or gc.active:
       return False  # the next lift is due (or another go is out, for a frame or two): no handback meanwhile

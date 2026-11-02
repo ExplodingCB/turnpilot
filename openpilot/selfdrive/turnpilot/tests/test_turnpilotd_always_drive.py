@@ -28,7 +28,8 @@ from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_go import attach_planne
 from openpilot.selfdrive.turnpilot.unprotected_left import LIGHT_RED_MAX_S, STAND_UNDECIDED_S
 from openpilot.selfdrive.turnpilot.turnpilotd import (LEAD_STAND_MAX_S, LIGHT_GREEN_REASON, LIGHT_WAIT_NOTE, NEAR_CONTROL_STAND_S, NO_MOVE_MAX_S,
                                                       NO_MOVE_REASON, NO_MOVE_S, PED_NOTE_S, PED_WAITING_NOTE, PED_WAITING_REASON, QUEUE_STILL_MAX_S,
-                                                      RELEASE_GOES, RELEASE_LIFT_M, STALLED_REASON, STALL_LIFTS, STALL_LIFT_GAP_S, STALL_LIFT_REASON,
+                                                      RELEASE_GOES, RELEASE_LIFT_M, STALLED_REASON, STALL_HANDED_MOVED_M, STALL_LIFTS,
+                                                      STALL_LIFT_GAP_S, STALL_LIFT_REASON,
                                                       STALL_MIN_DEG, STALL_PROMPT_S, STALL_REPULSE_S, STANDSTILL_SPEED, STOPPED_HANDBACK_S,
                                                       SIGN_CLEAR_M, SIGN_RUN_FRESH_S, STOPPED_NOTE, STOPPED_NOTE_S, TurnPilot,
                                                       UNSTICK_S)
@@ -496,6 +497,45 @@ def test_a_stalls_handback_for_a_flickering_model_lead_stays_and_no_lift_follows
     [i * DT_MDL for i, q in enumerate(plans[handed:], handed) if q.controlPrompt != 'stalledTakeControl'][:5]
   assert not [s for s in lifts_of(plans) if s[0] > handed], lifts_of(plans)
   assert not any(q.shouldStop for q in plans)
+
+
+def rolled(sim, speeds, flicker=False, **kw):
+  """stand(), the car's speed speeds[k] on frame k instead of 0 (a lift's roll); flicker: lead_prob read on odd frames only."""
+  lead, lead_x = kw.pop('lead_prob', None), kw.pop('lead_x', 30.)
+  plans = []
+  sim.model_holds = True
+  for k, v in enumerate(speeds):
+    on = lead is not None and (not flicker or k % 2)
+    sim.model_kw = {'lead_prob': lead, 'lead_x': lead_x} if on else {}
+    sim.v = v
+    plans.append(sim.step(engaged=True, **kw))
+  sim.model_holds = False
+  return plans
+
+
+def test_a_stalls_handback_stays_through_the_roll_of_the_lift_it_refused():
+  """SAT_RERUN C7 (red_right_g62): clearBox lift 2 ended after 0.6 s for the model's lead (the building, 13.2 m, p 0.93) with the
+  car rolling 0.25-0.5 m/s from that lift. 'Stalled in the turn: take control' came on the refusal and went 0.1 s later, the
+  latch cleared by the roll's first frame at STANDSTILL_SPEED, and clearBox lift 3 went 3 s after toward the same building.
+  The refused lift's roll is no move: the handback stays on every frame and no lift follows it. The car driving on
+  STALL_HANDED_MOVED_M is: the stand it handed back is over."""
+  n = round(1. / DT_MDL)
+  sim = stalled_right(True, deg=58.)
+  plans = stand(sim, STALL_PROMPT_S + 0.2)
+  assert lifts_of(plans), "the stall's first lift"
+  plans += rolled(sim, [0.02 * k for k in range(13)])  # the lift's first 0.6 s from a standstill, to 0.24 m/s
+  plans += rolled(sim, [0.25 + 0.25 * k / n for k in range(n)] + [0.5 * (1. - k / n) for k in range(n)], flicker=True,
+                  lead_prob=0.93, lead_x=13.2)  # the lead read, the lift refused, the roll up to 0.5 m/s and down again
+  plans += rolled(sim, [0.] * round(8. / DT_MDL), flicker=True, lead_prob=0.93, lead_x=13.2)  # standing again, the lead flickering
+  handed = next(i for i, q in enumerate(plans) if q.controlPrompt == 'stalledTakeControl')
+  assert all(q.controlPrompt == 'stalledTakeControl' for q in plans[handed:]), \
+    [round(i * DT_MDL, 2) for i, q in enumerate(plans[handed:], handed) if q.controlPrompt != 'stalledTakeControl'][:5]
+  assert not [s for s in lifts_of(plans) if s[0] > handed], lifts_of(plans)
+  assert sim.tp.odo_m - sim.trace[len(sim.trace) - len(plans) + handed][0] < STALL_HANDED_MOVED_M  # the roll, by the odometer
+  # the model driving on: past STALL_HANDED_MOVED_M the stand is over, and so is its handback
+  moved = rolled(sim, [1.] * round((STALL_HANDED_MOVED_M + 0.5) / DT_MDL))
+  assert moved[-1].controlPrompt == 'none'
+  assert not any(q.shouldStop for q in plans + moved)
 
 
 # --- ST-09 (stalls): a queue in a turn ---
