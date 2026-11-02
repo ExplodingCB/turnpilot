@@ -296,6 +296,14 @@ SIGNAL_STOPPED_REASON = "Stopped at the signal: take control"
 LIGHT_WAIT_NOTE = "Waiting at the light"
 LIGHT_GREEN_REASON = "Light green: car not moving"
 LIGHT_GREEN_STEADY_S = 2.
+# ...and a stand there with no red or yellow read by any source (the camera's shadow reader reading nothing, or another colour)
+# for LIGHT_UNREAD_S is said with a chime, once a stand (lightNotRead, LIGHT_UNREAD_REASON), switch on or off; never a lift,
+# the NEAR_CONTROL_STAND_S handback as it was. The confirm round's C8 (route_demo): the model stood 85 s at a mapped signal's
+# green, nothing in its path, no light read there, and nothing but the status line said it until the 90 s handback. A third
+# of that: at a red no source reads it costs the driver a glance at the light; at a green the car stands silent half a minute
+# at most. A red read there explains the stand (its clock starts over)
+LIGHT_UNREAD_S = 30.
+LIGHT_UNREAD_REASON = "No red seen: car not moving"
 # a turn released from a standstill (a hold's go: BeamNG 2026-10-28, taken about half the time) is checked, never trusted:
 MISSED_TURN_DEG = 15.  # past its junction (the follower's pass) turned less than this, it was missed: said and rerouted
 MISSED_HOLD_S = 3.     # turnMissed is held this long, for the alert and for navd (1 Hz) to see it
@@ -869,6 +877,9 @@ class TurnPilot:
     self.green_s = 0.              # ...under the switch, s the camera has read that signal steady green (LIGHT_GREEN_STEADY_S)
     self.green_said = False        # ...said for this green
     self.green_alert_t = 0.        # ...s left of its lightGreenNotMoving alert
+    self.unread_s = 0.             # ...s at a mapped signal with no red or yellow read there (LIGHT_UNREAD_S)
+    self.unread_said = False       # ...said for this stand
+    self.unread_alert_t = 0.       # ...s left of its lightNotRead alert
     self.stall_s = 0.              # standing in a route turn, nothing holding the car (stalledTakeControl)
     self.stall_stand_s = 0.        # ...standing there, a corroborated lead or not (LEAD_STAND_MAX_S)
     self.stall_said = False        # ...handed back for it (its log once)
@@ -1692,6 +1703,9 @@ class TurnPilot:
     if self.green_alert_t > 0. and str(plan.controlPrompt) == 'none' and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS:
       plan.controlAlert, plan.reason = 'lightGreenNotMoving', LIGHT_GREEN_REASON  # the model not going at a camera green: said
     self.green_alert_t = max(self.green_alert_t - DT_MDL, 0.)
+    if self.unread_alert_t > 0. and str(plan.controlPrompt) == 'none' and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS:
+      plan.controlAlert, plan.reason = 'lightNotRead', LIGHT_UNREAD_REASON  # a stand at a signal with no red read: said (C8)
+    self.unread_alert_t = max(self.unread_alert_t - DT_MDL, 0.)
     if self.stall_alert_t > 0. and str(plan.controlPrompt) == 'none' and str(plan.controlAlert) in ('none',) + CONTROL_STATUS_ALERTS:
       plan.controlAlert, plan.reason = 'stallLift', STALL_LIFT_REASON  # a stall's lift (LEFT-21): said with a chime
     self.stall_alert_t = max(self.stall_alert_t - DT_MDL, 0.)
@@ -3127,10 +3141,19 @@ class TurnPilot:
     limit = NEAR_CONTROL_STAND_S if near else STOPPED_HANDBACK_S
     self.stopped_signal = any(c.kind == 'signal' for c in near)
     light_wait = self.always_drive_on and self.stopped_signal  # the model owns the light (ALWAYS_DRIVE.md ST-07 (stops))
-    camera = self.map_controls.junction_lights(min(c.d for c in near if c.kind == 'signal'))[1] if light_wait else set()
-    if 'red' in camera:
+    accepted, camera = self.map_controls.junction_lights(min(c.d for c in near if c.kind == 'signal')) if self.stopped_signal else \
+      (set(), set())
+    if light_wait and 'red' in camera:
       limit = LIGHT_RED_MAX_S  # the camera explains the stand, a cycle at most; it never brakes the car
     self.stopped_s = self.stopped_s + DT_MDL if unheld else 0.
+    # LIGHT_UNREAD_S: no red or yellow read at the signal by any source, once a stand
+    unread = unheld and self.stopped_signal and not ((accepted | camera) & {'red', 'yellow'})
+    self.unread_s = self.unread_s + DT_MDL if unread else 0.
+    self.unread_said = unheld and self.unread_said
+    if self.unread_s >= LIGHT_UNREAD_S - 1e-6 and not self.unread_said:
+      self.unread_said, self.unread_alert_t = True, ABORT_HOLD_S
+      cloudlog.event("turnpilot.light_not_read", stood_s=round(self.stopped_s, 1), camera=sorted(camera), accepted=sorted(accepted),
+                     **self.lead_log(sm['modelV2']))
     green = light_wait and unheld and camera == {'green'} and not path_blocker(objects, raw)
     self.green_s = self.green_s + DT_MDL if green else 0.
     if not (light_wait and unheld and 'green' in camera):

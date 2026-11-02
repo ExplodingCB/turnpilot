@@ -527,6 +527,22 @@ def test_the_stopped_note_is_heard_once_with_the_info_chime_never_as_a_handback(
   assert [sounds[i] for i in rises] == [AudibleAlert.prompt, AudibleAlert.none]  # one chime, never tpHandback
 
 
+def test_a_stand_at_a_signal_with_no_red_read_is_appended_and_said_with_a_chime_never_a_handback():
+  # the confirm round's C8: the model stood 85 s at a mapped signal's green with no light read there, said only on the status
+  # line until the 90 s handback. ControlAlert lightNotRead @32, after turnpilotResumed @31: the info chime, above a lane change,
+  # below the handback, which keeps its own repeating chime
+  from openpilot.cereal import custom
+  from openpilot.selfdrive.turnpilot.hooks import CONTROL_ALERT_EVENTS, CONTROL_ALERT_TEXT, TAKE_CONTROL_PROMPTS, plan_events
+  from openpilot.selfdrive.turnpilot.turnpilotd import LIGHT_UNREAD_REASON
+  assert custom.TurnpilotPlan.ControlAlert.schema.enumerants['lightNotRead'] == 32
+  assert 'lightNotRead' in CONTROL_ALERT_EVENTS and 'lightNotRead' not in TAKE_CONTROL_PROMPTS
+  a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='lightNotRead', reason=LIGHT_UNREAD_REASON)))
+  assert a.alert_text_1 == 'Stopped at the Light' and a.alert_text_2 == CONTROL_ALERT_TEXT['lightNotRead']
+  assert a.audible_alert == AudibleAlert.prompt and a.visual_alert == VisualAlert.none
+  assert plan_events(FakeSM(plan(controlAlert='lightNotRead', laneMismatch='wrongLaneForTurn'))) == ['turnpilotControlAlert']
+  assert plan_events(FakeSM(plan(controlAlert='lightNotRead', controlPrompt='carStoppedTakeControl'))) == ['turnpilotControlPrompt']
+
+
 def test_the_map_stops_status_line_has_a_silent_twin():
   """ALWAYS_DRIVE.md MC-03 (TurnPilotAlwaysDrive): the same 'Map Stops Unavailable' line with no sound, for its later onsets."""
   loud, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='mapControlsUnavailable', reason='Map stops/signals: partial')))

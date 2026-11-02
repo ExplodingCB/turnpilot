@@ -28,7 +28,8 @@ from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, 
                                                                  walker_stops_the_car)
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_go import attach_planner, holding, model_stops_at, raw_person
 from openpilot.selfdrive.turnpilot.unprotected_left import LIGHT_RED_MAX_S, STAND_UNDECIDED_S
-from openpilot.selfdrive.turnpilot.turnpilotd import (LEAD_STAND_MAX_S, LIGHT_GREEN_REASON, LIGHT_WAIT_NOTE, NEAR_CONTROL_STAND_S, NO_MOVE_MAX_S,
+from openpilot.selfdrive.turnpilot.turnpilotd import (LEAD_STAND_MAX_S, LIGHT_GREEN_REASON, LIGHT_UNREAD_REASON, LIGHT_UNREAD_S, LIGHT_WAIT_NOTE,
+                                                      NEAR_CONTROL_STAND_S, NO_MOVE_MAX_S,
                                                       NO_MOVE_REASON, NO_MOVE_S, PED_NOTE_S, PED_WAITING_NOTE, PED_WAITING_REASON, QUEUE_STILL_MAX_S,
                                                       RELEASE_GOES, RELEASE_LIFT_M, STALLED_REASON, STALL_HANDED_MOVED_M, STALL_LIFTS,
                                                       STALL_LIFT_GAP_S, STALL_LIFT_REASON,
@@ -633,6 +634,27 @@ def test_a_steady_camera_green_the_model_doesnt_go_on_chimes():
       assert t_green <= said[0] * DT_MDL <= t_green + 5. and plans[said[0]].reason == LIGHT_GREEN_REASON
       assert said == list(range(said[0], said[0] + len(said))) and len(said) * DT_MDL <= 3.1  # one chime, held a moment
     assert all(str(q.goCertified.cause) == 'none' for q in plans)
+
+
+def test_a_stand_at_a_signal_with_no_red_read_is_said_loudly_long_before_its_handback():
+  """The confirm round's C8 (route_demo): the model stood 85 s at a mapped signal's green, 7 m short of a rerouted U-turn,
+  nothing in its path, and no light source read anything there: 'Waiting at the light' on the status line alone until the
+  90 s handback. A stand at a mapped signal with no red or yellow read for LIGHT_UNREAD_S is said with a chime, once a stand
+  (lightNotRead, LIGHT_UNREAD_REASON); never a lift, and the handback still at NEAR_CONTROL_STAND_S. A camera red there
+  explains the stand: nothing said. Switch on or off."""
+  for on in (True, False):
+    sim = at_a_signal(on)
+    plans = stand(sim, NEAR_CONTROL_STAND_S + 1.)
+    said = [i for i, q in enumerate(plans) if str(q.controlAlert) == 'lightNotRead']
+    assert said and abs(said[0] * DT_MDL - LIGHT_UNREAD_S) < 0.15, (on, said[:1])
+    assert said == list(range(said[0], said[0] + len(said))) and len(said) * DT_MDL <= 3.1  # one chime, held a moment
+    assert plans[said[0]].reason == LIGHT_UNREAD_REASON and plans[said[0]].controlPrompt == 'none'
+    assert LIGHT_UNREAD_S <= NEAR_CONTROL_STAND_S / 3.
+    first = next(i for i, q in enumerate(plans) if q.controlPrompt == 'carStoppedTakeControl')
+    assert abs(first * DT_MDL - NEAR_CONTROL_STAND_S) < 0.2, on
+    assert all(str(q.goCertified.cause) == 'none' for q in plans) and not any(q.shouldStop for q in plans)
+    sim = at_a_signal(on, camera=lambda sim: 'red')
+    assert not any(str(q.controlAlert) == 'lightNotRead' for q in stand(sim, LIGHT_UNREAD_S + 5.)), on
 
 
 # --- LEFT-20 (ST-07 (stalls)): a release where no signal is (RELEASE_UNSIGNALIZED under section 4.5's conditions) ---

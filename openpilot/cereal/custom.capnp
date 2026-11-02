@@ -265,6 +265,10 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     # TurnPilot back at the driver's engagement after a big model fallback paused it (turnpilotd.py watch_model): the big
     # model back (modelV2.big), "TurnPilot resumed", a chime, once
     turnpilotResumed @31;
+    # the confirm round's C8 (turnpilotd.py stopped_unheld): standing at a mapped signal LIGHT_UNREAD_S with nothing holding the
+    # car and no red or yellow read there by any source: "No red seen: car not moving", a chime, once a stand; never a lift, the
+    # NEAR_CONTROL_STAND_S handback unchanged
+    lightNotRead @32;
   }
   mapControl @24 :MapControlStatus;
   controlPrompt @25 :ControlPrompt;
