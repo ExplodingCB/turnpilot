@@ -481,3 +481,28 @@ def test_paint_is_none_read_with_the_scene_unavailable_or_before_the_first_messa
   fill_lane_paint(short.turnpilotDetections.init('lanePaint', 2), READ_PAINT[:2])
   short.turnpilotDetections.lanePaintStatus = 'read'
   assert turnpilotd.plan_paint(short.as_reader().turnpilotDetections, True) == ()
+
+
+def test_the_plans_inputs_pass_their_frequency_check_at_turnpilotds_own_rate():
+  """2026-11-02, the second drive: carState (100 Hz) read by turnpilotd's 20 Hz loop failed SubMaster's frequency check left at
+  carState's rate, so every plan went out invalid and the car did nothing on a shown route. main's SubMaster takes the loop's
+  rate, and at it carState and modelV2 as the loop reads them (the newest each frame) are freq_ok."""
+  made = {}
+
+  def capture(services, **kwargs):
+    made.update(services=services, **kwargs)
+    raise SystemExit
+  with mock.patch.object(turnpilotd.messaging, 'SubMaster', side_effect=capture), mock.patch.object(turnpilotd, 'Params'), \
+       pytest.raises(SystemExit):
+    turnpilotd.main()
+  assert made['frequency'] == turnpilotd.PLAN_FREQ == 20.
+
+  sm = messaging.SubMaster(['carState', 'modelV2'], frequency=made['frequency'])
+  for frame in range(400):  # 20 s of the loop: carState's newest of five, modelV2's one
+    t = frame * turnpilotd.DT_MDL
+    sm.update_msgs(t, [messaging.new_message('carState', valid=True), messaging.new_message('modelV2', valid=True)])
+  assert sm.all_checks(['carState', 'modelV2'])
+  unset = messaging.SubMaster(['carState', 'modelV2'])  # the old SubMaster, so the test fails without the fix
+  for frame in range(400):
+    unset.update_msgs(frame * turnpilotd.DT_MDL, [messaging.new_message('carState', valid=True), messaging.new_message('modelV2', valid=True)])
+  assert not unset.freq_ok['carState']

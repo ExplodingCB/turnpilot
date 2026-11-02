@@ -252,6 +252,7 @@ ERROR_LOG_PERIOD_S = 10.  # s between logged exceptions from one place, so one t
 # hooks.PLAN_MAX_AGE_S), not at the first: a plan invalid for one frame drops its desire for that frame, and modeld takes
 # the desire coming back as a new pulse
 PLAN_INPUT_GRACE_FRAMES = 10
+PLAN_FREQ = 1. / DT_MDL  # Hz, turnpilotd's loop (main)
 MISMATCH_CONFIRM_FRAMES = 20  # a lane mismatch this many frames in a row (1 s) is flagged: the model's lane count flickers
 NO_JUNCTION_DATA_REASON = "no junction data: nominal turn angle"
 # hazards hold the car's signal off while it signals a maneuver (car_signals.py; DESIGN phase4/blinker 7.7): the reason line
@@ -3698,9 +3699,12 @@ def main():
   # no route, no detector (TurnPilotEnabled off, no pkl), no light source (only the sim's oracle publishes one; the
   # camera's lights ride in turnpilotDetections, shadow unless TurnPilotCameraLights is addOnly)
   optional = ['navInstruction', 'turnpilotDetections', 'turnpilotLights', 'turnpilotFarDetections']
+  # frequency: the loop's own rate. Left to SubMaster it is carState's 100 Hz, and a conflated carState read at 20 Hz is never
+  # freq_ok, so on the car every plan went out invalid and nothing acted on one (2026-11-02, the second drive: route shown,
+  # "TurnPilot not running", nothing done). SIMULATION passes every freq_ok, so the sim never saw it
   sm = messaging.SubMaster(['carState', 'carControl', 'navInstruction', 'modelV2', 'turnpilotDetections', 'extrinsicsCalibration',
                             'deviceState', 'narrowRoadCameraState', 'turnpilotLights', 'turnpilotFarDetections'],
-                           ignore_alive=optional, ignore_avg_freq=optional, ignore_valid=optional)
+                           ignore_alive=optional, ignore_avg_freq=optional, ignore_valid=optional, frequency=PLAN_FREQ)
   drain = DetectionDrain(messaging.sub_sock(DetectionDrain.SERVICE, conflate=False))
   rk = Ratekeeper(1. / DT_MDL, print_delay_threshold=None)
   tp = TurnPilot()
