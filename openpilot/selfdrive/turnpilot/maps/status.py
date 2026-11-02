@@ -47,14 +47,15 @@ def same_destination(status: dict, destination) -> bool:
     return False
 
 
-def for_destination(status: dict | None, destination, onroad: bool = True) -> dict | None:
-  """navd's status for the current destination: its own if it is about it, else 'checking' while onroad (navd hasn't
-  started on it yet), and None with no destination or offroad, where navd doesn't run."""
+def for_destination(status: dict | None, destination, navd_running: bool = True) -> dict | None:
+  """navd's status for the current destination: its own if it is about it, else 'checking' while navd runs (it hasn't
+  started on it yet), and None with no destination or with navd not running. navd runs offroad too while TurnPilot is
+  enabled (process_config.navigation), so the phone sees the route made while the car is parked."""
   if destination is None:
     return None
   if status is not None and same_destination(status, destination):
     return status
-  if not onroad:
+  if not navd_running:
     return None
   return {'state': 'checking', 'message': 'Checking the mapped area', 'short': 'Checking the mapped area', 'code': '',
           'destination': [destination.get('longitude'), destination.get('latitude')] if isinstance(destination, dict) else None}

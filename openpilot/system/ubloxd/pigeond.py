@@ -354,14 +354,27 @@ def init(pigeon: TTYPigeon) -> None:
     except Exception:
       cloudlog.exception("failed to send time and position to ublox")
 
+ALMANAC_SAVE_S = 60*5  # comma's: the backup in the receiver's flash, every 5 minutes
+OFFROAD_ALMANAC_SAVE_S = 3600.
+
+def almanac_save_due(since_save: float, offroad: bool) -> bool:
+  """TurnPilot: whether to save the almanac backup now, since_save s after the last one. Every 5 minutes onroad, as comma's;
+  hourly offroad, where TurnPilot keeps the receiver running for hours (process_config.gps): each save rewrites the
+  receiver's flash, and at comma's rate around the clock that is about 300 writes a day, on the order of a flash's rated
+  erase cycles within a year or two.
+  The receiver keeps what it learns while it is powered; the backup only carries it across a power cut."""
+  return since_save > (OFFROAD_ALMANAC_SAVE_S if offroad else ALMANAC_SAVE_S)
+
 def run_receiving(duration: int = 0):
   pm = messaging.PubMaster(['ubloxRaw'])
+  params = Params()
 
   pigeon = TTYPigeon()
   init(pigeon)
 
   start_time = time.monotonic()
   last_almanac_save = time.monotonic()
+  last_almanac_check = time.monotonic()  # TurnPilot: IsOffroad is read only this often, not every read of the port
   assist_attempted = False
   assist_messages = None
 
@@ -402,10 +415,12 @@ def run_receiving(duration: int = 0):
       msg.ubloxRaw = dat[:]
       pm.send('ubloxRaw', msg)
 
-      # save almanac every 5 minutes
-      if (time.monotonic() - last_almanac_save) > 60*5:
-        save_almanac(pigeon)
-        last_almanac_save = time.monotonic()
+      # save almanac every 5 minutes; TurnPilot: hourly offroad (almanac_save_due)
+      if (time.monotonic() - last_almanac_check) > ALMANAC_SAVE_S:
+        last_almanac_check = time.monotonic()
+        if almanac_save_due(time.monotonic() - last_almanac_save, params.get_bool("IsOffroad")):
+          save_almanac(pigeon)
+          last_almanac_save = time.monotonic()
     else:
       # prevent locking up a CPU core if ublox disconnects
       time.sleep(0.001)

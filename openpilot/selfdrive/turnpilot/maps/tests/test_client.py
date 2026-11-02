@@ -36,17 +36,64 @@ def test_health_and_coverage_over_pinned_tls(server, tmp_path):
 
 def test_requests_always_verify_against_the_saved_certificate(server, tmp_path):
   c = client_for(server, tmp_path)
-  real = requests.request
+  real = c.session.request
   seen = []
 
   def spy(*args, **kwargs):
     seen.append(kwargs['verify'])
     return real(*args, **kwargs)
 
-  with patch.object(map_client.requests, 'request', side_effect=spy):
+  with patch.object(c.session, 'request', side_effect=spy):
     c.health()
     c.coverage()
   assert seen == [str(tmp_path / 'server-cert.pem')] * 2  # a path, never False
+  assert isinstance(c.session.get_adapter(server.host), map_client.PinnedAdapter)
+
+
+@pytest.mark.parametrize('valid_from, valid_to', [(365., 3650.), (-3650., -365.)], ids=['not_yet_valid', 'expired'])
+def test_the_pin_holds_whatever_the_clock_says(tmp_path, valid_from, valid_to):
+  """The comma's clock is wrong after a boot until GPS or NTP sets it, and the server's certificate starts on a date
+  such a clock hasn't reached. The pinned certificate is accepted whatever its dates say against the clock; a CA-file
+  check (what the client did before) refuses the very same certificate, so it is the dates and only they that are skipped."""
+  dated = MapServer(cert=self_signed(valid_from=valid_from, valid_to=valid_to))
+  try:
+    c = client_for(dated, tmp_path)
+    assert c.health()['ok'] and c.coverage()['version'] == coverage_doc()['version']
+    with pytest.raises(requests.exceptions.SSLError, match='certificate (is not yet valid|has expired)'):
+      requests.get(dated.host + '/v1/health', verify=str(c.cert_path), timeout=5)
+    with pytest.raises(MapError) as e:  # another certificate with the same dates is still refused, before any request
+      client_for(dated, tmp_path / 'other', TurnPilotMapCert=self_signed(valid_from=valid_from, valid_to=valid_to)[0]).coverage()
+    assert e.value.code == 'tls'
+    with pytest.raises(MapError) as e:  # and so is the right certificate at an address it isn't for
+      client_for(dated, tmp_path / 'name', TurnPilotMapHost=dated.host.replace('127.0.0.1', 'localhost')).coverage()
+    assert e.value.code == 'tls'
+    assert [path for _, path, _, _ in dated.requests] == ['/v1/health', '/v1/coverage']
+  finally:
+    dated.close()
+
+
+def test_a_certificate_the_pinned_one_signed_is_not_the_pinned_one(tmp_path):
+  """The pinned certificate is a CA the handshake's chain check would accept a certificate signed by; the pin is its exact
+  SHA-256, so such a certificate (with the right address) is refused before the key goes out."""
+  pinned = self_signed()
+  signed = MapServer(cert=self_signed(issuer=pinned))
+  try:
+    (tmp_path / 'pinned.pem').write_text(pinned[0])
+    assert requests.get(signed.host + '/v1/health', verify=str(tmp_path / 'pinned.pem'), timeout=5).ok  # a CA file takes it
+    with pytest.raises(MapError) as e:
+      client_for(signed, tmp_path, TurnPilotMapCert=pinned[0]).coverage()
+    assert e.value.code == 'tls'
+    assert [path for _, path, _, _ in signed.requests] == ['/v1/health']  # only the CA-file check above got through
+  finally:
+    signed.close()
+
+
+def test_a_certificate_that_is_not_pem_is_a_settings_error(tmp_path):
+  cert, _ = self_signed()
+  line = cert.splitlines()[3]
+  with pytest.raises(MapError) as e:
+    MapClient('https://127.0.0.1:1', KEY, cert.replace(line, '!' * len(line)), tmp_path)
+  assert e.value.code == 'not_configured' and 'certificate' in e.value.message
 
 
 def test_bad_key(server, tmp_path):
@@ -244,7 +291,7 @@ def test_a_key_that_is_not_printable_ascii_is_refused():
 def test_any_request_failure_is_a_map_error(server, tmp_path):
   c = client_for(server, tmp_path)
   for error in (requests.exceptions.InvalidURL('Failed to parse'), UnicodeEncodeError('latin-1', 'é', 0, 1, 'x'), requests.exceptions.TooManyRedirects()):
-    with patch.object(map_client.requests, 'request', side_effect=error), pytest.raises(MapError) as e:
+    with patch.object(c.session, 'request', side_effect=error), pytest.raises(MapError) as e:
       c.coverage()
     assert e.value.code == 'bad_request' and type(error).__name__ in e.value.message
 
@@ -261,14 +308,14 @@ def test_refresh_records_any_failure(server, tmp_path):
 def test_the_corridor_waits_longer_for_the_server_to_build_it(server, tmp_path):
   """The server builds the whole corridor before its status line: the default 30 s read timeout would cut off a big one."""
   server.corridor = (200, make_pack({'tiles/2/0.gph': b'x'}), 'application/x-tar')
-  real, seen = requests.request, []
+  c = client_for(server, tmp_path)
+  real, seen = c.session.request, []
 
   def spy(*args, **kwargs):
     seen.append((args[1].rsplit('/', 1)[1], kwargs['timeout']))
     return real(*args, **kwargs)
 
-  c = client_for(server, tmp_path)
-  with patch.object(map_client.requests, 'request', side_effect=spy):
+  with patch.object(c.session, 'request', side_effect=spy):
     c.coverage()
     c.corridor(INDY, INDY_EAST, tmp_path / 'out.tar')
   assert seen == [('coverage', map_client.TIMEOUT), ('corridor', map_client.CORRIDOR_TIMEOUT)]

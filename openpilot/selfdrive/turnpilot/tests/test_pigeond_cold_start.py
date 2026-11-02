@@ -84,3 +84,10 @@ def test_factory_reset_never_raises_and_still_reconfigures(monkeypatch):
   params.v["TurnPilotGpsFactoryReset"] = True
   assert factory(monkeypatch, params, ResetPigeon(fail=True)) is True
   assert params.v["TurnPilotGpsFactoryReset"] is False
+
+
+def test_the_almanac_backup_is_comma_s_onroad_and_hourly_offroad():
+  """The receiver now runs offroad for hours (process_config.gps): each backup rewrites its flash."""
+  assert pigeond.almanac_save_due(301., offroad=False) and not pigeond.almanac_save_due(299., offroad=False)
+  assert not pigeond.almanac_save_due(301., offroad=True) and not pigeond.almanac_save_due(3599., offroad=True)
+  assert pigeond.almanac_save_due(3601., offroad=True)
