@@ -262,6 +262,9 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     # car's path corridor ahead: the car stopped short of it, "Car crossing", loud while it holds (hardBrake's sound), in a
     # cross lane too since a car is entering the car's own path
     carCrossing @30;
+    # TurnPilot back at the driver's engagement after a big model fallback paused it (turnpilotd.py watch_model): the big
+    # model back (modelV2.big), "TurnPilot resumed", a chime, once
+    turnpilotResumed @31;
   }
   mapControl @24 :MapControlStatus;
   controlPrompt @25 :ControlPrompt;

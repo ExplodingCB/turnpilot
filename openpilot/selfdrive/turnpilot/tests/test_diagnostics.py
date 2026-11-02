@@ -12,7 +12,7 @@ from openpilot.common.params import Params
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.turnpilot import diagnostics, preflight
 from openpilot.selfdrive.turnpilot.diagnostics import (BIG_WHY_MAX, EVENTS_KEPT, EVENTS_PARAM, REPEAT_S, EventLog, Preflight, chestnut_line,
-                                                        log_event, model_text, note_big_model, report)
+                                                        log_event, model_text, note_big_model, note_big_model_event, report)
 from openpilot.selfdrive.turnpilot.web.store import last_gps_position
 from openpilot.system.qcomgpsd import qcomgpsd
 
@@ -253,7 +253,14 @@ class TestBigModel(OpenpilotTestCase):
     note_big_model(params, "timed out", None, 60, True, 0.1, None)
     assert model_text(small, params, params.get(EVENTS_PARAM))[0].endswith("(big model timed out after 60.0 s; see events)")
     note_big_model(params, "failed while running", raised(RuntimeError("chestnut failed with 7")), 90., True, 0.1, None)
-    assert model_text(small, params, params.get(EVENTS_PARAM))[0].endswith("(big model failed while driving, fell back; see events)")
+    assert model_text(small, params, params.get(EVENTS_PARAM))[0].endswith("(big model failed while driving, retrying in the background; see events)")
+    # the mid-drive recovery's own events (modeld/chestnut_recovery.py): saved like modeld's failures, read back by the report
+    note_big_model_event(params, "retry failed", "attempt 1: chestnut not enumerated")
+    assert params.get(EVENTS_PARAM)[-1]["what"] == "big model retry failed"
+    assert model_text(small, params, params.get(EVENTS_PARAM))[0].endswith("(big model failed while driving, retrying in the background; see events)")
+    note_big_model_event(params, "recovered", "big model back after 12.3 s, attempt 2, in a successor modeld")
+    assert params.get(EVENTS_PARAM)[-1] | {"t": 0.} == {"t": 0., "what": "big model recovered",
+                                                     "why": "big model back after 12.3 s, attempt 2, in a successor modeld"}
     assert model_text({"model_big": True}, params, params.get(EVENTS_PARAM))[0] == "driving model: the big model on the chestnut"
     assert chestnut_line(params) == "chestnut params: ChestnutLoading unset, ChestnutActive 0, ChestnutRetry 1"
     params.put_bool("ChestnutLoading", True, block=True)

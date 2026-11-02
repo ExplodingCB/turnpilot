@@ -31,16 +31,23 @@ TurnPilot acts only while it can do its job (Kellen, 2026-10-27: no degraded mod
   back but a model fallback, and neither deadline runs: their clocks hold through it, calibration time being no detector
   failure, and run on from where they were once it's done. openpilot's own calibration events say it too and keep it from
   engaging (or soft-disable it, on a recalibration mid-drive, where TurnPilot drops what it was doing as on a handback).
-- A modelV2 from the small model after one from the big model is a fallback (modelV2.big), for the rest of the drive.
-  So is modeld's ChestnutActive False (read in main()): it outlives this process, which TurnPilot turned off and on
-  restarts, and covers a big model that failed to load.
+- A modelV2 from the small model after one from the big model is a fallback (modelV2.big), which pauses TurnPilot. So is
+  modeld's ChestnutActive False (read in main()) while modelV2 isn't the big model's: it outlives this process, which
+  TurnPilot turned off and on restarts, and covers a big model that failed to load.
+  A pause isn't the drive's end (2026-11-01, the first drive: one USB glitch ended TurnPilot and wiped the route):
+  modeld retries the chestnut in the background (modeld/chestnut_recovery.py) and brings the big model back with
+  openpilot disengaged. The route is kept (NavDestination stays, navd keeps routing, the follower tracks it), and every
+  surface says why (PAUSED_REASON: the soft disable's alert, the status line, the nav view, the phone). Once modelV2 is
+  the big model's again (BIG_BACK_REASON) TurnPilot resumes at the driver's next engagement (watch_model): a frame
+  disengaged with the big model back, then an engaged one, said with a chime (turnpilotResumed), its detector's start
+  deadlines run afresh (the small model ran none). A drive the driver engaged on the small model as plain openpilot is
+  never taken over silently: that engagement predates the big model's return, so it takes a disengage and an engage.
 On either, plan.handback is set and selfdrived soft-disables (handback.py). TurnPilot stops at once: no new desire,
 lane change, signal prompt, skipped-turn reroute or wrong-lane flag, and the maneuver in hand is dropped. A turn whose
 desire already went out is never cancelled (desire_timing.py): its desire is held, with no new pulse, and cleared from
-the model at the turn's angle as usual; a keep desire is dropped. On a fallback the destination is removed, which
-cancels navd's route, once such a turn is over. The scene's stops in force stay, and so does the turn speed cap of a turn
-whose desire already went out: a handback must not speed the car up. Nor does the route going away under a committed
-turn cancel it (route_follower.py: gaps, navd going quiet, reroutes are dead-reckoned through). Nor does a cap the car
+the model at the turn's angle as usual; a keep desire is dropped. The scene's stops in force stay, and so does the turn
+speed cap of a turn whose desire already went out: a handback must not speed the car up. Nor does the route going away
+under a committed turn cancel it (route_follower.py: gaps, navd going quiet, reroutes are dead-reckoned through). Nor does a cap the car
 was slowing for going away with the maneuver or the route: from the handback until openpilot stops steering (the soft
 disable's end) the speed cap holds the car at no more than its speed then, and at no more than it has slowed to since
 (hold_v), or than the driver's gas has taken it to.
@@ -262,7 +269,10 @@ DETECTOR_START_DEADLINE_S = 15.
 LOAD_CHANCE_S = 1.5
 HANDBACK_REASON = {Handback.detectorStopped: "detector stopped: take control",
                    Handback.noDetector: "detector not running: take control",
-                   Handback.modelFellBack: "driving model fell back: take control"}
+                   Handback.modelFellBack: "Big model stopped: TurnPilot paused"}
+PAUSED_REASON = HANDBACK_REASON[Handback.modelFellBack]  # a model fallback: TurnPilot paused, its route kept (module docstring)
+BIG_BACK_REASON = "Big model back: TurnPilot resumes when you engage"  # ...the big model back, before the driver's engagement
+RESUMED_ALERT_S = 3.  # turnpilotResumed, at the engagement that resumes TurnPilot after a pause
 WAITING_REASON = "waiting for the detector"
 STANDSTILL_SPEED = 0.3  # m/s: a hold let go slower than this pulls the car away with a fresh turn pulse
 # standing engaged with nothing of TurnPilot's holding the car and no lead, the model stopped on its own (BeamNG route_demo,
@@ -698,8 +708,10 @@ class VetoedTurn:
 class TurnPilot:
   def __init__(self):
     self.big_seen = False  # modelV2 came from the big model this drive (kept when TurnPilot is turned off and on)
-    self.fell_back = False  # ...and then from the small one
-    self.cancel_route = False  # set once on a fallback: main() removes NavDestination, once no turn is committed
+    self.fell_back = False  # ...and then from the small one: TurnPilot paused, its route kept, until it resumes (watch_model)
+    self.big_now = False    # the last modelV2 was the big model's
+    self.resume_armed = False  # paused, the big model back, and a frame with openpilot disengaged since: the next engaged resumes
+    self.resumed_t = 0.     # s turnpilotResumed has left to show
     self.stop_abort, self._stop_abort_t = 'none', 0.  # a lane change cancelled by a disabled plan: reset() can't hold it
     self.handback_now: int | None = None  # this frame's handback, once handback() has run for it
     self.hold_v: float | None = None  # handed back with openpilot steering: the speed the car is held to (module docstring)
@@ -944,21 +956,54 @@ class TurnPilot:
     except Exception:
       log_error("turnpilotd.fault_track_failed")
 
-  def watch_model(self, model, enabled: bool) -> None:
-    """Note a fallback from the big driving model, whether or not TurnPilot is on: it lasts the drive."""
+  def watch_model(self, model, enabled: bool, engaged: bool = False) -> None:
+    """A fallback from the big driving model pauses TurnPilot, whether or not it is on; the big model back, the driver's
+    next engagement resumes it (module docstring): armed by a frame disengaged with the big model back, so an engagement
+    on the small model (plain openpilot) is never one. engaged: carControl.enabled."""
+    self.big_now = bool(model.big)
     if model.big:
       self.big_seen = True
     elif self.big_seen and not self.fell_back:
-      self.fell_back = True
-      self.cancel_route = enabled  # the route TurnPilot was driving; with it off, navd's route isn't TurnPilot's
+      self.pause()
+    if not (self.fell_back and self.big_now):
+      self.resume_armed = False
+    elif not engaged:
+      self.resume_armed = True
+    elif self.resume_armed:
+      self.resume()
 
   def big_model_failed(self, enabled: bool) -> None:
-    """modeld's ChestnutActive is False: the big model isn't running this drive (it fell back, or failed to load). A
-    fallback as watch_model's, but it outlives this process. The route is cancelled only by the process that saw the
-    big model drive it."""
-    if not self.fell_back:
-      self.fell_back = True
-      self.cancel_route = enabled and self.big_seen
+    """modeld's ChestnutActive is False: the big model isn't running (it fell back, or failed to load). A pause as
+    watch_model's that outlives this process, unless modelV2 is the big model's now: a successor modeld that brought it
+    back sets it True as it takes over, and this is read once a second."""
+    if not self.fell_back and not self.big_now:
+      self.pause()
+
+  def pause(self) -> None:
+    self.fell_back, self.resume_armed = True, False
+    cloudlog.warning("turnpilot: big model stopped, TurnPilot paused, its route kept")
+
+  def resume(self) -> None:
+    """The driver engaged with the big model back: TurnPilot acts again, said (turnpilotResumed). Its detector ran on the
+    small model's frames not at all, so its start deadlines run afresh (handback()): waiting for the detector, not a
+    stopped one, at the engagement."""
+    self.fell_back = self.resume_armed = False
+    self.resumed_t = RESUMED_ALERT_S
+    self.detector_seen = False
+    self.stale_s = self.waited_s = self.disengaged_s = self.engaged_wait_s = 0.
+    cloudlog.warning("turnpilot: big model back, TurnPilot resumed at the driver's engagement")
+
+  def handback_reason(self, handback) -> str:
+    if handback == Handback.modelFellBack and self.big_now:
+      return BIG_BACK_REASON
+    return HANDBACK_REASON.get(handback, WAITING_REASON)
+
+  def fill_resumed(self, plan) -> None:
+    """turnpilotResumed for RESUMED_ALERT_S from the resume, on a plan acting on the route (none disabled, or with another
+    alert up)."""
+    if self.resumed_t > 1e-6 and plan.state != State.disabled and str(plan.controlAlert) == 'none':
+      plan.controlAlert = 'turnpilotResumed'
+    self.resumed_t = max(self.resumed_t - DT_MDL, 0.)
 
   def handback(self, available: bool, model_running: bool = True, engaged: bool = False, calibrating: bool = False) -> int:
     """Why TurnPilot can't act now, as a Handback: none while it can, and while the detector hasn't started yet, short of
@@ -1051,7 +1096,7 @@ class TurnPilot:
     plan.shadow = shadow
     plan.accelCap = NO_ACCEL_CAP
     plan.speedCap = NO_SPEED_CAP
-    self.watch_model(sm['modelV2'], enabled)
+    self.watch_model(sm['modelV2'], enabled, sm['carControl'].enabled)
     if not enabled:
       self.stop('turnedOff')
       plan.state = State.disabled
@@ -1634,7 +1679,7 @@ class TurnPilot:
 
     if not acting:
       plan.state = State.unavailable
-      plan.reason = calibrating if calibrating and handback == Handback.none else HANDBACK_REASON.get(handback, WAITING_REASON)
+      plan.reason = calibrating if calibrating and handback == Handback.none else self.handback_reason(handback)
     elif decision.holding or withdrawn:
       plan.state = State.holding
     elif not rf.valid:
@@ -3122,6 +3167,7 @@ class TurnPilot:
     msg = self.plan_inner(sm, scene, enabled, shadow, *args, long_control=long_control, disengage_on_accel=disengage_on_accel,
                           **kwargs)
     self.fill_runtime(msg.turnpilotPlan)
+    self.fill_resumed(msg.turnpilotPlan)
     return msg
 
   def fill_runtime(self, plan) -> None:
@@ -3158,7 +3204,7 @@ class TurnPilot:
     if enabled and long_control and not disengage_on_accel:
       self.fault_track(sm)
       self.stop('fault')
-      self.watch_model(sm['modelV2'], enabled)
+      self.watch_model(sm['modelV2'], enabled, sm['carControl'].enabled)
       msg = disabled_plan(shadow, GAS_DISENGAGE_REASON, Fault.disengageOnAccelerator,
                           Handback.modelFellBack if self.fell_back else Handback.none)
       self.fill_stop_abort(msg.turnpilotPlan)
@@ -3167,7 +3213,7 @@ class TurnPilot:
     if enabled and not long_control:
       self.fault_track(sm)
       self.stop('fault')
-      self.watch_model(sm['modelV2'], enabled)
+      self.watch_model(sm['modelV2'], enabled, sm['carControl'].enabled)
       handback = Handback.modelFellBack if self.fell_back else Handback.none
       msg = disabled_plan(shadow, CAR_UNKNOWN_REASON, handback=handback) if long_control is None else \
         disabled_plan(shadow, NO_LONG_REASON, Fault.noLongitudinal, handback)
@@ -3670,11 +3716,6 @@ def main():
     invalid_frames = 0 if valid else invalid_frames + 1
     msg.valid = invalid_frames < PLAN_INPUT_GRACE_FRAMES
     pm.send('turnpilotPlan', msg)
-    if tp.cancel_route and not tp.turn_committed:  # a turn under way finishes first, its cap and desire held
-      tp.cancel_route = False
-      cloudlog.warning(f"turnpilot: driving model fell back to the small model, handing back{'' if shadow else ' and cancelling the route'}")
-      if not shadow:
-        params.remove("NavDestination")
     rk.keep_time()
 
 

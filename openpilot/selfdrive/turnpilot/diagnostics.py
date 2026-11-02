@@ -199,6 +199,19 @@ def note_big_model(params, kind: str, exc: BaseException | None = None, took_s: 
     pass
 
 
+def note_big_model_event(params, kind: str, why: str, now=wall_time) -> None:
+  """modeld's mid-drive recovery (modeld/chestnut_recovery.py) in TurnPilotDiagEvents: big model retry failed, recovered,
+  stopped (a successor modeld's big model). Never raises."""
+  try:
+    why = scrub(why, secrets_of(params))[:BIG_WHY_MAX]
+    saved = params.get(EVENTS_PARAM)
+    events = [e for e in saved if isinstance(e, dict)] if isinstance(saved, list) else []
+    events = [*events, {"t": now(), "what": f"{BIG_WHAT} {kind}", "why": why}][-EVENTS_KEPT:]
+    params.put(EVENTS_PARAM, events, block=True)
+  except Exception:
+    pass
+
+
 class Preflight:
   """preflight's lines, run as its own process (its collect() imports the planner and the map engine), at most every
   PREFLIGHT_CACHE_S. run: a stand-in for tests."""
@@ -291,8 +304,8 @@ def small_model_why(params, events: list[dict]) -> str:
   if what.endswith("timed out"):
     took = re.search(r"timed out after (\d+(?:\.\d)?) s", why)
     return f"(big model timed out after {took.group(1) if took else '?'} s; see events)"
-  if what.endswith("failed while running"):
-    return "(big model failed while driving, fell back; see events)"
+  if what.endswith(("failed while running", "retry failed", "stopped")):
+    return "(big model failed while driving, retrying in the background; see events)"
   return "(big model failed to load; see events)"
 
 

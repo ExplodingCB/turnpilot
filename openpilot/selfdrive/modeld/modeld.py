@@ -60,6 +60,22 @@ def note_big_model(params, kind, exc, took_s, retry, waited_s, wait_error) -> No
     pass
 
 
+def note_recovery(params, kind: str, why: str) -> None:
+  """TurnPilot diagnostics: the mid-drive recovery's events (chestnut_recovery.py: a retry that failed, the big model back).
+  Never raises."""
+  try:
+    from openpilot.selfdrive.turnpilot.diagnostics import note_big_model_event
+    note_big_model_event(params, kind, why)
+  except Exception:
+    pass
+
+
+def successor_heard() -> Callable[[], bool]:
+  """Whether a successor modeld published modelV2 since the last call (its liveness, chestnut_recovery.STALL_S)."""
+  sock = messaging.sub_sock('modelV2', conflate=True, timeout=0)
+  return lambda: sock.receive(non_blocking=True) is not None
+
+
 def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
                           lat_action_t: float, long_action_t: float, v_ego: float) -> log.ModelDataV2.Action:
   if 'action' not in model_output:
@@ -250,17 +266,25 @@ class ModelState:
     self.prev_desire[:] = 0
 
 
-def main(demo=False):
-  cloudlog.warning("modeld init")
+def main(demo=False, successor: str | None = None):
+  """successor: TurnPilot's mid-drive recovery (chestnut_recovery.py), the pipe fds 'R,W' of a successor modeld, which
+  loads the big model alone, runs nothing until its parent probes it and publishes nothing until its parent hands over."""
+  cloudlog.warning("modeld init" + (" (successor)" if successor else ""))
+  link = None
+  if successor is not None:
+    from openpilot.selfdrive.modeld.chestnut_recovery import SuccessorLink
+    cloudlog.bind(daemon="modeld")
+    link = SuccessorLink(successor)
 
   # a cable is a chestnut on its way, unless a USB host is on it
-  CHESTNUT = chestnut_compiled() and (chestnut_present() or (cable_connected() and not usb_host_connected()))
+  CHESTNUT = link is not None or (chestnut_compiled() and (chestnut_present() or (cable_connected() and not usb_host_connected())))
   if CHESTNUT:
     from tinygrad.runtime.ops_amd import AMDDevice
     AMDDevice.wait_timeout_ms = 3000
   params = Params()
-  params.put_bool("ChestnutLoading", CHESTNUT)
-  params.remove("ChestnutActive")
+  if link is None:  # a successor's parent drives on the small model meanwhile, and says what the big model is doing
+    params.put_bool("ChestnutLoading", CHESTNUT)
+    params.remove("ChestnutActive")
 
   gc.disable()
 
@@ -292,7 +316,17 @@ def main(demo=False):
   model = None
   retry = False  # TurnPilot diagnostics: this load is the onroad cycle's retry
   load: dict = {"waited_s": None, "wait_error": None}
-  if CHESTNUT:
+  if link is not None:
+    # the successor's load holds nothing up (its parent publishes meanwhile, and gives it LOAD_DEADLINE_S); a failure ends it
+    try:
+      wait_for_chestnut()
+      model = ModelState(vipc_client_main.width, vipc_client_main.height, True)
+      model.warmup()
+    except Exception as e:
+      cloudlog.exception("successor: big model load failed")
+      link.failed(f"load: {type(e).__name__}: {e}")
+      os._exit(1)  # no finalize: a chestnut that failed to load waits out its timeouts there
+  elif CHESTNUT:
     big_model = None
     retry = params.get_bool("ChestnutRetry")
     def load_big():
@@ -328,10 +362,11 @@ def main(demo=False):
     else:
       params.put_bool("ChestnutActive", model is not None)
 
-  small_model = ModelState(vipc_client_main.width, vipc_client_main.height, False) if model is None or CHESTNUT else None
+  small_model = ModelState(vipc_client_main.width, vipc_client_main.height, False) if link is None and (model is None or CHESTNUT) else None
   if model is None:
     model = small_model
-  params.put_bool("ChestnutLoading", False)
+  if link is None:
+    params.put_bool("ChestnutLoading", False)
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
   loaded_at = time.monotonic()
 
@@ -347,12 +382,24 @@ def main(demo=False):
   except Exception:
     cloudlog.exception("turnpilot detector failed to load")
 
-  config_realtime_process(7, 54)
+  if link is None:  # a successor takes modeld's realtime slot only when it goes live, off its parent's core until then
+    config_realtime_process(7, 54)
 
   # messaging
   pub_socks = ["modelV2", "drivingModelData", "cameraOdometry"] + (["chestnutGpuState"] if CHESTNUT else [])
   pub_socks += ["turnpilotDetections", "turnpilotFarDetections"] if detector is not None else []
-  pm = PubMaster(pub_socks)
+  pm = PubMaster(pub_socks if link is None else [])  # one publisher a topic: a successor's sockets open when it goes live
+
+  # TurnPilot: the big model back mid-drive after a runtime failure, in a successor modeld (chestnut_recovery.py)
+  recovery = None
+  if CHESTNUT and link is None:
+    import atexit
+    import sys
+    from openpilot.selfdrive.modeld.chestnut_recovery import ChestnutRecovery, Successor
+    cmd = [sys.executable, '-m', 'openpilot.selfdrive.modeld.modeld'] + (['--demo'] if demo else []) + ['--successor']
+    recovery = ChestnutRecovery(spawn=lambda: Successor.spawn(cmd), present=chestnut_present,
+                                note=lambda kind, why: note_recovery(params, kind, why))
+    atexit.register(recovery.close)
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState",
                   "carControl", "controlsState", "lateralDelay", "turnpilotPlan"],
                  ignore_alive=["turnpilotPlan"], ignore_avg_freq=["turnpilotPlan"], ignore_valid=["turnpilotPlan"])
@@ -387,6 +434,8 @@ def main(demo=False):
 
   DH = DesireHelper()
   desire_cleared = False
+  if link is not None:
+    link.loaded()
 
   while True:
     # Keep receiving frames until we are at least 1 frame ahead of previous extra frame
@@ -479,18 +528,35 @@ def main(demo=False):
       'action_t': np.array([lat_action_t, long_action_t], dtype=np.float32),
     }
 
+    # a successor runs once its parent probes it, and publishes once its parent has stopped (chestnut_recovery.SuccessorLink)
+    if link is not None and link.poll():
+      pm.sock.update({s: messaging.pub_sock(s) for s in pub_socks})
+      config_realtime_process(7, 54)
+      params.put_bool("ChestnutActive", True)
+      run_count = 0
+      cloudlog.warning("successor: live, the big model publishes")
+    publishing = link is None or link.live
+
     mt1 = time.perf_counter()
+    model_output = None
     try:
-      send_chestnut = (chestnut_state is not None and
-                       run_count % round(ModelConstants.MODEL_RUN_FREQ / SERVICE_LIST['chestnutGpuState'].frequency) == 0)
-      model_output = model.run(bufs, transforms, inputs, chestnut_state.send if send_chestnut else None)
+      if link is None or link.runs:
+        send_chestnut = (publishing and chestnut_state is not None and
+                         run_count % round(ModelConstants.MODEL_RUN_FREQ / SERVICE_LIST['chestnutGpuState'].frequency) == 0)
+        model_output = model.run(bufs, transforms, inputs, chestnut_state.send if send_chestnut else None)
     except Exception as e:
+      if link is not None:  # a successor has no small model: its parent publishes again at once, and notes why
+        cloudlog.exception("successor: big model failed")
+        link.failed(f"{'run' if link.live else 'probe'}: {type(e).__name__}: {e}")
+        os._exit(1)  # at once: its parent waits on the exit, and a finalize would wait out the dead chestnut's timeouts
       if not model.chestnut:
         raise
-      # fallback to small model
+      # fallback to small model, and the big model retried in the background (chestnut_recovery.py)
       cloudlog.exception("big model failed, fall back to small")
       note_big_model(params, "failed while running", e, time.monotonic() - loaded_at, retry, load["waited_s"], load["wait_error"])
       params.put_bool("ChestnutActive", False)
+      if recovery is not None:
+        recovery.failed(time.monotonic(), model)
       model = small_model
       if chestnut_state is not None:
         chestnut_state.big = False
@@ -498,8 +564,10 @@ def main(demo=False):
       model_output = None
     mt2 = time.perf_counter()
     model_execution_time = mt2 - mt1
+    if link is not None and model_output is not None:
+      link.ran()
 
-    if model_output is not None:
+    if model_output is not None and publishing:
       modelv2_send = messaging.new_message('modelV2')
       drivingdata_send = messaging.new_message('drivingModelData')
       posenet_send = messaging.new_message('cameraOdometry')
@@ -529,7 +597,7 @@ def main(demo=False):
       pm.send('cameraOdometry', posenet_send)
     last_vipc_frame_id = meta_main.frame_id
 
-    if detector is not None and model_output is not None:
+    if detector is not None and model_output is not None and publishing:
       from openpilot.selfdrive.turnpilot.detector.modeld_detector import plan_inputs
       # the camera TurnPilot asks for (DESIGN phase 4 G4, the stop sweeps), where the far crop looks (G5) and whether a signal
       # is mapped near: read in shadow too, where it steers nothing
@@ -537,12 +605,28 @@ def main(demo=False):
       detector.step(pm, model, model_execution_time, prev_action.desiredCurvature, desire, [meta_main, meta_extra], sm['carControl'].enabled,
                     view, far_bearing, v_ego, signal_near)
 
+    # TurnPilot: the big model back. With openpilot disengaged and the successor sane on these frames, this process stops
+    # publishing, and waits on the successor while it publishes; when it stops, this process publishes again on the small
+    # model at once, and retries later
+    if recovery is not None and recovery.active and recovery.step(time.monotonic(), sm['carControl'].enabled):
+      pm.sock.clear()
+      heard = successor_heard()
+      recovery.go(time.monotonic())
+      cloudlog.warning("big model: handed over to a successor modeld")
+      why = recovery.standby(heard)
+      recovery.failed(time.monotonic(), why=why)  # killed first if it stalled: one publisher a topic
+      pm.sock.update({s: messaging.pub_sock(s) for s in pub_socks})
+      params.put_bool("ChestnutActive", False)
+      cloudlog.error(f"big model: {why}, the small model publishes again")
+      prev_action, run_count = log.ModelDataV2.Action(), 0  # minutes stale: a fresh start, as at startup
+
 if __name__ == "__main__":
   try:
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--demo', action='store_true', help='A boolean for demo mode.')
+    parser.add_argument('--successor', help="TurnPilot's mid-drive recovery: a successor modeld's pipe fds, R,W (chestnut_recovery.py)")
     args = parser.parse_args()
-    main(demo=args.demo)
+    main(demo=args.demo, successor=args.successor)
   except KeyboardInterrupt:
     cloudlog.warning("got SIGINT")

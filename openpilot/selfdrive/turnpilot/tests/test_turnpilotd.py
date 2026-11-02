@@ -20,7 +20,7 @@ from openpilot.selfdrive.turnpilot.route_follower import Maneuver, classify
 from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP, POST_GO_PROFILES, V_TURN_MIN
 from openpilot.selfdrive.turnpilot.turnpilotd import (CAR_UNKNOWN_REASON, DETECTOR_DEADLINE_S, DETECTOR_START_DEADLINE_S, NO_LONG_REASON,
                                                        GAS_DISENGAGE_REASON, GO_LINE_M, LEFT_NO_MOVE_S, NEAR_CONTROL_STAND_S, NO_MOVE_REASON, NO_MOVE_S,
-                                                       LIGHT_WAIT_NOTE,
+                                                       LIGHT_WAIT_NOTE, PAUSED_REASON,
                                                        LEAD_STAND_MAX_S, NO_MOVE_MAX_S, SIGNAL_STOPPED_REASON, STALL_MIN_DEG, STALL_PROMPT_S,
                                                        STALLED_REASON, TURN_ABANDON_CURV, TURN_ABANDON_S, TURN_ABANDONED_REASON,
                                                        WRONG_SIDE_MIN_SPEED, WRONG_SIDE_REASON, WRONG_SIDE_S, yellow_on_the_right,
@@ -606,7 +606,7 @@ def test_fault_carries_a_model_fallback():
   sim.big = False
   plan = sim.step()
   assert plan.state == State.disabled and plan.fault == Fault.noLongitudinal and plan.handback == Handback.modelFellBack
-  assert sim.tp.cancel_route
+  assert sim.tp.fell_back
 
 
 def test_skip_and_wrong_lane_unset_while_not_acting():
@@ -620,20 +620,20 @@ def test_skip_and_wrong_lane_unset_while_not_acting():
       assert not p.tooFastToTurn and p.laneMismatch == custom.TurnpilotPlan.LaneMismatch.none
 
 
-def test_model_fallback_hands_back_and_cancels_the_route():
+def test_model_fallback_pauses_and_keeps_the_route():
   sim = Sim([(400., "turn", "left"), (1500., "turn", "right")])
   sim.big = True
   sim.run(5.)
-  assert sim.trace[-1][2].handback == Handback.none and not sim.tp.cancel_route
+  assert sim.trace[-1][2].handback == Handback.none and not sim.tp.fell_back
   sim.big = False  # modeld fell back to the small model
   plan = sim.step()
-  assert plan.handback == Handback.modelFellBack and plan.state == State.unavailable
-  assert sim.tp.cancel_route  # main() removes NavDestination once, which ends navd's route
-  sim.tp.cancel_route = False
+  assert plan.handback == Handback.modelFellBack and plan.state == State.unavailable and plan.reason == PAUSED_REASON
+  # paused on the small model: nothing acted on, the route followed all along (no route cancel: navd keeps it)
   plans = [sim.step() for _ in range(int(60. / DT_MDL))]
   assert all(p.handback == Handback.modelFellBack and p.desire == Desire.none and p.laneChange == LaneChange.none for p in plans)
-  assert not sim.tp.cancel_route  # once
-  # for the rest of the drive: turning TurnPilot off and on doesn't bring it back on the small model
+  assert all(p.routeValid and p.reason == PAUSED_REASON for p in plans)
+  assert (plans[0].maneuverModifier, plans[-1].maneuverModifier) == ('left', 'right')  # followed past the left the pause dropped
+  # turning TurnPilot off and on doesn't bring it back on the small model
   sim.tp.update(sim.sm, scene(), False, False)
   assert sim.step().handback == Handback.modelFellBack
 
@@ -644,10 +644,10 @@ def test_small_model_from_the_start_is_not_a_fallback():
   sim = Sim([(400., "turn", "left")])
   for _ in range(int(5. / DT_MDL)):
     plan = sim.step(available=False)
-  assert plan.handback == Handback.none and plan.reason == WAITING_REASON and not sim.tp.cancel_route
+  assert plan.handback == Handback.none and plan.reason == WAITING_REASON and not sim.tp.fell_back
   for _ in range(int(DETECTOR_START_DEADLINE_S / DT_MDL)):
     plan = sim.step(available=False)
-  assert plan.handback == Handback.noDetector and not sim.tp.cancel_route
+  assert plan.handback == Handback.noDetector and not sim.tp.fell_back
 
 
 def offered_sim(**kwargs):
@@ -733,10 +733,10 @@ def test_one_off_route_update_keeps_the_committed_turn():
   assert all(p.desire != CLEAR_DESIRE and not p.tooFastToTurn for _, _, p in sim.trace)
 
 
-def test_model_fallback_on_the_approach_holds_the_turn_and_defers_the_route_cancel():
-  # the big model falls back 25 m before the left, its desire out: the handback holds the desire and the cap, and the
-  # route isn't cancelled until the turn is over. Were navd's route gone at once (every instruction invalid), the turn
-  # is still held: no CLEAR, the cap stays, the car doesn't speed up into the junction
+def test_model_fallback_on_the_approach_holds_the_turn():
+  # the big model falls back 25 m before the left, its desire out: the pause holds the desire and the cap to the turn's
+  # end. Were navd's route gone at once too (every instruction invalid), the turn is still held: no CLEAR, the cap stays,
+  # the car doesn't speed up into the junction
   for route_gone in (False, True):
     sim = approach_with_desire_out()
     sim.big = True
@@ -750,8 +750,8 @@ def test_model_fallback_on_the_approach_holds_the_turn_and_defers_the_route_canc
       plan = sim.step()
       assert plan.handback == Handback.modelFellBack
       if sim.s < 300.:
-        held.append(sim.tp.cancel_route and sim.tp.turn_committed)
-    assert all(held) and sim.tp.cancel_route and not sim.tp.turn_committed, route_gone
+        held.append(sim.tp.turn_committed)
+    assert all(held) and not sim.tp.turn_committed, route_gone
     assert_turn_held(sim, n)
 
 
@@ -969,18 +969,27 @@ def test_fault_in_a_detector_gap_keeps_the_stop_and_the_handback():
 
 def test_model_fallback_outlives_turnpilotd():
   # TurnPilot turned off and on runs a new turnpilotd, which never saw the big model: modeld's ChestnutActive (False:
-  # the big model isn't running this drive) still hands back, with no route cancel (the first process did that)
+  # the big model isn't running) still pauses it
   sim = Sim([(400., "turn", "left"), (1500., "turn", "right")])
   sim.tp.big_model_failed(enabled=True)
   plans = [sim.step() for _ in range(int(5. / DT_MDL))]
   assert all(p.handback == Handback.modelFellBack and p.desire == Desire.none and p.laneChange == LaneChange.none for p in plans)
-  assert not sim.tp.cancel_route
-  # in the process that drove the route, the param read first is the fallback as much as modelV2 is: the route is cancelled
+  # in the process that drove the route, the param read first is the fallback as much as modelV2 is
+  sim = Sim([(400., "turn", "left"), (1500., "turn", "right")])
+  sim.big = True
+  sim.run(2.)
+  sim.big = False
+  sim.step()
+  sim.tp.fell_back = False
+  sim.tp.big_model_failed(enabled=True)
+  assert sim.step().handback == Handback.modelFellBack
+  # a successor modeld that brought the big model back sets ChestnutActive True as it takes over, read once a second: a
+  # False read while modelV2 is the big model's is that lag, never a fallback
   sim = Sim([(400., "turn", "left"), (1500., "turn", "right")])
   sim.big = True
   sim.run(2.)
   sim.tp.big_model_failed(enabled=True)
-  assert sim.step().handback == Handback.modelFellBack and sim.tp.cancel_route
+  assert sim.step().handback == Handback.none and not sim.tp.fell_back
 
 
 def oncoming_at(junction_s: float, after_s: float):

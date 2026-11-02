@@ -104,8 +104,8 @@ def test_the_driver_reads_turnpilots_alert_on_a_fallback():
       am.add_many(frame, events.create_alerts([ET.SOFT_DISABLE], args))
       am.process_alerts(frame, set())
     return am.current_alert.alert_text_2
-  assert shown([(True, Handback.modelFellBack)]) == "TurnPilot unavailable: driving model fell back"
-  assert shown([(True, Handback.none), (True, Handback.modelFellBack)]) == "TurnPilot unavailable: driving model fell back"
+  assert shown([(True, Handback.modelFellBack)]) == "Big model stopped: TurnPilot paused"
+  assert shown([(True, Handback.none), (True, Handback.modelFellBack)]) == "Big model stopped: TurnPilot paused"
   assert shown([(True, Handback.none)]) == "Big Model Failed"  # TurnPilot off or in shadow mode: upstream's, unchanged
 
 

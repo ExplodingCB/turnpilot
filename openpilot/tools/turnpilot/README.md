@@ -26,6 +26,7 @@ ioreg -p IOService -l -w0 -r -n "custom 8516b768-CLEAN" | grep -c UserClient
 ```
 
 - `python -m openpilot.tools.turnpilot.chestnut_smoke [--hz 20]` loads the big model the way modeld does, then times one packed upload of both 1344x760 frames and `model.run`.
+- `python -m openpilot.tools.turnpilot.chestnut_recovery_check [--modeld]` forces a big model failure by raising from its runner, then checks that the mid-drive recovery (`selfdrive/modeld/chestnut_recovery.py`) reloads the big model in a successor process, bit-exact, while the small model keeps publishing. With `--modeld` it runs the real `modeld --demo` against fake cameras and checks that modelV2 goes big, small, then big again with no gap.
 - `python -m openpilot.tools.turnpilot.gate2_modeld [--frames 600]` runs the real `modeld --demo` against fake os04c10 road and wide cameras. It reports `modelV2.modelExecutionTime`, frame age and frame drops, then checks that chestnut was released. With `--detector` it sets `TurnPilotEnabled`, so modeld also runs the TurnPilot detector, and reports its time and rate.
 
 ## Sim stack

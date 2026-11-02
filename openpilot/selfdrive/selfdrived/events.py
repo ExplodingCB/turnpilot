@@ -370,7 +370,7 @@ CONTROL_ALERT_TITLE = {'cannotStopComfortably': "Take Control", 'stopOverrun': "
                        'stalledInJunction': "Stalled in Junction", 'overrideWriteFailed': "Junction Not Saved",
                        'carStoppedNote': "Car Stopped", 'stallLift': "Stalled: Finishing the Turn",
                        'lightGreenNotMoving': "Light Green: Car Not Moving", 'unstickLift': "Going On",
-                       'pedestrianWaiting': "Waiting for Pedestrian"}
+                       'pedestrianWaiting': "Waiting for Pedestrian", 'turnpilotResumed': "TurnPilot Resumed"}
 # the route's stop signs (route_notice.py, STOP_SIGNS.md 3.4), said engaged or not: the text is turnpilotPlan.routeNotice
 ROUTE_NOTICE_TITLE = {'routeAvoidsStops': "Route Avoids Stop Signs", 'routeDetour': "Long Detour Around Stop Signs",
                       'stopsNeedYou': "Stop Signs Need You", 'firstStopNeedsYou': "First Stop Needs You",
@@ -630,12 +630,14 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
 
   EventName.bigModelFailed: {
     ET.SOFT_DISABLE: soft_disable_alert("Big Model Failed"),
-    ET.PERMANENT: NormalPermanentAlert("Big Model Failed ", "Restart the car to retry,\nsmall model is still available", duration=20.),
+    # TurnPilot: modeld retries it in the background and brings it back with openpilot disengaged (chestnut_recovery.py)
+    ET.PERMANENT: NormalPermanentAlert("Big Model Failed ", "Small model driving,\nretrying the big model", duration=20.),
   },
 
   # TurnPilot handing control back (selfdrive/turnpilot/handback.py): openpilot's standard soft disable, with
   # TurnPilot's handback chime. A stopped detector, or one that never started, also blocks engaging while it stays so;
-  # after a model fallback openpilot can be engaged again on the small model, without TurnPilot.
+  # after a model fallback openpilot can be engaged again on the small model, TurnPilot paused with its route kept until
+  # the big model is back and the driver engages again (turnpilotd.py).
   EventName.turnpilotDetectorStopped: {
     ET.SOFT_DISABLE: turnpilot_handback_alert("TurnPilot unavailable: detector stopped"),
     ET.NO_ENTRY: NoEntryAlert("TurnPilot unavailable: detector stopped"),
@@ -649,8 +651,8 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   },
 
   EventName.turnpilotModelFellBack: {
-    ET.SOFT_DISABLE: turnpilot_handback_alert("TurnPilot unavailable: driving model fell back"),
-    ET.PERMANENT: NormalPermanentAlert("TurnPilot Unavailable", "Driving model fell back: take control", duration=10.),
+    ET.SOFT_DISABLE: turnpilot_handback_alert("Big model stopped: TurnPilot paused"),
+    ET.PERMANENT: NormalPermanentAlert("TurnPilot Paused", "Big model stopped: route kept", duration=10.),
   },
 
   EventName.lateralManeuver: {
