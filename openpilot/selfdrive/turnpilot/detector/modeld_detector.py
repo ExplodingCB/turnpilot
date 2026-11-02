@@ -442,6 +442,22 @@ def upload_maps(name: str, side_map: SideMap, device: str | None = None) -> tupl
   return tuple(Tensor(a, device=device).realize() for a in (side_map.luma_idx, side_map.chroma_idx, side_map.weights))
 
 
+SIDE_MAPS_CORES = [0, 1, 2, 3]  # the little cores, where openpilot's own background daemons run
+
+
+def side_maps_thread() -> None:
+  """The side maps' worker leaves modeld's realtime slot. A thread inherits its creator's SCHED_FIFO 54 and core 7, where
+  dmonitoringmodeld runs at FIFO 5: there compute_geometry's 0.1-0.3 s (more on the comma's CPU) would hold off driver
+  monitoring, and modeld's own step, every time the calibration moves. Both calls act on this thread alone."""
+  from openpilot.common.realtime import drop_realtime, set_core_affinity
+  drop_realtime()
+  set_core_affinity(SIDE_MAPS_CORES)
+
+
+def side_maps_executor() -> ThreadPoolExecutor:
+  return ThreadPoolExecutor(max_workers=1, thread_name_prefix='side_maps', initializer=side_maps_thread)
+
+
 def blank_maps(device: str | None = None) -> tuple:
   """A view's maps of zeros on device, for the side graph's warm-up at load."""
   n = SIDE_INPUT_SIZE[0] * SIDE_INPUT_SIZE[1]
@@ -523,7 +539,7 @@ class SideViews:
       self.pending, self.staged = None, {}  # for a calibration since left behind: never used
     if self.pending is None:
       if self.executor is None:
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='side_maps')
+        self.executor = side_maps_executor()
       self.pending = (self.executor.submit(compute_geometry, self.lens, rpy, euler, self.cam_w, self.cam_h), rpy, euler)
     future = self.pending[0]
     if upload and future.done():

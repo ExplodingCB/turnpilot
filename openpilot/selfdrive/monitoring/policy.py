@@ -101,6 +101,7 @@ class DriverPose:
     self.cfactor_pitch = 1.
     self.cfactor_yaw = 1.
     self.steer_yaw_offset = 0.
+    self.scan_yaw_offset = 0.  # TurnPilot: either way, while its maneuver has the driver checking (run_step's maneuver_scan)
 
 class DriverBlink:
   def __init__(self):
@@ -232,9 +233,11 @@ class DriverMonitoring:
     pitch_error = 0 if pitch_error > 0 else abs(pitch_error) # no positive pitch limit
 
     if yaw_error * self.pose.steer_yaw_offset > 0: # unidirectional
-      yaw_error = max(abs(yaw_error) - min(abs(self.pose.steer_yaw_offset), self.settings._POSE_YAW_STEER_MAX_OFFSET), 0.)
+      yaw_allowance = min(abs(self.pose.steer_yaw_offset), self.settings._POSE_YAW_STEER_MAX_OFFSET)
     else:
-      yaw_error = abs(yaw_error)
+      yaw_allowance = 0.
+    # TurnPilot: its junction or lane change, either way, never past the steering allowance's own cap (0 without TurnPilot)
+    yaw_error = max(abs(yaw_error) - max(yaw_allowance, self.pose.scan_yaw_offset), 0.)
 
     pitch_threshold = self.settings._POSE_PITCH_THRESHOLD * self.pose.cfactor_pitch if self.pose.calibrated else self.settings._PITCH_NATURAL_THRESHOLD
     yaw_threshold = self.settings._POSE_YAW_THRESHOLD * self.pose.cfactor_yaw
@@ -244,7 +247,11 @@ class DriverMonitoring:
     self.distracted_types['phone'] = bool(self.phone_prob > self.settings._PHONE_THRESH)
     self.distracted_types['sleep'] = bool(self.sleep_prob > self.settings._SLEEP_THRESH)
 
-  def _update_states(self, driver_state, cal_rpy, car_speed, op_engaged, lowspeed, demo_mode=False, steering_angle_deg=0.):
+  def _update_states(self, driver_state, cal_rpy, car_speed, op_engaged, lowspeed, demo_mode=False, steering_angle_deg=0.,
+                     maneuver_scan=False):
+    # TurnPilot (turnpilot/hooks.py dm_maneuver_scan): the yaw its maneuver needs either way, the steering allowance's cap
+    scan = maneuver_scan and not demo_mode
+    self.pose.scan_yaw_offset = self.settings._POSE_YAW_STEER_MAX_OFFSET if scan else 0.
     rhd_pred = driver_state.wheelOnRightProb
     # calibrates only when there's movement and either face detected
     if car_speed > self.settings._WHEELPOS_CALIB_MIN_SPEED and (driver_state.leftDriverData.faceProb > self.settings._FACE_THRESHOLD or
@@ -287,7 +294,9 @@ class DriverMonitoring:
     self.driver_distraction_filter.update(self.driver_distracted)
 
     # only update offsetter when driver is actively driving the car above a certain speed
-    if self.face_detected and car_speed > self.settings._POSE_CALIB_MIN_SPEED and self.pose.low_std and (not op_engaged or not self.driver_distracted):
+    # (TurnPilot: never from a maneuver's mirror and junction checks, or they'd be learnt as the natural pose)
+    if self.face_detected and car_speed > self.settings._POSE_CALIB_MIN_SPEED and self.pose.low_std and not scan and \
+       (not op_engaged or not self.driver_distracted):
       self.pose.pitch_offsetter.push_and_update(self.pose.pitch)
       self.pose.yaw_offsetter.push_and_update(self.pose.yaw)
 
@@ -428,7 +437,8 @@ class DriverMonitoring:
     dm.wheeltouchPolicyState.driverInteracting = self.driver_interacting
     return dat
 
-  def run_step(self, sm, demo=False):
+  def run_step(self, sm, demo=False, maneuver_scan=False):
+    """maneuver_scan: TurnPilot's maneuver has the driver checking the junction or the mirrors (dmonitoringd)."""
     if demo:
       car_speed = 30
       enabled = True
@@ -462,6 +472,7 @@ class DriverMonitoring:
       lowspeed=lowspeed,
       demo_mode=demo,
       steering_angle_deg=steering_angle_deg,
+      maneuver_scan=maneuver_scan,
     )
 
     # Update distraction events

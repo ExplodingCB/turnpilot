@@ -3,6 +3,7 @@ import openpilot.cereal.messaging as messaging
 from openpilot.common.params import Params
 from openpilot.common.realtime import config_realtime_process
 from openpilot.selfdrive.monitoring.policy import DriverMonitoring
+from openpilot.selfdrive.turnpilot.hooks import active_plan, dm_maneuver_scan
 
 
 def dmonitoringd_thread():
@@ -10,7 +11,11 @@ def dmonitoringd_thread():
 
   params = Params()
   pm = messaging.PubMaster(['driverMonitoringState'])
-  sm = messaging.SubMaster(['driverStateV2', 'extrinsicsCalibration', 'carState', 'selfdriveState', 'modelV2'], poll='driverStateV2')
+  # TurnPilot's plan says when its maneuver has the driver checking the junction or the mirrors; never one of the checks, so
+  # TurnPilot off or turnpilotd gone leaves DM exactly stock's (hooks.active_plan is None)
+  tp = ['turnpilotPlan']
+  sm = messaging.SubMaster(['driverStateV2', 'extrinsicsCalibration', 'carState', 'selfdriveState', 'modelV2'] + tp, poll='driverStateV2',
+                           ignore_alive=tp, ignore_avg_freq=tp, ignore_valid=tp)
 
   DM = DriverMonitoring(rhd_saved=params.get_bool("IsRhdDetected"), always_on=params.get_bool("AlwaysOnDM"))
   demo_mode=False
@@ -26,7 +31,7 @@ def dmonitoringd_thread():
     if demo_mode and sm.valid['driverStateV2']:
       DM.run_step(sm, demo=True)
     elif valid:
-      DM.run_step(sm, demo=demo_mode)
+      DM.run_step(sm, demo=demo_mode, maneuver_scan=dm_maneuver_scan(active_plan(sm), sm['carState'].vEgo))
 
     # publish
     dat = DM.get_state_packet(valid=valid)
