@@ -174,8 +174,10 @@ class TestNativeDetect(OpenpilotTestCase):
   def test_step_overruns_fall_back(self):
     det, pm = native_detector('full'), FarPM()
     det.native.estimate = lambda lights_on: 0.001  # fits by its estimate every time...
-    det.native.run.delay = 0.006                   # ...but with the model's 40 ms the run takes the step past STEP_BUDGET_S
-    steps(det, pm, FAR_OVERRUNS * RUN_EVERY, model_time=STEP_BUDGET_S - 0.005)
+    det.native.run.delay = 0.009                   # ...but beside a model 1 ms over STEP_BUDGET_S it leaves 11 ms of debt
+    for k in range(FAR_OVERRUNS):                  # (the full pass's 1, its own 1 and 9), past DEBT_CAP_S (each pair from a
+      det.debt = 0.                                # paid-back cycle)
+      steps(det, pm, RUN_EVERY, model_time=STEP_BUDGET_S + 0.001, start=10 * k)
     assert det.native.disabled and len(det.native.run.calls) == FAR_OVERRUNS and det.native_status() == NativeStatus.fallback
     assert len(det.native.times) == FAR_OVERRUNS and float(np.median(det.native.times)) < NATIVE_BUDGET_S  # the step's rule, not the median's
     steps(det, pm, RUN_EVERY, start=100)
@@ -190,7 +192,9 @@ class TestNativeDetect(OpenpilotTestCase):
 
   def test_a_frame_without_room_for_the_strip_is_the_far_crops(self):
     det, pm = native_detector('full', native_time=0.012, far_time=0.006), FarPM()
-    steps(det, pm, 2 * RUN_EVERY, model_time=STEP_BUDGET_S - 0.008)  # room for the far crop (6 ms), not a strip (12 ms)
+    # 3 ms under the budget the full pass (5 ms) leaves 2 ms of debt to come: room for the far crop (6 ms: 3 + 2), not a
+    # strip (12 ms: 9 + 2)
+    steps(det, pm, 2 * RUN_EVERY, model_time=STEP_BUDGET_S - 0.003)
     assert det.native.run.calls == [] and len(det.far.run.calls) == 2 and not det.native.disabled
     assert pm.full[-1].farStatus == FarStatus.read and statuses(pm)[-1] == NativeStatus.full
     steps(det, pm, 2 * RUN_EVERY, start=100, model_time=STEP_BUDGET_S - 0.020)  # room again: the strips

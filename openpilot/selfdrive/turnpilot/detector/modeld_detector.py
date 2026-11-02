@@ -35,9 +35,9 @@ full pass's runs and published apart (turnpilotFarDetections), so it never takes
 not: the full pass always wins. It is aimed by turnpilotPlan.farCropBearing (read through fresh_plan, shadow too: the
 unprotected left aims it up the oncoming approach, else straight ahead) at the calibrated horizon (FAR_HORIZON_ROW down
 the crop), and one compiled graph serves every aim: it takes two byte windows of modeld's device copy of the frame
-(crop_view_offsets). Its own budget: a run only where the model's time and its estimate fit STEP_BUDGET_S; a failure, a
-median run over FAR_BUDGET_S, or FAR_OVERRUNS of its last TIME_WINDOW runs pushing the step past STEP_BUDGET_S turn it off
-for the drive, logged, said by every full pass message (farStatus disabled, which turnpilotd raises once), and nothing of
+(crop_view_offsets). Its own budget: a run only where its estimate leaves the next full pass its room (the time budget
+below); a failure, a median run over FAR_BUDGET_S, or FAR_OVERRUNS of its last TIME_WINDOW runs pushing the debt past
+DEBT_CAP_S turn it off for the drive, logged, said by every full pass message (farStatus disabled, which turnpilotd raises once), and nothing of
 the full pass's (its runs, its backoff) changes. Its class-9 boxes go to a light reader of its own, always in shadow.
 TurnPilotFarCrop off, or no far pkl, runs none (farStatus off).
 
@@ -52,11 +52,12 @@ lights and the odd paint read take them as they take the far crop's. Where the s
 rule drops (scene/tracker.py tile_boxes), and the bottom strip holds its feet with only its head cut, which that rule keeps;
 every ground object's bottom is whole in one strip. It is loaded with the detector, for the mode the param says then (a
 change mid-drive to another mode takes effect at the next load; to off, at once), and has its own budget: a run only where
-the model's time and its estimate fit STEP_BUDGET_S (else the far crop takes that frame if it fits: never nothing); a
-failure, a median run over NATIVE_BUDGET_S, or FAR_OVERRUNS of its last TIME_WINDOW runs pushing the step past
-STEP_BUDGET_S send it back to the far crop for the drive, logged and said by every full pass message (nativeStatus
-fallback), the far crop then on its own budget as without it. Measured on the chestnut beside the big model (models/
-README.md): the step 34.86 ms median with strip, 35.71 ms with full, against 33.39 ms with the far crop.
+its estimate leaves the next full pass its room (else the far crop takes that frame if it fits: never nothing); a failure,
+a median run over NATIVE_BUDGET_S, or FAR_OVERRUNS of its last TIME_WINDOW runs pushing the debt past DEBT_CAP_S send it
+back to the far crop for the drive, logged and said by every full pass message (nativeStatus fallback), the far crop then on its own budget
+as without it. Measured on the chestnut beside the big model on the bench (models/README.md): the step 34.86 ms median with
+strip, 35.71 ms with full, against 33.39 ms with the far crop; on the car the big model alone is 13 ms slower (the time
+budget below), so a strip (10.7-12 ms) has no room on the frame after a road run, and the far crop takes it where it fits.
 
 The stop sweep (STOP_SIGNS.md section 1.3, SideViews): turnpilotPlan.detectorView stopSweep (held at a stop or yield) or
 stopSweepGo (crossing, from the commit point), read through fresh_plan, shadow too. Its even steps (the full pass's, every
@@ -68,8 +69,8 @@ it the odd steps idle, so the approach costs what the detector costs today. The 
 camera's fisheye pixels (camera wide, view sideLeft or sideRight), each with its sectors' image quality (sectorQuality) from
 the host copy of the wide frame. Their maps follow the bus's calibration: recomputed off the step (a thread) when it moves
 more than sideview.RECALIB_DEG, uploaded on an odd step, the views invalid until then (sideViewStatus mapsStale). Each
-view's run is governed by room() on its own estimate (noRoom); a failure, a median run over SIDE_BUDGET_S, or SIDE_OVERRUNS
-of the last TIME_WINDOW runs pushing the step past STEP_BUDGET_S turn them off for the drive (sideViewStatus disabled,
+view's run is governed by the time budget on its own estimate (noRoom); a failure, a median run over SIDE_BUDGET_S, or
+SIDE_OVERRUNS of the last TIME_WINDOW runs pushing the debt past DEBT_CAP_S turn them off for the drive (sideViewStatus disabled,
 which turnpilotd says once, sideCamerasOff), and both cycles fall back to the forward views. While a sweep runs, the lane
 paint isn't read (lanePaintStatus sweep), the light reader reads colour only with a signal mapped within SWEEP_SIGNAL_M
 (lightStatus sweep otherwise), every forward run publishes its class-9 boxes (lightBoxes), and the far crop is suspended
@@ -78,6 +79,22 @@ paint isn't read (lanePaintStatus sweep), the light reader reads colour only wit
 Stop signs (COCO 11), on every forward run under TurnPilotCameraStopSigns shadow (the default; off reads none): decoded
 apart into the message's signs, each with the luma below it for plaque labelling (decoder.fill_signs), never into its
 detections, so nothing stops, caps or releases on one.
+
+The time budget (STEP_BUDGET_S, DEBT_CAP_S): the detector runs after modelV2 is sent, so a step that takes longer than
+modeld's 50 ms cycle drops nothing; it only starts the next frame late, and a lighter frame after it catches up. On the car
+(comma four and chestnut, 2026-11-02, build 95a27d7) the big model takes 38.9 ms median (p99 40.2, max 41.1), not the
+bench's 25-27 ms, and a full pass 10.4 ms (p99 10.7) with the lane paint 3.5 ms more on the road camera: model and detector
+never fit a per-frame cap of 45 ms, and the detector ran only forced, 1.27 Hz. Those forced steps (about 53 ms) dropped no
+model frame: a road run started the next frame 7.8 ms late (median; max 9.8), a wide one 3.5 ms, and the model-only frame
+after it was back on time. So each step's driving model time (modeld's measured model_execution_time, so a slower host backs
+off) and detector work past STEP_BUDGET_S is a debt the next step starts with (paid back by the frames under it), and a run
+goes only where the debt it leaves stays within DEBT_CAP_S. A run on the frames between the full runs (the far crop, the
+native schedule, the side views, the odd paint read) must also leave the next full pass its room, so the full pass always
+wins (a run that, for all its estimate, left it none costs the full pass a frame, paid back by the next); one that pushed
+the debt past DEBT_CAP_S itself counts against its own overrun budget. With the car's numbers the full pass runs every
+RUN_EVERY frame with the paint, its debt (5.8 ms) paid back on the frame after; the far crop's 6 ms has no room after a
+road run (the next would start 9.8 ms late) but takes most frames between the wide runs of a turn (2.4 ms of debt each),
+where the odd paint read fits now and then; a 45 ms driving model gets only forced runs, which stay the backstop.
 
 Nothing here runs unless TurnPilotEnabled is set and the compiled pkl for this device and camera size exists
 (compile_detector.py builds it; the pkls are not in git).
@@ -118,10 +135,19 @@ from openpilot.selfdrive.turnpilot.scene.ranging import Lens, calib_from_view, c
 from openpilot.selfdrive.turnpilot.scene.tracker import predicted_path
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 
-# chestnut, 2026-10-27, yolo26n at 1344x760: big model 25-27 ms, detector 7.9 ms in modeld (5.9 ms alone). Every frame
-# fit with no drops; every 2nd keeps headroom for a slower host and in-stack load.
+# chestnut, 2026-10-27, yolo26n at 1344x760 on the bench: big model 25-27 ms, detector 7.9 ms in modeld (5.9 ms alone). On
+# the car (2026-11-02, module docstring's time budget) the big model is 38.9 ms and the full pass 10.4 ms: every 2nd frame,
+# its debt paid back on the frame between
 RUN_EVERY = 2              # at most every 2nd model frame (10 Hz)
-STEP_BUDGET_S = 0.045      # driving model + detector must finish within this of the 50 ms cycle (the rest takes ~1 ms)
+CYCLE_S = 1. / 20          # modeld's cycle
+# the rest of modeld's step (the frame's wait and upload, its messages): the car's model-only frame after a road run paid back
+# all of its 7.8 ms late start (2026-11-02), so the rest beside a 38.9 ms model is at most 3 ms
+REST_S = 0.003
+STEP_BUDGET_S = CYCLE_S - REST_S  # driving model + detector past this in a step are debt the next step starts with
+# a run only where the debt it leaves stays within this. On the car a road run's step (model 38.9 + full pass 10.4 + paint
+# 3.5 ms) carried 7.8 ms into the next (median; max 9.8) and modeld dropped no frame; the estimate projects 5.8 ms (8.0 at
+# the model's max). A host 6 ms slower (a 45 ms model) projects 12: only forced runs
+DEBT_CAP_S = 0.008
 WIDE_CURVATURE = 0.01      # 1/m (a 100 m radius): at or above this, look through the wide camera
 WIDE_HOLD_S = 2.0          # and keep looking through it this long after the turn ends
 # at a standstill and a crawl the full pass looks through the wide camera (SAT_VALIDATION rows 6 and X3: standing, the road
@@ -141,23 +167,23 @@ TIME_WINDOW = 5            # the detector time estimate is the median of this ma
 # (a loaded host runs the driving model below 20 Hz), it runs anyway and the estimate starts over from that run: a burst
 # of slow runs under load can't keep it off once the load has gone. The wait never grows: turnpilotd hands back
 # DETECTOR_DEADLINE_S (1.5 s) after the last detections, so a forced run must land well inside (DETECTOR_DEADLINE_S -
-# STALE_S) of the one before; each costs one step past the budget, one in 16 frames while nothing fits. A detector that
-# can't run in time even so (a forced run itself too slow, failures) is a loud handback in turnpilotd, never quietly off.
+# STALE_S) of the one before; each may leave a debt past DEBT_CAP_S, one in 16 frames while nothing fits, which the frames
+# after it pay back. A detector that can't run in time even so (a forced run itself too slow, failures) is a loud handback
+# in turnpilotd, never quietly off.
 FORCE_RUN_FRAMES = 16      # 0.8 s at 20 Hz
 FORCE_RUN_S = 0.8
 RETRY_S = 1.0              # a failed run is retried after this, doubled for each failure in a row...
 RETRY_MAX_S = 60.          # ...to this
 PARAM_CHECK_S = 1.0        # TurnPilotEnabled is read this often
-# the lane paint read's median over TIME_WINDOW reads above this turns it off for the drive. The most the tighter step has for
-# it: the odd read's (read_odd_paint), the native schedule's 35.7 ms beside the big model, with the lights at LIGHT_BUDGET_S,
-# fits STEP_BUDGET_S with 5.3 ms for the paint (the full pass's road step has more). The read is about 2.6 ms on the comma
-# four (module docstring), so it stays on with half the budget spare
+# the lane paint read's median over TIME_WINDOW reads above this turns it off for the drive. On the car (2026-11-02) a read at
+# it beside the 38.9 ms model and the 10.4 ms full pass projects a 7.3 ms debt, inside DEBT_CAP_S; the read there was 3.5 ms
+# (median; p90 3.8), so it stays on with 1.5 ms spare
 PAINT_BUDGET_S = 0.005
 LIGHT_BUDGET_S = 0.004     # the light read's median over TIME_WINDOW reads above this turns the lights off for the drive
 # the far crop (FarCrop). Chestnut, 2026-10-28, yolo26n on the 640x384 crop alone: 6.0 ms (the full pass 5.9 ms alone, 7.9 ms
 # beside the big model); a median run over FAR_BUDGET_S is more than the frames between the full runs were measured to hold
 FAR_BUDGET_S = 0.012
-FAR_OVERRUNS = 3           # of its last TIME_WINDOW runs pushing the step past STEP_BUDGET_S: off for the drive
+FAR_OVERRUNS = 3           # of its last TIME_WINDOW runs pushing the debt past DEBT_CAP_S: off for the drive
 FAR_STATUS_S = 0.5         # farStatus read: it ran within this
 FAR_VIEW_CACHE = 64        # device views kept, one per crop position (graph.crop_at aligns them to a coarse grid)
 FAR_CROP_DEFAULT = True    # TurnPilotFarCrop unset or unknown to this build
@@ -170,7 +196,7 @@ NATIVE_DEFAULT = 'full'    # TurnPilotNativeDetect unset, unknown to this build,
 SWEEPS = ('stopSweep', 'stopSweepGo')
 SIDE_VIEW_V_MAX = 2.0      # m/s (STOP_GO_V_MAX): side views only at or under this, inside a sweep
 SIDE_BUDGET_S = 0.015      # a median side-view run over this (the odd step's room beside the driving model): off for the drive
-SIDE_OVERRUNS = 3          # of the last TIME_WINDOW side runs pushing the step past STEP_BUDGET_S: off for the drive
+SIDE_OVERRUNS = 3          # of the last TIME_WINDOW side runs pushing the debt past DEBT_CAP_S: off for the drive
 SIDE_STATUS_S = 0.5        # sideViewStatus noRoom: the gate open this long with no side run
 SWEEP_SIGNAL_M = 60.       # during a sweep the light reader reads colour only with a signal mapped within this
 STOP_SIGNS_DEFAULT = 'shadow'  # TurnPilotCameraStopSigns: off, or shadow (logged, never acted on)
@@ -415,7 +441,7 @@ class FarCrop:
     self.disabled = True
 
   def ran(self, now: float, dt: float, overran: bool) -> None:
-    """A run of dt s at now; overran: with the model's time it pushed the step past STEP_BUDGET_S."""
+    """A run of dt s at now; overran: the step's debt after it (ModeldDetector.debt_after) past DEBT_CAP_S."""
     self.last_run_t = now
     self.next += 1
     self.times.append(dt)
@@ -423,7 +449,7 @@ class FarCrop:
     if len(self.times) == TIME_WINDOW and float(np.median(self.times)) > self.budget_s:
       self.disable(f"over budget ({np.median(self.times) * 1e3:.1f} ms)")
     elif sum(self.overruns) >= FAR_OVERRUNS:
-      self.disable(f"pushed the step past {STEP_BUDGET_S * 1e3:.0f} ms {sum(self.overruns)} times in {len(self.overruns)} runs")
+      self.disable(f"pushed the debt past {DEBT_CAP_S * 1e3:.0f} ms {sum(self.overruns)} times in {len(self.overruns)} runs")
 
 
 class NativeStrips(FarCrop):
@@ -591,7 +617,7 @@ class SideViews:
     self.disabled = True
 
   def ran(self, name: str, now: float, dt: float, overran: bool) -> None:
-    """A run of view name, dt s at now; overran: with the model's time and its sectors it pushed the step past the budget."""
+    """A run of view name, dt s at now; overran: with its sectors, the step's debt after it past DEBT_CAP_S."""
     self.last_run_t = now
     self.times[name].append(dt)
     self.recent.append(dt)
@@ -599,7 +625,7 @@ class SideViews:
     if len(self.recent) == TIME_WINDOW and float(np.median(self.recent)) > SIDE_BUDGET_S:
       self.disable(f"over budget ({np.median(self.recent) * 1e3:.1f} ms)")
     elif sum(self.overruns) >= SIDE_OVERRUNS:
-      self.disable(f"pushed the step past {STEP_BUDGET_S * 1e3:.0f} ms {sum(self.overruns)} times in {len(self.overruns)} runs")
+      self.disable(f"pushed the debt past {DEBT_CAP_S * 1e3:.0f} ms {sum(self.overruns)} times in {len(self.overruns)} runs")
 
 
 def fill_lights(tl, heads: list[LightHead], shadow: bool) -> None:
@@ -632,6 +658,10 @@ class ModeldDetector:
   steps = 0                       # step() calls, for odd_paint's age
   last_cam: str | None = None     # the camera of the last full run
   odd_paint: tuple | None = None  # (paint, lanePaintStatus, its time, steps) read on the far crop's frame (read_odd_paint)
+  debt = 0.                       # s this step started late: the last one's time past STEP_BUDGET_S (the time budget)
+  last_step_t: float | None = None  # time.monotonic() at the last step()'s start
+  step_t0 = 0.                    # time.perf_counter() at this step()'s start
+  next_cam: str | None = None     # the camera a full run would take on this frame (choose_camera's peek), for odd_room
 
   def __init__(self, model_state, cam_w: int, cam_h: int, cameras: dict[str, int]):
     """cameras: 'road' and/or 'wide' -> index of its frame in modeld's packed input."""
@@ -663,48 +693,78 @@ class ModeldDetector:
     self.side = load_side(model_state, cam_w, cam_h, cameras['wide'], bus) if 'wide' in cameras else None
 
 
-  def choose_camera(self, desired_curvature: float, desire: int, now: float, view: str = 'auto', v_ego: float | None = None) -> str:
+  def choose_camera(self, desired_curvature: float, desire: int, now: float, view: str = 'auto', v_ego: float | None = None,
+                    peek: bool = False) -> str:
     """The camera for this run: the wide one in a turn or on a curve and WIDE_HOLD_S after, and at or under WIDE_SLOW_V
     (v_ego, None unknown) but for one run in WIDE_SLOW_ROAD_EVERY, else the road one; the plan's view (WIDE_EVERY, the
-    sweeps) overrides that. A device with one camera runs it."""
+    sweeps) overrides that. A device with one camera runs it. peek: the same pick, its cycles left as they were (the time
+    budget's estimate, before the run)."""
+    cycles = {}  # the cycles' next values, set on self unless peek
+    wide_until = self.wide_until
     if abs(desired_curvature) >= WIDE_CURVATURE or desire in TURN_DESIRES:
-      self.wide_until = now + WIDE_HOLD_S
+      wide_until = cycles['wide_until'] = now + WIDE_HOLD_S
     if view == 'stopSweep':  # held: the full wide pass and the road camera alternating, the wide first
       want = 'wide' if self.sweep_runs % 2 == 0 else 'road'
-      self.sweep_runs += 1
+      cycles['sweep_runs'] = self.sweep_runs + 1
     elif view == 'stopSweepGo':  # crossing: the full wide pass every time
       want = 'wide'
     elif view == 'road':
       want = 'road'
     elif view == 'roadAndWide':
-      self.view_runs = (self.view_runs + 1) % WIDE_EVERY
-      want = 'wide' if self.view_runs == 0 else 'road'
-    elif now < self.wide_until:
+      cycles['view_runs'] = (self.view_runs + 1) % WIDE_EVERY
+      want = 'wide' if cycles['view_runs'] == 0 else 'road'
+    elif now < wide_until:
       want = 'wide'
     elif v_ego is not None and v_ego <= WIDE_SLOW_V:
       want = 'road' if self.slow_runs == WIDE_SLOW_ROAD_EVERY - 1 else 'wide'
-      self.slow_runs = (self.slow_runs + 1) % WIDE_SLOW_ROAD_EVERY
+      cycles['slow_runs'] = (self.slow_runs + 1) % WIDE_SLOW_ROAD_EVERY
     else:
       want = 'road'
-    if view != 'auto' or now < self.wide_until or v_ego is None or v_ego > WIDE_SLOW_V:
-      self.slow_runs = 0
+    if view != 'auto' or now < wide_until or v_ego is None or v_ego > WIDE_SLOW_V:
+      cycles['slow_runs'] = 0
+    if not peek:
+      for name, value in cycles.items():
+        setattr(self, name, value)
     return want if want in self.frames else next(iter(self.frames))
 
-  def room(self, model_execution_time: float) -> bool:
-    """Whether this frame has room for a run: the driving model's time plus the estimate (the detector's, and the lane
-    paint read's and the lights' while they are on: a sweep reads no paint, and lights only near a mapped signal) fit the
-    budget, or the detector has gone FORCE_RUN_FRAMES or FORCE_RUN_S without and runs to measure again."""
+  def estimate(self, cam: str | None = None) -> float:
+    """The full pass's time estimate on camera cam (None: unknown, as the road camera): the detector's, and on the road
+    camera the lane paint read's and the lights' while they are on (a sweep reads no paint, and lights only near a mapped
+    signal). A wide run reads neither: on the car (2026-11-02) its step carried 3.5 ms into the next, a road run's 7.8."""
     estimate = float(np.median(self.times)) if self.times else 0.
+    if cam == 'wide':
+      return estimate
     if self.sweep is None and self.lane_paint is not None and self.paint_times:
       estimate += float(np.median(self.paint_times))
     if self.lights_read() and self.lights is not None and self.light_mode != 'off' and self.light_times:
       estimate += float(np.median(self.light_times))
-    if model_execution_time + estimate <= STEP_BUDGET_S:
+    return estimate
+
+  def debt_after(self, model_execution_time: float, more_s: float = 0.) -> float:
+    """The debt this step leaves the next if it spends more_s s more (the time budget): the debt it started with, plus the
+    driving model's time and the detector's work so far and more_s, past STEP_BUDGET_S. Never more than a cycle: a step a
+    whole cycle late drops a frame, and the next starts on a fresh one."""
+    used = model_execution_time + (time.perf_counter() - self.step_t0) + more_s
+    return min(CYCLE_S, max(0., self.debt + used - STEP_BUDGET_S))
+
+  def odd_room(self, model_execution_time: float, more_s: float = 0.) -> bool:
+    """Whether a run of more_s s on a frame between the full runs leaves the next full pass its room: the debt it leaves,
+    plus the full pass's own past STEP_BUDGET_S at this model time on the camera it would take on this frame (next_cam),
+    within DEBT_CAP_S. A full pass that can't fit even with no debt runs only forced, and has no room to keep."""
+    full = max(0., model_execution_time + self.estimate(self.next_cam) - STEP_BUDGET_S)
+    return self.debt_after(model_execution_time, more_s) + (full if full <= DEBT_CAP_S else 0.) <= DEBT_CAP_S
+
+  def room(self, model_execution_time: float, cam: str | None = None) -> bool:
+    """Whether this frame has room for a run on camera cam: the debt it would leave (debt_after, on the estimate) stays
+    within DEBT_CAP_S, or the detector has gone FORCE_RUN_FRAMES or FORCE_RUN_S without and runs to measure again."""
+    estimate = self.estimate(cam)
+    if self.debt_after(model_execution_time, estimate) <= DEBT_CAP_S:
       return True
     waited_s = time.monotonic() - self.last_run_t if self.last_run_t is not None else 0.
     if self.since_run < FORCE_RUN_FRAMES and waited_s < FORCE_RUN_S:
       return False
-    cloudlog.info(f"turnpilot detector: no room for {waited_s:.2f} s at {1e3 * estimate:.0f} ms, measuring again")
+    model_ms, debt_ms = 1e3 * model_execution_time, 1e3 * self.debt
+    cloudlog.info(f"turnpilot detector: no room for {waited_s:.2f} s at {1e3 * estimate:.0f} ms, model {model_ms:.0f}, debt {debt_ms:.0f}; measuring again")
     self.times.clear()
     return True
 
@@ -713,7 +773,20 @@ class ModeldDetector:
     """Called once per model frame after modelV2 is sent, with the driving model this detector was loaded for.
     metas: FrameMeta of packed frames 0 and 1; view: turnpilotPlan.detectorView (choose_camera, the sweeps); far_bearing:
     turnpilotPlan.farCropBearing (FarCrop); v_ego: carState.vEgo for the side views' speed gate (None: unknown, closed);
-    signal_near: a signal mapped within SWEEP_SIGNAL_M (plan_inputs), for the light reader during a sweep."""
+    signal_near: a signal mapped within SWEEP_SIGNAL_M (plan_inputs), for the light reader during a sweep. Whatever it
+    runs, the step's time past STEP_BUDGET_S is the next step's debt (the time budget)."""
+    now = time.monotonic()
+    if self.last_step_t is None or now - self.last_step_t > 2 * CYCLE_S:
+      self.debt = 0.  # the first step, or after a gap (the host stepped nothing, modeld idled): nothing carried
+    self.last_step_t, self.step_t0 = now, time.perf_counter()
+    try:
+      self.detect(pm, model_state, model_execution_time, desired_curvature, desire, metas, view, far_bearing, v_ego, signal_near)
+    finally:
+      self.debt = self.debt_after(model_execution_time)
+
+  def detect(self, pm, model_state, model_execution_time: float, desired_curvature: float, desire: int, metas: list,
+             view: str, far_bearing: float, v_ego: float | None, signal_near: bool) -> None:
+    """step()'s runs on this frame, in its time budget."""
     if model_state is not self.model_state:
       # DetectorHost picks the detector by model, so this is a bug: raise for the host to log and retry, never a quiet off
       raise ValueError("turnpilot detector stepped with a driving model it wasn't loaded for")
@@ -727,6 +800,7 @@ class ModeldDetector:
     gated = sweep is not None and v_ego is not None and v_ego <= SIDE_VIEW_V_MAX
     if self.side is not None:
       self.side.gate(gated, now)
+    self.next_cam = self.choose_camera(desired_curvature, desire, now, view, v_ego, peek=True)
     self.since_run += 1
     if self.since_run < RUN_EVERY:  # a frame between the full runs: the sweep's side views, else the far crop
       if sweep is not None:
@@ -738,10 +812,10 @@ class ModeldDetector:
       self.side_ready(upload=False)  # the maps' recompute starts with the sweep, above the gate too; uploaded on an odd step
     self.signal_near = signal_near
     lights_read = self.lights_read()
-    if time.monotonic() < self.retry_at or not self.room(model_execution_time):
+    if time.monotonic() < self.retry_at or not self.room(model_execution_time, self.next_cam):
       return
     try:
-      cam = self.choose_camera(desired_curvature, desire, time.monotonic(), view, v_ego)
+      cam = self.choose_camera(desired_curvature, desire, now, view, v_ego)
       t0 = time.perf_counter()
       raw = self.run(input_frame=self.frames[cam]).numpy()
       dt = time.perf_counter() - t0
@@ -863,7 +937,7 @@ class ModeldDetector:
     if side is None or side.disabled or not gated or not self.side_ready(upload=True):
       return
     name = SIDE_VIEWS[side.next]
-    if model_execution_time + side.estimate(name) > STEP_BUDGET_S:
+    if not self.odd_room(model_execution_time, side.estimate(name)):
       return  # stale, said once it outlasts SIDE_STATUS_S (noRoom)
     try:
       geom = side.geometry
@@ -879,13 +953,13 @@ class ModeldDetector:
       td = msg.turnpilotDetections
       fill_detections(td, decode_side(raw, geom, name), meta.frame_id, meta.timestamp_eof, 'wide', dt)
       td.view, td.lens = name, geom.lens.spec
-      quality_dt = self.read_sectors(td, model_state.frames[i], meta, name)
+      self.read_sectors(td, model_state.frames[i], meta, name)
       td.lanePaintStatus = LanePaintStatus.sweep if self.lane_paint is not None else LanePaintStatus.disabled
       td.lightStatus = self.light_status() if self.light_status() != LightStatus.read else LightStatus.wideCamera
       td.farStatus, td.sideViewStatus = self.far_status(), SideViewStatus.running
       td.nativeStatus = self.native_status()
       pm.send('turnpilotDetections', msg)
-      side.ran(name, time.monotonic(), dt, model_execution_time + dt + quality_dt > STEP_BUDGET_S)
+      side.ran(name, time.monotonic(), dt, self.debt_after(model_execution_time) > DEBT_CAP_S)
     except Exception:
       cloudlog.exception("turnpilot side views failed")
       side.disable("failed")
@@ -933,7 +1007,7 @@ class ModeldDetector:
         far.why = FarStatus.noCalibration
         return far.why
       lights_on = far.lights is not None and self.light_mode != 'off'
-      if model_execution_time + far.estimate(lights_on) > STEP_BUDGET_S:
+      if not self.odd_room(model_execution_time, far.estimate(lights_on)):
         far.why = FarStatus.noRoom
         return far.why
       crop = far.aim(bearing, rpy)
@@ -946,25 +1020,25 @@ class ModeldDetector:
       msg = messaging.new_message('turnpilotFarDetections', valid=bool(np.isfinite(raw).all()))
       boxes = decode_far(raw, crop)
       fill_far(msg.turnpilotFarDetections, boxes, crop, bearing, meta.frame_id, meta.timestamp_eof, dt)
-      light_dt = self.read_far_lights(msg.turnpilotFarDetections.run, model_state, metas, raw, crop, far)
+      self.read_far_lights(msg.turnpilotFarDetections.run, model_state, metas, raw, crop, far)
       pm.send('turnpilotFarDetections', msg)
-      far.ran(time.monotonic(), dt, model_execution_time + dt + light_dt > STEP_BUDGET_S)
+      far.ran(time.monotonic(), dt, self.debt_after(model_execution_time) > DEBT_CAP_S)
     except Exception:
       cloudlog.exception("turnpilot native schedule failed" if far.mode != 'off' else "turnpilot far crop failed")
       far.disable("failed")
       return FarStatus.disabled
-    self.read_odd_paint(model_state, metas, boxes, model_execution_time + dt + light_dt)
+    self.read_odd_paint(model_state, metas, boxes, model_execution_time)
     return FarStatus.read
 
-  def read_odd_paint(self, model_state, metas: list, boxes: np.ndarray, used_s: float) -> None:
+  def read_odd_paint(self, model_state, metas: list, boxes: np.ndarray, model_execution_time: float) -> None:
     """While the full pass looks through the wide camera (a turn, a curve, their WIDE_HOLD_S), the lane paint on the far
     crop's road frame, behind the far crop's boxes, kept in odd_paint for the next full run's message, where the step has
-    room for it (used_s: the step's time so far; with no paint time yet, as when the drive starts in a turn, a read is taken
-    to cost PAINT_BUDGET_S, the most one may). Its failures and budget are the paint's own (read_lane_paint's)."""
+    room for it (odd_room, with the step's time so far; with no paint time yet, as when the drive starts in a turn, a read
+    is taken to cost PAINT_BUDGET_S, the most one may). Its failures and budget are the paint's own (read_lane_paint's)."""
     if self.last_cam != 'wide' or self.lane_paint is None or 'road' not in self.cameras:
       return
     estimate = float(np.median(self.paint_times)) if self.paint_times else PAINT_BUDGET_S
-    if used_s + estimate > STEP_BUDGET_S:
+    if not self.odd_room(model_execution_time, estimate):
       return  # no room: this wide run's message says wideCamera, as before
     t0 = time.perf_counter()
     try:

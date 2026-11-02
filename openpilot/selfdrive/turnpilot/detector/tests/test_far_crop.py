@@ -9,8 +9,9 @@ from openpilot.common.test import OpenpilotTestCase
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.selfdrive.turnpilot.detector.decoder import CAR, TRAFFIC_LIGHT
 from openpilot.selfdrive.turnpilot.detector.graph import FAR_HORIZON_ROW, Crop
-from openpilot.selfdrive.turnpilot.detector.modeld_detector import (FAR_BUDGET_S, FAR_STATUS_S, FORCE_RUN_FRAMES, PAINT_BUDGET_S, RUN_EVERY,
-                                                                    STEP_BUDGET_S, TIME_WINDOW, FarCrop, LanePaintStatus, LightStatus)
+from openpilot.selfdrive.turnpilot.detector.modeld_detector import (DEBT_CAP_S, FAR_BUDGET_S, FAR_STATUS_S, FORCE_RUN_FRAMES, PAINT_BUDGET_S,
+                                                                    RUN_EVERY, STEP_BUDGET_S, TIME_WINDOW, FarCrop, LanePaintStatus,
+                                                                    LightStatus)
 from openpilot.selfdrive.turnpilot.detector.tests.test_modeld_detector import FakeLights, FakeOutput, Meta, make_detector
 from openpilot.selfdrive.turnpilot.scene.ranging import road_lens
 
@@ -93,21 +94,22 @@ class TestFarCrop(OpenpilotTestCase):
     assert abs(pm.far[0].crop[1] + FAR_HORIZON_ROW - v) <= 1 and abs(v - 380) > 15
 
   def test_never_on_a_frame_the_full_pass_is_due_or_forced(self):
-    # no room for the full pass (5 ms), room for the far crop (3 ms): the full pass is due on every frame and the far crop
-    # never takes them, up to the full pass's forced run; on the frame after it, the far crop runs
-    det, pm = far_detector(far_time=0.003), FarPM()
-    steps(det, pm, FORCE_RUN_FRAMES - RUN_EVERY - 1, model_time=STEP_BUDGET_S - 0.004)
+    # no room for the full pass (10 ms beside a model 1 ms under the budget: a 9 ms debt), room for the far crop (3 ms: 2):
+    # the full pass is due on every frame and the far crop never takes them, up to the full pass's forced run; on the
+    # frame after it, the far crop runs
+    det, pm = far_detector(far_time=0.003, det_time=0.010), FarPM()
+    steps(det, pm, FORCE_RUN_FRAMES - RUN_EVERY - 1, model_time=STEP_BUDGET_S - 0.001)
     assert pm.full == [] and pm.far == [] and det.since_run == FORCE_RUN_FRAMES - 1
-    steps(det, pm, 2, model_time=STEP_BUDGET_S - 0.004, start=100)
+    steps(det, pm, 2, model_time=STEP_BUDGET_S - 0.001, start=100)
     assert len(pm.full) == 1 and len(pm.far) == 1 and pm.far[0].run.frameId == 102
-    det, pm = far_detector(far_time=0.003), FarPM()
+    det, pm = far_detector(far_time=0.003, det_time=0.010), FarPM()
     det.since_run = 0  # the full pass just ran
-    det.step(pm, det.model_state, STEP_BUDGET_S - 0.004, 0.0, log.Desire.none, [Meta(1), Meta(2)], 'auto', 0.)
+    det.step(pm, det.model_state, STEP_BUDGET_S - 0.001, 0.0, log.Desire.none, [Meta(1), Meta(2)], 'auto', 0.)
     assert len(pm.far) == 1 and pm.full == []  # room for the far crop alone, on the frame between
 
   def test_no_room_and_no_calibration_are_said(self):
     det, pm = far_detector(far_time=0.012), FarPM()
-    steps(det, pm, 4, model_time=STEP_BUDGET_S - 0.008)  # room for the full pass (5 ms), not the far crop (12 ms)
+    steps(det, pm, 4, model_time=STEP_BUDGET_S)  # room for the full pass (a 5 ms debt), not the far crop (12 ms, and 5 to come)
     assert pm.far == [] and len(pm.full) == 2 and pm.full[-1].farStatus == FarStatus.noRoom
     det, pm = far_detector(rpy=None), FarPM()
     steps(det, pm, 4)
@@ -150,14 +152,15 @@ class TestFarCrop(OpenpilotTestCase):
     assert len(pm.full) == TIME_WINDOW + 2 and pm.full[-1].farStatus == FarStatus.disabled
 
   def test_step_overruns_turn_it_off(self):
-    # runs that fit their estimate but, with the model's time, overrun the step's budget (the estimate low, the model slow):
-    # FAR_OVERRUNS of the last TIME_WINDOW and it is off for the drive
+    # runs that fit their estimate but, with the model's time, push the debt past DEBT_CAP_S (the estimate low, the model
+    # slow): FAR_OVERRUNS of the last TIME_WINDOW and it is off for the drive
     from openpilot.selfdrive.turnpilot.detector.modeld_detector import FAR_OVERRUNS
     det, pm = far_detector(far_time=0.001), FarPM()
-    det.far.run.delay = 0.007
+    det.far.run.delay = 0.009
     for k in range(2 * TIME_WINDOW):
-      det.far.times.clear()  # each run fits the (low) estimate
-      steps(det, pm, 1, model_time=STEP_BUDGET_S - 0.005, start=10 * k)
+      det.far.times.clear()  # each run fits the (low) estimate from a paid-back cycle, but beside a model 1 ms over the
+      det.debt = 0.          # budget it leaves 10 ms of debt
+      steps(det, pm, 1, model_time=STEP_BUDGET_S + 0.001, start=10 * k)
     assert det.far.disabled and len(pm.far) == FAR_OVERRUNS and pm.full[-1].farStatus == FarStatus.disabled
     det, pm = far_detector(far_time=0.001), FarPM()
     det.far.run.delay = 0.007
@@ -215,9 +218,12 @@ class TestOddPaint(OpenpilotTestCase):
     det = far_detector()
     det.last_cam = 'wide'
     det.paint_times.extend([0.004] * 3)
-    det.read_odd_paint(det.model_state, [Meta(2), Meta(3)], np.zeros((0, 6), np.float32), STEP_BUDGET_S - 0.003)
+    det.step_t0 = time.perf_counter()  # the far crop's step, its own time so far nothing
+    # the read (4 ms) beside a model 2 ms under the budget leaves 2 ms of debt, and the next full pass (5 ms, 4 of paint
+    # with the camera unknown) 7 more: past DEBT_CAP_S. 4 ms under, 0 + 5
+    det.read_odd_paint(det.model_state, [Meta(2), Meta(3)], np.zeros((0, 6), np.float32), STEP_BUDGET_S - 0.002)
     assert det.lane_paint.calls == [] and det.odd_paint is None
-    det.read_odd_paint(det.model_state, [Meta(2), Meta(3)], np.zeros((0, 6), np.float32), STEP_BUDGET_S - 0.005)
+    det.read_odd_paint(det.model_state, [Meta(2), Meta(3)], np.zeros((0, 6), np.float32), STEP_BUDGET_S - 0.004)
     assert det.lane_paint.calls == [('host0', 2, 0)] and det.odd_paint is not None
     # a read older than the step before (the full run it was for had no room) is dropped, not sent
     det, pm = far_detector(), FarPM()
@@ -231,9 +237,13 @@ class TestOddPaint(OpenpilotTestCase):
     det = far_detector()
     det.last_cam = 'wide'
     assert len(det.paint_times) == 0
-    det.read_odd_paint(det.model_state, [Meta(2), Meta(3)], np.zeros((0, 6), np.float32), STEP_BUDGET_S - PAINT_BUDGET_S + 0.001)
+    det.step_t0 = time.perf_counter()
+    # the read's debt (model + PAINT_BUDGET_S past the budget) and the next full pass's (model + 5 ms) fit DEBT_CAP_S at
+    # this model time, and no later
+    edge = STEP_BUDGET_S + (DEBT_CAP_S - PAINT_BUDGET_S - 0.005) / 2
+    det.read_odd_paint(det.model_state, [Meta(2), Meta(3)], np.zeros((0, 6), np.float32), edge + 0.001)
     assert det.lane_paint.calls == [] and det.odd_paint is None
-    det.read_odd_paint(det.model_state, [Meta(2), Meta(3)], np.zeros((0, 6), np.float32), STEP_BUDGET_S - PAINT_BUDGET_S - 0.001)
+    det.read_odd_paint(det.model_state, [Meta(2), Meta(3)], np.zeros((0, 6), np.float32), edge - 0.001)
     assert det.lane_paint.calls == [('host0', 2, 0)] and det.odd_paint is not None and len(det.paint_times) == 1
 
   def test_paint_failure_on_the_far_frame_turns_only_the_paint_off(self):

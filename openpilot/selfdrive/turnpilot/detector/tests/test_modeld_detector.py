@@ -10,8 +10,8 @@ from openpilot.common.params import UnknownKeyName
 from openpilot.selfdrive.turnpilot.detector.decoder import PERSON, TRAFFIC_LIGHT
 from openpilot.selfdrive.turnpilot.detector.graph import letterbox
 from openpilot.selfdrive.turnpilot.detector.light_state import LightHead
-from openpilot.selfdrive.turnpilot.detector.modeld_detector import (LIGHT_BUDGET_S, PAINT_BUDGET_S, RUN_EVERY, STEP_BUDGET_S, TIME_WINDOW,
-                                                                    WIDE_HOLD_S, LanePaintStatus, LightStatus, ModeldDetector,
+from openpilot.selfdrive.turnpilot.detector.modeld_detector import (DEBT_CAP_S, LIGHT_BUDGET_S, PAINT_BUDGET_S, RUN_EVERY, STEP_BUDGET_S,
+                                                                    TIME_WINDOW, WIDE_HOLD_S, LanePaintStatus, LightStatus, ModeldDetector,
                                                                     camera_lights_mode)
 from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN, LinePaint
 
@@ -179,12 +179,15 @@ class TestModeldDetector(OpenpilotTestCase):
     assert det.run.calls == ['frame1'] and str(pm.sent[0].camera) == 'wide' and pm.sent[0].frameId == 2
 
   def test_budget(self):
-    det, pm = make_detector(det_time=0.006), PM()
+    # a run only where the debt it leaves (the step past STEP_BUDGET_S) stays within DEBT_CAP_S: a 10 ms detector beside a
+    # model 1 ms under the budget leaves 9 ms; 3 ms under, 7. The model alone fits, so no debt builds while it waits
+    det, pm = make_detector(det_time=0.010), PM()
     for _ in range(10):
-      det.step(pm, det.model_state, STEP_BUDGET_S - 0.005, 0.0, log.Desire.none, [Meta(1), Meta(2)])
-    assert pm.sent == []  # no room this step, every step
-    det.step(pm, det.model_state, STEP_BUDGET_S - 0.007, 0.0, log.Desire.none, [Meta(1), Meta(2)])
+      det.step(pm, det.model_state, STEP_BUDGET_S - 0.001, 0.0, log.Desire.none, [Meta(1), Meta(2)])
+    assert pm.sent == [] and det.debt < 0.001  # no room this step, every step
+    det.step(pm, det.model_state, STEP_BUDGET_S - 0.003, 0.0, log.Desire.none, [Meta(1), Meta(2)])
     assert len(pm.sent) == 1  # the first frame with room runs, even if it's not on the N-frame grid
+    assert 0.010 - 0.003 <= DEBT_CAP_S
 
   def test_failure_retries_and_a_wrong_model_raises(self):
     det, pm = make_detector(), PM()
@@ -242,10 +245,10 @@ class TestModeldDetector(OpenpilotTestCase):
   def test_paint_time_counts_toward_the_step_budget(self):
     det, pm = make_detector(det_time=0.006), PM()
     det.paint_times.extend([0.003] * 3)
-    det.step(pm, det.model_state, STEP_BUDGET_S - 0.008, 0.0, log.Desire.none, [Meta(1), Meta(2)])
-    assert pm.sent == []  # 6 ms detector + 3 ms paint don't fit in 8 ms
+    det.step(pm, det.model_state, STEP_BUDGET_S, 0.0, log.Desire.none, [Meta(1), Meta(2)])
+    assert pm.sent == []  # 6 ms detector + 3 ms paint past the budget: a 9 ms debt, past DEBT_CAP_S (8 ms)
     det.lane_paint = None  # paint off: its time no longer counts
-    det.step(pm, det.model_state, STEP_BUDGET_S - 0.008, 0.0, log.Desire.none, [Meta(1), Meta(2)])
+    det.step(pm, det.model_state, STEP_BUDGET_S, 0.0, log.Desire.none, [Meta(1), Meta(2)])
     assert len(pm.sent) == 1
 
 
@@ -308,10 +311,10 @@ class TestCameraLights(OpenpilotTestCase):
     det, pm = with_lights(make_detector(det_time=0.006)), PM()
     det.lane_paint = None
     det.light_times.extend([0.003] * 3)
-    det.step(pm, det.model_state, STEP_BUDGET_S - 0.008, 0.0, log.Desire.none, [Meta(1), Meta(2)])
+    det.step(pm, det.model_state, STEP_BUDGET_S, 0.0, log.Desire.none, [Meta(1), Meta(2)])
     assert pm.sent == []
     det.light_mode = 'off'  # off: its time no longer counts
-    det.step(pm, det.model_state, STEP_BUDGET_S - 0.008, 0.0, log.Desire.none, [Meta(1), Meta(2)])
+    det.step(pm, det.model_state, STEP_BUDGET_S, 0.0, log.Desire.none, [Meta(1), Meta(2)])
     assert len(pm.sent) == 1
 
 
@@ -606,17 +609,19 @@ class TestStopSweep(OpenpilotTestCase):
     assert len(far.run.calls) == 2 and pm.msgs[-1].farStatus == FarStatus.read
 
   def test_E7_a_side_view_without_room_is_skipped_and_said(self):
-    # room() governs each side-view run on its own estimate: one that doesn't fit is skipped (its view goes stale, which
-    # the decider counts against a go) and the messages say noRoom; the full pass's runs are untouched
+    # the time budget governs each side-view run on its own estimate: one that doesn't fit is skipped (its view goes stale,
+    # which the decider counts against a go) and the messages say noRoom; the full pass's runs are untouched
     from openpilot.selfdrive.turnpilot.detector.modeld_detector import SIDE_STATUS_S, SideViewStatus
     det, pm = side_detector(side_time=0.012), SweepPM()
-    sweep_steps(det, pm, 8, model_time=STEP_BUDGET_S - 0.008)  # room for the full pass (5 ms), not a side view (12 ms)
+    # 1 ms under the budget: the full pass (5 ms) leaves 4 ms of debt; a side view (12 ms) would leave 11 with the next full
+    # pass's 4 still to come, a 4 ms one 3 + 4
+    sweep_steps(det, pm, 8, model_time=STEP_BUDGET_S - 0.001)
     assert det.side.run.calls == [] and pm.runs == [('wide', 'full'), ('road', 'full')] * 2
     det.side.started_t -= SIDE_STATUS_S + 0.01
-    sweep_steps(det, pm, 2, model_time=STEP_BUDGET_S - 0.008, start=100)
+    sweep_steps(det, pm, 2, model_time=STEP_BUDGET_S - 0.001, start=100)
     assert pm.msgs[-1].sideViewStatus == SideViewStatus.noRoom
     det.side.times['sideLeft'].extend([0.004] * TIME_WINDOW)  # its own estimate: the left fits, the right doesn't
-    sweep_steps(det, pm, 4, model_time=STEP_BUDGET_S - 0.008, start=200)
+    sweep_steps(det, pm, 4, model_time=STEP_BUDGET_S - 0.001, start=200)
     assert [c[1] for c in det.side.run.calls] == ['sideLeft']
 
   def test_E9_an_overrunning_side_view_is_off_for_the_drive_loudly(self):
@@ -646,11 +651,12 @@ class TestStopSweep(OpenpilotTestCase):
   def test_E9_step_overruns_turn_the_side_views_off(self):
     from openpilot.selfdrive.turnpilot.detector.modeld_detector import SIDE_OVERRUNS
     det, pm = side_detector(side_time=0.001), SweepPM()
-    det.side.run.delay = 0.007
+    det.side.run.delay = 0.009
     for k in range(4 * TIME_WINDOW):
       for t in det.side.times.values():
-        t.clear()  # each run fits its (low) estimate
-      sweep_steps(det, pm, 1, model_time=STEP_BUDGET_S - 0.005, start=10 * k)
+        t.clear()  # each run fits its (low) estimate from a paid-back cycle, but beside a model 1 ms over the budget it
+      det.debt = 0.  # leaves 10 ms of debt, past DEBT_CAP_S
+      sweep_steps(det, pm, 1, model_time=STEP_BUDGET_S + 0.001, start=10 * k)
     assert det.side.disabled and len(det.side.run.calls) == SIDE_OVERRUNS
 
   def test_E8_a_calibration_change_invalidates_the_side_views_until_their_maps_are_recomputed(self):
