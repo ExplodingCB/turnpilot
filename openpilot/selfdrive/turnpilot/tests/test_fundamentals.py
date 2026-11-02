@@ -423,11 +423,14 @@ def test_a_right_approached_in_slow_traffic_under_the_old_20_mph_floor_still_get
 @pytest.mark.parametrize("signals", ['car', 'driver'])
 @pytest.mark.parametrize("mph", [25, 35])
 def test_a_right_from_the_curb_lane_at_a_green_is_taken_cleanly_without_a_stop(mph, signals):
-  """Already in the turn lane: no change, the turn's speed cap and no stop (through greens unslowed), the lamp on, turned."""
+  """Already in the turn lane: no change, the turn's speed cap and no stop (through greens unslowed), the lamp on, turned.
+  It comes to the corner at 3.5 m/s or less from 15 m out (turn_speed.V_CORNER_CURB): BeamNG's rights taken came so, and
+  the ones at 4.6-4.7 m/s there were started 4-6 m out and lost (F3 right_green, 2026-11-01: abandoned at 14 deg)."""
   sim, _ = right_at_a_signal(mph, signals, lane=1, green=True)
   through(sim, 450.)
   assert not lane_changes(sim) and all(f.lane == 1 for f in sim.frames), trace(sim)
   assert min(f.v for f in sim.frames if f.s < 450.) > 2., ("stopped at a green", trace(sim))
+  assert max(f.v for f in sim.frames if 435. <= f.s <= 450.) <= 3.5, ("into the corner too fast", trace(sim))
   assert_turned(sim, 'right', 1, 450.)
 
 

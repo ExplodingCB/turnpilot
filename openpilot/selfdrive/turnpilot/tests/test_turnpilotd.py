@@ -227,7 +227,7 @@ def test_left_turn_drive():
 
 def test_consecutive_turns_drive():
   sim = Sim([(300., "turn", "right"), (420., "turn", "left"), (2000., "turn", "right")])
-  for _ in range(int(60. / DT_MDL)):
+  for _ in range(int(75. / DT_MDL)):  # the right's corner at V_CORNER_CURB
     near = [m for m in (300., 420.) if abs(sim.s - m) < 8.]
     sim.step(available=True, steer=90. if near else 0.)
   # a pulse each, and more on the REPULSE_S clock while the car hasn't turned (this sim has no yaw rate)
@@ -1273,7 +1273,7 @@ def test_gps_outlier_that_brings_the_turns_first_pulse_out_doesnt_hold_its_junct
     sim.nav_filter = outlier
     committed_at, stops, errors = None, [], []
     while sim.s < J + 30.:
-      sim.step(yaw_rate=(0.5 if side == 'left' else -0.5) if J - 2. < sim.s < J + 12. else 0.)
+      sim.step(yaw_rate=turn_yaw(sim, side, J - 2. < sim.s < J + 12.))
       if committed_at is None and sim.tp.turn_committed:
         committed_at = sim.s
       if sim.v < 0.3:
@@ -1296,6 +1296,15 @@ def assert_hold_line_kept(sim, stops, case):
   assert stops and HOLD_LINE_M < min(stops), (case, stops[:1], stops[-1:])
   if max(stops) >= HOLD_LINE_M + 2.:
     assert any(p.controlAlert == 'junctionUncertain' for _, _, p in sim.trace), (case, max(stops))
+
+
+TURN_R_M = 8.6  # m: the synthetic turn's radius, 0.5 rad/s at the 4.3 m/s every turn's corner was capped to
+
+
+def turn_yaw(sim, side: str, on: bool) -> float:
+  """The car's yaw going round a turn toward side while on: per metre driven (v / TURN_R_M), not per second, so a turn taken
+  slower (a right's corner at turn_speed.V_CORNER_CURB) is no further round in the same metres."""
+  return ((1. if side == 'left' else -1.) * sim.v / TURN_R_M) if on else 0.
 
 
 def assert_junction_kept(sim, J, side, case, from_s, ids=None):
@@ -1337,7 +1346,7 @@ def test_gps_outliers_around_the_turns_first_pulse_never_hold_its_junction_short
     sim.nav_filter = outliers
     committed_at, errors = None, []
     while sim.s < J + 30.:
-      sim.step(yaw_rate=(0.5 if side == 'left' else -0.5) if J - 2. < sim.s < J + 12. else 0.)
+      sim.step(yaw_rate=turn_yaw(sim, side, J - 2. < sim.s < J + 12.))
       if committed_at is None and sim.tp.turn_committed:
         committed_at = sim.s
       if J - 30. < sim.s < J:
@@ -1370,7 +1379,7 @@ def test_a_gps_bias_long_before_the_turn_or_lasting_into_it_never_holds_its_junc
     sim.nav_filter = biased
     committed_at, errors = None, []
     while sim.s < J + 30.:
-      sim.step(yaw_rate=(0.5 if side == 'left' else -0.5) if J - 2. < sim.s < J + 12. else 0.)
+      sim.step(yaw_rate=turn_yaw(sim, side, J - 2. < sim.s < J + 12.))
       if committed_at is None and sim.tp.turn_committed:
         committed_at = sim.s
       if J - 30. < sim.s < J:
@@ -1406,7 +1415,7 @@ def test_gps_outlier_that_commits_the_turn_and_a_fault_after_it_dont_pass_the_tu
     sim.tp.follower.update = failing
     committed_at = None
     while sim.s < J + 30.:
-      sim.step(yaw_rate=-0.5 if J - 2. < sim.s < J + 12. else 0.)
+      sim.step(yaw_rate=turn_yaw(sim, 'right', J - 2. < sim.s < J + 12.))
       if committed_at is None and sim.tp.turn_committed:
         committed_at = sim.s
     assert committed_at is not None and committed_at >= J - 61., frames
@@ -1434,9 +1443,9 @@ def test_gps_outlier_on_the_first_reading_of_the_next_turns_step_doesnt_hold_its
       return nav_instruction(J2 - sim.s + off, "turn", second, remaining=2000. - sim.s + off, junction=j2,
                              ahead=[(mans[2][0] - sim.s + off, "turn", "right", junction_of("right", 3))]), True
     sim.nav_filter = outlier
-    errors, y2 = [], (0.5 if second == 'left' else -0.5)
+    errors = []
     while sim.s < J2 + 30.:
-      sim.step(yaw_rate=-0.5 if J1 - 2. < sim.s < J1 + 12. else (y2 if J2 - 2. < sim.s < J2 + 12. else 0.))
+      sim.step(yaw_rate=turn_yaw(sim, 'right', J1 - 2. < sim.s < J1 + 12.) + turn_yaw(sim, second, J2 - 2. < sim.s < J2 + 12.))
       if J2 - 30. < sim.s < J2:
         errors.append(sim.distance() - (J2 - sim.s))
     assert_junction_kept(sim, J2, second, (off, gap, second), J2 - 30., errors)
@@ -1461,7 +1470,7 @@ def test_gps_outlier_on_the_last_reading_of_a_straight_on_step_doesnt_hold_the_t
   sim.nav_filter = outlier
   errors = []
   while sim.s < J + 30.:
-    sim.step(yaw_rate=-0.5 if J - 2. < sim.s < J + 12. else 0.)
+    sim.step(yaw_rate=turn_yaw(sim, 'right', J - 2. < sim.s < J + 12.))
     if J - 30. < sim.s < J:
       errors.append(sim.distance() - (J - sim.s))
   assert_junction_kept(sim, J, 'right', 'none step', J - 30., errors)

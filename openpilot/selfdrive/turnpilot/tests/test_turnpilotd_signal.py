@@ -11,7 +11,7 @@ from openpilot.selfdrive.turnpilot.desire_timing import TURN_STARTED_DEG
 from openpilot.selfdrive.turnpilot.hooks import CLEAR_DESIRE
 from openpilot.selfdrive.turnpilot.route_follower import KEEP
 from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of, nav_instruction
-from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Sim
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import TURN_R_M, Sim
 
 Status = custom.TurnpilotPlan.TurnSignal.Status
 LaneChange = custom.TurnpilotPlan.LaneChange
@@ -209,7 +209,7 @@ def test_a_turn_the_car_took_ended_by_the_pass_is_never_handed_over():
   drive_to(sim, 5.)
   plans, turned = [], 0.
   while sim.distance() > -40. and sim.t < 120.:
-    plans.append(sim.step(engaged=True, yaw_rate=-0.25))
+    plans.append(sim.step(engaged=True, yaw_rate=-sim.v / (2. * TURN_R_M)))  # per metre (TURN_R_M): 0.25 rad/s at 4.3 m/s
     turned = max(turned, sim.tp.desires.turned_deg)
   assert 45. < turned < 80., turned
   assert not handed_over(sim, plans)
