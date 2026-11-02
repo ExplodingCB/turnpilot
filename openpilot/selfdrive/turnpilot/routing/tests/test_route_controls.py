@@ -49,6 +49,9 @@ class StubValhalla:
            'internal_intersection': f.get('internal', False), 'length': (e - b) / 1000.,
            'end_node': {'traffic_signal': f.get('node_signal', False),
                         'intersecting_edges': [{'road_class': c} for c in f.get('crossing', ['residential'])]}}
+      d.update({k: f[k] for k in ('speed_limit', 'use') if k in f})  # as trace_attributes: speed_limit only where tagged
+      if f.get('road_class', '') is None:
+        del d['road_class']
       self.edges.append((d, f.get('stop', False), f.get('yield', False)))
     self.requests = []
 
@@ -1503,3 +1506,28 @@ def test_exclusion_headings_are_valhallas_own_at_the_point():
                                   'costing': 'auto', 'verbose': True})]
   assert exclusion_headings(lambda e, r: (_ for _ in ()).throw(RuntimeError('down')), [(1., 2., 3, True)]) == [None]
   assert exclusion_headings(call, []) == []
+
+
+def test_speed_limits_are_tagged_else_the_class_default_off_the_controls_own_trace():
+  """navInstruction.speedLimit (navd; turnpilotd's signal lead, car_signals.lead_m: 200 ft only under 50 mph): per trace edge
+  its tagged maxspeed, else decision D8's road-class default, 0 only where the edge has no class at all. route_controls reads
+  them off its own trace (Limits), so a route makes no second trace_attributes; route_limits is the same alone."""
+  from openpilot.selfdrive.turnpilot.routing.controls import Limits, route_limits
+  from openpilot.selfdrive.turnpilot.routing.guidance import speed_limit_at
+  from openpilot.selfdrive.turnpilot.routing.junctions import MPH
+  v = StubValhalla([(0., 100., {'speed_limit': 56, 'road_class': 'primary'}), (100., 250., {'road_class': 'tertiary'}),
+                    (250., 330., {'speed_limit': 255, 'road_class': 'motorway'}), (330., 400., {'road_class': None})])
+  out = Limits()
+  route_controls(v, steps((200., 200.)), limits=out)
+  assert sum(1 for e, _ in v.requests if e == 'trace_attributes') == 1
+  want = [(100., 56 / 3.6), (250., 35 * MPH), (330., 55 * MPH), (400., 0.)]  # 255 is "no limit": the class default
+  assert [(round(m, 1), round(ms, 3)) for m, ms in out.segments] == [(m, round(ms, 3)) for m, ms in want]
+  alone = route_limits(StubValhalla([(0., 100., {'speed_limit': 56}), (100., 400., {'road_class': 'residential'})]), steps((200., 200.)))
+  assert [(round(m, 1), round(ms, 3)) for m, ms in alone] == [(100., round(56 / 3.6, 3)), (400., round(30 * MPH, 3))]
+  # the car's edge: the first ending past it; past the route's end the last; none known is 0
+  assert speed_limit_at(out.segments, 0.) == pytest.approx(56 / 3.6)
+  assert speed_limit_at(out.segments, 120.) == pytest.approx(35 * MPH)
+  assert speed_limit_at(out.segments, 399.) == 0.
+  assert speed_limit_at(out.segments, 450.) == 0.
+  assert speed_limit_at([], 10.) == 0.
+  assert route_limits(lambda *_: 1 / 0, steps()) == []  # a failure is unknown, logged, never a guess

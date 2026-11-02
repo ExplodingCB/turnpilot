@@ -15,7 +15,7 @@ def set_lanes(builder, field, lanes):
 
 def nav_instruction(distance, mtype="turn", modifier="left", remaining=None, lanes=(), valid=True, junction=None,
                     through=None, route_count=0, ahead=(), controls=(), controls_status=None, off_route=(), off_route_status=None,
-                    route_turns=None):
+                    route_turns=None, wrong_way=0.):
   """A navInstruction reader. lanes: ((directions, active), ...) left to right. junction: (bearing_before,
   bearing_after, branches[, opposing[, opposing speed m/s[, opposing lanes[, opposing straight m]]]]) from Valhalla, or None for a
   route without intersection data; opposing is NavInstruction.Opposing's name, unknown when left out; its speed, lanes and
@@ -24,7 +24,8 @@ def nav_instruction(distance, mtype="turn", modifier="left", remaining=None, lan
   junction]), ...]; allManeuvers starts with this one, as navd's does. controls: map stop controls, [(id, kind, distance[,
   line_mapped, junction, cross_suspect[, junctionInfo dict]]), ...]; controls_status: navd's controlsStatus ('ok' when there are controls).
   off_route, off_route_status: offRouteControls as controls, and offRouteControlsStatus ('ok' when there are controls).
-  route_turns: (routeTurns, routeTurnsStart, routeTurnsStep), the route's shape around the car, or None for none."""
+  route_turns: (routeTurns, routeTurnsStart, routeTurnsStep), the route's shape around the car, or None for none.
+  wrong_way: maneuverWrongWayM (and its allManeuvers entry's), m before the junction of an opening the car may not enter."""
   msg = messaging.new_message('navInstruction', valid=valid)
   ni = msg.navInstruction
   ni.routeCount = route_count
@@ -39,6 +40,7 @@ def nav_instruction(distance, mtype="turn", modifier="left", remaining=None, lan
       m.opposingSpeed = float(m_junction[4]) if len(m_junction) > 4 else 0.
       m.opposingLanes = int(m_junction[5]) if len(m_junction) > 5 else 0
       m.opposingStraightM = float(m_junction[6]) if len(m_junction) > 6 else 0.
+  ni.allManeuvers[0].wrongWayM = ni.maneuverWrongWayM = float(wrong_way)
   ni.maneuverDistance = float(distance)
   ni.maneuverType = mtype
   ni.maneuverModifier = modifier
@@ -91,10 +93,12 @@ class FakeNavd:
   route_count: navd's routeCount for this route. controls: [(s, kind[, line_mapped, junction, cross_suspect]), ...] stop
   points along the route, sent with ids in route order, -15 m to 400 m ahead and at most 8, nearest first, as navd does;
   controls_status: navd's controlsStatus. shape: the route's (longitude, latitude) polyline from s = 0, for routeTurns as
-  navd's route_turns makes them at the car's place lag m back (navd's 1 Hz fix behind the car); None: no shape."""
+  navd's route_turns makes them at the car's place lag m back (navd's 1 Hz fix behind the car); None: no shape.
+  wrong_way: {step: m}, maneuverWrongWayM of that step's maneuver (an opening it may not enter that far before it)."""
   def __init__(self, maneuvers, lanes=None, period=20, through=None, route_count=0, controls=(), controls_status=None,
-               shape=None, lag=0.):
+               shape=None, lag=0., wrong_way=None):
     self.shape, self.lag = shape, lag
+    self.wrong_way = wrong_way or {}
     self.maneuvers = sorted(maneuvers, key=lambda m: m[0])
     self.controls = sorted(controls, key=lambda c: c[0])
     self.controls_status = controls_status
@@ -125,7 +129,8 @@ class FakeNavd:
       route_turns = route_turns_of([self.shape], 0, max(s - self.lag, 0.)) + (ROUTE_TURNS_STEP_M,)
     return nav_instruction(pos - s, mtype, modifier, remaining=self.maneuvers[-1][0] - s, lanes=self.lanes.get(self.step, ()),
                            junction=junction, through=through, route_count=self.route_count, ahead=ahead, controls=controls,
-                           controls_status=self.controls_status, route_turns=route_turns)
+                           controls_status=self.controls_status, route_turns=route_turns,
+                           wrong_way=self.wrong_way.get(self.step, 0.))
 
 
 def road(lanes_left, lanes_right, line_prob=0.9, edge_std=0.3, lane_width=LANE_WIDTH, shoulder=0.5):

@@ -287,10 +287,10 @@ def test_the_time_avoidance_added(tmp_path):
   # the stop's approach edge isn't the route's first (that one can't be avoided)
   v, side, ctx = stub_allway(tmp_path, [survey()], [(0., 50., {'way_id': 49}), (50., 100., {'stop': True, 'way_id': 50}), (100., 400., {})])
   report = route_audit.audit(v, steps(), None, side, ctx, eta=ETA)
-  longer = [dict(s, duration=40.) for s in steps()]
+  longer = [dict(s, duration=10.) for s in steps()]  # +20 s: within avoid.detour_budget_s (its 30 s floor)
   result = route_audit.audit_avoidance(report, steps(), reroute=lambda exclude: longer, route_controls=lambda s: ([], 'ok'), eta=ETA)
   assert (result.status, result.avoided, result.iterations) == ('clean', 1, 1)
-  assert result.added_s == pytest.approx(80. - sum(s.get('duration', 0.) for s in steps()))
+  assert result.added_s == pytest.approx(20. - sum(s.get('duration', 0.) for s in steps()))
   assert 'avoidance: clean, 1 stop routed around' in '\n'.join(route_audit.avoidance_lines(result))
 
 

@@ -49,6 +49,15 @@ model, and a pulse, repeat or timeout spent then is lost. Once openpilot engages
 has turned the car TURN_STARTED_DEG toward a turn meanwhile.
 When a new route replaces the maneuver (RouteFollower.replaced), a turn pulse the car hasn't started turning on is
 cleared at once: the old junction may be just ahead, and the pulse would turn the car there.
+Nor does a turn's pulse go while the car is short of an opening on the turn's side it may not enter (navd's
+maneuverWrongWayM: a one-way toward it, a divided road's near carriageway, its left at the far one; routing/guidance.py:
+wrong_way_before), by the furthest reading of the junction (RouteFollower.junction_spread): the model takes a turn desire at
+the first opening that way, and from 40 m out, or pulling away from a red light standing at that opening, that is the
+one-way, the wrong way (the first drive: a left onto a one-way planned at a red light). The first pulse goes once the car
+is WRONG_WAY_PAST_M past the opening, closer in than the 40 m lead (turn_skip moves its tooLate deadline in with it); a turn
+the model doesn't take from there is missed and rerouted, never driven into the one-way. An autonomous left whose hold
+line stands at such an opening (one under about 11 m before its junction) is let go from its line with no desire, its first
+pulse past the opening: turnpilotd's go bookkeeping for a pulsed go (its stall watch) isn't armed for that left.
 """
 import math
 
@@ -78,9 +87,26 @@ CLEAR_MARGIN_DEG = 10.        # ...and before it, once it has turned the maneuve
 CLEAR_MIN_FRACTION = 0.75     # ...and at least this much of it
 CLEAR_WAIT_S = 6.             # past the junction short of CLEAR_MIN_DEG, the turn may get there this long after
 CLEAR_FRAMES = 5              # frames CLEAR_DESIRE is published
+WRONG_WAY_PAST_M = 2.         # m past an opening it may not enter (maneuverWrongWayM) the car is before its turn may pulse:
+                              # the device about 2 m behind the bumper, the bumper into the opening's far lanes
+WRONG_WAY_GRACE_M = 3.        # m the car may run past that point before turn_skip calls the first pulse too late
 
 DESIRES = {(TURN, LEFT): Desire.turnLeft, (TURN, -LEFT): Desire.turnRight,
            (KEEP, LEFT): Desire.keepLeft, (KEEP, -LEFT): Desire.keepRight}
+
+
+def wrong_way_wait(maneuver, far: float) -> bool:
+  """A turn's pulse waits: an opening on its side the car may not enter (maneuver.wrong_way_m before its junction) is still
+  ahead of, or under WRONG_WAY_PAST_M behind, the car far m short of the junction (its furthest reading)."""
+  w = getattr(maneuver, 'wrong_way_m', 0.) if maneuver is not None else 0.
+  return w > 0. and maneuver.kind == TURN and far > w - WRONG_WAY_PAST_M
+
+
+def first_pulse_by(maneuver, latest: float) -> float:
+  """m before the junction a turn's first pulse must have gone by (turn_skip's tooLate, latest by default), moved in for an
+  opening it waits past (wrong_way_wait), less the second it may take to go once the car is past it at turning speed."""
+  w = getattr(maneuver, 'wrong_way_m', 0.) if maneuver is not None else 0.
+  return min(latest, max(w - WRONG_WAY_PAST_M - WRONG_WAY_GRACE_M, 0.)) if w > 0. else latest
 
 
 def keep_lead(v_ego: float) -> float:
@@ -190,14 +216,16 @@ class DesireTiming:
   def update(self, maneuver, distance: float, maneuver_id: int, passed: bool, v_ego: float,
              steering_angle_deg: float, keep_left_ok: bool, keep_right_ok: bool, dt: float, yaw_rate: float = 0.,
              lat_active: bool = True, replaced: bool = False, may_start: bool = True, go: bool = False,
-             holding: bool = False) -> int:
+             holding: bool = False, far: float | None = None) -> int:
     """The desire to publish, CLEAR_DESIRE once a turn is done. maneuver is RouteFollower.upcoming (None when there is
     none); keep_left_ok/keep_right_ok: the model sees a lane line and road that way (lane_planner.ModelLanes);
     yaw_rate: rad/s, left positive; lat_active: carControl.latActive; replaced: RouteFollower.replaced;
     may_start: the car can still make the turn (turn_skip.py); no turn pulse starts while it can't; go: a hold let go of
     the car at standstill (turnpilotd): the turn pulses again now, not once the car moves, since the model won't pull
     away from a standstill with its pulse forgotten; holding: a hold has the car (shouldStop): standing, the turn desire
-    drops to none (its edge stays in the model's queue), so the go's pulse is a fresh edge in the very frame it lets go."""
+    drops to none (its edge stays in the model's queue), so the go's pulse is a fresh edge in the very frame it lets go;
+    far: the furthest reading of the junction's distance (distance plus RouteFollower.junction_spread; distance when not
+    given), which a turn's pulse waits past an opening it may not enter by (wrong_way_wait)."""
     if maneuver_id != self.maneuver_id:
       if replaced and self.side and self.turned_deg < TURN_STARTED_DEG:
         self._clear()
@@ -210,6 +238,7 @@ class DesireTiming:
         self._clear()
       elif self._pending[2] > CLEAR_WAIT_S:
         self._pending = None
+    may_start = may_start and not wrong_way_wait(maneuver, distance if far is None else far)
     desire = self._update(maneuver, distance, maneuver_id, passed, v_ego, keep_left_ok, keep_right_ok, dt, yaw_rate, lat_active,
                           may_start, go, holding)
     if desire != Desire.none:
