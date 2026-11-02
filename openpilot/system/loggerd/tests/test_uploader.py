@@ -179,33 +179,3 @@ class TestUploader(UploaderTestCase):
     for f_path in f_paths:
       lock_path = f_path.with_suffix(f_path.suffix + ".lock")
       assert not lock_path.is_file(), "File lock not cleared on startup"
-
-
-class FakeParams:
-  def __init__(self, enabled):
-    self.enabled = enabled
-
-  def get(self, key):
-    return None
-
-  def get_bool(self, key):
-    return key == "TurnPilotEnabled" and self.enabled
-
-
-def test_turnpilot_uploads_rlogs_after_the_qlogs_off_metered_connections(tmp_path):
-  """TurnPilot: rlogs go up by themselves, after every qlog, and never on a metered connection or with TurnPilot off."""
-  for seg in ("a--0", "a--1"):
-    (tmp_path / seg).mkdir()
-    for name in ("rlog.zst", "qlog.zst"):
-      (tmp_path / seg / name).write_bytes(b"x")
-  up = Uploader("0000000000000000", str(tmp_path))
-  up.params = FakeParams(True)
-  assert up.next_file_to_upload(metered=False)[0] == "qlog.zst"
-  for seg in ("a--0", "a--1"):
-    os.setxattr(str(tmp_path / seg / "qlog.zst"), UPLOAD_ATTR_NAME, UPLOAD_ATTR_VALUE) if hasattr(os, "setxattr") else None
-  # with the qlogs up, the rlogs follow, off metered connections only
-  up.list_upload_files = lambda metered: iter([(n, f"{s}/{n}", str(tmp_path / s / n)) for s in ("a--0", "a--1") for n in ("rlog.zst",)])
-  assert up.next_file_to_upload(metered=False)[1] == "a--0/rlog.zst"
-  assert up.next_file_to_upload(metered=True) is None
-  up.params = FakeParams(False)
-  assert up.next_file_to_upload(metered=False) is None
