@@ -46,17 +46,23 @@ def coverage_doc(version='2026-10-27', rings=None):
 WORLD = coverage_doc(rings={'world': ('Test world', [[-180, -85], [180, -85], [180, 85], [-180, 85], [-180, -85]])})
 
 
-def self_signed(ip='127.0.0.1'):
-  """(cert PEM, key PEM) for a certificate with ip in its SAN, as the real server has."""
+def self_signed(ip='127.0.0.1', valid_from: float = -1., valid_to: float = 30., issuer=None):
+  """(cert PEM, key PEM) for a certificate with ip in its SAN, as the real server has, valid from valid_from to valid_to
+  days from now (a clock that is behind sees a certificate from the future). issuer, a (cert PEM, key PEM), signs it;
+  else it signs itself."""
   key = ec.generate_private_key(ec.SECP256R1())
-  name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'turnpilot-maps-test')])
+  name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'turnpilot-maps-test' if issuer is None else 'turnpilot-maps-test-leaf')])
+  issuer_name, issuer_key = name, key
+  if issuer is not None:
+    issuer_name = x509.load_pem_x509_certificate(issuer[0].encode()).subject
+    issuer_key = serialization.load_pem_private_key(issuer[1].encode(), password=None)
   now = datetime.datetime.now(datetime.UTC)
-  cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
-          .serial_number(x509.random_serial_number()).not_valid_before(now - datetime.timedelta(days=1))
-          .not_valid_after(now + datetime.timedelta(days=30))
+  cert = (x509.CertificateBuilder().subject_name(name).issuer_name(issuer_name).public_key(key.public_key())
+          .serial_number(x509.random_serial_number()).not_valid_before(now + datetime.timedelta(days=valid_from))
+          .not_valid_after(now + datetime.timedelta(days=valid_to))
           .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address(ip))]), critical=False)
-          .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-          .sign(key, hashes.SHA256()))
+          .add_extension(x509.BasicConstraints(ca=issuer is None, path_length=None), critical=True)
+          .sign(issuer_key, hashes.SHA256()))
   return (cert.public_bytes(serialization.Encoding.PEM).decode(),
           key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode())
 
@@ -114,8 +120,8 @@ class MapServer:
   header. .cut_at sends only that many bytes of the body and hangs up (a dropped connection); .send_length=False leaves
   Content-Length out, as an older server or a proxy might."""
 
-  def __init__(self, coverage=None, corridor=(200, b'', 'application/x-tar')):
-    self.cert, key_pem = self_signed()
+  def __init__(self, coverage=None, corridor=(200, b'', 'application/x-tar'), cert=None):
+    self.cert, key_pem = cert if cert is not None else self_signed()  # cert: the (cert PEM, key PEM) it serves
     self.coverage = coverage if coverage is not None else coverage_doc()
     self.corridor = corridor
     self.gzip = True  # as the real server does when the client accepts it

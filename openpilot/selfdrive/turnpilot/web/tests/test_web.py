@@ -418,10 +418,13 @@ class TestGeofence(WebTestCase):
     self.params.put(STATUS_PARAM, {"state": "error", "message": "The car is outside TurnPilot's mapped area.", "short": "Car outside",
                                    "code": "outside_coverage", "destination": [SEATTLE[0], SEATTLE[1]], "at": 1})
     assert self.navigate(INDY)[0] == 200
-    assert self.call("GET", "/api/status")[1]["map"]["nav"] is None  # offroad navd doesn't run: nothing to check yet
-    with mock.patch.object(server, "format_status", side_effect=lambda *a, **k: {**status.format_status(*a, **k), "onroad": True}):
-      nav = self.call("GET", "/api/status")[1]["map"]["nav"]
+    # navd runs offroad too (process_config.navigation): it hasn't started on the new destination yet, so it is checking
+    self.params.put_bool("NavigationEnabled", True, block=True)
+    nav = self.call("GET", "/api/status")[1]["map"]["nav"]
     assert nav["state"] == "checking" and nav["destination"] == [INDY[0], INDY[1]], nav
+    self.params.put_bool("NavigationEnabled", False, block=True)
+    assert self.call("GET", "/api/status")[1]["map"]["nav"] is None  # without navigation navd doesn't run: nothing to check
+    self.params.put_bool("NavigationEnabled", True, block=True)
     self.params.put(STATUS_PARAM, {"state": "ready", "message": "Ready", "short": "Ready", "code": "", "destination": [INDY[0], INDY[1]]})
     assert self.call("GET", "/api/status")[1]["map"]["nav"]["state"] == "ready"
 

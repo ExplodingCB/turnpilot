@@ -6,10 +6,15 @@ none, which navd then says out loud). The manifest carries the region's osm_time
 member is checked before anything is written: regular files and directories only, relative paths with no '..', nothing
 outside manifest.json, tiles/ and osm_controls/<digits>.json, and exactly the files the manifest lists, each with its
 SHA-256. Any problem rejects the whole pack.
+
+Beside the manifest the router writes trip.json, the trip the pack was downloaded for, so a later drive (after a reboot,
+or the way back) can route on a pack it already has instead of downloading one (saved, serves; routing/sources.py).
 """
 import gzip
 import hashlib
 import json
+import math
+import os
 import shutil
 import tarfile
 import time
@@ -19,7 +24,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path, PurePosixPath
 
-from openpilot.selfdrive.turnpilot.maps.client import MapError, storage_error
+from openpilot.selfdrive.turnpilot.maps.client import MapError, storage_error, write_atomic
 
 MANIFEST = 'manifest.json'
 TILES = 'tiles'
@@ -29,6 +34,8 @@ STALE_DOWNLOAD_S = 3600.  # a download this old was cut off by a crash or a rest
 MAX_MANIFEST = 16 * 1024 * 1024
 CHUNK = 1024 * 1024
 LEVEL2_SIZE = 0.25  # degrees: Valhalla's local road tiles. Levels 0 and 1 are 4 and 1 degrees, so they cover far more than the corridor
+TRIP = 'trip.json'  # {"start": [lon, lat], "destination": [lon, lat]} the pack was downloaded for
+REUSE_M = 1000.  # a drive's end this close to a pack's own is the same place (serves)
 
 
 def level2_index(lon: float, lat: float) -> int:
@@ -192,6 +199,57 @@ def unpack_to(tar_path: Path, packs_dir: Path, staging: Path) -> Pack:
   final = packs_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
   staging.rename(final)
   return Pack(final, manifest)
+
+
+def meters(a, b) -> float:
+  """Metres between two (lon, lat), flat: it only tells near from far."""
+  x = math.radians(b[0] - a[0]) * math.cos(math.radians((a[1] + b[1]) / 2))
+  return 6371000. * math.hypot(x, math.radians(b[1] - a[1]))
+
+
+def save_trip(pack: Pack, start, destination):
+  """Record the (lon, lat) trip the pack was downloaded for, beside its manifest (saved reads it back)."""
+  trip = {'start': [float(v) for v in start], 'destination': [float(v) for v in destination]}
+  write_atomic(pack.path / TRIP, json.dumps(trip).encode())
+
+
+def touch(pack: Pack):
+  """Mark the pack as just used, so prune keeps it over older ones: packs are ordered by their manifest's time. Never
+  back: a clock not yet set after a boot is behind, and would make the pack in use the first one pruned."""
+  manifest = pack.path / MANIFEST
+  now = time.time_ns()  # file times are wall clock
+  if now > manifest.stat().st_mtime_ns:
+    os.utime(manifest, ns=(now, now))
+
+
+def saved(packs_dir: Path) -> list[tuple[Pack, tuple, tuple]]:
+  """(pack, start, destination) for each unpacked pack with its trip recorded, newest first. Packs unpacked before trips
+  were recorded, and any that don't read (another job pruning it as we look), are left out."""
+  found = []
+  for path in reversed(packs(packs_dir)):
+    try:
+      manifest = json.loads((path / MANIFEST).read_text())
+      trip = json.loads((path / TRIP).read_text())
+      start = (float(trip['start'][0]), float(trip['start'][1]))
+      destination = (float(trip['destination'][0]), float(trip['destination'][1]))
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
+      continue
+    if isinstance(manifest, dict) and isinstance(manifest.get('files'), dict):
+      found.append((Pack(path, manifest), start, destination))
+  return found
+
+
+def serves(pack: Pack, trip_start, trip_destination, start, destination) -> bool:
+  """Whether a pack downloaded for trip_start to trip_destination can serve a drive from start to destination, all (lon,
+  lat): both ends on its roads (covers), and the drive is its own trip, to the same destination from anywhere on those
+  roads (as a reroute on a corridor is), or the way back, each end within REUSE_M of the other's. The server sent every
+  road within its buffer of its own route, so the route between such ends is all there; the caller still checks that it
+  is (holds), and routes on a pack only from the same map (the coverage version)."""
+  if not (pack.covers(*start) and pack.covers(*destination)):
+    return False
+  same = meters(trip_destination, destination) <= REUSE_M
+  back = meters(trip_start, destination) <= REUSE_M and meters(trip_destination, start) <= REUSE_M
+  return same or back
 
 
 def packs(packs_dir: Path) -> list[Path]:

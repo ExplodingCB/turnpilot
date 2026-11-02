@@ -268,6 +268,8 @@ class MapRouter:
 
     coverage = self.coverage_or_fetch()
     region = check_trip(coverage, start, destination)
+    if (steps := self.reuse(start, destination, bearing, language, region, coverage.version)) is not None:
+      return steps
     downloaded = self.download(start, destination, region, coverage.names(), cancelled)
     if position is not None:  # the download took a while: route from where the car is now
       start, bearing = position()
@@ -288,6 +290,39 @@ class MapRouter:
     self.ready(region, destination)
     self.served = (steps, downloaded.source, None, downloaded.pack.path)
     return steps
+
+  def reuse(self, start, destination, bearing, language, region: Region, version: str) -> list[dict] | None:
+    """The steps on a corridor already on the comma, or None to download one: the corridor in memory, or one saved under
+    packs_dir (the newest KEEP_PACKS survive a reboot), for the same map (the coverage version and the region), for this
+    trip or its way back (corridor.serves), with the whole route on it (holds). That skips the minutes of a download
+    after a reboot, and on the way home. Status-neutral, and never a failure the destination waits out: anything wrong
+    with one corridor is logged, the next is tried, and then the download."""
+    current = self.corridor
+    for pack, trip_start, trip_destination in corridor.saved(self.packs_dir):
+      if current is not None and current.destination == destination and current.pack.path == pack.path:
+        continue  # route_server just routed on it
+      if pack.manifest.get('version') != version or pack.manifest.get('region') != region.id:
+        continue
+      if not corridor.serves(pack, trip_start, trip_destination, start, destination):
+        continue
+      try:
+        source = current.source if current is not None and current.pack.path == pack.path else self.valhalla(str(pack.path))
+        steps = source.route(start, destination, bearing, language)
+      except Exception as e:
+        cloudlog.warning(f"turnpilot: the saved corridor {pack.path.name} doesn't route: {type(e).__name__}: {e}")
+        continue
+      if not steps or not pack.holds(steps):
+        continue
+      try:
+        corridor.touch(pack)  # kept over older packs by the next prune
+      except OSError:
+        pass
+      cloudlog.info(f"turnpilot: routing on the saved corridor {pack.path.name}, no download")
+      self.corridor = Corridor(destination, pack, source, region)
+      self.ready(region, destination)
+      self.served = (steps, source, None, pack.path)
+      return steps
+    return None
 
   def ready(self, region: Region, destination):
     self.status.set('ready', f"Ready: map for this drive in the {region.name}", 'Ready', source='server', region=region.name,
@@ -371,6 +406,10 @@ class MapRouter:
       source = self.valhalla(str(pack.path))
     except Exception as e:
       raise MapError('routing_failed', f"The downloaded map doesn't load in Valhalla: {e}", 'Downloaded map does not load') from None
+    try:
+      corridor.save_trip(pack, start, destination)  # for a later drive on it (reuse)
+    except OSError:
+      cloudlog.exception("turnpilot: the corridor's trip wasn't saved; it serves this drive only")
     corridor.prune(packs_dir, in_use=pack.path)
     cloudlog.info(f"turnpilot: corridor {pack.path.name} for {destination}, {size / 1e6:.1f} MB, {pack.manifest.get('route_km')} km")
     return Corridor(destination, pack, source, region)

@@ -1,6 +1,7 @@
 import errno
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -385,8 +386,9 @@ class TestMapRouter(RouterCase):
     self.assertTrue(all(v['destination'] == list(DESTINATION) for k, v in self.params.writes if k == STATUS_PARAM))
 
   def test_new_destinations_keep_the_last_few_packs(self):
+    # 1.7 km apart, and from the start: each is a new trip, none a saved pack serves (MapRouter.reuse)
     for i in range(KEEP_PACKS + 2):
-      self.router.route(START, (-86.16 + i * 0.001, 39.774), 90, 'en')
+      self.router.route(START, (DESTINATION[0] + 0.02 * (i + 1), DESTINATION[1]), 90, 'en')
     self.assertEqual(len(self.server.corridor_requests()), KEEP_PACKS + 2)
     kept = corridor.packs(self.maps / PACKS_DIR)
     self.assertEqual(len(kept), KEEP_PACKS)
@@ -441,11 +443,11 @@ class TestMapRouter(RouterCase):
     e = self.refused('unreachable')
     self.assertIn("Can't reach", e.message)
     self.assertIsNone(self.router.corridor)
-    with patch('openpilot.selfdrive.turnpilot.maps.client.requests.request') as request:
+    with patch.object(requests.Session, 'request') as request:  # the map client's pinned session (maps/client.py)
       self.refused('unreachable')  # within RETRY_SECONDS the same error, with no new attempt
       request.assert_not_called()
     with patch('openpilot.selfdrive.turnpilot.routing.sources.time.monotonic', return_value=time.monotonic() + RETRY_SECONDS + 1):
-      with patch('openpilot.selfdrive.turnpilot.maps.client.requests.request', side_effect=requests.ConnectionError) as request:
+      with patch.object(requests.Session, 'request', side_effect=requests.ConnectionError) as request:
         self.refused('unreachable')
         request.assert_called_once()
 
@@ -477,6 +479,7 @@ class TestMapRouter(RouterCase):
     full = OSError(errno.ENOSPC, 'No space left on device')
     for target in (patch.object(corridor, 'unpack', side_effect=storage_error(full)), patch.object(Path, 'mkdir', side_effect=full)):
       self.router.failure, self.router.corridor = None, None
+      shutil.rmtree(self.maps / PACKS_DIR, ignore_errors=True)  # nor one saved from the last pass (MapRouter.reuse)
       self.server.requests.clear()
       with target:
         e = self.refused('storage')

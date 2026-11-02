@@ -25,11 +25,19 @@ def logging(started: bool, params: Params, CP: car.CarParams) -> bool:
 def ublox_available() -> bool:
   return os.path.exists('/dev/ttyHS0') and not os.path.exists('/persist/comma/use-quectel-gps')
 
+def gps(started: bool, params: Params, CP: car.CarParams) -> bool:
+  """TurnPilot: the GPS daemons run onroad, as comma's, and offroad too while TurnPilot is enabled. comma powers the
+  receiver only onroad to save power, so every drive began with the receiver's start from its flash backup and no fix
+  for the first half minute or more, and navd waited on that fix to route. Kept running, the fix is hot at ignition, the
+  clock is set from GPS (timed) and LastGPSPosition is where the car is parked. It costs the receiver's tracking power
+  offroad; hardwared still shuts the comma down on its usual offroad timer, and the manager stops these with it."""
+  return started or params.get_bool("TurnPilotEnabled")
+
 def ublox(started: bool, params: Params, CP: car.CarParams) -> bool:
   use_ublox = ublox_available()
   if use_ublox != params.get_bool("UbloxAvailable"):
     params.put_bool("UbloxAvailable", use_ublox, block=True)
-  return started and use_ublox
+  return gps(started, params, CP) and use_ublox
 
 def joystick(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and params.get_bool("JoystickDebugMode")
@@ -47,7 +55,7 @@ def not_long_maneuver(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and not params.get_bool("LongitudinalManeuverMode")
 
 def qcomgps(started: bool, params: Params, CP: car.CarParams) -> bool:
-  return started and not ublox_available()
+  return gps(started, params, CP) and not ublox_available()
 
 def always_run(started: bool, params: Params, CP: car.CarParams) -> bool:
   return True
@@ -55,11 +63,16 @@ def always_run(started: bool, params: Params, CP: car.CarParams) -> bool:
 def only_onroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started
 
-def navigation(started: bool, params: Params, CP: car.CarParams) -> bool:
-  return started and params.get_bool("NavigationEnabled")
-
 def turnpilot(started: bool, params: Params, CP: car.CarParams) -> bool:
   return params.get_bool("TurnPilotEnabled")
+
+def navigation(started: bool, params: Params, CP: car.CarParams) -> bool:
+  """navd and mapsd: onroad with NavigationEnabled, as comma's, and TurnPilot's offroad too while it is enabled, so a
+  destination set from the phone is routed, its corridor downloaded and Valhalla loaded, and the route's map tiles fetched,
+  while the car is parked, and the last corridor stays loaded from one drive to the next. Offroad navd plans the route
+  and stops there (no reroutes or lookups ahead), and mapsd only fetches tiles, once a second; the device still shuts
+  down offroad on hardwared's usual timer."""
+  return params.get_bool("NavigationEnabled") and (started or turnpilot(started, params, CP))
 
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started

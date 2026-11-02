@@ -15,6 +15,7 @@ from openpilot.selfdrive.navigation.route import RouteTracker
 from openpilot.selfdrive.navigation.tiles import RemoteTiles
 
 RETRY_SECONDS = 10
+OFFROAD_PERIOD = 1.0  # TurnPilot: s between updates offroad, where mapsd only fetches the route's tiles (main)
 
 
 class MapsD:
@@ -25,8 +26,9 @@ class MapsD:
     self.prefetched = False
     self.retry_at = 0.0
 
-  def update(self, sm) -> tuple[np.ndarray, int]:
-    """The map frame for the latest messages: black with a zero timestamp without a usable map, never stale."""
+  def update(self, sm, render: bool = True) -> tuple[np.ndarray, int]:
+    """The map frame for the latest messages: black with a zero timestamp without a usable map, never stale. TurnPilot:
+    render False (offroad) only fetches the route's tiles, so the first frame onroad is a cache hit."""
     if sm.updated['navRoute']:
       route = np.array([(c.longitude, c.latitude) for c in sm['navRoute'].coordinates], dtype=np.float64).reshape((-1, 2))
       if not np.array_equal(route, self.route):
@@ -44,7 +46,7 @@ class MapsD:
           # Every tile the route can show is fetched up front, so each render below is a cache hit.
           self.renderer.prefetch(self.route)
           self.prefetched = True
-        if source is not None:
+        if render and source is not None:
           gps = sm[source]
           # As in training, the map is centered on the route and headed along it, not at the GPS fix.
           image, valid = self.renderer.render(*self.tracker.snap(gps.longitude, gps.latitude), self.route)
@@ -63,19 +65,31 @@ class MapsD:
     self.prefetched = False
 
 
+def started(sm) -> bool:
+  """TurnPilot: mapsd runs offroad too while TurnPilot is enabled (process_config.navigation), to fetch the tiles of the
+  route navd plans while the car is parked. Before deviceState is heard it is onroad, as mapsd always was."""
+  return not sm.seen['deviceState'] or sm['deviceState'].started
+
+
 def main():
   rk = Ratekeeper(20.0)
-  sm = messaging.SubMaster(['gpsLocation', 'gpsLocationExternal', 'navRoute'])
+  sm = messaging.SubMaster(['gpsLocation', 'gpsLocationExternal', 'navRoute', 'deviceState'])
   server = VisionIpcServer('mapsd')
   server.create_buffers_with_sizes(VisionStreamType.VISION_STREAM_MAP, 4, SIZE, SIZE, SIZE * SIZE, SIZE, SIZE * SIZE)
   server.start_listener()
   mapsd = MapsD()
+  frame = 0
   try:
     while True:
       sm.update(0)
-      image, timestamp = mapsd.update(sm)
-      server.send(VisionStreamType.VISION_STREAM_MAP, image.tobytes(), rk.frame, timestamp, time.monotonic_ns())
-      rk.keep_time()
+      onroad = started(sm)
+      image, timestamp = mapsd.update(sm, render=onroad)
+      server.send(VisionStreamType.VISION_STREAM_MAP, image.tobytes(), frame, timestamp, time.monotonic_ns())
+      frame += 1
+      if onroad:
+        rk.keep_time()
+      else:
+        time.sleep(OFFROAD_PERIOD)  # nothing renders or reads frames offroad; the Ratekeeper resyncs onroad
   finally:
     mapsd.close()
 

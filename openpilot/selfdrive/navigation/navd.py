@@ -21,6 +21,7 @@ from openpilot.selfdrive.turnpilot.maps import surveys
 from openpilot.selfdrive.turnpilot import stop_rules, visibility_table
 from openpilot.selfdrive.turnpilot.routing import avoid, certify
 from openpilot.selfdrive.turnpilot.routing.sources import MapRouter
+from openpilot.selfdrive.turnpilot.web.store import last_gps_position
 
 REROUTE_DISTANCE = 25
 OFF_ROUTE_DISTANCE = 20  # TurnPilot: further than this off the step, its distances mean nothing until the reroute
@@ -83,6 +84,7 @@ class RouteJob(threading.Thread):
     super().__init__(name='navd-route', daemon=True)
     self.engine, self.destination, self.language = engine, destination, language
     self.start_position, self.start_bearing = engine.last_position, engine.last_bearing
+    self.seeded = engine.seeded  # TurnPilot: started from LastGPSPosition, not a live fix (RouteEngine.reseed_due)
     self.cancel = threading.Event()
     self.steps: list[dict] | None = None
     self.controls: list = []  # TurnPilot: the route's stop signs, yields and signals (turnpilot/routing/controls.py)
@@ -198,6 +200,10 @@ class RouteEngine:
 
     self.last_position = None  # (longitude, latitude)
     self.last_bearing = None
+    # TurnPilot: until the first live fix, LastGPSPosition stands in for the car's position (seed_position), and the last
+    # route job started from it is checked against that fix (reseed_due)
+    self.seeded = False
+    self.route_seeded = False
 
     self.nav_destination = None
     self.step_idx = None
@@ -229,6 +235,31 @@ class RouteEngine:
 
     # TurnPilot: routes come from TurnPilot's map server (or local tiles), never Mapbox; see turnpilot/routing/sources.py
     self.router = router if router is not None else MapRouter(self.params)
+    self.seed_position()
+
+  def seed_position(self) -> None:
+    """TurnPilot: LastGPSPosition (ubloxd's or qcomgpsd's last fix, saved once a minute; with the receiver on offroad, where
+    the car is parked) is the car's position until the first live fix, so the geofence check, the corridor download and
+    Valhalla start with navd, at boot, instead of after the receiver's fix. It is a guess, of an unknown age with the clock
+    not yet set: no valid instruction is sent from it (send_instruction), nothing is looked up ahead of it (fill_off_route),
+    and the first live fix checks the route made from it (reseed_due). It carries no heading: a parked car's says nothing."""
+    try:
+      seed = last_gps_position(self.params)
+    except Exception:
+      cloudlog.exception("navd: LastGPSPosition unreadable")
+      return
+    if seed is not None:
+      self.last_position, self.last_bearing, self.seeded = (seed[1], seed[0]), None, True
+      cloudlog.event("navd.seeded_from_last_position")  # never the position itself
+
+  def onroad(self) -> bool:
+    """TurnPilot: whether the car is started (deviceState.started). navd runs offroad too while TurnPilot is enabled
+    (process_config.navigation), where it plans the route and stops there: no reroutes for a parked fix's wander, no
+    lookups ahead and no ETA drift (turnpilotd isn't running, and the drive's ETAs start at departure). Before deviceState
+    is heard, and where navd isn't given it (tests), it is onroad, as navd always was."""
+    if 'deviceState' not in self.sm.data or not self.sm.seen['deviceState']:
+      return True
+    return bool(self.sm['deviceState'].started)
 
   def update(self):
     self.sm.update(0)
@@ -237,6 +268,7 @@ class RouteEngine:
     if source is not None:
       gps = self.sm[source]
       self.last_position, self.last_bearing = (gps.longitude, gps.latitude), gps.bearingDeg
+      self.seeded = False
     self.note_skip()
     route, route_count = self.route, self.route_count
     try:
@@ -371,7 +403,7 @@ class RouteEngine:
     """TurnPilot: N14, each certified control still ahead: its ETA now (the route's durations, as timeRemaining) outside the
     window its light check passed for queues the avoidance loop again (a re-run route certifies at the new ETAs)."""
     now = self.clock()
-    if self.avoid_rerun or self.route is None or now is None:
+    if self.avoid_rerun or self.route is None or now is None or not self.onroad():  # TurnPilot: offroad the ETAs start at departure
       return
     t_car = avoid.time_at(self.route, car_along)
     for c in self.controls:
@@ -416,10 +448,29 @@ class RouteEngine:
     skipped_past = self.skipped_turn_passed() or self.missed_off_route()  # TurnPilot: a reroute past a skipped or missed
                                                                           # turn waits for nothing
     rerun = self.avoid_rerun_due()  # TurnPilot: nor does a stop-sign certification that changed
-    if skipped_past or rerun or new_destination != self.requested_destination or (self.should_recompute() and self.recompute_hold <= 0):
+    reseed = self.reseed_due()  # nor a route from the seed that the first live fix finds the car off
+    parked = self.step_idx is not None and not self.onroad()  # TurnPilot: offroad, a route is kept as planned
+    if skipped_past or rerun or reseed or new_destination != self.requested_destination or \
+       (not parked and self.should_recompute() and self.recompute_hold <= 0):
       self.recompute_hold = RECOMPUTE_HOLD
       self.calculate_route(new_destination)
       self.reroute_counter = 0
+
+  def reseed_due(self) -> bool:
+    """TurnPilot: the last route job started from the seed (seed_position) and navd has a live fix now. Once: route again at
+    once if that job found no route (a seed outside the mapped area, say) or the car is more than REROUTE_DISTANCE off the
+    step it is on, rather than wait out RECOMPUTE_HOLD or REROUTE_COUNTER_MIN. On a corridor that covers the car that is a
+    reroute on it, with no download. A job that downloaded routed from the live fix if it had come by then (RouteJob's
+    position), and the car is on that route: nothing to do."""
+    if not self.route_seeded or self.seeded or self.job is not None or self.last_position is None:
+      return False
+    self.route_seeded = False
+    if self.route is None or self.route_geometry is None or self.step_idx is None:
+      return True
+    off = along_path(self.route_geometry[self.step_idx], self.last_position)[1] > REROUTE_DISTANCE
+    if off:
+      cloudlog.event("navd.reroute_from_first_fix", step_idx=self.step_idx)
+    return off
 
   def calculate_route(self, destination):
     """Start routing to destination. In the background the route arrives in a later update(); else it is here now."""
@@ -450,6 +501,7 @@ class RouteEngine:
     if job.cancel.is_set() or job.destination != destination:
       cloudlog.warning(f"navd: dropped the route to {job.destination}, the destination is now {destination}")
       return
+    self.route_seeded = job.seeded  # TurnPilot: checked against the first live fix (reseed_due)
     if job.steps is None:
       self.clear_route()
       return
@@ -485,7 +537,8 @@ class RouteEngine:
     # TurnPilot: a job while there is a route is a reroute for the same destination (a new one clears the route), as when
     # the car left the corridor and a new one downloads for minutes. The car is off this route meanwhile: its distances
     # mean nothing, and following them would run through its steps to 'Destination reached' and delete the destination.
-    if self.step_idx is None or self.job is not None:
+    # Nor is there guidance before the first live fix: the seed (seed_position) is only where the car was last seen.
+    if self.step_idx is None or self.job is not None or self.seeded:
       msg.valid = False
       self.fill_off_route(msg)
       self.pm.send('navInstruction', msg)
@@ -562,7 +615,8 @@ class RouteEngine:
     if self.off_status == 'none':
       self.off_status = 'pending'
     self.collect_ahead()
-    if self.ahead_job is None and self.last_position is not None:
+    # TurnPilot: nothing looked up ahead of the seed, a guess, nor offroad, where turnpilotd doesn't run (onroad)
+    if self.ahead_job is None and self.last_position is not None and not self.seeded and self.onroad():
       self.ahead_job = AheadJob(self.router, self.last_position, self.last_bearing)
       if self.background:
         self.ahead_job.start()
@@ -670,8 +724,9 @@ class RouteEngine:
 
 def main():
   pm = messaging.PubMaster(['navInstruction', 'navRoute'])
-  # TurnPilot: turnpilotPlan says when a turn was skipped (too fast), so navd reroutes past it at once
-  sm = messaging.SubMaster(['gpsLocation', 'gpsLocationExternal', 'turnpilotPlan'], ignore_alive=['turnpilotPlan'],
+  # TurnPilot: turnpilotPlan says when a turn was skipped (too fast), so navd reroutes past it at once; deviceState whether
+  # the car is started (navd runs offroad too: RouteEngine.onroad)
+  sm = messaging.SubMaster(['gpsLocation', 'gpsLocationExternal', 'turnpilotPlan', 'deviceState'], ignore_alive=['turnpilotPlan'],
                            ignore_avg_freq=['turnpilotPlan'], ignore_valid=['turnpilotPlan'])
 
   rk = Ratekeeper(1.0)

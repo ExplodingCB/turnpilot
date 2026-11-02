@@ -1,5 +1,10 @@
 """The TurnPilot map server's API, over HTTPS with its self-signed certificate pinned from TurnPilotMapCert.
 
+The pin doesn't read the comma's clock (PinnedContext): after a boot the clock is wrong until GPS or NTP sets it, and the
+server's certificate starts on a date such a clock may not have reached, which failed the TLS check and the map download.
+The handshake still checks everything else it did (the only trust anchor is the pinned certificate, its signature, the
+address in its SAN), and the certificate the server sends must be the pinned one exactly, by SHA-256.
+
 Every failure is a MapError with a code and a message meant for the driver; nothing here retries or falls back.
 """
 import base64
@@ -9,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import ssl
 import tempfile
 import time
 import zlib
@@ -16,6 +22,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from openpilot.selfdrive.turnpilot.maps.paths import maps_dir
 
@@ -26,6 +33,8 @@ CORRIDOR_TIMEOUT = (5., 180.)
 CHUNK = 256 * 1024
 CERT_FILE = 'server-cert.pem'
 PEM_BEGIN = '-----BEGIN CERTIFICATE-----'
+PEM_END = '-----END CERTIFICATE-----'
+X509_V_FLAG_NO_CHECK_TIME = 0x200000  # OpenSSL's x509_vfy.h (1.1.0 and later); Python's ssl has no name for it
 
 
 class MapError(Exception):
@@ -97,19 +106,80 @@ def check_key(key: str) -> str:
   return key
 
 
+def bad_cert() -> MapError:
+  return MapError('not_configured', "The map server certificate is not a PEM certificate. Paste it again in the TurnPilot web app.",
+                  'Map server certificate is wrong')
+
+
 def check_cert(pem: str) -> str:
   pem = (pem or '').strip()
-  if not pem.startswith(PEM_BEGIN) or '-----END CERTIFICATE-----' not in pem:
-    raise MapError('not_configured', "The map server certificate is not a PEM certificate. Paste it again in the TurnPilot web app.",
-                   'Map server certificate is wrong')
+  if not pem.startswith(PEM_BEGIN) or PEM_END not in pem:
+    raise bad_cert()
   return pem + '\n'
+
+
+def cert_der(pem: str) -> bytes:
+  """The DER bytes of the first certificate in pem, the one the server sends and the one pinned. A ValueError (base64's
+  binascii.Error is one) for a PEM with no certificate in it."""
+  _, begin, rest = (pem or '').partition(PEM_BEGIN)
+  body, end, _ = rest.partition(PEM_END)
+  if not begin or not end:
+    raise ValueError("no PEM certificate")
+  return base64.b64decode(''.join(body.split()))
 
 
 def cert_fingerprint(pem: str) -> str:
   """SHA-256 of the certificate's DER bytes, as openssl x509 -fingerprint -sha256 prints it."""
-  body = ''.join(line for line in pem.strip().splitlines() if line and not line.startswith('-----'))
-  digest = hashlib.sha256(base64.b64decode(body)).hexdigest().upper()
+  digest = hashlib.sha256(cert_der(pem)).hexdigest().upper()
   return ':'.join(digest[i:i + 2] for i in range(0, len(digest), 2))
+
+
+class PinnedContext(ssl.SSLContext):
+  """TLS to the map server with its certificate pinned, and no clock (module docstring). It verifies as the CA file it
+  replaces did: the pinned certificate is the only trust anchor, its signature is checked and so is the address in its
+  SAN (check_hostname). X509_V_FLAG_NO_CHECK_TIME skips the certificate's dates and nothing else, and once the handshake
+  is done, before a request (the key) goes out, the server's certificate must be the pinned one byte for byte (its
+  SHA-256), so a certificate the pinned one signed can't stand in for it. urllib3 hands every connection's socket to
+  wrap_socket, which does the handshake on the connected socket."""
+  pin: bytes = b''
+
+  def wrap_socket(self, *args, **kwargs):
+    sock = super().wrap_socket(*args, **kwargs)
+    try:
+      der = sock.getpeercert(binary_form=True)
+      if not der or hashlib.sha256(der).digest() != self.pin:
+        raise ssl.SSLCertVerificationError("the map server's certificate is not the pinned one")
+    except BaseException:
+      sock.close()
+      raise
+    return sock
+
+
+def pinned_context(cert_path: Path, pem: str) -> PinnedContext:
+  """A PinnedContext trusting only the certificate in cert_path, pinned to pem's (the same certificate)."""
+  context = PinnedContext(ssl.PROTOCOL_TLS_CLIENT)  # CERT_REQUIRED and check_hostname, as requests' verify=<file> had
+  context.minimum_version = ssl.TLSVersion.TLSv1_2
+  try:
+    context.load_verify_locations(cafile=str(cert_path))
+    context.pin = hashlib.sha256(cert_der(pem)).digest()
+  except (ssl.SSLError, ValueError):
+    raise bad_cert() from None
+  context.verify_flags |= X509_V_FLAG_NO_CHECK_TIME
+  return context
+
+
+class PinnedAdapter(HTTPAdapter):
+  """requests' HTTPS through a PinnedContext. Every pool gets it: the server's own, and one through a proxy."""
+
+  def __init__(self, context: PinnedContext):
+    self.context = context
+    super().__init__()  # which builds the pool manager, so the context is set first
+
+  def init_poolmanager(self, *args, **kwargs):
+    super().init_poolmanager(*args, ssl_context=self.context, **kwargs)
+
+  def proxy_manager_for(self, proxy, **kwargs):
+    return super().proxy_manager_for(proxy, ssl_context=self.context, **kwargs)
 
 
 def missing_config(params) -> list[str]:
@@ -139,6 +209,9 @@ class MapClient:
     self.cert_path = (directory or maps_dir()) / CERT_FILE
     if not self.cert_path.is_file() or self.cert_path.read_text() != pem:
       write_atomic(self.cert_path, pem.encode())
+    self.session = requests.Session()
+    self.session.trust_env = False  # no proxy from the environment: an https proxy's TLS goes around wrap_socket's pin check
+    self.session.mount('https://', PinnedAdapter(pinned_context(self.cert_path, pem)))
 
   @classmethod
   def from_params(cls, params, directory: Path | None = None) -> 'MapClient':
@@ -151,7 +224,7 @@ class MapClient:
   def request(self, method, path, auth=True, timeout=TIMEOUT, **kwargs) -> requests.Response:
     headers = {'Authorization': f"Bearer {self.key}"} if auth else {}
     try:
-      resp = requests.request(method, self.host + path, headers=headers, verify=str(self.cert_path), timeout=timeout, **kwargs)
+      resp = self.session.request(method, self.host + path, headers=headers, verify=str(self.cert_path), timeout=timeout, **kwargs)
     except requests.exceptions.SSLError as e:
       raise MapError('tls', f"The map server at {self.host} failed the TLS check against the saved certificate ({type(e).__name__}). " +
                      "Paste the server's current certificate in the TurnPilot web app.", 'Map server TLS check failed') from None
