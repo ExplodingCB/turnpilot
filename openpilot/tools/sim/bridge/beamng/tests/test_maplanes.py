@@ -13,6 +13,7 @@ import pytest
 from openpilot.selfdrive.turnpilot.lane_planner import ModelLanes, lane_changes_needed
 from openpilot.selfdrive.turnpilot.route_follower import maneuver_from_instruction
 from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN, LinePaint
+from openpilot.selfdrive.turnpilot.unprotected_left import ANNOUNCE
 from openpilot.selfdrive.turnpilot.routing.valhalla_source import ValhallaSource
 from openpilot.tools.sim.bridge.beamng import demo_junctions, frame, maplanes
 
@@ -193,13 +194,17 @@ class TestWestCoastUSA:
   def test_navd_fills_the_lanes_before_a_left_and_the_planner_changes_lane(self, tiles, demos):
     from openpilot.selfdrive.navigation.navd import RouteEngine  # needs the params library, which the geometry tests don't
     demo = demos["left"][0]
-    values = {"TurnPilotValhallaTiles": tiles["lanes"], "TurnPilotRouteSource": "valhalla", "LanguageSetting": "main_en"}
+    # the lane fill is under test, not the left's autonomy: in auto (the default) with the range unmeasured, navd routes round
+    # every left the car would skip (routing/lefts.py), this one too (+24 s, its opposing road not known straight out to its
+    # R_req), and the route kept has no lane tags at its first left. In announce no left is refused for its range
+    values = {"TurnPilotValhallaTiles": tiles["lanes"], "TurnPilotRouteSource": "valhalla", "LanguageSetting": "main_en",
+              "TurnPilotAutoLeft": ANNOUNCE}
     params, pm = MagicMock(), MagicMock()
     params.get.side_effect = values.get
     engine = RouteEngine(MagicMock(), pm, params=params, background=False)
     engine.last_position, engine.last_bearing = demo.latlon(demo.start)[::-1], demo.bearing
     engine.calculate_route(demo.latlon(demo.destination)[::-1])
-    assert engine.step_idx == 0
+    assert engine.step_idx == 0 and engine.lefts_avoided == 0
     engine.send_instruction()
     instruction = pm.send.call_args.args[1].navInstruction
     assert (instruction.maneuverType, instruction.maneuverModifier) == ("turn", "left")
