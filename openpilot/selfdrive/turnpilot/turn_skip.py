@@ -125,7 +125,7 @@ class TurnSkip:
     if maneuver is None or maneuver.kind != TURN:
       self._infeasible = 0
       ahead_skipped = maneuver is not None and ahead is not None and ahead.kind == TURN and lat_active and \
-        ahead_distance < MIN_FIRST_PULSE_M
+        ahead_distance < first_pulse_by(ahead, MIN_FIRST_PULSE_M)
       if ahead_skipped and self._ahead_logged != maneuver_id:
         self._ahead_logged = maneuver_id
         cloudlog.event("turnpilot_turn_skipped", error=True, reason='tooLate', ahead=True, type=ahead.type,

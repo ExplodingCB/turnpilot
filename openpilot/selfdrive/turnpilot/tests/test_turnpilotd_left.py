@@ -91,6 +91,25 @@ def test_an_empty_road_goes_from_the_line_with_no_pulse_before_it():
   assert not any(p.turnMissed for p in plans)
 
 
+def test_a_left_whose_line_is_at_a_wrong_way_opening_pulses_only_past_it():
+  """The autonomous left's go is its first pulse, from its hold line 9 m before the junction. Where a divided road's near
+  carriageway, one-way toward the car (navd's maneuverWrongWayM), is that close before the junction, the line stands at it:
+  the go lets the car roll with no desire, and the pulse goes once it is WRONG_WAY_PAST_M past the opening (desire_timing:
+  wrong_way_wait), never a left desire at the one-way. It still commits and turns, said as a left go, no handback."""
+  from openpilot.selfdrive.turnpilot.desire_timing import WRONG_WAY_PAST_M
+  w = 10.
+  sim = left_sim()
+  sim.navd.wrong_way = {0: w}
+  plans = []
+  while sim.s < JUNCTION + 30. and sim.t < 90.:
+    plans += drive(sim, DT_MDL)
+  assert sim.s > JUNCTION + 30.
+  go = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
+  assert sim.trace[go][0] >= JUNCTION - w + WRONG_WAY_PAST_M - 0.1  # past the opening, not at the line
+  assert any(p.controlPrompt == 'leftGo' for p in plans) and any(str(p.unprotectedLeft.state) == 'committed' for p in plans)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans) and not any(p.turnMissed for p in plans)
+
+
 def test_it_waits_through_an_oncoming_stream_silently_and_goes_after_it():
   # four oncoming cars at the limit 6 s apart, the first 60 m past the junction when the car nears it: the car stands at its
   # line through all of them (no take-control in the wait: no intervention) and goes only once the band is clear

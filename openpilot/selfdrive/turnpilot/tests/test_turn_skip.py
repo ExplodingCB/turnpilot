@@ -220,6 +220,22 @@ def test_turn_ahead_of_a_bend_too_close_for_its_first_pulse_is_announced_skipped
   assert skip.update(left, MIN_FIRST_PULSE_M - 6., 2, 4., False).skipped
 
 
+def test_a_turn_waiting_past_a_wrong_way_opening_is_too_late_only_past_it():
+  """A turn whose pulse waits past an opening on its side the car may not enter (navd's maneuverWrongWayM; desire_timing:
+  wrong_way_wait) can't pulse by MIN_FIRST_PULSE_M: its tooLate deadline, and the announced skip of one ahead of a bend,
+  move in to that point less WRONG_WAY_GRACE_M."""
+  from openpilot.selfdrive.turnpilot.desire_timing import WRONG_WAY_GRACE_M, WRONG_WAY_PAST_M
+  w = 16.
+  left = maneuver_from_instruction(nav_instruction(30., "turn", "left", junction=junction_of("left"), wrong_way=w))
+  deadline = w - WRONG_WAY_PAST_M - WRONG_WAY_GRACE_M
+  skip = TurnSkip()
+  assert not skip.update(left, deadline + 1., 1, 4., False).skipped
+  assert skip.update(left, deadline - 1., 1, 4., False).skipped
+  bend = maneuver_from_instruction(nav_instruction(0., "turn", "right", junction=junction_of("right", 0, 60.)))
+  assert not TurnSkip().update(bend, 0., 1, 4., False, ahead=left, ahead_distance=deadline + 1.).ahead_skipped
+  assert TurnSkip().update(bend, 0., 1, 4., False, ahead=left, ahead_distance=deadline - 1.).ahead_skipped
+
+
 def test_shadow_plan_raises_no_alert():
   msg = messaging.new_message('turnpilotPlan')
   msg.turnpilotPlan.tooFastToTurn, msg.turnpilotPlan.shadow = True, True

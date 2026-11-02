@@ -55,7 +55,9 @@ wrong_way_before), by the furthest reading of the junction (RouteFollower.juncti
 the first opening that way, and from 40 m out, or pulling away from a red light standing at that opening, that is the
 one-way, the wrong way (the first drive: a left onto a one-way planned at a red light). The first pulse goes once the car
 is WRONG_WAY_PAST_M past the opening, closer in than the 40 m lead (turn_skip moves its tooLate deadline in with it); a turn
-the model doesn't take from there is missed and rerouted, never driven into the one-way.
+the model doesn't take from there is missed and rerouted, never driven into the one-way. An autonomous left whose hold
+line stands at such an opening (one under about 11 m before its junction) is let go from its line with no desire, its first
+pulse past the opening: turnpilotd's go bookkeeping for a pulsed go (its stall watch) isn't armed for that left.
 """
 import math
 
