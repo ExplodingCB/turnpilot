@@ -67,6 +67,7 @@ class UIState:
         "gpsLocationExternal",
         "gpsLocation",
         "navInstruction",
+        "navRoute",  # TurnPilot's nav view draws the route; navd sends it on change and every 10 s, so never read its alive
         "turnpilotPlan",
         "carOutput",
         "carControl",

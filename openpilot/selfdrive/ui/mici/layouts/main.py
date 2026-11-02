@@ -4,6 +4,8 @@ from openpilot.selfdrive.ui.mici.layouts.home import MiciHomeLayout
 from openpilot.selfdrive.ui.mici.layouts.settings.settings import SettingsLayout
 from openpilot.selfdrive.ui.mici.layouts.offroad_alerts import MiciOffroadAlerts
 from openpilot.selfdrive.ui.mici.onroad.augmented_road_view import AugmentedRoadView
+from openpilot.selfdrive.ui.mici.onroad.nav_view import NavView
+from openpilot.selfdrive.ui.lib.turnpilot_nav import OnroadPage, resting_page
 from openpilot.selfdrive.ui.ui_state import device, ui_state
 from openpilot.selfdrive.ui.mici.layouts.onboarding import OnboardingWindow
 from openpilot.selfdrive.ui.mici.layouts.turnpilot_setup import setup_needed, setup_window
@@ -11,6 +13,7 @@ from openpilot.selfdrive.ui.body.layouts.onroad import BodyLayout
 from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.widgets.scroller import Scroller
 from openpilot.system.ui.lib.application import gui_app
+from openpilot.system.ui.lib.scroll_panel2 import ScrollState
 
 
 ONROAD_DELAY = 2.5  # seconds
@@ -33,16 +36,23 @@ class MiciMainLayout(Scroller):
     self._settings_layout = SettingsLayout()
     self._car_onroad_layout = AugmentedRoadView(bookmark_callback=self._on_bookmark_clicked)
     self._body_onroad_layout = BodyLayout()
+    # TurnPilot's nav view: a page between home and the camera view, so a swipe right from the camera shows it and a swipe left
+    # goes back. Not right of the camera, where a swipe left is the bookmark's. Onroad with TurnPilot on only, so offroad and
+    # with TurnPilot off the pages are upstream's
+    self._nav_onroad_layout = NavView()
+    self._nav_onroad_layout.set_visible(lambda: ui_state.started and ui_state.turnpilot_enabled and not ui_state.is_body)
+    self._onroad_page = OnroadPage()
 
     # Initialize widget rects
     for widget in (self._home_layout, self._alerts_layout, self._settings_layout,
-                   self._car_onroad_layout, self._body_onroad_layout):
+                   self._nav_onroad_layout, self._car_onroad_layout, self._body_onroad_layout):
       # TODO: set parent rect and use it if never passed rect from render (like in Scroller)
       widget.set_rect(rl.Rectangle(0, 0, gui_app.width, gui_app.height))
 
     self._scroller.add_widgets([
       self._alerts_layout,
       self._home_layout,
+      self._nav_onroad_layout,
       self._car_onroad_layout,
       self._body_onroad_layout,
     ])
@@ -77,8 +87,25 @@ class MiciMainLayout(Scroller):
 
   @property
   def _onroad_layout(self) -> Widget:
-    # For scroll_to
-    return self._body_onroad_layout if ui_state.is_body else self._car_onroad_layout
+    # For scroll_to. TurnPilot: the onroad page the driver last rested on, so the drive's start, leaving a standstill and the
+    # interactive timeout bring back the nav view if that's where they left it
+    if ui_state.is_body:
+      return self._body_onroad_layout
+    if self._onroad_page.page == OnroadPage.NAV and self._nav_onroad_layout.is_visible:
+      return self._nav_onroad_layout
+    return self._car_onroad_layout
+
+  def _see_onroad_page(self):
+    """TurnPilot: note which onroad page the scroller rests on, after it laid the pages out this frame. An invisible page keeps its
+    last position, so the nav view is only asked about while it shows."""
+    if not ui_state.started:
+      return
+    scroller = self._scroller
+    settled = not scroller.is_auto_scrolling and scroller.scroll_panel.state == ScrollState.STEADY
+    pages = {OnroadPage.CAMERA: self._car_onroad_layout.rect.x}
+    if self._nav_onroad_layout.is_visible:
+      pages[OnroadPage.NAV] = self._nav_onroad_layout.rect.x
+    self._onroad_page.see(resting_page(self._rect.x, pages, settled))
 
   def _setup_callbacks(self):
     self._alerts_layout.set_enabled(lambda: self.enabled)
@@ -89,7 +116,7 @@ class MiciMainLayout(Scroller):
       alert_count_callback=self._alerts_layout.active_alerts,
       alert_icon_callback=self._alerts_layout.highest_severity_icon,
     )
-    for layout in (self._car_onroad_layout, self._body_onroad_layout):
+    for layout in (self._car_onroad_layout, self._body_onroad_layout, self._nav_onroad_layout):
       layout.set_click_callback(lambda: self._scroll_to(self._home_layout))
 
     device.add_interactive_timeout_callback(self._on_interactive_timeout)
@@ -114,6 +141,7 @@ class MiciMainLayout(Scroller):
 
     # Render
     super()._render(self._rect)
+    self._see_onroad_page()
 
   def _handle_transitions(self):
     # Don't pop if onboarding
