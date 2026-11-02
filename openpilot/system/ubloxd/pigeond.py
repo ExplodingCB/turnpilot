@@ -283,6 +283,25 @@ def deinitialize_and_exit(pigeon: TTYPigeon | None):
   set_power(False)
   sys.exit(0)
 
+def factory_reset_once(pigeon: TTYPigeon) -> bool:
+  """TurnPilot: once per install (TurnPilotGpsFactoryReset, default on, cleared first), comma's own reset_device: a cold
+  start, then UBX-CFG-CFG clearing the configuration stored in BBR and flash, then the flash backup, verified. The chip
+  loads its stored configuration at power-up (MON-HW2 cfgSource flash), so a bad stored setting survives every
+  restart, OS and cold start. True when it ran (the caller power cycles and reconfigures); it never raises."""
+  params = Params()
+  try:
+    if not params.get_bool("TurnPilotGpsFactoryReset"):
+      return False
+    params.put_bool("TurnPilotGpsFactoryReset", False)
+    cloudlog.warning("TurnPilot: factory resetting the ublox once")
+    ok = pigeon.reset_device()
+    cloudlog.warning(f"TurnPilot: ublox factory reset {'done' if ok else 'not verified'}")
+    return True
+  except Exception:
+    cloudlog.exception("TurnPilot: ublox factory reset failed")
+    return True
+
+
 def cold_start_once(pigeon: TTYPigeon) -> None:
   """TurnPilot: one cold start of the receiver, the first time pigeond runs on this install (TurnPilotGpsColdStart, default
   on, cleared after). A receiver whose saved state went bad (its flash backup or battery-backed data) can stay powered,
@@ -318,6 +337,14 @@ def init(pigeon: TTYPigeon) -> None:
 
   init_baudrate(pigeon)
   init_pigeon(pigeon)
+  if factory_reset_once(pigeon):
+    # the stored configuration is gone: power cycle so the chip starts from its defaults, then configure it as always
+    set_power(False)
+    time.sleep(0.1)
+    set_power(True)
+    time.sleep(0.5)
+    init_baudrate(pigeon)
+    init_pigeon(pigeon)
   cold_start_once(pigeon)
 
   if system_time_valid():

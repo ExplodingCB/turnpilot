@@ -51,3 +51,36 @@ def test_a_failing_tty_never_raises_and_still_clears_the_flag(monkeypatch):
   params = FakeParams(True)
   run(monkeypatch, params, FakePigeon(fail=True))
   assert params.v["TurnPilotGpsColdStart"] is False
+
+
+class ResetPigeon(FakePigeon):
+  def __init__(self, ok=True, fail=False):
+    super().__init__()
+    self.ok, self.fail_reset, self.resets = ok, fail, 0
+
+  def reset_device(self):
+    self.resets += 1
+    if self.fail_reset:
+      raise TimeoutError("no ack")
+    return self.ok
+
+
+def factory(monkeypatch, params, pigeon):
+  monkeypatch.setattr(pigeond, "Params", lambda: params)
+  return pigeond.factory_reset_once(pigeon)
+
+
+def test_factory_reset_runs_comma_reset_device_once(monkeypatch):
+  params = FakeParams(False)
+  params.v["TurnPilotGpsFactoryReset"] = True
+  pigeon = ResetPigeon()
+  assert factory(monkeypatch, params, pigeon) is True and pigeon.resets == 1
+  assert params.v["TurnPilotGpsFactoryReset"] is False
+  assert factory(monkeypatch, params, pigeon) is False and pigeon.resets == 1
+
+
+def test_factory_reset_never_raises_and_still_reconfigures(monkeypatch):
+  params = FakeParams(False)
+  params.v["TurnPilotGpsFactoryReset"] = True
+  assert factory(monkeypatch, params, ResetPigeon(fail=True)) is True
+  assert params.v["TurnPilotGpsFactoryReset"] is False
