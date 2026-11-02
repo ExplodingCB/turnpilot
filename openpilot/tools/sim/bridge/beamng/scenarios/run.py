@@ -72,6 +72,12 @@ CLEAR_TIMEOUT_S = 5.  # wait this long for navd to drop the old route
 # (gaps are dead-reckoned through) and its latch and left on it (BeamNG unprotected_left_gap6: a hold 13 m early)
 TP_RESET_S = 2.5
 ROUTE_TIMEOUT_S = 30.
+# ...and with the route out, the engagement waits for TurnPilot acting (its plan not unavailable: the fresh turnpilotd has
+# seen the detector and the calibration), TP_READY_TIMEOUT_S at most: left_t_junction engaged 1.4 s into the stack's
+# segment, TurnPilot came up 1.8-2.7 s after (waiting for the detector), and the rolling start had the car at 9.3-11.4 m/s
+# 30-33 m from its left with no turn cap: a left pulsed at road speed (F4), or skipped as too fast (T1). On the car TurnPilot is
+# up long before the first turn
+TP_READY_TIMEOUT_S = 15.
 # turnpilot_web refusing the connection (a fresh stack whose web server isn't listening yet: BeamNG smoke 2026-10-29, a run
 # ended 'no destination' 5 s in): the destination call again this often, for ROUTE_TIMEOUT_S from its first try
 WEB_RETRY_S = 1.
@@ -269,7 +275,8 @@ class Runner:
         self.t_phase = now
       elif self.web.done() and self.web.exception() is not None:
         self.end_run(b, 'no destination', f"turnpilot_web at {self.web_url}: {self.web.exception()!r}")
-      elif self.web.done() and self.route_pts and self.sm.valid['navInstruction'] and self.sm['navInstruction'].distanceRemaining > 0:
+      elif self.web.done() and self.route_pts and self.sm.valid['navInstruction'] and self.sm['navInstruction'].distanceRemaining > 0 \
+          and (self.tp_acting() or now - self.t_phase > TP_READY_TIMEOUT_S):
         self.engage(b)
       elif now - self.t_phase > ROUTE_TIMEOUT_S:
         self.end_run(b, 'no route', "navd sent no route (is navd running, with a route source for the sim map?)")
@@ -291,6 +298,13 @@ class Runner:
       if end is not None:
         self.end_run(b, end)
     return False
+
+  def tp_acting(self) -> bool:
+    """TurnPilot's plan is out and acting (not unavailable: its detector seen and the camera calibrated), or TurnPilot isn't
+    asked for (no plan at all)."""
+    if not self.sm.seen['turnpilotPlan']:
+      return False
+    return str(self.sm['turnpilotPlan'].state) != 'unavailable'
 
   def oracle_up(self, now: float) -> bool:
     """The light oracle's lights are fresh, or it isn't asked for."""

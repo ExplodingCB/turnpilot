@@ -403,3 +403,52 @@ def test_lane_change_runs_end_to_end(tmp_path, monkeypatch):
   out = json.load(open(tmp_path / 'result.json'))
   assert [r['outcome'] for r in out['runs']] == ['arrived']
   assert out['runs'][0]['rows'] and all(row['pacer_dx'] is None for row in out['runs'][0]['rows'])
+
+
+class SlowTurnPilot(World):
+  """World whose turnpilotd is unavailable (waiting for its detector) until ready_after s after the destination's POST, or
+  for good with ready_after None."""
+  def __init__(self, plan, clock, ready_after):
+    super().__init__(plan, clock)
+    self.ready_after, self.posted_t, self.engaged_t = ready_after, None, None
+
+  def web(self, url, token, method, body=None):
+    if method == 'POST':
+      self.posted_t = self.clock.t
+    return super().web(url, token, method, body)
+
+  def step(self, b):
+    engaging = b.auto_engage and not self.enabled
+    super().step(b)
+    if engaging and self.engaged_t is None:
+      self.engaged_t = self.clock.t
+    ready = self.ready_after is not None and self.posted_t is not None and self.clock.t >= self.posted_t + self.ready_after
+    if not ready:
+      self.msgs['turnpilotPlan'].turnpilotPlan.state = custom.TurnpilotPlan.State.unavailable
+
+
+def test_the_car_is_engaged_only_once_turnpilot_acts(tmp_path, monkeypatch):
+  """BeamNG left_t_junction (F4, T1): the run engaged 1.4 s into the stack's segment, before the fresh turnpilotd had seen its
+  detector, and the rolling start had the car at 9.3-11.4 m/s 30-33 m from its left with no turn cap by the time TurnPilot
+  came up: a left pulsed at road speed, or skipped as too fast. With the route out, the engagement waits for TurnPilot
+  acting (its plan not unavailable), and engages TP_READY_TIMEOUT_S on without it."""
+  for ready_after, lo, hi in ((6., 6., 7.), (None, run.TP_READY_TIMEOUT_S - 1., run.TP_READY_TIMEOUT_S + 2.)):
+    clock = Clock()
+    plan = catalog.build('right_green')
+    world = SlowTurnPilot(plan, clock, ready_after)
+    monkeypatch.setattr(run, 'time', SimpleNamespace(monotonic=clock.monotonic, strftime=lambda *a: 'now'))
+    monkeypatch.setattr(run, 'wall', clock.wall)
+    monkeypatch.setattr(run, 'Director', FakeDirector)
+    monkeypatch.setattr(FakeDirector, 'clock', clock)
+    monkeypatch.setattr(run, 'web_call', world.web)
+    monkeypatch.setattr(run.messaging, 'SubMaster', lambda services, world=world: FakeSM(world))
+    runner = run.Runner(plan, 1, str(tmp_path), 'http://127.0.0.1:8088', 'tok', 'host', 0)
+    b = bridge()
+    b.simulator_state.position, b.simulator_state.bearing, b.simulator_state.wheel_speed = SimpleNamespace(x=0, y=0, z=0), 0.0, 0.0
+    for _ in range(int(60 / DT)):
+      world.step(b)
+      if runner(b) or world.engaged_t is not None:
+        break
+      b.rk_frame += 1
+      clock.t += DT
+    assert world.engaged_t is not None and lo <= world.engaged_t - world.posted_t <= hi, (ready_after, world.engaged_t, world.posted_t)
