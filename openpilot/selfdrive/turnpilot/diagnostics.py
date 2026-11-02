@@ -1,9 +1,11 @@
 """Diagnostics: one plain-text report Chase copies from the phone page (Diagnostics, Copy) and texts to Kellen.
 
 It says the build (GitCommit, GitBranch), the AGNOS version, the driving model and the detector as they run now (modelV2.big:
-the big model on the chestnut; the step's times; nativeStatus), preflight's lines (python -m openpilot.selfdrive.turnpilot.
-preflight, run apart so turnpilot_web never imports the planner), and the last few TurnPilot events: its handbacks and
-faults (turnpilotPlan) and the errors its code logged (errorLogMessage), kept in TurnPilotDiagEvents across reboots. Its GPS
+the big model on the chestnut; the step's times; nativeStatus) and the cameras' calibration (which TurnPilot waits for, its
+detector deadlines held: a calibration an OS update reset is no detector out), preflight's lines (python -m openpilot.
+selfdrive.turnpilot.preflight, run apart so turnpilot_web never imports the planner), and the last few TurnPilot events: its
+handbacks, waits for calibration and faults (turnpilotPlan) and the errors its code logged (errorLogMessage), kept in
+TurnPilotDiagEvents across reboots. Its GPS
 section says which GPS daemon runs, each GPS message's state and quality and whether LastGPSPosition is saved.
 
 It never says the map key, the web token or the pairing URL that carries it, or any position: preflight's pairing and token
@@ -20,6 +22,7 @@ import time
 import traceback
 
 from openpilot.common.basedir import BASEDIR
+from openpilot.selfdrive.turnpilot.control_text import calibration_reason, calibration_text
 from openpilot.selfdrive.turnpilot.maps.paths import wall_time
 
 EVENTS_PARAM = "TurnPilotDiagEvents"
@@ -85,8 +88,8 @@ class EventLog:
   def __init__(self, params, now=wall_time):
     self.params, self.now = params, now
     self.lock = threading.Lock()
-    self.last_prompt = self.last_alert = None
-    self.last_missed = False
+    self.last_prompt = self.last_alert = self.last_handback = None
+    self.last_missed = self.last_calibrating = False
     try:
       saved = params.get(EVENTS_PARAM)
     except Exception:  # Params raises UnknownKeyName on a build whose params predate the key
@@ -94,18 +97,29 @@ class EventLog:
     self.events: list[dict] = [e for e in saved if isinstance(e, dict)][-EVENTS_KEPT:] if isinstance(saved, list) else []
 
   def see_plan(self, plan: dict | None) -> None:
-    """plan: the snapshot's plan (status.read_services), None while turnpilotd isn't publishing."""
+    """plan: the snapshot's plan (status.read_services), None while turnpilotd isn't publishing. The detector's and the
+    model's handbacks (plan.handback) are events as the prompts' are, and so is TurnPilot waiting for the cameras'
+    calibration, by its reason (control_text.calibration_text), once a spell: it says why TurnPilot didn't drive, and that
+    it wasn't the detector."""
     if plan is None:  # the next drive's first handback is an onset again
       self.last_prompt, self.last_alert, self.last_missed = None, None, False
+      self.last_handback, self.last_calibrating = None, False
       return
     prompt, alert, missed, reason = plan.get("prompt"), plan.get("alert"), bool(plan.get("missed")), plan.get("reason") or ""
+    handback = plan.get("handback")
+    calibrating = plan.get("state") == "unavailable" and calibration_text(reason) is not None
     if prompt != self.last_prompt and isinstance(prompt, str) and prompt.endswith("TakeControl"):
       self.add(f"handback {prompt}", reason)
+    if handback != self.last_handback and isinstance(handback, str) and handback != "none":
+      self.add(f"handback {handback}", reason)
+    if calibrating and not self.last_calibrating:
+      self.add("waiting for calibration", reason)
     if alert != self.last_alert and alert in FAULT_ALERTS:
       self.add(f"alert {alert}", reason)
     if missed and not self.last_missed:
       self.add("turn missed", reason)
     self.last_prompt, self.last_alert, self.last_missed = prompt, alert, missed
+    self.last_handback, self.last_calibrating = handback, calibrating
 
   def see_log(self, record) -> None:
     if (found := log_event(record)) is not None:
@@ -294,7 +308,19 @@ def model_text(live: dict | None, params=None, events: list[dict] | None = None)
            if isinstance(live.get(key), (int, float))]
   if times:
     out.append(f"step times (median, last {live.get('samples', 0)}): " + ", ".join(times) + "; budget 45 ms")
+  out.append(calibration_line(live.get("calibration")))
   return out
+
+
+def calibration_line(calibration: tuple[str, int] | None) -> str:
+  """The cameras' calibration as the status reader read it (calStatus, calPerc): until it is calibrated the tracker takes no
+  detector run and TurnPilot waits, saying so, with the detector's deadlines held (turnpilotd.calibration_wait)."""
+  if calibration is None:
+    return "camera calibration: not received (calibrationd isn't publishing)"
+  status, percent = calibration
+  if status == "calibrated":
+    return "camera calibration: calibrated"
+  return f"camera calibration: {calibration_reason(status, percent)} (TurnPilot waits for it; the detector deadline doesn't run)"
 
 
 def event_lines(events: list[dict]) -> list[str]:

@@ -84,13 +84,16 @@ class LoopSM:
   """What turnpilotd's main loop reads from its SubMaster. modelV2 raises for the first frames, and the input checks
   pass on the frames checks(frame) says."""
   def __init__(self, failing_frames, checks):
+    from openpilot.selfdrive.turnpilot.scene.tests.test_tracker import calibration
     self.data = {'carState': car_state(10.), 'carControl': car_control(), 'modelV2': model_v2(),
                  'navInstruction': nav_instruction(0., valid=False)}
-    for service in ('deviceState', 'narrowRoadCameraState', 'extrinsicsCalibration'):
+    for service in ('deviceState', 'narrowRoadCameraState'):
       self.data[service] = getattr(messaging.new_message(service).as_reader(), service)
+    self.data['extrinsicsCalibration'] = calibration()  # calibrated: what TurnPilot waits for (test_calibrating_is_said_from_main)
     self.updated = dict.fromkeys(self.data, False)
     self.valid = dict.fromkeys([*self.data, 'turnpilotDetections', 'turnpilotFarDetections'], True)
-    self.seen = {'deviceState': True, 'narrowRoadCameraState': True, 'turnpilotDetections': False, 'turnpilotFarDetections': False}
+    self.seen = {'deviceState': True, 'narrowRoadCameraState': True, 'extrinsicsCalibration': True, 'turnpilotDetections': False,
+                 'turnpilotFarDetections': False}
     self.frame, self.failing_frames, self.checks = -1, failing_frames, checks
 
   def update(self, timeout):
@@ -240,6 +243,26 @@ def test_scene_failure_publishes_an_empty_scene_and_goes_on():
   # an empty scene: unavailable, so TurnPilot doesn't act (waiting for the detector; once it has run, a stopped detector)
   assert not any(s.available for s in scenes) and all(p.turnpilotPlan.state == State.unavailable for p in plans)
   assert errors == ["turnpilotd.scene_failed"] * 5
+
+
+@pytest.mark.parametrize("status,percent,seen,reason", [
+  ('uncalibrated', 45, True, "calibrating cameras: 45%"), ('recalibrating', 12, True, "recalibrating cameras: 12%"),
+  ('invalid', 100, True, "camera calibration invalid"), ('uncalibrated', 0, False, "waiting for camera calibration")])
+def test_calibrating_is_said_from_main(status, percent, seen, reason):
+  # after an OS update reset calibration the phone and the comma said "detector not running: take control" while the car
+  # only calibrated: main() hands the plan extrinsicsCalibration's state, which it says, and nothing is handed back
+  orig = LoopSM.__init__
+
+  def init(self, *a, **k):
+    orig(self, *a, **k)
+    msg = messaging.new_message('extrinsicsCalibration')
+    msg.extrinsicsCalibration.calStatus, msg.extrinsicsCalibration.calPerc = status, percent
+    self.data['extrinsicsCalibration'], self.seen['extrinsicsCalibration'] = msg.as_reader().extrinsicsCalibration, seen
+  with mock.patch.object(LoopSM, '__init__', init):
+    plans, _, errors = run_main(frames=5)
+  assert not errors
+  assert all(p.turnpilotPlan.state == State.unavailable and p.turnpilotPlan.reason == reason and
+             p.turnpilotPlan.handback == custom.TurnpilotPlan.Handback.none for p in plans)
 
 
 def test_a_bad_input_frame_keeps_the_plan_valid():

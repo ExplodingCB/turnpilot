@@ -987,6 +987,24 @@ class TestMapHoldStatus(OpenpilotTestCase):
     snap["plan"] = {"state": "holding", "reason": "pedestrian in path", "shadow": False}
     assert status.format_status(snap, None, True, False, now=101.)["turnpilot"]["label"] == "Holding"
 
+  def test_calibrating_on_the_phone_is_no_detector_out(self):
+    # after an OS update reset calibration the phone said "detector not running: take control" while the car calibrated:
+    # turnpilotd's calibration reason (turnpilotd.calibration_wait) reads as what it is, with the progress and what finishes it
+    snap = {"at": 100., "onroad": True, "route": None, "gps": None,
+            "plan": {"state": "unavailable", "reason": "calibrating cameras: 45%", "shadow": False}}
+    tp = status.format_status(snap, None, True, False, now=101.)["turnpilot"]
+    assert (tp["label"], tp["reason"]) == ("Calibrating cameras", "45%, drive straight above 15 mph")
+    assert status.format_status(snap, None, True, True, now=101.)["turnpilot"]["reason"] == "45%, drive straight above 24 km/h"
+    snap["plan"]["reason"] = "recalibrating cameras: 12%"
+    assert status.format_status(snap, None, True, False, now=101.)["turnpilot"]["label"] == "Recalibrating cameras"
+    snap["plan"]["reason"] = "camera calibration invalid"
+    tp = status.format_status(snap, None, True, False, now=101.)["turnpilot"]
+    assert (tp["label"], tp["reason"]) == ("Camera calibration invalid", "remount the device")
+    # a real handback says itself, under a label, not the raw state
+    snap["plan"]["reason"] = "detector not running: take control"
+    tp = status.format_status(snap, None, True, False, now=101.)["turnpilot"]
+    assert (tp["label"], tp["reason"]) == ("Unavailable", "detector not running: take control")
+
 
 class TestCarSignals(WebTestCase):
   """The car turn signal card (DESIGN phase4/blinker 7.8): the mode, Start in Drive, the outside-lamp answer."""
