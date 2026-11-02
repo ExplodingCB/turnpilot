@@ -2,7 +2,9 @@
 
 {"state": "idle" | "checking" | "downloading" | "ready" | "error", "message": for the driver, "short": for the
 onroad status line, "code": MapError code on errors, "destination": [lon, lat] it is about, plus "region", "source"
-("server" or "local"), "progress" (0-1 or null), "bytes", "total" while downloading, and "at" (epoch seconds).
+("server" or "local"), "progress" (0-1 or null), "bytes", "total" while downloading, and "at" (epoch seconds). Ready with a
+route, "lefts": {"avoided", "unavoidable"}, how many unprotected lefts the car would skip the route goes around and how many
+it couldn't (routing/lefts.py; NavStatus.note): counts, never where.
 
 A status is about one destination. Until navd starts on a new one, the status still names the old one, so readers
 show it only for the current NavDestination (for_destination).
@@ -29,6 +31,16 @@ class NavStatus:
 
   def error(self, e, **extra):
     self.set('error', e.message, e.short, e.code, **extra)
+
+  def note(self, destination, **extra) -> bool:
+    """Add extra to the ready status of destination (navd's (lon, lat)): what the route made there did, as the avoidance's
+    lefts ({"avoided": n, "unavoidable": m}: counts only, never a position). Nothing for another destination's status or one
+    not ready. A route() that sets the status again drops them until navd notes the new route's. Whether it was noted."""
+    last = self.last
+    if last is None or last.get('state') != 'ready' or last.get('destination') != list(destination):
+      return False
+    self.set(**{**last, **extra})
+    return True
 
 
 def read_status(params) -> dict | None:

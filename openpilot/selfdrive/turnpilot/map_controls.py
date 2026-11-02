@@ -384,6 +384,18 @@ def rail_between(c) -> bool:
   return near_rail(c) and float(info.get('railDistance', -1.)) < float(info.get('stopPointDistance', 0.))
 
 
+def line_setback_at(distance: float, controls) -> float | None:
+  """MapControlPolicy.line_setback's rule over controls (each with d, its stop point's m ahead, line_mapped, kind, cross_suspect
+  and junction_info as a dict): m the junction distance m ahead's mapped stop line lies back of the unprotected turn's hold
+  line, 0 at or short of it, None without one. Its own controls only (PROTECT_BEFORE_M before it to PROTECT_PAST_M past it),
+  never the cross road's yield nor a rail orphan's stop. One rule for turnpilotd's tracked controls and navd's route controls
+  (routing/lefts.py), since both feed unprotected_left.route_range."""
+  lines = [distance - c.d for c in controls
+           if c.line_mapped and distance - PROTECT_BEFORE_M <= c.d <= distance + PROTECT_PAST_M and not cross_road_yield(c) and
+           not rail_between(c)]
+  return max(max(lines) - HOLD_LINE_M - MAP_MARGIN_M, 0.) if lines else None
+
+
 def protecting(c) -> str:
   """How control c stops the car at its junction (protected()): 'stop' a stop sign (a signal too, with SIGNAL_PROTECTS_LEFT) or
   a yield that became one (yieldStop), whose cross traffic the stop-sign decider watches, not only the oncoming the unprotected
@@ -583,11 +595,9 @@ class MapControlPolicy:
     """m the mapped stop line of the junction distance m ahead lies back of the unprotected turn's hold line (HOLD_LINE_M +
     MAP_MARGIN_M before the junction), 0 at or short of it; None where the junction has no mapped line (only the junction less
     10 m). Its own controls only (PROTECT_BEFORE_M before it to PROTECT_PAST_M past it), never the cross road's yield or a
-    rail orphan's stop. turnpilotd's route time takes an unprotected left's reach this much past LINE_D (BUILD_FINDINGS D4)."""
-    lines = [distance - c.d for c in self.tracker.controls.values()
-             if c.line_mapped and distance - PROTECT_BEFORE_M <= c.d <= distance + PROTECT_PAST_M and not cross_road_yield(c) and
-             not rail_between(c)]
-    return max(max(lines) - HOLD_LINE_M - MAP_MARGIN_M, 0.) if lines else None
+    rail orphan's stop. turnpilotd's route time takes an unprotected left's reach this much past LINE_D (BUILD_FINDINGS D4).
+    The rule is line_setback_at's, which navd's route time shares."""
+    return line_setback_at(distance, self.tracker.controls.values())
 
   def turn_engaged(self, maneuver_id: int) -> bool:
     """The unprotected turn of this maneuver is engaged (stopping for it, held at it, or released from it)."""

@@ -19,7 +19,7 @@ from openpilot.selfdrive.turnpilot.routing.guidance import (CONTROLS_AHEAD_M, CO
 from openpilot.selfdrive.turnpilot.maps.client import MapError
 from openpilot.selfdrive.turnpilot.maps import surveys
 from openpilot.selfdrive.turnpilot import stop_rules, visibility_table
-from openpilot.selfdrive.turnpilot.routing import avoid, certify
+from openpilot.selfdrive.turnpilot.routing import avoid, certify, lefts
 from openpilot.selfdrive.turnpilot.routing.sources import MapRouter
 from openpilot.selfdrive.turnpilot.web.store import last_gps_position
 
@@ -98,6 +98,10 @@ class RouteJob(threading.Thread):
     self.always_drive = engine.always_drive_on()
     self.runtime = engine.runtime_inputs()
     self.avoid_status, self.avoided, self.avoid_added_s = 'none', 0, 0.
+    # TurnPilot (unprotected lefts): what the route's lefts are judged under (routing/lefts.py: TurnPilotAutoLeft, the
+    # detector's proven ranges, the far crop), and how many the avoidance routed around and couldn't
+    self.left_config = lefts.left_config(engine.params)
+    self.lefts_avoided, self.lefts_unavoidable = 0, 0
 
   def run(self):
     router, destination = self.engine.router, self.destination
@@ -164,11 +168,30 @@ class RouteJob(threading.Thread):
     def headings(points):
       return router.exclusion_headings(points) if hasattr(router, 'exclusion_headings') else [None for _ in points]
 
+    def opposing_of(steps):
+      try:
+        return router.opposing(steps)
+      except Exception:
+        cloudlog.exception("navd: the route's opposing roads failed: its lefts take 45 mph, not known straight (out of range)")
+        return {}
+
+    def route_lefts(steps, controls):
+      # the lefts the car would skip (turnpilotd's own predicate, unprotected_left.route_range), routed around by their exits;
+      # a failure here routes none around, said: turnpilotd still skips each out loud at its junction and navd reroutes
+      try:
+        return lefts.route_lefts(steps, controls, self.left_config, lambda: opposing_of(steps),
+                                 lambda: router.exits(steps) if hasattr(router, 'exits') else {})
+      except Exception:
+        cloudlog.exception("navd: the route's unprotected lefts failed: none is routed around")
+        return []
+
     result = avoid.run(self.steps, self.controls, self.controls_status, self.avoid, certify=certify_one, reroute=reroute,
                        route_controls=router.controls, own_edge=own_edge, cancelled=self.cancel.is_set,
-                       deadline=engine.monotonic() + AVOID_TIME_S, monotonic=engine.monotonic, enabled=self.avoid_on, headings=headings)
+                       deadline=engine.monotonic() + AVOID_TIME_S, monotonic=engine.monotonic, enabled=self.avoid_on, headings=headings,
+                       lefts=route_lefts)
     self.steps, self.controls, self.controls_status = result.steps, result.controls, result.controls_status
     self.avoid_status, self.avoided, self.avoid_added_s = result.status, result.avoided, result.added_s
+    self.lefts_avoided, self.lefts_unavoidable = result.lefts_avoided, result.lefts_unavoidable
     if hasattr(router, 'serve_again'):  # a kept earlier route is the served one again, for its opposing roads and limits
       router.serve_again(self.steps)
 
@@ -203,6 +226,7 @@ class RouteEngine:
     self.certifier = certifier if certifier is not None else self.certify_default
     self.avoid_sets: dict = {}
     self.avoid_status, self.avoided, self.avoid_added_s = 'none', 0, 0.
+    self.lefts_avoided, self.lefts_unavoidable = 0, 0  # TurnPilot: the route's lefts routed around and left on it (RouteJob)
     self.route_runtime = None
     self.avoid_rerun = False
     self.route_always_drive = False  # TurnPilotAlwaysDrive as the route was made under it (always_drive_on; R1 to R3, S6)
@@ -531,12 +555,26 @@ class RouteEngine:
     self.opposing = job.opposing
     self.limits = job.limits
     self.avoid_status, self.avoided, self.avoid_added_s = job.avoid_status, job.avoided, job.avoid_added_s
+    self.lefts_avoided, self.lefts_unavoidable = job.lefts_avoided, job.lefts_unavoidable
+    self.note_lefts(job.destination)
     self.route_always_drive = job.always_drive
     self.route_runtime, self.avoid_rerun = self.runtime_key(job.runtime), False
     self.route_count += 1
     self.route_geometry = [np.array(step['geometry']['coordinates'], dtype=np.float64).reshape((-1, 2)) for step in self.route]
     self.step_idx = 0
     self.nav_destination = job.destination
+
+  def note_lefts(self, destination) -> None:
+    """TurnPilot: the route's lefts in TurnPilotMapStatus, for the phone page and the comma: how many the route goes around and
+    how many it couldn't (each skipped out loud at its junction and rerouted), never where. Here on navd's loop, for a job
+    whose route it takes, so a route dropped for a new destination never writes the new one's status."""
+    status = getattr(self.router, 'status', None)
+    if status is None or not hasattr(status, 'note'):
+      return
+    try:
+      status.note(destination, lefts={'avoided': int(self.lefts_avoided), 'unavoidable': int(self.lefts_unavoidable)})
+    except Exception:
+      cloudlog.exception("navd: the route's lefts weren't written to the map status")
 
   def send_instruction(self):
     msg = messaging.new_message('navInstruction', valid=True)

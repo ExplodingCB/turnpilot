@@ -43,8 +43,9 @@ by it, DESIGN section 6's 95% recall. By default k is 1, the shortest of them al
 three's 3/n under 5% says the same): every sampled car was confirmed by it, so CRITIQUE REQUIRED 2 holds for each one it
 saw. --allow-misses (off by default: it loosens) takes Wilks' largest k, which lets the k-1 shortest fall short; they are
 listed. Fewer than MIN_VEHICLES recommends nothing. It is rounded down to ROUND_M, never past what the samples reached, and
-capped at turnpilotd's LEFT_RANGE_MAX_M. The far crop's is given only with a road range (turnpilotd extends the reach by it
-only then) and past it. The preflight --set command is printed only with a recommendation, for Kellen to run parked.
+capped at LEFT_RANGE_MAX_M (unprotected_left's: turnpilotd and navd clamp the params to it). The far crop's is given only with
+a road range (turnpilotd extends the reach by it only then) and past it. The preflight --set command is printed only with a
+recommendation, for Kellen to run parked.
 
 It reads only: rlogs through LogReader, no params, no sockets. It reads no location service, so it prints no position. A
 sunnypilot log (initData.gitRemote) is refused: sunnypilot's own messages sit on turnpilotDetections' union slot.
@@ -65,8 +66,7 @@ from openpilot.selfdrive.turnpilot.detector.modeld_detector import WIDE_EVERY
 from openpilot.selfdrive.turnpilot.route_follower import LEFT
 from openpilot.selfdrive.turnpilot.scene.tracker import GROUND_GATE_FRAC, GROUND_GATE_M, NEAR_PX, iou, is_calibrated
 from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_Y_FAR_M, ONCOMING_Y_NEAR_M, velocity_trusted
-from openpilot.selfdrive.turnpilot.turnpilotd import LEFT_RANGE_MAX_M
-from openpilot.selfdrive.turnpilot.unprotected_left import CLEAR_WINDOW_S, ROUTE_REACH_MARGIN_M, band_blockers, reach_at_line
+from openpilot.selfdrive.turnpilot.unprotected_left import CLEAR_WINDOW_S, LEFT_RANGE_MAX_M, ROUTE_REACH_MARGIN_M, band_blockers, reach_at_line
 
 MAX_DROPOUT_S = CLEAR_WINDOW_S / 3.  # CRITIQUE REQUIRED 2: the window at least 3x the longest dropout, at the left
 LEFT_SCHEDULE = WIDE_EVERY / (WIDE_EVERY - 1)  # held at its line (roadAndWide) the full pass is on the road camera 2 runs in 3

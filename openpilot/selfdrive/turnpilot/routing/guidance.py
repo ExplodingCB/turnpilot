@@ -211,18 +211,26 @@ def upcoming_maneuvers(steps, step_idx, distance_to_maneuver, opposing=None) -> 
   maneuvers = []
   distance = distance_to_maneuver
   for i, ahead in enumerate(steps[step_idx + 1:step_idx + 1 + MAX_MANEUVERS]):
-    maneuver = ahead.get('maneuver') or {}
-    junction = maneuver_junction(steps, step_idx + i)
-    maneuvers.append({'distance': distance, 'type': maneuver.get('type') or '', 'modifier': maneuver.get('modifier') or '',
-                      'geometryValid': junction is not None, 'bearingBefore': junction['before'] if junction else 0.,
-                      'bearingAfter': junction['after'] if junction else 0., 'branches': min(junction['branches'], 255) if junction else 0,
-                      'opposing': junction['opposing'] if junction else 'unknown',
-                      'opposingSpeed': float(opposing.get(step_idx + i, (0., 0))[0]),
-                      'opposingLanes': min(int(opposing.get(step_idx + i, (0., 0))[1]), 255),
-                      'opposingStraightM': straight_of(opposing.get(step_idx + i)),
-                      'wrongWayM': wrong_way_before(steps, step_idx + i)})
+    maneuvers.append(maneuver_entry(steps, step_idx + i, distance, opposing))
     distance += ahead['distance']
   return maneuvers
+
+
+def maneuver_entry(steps, step_idx, distance, opposing=None) -> dict:
+  """allManeuvers' entry (a NavInstruction.Maneuver as a dict) for the maneuver that ends step step_idx, distance m ahead: what
+  turnpilotd reads a maneuver past the current one from (route_follower.maneuver_from_ahead), and so what route time judges
+  the route's lefts by (routing/lefts.py). opposing: as upcoming_maneuvers'."""
+  opposing = opposing or {}
+  maneuver = steps[step_idx + 1].get('maneuver') or {}
+  junction = maneuver_junction(steps, step_idx)
+  return {'distance': distance, 'type': maneuver.get('type') or '', 'modifier': maneuver.get('modifier') or '',
+          'geometryValid': junction is not None, 'bearingBefore': junction['before'] if junction else 0.,
+          'bearingAfter': junction['after'] if junction else 0., 'branches': min(junction['branches'], 255) if junction else 0,
+          'opposing': junction['opposing'] if junction else 'unknown',
+          'opposingSpeed': float(opposing.get(step_idx, (0., 0))[0]),
+          'opposingLanes': min(int(opposing.get(step_idx, (0., 0))[1]), 255),
+          'opposingStraightM': straight_of(opposing.get(step_idx)),
+          'wrongWayM': wrong_way_before(steps, step_idx)}
 
 
 def fill_guidance(instruction, steps, step_idx, distance_to_maneuver, opposing=None):
