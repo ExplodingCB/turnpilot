@@ -45,7 +45,7 @@ saw. --allow-misses (off by default: it loosens) takes Wilks' largest k, which l
 listed. Fewer than MIN_VEHICLES recommends nothing. It is rounded down to ROUND_M, never past what the samples reached, and
 capped at LEFT_RANGE_MAX_M (unprotected_left's: turnpilotd and navd clamp the params to it). The far crop's is given only with
 a road range (turnpilotd extends the reach by it only then) and past it. The preflight --set command is printed only with a
-recommendation, for Kellen to run parked.
+recommendation, for the owner to run parked.
 
 It reads only: rlogs through LogReader, no params, no sockets. It reads no location service, so it prints no position. A
 sunnypilot log (initData.gitRemote) is refused: sunnypilot's own messages sit on turnpilotDetections' union slot.
@@ -596,7 +596,7 @@ def render(res: Result) -> list[str]:
     sets = [f"--set {res.road.key}={res.road.range_m}"]
     if res.far.range_m is not None:
       sets.append(f"--set {res.far.key}={res.far.range_m}")
-    out.append("to set, on the comma, parked in P (Kellen's call, not this tool's):")
+    out.append("to set, on the comma, parked in P (the owner's call, not this tool's):")
     out.append(f"  {PREFLIGHT} {' '.join(sets)}")
     if res.far.range_m is not None:
       out.append("  the far range counts only with TurnPilotFarCrop on")
