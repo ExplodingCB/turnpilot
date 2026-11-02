@@ -10,6 +10,13 @@ model had dropped the desire and drove straight on (four junctions of four, 2026
 curve brings a junction turn down to the 4.3 m/s gate 1's model chose by itself 15 m out: at junctions where the
 model planned the turn but held 7 m/s, it gave the turn up or stopped at the corner. The planner turns the cap into
 an accel with a 1 s time constant, so the car trails the curve; the curve leads the car by 2 s.
+A curb-side turn (a right where traffic keeps right) is slowed further, to V_CORNER_CURB by CORNER_CURB_M: in BeamNG every
+right that was taken (R6 right_green, the g62 rights) came to its junction at 3.5 m/s or less from 15 m out and began turning
+12 m out, and every one that failed (S3, C5, F3 right_green) came at 4.6-4.7 m/s with the 4.3 cap binding, began turning
+4-6 m out, and was then given up (F3: abandoned at 14 deg), stood in the corner (C5) or driven straight (S3). The model
+turned them all at a fraction of its own plan's curvature (F3: 0.02-0.04 against a path that asked 0.07-0.14), and its
+speed read under the car's by 30-70% through the cap's braking, so it planned the corner for a car slower than it was:
+only the car's speed is TurnPilot's to set. A far-side turn's wider arc keeps V_CORNER.
 A keep (a slight turn at a junction) is capped only from town speeds: above KEEP_CAP_SPEED_MAX it is a road bearing
 off, and the cap would brake the car at 2 m/s^2 from highway speed for a bend it takes as it is. But one the route's
 bearings put at a junction (geometry: a branch meets it there) at KEEP_CORNER_MIN_DEG or more is a corner at any speed
@@ -54,6 +61,8 @@ KEEP_CORNER_MIN_DEG = 20.  # ...or at any speed at a junction (its bearings, a b
 LAG_S = 2.0             # s the curve leads the car
 V_CORNER = 4.3          # m/s a junction turn slows to by CORNER_M before the junction (gate 1's model, by itself)
 CORNER_M = 15.
+V_CORNER_CURB = 3.0     # m/s a curb-side one slows to by CORNER_CURB_M (module docstring: BeamNG's taken rights)
+CORNER_CURB_M = 20.
 # a junction turn this sharp or more gets the V_CORNER curve. With nominal angles that was every left and right (90);
 # real ones from the bearings come in under 90 at about half of right-angle junctions (89, 70 in Indiana), and a
 # Valhalla "left" or "right" starts at about 45 degrees
@@ -84,7 +93,8 @@ def turn_speed_cap(maneuver, distance: float, v_ego: float, right_hand_traffic: 
   lag = max(v_ego, 0.) * LAG_S
   cap = math.sqrt(v_turn ** 2 + 2. * A_DECEL * max(distance - TURN_DESIRE_LEAD_M - lag, 0.))
   if maneuver.kind == TURN and maneuver.angle_deg >= CORNER_ANGLE_MIN_DEG:
-    cap = min(cap, math.sqrt(V_CORNER ** 2 + 2. * A_DECEL * max(distance - CORNER_M - lag / 2., 0.)))
+    v_corner, corner_m = (V_CORNER_CURB, CORNER_CURB_M) if curb_side else (V_CORNER, CORNER_M)
+    cap = min(cap, math.sqrt(v_corner ** 2 + 2. * A_DECEL * max(distance - corner_m - lag / 2., 0.)))
   return min(cap, NO_SPEED_CAP)
 
 

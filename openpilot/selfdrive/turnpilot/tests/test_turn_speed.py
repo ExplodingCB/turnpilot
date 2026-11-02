@@ -5,9 +5,9 @@ from openpilot.selfdrive.turnpilot.desire_timing import TURN_DESIRE_LEAD_M
 from openpilot.selfdrive.turnpilot.route_follower import NOMINAL_ANGLE_DEG, Maneuver, classify
 from openpilot.selfdrive.turnpilot.hooks import plan_accel
 from openpilot.selfdrive.turnpilot.scene_policy import NO_ACCEL_CAP
-from openpilot.selfdrive.turnpilot.turn_speed import (CORNER_M, LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_MAX_M,
-                                                      POST_GO_PROFILES, V_CORNER, V_TURN_MAX, V_TURN_MIN, PostGo, post_go_caps,
-                                                      turn_speed_cap, turn_target_speed)
+from openpilot.selfdrive.turnpilot.turn_speed import (CORNER_CURB_M, CORNER_M, LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT,
+                                                      POST_GO_MAX_M, POST_GO_PROFILES, V_CORNER, V_CORNER_CURB, V_TURN_MAX, V_TURN_MIN,
+                                                      PostGo, post_go_caps, turn_speed_cap, turn_target_speed)
 
 
 def maneuver(mtype, modifier):
@@ -25,7 +25,8 @@ def test_target_speeds():
 
 
 def test_which_maneuvers_are_capped():
-  assert turn_speed_cap(maneuver("turn", "right"), 0., 4.) == V_CORNER
+  assert turn_speed_cap(maneuver("turn", "right"), 0., 4.) == V_CORNER_CURB
+  assert turn_speed_cap(maneuver("turn", "left"), 0., 4.) == V_CORNER
   assert turn_speed_cap(maneuver("turn", "slight left"), 0., 4.) < 10.
   assert turn_speed_cap(maneuver("off ramp", "slight right"), 0., 25.) == NO_SPEED_CAP
   assert turn_speed_cap(maneuver("fork", "left"), 0., 25.) == NO_SPEED_CAP
@@ -88,12 +89,41 @@ def test_car_reaches_turn_speed_by_the_desire():
 
 
 def test_corner_curve_at_real_angles():
-  # a right whose bearings turn 70 degrees still slows to V_CORNER by CORNER_M, as the nominal 90 did; a slight keep doesn't
+  # a right whose bearings turn 70 degrees still slows to its corner speed by its corner distance, as the nominal 90 did, a
+  # left to its own; a slight keep doesn't
   for angle in (70., 85., 90., 120.):
     real = Maneuver(*classify("turn", "right"), "turn", "right", angle, geometry=True)
-    assert turn_speed_cap(real, CORNER_M, 4.) == V_CORNER, angle
+    assert turn_speed_cap(real, CORNER_CURB_M, 3.) == V_CORNER_CURB, angle
+    left = Maneuver(*classify("turn", "left"), "turn", "left", angle, geometry=True)
+    assert turn_speed_cap(left, CORNER_M, 4.) == V_CORNER, angle
   keep = Maneuver(*classify("turn", "slight right"), "turn", "slight right", 30., geometry=True)
   assert turn_speed_cap(keep, CORNER_M, 4.) > V_CORNER
+
+
+def approach(modifier, until_m, v=15., d=300., right_hand_traffic=True):
+  """The car under the turn's cap from d m out at v (test_car_reaches_turn_speed_by_the_desire's): (v at until_m, min accel)."""
+  m = maneuver("turn", modifier)
+  min_a = 0.
+  while d > until_m:
+    a = min(plan_accel(10., turn_speed_cap(m, d, v, right_hand_traffic), v), 0.)
+    min_a = min(min_a, a)
+    v = max(v + a * DT_MDL, 0.)
+    d -= v * DT_MDL
+  return v, min_a
+
+
+def test_a_curb_side_turn_comes_to_its_corner_at_the_speed_the_model_takes_it_from():
+  """BeamNG right_green and red_right's junction (DR435_1), 2026-10-30 to 11-01: every right taken came to it at 3.5 m/s or
+  less from 15 m out and started round 12 m out; every right lost (S3, C5, F3) came at 4.6-4.7 m/s, the 4.3 cap binding,
+  started round 4-6 m out and was given up (F3 abandoned at 14 deg), stood in the corner or driven straight. A curb-side
+  turn comes to 15 m out at no more than 3.5 m/s on the same gentle braking, and through its corner at V_CORNER_CURB; a
+  far-side one keeps V_CORNER (its wider arc); traffic keeping left mirrors it."""
+  v, min_a = approach("right", 15.)
+  assert v <= 3.5 and min_a > -1.6, (v, min_a)
+  assert approach("right", 0.)[0] <= V_CORNER_CURB + 0.1
+  v, _ = approach("left", 15.)
+  assert V_CORNER - 0.3 < v < V_CORNER + 0.6, v
+  assert approach("left", 15., right_hand_traffic=False)[0] <= 3.5
 
 
 def test_post_go_cap_shape_by_angle():

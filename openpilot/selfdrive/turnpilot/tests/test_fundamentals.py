@@ -222,6 +222,32 @@ class Loop(Sim):
       assert self.t - t0 < limit_s, trace(self)
 
 
+class CrawlLoop(Loop):
+  """Loop at a crawl into a right, BeamNG right_green at cbdf5f4: the model starts round CRAWL_ENTRY_M out, and a fresh
+  rising edge of the turn desire while it is under way restarts it, as the big model did there (unwound within 0.4 s, round
+  again RESTART_S later and late, into the oncoming half of the exit road)."""
+  def yaw_rate(self) -> float:
+    if getattr(self, 'restart_s', 0.) > 0.:
+      self.restart_s -= DT_MDL
+      return 0.
+    if self.turn is None and self.queue is not None and self.v > 0.3:
+      j = self.junction_ahead(self.queue[1])
+      if j is not None and self.s >= j - CRAWL_ENTRY_M:
+        self.turn = [self.queue[1], j]
+    return super().yaw_rate()
+
+  def drive_model(self, fed, clear: bool) -> None:
+    fresh = fed in (Desire.turnLeft, Desire.turnRight) and fed != self.fed
+    if fresh and self.turn is not None and abs(self.heading) < TURN_DEG / 2.:
+      self.restarts = getattr(self, 'restarts', 0) + 1
+      self.turn, self.heading, self.restart_s = None, 0., RESTART_S
+    super().drive_model(fed, clear)
+
+
+CRAWL_ENTRY_M = 12.  # m: the model started round at 12 m out at a crawl (right_green at cbdf5f4)
+RESTART_S = 1.5      # s straight on after a fresh edge restarts the turn
+
+
 class StopLoop(Loop, StopSim):
   """Loop at test_turnpilotd_stop's stop sign under the decider (its surveyed all-way, the visibility file, the clock):
   StopSim's model holds the car standing and drives once it rolls, its planner a lag late. One lane, so no change."""
@@ -321,11 +347,11 @@ def stood_at(sim, line: float) -> int:
 # ------------------------------------------------------------------------------------------- the drives
 
 def right_at_a_signal(mph: float, signals: str, lanes: int = 2, lane: int = 0, nav=TWO_LANES_RIGHT_TURN, junction: float = 450.,
-                      green: bool = False) -> tuple:
+                      green: bool = False, loop=Loop) -> tuple:
   """A right at junction from the curb lane of lanes, a signal 10 m before it, the car starting in lane at mph: red on arrival,
-  green WAIT_S after it stands (green: green throughout). (sim, the light's line)."""
+  green WAIT_S after it stands (green: green throughout). (sim, the light's line). loop: the Loop class."""
   line = junction - 10.
-  sim = Loop([(junction, "turn", "right", junction_of("right")), (junction + 1600., "turn", "left", junction_of("left"))],
+  sim = loop([(junction, "turn", "right", junction_of("right")), (junction + 1600., "turn", "left", junction_of("left"))],
              lanes=lanes, lane=lane, signals=signals, cruise=mph * MPH, nav_lanes={0: nav}, controls=[(line, 'signal')])
   red_light(sim, line, green)
   return sim, line
@@ -404,6 +430,17 @@ def test_a_left_at_a_red_changes_into_its_turn_lane_and_takes_the_unprotected_le
   assert any(str(f.plan.controlPrompt) == 'leftGo' for f in sim.frames)
 
 
+def test_a_right_crawled_into_is_never_restarted_by_a_pulse_mid_corner():
+  """BeamNG right_green at cbdf5f4: the car crawled into the right at 1-2 m/s, the model steering in from 12 m out while the
+  heading had barely moved, and the entry pulse 10 m out restarted its turn: the wheel unwound, the corner came again late,
+  and the car finished it in the oncoming half of the exit road. Crawled into, the right is turned in one go, never
+  restarted."""
+  sim, _ = right_at_a_signal(5, 'car', lane=1, green=True, junction=150., loop=CrawlLoop)
+  sim.drive(lambda sim: sim.s > 180., 150.)
+  assert getattr(sim, 'restarts', 0) == 0, ("a pulse restarted the turn", trace(sim))
+  assert_turned(sim, 'right', 1, 150.)
+
+
 # ------------------------------------------------------------------------------------------- 3: slow traffic
 
 @pytest.mark.parametrize("signals", ['car', 'driver'])
@@ -423,11 +460,14 @@ def test_a_right_approached_in_slow_traffic_under_the_old_20_mph_floor_still_get
 @pytest.mark.parametrize("signals", ['car', 'driver'])
 @pytest.mark.parametrize("mph", [25, 35])
 def test_a_right_from_the_curb_lane_at_a_green_is_taken_cleanly_without_a_stop(mph, signals):
-  """Already in the turn lane: no change, the turn's speed cap and no stop (through greens unslowed), the lamp on, turned."""
+  """Already in the turn lane: no change, the turn's speed cap and no stop (through greens unslowed), the lamp on, turned.
+  It comes to the corner at 3.5 m/s or less from 15 m out (turn_speed.V_CORNER_CURB): BeamNG's rights taken came so, and
+  the ones at 4.6-4.7 m/s there were started 4-6 m out and lost (F3 right_green, 2026-11-01: abandoned at 14 deg)."""
   sim, _ = right_at_a_signal(mph, signals, lane=1, green=True)
   through(sim, 450.)
   assert not lane_changes(sim) and all(f.lane == 1 for f in sim.frames), trace(sim)
   assert min(f.v for f in sim.frames if f.s < 450.) > 2., ("stopped at a green", trace(sim))
+  assert max(f.v for f in sim.frames if 435. <= f.s <= 450.) <= 3.5, ("into the corner too fast", trace(sim))
   assert_turned(sim, 'right', 1, 450.)
 
 

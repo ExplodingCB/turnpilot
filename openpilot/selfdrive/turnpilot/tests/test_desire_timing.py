@@ -1,8 +1,8 @@
 from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.desire_timing import (CLEAR_FRAMES, CLEAR_MARGIN_DEG, CLEAR_MIN_DEG, CLEAR_WAIT_S, ENTRY_GAP_S, ENTRY_M,
-                                                         PULSE_GAP_FRAMES, REPULSE_S, STANDSTILL_REARM_S, TURN_DESIRE_LEAD_M,
-                                                         DesireTiming, keep_lead)
+                                                         PULSE_GAP_FRAMES, REPULSE_S, STANDSTILL_REARM_S, STEER_IN_CURV,
+                                                         TURN_DESIRE_LEAD_M, TURN_STARTED_DEG, DesireTiming, keep_lead)
 from openpilot.selfdrive.turnpilot.hooks import CLEAR_DESIRE
 from openpilot.selfdrive.turnpilot.route_follower import RouteFollower, maneuver_from_instruction
 from openpilot.selfdrive.turnpilot.turn_skip import TurnSkip
@@ -131,6 +131,41 @@ def test_repeat_pulses_stop_once_the_car_has_turned():
   trace = drive([(200., "turn", "right"), (900., "turn", "left")], v=3., turns_at=20., seconds=80., steer_sign=-1.)
   edges = rising_edges(trace, Desire.turnRight)
   assert len(edges) >= 2 and all(d > 20. - 2.8 * 3. for _, d in edges)
+
+
+def crawl_into_a_right(steer_in, v=1.5, d0=30., seconds=24.):
+  """A right at d0 m crawled at v; the model's desiredCurvature (positive right) steer_in(d) at d m out; the car's yaw
+  from it (v * curvature), so at a crawl it turns little while the model steers hard. [(d, desire, curvature)] per frame."""
+  from openpilot.selfdrive.turnpilot.route_follower import Maneuver, classify
+  m = Maneuver(*classify("turn", "right"), "turn", "right", 90.)
+  dt_, out, d = DesireTiming(), [], d0
+  for _ in range(int(seconds / DT_MDL)):
+    curv = steer_in(d)
+    out.append((d, dt_.update(m, d, 1, False, v, 0., True, True, DT_MDL, -v * curv, curvature=curv), curv, dt_.turned_deg))
+    d -= v * DT_MDL
+  return out
+
+
+def test_no_pulse_reaches_the_model_while_it_steers_into_the_turn():
+  """BeamNG right_green at cbdf5f4 (both runs): crawling into the right at 1-2 m/s the entry pulse went with the model
+  steering -46 and -75 deg into it but the car under TURN_STARTED_DEG of heading, and the fresh rising edge restarted the
+  model's turn: it unwound within 0.4 s and took the corner late, into the oncoming half of the exit road. No repeat and no
+  entry pulse while its curvature is STEER_IN_CURV or more toward the turn; the entry pulse goes once it lets go short of
+  TURN_STARTED_DEG, and a steady approach still gets its repeats and entry."""
+  # the model steers in from 12 m out, through ENTRY_M, at 0.03 1/m: nothing new reaches it
+  trace = crawl_into_a_right(lambda d: 0.03 if d < 12. else 0.)
+  first = next(i for i, (_, desire, _, _) in enumerate(trace) if desire == Desire.turnRight)
+  steering = [(d, desire) for d, desire, curv, deg in trace[first:] if curv >= STEER_IN_CURV and deg < TURN_STARTED_DEG]
+  assert any(d < ENTRY_M - 3. for d, _ in steering)  # deep inside ENTRY_M, still under TURN_STARTED_DEG by heading
+  assert all(desire == Desire.turnRight for _, desire in steering), "a pulse went into the turn"
+  # it lets go of the corner 6 m out, short of TURN_STARTED_DEG: the entry pulse goes then
+  trace = crawl_into_a_right(lambda d: 0.03 if 6. < d < 12. else 0.)
+  edges = [d for (_, a, _, _), (d, b, _, _) in zip(trace, trace[1:]) if b == Desire.turnRight and a != Desire.turnRight]
+  assert any(d <= 6. for d in edges) and not any(6. < d < 12. for d in edges), edges
+  # never steering in: the entry pulse inside ENTRY_M as before
+  trace = crawl_into_a_right(lambda d: 0.)
+  edges = [d for (_, a, _, _), (d, b, _, _) in zip(trace, trace[1:]) if b == Desire.turnRight and a != Desire.turnRight]
+  assert any(0. < d < ENTRY_M for d in edges), edges
 
 
 def test_pulse_again_after_a_standstill():
