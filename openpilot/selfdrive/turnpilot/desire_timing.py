@@ -17,7 +17,12 @@ before the junction, so the last pulse is fresh for the whole turn: at 4 m/s a t
 model let go of it halfway round. Crossing ENTRY_M within ENTRY_GAP_S of a repeat, the entry pulse goes once that gap is
 past (it used to be used up then, and never went); a pulse that itself goes inside ENTRY_M is the entry pulse.
 None once the car has turned TURN_STARTED_DEG (by its yaw rate): pulses during the turn turned the car on past the exit
-road, into the curb. That holds for a repeat and one on engaging. One as the car
+road, into the curb. That holds for a repeat and one on engaging. Nor a repeat or the entry pulse while the model is steering
+into the turn (modelV2.action.desiredCurvature STEER_IN_CURV or more toward its side), however little the car has turned:
+crawling into a right at 1-2 m/s (BeamNG right_green at cbdf5f4, both runs) the entry pulse went with the model at -46 and
+-75 deg of steering but under 15 deg of heading, and within 0.4 s the model unwound to -1 and -23 deg and started the
+corner again late, swinging into the oncoming half of the exit road for 31-32 m: a fresh rising edge restarts the model's
+turn. The entry pulse waits while it steers in, and goes if it lets go of the corner short of TURN_STARTED_DEG. One as the car
 pulls away after a standstill (STANDSTILL_REARM_S) goes while it has turned less than STANDSTILL_REPULSE_MAX_DEG: waiting
 in the junction for oncoming traffic, 15-25 degrees into a left, longer than the model's queue, the turn would lapse
 (H2, below: with the pulse gone at 5-16 degrees the model gave up 3 turns of 3); further round (stopped halfway for a
@@ -77,6 +82,7 @@ REPULSE_S = 3.5               # a turn desire pulses again this often on the app
 ENTRY_M = 10.                 # ...and once more this far before the junction (not within ENTRY_GAP_S of the last)...
 ENTRY_GAP_S = 1.5
 TURN_STARTED_DEG = 15.        # ...until the car has turned this far toward the maneuver
+STEER_IN_CURV = 0.01          # 1/m: nor while the model steers into the turn this hard (a 100 m radius toward its side)
 STANDSTILL_REPULSE_MAX_DEG = 25.  # a pulse as the car pulls away after a standstill goes while it has turned less than this
 MAX_PULSES = 5
 PULSE_GAP_FRAMES = 3          # frames of none before a repeat pulse
@@ -216,7 +222,7 @@ class DesireTiming:
   def update(self, maneuver, distance: float, maneuver_id: int, passed: bool, v_ego: float,
              steering_angle_deg: float, keep_left_ok: bool, keep_right_ok: bool, dt: float, yaw_rate: float = 0.,
              lat_active: bool = True, replaced: bool = False, may_start: bool = True, go: bool = False,
-             holding: bool = False, far: float | None = None) -> int:
+             holding: bool = False, far: float | None = None, curvature: float = 0.) -> int:
     """The desire to publish, CLEAR_DESIRE once a turn is done. maneuver is RouteFollower.upcoming (None when there is
     none); keep_left_ok/keep_right_ok: the model sees a lane line and road that way (lane_planner.ModelLanes);
     yaw_rate: rad/s, left positive; lat_active: carControl.latActive; replaced: RouteFollower.replaced;
@@ -225,7 +231,8 @@ class DesireTiming:
     away from a standstill with its pulse forgotten; holding: a hold has the car (shouldStop): standing, the turn desire
     drops to none (its edge stays in the model's queue), so the go's pulse is a fresh edge in the very frame it lets go;
     far: the furthest reading of the junction's distance (distance plus RouteFollower.junction_spread; distance when not
-    given), which a turn's pulse waits past an opening it may not enter by (wrong_way_wait)."""
+    given), which a turn's pulse waits past an opening it may not enter by (wrong_way_wait); curvature: modelV2's
+    action.desiredCurvature (1/m, positive right): no repeat while it steers into the turn (STEER_IN_CURV)."""
     if maneuver_id != self.maneuver_id:
       if replaced and self.side and self.turned_deg < TURN_STARTED_DEG:
         self._clear()
@@ -240,7 +247,7 @@ class DesireTiming:
         self._pending = None
     may_start = may_start and not wrong_way_wait(maneuver, distance if far is None else far)
     desire = self._update(maneuver, distance, maneuver_id, passed, v_ego, keep_left_ok, keep_right_ok, dt, yaw_rate, lat_active,
-                          may_start, go, holding)
+                          may_start, go, holding, curvature)
     if desire != Desire.none:
       self._pending = None  # the next maneuver's pulse is in the model's queue now
     if self.clear_frames > 0:
@@ -250,7 +257,7 @@ class DesireTiming:
 
   def _update(self, maneuver, distance: float, maneuver_id: int, passed: bool, v_ego: float,
               keep_left_ok: bool, keep_right_ok: bool, dt: float, yaw_rate: float, lat_active: bool, may_start: bool,
-              go: bool = False, holding: bool = False) -> int:
+              go: bool = False, holding: bool = False, curvature: float = 0.) -> int:
     if maneuver_id != self.maneuver_id:
       self.maneuver_id = maneuver_id
       self._reset()
@@ -335,11 +342,13 @@ class DesireTiming:
 
     if self.active and turn:
       self._since_pulse += dt
-      entry = not self.entry and distance < ENTRY_M and self._since_pulse >= ENTRY_GAP_S
-      # used up once it can go: crossing ENTRY_M within ENTRY_GAP_S of a repeat, it waits out the gap and then goes
+      steering_in = -maneuver.side * curvature >= STEER_IN_CURV  # desiredCurvature is positive right, side positive left
+      entry = not self.entry and distance < ENTRY_M and self._since_pulse >= ENTRY_GAP_S and not steering_in
+      # used up once it can go: crossing ENTRY_M within ENTRY_GAP_S of a repeat, or while the model steers in, it waits and
+      # then goes
       self.entry = self.entry or entry
       if (entry or (self._since_pulse >= REPULSE_S and distance > ENTRY_M)) and self.turned_deg < TURN_STARTED_DEG and \
-         self.pulses < MAX_PULSES and may_start:
+         self.pulses < MAX_PULSES and may_start and not steering_in:
         self._gap, self._since_pulse = PULSE_GAP_FRAMES, 0.
         self.pulses += 1
     if self._gap > 0:
