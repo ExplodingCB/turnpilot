@@ -39,6 +39,11 @@ OFF_ROUTE_MATCH_M = 20.  # TurnPilot: a lookup's control this close to one of th
 # median 0.051 s, p90 0.074 s, max 0.080 s over 101 iterations on 36 trips. Allowing the comma four 6x the Mac's worst, all
 # MAX_AVOID_ITER (8) iterations take 3.8 s.
 AVOID_TIME_S = 4.0
+# ...and parked (offroad, the route planned before the drive), where nothing waits on the route but the driver at the screen.
+# On the car, 2026-11-02, an iteration took 1.5-2 s, not the Mac's 0.05 s: 4 s held 4 of the 8 reroutes ("out of time after
+# 4 reroutes: the best route is kept"), so a route planned parked kept stops and lefts it could have gone around. Parked it
+# gets room for all 8 at the car's pace
+AVOID_TIME_PARKED_S = 20.0
 AVOID_PARAM = 'TurnPilotAvoidStops'
 ALWAYS_DRIVE_PARAM = 'TurnPilotAlwaysDrive'  # TurnPilot: read at route time for R1 to R3 (ALWAYS_DRIVE.md section 1, step S6)
 
@@ -187,7 +192,7 @@ class RouteJob(threading.Thread):
 
     result = avoid.run(self.steps, self.controls, self.controls_status, self.avoid, certify=certify_one, reroute=reroute,
                        route_controls=router.controls, own_edge=own_edge, cancelled=self.cancel.is_set,
-                       deadline=engine.monotonic() + AVOID_TIME_S, monotonic=engine.monotonic, enabled=self.avoid_on, headings=headings,
+                       deadline=engine.monotonic() + (AVOID_TIME_S if engine.onroad() else AVOID_TIME_PARKED_S), monotonic=engine.monotonic, enabled=self.avoid_on, headings=headings,
                        lefts=route_lefts)
     self.steps, self.controls, self.controls_status = result.steps, result.controls, result.controls_status
     self.avoid_status, self.avoided, self.avoid_added_s = result.status, result.avoided, result.added_s
@@ -402,11 +407,11 @@ class RouteEngine:
         side, mode = bool(go.sideViewsLive), str(go.mode) or mode
       except Exception:
         pass
-    return certify.Runtime(mode=mode, side_views=side, a_launch=stop_rules.a_launch_plan(self.params))
+    return certify.Runtime(mode=mode, side_views=side, a_launch=stop_rules.a_launch_plan(self.params), clock_valid=system_time_valid())
 
   @staticmethod
   def runtime_key(runtime: certify.Runtime) -> tuple:
-    return runtime.mode, runtime.side_views, runtime.a_launch
+    return runtime.mode, runtime.side_views, runtime.a_launch, runtime.clock_valid
 
   def certify_default(self, control, eta, runtime):
     """TurnPilot: routing/certify.py on the shipped visibility and survey files (a sim table only where the sim says so)."""

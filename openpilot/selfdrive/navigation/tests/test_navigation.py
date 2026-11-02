@@ -1348,6 +1348,26 @@ class TestStopAvoidance(unittest.TestCase):
     self.engine.recompute_route(gps_ok=True)
     self.assertEqual(router.call_count, 2)  # once
 
+  def test_a_route_planned_before_the_clock_was_set_reruns_once_it_is(self):
+    # 2026-11-02: the comma boots on a clock months behind; a route planned then failed every light check and was never
+    # certified again
+    from unittest import mock
+    import openpilot.selfdrive.navigation.navd as navd_mod
+    a = self.stop(1, 60.)
+    self.certified = {a.approach_key}
+    with mock.patch.object(navd_mod, 'system_time_valid', return_value=False):
+      router = self.start([a])
+      self.engine.recompute_hold = RECOMPUTE_HOLD
+      self.engine.recompute_route(gps_ok=True)
+    self.assertEqual(router.call_count, 1)
+    router.steps = self.route_with([self.stop(1, 60.)])
+    router.reroute_results = [self.route_with([])]
+    with mock.patch.object(navd_mod, 'system_time_valid', return_value=True):
+      self.engine.recompute_route(gps_ok=True)
+      self.assertEqual(router.call_count, 2)
+      self.engine.recompute_route(gps_ok=True)
+      self.assertEqual(router.call_count, 2)  # once
+
   def test_N14_eta_leaving_its_window_reruns_once_and_a_slip_inside_does_not(self):
     a = self.stop(1, 60.)
     self.certified = {a.approach_key}

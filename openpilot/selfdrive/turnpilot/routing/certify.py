@@ -68,6 +68,10 @@ class Runtime:
   launch_verified: bool | None = None
   window: tuple = (sr.ETA_EARLY_S, sr.ETA_LATE_S)
   a_launch: float = sr.A_LAUNCH_PLAN
+  # the system clock was valid when the route was planned (navd: wall_clock). A route planned before GPS time fails every
+  # light check; its runtime key holds this so the clock turning valid re-runs the avoidance (2026-11-02: the comma boots on
+  # a clock months behind, and a route planned parked was never certified again)
+  clock_valid: bool = True
   yaw_deg: float = 0.
   yaw_offset_deg: float = sr.ROUTE_YAW_DEG
 

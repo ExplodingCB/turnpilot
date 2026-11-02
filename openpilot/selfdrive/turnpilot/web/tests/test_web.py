@@ -335,6 +335,12 @@ class TestDestination(WebTestCase):
     assert self.call("POST", "/api/destination", {"url": "https://maps.apple.com/?q=zzzz"})[0] == 404
     assert self.params.get("NavDestination") is None
 
+  def test_search_before_the_clock_is_set_says_so_and_doesnt_search(self):
+    from unittest import mock
+    with mock.patch.object(server, 'system_time_valid', return_value=False):
+      code, body, _ = self.call("GET", "/api/search?q=cafe")
+    assert code == 503 and "clock" in json.dumps(body) and self.search.calls == []
+
   def test_search_bias_uses_the_last_gps_fix(self):
     msg = messaging.new_message("gpsLocationExternal", valid=True)
     msg.gpsLocationExternal.latitude, msg.gpsLocationExternal.longitude = INDIANAPOLIS

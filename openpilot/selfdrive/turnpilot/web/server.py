@@ -21,6 +21,7 @@ from pathlib import Path
 from openpilot.common.hardware import PC
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
+from openpilot.common.time_helpers import system_time_valid
 from openpilot.selfdrive.turnpilot import diagnostics
 from openpilot.selfdrive.turnpilot.car_signals import MODES as CAR_SIGNAL_MODES, read_mode
 from openpilot.selfdrive.turnpilot.maps import coverage as coverage_cache
@@ -414,6 +415,10 @@ class Handler(BaseHTTPRequestHandler):
     text = (query.get("q") or [""])[0].strip()
     if len(text) < 2:
       return []
+    # the comma boots on a clock months behind until GPS or NTP sets it, and every search's TLS check then fails on the
+    # certificate's dates (2026-11-02, the second drive): said as that, for the phone to try again, never "not reachable"
+    if not system_time_valid():
+      raise ApiError(503, "the comma's clock isn't set yet (it sets from GPS or the internet in a minute or so): search again shortly")
     try:
       return self.app.search(text, self.app.position())
     except Exception as e:
