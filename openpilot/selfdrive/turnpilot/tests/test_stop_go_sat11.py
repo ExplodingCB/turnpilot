@@ -302,6 +302,37 @@ def test_the_band_abort_s_stand_crosses_once_the_car_has_gone_never_a_handback(t
   assert geo[moved][1] < -CAR_HALF_LEN_M
 
 
+@pytest.mark.parametrize('after_s', [1.0, 1.2])
+def test_a_withdrawn_go_s_rest_with_no_room_for_another_crosses_once_the_car_has_gone_never_a_handback(tmp_path, after_s):
+  # the confirm round at 2ea0e3c (C3, stop_allway_out_of_turn): the car from the left started 1.0 s into our go, before our
+  # commit, and the go was withdrawn for it (pos 0.89 m, 1.34 m/s); it crossed ahead (7.34 m nearest), and from the rest,
+  # 0.18 m from the closest edge, H5 handed back: "no room for another go: 0.18 m to the closest edge, 1.69 needed". As the
+  # band abort's stand (241d36d), that rest is the stall's under vision: held while the lanes left to cross fail their object
+  # tests, then the clearBox lifts, and across after the car, never a handback, never touching it, never a stop under -2.0
+  w = world(tmp_path, 'back')
+  d_fn, holder = start(standing_d('back'))
+  t_go = {}
+
+  def trigger(d):
+    if d.state == 'going' and 'go' not in t_go:
+      t_go['go'] = w.t_cam - 100.
+    return 'go' in t_go and w.t_cam - 100. >= t_go['go'] + after_s - 1e-6
+  out, geo = drive_with(w, d_fn, holder, trigger, 40.)
+  wd = next((k for k, d in enumerate(out) if d.withdraw), None)
+  assert wd is not None and out[wd].withdraw.startswith('outOfTurn:5') and not any(d.state == 'committed' for d in out[:wd])
+  stand = next(k for k in range(wd, len(out)) if w.cmds[k][1] < sg.STAND_V)
+  assert w.sg.edges.d_min - geo[stand][0] < sr.go_room_vision_m(w.kw['t_abort'])  # no room for another go from here
+  assert not any(d.fault for d in out), [(k * DT_MDL, d.fault, d.reason) for k, d in enumerate(out) if d.fault][:3]
+  assert not any(touching(p, cd, lane_axis_m(w, 'left')) for p, cd in geo)
+  assert all(s.accel_cap >= -2. - 1e-9 for d in out for s in d.stops)
+  assert any(d.reason.startswith("Waiting: a car") for d in out[stand:]), "held for the car while it comes"
+  done = next((k for k, d in enumerate(out) if d.state == 'done'), None)
+  assert done is not None and done > stand, [(round(k * DT_MDL, 2), d.state, d.reason) for k, d in enumerate(out)][stand::20]
+  moved = next(k for k in range(stand, len(out)) if geo[k][0] > geo[stand][0] + 0.2)
+  assert geo[moved][1] < -CAR_HALF_LEN_M  # it moved on only once the car had crossed our path
+  assert any(d.go_cause == 'clearBox' for d in out[stand:moved + 1])  # on the stall's clearBox lift
+
+
 def crossing_y(kind, t):
   """(y left of our axis, vy) of the rail tests' scene car t s after the go reaches the stage: 5 m left then, at 2.5 m/s across
   our path, on its way since earlier (t < 0: further out on its line) ('crossing'), or the same but standing across our lane

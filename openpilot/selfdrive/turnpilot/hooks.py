@@ -70,7 +70,7 @@ SILENT_PROMPTS = ('none', 'yieldAhead', 'waitingForGap', 'creepingForView', 'wai
 RETIRED_PROMPTS = ('stopSignGo', 'signalGo', 'unprotectedTurnGo', 'carStoppedGo')
 RETIRED_ALERTS = ('goingOnRed',)
 CONTROL_ALERT_EVENTS = ('stopOverrun', 'proceedingOnYellow', 'junctionUncertain', 'carStoppedNote',  # below the prompt, above a lane change
-                        'lightGreenNotMoving', 'unstickLift', 'pedestrianWaiting', 'turnpilotResumed')
+                        'lightGreenNotMoving', 'unstickLift', 'pedestrianWaiting', 'turnpilotResumed', 'lightNotRead')
 CONTROL_STATUS_ALERTS = ('mapControlsUnavailable', 'lightSourceRejected', 'farViewOff', 'sideCamerasOff',  # last of all, a status line
                          'mapControlsUnavailableSilent')
 SILENT_STATUS_ALERTS = ('mapControlsUnavailableSilent',)  # ...that line with no sound (MC-03)
@@ -218,6 +218,7 @@ CONTROL_ALERT_TEXT = {
   'unstickLift': 'Nothing ahead is holding the car: going on',  # under TurnPilotAlwaysDrive, section 4.5's lift
   'pedestrianWaiting': 'Waiting for pedestrian',  # the crosswalk hold's standoff (SC-02), once a hold at PED_NOTE_S
   'turnpilotResumed': 'Big model back: TurnPilot drives the route again',  # at the engagement after a fallback's pause
+  'lightNotRead': 'No red seen: check the light',  # a stand at a mapped signal with no red read (turnpilotd.py LIGHT_UNREAD_S)
 }
 
 

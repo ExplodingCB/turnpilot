@@ -26,6 +26,14 @@ A left whose exit is the route's last edge (onto the destination's street), or w
 unavoidable, as is one over the detour budget; turnpilotd skips it out loud at its junction and navd reroutes, as before. A
 measured range keeps the lefts within it, as ever.
 Positions never leave navd: the status says how many (TurnPilotMapStatus lefts: avoided, unavoidable), the logs say steps.
+
+A U-turn on the route (continue/uturn, any maneuver whose modifier is uturn) is refused the same way, whatever TurnPilotAutoLeft
+says: the driving model can't U-turn and turnpilotd sends nothing there (route_follower: UTURN), so the car drives on past it
+and navd reroutes, or the model stands short of it. The confirm round's route_demo (BeamNG): the reroute after the designed
+left skip asked a U-turn 100.9 m on, and the model stood 85 s at the green 7 m short of it. The lefts' rules never saw it
+(unprotected_turn: a junction turn only), so the lefts work didn't keep it off the reroute, which runs the same loop. A U-turn
+is a Left of kind 'uturn' here, excluded by its exit edge (the road it turns back onto) under the same loop and budget; it is
+no unprotected left, so the status's counts are the lefts' alone (avoid.py).
 """
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -33,7 +41,7 @@ from types import SimpleNamespace
 
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.turnpilot.map_controls import line_setback_at, unprotected_turn
-from openpilot.selfdrive.turnpilot.route_follower import maneuver_from_ahead
+from openpilot.selfdrive.turnpilot.route_follower import UTURN, maneuver_from_ahead
 from openpilot.selfdrive.turnpilot.routing.guidance import maneuver_entry
 from openpilot.selfdrive.turnpilot.unprotected_left import AUTO, ROAD_RANGE_M, left_mode_for, left_reach, range_param, route_range
 
@@ -69,7 +77,7 @@ class Left:
   last_edge: bool = False
   unavoidable: bool = False
   first_edge: bool = False
-  kind: str = 'left'
+  kind: str = 'left'   # or 'uturn' (module docstring)
 
 
 def read(params, key: str):
@@ -119,18 +127,19 @@ def setback_at(junction_m: float, controls) -> float | None:
 
 
 def route_lefts(steps, controls, config: LeftConfig, opposing: Callable[[], dict], exits: Callable[[], dict]) -> list[Left]:
-  """The route's lefts the car would skip (module docstring), nearest first. opposing() -> {step index: (m/s, lanes, straight m)}
-  and exits() -> {step index: Exit} are asked only for a route with an unprotected left on it (both cached by the route's
-  controls() on the real router, so no second Valhalla call)."""
+  """The route's lefts the car would skip and its U-turns (module docstring), nearest first. opposing() -> {step index: (m/s,
+  lanes, straight m)} is asked only for a route with an unprotected left on it, exits() -> {step index: Exit} for one with
+  either (both cached by the route's controls() on the real router, so no second Valhalla call)."""
   ends, at = [], 0.
   for i in range(len(steps) - 1):
     at += float(steps[i].get('distance', 0.))
     ends.append(at)
   candidates = [i for i in range(len(steps) - 1) if config.mode == AUTO and
                 unprotected_turn(route_maneuver(steps, i), config.right_hand_traffic)]
-  if not candidates:
+  uturns = [i for i in range(len(steps) - 1) if route_maneuver(steps, i).kind == UTURN]
+  if not candidates and not uturns:
     return []
-  roads, edges, out = opposing() or {}, exits() or {}, []
+  roads, edges, out = (opposing() or {}) if candidates else {}, exits() or {}, []
   for i in candidates:
     rc = route_range(route_maneuver(steps, i, roads), setback_at(ends[i], controls), config.reach_m, config.right_hand_traffic,
                      config.mode)
@@ -138,7 +147,14 @@ def route_lefts(steps, controls, config: LeftConfig, opposing: Callable[[], dict
       continue
     ex = edges.get(i)
     out.append(Left(i, ends[i], rc.reach, rc.bent, ex.key if ex else None, ex.exclusion if ex else None, bool(ex and ex.last_edge)))
-  if out:
-    cloudlog.info(f"turnpilot lefts: {len(out)} of the route's {len(candidates)} unprotected lefts past the reach of " +
-                  f"{config.reach_m:.0f} m (steps {[t.step_idx for t in out]}), {sum(t.exclusion is None for t in out)} with no exit known")
+  for i in uturns:
+    ex = edges.get(i)
+    out.append(Left(i, ends[i], 0., False, ex.key if ex else None, ex.exclusion if ex else None, bool(ex and ex.last_edge), kind='uturn'))
+  out.sort(key=lambda t: t.route_m)
+  if uturns:
+    cloudlog.info(f"turnpilot lefts: {len(uturns)} U-turns on the route (steps {uturns}), the car can't drive one")
+  if len(out) > len(uturns):
+    lefts_out = [t for t in out if t.kind == 'left']
+    cloudlog.info(f"turnpilot lefts: {len(lefts_out)} of the route's {len(candidates)} unprotected lefts past the reach of " +
+                  f"{config.reach_m:.0f} m (steps {[t.step_idx for t in lefts_out]}), {sum(t.exclusion is None for t in lefts_out)} with no exit known")
   return out

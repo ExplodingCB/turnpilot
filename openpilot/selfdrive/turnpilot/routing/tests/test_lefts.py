@@ -13,7 +13,7 @@ import pytest
 from openpilot.selfdrive.navigation.navd import RouteEngine
 from openpilot.selfdrive.turnpilot.maps.status import NavStatus
 from openpilot.selfdrive.turnpilot.map_controls import line_setback_at
-from openpilot.selfdrive.turnpilot.route_follower import LEFT, RIGHT, TURN, Maneuver
+from openpilot.selfdrive.turnpilot.route_follower import LEFT, RIGHT, TURN, UTURN, Maneuver
 from openpilot.selfdrive.turnpilot.routing import avoid
 from openpilot.selfdrive.turnpilot.routing.controls import EXCLUDE_BACK_M, Exits, route_controls, route_exits
 from openpilot.selfdrive.turnpilot.routing.lefts import LeftConfig, left_config, route_lefts, route_maneuver
@@ -121,6 +121,7 @@ def test_the_exit_is_the_edge_the_route_leaves_the_junction_by():
 # ---- a synthetic street grid
 
 RIGHT_S, LEFT_S = 2., 5.  # s a right and a left cost the grid's router, as Valhalla's turn costs make lefts dearer
+UTURN_DEG = 170.  # a heading change past this is a U-turn
 MATCH_M = 3.
 
 
@@ -151,9 +152,12 @@ class Grid:
   """Two-way streets [(way id, [(x, y) m, ...], m/s)], every point a node. route() is Dijkstra by time with turn costs (RIGHT_S,
   LEFT_S, no U-turns) around the directed edges an exclude_location closes as Valhalla's does (within MATCH_M of its point,
   heading within EXCLUDE_HEADING_TOL), and gives Valhalla's format=osrm steps: a maneuver at each turn, every node's
-  intersection with its roads' bearings, in and out. opposing() and exits() answer for the steps as the real router does."""
+  intersection with its roads' bearings, in and out. opposing() and exits() answer for the steps as the real router does.
+  uturn_s: U-turns as Valhalla's auto costing makes them, at a dead end only, for this many s, a step of their own
+  (continue/uturn); none mid-road, not even from the start."""
 
-  def __init__(self, roads):
+  def __init__(self, roads, uturn_s=None):
+    self.uturn_s = uturn_s
     self.out = defaultdict(list)
     for way, points, speed in roads:
       for a, b in zip(points, points[1:], strict=False):
@@ -183,12 +187,20 @@ class Grid:
         continue
       done.add((n, prev))
       for m, _, speed in self.out[n]:
-        if m == prev or (n, m) in shut:
+        dead_end = self.uturn_s is not None and len(self.out[n]) == 1
+        if (m == prev and not dead_end) or (n, m) in shut:
           continue
         turn = turned(heading(prev, n), heading(n, m))
-        cost = math.dist(n, m) / speed + (0. if abs(turn) < 30. else RIGHT_S if turn > 0. else LEFT_S)
+        if self.uturn_s is not None and abs(turn) > UTURN_DEG and not dead_end:
+          continue
+        cost = math.dist(n, m) / speed + self.turn_s(turn)
         heapq.heappush(queue, (t + cost, m, n, path + (m,)))
     return None
+
+  def turn_s(self, turn: float) -> float:
+    if self.uturn_s is not None and abs(turn) > UTURN_DEG:
+      return self.uturn_s
+    return 0. if abs(turn) < 30. else RIGHT_S if turn > 0. else LEFT_S
 
   def edge(self, a, b):
     return next((way, speed) for m, way, speed in self.out[a] if m == b)
@@ -216,7 +228,9 @@ class Grid:
         before = heading(path[k0 - 1], path[k0])
         turn = turned(before, after)
         maneuver = {'type': 'turn', 'modifier': 'right' if turn > 0. else 'left', 'bearing_before': round(before), 'bearing_after': round(after)}
-        t += RIGHT_S if turn > 0. else LEFT_S
+        if self.uturn_s is not None and abs(turn) > UTURN_DEG:
+          maneuver.update(type='continue', modifier='uturn')
+        t += self.turn_s(turn)
       maneuver['location'] = [ll(path[k0])[1], ll(path[k0])[0]]
       out.append({'maneuver': maneuver, 'distance': dist, 'duration': t, 'bannerInstructions': [],
                   'geometry': {'coordinates': [[ll(p)[1], ll(p)[0]] for p in path[k0:k1 + 1]]},
@@ -233,7 +247,7 @@ class Grid:
     out = []
     for i, s in enumerate(steps[:-1]):
       at += len(s['geometry']['coordinates']) - 1
-      if steps[i + 1]['maneuver']['type'] == 'turn':
+      if steps[i + 1]['maneuver']['type'] in ('turn', 'continue'):
         out.append((i, at))
     return path, out
 
@@ -364,6 +378,30 @@ class TestGrid:
     assert (r.lefts_avoided, r.lefts_unavoidable) == (1, 0) and turns_of(r.steps) == ['left']  # B's end: a bend, no left
     assert route_maneuver(r.steps, 0).kind == 'none'
     assert skipped(g, r.steps) == [] and all(avoid.same_edge(k, own) is False for k in r.sent)
+
+  def test_a_u_turn_the_car_cant_drive_is_routed_around_by_its_exit(self):
+    """The confirm round's C8 (route_demo, BeamNG): the reroute after the designed left skip asked continue/uturn 100.9 m on,
+    which the driving model can't drive (route_follower: nothing is sent), and the model stood at the green short of it for
+    85 s. The lefts' rules don't see a U-turn (unprotected_turn: a junction turn only), so it was kept. Now a U-turn on the
+    route is a maneuver the car refuses, under every TurnPilotAutoLeft mode, routed around by its exit as a left is: here the
+    dead end the plain route turns at, for the block round to the right, within the detour budget; never counted as a left."""
+    g = Grid([(30, [(100, -200), (100, -100), (100, 0), (100, 50), (100, 100)], 10.), (31, [(100, 50), (200, 50)], 10.),
+              (32, [(200, 50), (200, -100)], 10.), (33, [(200, -100), (100, -100)], 10.)], uturn_s=10.)
+    start, dest = (100, 0), (100, -200)
+    plain = g.route(start, NORTH, dest)
+    assert turns_of(plain) == ['uturn'] and route_maneuver(plain, 0).kind == UTURN
+    for mode in ('auto', 'announce', 'off'):
+      found = skipped(g, plain, LeftConfig(mode=mode))
+      assert [(t.kind, t.step_idx, t.exclusion is not None) for t in found] == [('uturn', 0, True)], mode
+    plain, r = run_grid(g, start=start, dest=dest)
+    assert 'uturn' not in turns_of(r.steps) and turns_of(r.steps)[0] == 'right' and skipped(g, r.steps) == []
+    assert r.iterations == 1 and (r.lefts_avoided, r.lefts_unavoidable) == (0, 0)  # a left's counts only (the phone page's)
+    assert 0. < r.added_s <= avoid.detour_budget_s(avoid.duration(plain))
+    # one with no way round within the budget stays on the route: unavoidable, as a left
+    g = Grid([(30, [(100, -200), (100, -100), (100, 0), (100, 50), (100, 100)], 10.), (31, [(100, 50), (200, 50)], 1.),
+              (32, [(200, 50), (200, -100)], 1.), (33, [(200, -100), (100, -100)], 1.)], uturn_s=10.)
+    plain, r = run_grid(g, start=start, dest=dest)
+    assert r.steps is plain and [t.kind for t in r.lefts] == ['uturn'] and r.lefts[0].unavoidable and r.lefts_unavoidable == 0
 
   def test_navd_routes_around_it_and_says_how_many_never_where(self):
     """The whole of navd: RouteJob's avoidance with the lefts (TurnPilotAutoLeft auto, both ranges unmeasured), and the route's

@@ -53,6 +53,9 @@ module says why not the approach), in the same set, under the same bounds and th
   - every left still on the kept route is unavoidable: skipped out loud at its junction and rerouted, as before. The counts
     (AvoidResult: lefts_avoided, the plain route's lefts not on the kept one; lefts_unavoidable, the kept one's) are what
     navd's TurnPilotMapStatus says, never where.
+The route's U-turns (routing/lefts.py: a Left of kind 'uturn', which the driving model can't drive) are lefts to the loop,
+every rule above theirs too, but no unprotected left to the counts: lefts_avoided and lefts_unavoidable are the lefts' alone,
+what the phone page says of unprotected lefts, and the U-turns' are logged.
 avoidStatus stays the stops' (none with their avoidance off or unsupported, failed with their controls failed): a route whose
 lefts alone went round the loop says nothing about stop signs.
 """
@@ -140,7 +143,7 @@ class AvoidResult:
 
   @property
   def lefts_unavoidable(self) -> int:
-    return len(self.lefts)
+    return sum(t.kind == 'left' for t in self.lefts)  # its U-turns are no unprotected lefts (module docstring)
 
 
 def time_at(steps, route_m: float) -> float:
@@ -188,7 +191,8 @@ def run(steps, controls, controls_status: str, avoid: AvoidSet, *, certify: Call
   turns = lefts(steps, controls)
   if not live(controls_status) and not turns:
     return AvoidResult(steps, controls, controls_status, 'failed' if enabled and controls_status == 'failed' else 'none')
-  plain_lefts = {t.approach_key for t in turns if t.approach_key is not None}
+  plain_lefts = {t.approach_key for t in turns if t.approach_key is not None and t.kind == 'left'}
+  plain_uturns = {t.approach_key for t in turns if t.approach_key is not None and t.kind == 'uturn'}
   sent, excluded, status, iterations, singly = set(), set(), None, 0, False
   added: list = []  # the keys this run put in the set, in order (never one an earlier route's job put there)
 
@@ -346,6 +350,8 @@ def run(steps, controls, controls_status: str, avoid: AvoidSet, *, certify: Call
   on_route = {c.approach_key for c in stops(controls)}
   avoided = len(excluded - on_route)
   lefts_avoided = len(plain_lefts - {t.approach_key for t in turns})
-  cloudlog.info(f"turnpilot avoid: {status}, {avoided} stops and {lefts_avoided} lefts routed around in {iterations} reroutes, " +
-                f"{len(turns)} lefts unavoidable, +{duration(steps) - first:.0f} s")
+  uturns_avoided = len(plain_uturns - {t.approach_key for t in turns})
+  uturns_left = sum(t.kind == 'uturn' for t in turns)
+  cloudlog.info(f"turnpilot avoid: {status}, {avoided} stops, {lefts_avoided} lefts and {uturns_avoided} U-turns routed around in " +
+                f"{iterations} reroutes, {len(turns) - uturns_left} lefts and {uturns_left} U-turns unavoidable, +{duration(steps) - first:.0f} s")
   return AvoidResult(steps, controls, controls_status, status, avoided, iterations, duration(steps) - first, sent, lefts_avoided, turns)

@@ -20,7 +20,7 @@ from openpilot.selfdrive.turnpilot.route_follower import Maneuver, classify
 from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP, POST_GO_PROFILES, V_TURN_MIN
 from openpilot.selfdrive.turnpilot.turnpilotd import (CAR_UNKNOWN_REASON, DETECTOR_DEADLINE_S, DETECTOR_START_DEADLINE_S, NO_LONG_REASON,
                                                        GAS_DISENGAGE_REASON, GO_LINE_M, LEFT_NO_MOVE_S, NEAR_CONTROL_STAND_S, NO_MOVE_REASON, NO_MOVE_S,
-                                                       LIGHT_WAIT_NOTE, PAUSED_REASON,
+                                                       LIGHT_UNREAD_S, LIGHT_WAIT_NOTE, PAUSED_REASON,
                                                        LEAD_STAND_MAX_S, NO_MOVE_MAX_S, SIGNAL_STOPPED_REASON, STALL_MIN_DEG, STALL_PROMPT_S,
                                                        STALLED_REASON, TURN_ABANDON_CURV, TURN_ABANDON_S, TURN_ABANDONED_REASON,
                                                        WRONG_SIDE_MIN_SPEED, WRONG_SIDE_REASON, WRONG_SIDE_S, yellow_on_the_right,
@@ -2078,7 +2078,8 @@ def test_the_stopped_notes_chime_is_silent_near_a_mapped_signal(always_drive):
   with tp/chase-car's chime (PF-14) the 5 s note chimed at each. Within STOPPED_CONTROL_M of a mapped signal the note is the
   status line alone, with no chime; the handback at NEAR_CONTROL_STAND_S comes as before, with its own sound. A signal past
   STOPPED_CONTROL_M, or a stop sign near, chimes once a stand as before. Under TurnPilotAlwaysDrive the note at the signal
-  reads LIGHT_WAIT_NOTE (step S2: the model owns the light)."""
+  reads LIGHT_WAIT_NOTE (step S2: the model owns the light). With no red read there by LIGHT_UNREAD_S the stand is said once,
+  with its own chime (lightNotRead: the confirm round's C8), and is the silent status line again after it."""
   hold = int(round(ABORT_HOLD_S / DT_MDL))
   sim = Sim([(2000., 'turn', 'left', T_LEFT)], controls=[(20., 'signal')])
   sim.tp.always_drive = always_drive
@@ -2087,9 +2088,11 @@ def test_the_stopped_notes_chime_is_silent_near_a_mapped_signal(always_drive):
   text = LIGHT_WAIT_NOTE if always_drive else STOPPED_NOTE
   note = next(i for i, p in enumerate(plans) if p.reason == text)
   back = next(i for i, p in enumerate(plans) if p.controlPrompt != 'none')
+  unread = [i for i, p in enumerate(plans) if str(p.controlAlert) == 'lightNotRead']
   assert not note_chimes(plans)
   assert (note + 1) * DT_MDL == pytest.approx(STOPPED_NOTE_S, abs=1.5 * DT_MDL)
-  assert all(p.reason == text and p.controlAlert == 'none' for p in plans[note:back])  # the status line, silent
+  assert unread and (unread[0] + 1) * DT_MDL == pytest.approx(LIGHT_UNREAD_S, abs=1.5 * DT_MDL) and len(unread) == hold
+  assert all(p.reason == text and p.controlAlert == 'none' for i, p in enumerate(plans[note:back], note) if i not in unread)  # silent
   assert plans[back].controlPrompt == 'carStoppedTakeControl' and plans[back].reason == SIGNAL_STOPPED_REASON
   assert (back - note) * DT_MDL == pytest.approx(NEAR_CONTROL_STAND_S - STOPPED_NOTE_S, abs=1.5 * DT_MDL)
   sim = Sim([(2000., 'turn', 'left', T_LEFT)], controls=[(STOPPED_CONTROL_M + 8., 'signal')])  # 35 m on: not near it

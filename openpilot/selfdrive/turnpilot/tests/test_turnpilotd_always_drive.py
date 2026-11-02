@@ -15,6 +15,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.turnpilot.go_override import GO_CLEAR_M, GO_END_SPEED, TAKEOVER_S
 from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
+from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN
 from openpilot.selfdrive.turnpilot.scene.tracker import RawFrame
 from openpilot.selfdrive.turnpilot.scene_policy import (CROSSWALK_X_AFTER_M, CROSSWALK_X_BEFORE_M, CROSSWALK_Y_FAR_M, CROSSWALK_Y_NEAR_M,
                                                          NO_ACCEL_CAP, SceneDecision)
@@ -22,13 +23,16 @@ from openpilot.selfdrive.turnpilot.stop_go import Frame
 from openpilot.selfdrive.turnpilot.tests.test_camera_lights import detections
 from openpilot.selfdrive.turnpilot.tests.test_go_override import WARM_S
 from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of, model_v2
-from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, RIGHT_AT_A_CORNER, T_LEFT, WALKER, WALKER_CLEAR, Sim, go_from_a_red,
-                                                                 model_stands_in_the_turn, oracle_lights, stand, stop_at, walker_stops_the_car)
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, RIGHT_AT_A_CORNER, T_LEFT, WALKER, WALKER_CLEAR, WHITE, YELLOW, Sim,
+                                                                 go_from_a_red, model_stands_in_the_turn, oracle_lights, stand, stop_at,
+                                                                 walker_stops_the_car)
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_go import attach_planner, holding, model_stops_at, raw_person
 from openpilot.selfdrive.turnpilot.unprotected_left import LIGHT_RED_MAX_S, STAND_UNDECIDED_S
-from openpilot.selfdrive.turnpilot.turnpilotd import (LEAD_STAND_MAX_S, LIGHT_GREEN_REASON, LIGHT_WAIT_NOTE, NEAR_CONTROL_STAND_S, NO_MOVE_MAX_S,
+from openpilot.selfdrive.turnpilot.turnpilotd import (LEAD_STAND_MAX_S, LIGHT_GREEN_REASON, LIGHT_UNREAD_REASON, LIGHT_UNREAD_S, LIGHT_WAIT_NOTE,
+                                                      NEAR_CONTROL_STAND_S, NO_MOVE_MAX_S,
                                                       NO_MOVE_REASON, NO_MOVE_S, PED_NOTE_S, PED_WAITING_NOTE, PED_WAITING_REASON, QUEUE_STILL_MAX_S,
-                                                      RELEASE_GOES, RELEASE_LIFT_M, STALLED_REASON, STALL_LIFTS, STALL_LIFT_GAP_S, STALL_LIFT_REASON,
+                                                      RELEASE_GOES, RELEASE_LIFT_M, STALLED_REASON, STALL_HANDED_MOVED_M, STALL_LIFTS,
+                                                      STALL_LIFT_GAP_S, STALL_LIFT_REASON,
                                                       STALL_MIN_DEG, STALL_PROMPT_S, STALL_REPULSE_S, STANDSTILL_SPEED, STOPPED_HANDBACK_S,
                                                       SIGN_CLEAR_M, SIGN_RUN_FRESH_S, STOPPED_NOTE, STOPPED_NOTE_S, TurnPilot,
                                                       UNSTICK_S)
@@ -498,6 +502,45 @@ def test_a_stalls_handback_for_a_flickering_model_lead_stays_and_no_lift_follows
   assert not any(q.shouldStop for q in plans)
 
 
+def rolled(sim, speeds, flicker=False, **kw):
+  """stand(), the car's speed speeds[k] on frame k instead of 0 (a lift's roll); flicker: lead_prob read on odd frames only."""
+  lead, lead_x = kw.pop('lead_prob', None), kw.pop('lead_x', 30.)
+  plans = []
+  sim.model_holds = True
+  for k, v in enumerate(speeds):
+    on = lead is not None and (not flicker or k % 2)
+    sim.model_kw = {'lead_prob': lead, 'lead_x': lead_x} if on else {}
+    sim.v = v
+    plans.append(sim.step(engaged=True, **kw))
+  sim.model_holds = False
+  return plans
+
+
+def test_a_stalls_handback_stays_through_the_roll_of_the_lift_it_refused():
+  """SAT_RERUN C7 (red_right_g62): clearBox lift 2 ended after 0.6 s for the model's lead (the building, 13.2 m, p 0.93) with the
+  car rolling 0.25-0.5 m/s from that lift. 'Stalled in the turn: take control' came on the refusal and went 0.1 s later, the
+  latch cleared by the roll's first frame at STANDSTILL_SPEED, and clearBox lift 3 went 3 s after toward the same building.
+  The refused lift's roll is no move: the handback stays on every frame and no lift follows it. The car driving on
+  STALL_HANDED_MOVED_M is: the stand it handed back is over."""
+  n = round(1. / DT_MDL)
+  sim = stalled_right(True, deg=58.)
+  plans = stand(sim, STALL_PROMPT_S + 0.2)
+  assert lifts_of(plans), "the stall's first lift"
+  plans += rolled(sim, [0.02 * k for k in range(13)])  # the lift's first 0.6 s from a standstill, to 0.24 m/s
+  plans += rolled(sim, [0.25 + 0.25 * k / n for k in range(n)] + [0.5 * (1. - k / n) for k in range(n)], flicker=True,
+                  lead_prob=0.93, lead_x=13.2)  # the lead read, the lift refused, the roll up to 0.5 m/s and down again
+  plans += rolled(sim, [0.] * round(8. / DT_MDL), flicker=True, lead_prob=0.93, lead_x=13.2)  # standing again, the lead flickering
+  handed = next(i for i, q in enumerate(plans) if q.controlPrompt == 'stalledTakeControl')
+  assert all(q.controlPrompt == 'stalledTakeControl' for q in plans[handed:]), \
+    [round(i * DT_MDL, 2) for i, q in enumerate(plans[handed:], handed) if q.controlPrompt != 'stalledTakeControl'][:5]
+  assert not [s for s in lifts_of(plans) if s[0] > handed], lifts_of(plans)
+  assert sim.tp.odo_m - sim.trace[len(sim.trace) - len(plans) + handed][0] < STALL_HANDED_MOVED_M  # the roll, by the odometer
+  # the model driving on: past STALL_HANDED_MOVED_M the stand is over, and so is its handback
+  moved = rolled(sim, [1.] * round((STALL_HANDED_MOVED_M + 0.5) / DT_MDL))
+  assert moved[-1].controlPrompt == 'none'
+  assert not any(q.shouldStop for q in plans + moved)
+
+
 # --- ST-09 (stalls): a queue in a turn ---
 
 def queued(sim, seconds, moves_every=None):
@@ -593,6 +636,27 @@ def test_a_steady_camera_green_the_model_doesnt_go_on_chimes():
     assert all(str(q.goCertified.cause) == 'none' for q in plans)
 
 
+def test_a_stand_at_a_signal_with_no_red_read_is_said_loudly_long_before_its_handback():
+  """The confirm round's C8 (route_demo): the model stood 85 s at a mapped signal's green, 7 m short of a rerouted U-turn,
+  nothing in its path, and no light source read anything there: 'Waiting at the light' on the status line alone until the
+  90 s handback. A stand at a mapped signal with no red or yellow read for LIGHT_UNREAD_S is said with a chime, once a stand
+  (lightNotRead, LIGHT_UNREAD_REASON); never a lift, and the handback still at NEAR_CONTROL_STAND_S. A camera red there
+  explains the stand: nothing said. Switch on or off."""
+  for on in (True, False):
+    sim = at_a_signal(on)
+    plans = stand(sim, NEAR_CONTROL_STAND_S + 1.)
+    said = [i for i, q in enumerate(plans) if str(q.controlAlert) == 'lightNotRead']
+    assert said and abs(said[0] * DT_MDL - LIGHT_UNREAD_S) < 0.15, (on, said[:1])
+    assert said == list(range(said[0], said[0] + len(said))) and len(said) * DT_MDL <= 3.1  # one chime, held a moment
+    assert plans[said[0]].reason == LIGHT_UNREAD_REASON and plans[said[0]].controlPrompt == 'none'
+    assert LIGHT_UNREAD_S <= NEAR_CONTROL_STAND_S / 3.
+    first = next(i for i, q in enumerate(plans) if q.controlPrompt == 'carStoppedTakeControl')
+    assert abs(first * DT_MDL - NEAR_CONTROL_STAND_S) < 0.2, on
+    assert all(str(q.goCertified.cause) == 'none' for q in plans) and not any(q.shouldStop for q in plans)
+    sim = at_a_signal(on, camera=lambda sim: 'red')
+    assert not any(str(q.controlAlert) == 'lightNotRead' for q in stand(sim, LIGHT_UNREAD_S + 5.)), on
+
+
 # --- LEFT-20 (ST-07 (stalls)): a release where no signal is (RELEASE_UNSIGNALIZED under section 4.5's conditions) ---
 
 def camera_heads(*heads):
@@ -684,11 +748,12 @@ def test_a_stop_sign_seen_only_on_the_approach_bars_the_unsignalized_release(sig
 STAND_AT_M = 160.
 
 
-def stood_off_any_hold(on: bool, seconds: float, status='ok', lights=NO_HEADS, signs=False, controls=(), **kw):
+def stood_off_any_hold(on: bool, seconds: float, status='ok', lights=NO_HEADS, signs=False, controls=(), model_lanes=(0, 0), paint=(),
+                       **kw):
   """The model stands the car at STAND_AT_M on a straight with nothing of TurnPilot's holding it (a model stop off any hold),
-  navd's controls status status, the camera's reads lights, the forward runs' stop-sign boxes signs (sign_runs). Returns the
-  plans of the stand."""
-  sim = Sim(STRAIGHT, controls=list(controls), controls_status=status)
+  navd's controls status status, the camera's reads lights, the forward runs' stop-sign boxes signs (sign_runs), the model's
+  lanes model_lanes (left, right of the car's) and the lane paint paint. Returns the plans of the stand."""
+  sim = Sim(STRAIGHT, controls=list(controls), controls_status=status, model_lanes=model_lanes, paint=paint)
   sim.tp.always_drive = on
   sim.lights = lights
   sim.raw = sign_runs(signs)
@@ -721,6 +786,37 @@ def test_a_model_stop_off_any_hold_gets_one_unstick_lift_at_10_s_under_section_4
     args = {'on': True, **kw}
     _, plans = stood_off_any_hold(args.pop('on'), UNSTICK_S + 4., **args)
     assert not unstick_spans(plans), kw
+
+
+def test_a_stand_that_may_be_on_the_wrong_side_never_gets_the_unstick_lift():
+  """SAT_RERUN R8 (route_demo): after a right's wide exit the model stood itself in the oncoming lane, every paint read unknown,
+  its left road edge 0.3-0.85 m past the car's left line; 'Nothing ahead is holding the car: going on' lifted it 10 s on and
+  the model drove on there at 5-7 m/s. A stand in the road's leftmost lane with a lane on its right and no yellow read on its
+  left, or with a yellow line read on its right, gets no lift (the 60 s handback as with the switch off); on its own side of a
+  two-way road (the oncoming lane on its left), on a one-lane road, or leftmost with the yellow line on its left (a one-way's
+  or a divided road's left lane), the lift as before: an unknown read alone bars nothing."""
+  unknown = (UNKNOWN,) * 4
+  cases = {'R8: leftmost, a lane on its right, paint unknown': ((0, 1), unknown, False),
+           'yellow on its right': ((1, 1), (UNKNOWN, WHITE, YELLOW, UNKNOWN), False),
+           'leftmost, the right line white': ((0, 1), (UNKNOWN, UNKNOWN, WHITE, UNKNOWN), False),
+           'its own side of a two-way road, paint unknown': ((1, 0), unknown, True),
+           'a one-lane road, paint unknown': ((0, 0), unknown, True),
+           "a one-way's left lane, the yellow edge line on its left": ((0, 1), (UNKNOWN, YELLOW, WHITE, UNKNOWN), True)}
+  for why, (lanes, paint, lifted) in cases.items():
+    _, plans = stood_off_any_hold(True, STOPPED_HANDBACK_S + 1., model_lanes=lanes, paint=paint)
+    assert bool(unstick_spans(plans)) is lifted, why
+    assert plans[-1].controlPrompt == 'carStoppedTakeControl' and not any(q.shouldStop for q in plans), why
+  # one frame of the stand reading the car on the wrong side is the stand's
+  sim, plans = stood_off_any_hold(True, 1., model_lanes=(1, 1), paint=(UNKNOWN, WHITE, YELLOW, UNKNOWN))
+  sim.paint = unknown
+  assert not unstick_spans(stand(sim, UNSTICK_S + 2.))
+  # a doubt coming mid-lift withdraws it
+  sim, plans = stood_off_any_hold(True, UNSTICK_S + 0.2, model_lanes=(1, 0), paint=unknown)
+  assert unstick_spans(plans) and sim.tp.go_cert.active
+  sim.paint = (UNKNOWN, WHITE, YELLOW, UNKNOWN)
+  sim.model_lanes = (1, 1)
+  stand(sim, DT_MDL)
+  assert not sim.tp.go_cert.active and sim.tp.go_cert.end == 'wrongSide'
 
 
 def stood_at(raw, seconds=UNSTICK_S + 2., long_control=lambda s: True, at_m=STAND_AT_M):

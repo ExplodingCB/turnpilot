@@ -5,7 +5,14 @@ The comma's own installer (installer.comma.ai/kaileh57/turnpilot) is the install
 LFS object is on the .lfsconfig server. This is for when it can't be used. It builds the tree here, with every submodule at
 its gitlink and every LFS file as its real bytes, copies it to a new directory on the comma, verifies it, and only then
 swaps it in. The old /data/openpilot (sunnypilot) is kept as /data/openpilot.prev-<stamp>; --rollback swaps it back. The
-comma never fetches anything.
+deploy itself fetches nothing on the comma.
+
+Updates stay on, as on the installer path (DisableUpdates 0, TurnPilot's default: no feature ships off): the deploy writes 0,
+undoing the 1 an earlier version of this script left, so a fix pushed to the turnpilot branch reaches the comma through
+Settings > Software. The tree tracks origin/turnpilot on GitHub, so a deployed commit that isn't that branch's tip (one not
+pushed yet) is replaced by the tip at the comma's next update; push it first, or turn updates off for the day by hand
+(INSTALL.md, "Update"). Between the swap and the reboot the old fork's updater may set up its overlay over the new tree:
+the reboot refuses while /data/openpilot/.overlay_init is there, and says how to clear it.
 
 --map-key also writes the map server's API key, from this Mac's ~/turnpilot_data/mapserver/client/key, into the comma's
 TurnPilotMapKey; --map-key-only writes only that. The key goes over ssh's stdin, never on a command line, and is never
@@ -37,7 +44,7 @@ from pathlib import Path
 MAP_KEY_PARAM = "TurnPilotMapKey"  # PERSISTENT | DONT_LOG
 MAP_KEY_FILE = Path.home() / "turnpilot_data" / "mapserver" / "client" / "key"  # SECRET: never printed, never in a repo
 BRANCH = "turnpilot"  # the branch name the comma sees: not in RELEASE_BRANCHES, so IsReleaseBranch is 0
-ORIGIN_URL = "https://github.com/kaileh57/turnpilot.git"  # credential-free; only read, since DisableUpdates is set
+ORIGIN_URL = "https://github.com/kaileh57/turnpilot.git"  # credential-free: the updater fetches pushed fixes from it
 LFS_HEADER = b"version https://git-lfs.github.com/spec/v1\n"
 # item by item what the device reads as real bytes: the driving models (big = chestnut), the TurnPilot detectors, the
 # chestnut firmware, the AGNOS updater, the UI fonts. Every LFS pointer in the tree is replaced; these are checked by name.
@@ -221,8 +228,6 @@ reboot)
   require_offroad "$root"
   [ -x "$t/launch_openpilot.sh" ] || die "$t is missing, or has no launch_openpilot.sh: the comma would boot nothing"
   if [ "$(git -C "$t" config --get remote.origin.url 2>/dev/null || true)" = "$ours" ]; then
-    du=$(pval "$root" DisableUpdates)
-    [ "$du" = 1 ] || die "DisableUpdates is ${du:-unset}, not 1, so TurnPilot's updater would fetch from GitHub after the reboot"
     if [ -e "$t/.overlay_init" ]; then
       # this script never ships it: an updater still running from the old tree has set up its overlay over this one, and
       # the launcher installs a finalized update into a tree that has it
@@ -276,7 +281,7 @@ LFS_CLEAN = ["-c", "filter.lfs.process=git-lfs filter-process", "-c", "filter.lf
 # The same clean filter, written into the comma's .git/config and every .git/modules/<name>/config: the comma's check and
 # the device's own is_dirty() (`git update-index --refresh` and `git diff-index`, no -c) then hash each LFS file the way
 # its pointer was made, whatever AGNOS's git config for user comma has. Without a filter, git hashes the real bytes, and
-# every LFS file reads modified. No smudge and no process filter: checkouts (the updater's, if DisableUpdates is ever 0)
+# every LFS file reads modified. No smudge and no process filter: checkouts (the updater's: updates stay on)
 # keep whatever smudge AGNOS's config gives them, and a process filter there still takes precedence, as git-lfs's own.
 DEVICE_LFS_FILTER = {"filter.lfs.clean": "git-lfs clean -- %f", "filter.lfs.required": "true"}
 
@@ -562,7 +567,7 @@ class Comma:
 
   def reboot(self) -> None:
     """Reboot, once the comma's side has checked again that it is offroad and has a tree to boot, and for a TurnPilot
-    tree that DisableUpdates is 1 and no updater has set up its overlay over it. Raises Refused when it doesn't reboot."""
+    tree that no updater has set up its overlay over it. Raises Refused when it doesn't reboot."""
     step("rebooting the comma, once it has checked again that it is offroad")
     rc, out = self.run("reboot", self.root, ORIGIN_URL)
     if rc == 0 or (rc == 255 and "[comma] rebooting now" in out):  # 255: the connection dropped as it went down
@@ -681,7 +686,7 @@ def deploy(args, comma: Comma, stamp: str) -> int:
   if state["missing_tool"]:
     raise Refused(f"the comma lacks {', '.join(state['missing_tool'])}")
   if state.get("params") != "1":
-    raise Refused(f"no {comma.root}/params/d on the comma, so DisableUpdates can't be set")
+    raise Refused(f"no {comma.root}/params/d on the comma, so DisableUpdates can't be set to 0 (updates on)")
   stage_parent = Path(tempfile.mkdtemp(prefix="turnpilot-deploy-"))
   try:
     facts = build_stage(Path(args.repo), args.commit, stage_parent / "openpilot")
@@ -703,7 +708,8 @@ def deploy(args, comma: Comma, stamp: str) -> int:
       step("dry run: nothing on the comma changed. A deploy would:")
       info(f"copy {facts['nfiles']} files ({gb(facts['bytes'])}) to {incoming}, and check them")
       info(f"rename {comma.root}/openpilot ({current}) to {prev}" if current else f"({comma.root}/openpilot is absent)")
-      info(f"move {incoming} to {comma.root}/openpilot, set DisableUpdates=1, and ask before rebooting")
+      info(f"move {incoming} to {comma.root}/openpilot, set DisableUpdates=0 (updates on), and ask before rebooting")
+      tip_note(Path(args.repo), facts["sha"])
       if args.map_key:
         info(f"write {MAP_KEY_PARAM} from {args.map_key_file}")
       return 0
@@ -729,31 +735,45 @@ def deploy(args, comma: Comma, stamp: str) -> int:
     if rc != 0:
       if rc != 3:  # not the comma's own FAILED line: ssh ended, and the comma's side may have done both moves, one, or none
         raise Failed(comma.state_unknown("swap", rc, "--dry-run", prev) +
-                     f" If it shows TurnPilot in {comma.root}/openpilot, DisableUpdates was not set: set it before rebooting, " +
-                     f"with: ssh {comma.host} \"printf 1 > {comma.root}/params/d/DisableUpdates\"")
+                     f" If it shows TurnPilot in {comma.root}/openpilot, DisableUpdates was not set to 0: turn updates on " +
+                     f"with: ssh {comma.host} \"printf 0 > {comma.root}/params/d/DisableUpdates\"")
       if "MISSING" in out:
         raise Failed(f"the swap failed half way: {comma.root}/openpilot is missing. Run: ssh {comma.host} mv {prev} " +
                      f"{comma.root}/openpilot")
       raise Failed(f"the swap didn't happen. {intact}")
 
-    step("setting DisableUpdates=1, so the updater never fetches from GitHub")
-    rc, out = comma.run("set_param", comma.root, "DisableUpdates", "1")
+    step("setting DisableUpdates=0: updates on, so a fix pushed to the turnpilot branch reaches the comma")
+    rc, out = comma.run("set_param", comma.root, "DisableUpdates", "0")
     if rc != 0:
-      raise Failed(f"TurnPilot is in {comma.root}/openpilot and the old tree is at {prev}, but DisableUpdates is NOT set. " +
-                   f"Don't reboot until it is: ssh {comma.host} \"printf 1 > {comma.root}/params/d/DisableUpdates\"")
+      raise Failed(f"TurnPilot is in {comma.root}/openpilot and the old tree is at {prev}, but DisableUpdates is NOT set to 0, so " +
+                   f"updates may be off. Turn them on with: ssh {comma.host} \"printf 0 > {comma.root}/params/d/DisableUpdates\"")
     if map_key is not None:
       try:
         comma.set_map_key(map_key)
       except Failed as e:
-        raise Failed(f"{e}. TurnPilot is in {comma.root}/openpilot and DisableUpdates is 1; write the key with: " +
+        raise Failed(f"{e}. TurnPilot is in {comma.root}/openpilot and DisableUpdates is 0; write the key with: " +
                      f"{sys.argv[0]} {comma.host} --map-key-only, or in the web app's Map server section") from None
     step(f"done: {comma.root}/openpilot is TurnPilot {facts['sha'][:12]}; the old tree ({current}) is {prev}")
     info("the first boot compiles openpilot and flashes the panda; keep the comma powered until the road view shows")
     info(f"to go back: {sys.argv[0]} {comma.host} --rollback")
+    tip_note(Path(args.repo), facts["sha"])
     ask_reboot(comma, prev)
     return 0
   finally:
     shutil.rmtree(stage_parent, ignore_errors=True)
+
+
+def tip_note(repo: Path, sha: str) -> None:
+  """Say so when sha isn't this Mac's origin/turnpilot (the module docstring: updates on, the comma's updater replaces a
+  commit that isn't the branch's tip with the tip at its next update)."""
+  try:
+    tip = git("rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{BRANCH}^{{commit}}", cwd=source_dirs(repo))
+  except Failed:
+    tip = ""
+  if tip != sha:
+    info(f"NOTE: {sha[:12]} isn't origin/{BRANCH} on this Mac ({tip[:12] or 'not known here'}). Updates are on: the comma's " +
+         f"next update replaces it with the {BRANCH} branch's tip on GitHub. Push it first, or turn updates off for the day " +
+         "(INSTALL.md, Update)")
 
 
 def rollback(args, comma: Comma, stamp: str) -> int:
@@ -780,7 +800,7 @@ def rollback(args, comma: Comma, stamp: str) -> int:
                    f"{comma.root}/openpilot")
     raise Failed(f"the rollback didn't happen; {comma.root}/openpilot is as it was")
   step(f"done: {comma.root}/openpilot is {target}'s tree; the one it replaced is {newprev} (--rollback again swaps back)")
-  info("DisableUpdates stays 1; turn updates back on in the restored fork's settings if you want them")
+  info("DisableUpdates is left as it is (0 after a deploy: updates on); the restored fork's updater follows its own branch")
   ask_reboot(comma, newprev)
   return 0
 

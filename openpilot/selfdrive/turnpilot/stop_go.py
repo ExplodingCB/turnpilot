@@ -601,6 +601,7 @@ class StopGo:
     self.rail_on: dict | None = None
     self.rail_held = False
     self.band_held = False          # the re-run's R2: a band abort stood the car with no room for a go: that stand is the stall's
+    self.rest_held = False          # the confirm round's C3: so did a withdrawn go's rest: its next go is the stall's (_rest_go)
     # ...and its evidence, fed on every vision frame of the encounter (_rail_feed): scene_policy's TrackEvidence (confirmed:
     # its hits, steady, still matched) for the hard tier, our ground pose (x, y, heading from the odometer and turned_deg),
     # and each vehicle's matches in the ground frame (RailTrack)
@@ -1356,7 +1357,19 @@ class StopGo:
         return
       self.aborting = None
       room, need = self.edges.d_min - pos, self._go_room(f)
-      if acting and room < need - 1e-6:
+      if acting and room < need - 1e-6 and self.vision and not self.no_lift and \
+         self.withdrawn not in TAKEOVER_WITHDRAWALS + ('signalVeto',):
+        # the confirm round's C3 (stop_allway_out_of_turn): the go withdrawn for the car from the left starting 1.0 s into it,
+        # before our commit, came to rest 0.18 m from the closest edge, where no go has go_room_vision_m (1.69 m), and H5
+        # handed back from there once that car had crossed. As the band abort's stand (241d36d), under vision that rest is the
+        # stall's: the wait goes on here, held while the lanes left to cross fail their tests (go_holds, the window, the
+        # announce), and its go is the clearBox lift (_rest_go), never H5. Only for a go withdrawn for what those tests saw:
+        # one the model didn't take over (TAKEOVER_WITHDRAWALS) still meets GO_RETRIES and H5 (V3: no lift for a model that
+        # holds), one the driver's signal vetoed hands back as before, and at a signal head (V7) no go lifts the car
+        if not self.rest_held:
+          cloudlog.event("turnpilot.stop_go_rest_stand", key=list(self.key), pos=round(pos, 2), room=round(room, 2), need=round(need, 2))
+        self.rest_held = True
+      elif acting and room < need - 1e-6:
         # a withdrawn go come to rest with no room for another (2.6): H5, never a wait from where no go can start
         self._fault('H5', f, d, f"no room for another go: {room:.2f} m to the closest edge, {need:.2f} needed")
         return
@@ -1420,6 +1433,9 @@ class StopGo:
       return
     room = self.edges.d_min - pos
     need = self._go_room(f)
+    if room < need - 1e-6 and self.rest_held:
+      self._rest_go(f, d, pos, room)
+      return
     if room < need - 1e-6:
       self._fault('H5', f, d, f"no room for a go: {room:.2f} m to the closest edge, {need:.2f} needed")
       return
@@ -1449,6 +1465,26 @@ class StopGo:
                    rank=self.rank, lanes=[(x.role, x.index, round(x.r_seen, 1), round(x.r_req, 1), x.shielded) for x in self.last_lanes],
                    vision=self.vision, need_s=need_s, noLift=self.no_lift, longLook=[r for r, _ in self.long_look],
                    margins=[(x.role, x.index, round(x.r_seen - x.r_req, 1)) for x in self.last_lanes])
+
+  def _rest_go(self, f: Frame, d: StopGoDecision, pos: float, room: float) -> None:
+    """The go from a withdrawn go's rest with no room for another (rest_held, the confirm round's C3): every go condition held
+    for the window and the go said, as any vision go, but committed from here, since no go from here can stop short of the
+    closest edge: the band abort's stand's (241d36d) clearBox lift (_vision_stall's, VISION_BOX_LIFT_M until the model takes
+    over), the in-path rail, the start watch and the band's threat test after it, H5 only at VISION_STALL_H5_S standing."""
+    self.go = {'pos': pos, 't': self.t, 'reach': {(x.role, x.index): x.r_seen for x in self.last_lanes},
+               'tracks': self._known_tracks(f), 'said': True}
+    self.curb_until = self.curb_cap_until()  # D3: past a curb person's crosswalk at STOP_GO_V_MAX at most
+    self.takeover.reset()
+    self.takeover_s, self.uncommit_s, self.stall_s = -1., 0., 0.
+    self.state, self.clear_s, self.went, self.ped_carry_on = 'committed', 0., True, False
+    self.rest_held, self.band_held = False, True
+    self.clear_boxes += 1
+    self.box_next = STALL_BOX_S
+    d.go_cause, d.prompt, d.reason, d.ledger = 'clearBox', 'stopGo', GOING_REASON, 'none'
+    d.action, d.committed, d.detector_view, d.stops = 'committed', True, 'stopSweepGo', []
+    self.said_t = None
+    cloudlog.event("turnpilot.stop_go_rest_go", key=list(self.key), pos=round(pos, 2), room=round(room, 2), n=self.clear_boxes,
+                   lanes=[(x.role, x.index, round(x.r_seen, 1), round(x.r_req, 1), x.shielded) for x in self.last_lanes])
 
   def _need_s(self) -> float:
     """s every go condition must hold for the go: VISION_LONG_CLEAR_S for the long look, VISION_CLEAR_S under vision, else
