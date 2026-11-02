@@ -198,6 +198,10 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     # SAT_VALIDATION row 1: the car's heading turning OFF_ROUTE_TURN_DEG within OFF_ROUTE_TURN_M away from any route maneuver,
     # no turn desire out (turnpilotd.py: off_route_turn): the model turned off the route, take control; no hold, no steering
     offRouteTakeControl @22;
+    # GPS loss: navd can't place the car on its route (navInstruction.positionSource lost: no trusted fix past the hold's limits,
+    # or the car left the route while carried along it; navigation/hold.py): take control, said once a spell from its first
+    # frame engaged, held until the driver takes over or GPS is back (turnpilotd.py: gps_lost); no hold, no steering
+    gpsLostTakeControl @23;
   }
   enum ControlAlert {
     none @0;

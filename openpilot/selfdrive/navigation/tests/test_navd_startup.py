@@ -86,7 +86,8 @@ class TestSeededStart(NavdCase):
     self.tick()
     self.sm.fix = (0.0005, 100 * METER)  # the car was moved, or the seed is old
     self.tick()
-    self.assertEqual(engine.router.calls[1], ((0.0005, 100 * METER), (0.002, 0), 90., 'en'))
+    # no heading: this fix stands still, and a standing fix's bearing is stale (hold.py: route heading)
+    self.assertEqual(engine.router.calls[1], ((0.0005, 100 * METER), (0.002, 0), None, 'en'))
     self.tick()
     self.assertEqual(len(engine.router.calls), 2)  # once
 

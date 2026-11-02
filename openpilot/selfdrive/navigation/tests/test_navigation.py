@@ -919,7 +919,8 @@ class TestBackgroundRouting(unittest.TestCase):
     for _ in range(3):
       self.assertFalse(self.tick().valid)  # no route yet: invalid, but published every second
     self.assertEqual(len(self.router.calls), 1)
-    self.fix = SimpleNamespace(hasFix=True, latitude=0, longitude=0.0005, bearingDeg=80)  # the car moved on meanwhile
+    # the car moved on meanwhile (TurnPilot: a moving fix with a good bearing accuracy, the only heading navd routes with, hold.py)
+    self.fix = SimpleNamespace(hasFix=True, latitude=0, longitude=0.0005, bearingDeg=80, speed=10., bearingAccuracyDeg=2.)
     self.tick()
     self.finish()
     self.assertTrue(self.tick().valid)

@@ -11,7 +11,7 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import Ratekeeper
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.time_helpers import system_time_valid
-from openpilot.selfdrive.navigation.helpers import latest_gps_source
+from openpilot.selfdrive.navigation.hold import GPS, PositionHold, car_motion, gps_fix
 from openpilot.selfdrive.navigation.route import ROUTE_TURNS_STEP_M, along_path, local_meters, route_turns
 from openpilot.selfdrive.turnpilot.routing.controls import haversine
 from openpilot.selfdrive.turnpilot.routing.guidance import (CONTROLS_AHEAD_M, CONTROLS_BEHIND_M, MAX_CONTROLS, control_msg, fill_controls,
@@ -83,7 +83,7 @@ class RouteJob(threading.Thread):
   def __init__(self, engine: 'RouteEngine', destination, language):
     super().__init__(name='navd-route', daemon=True)
     self.engine, self.destination, self.language = engine, destination, language
-    self.start_position, self.start_bearing = engine.last_position, engine.last_bearing
+    self.start_position, self.start_bearing = engine.last_position, engine.route_heading()
     self.seeded = engine.seeded  # TurnPilot: started from LastGPSPosition, not a live fix (RouteEngine.reseed_due)
     self.cancel = threading.Event()
     self.steps: list[dict] | None = None
@@ -159,7 +159,7 @@ class RouteJob(threading.Thread):
 
     def own_edge():
       position, bearing = engine.position()
-      return router.own_edge(position, bearing) if hasattr(router, 'own_edge') and position is not None else None
+      return router.own_edge(position, bearing) if hasattr(router, 'own_edge') and position is not None and bearing is not None else None
 
     def headings(points):
       return router.exclusion_headings(points) if hasattr(router, 'exclusion_headings') else [None for _ in points]
@@ -213,6 +213,9 @@ class RouteEngine:
     # route job started from it is checked against that fix (reseed_due)
     self.seeded = False
     self.route_seeded = False
+    # TurnPilot (GPS loss): where last_position comes from: a trusted fix, held standing, carried along the route without one
+    # (navigation/hold.py), and navInstruction.positionSource
+    self.hold = PositionHold()
 
     self.nav_destination = None
     self.step_idx = None
@@ -274,20 +277,22 @@ class RouteEngine:
   def update(self):
     self.sm.update(0)
 
-    source = latest_gps_source(self.sm)
-    if source is not None:
-      gps = self.sm[source]
-      self.last_position, self.last_bearing = (gps.longitude, gps.latitude), gps.bearingDeg
-      self.seeded = False
     self.note_skip()
+    # TurnPilot (GPS loss): a fix moves the car only when trusted and the car moves; without one the car's own travel carries
+    # it along the route (navigation/hold.py). A turn missed while carried means the car isn't where the hold put it: lost
+    self.hold.update(gps_fix(self.sm), car_motion(self.sm), self.monotonic(), self.route_geometry,
+                     self.step_idx, missed=self.missed and self.step_idx is not None)
+    if self.hold.position is not None:  # a live fix (held or carried from one) replaces LastGPSPosition's seed
+      self.last_position, self.last_bearing, self.seeded = self.hold.position, self.hold.bearing, False
     route, route_count = self.route, self.route_count
     try:
-      self.recompute_route(gps_ok=source is not None)
+      self.recompute_route(gps_ok=self.hold.source == GPS)
       if route is not None and self.route is not None and self.route_count != route_count:
         # TurnPilot: one invalid instruction between two routes, so no maneuver (and its turn desire) carries over to
         # a new route that starts with one of the same type
         msg = messaging.new_message('navInstruction', valid=False)
         msg.navInstruction.routeCount = self.route_count
+        self.fill_position(msg.navInstruction)
         self.fill_off_route(msg)
         self.pm.send('navInstruction', msg)
       else:
@@ -324,7 +329,13 @@ class RouteEngine:
 
   def position(self):
     """(position, bearing) now, for a route job that finishes a download."""
-    return self.last_position, self.last_bearing
+    return self.last_position, self.route_heading()
+
+  def route_heading(self) -> float | None:
+    """TurnPilot: the heading navd routes and looks ahead with: the hold's, a fix's bearing only moving with a good bearing
+    accuracy, else the last good one, else none (hold.py; a standing or just-reacquired u-blox heading is stale or 0). A
+    position set by hand, with no hold, routes with its bearing."""
+    return self.hold.heading if self.hold.position is not None else self.last_bearing
 
   def avoid_set(self, destination) -> avoid.AvoidSet:
     """TurnPilot: the stop-sign exclusions for destination, kept across every route to it; a new destination clears them."""
@@ -450,7 +461,7 @@ class RouteEngine:
       self.requested_destination = None
       return
 
-    # Don't recompute when GPS drifts in tunnels
+    # Don't recompute when GPS drifts in tunnels (TurnPilot: nor while the route is held without a trusted fix, hold.py)
     if not gps_ok and self.step_idx is not None:
       return
 
@@ -544,12 +555,15 @@ class RouteEngine:
                    key=lambda c: c.route_m) if self.route is not None else []
     msg.navInstruction.unavoidableControls = min(len(stuck), 65535)
     msg.navInstruction.firstUnavoidableOnOrigin = bool(stuck) and bool(getattr(stuck[0], 'first_edge', False))
+    self.fill_position(msg.navInstruction)
 
     # TurnPilot: a job while there is a route is a reroute for the same destination (a new one clears the route), as when
     # the car left the corridor and a new one downloads for minutes. The car is off this route meanwhile: its distances
     # mean nothing, and following them would run through its steps to 'Destination reached' and delete the destination.
-    # Nor is there guidance before the first live fix: the seed (seed_position) is only where the car was last seen.
-    if self.step_idx is None or self.job is not None or self.seeded:
+    # Nor is there guidance before the first live fix: the seed (seed_position) is only where the car was last seen. And
+    # with the position lost (GPS gone past the hold's limits, hold.py): the route is kept for the fix that comes back,
+    # and turnpilotd hands back on positionSource lost
+    if self.step_idx is None or self.job is not None or self.seeded or self.hold.lost:
       msg.valid = False
       self.fill_off_route(msg)
       self.pm.send('navInstruction', msg)
@@ -617,20 +631,30 @@ class RouteEngine:
           self.params.remove("NavDestination")
           self.clear_route()
 
+  def fill_position(self, ni):
+    """TurnPilot (GPS loss): navInstruction's positionSource, positionUncertainty and gpsLostS (hold.py), on every message."""
+    ni.positionSource = self.hold.source
+    ni.positionUncertainty = float(self.hold.uncertainty_m)
+    ni.gpsLostS = float(self.hold.lost_s)
+
   def fill_off_route(self, msg):
     """TurnPilot: an invalid navInstruction's offRouteControls and offRouteControlsStatus. With a destination (rerouting, no
     route yet, off it for a fix), the last lookup ahead of the car, measured from where the car is now along the road it
     looked at, and a new lookup started (one at a time, off this loop). pending until the first is in; none with no
-    destination, and nothing looked up."""
+    destination, and nothing looked up. With the position lost (hold.py) there is no place to look ahead from: failed, the
+    stops ahead unknown, never clear."""
     if self.requested_destination is None and self.nav_destination is None:
       self.reset_off_route()
+      return
+    if self.hold.lost:
+      msg.navInstruction.offRouteControlsStatus = 'failed'
       return
     if self.off_status == 'none':
       self.off_status = 'pending'
     self.collect_ahead()
     # TurnPilot: nothing looked up ahead of the seed, a guess, nor offroad, where turnpilotd doesn't run (onroad)
     if self.ahead_job is None and self.last_position is not None and not self.seeded and self.onroad():
-      self.ahead_job = AheadJob(self.router, self.last_position, self.last_bearing)
+      self.ahead_job = AheadJob(self.router, self.last_position, self.route_heading())
       if self.background:
         self.ahead_job.start()
       else:
@@ -683,6 +707,7 @@ class RouteEngine:
     self.route_geometry = None
     self.step_idx = None
     self.nav_destination = None
+    self.missed = False  # TurnPilot: a turn missed on this route, never the next one's (it would lose a GPS hold, hold.py)
 
   def on_next_step(self, lateral: float, distance_to_maneuver: float) -> bool:
     """The car is on the next step's geometry and off this one's: a sharp turn leaves the step sideways, and along it the
@@ -726,6 +751,10 @@ class RouteEngine:
     # Don't recompute in last segment, assume destination is reached
     if self.step_idx == len(self.route) - 1:
       return False
+    # TurnPilot (GPS loss): standing, the car can't leave its route, so no fix counts toward a reroute (hold.py: GPS jitter at
+    # a light rerouted from a wandering spot with a standstill bearing)
+    if self.hold.standing:
+      return False
 
     # TODO: Check for going wrong way in segment
     if along_path(self.route_geometry[self.step_idx], self.last_position)[1] > REROUTE_DISTANCE:
@@ -738,8 +767,10 @@ class RouteEngine:
 def main():
   pm = messaging.PubMaster(['navInstruction', 'navRoute'])
   # TurnPilot: turnpilotPlan says when a turn was skipped (too fast), so navd reroutes past it at once; deviceState whether
-  # the car is started (navd runs offroad too: RouteEngine.onroad)
-  sm = messaging.SubMaster(['gpsLocation', 'gpsLocationExternal', 'turnpilotPlan', 'deviceState'], ignore_alive=['turnpilotPlan'],
+  # the car is started (navd runs offroad too: RouteEngine.onroad); carState and deviceMotion carry the route through a GPS
+  # loss (hold.py), absent offroad
+  sm = messaging.SubMaster(['gpsLocation', 'gpsLocationExternal', 'turnpilotPlan', 'deviceState', 'carState', 'deviceMotion'],
+                           ignore_alive=['turnpilotPlan'],
                            ignore_avg_freq=['turnpilotPlan'], ignore_valid=['turnpilotPlan'])
 
   rk = Ratekeeper(1.0)

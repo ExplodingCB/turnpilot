@@ -4,7 +4,7 @@ import pyray as rl
 from msgq.visionipc import VisionIpcClient
 from openpilot.cereal.visionipc import VisionStreamType
 from openpilot.common.constants import CV
-from openpilot.selfdrive.navigation.helpers import latest_gps_source
+from openpilot.selfdrive.navigation.helpers import gps_status
 from openpilot.selfdrive.navigation.renderer import EGO, ROUTE_INTENSITY, SIZE
 from openpilot.selfdrive.ui.mici.onroad.cameraview import CONNECTION_RETRY_INTERVAL
 from openpilot.selfdrive.ui.ui_state import ui_state
@@ -84,13 +84,14 @@ class NavigationPanel(Widget):
 
   def _draw_status(self, rect):
     """What the map is waiting on, in place of the map."""
+    # TurnPilot: the GPS line is navd's own word through a GPS loss ('GPS lost, holding route'), never just gone
     statuses = (
-      ('GPS fix', latest_gps_source(ui_state.sm) is not None),
-      ('Route', self.routing),
-      ('Map frames', self.map_ready),
+      gps_status(ui_state.sm),
+      (f'Route: {"yes" if self.routing else "no"}', self.routing),
+      (f'Map frames: {"yes" if self.map_ready else "no"}', self.map_ready),
     )
-    for i, (name, ok) in enumerate(statuses):
-      gui_label(rl.Rectangle(rect.x + 10, rect.y + 12 + i * 28, rect.width - 20, 26), f'{name}: {"yes" if ok else "no"}', 22,
+    for i, (text, ok) in enumerate(statuses):
+      gui_label(rl.Rectangle(rect.x + 10, rect.y + 12 + i * 28, rect.width - 20, 26), text, 22,
                 self._accent if ok else self._muted, FontWeight.MEDIUM, alignment_vertical=TextAlignmentVertical.TOP)
 
   def _render(self, rect):
@@ -103,7 +104,9 @@ class NavigationPanel(Widget):
       gui_label(rl.Rectangle(x+64, y+11, rect.width-72, 40), format_distance(max(0, instruction.maneuverDistance)), 34, rl.WHITE, FontWeight.BOLD,
                 alignment_vertical=TextAlignmentVertical.TOP)
     else:
-      gui_label(rl.Rectangle(x+12, y+18, rect.width-24, 30), 'Waiting for route', 26, rl.WHITE, FontWeight.BOLD,
+      # TurnPilot: navd keeps the route while its position is lost (navigation/hold.py), so that, not a route to wait for
+      lost = ui_state.sm.alive['navInstruction'] and str(instruction.positionSource) == 'lost'
+      gui_label(rl.Rectangle(x+12, y+18, rect.width-24, 30), 'GPS lost' if lost else 'Waiting for route', 26, rl.WHITE, FontWeight.BOLD,
                 alignment_vertical=TextAlignmentVertical.TOP)
     top = HEADER_HEIGHT
     if street:
