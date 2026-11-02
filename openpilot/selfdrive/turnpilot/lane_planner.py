@@ -52,7 +52,9 @@ longer needed, the car too slow or too close to the maneuver, DesireHelper waiti
 nothing cancels it: the car is already moving over. Where the car works its own turn signal (turnpilot/car_signals.py,
 a verified Tesla), the lamp goes on with the warning and the request waits, past the countdown, until it has been lit for
 the legal distance (litM >= leadM, IC 9-21-8-25), and the driver's lamp the other way or hazards (the port's block) are
-the driver declining the change: aborted noSignal. Who signals is latched per offer: one made with the car signalling
+the driver declining the change: aborted noSignal. The window opens early enough for that lead and the change itself, so
+the car is in its lane by the window's end (lane_change_window's room_s), and between two changes the same way the lamp
+stays lit (signal_side), the second's lead its whole run. Who signals is latched per offer: one made with the car signalling
 keeps the car's path unless the car's signal fails (then the driver's path, prompted); one made with the driver
 signalling keeps it to its end. A change the driver makes alone gets the same cooldown before the next
 offer, for the lines to settle. TurnPilotLanePaintActive off plans no change at all; turnpilotd then publishes what this
@@ -136,7 +138,8 @@ STOPPED_V = 2.               # m/s: an object this slow in the target lane, up t
 STOPPED_X_M = 80.
 
 LC_START_S, LC_START_MIN_M, LC_START_MAX_M = 20., 150., 400.  # lane changes start this far before the maneuver...
-LC_END_S, LC_END_MIN_M, LC_END_MAX_M = 6., 60., 120.          # ...and none start closer than this
+LC_END_S, LC_END_MIN_M, LC_END_MAX_M = 6., 60., 120.          # ...and none start closer than this (and, with the offer's
+                                                              # room, the window has the car in the lane by then)
 LC_EXTRA_LANE_S = 8.        # each change past the first starts this much earlier (an exit across a highway)
 LC_SPEED_MARGIN = 0.5       # m/s above DesireHelper's minimum, so a request never waits below it
 LC_CONFIRM_FRAMES = 10      # the same need this many frames in a row before the warning
@@ -160,8 +163,11 @@ STOP_CURVE_DECEL = 1.5      # m/s^2: map_controls.MAP_STOP_DECEL, the braking cu
 STOP_CURVE_LAG_S = 1.       # ...after a second's lag (scene_policy.STOP_LAG_S)
 LC_DH_START_S = 1.5         # s from the request to DesireHelper starting the change, blind spot clear
 LC_OFFER_ROOM_S = LC_WARN_S + LC_DH_START_S  # s at speed an offer needs before the slow zone: the warning and the start
-LC_PRE_LEAD_S = LC_CONFIRM_FRAMES * DT_MDL + LC_OFFER_ROOM_S + 2.  # s: the window before a stop opens this long ahead of its
-                                                                    # slow zone: the confirming frames, the offer, 2 s spare
+LC_SPARE_S = 2.
+LC_CHANGE_S = 5.            # s a change takes once DesireHelper starts it (the model moving the car over, its end)
+LC_PRE_LEAD_S = LC_CONFIRM_FRAMES * DT_MDL + LC_OFFER_ROOM_S + LC_SPARE_S  # s: the window before a stop opens this long
+                                                                           # ahead of its slow zone: the confirming frames,
+                                                                           # the offer, LC_SPARE_S spare
 GO_ACCEL = 1.0              # m/s^2: the model pulls away from a stop at about this, or faster
 # m from the stop to the window's end the change needs after the go: up to LC_SPEED_MIN at GO_ACCEL (49 m), then the
 # confirming frames and the offer at that speed (50 m)
@@ -469,10 +475,20 @@ def lane_changes_needed(maneuver, lanes: ModelLanes, right_hand_traffic: bool = 
   return need
 
 
-def lane_change_window(v_ego: float, changes: int = 1) -> tuple[float, float]:
-  """(start, end) m before the maneuver, for this many lane changes still to make."""
-  start = min(max(LC_START_S * v_ego, LC_START_MIN_M), LC_START_MAX_M) + max(changes - 1, 0) * LC_EXTRA_LANE_S * v_ego
+def lane_change_window(v_ego: float, changes: int = 1, room_s: float | None = None) -> tuple[float, float]:
+  """(start, end) m before the maneuver, for this many lane changes still to make. room_s: the offer's room (offer_room_s:
+  the warning, or where the car signals the lamp's legal lead, and DesireHelper's start), and the window opens early enough
+  for the first change to be confirmed, offered, started and made with LC_SPARE_S to spare by its end, each one after it
+  LC_EXTRA_LANE_S on: the car in the lane before the end, not just under way at it. Never past LC_START_MAX_M (and the
+  extra lanes), so a highway's window is as it was. The lamp's 300 ft took most of a city window (at 18 mph the offer at
+  181 m, the request at 84 m, in the turn lane 50 m out), and a second change none was left for: the first drive's car
+  into its turn lane only at the light. A driver's warning (LC_OFFER_ROOM_S) fits the windows as they were at every speed."""
+  extra = max(changes - 1, 0) * LC_EXTRA_LANE_S * v_ego
+  start = min(max(LC_START_S * v_ego, LC_START_MIN_M), LC_START_MAX_M) + extra
   end = min(max(LC_END_S * v_ego, LC_END_MIN_M), LC_END_MAX_M)
+  if room_s is not None:
+    made = end + v_ego * (LC_CONFIRM_FRAMES * DT_MDL + room_s + LC_CHANGE_S + LC_SPARE_S) + extra
+    start = max(start, min(made, LC_START_MAX_M + extra))
   return start, end
 
 
@@ -486,12 +502,12 @@ def stop_window(v_ego: float, distance: float, stop_d: float | None, changes: in
   """(start, end, wait) of the lane change window for this many changes with a map stop stop_d m ahead (module docstring),
   the maneuver distance m ahead. wait: '' (offer in the window), 'afterStop' or 'unreachable'. A stop past the maneuver, or
   one before the window at the change's speed (the car is up to speed again by its start), changes nothing."""
-  start, end = lane_change_window(v_ego, changes)
+  start, end = lane_change_window(v_ego, changes, room_s)
   if stop_d is None or not 0. <= stop_d < distance:
     return start, end, ''
   before = distance - stop_d  # m before the maneuver the stop is
   v = max(v_ego, LC_SPEED_MIN)
-  if before >= lane_change_window(v, changes)[0]:  # slowing for it shrinks the window: not the window at speed
+  if before >= lane_change_window(v, changes, room_s)[0]:  # slowing for it shrinks the window: not the window at speed
     return start, end, ''
   end_stop = max(end, before + slow_zone(v))
   if distance - end_stop >= v * room_s:
@@ -669,6 +685,7 @@ class LanePlanner:
     self._clear_t = 0.                # ...s the blind spot holding it has read clear
     self._curb_marked = False         # the curb-side ego line read solid or yellow on a frame of the window, since the car's last
                                       # lane change: no change on less than paint there for the rest of it (4.10)
+    self._carry = LaneChange.none     # a change of ours just made, with the route wanting another that way: signal_side
 
   @property
   def active(self) -> bool:
@@ -676,12 +693,17 @@ class LanePlanner:
 
   @property
   def signal_side(self) -> int:
-    """The side to signal for the planner: the offer's from its warning, and ours until the change under way is over."""
+    """The side to signal for the planner: the offer's from its warning, ours until the change under way is over, and on
+    from it through the cooldown while the route wants another change that way, until that one is offered (or anything
+    ends it: an abort, the window's end, the driver's lamp the other way). A driver crossing two lanes signals throughout;
+    the car's lamp going dark between them (the turn not armed yet) started its 300 ft lead over, and the second change of a
+    three-lane road had no window left for it. The carry lengthens one continuous request by a cooldown and an offer (tens
+    of seconds at most), well inside the port's own cap on one (opendbc car_signal.REQUEST_CAP_S, 300 s)."""
     if self.phase in (Phase.WARN, Phase.REQUEST, Phase.WAIT):
       return self.offer
     if self.ours and self._lc_dir:
       return _toward(self._lc_dir)
-    return LaneChange.none
+    return self._carry
 
   def update(self, maneuver, distance: float, lanes: ModelLanes, lc_state, v_ego: float, left_blinker: bool,
              right_blinker: bool, objects, driver_signals: bool, right_hand_traffic: bool, dt: float, paint=(),
@@ -703,16 +725,28 @@ class LanePlanner:
     if maneuver_id != self._done_id:  # a new maneuver: its changes are counted from here
       self._done_id, self.done, self._start = maneuver_id, 0, None
       self._lane_seen = self._curb_marked = False
+      self._carry = LaneChange.none
     if maneuver_id != self._judged_id:
       self._blocked = False
     changing = lc_state in (LaneChangeState.laneChangeStarting, LaneChangeState.laneChangeFinishing)
     read = len(paint) == 4  # this frame's paint read (turnpilotd.plan_paint), before the hold gives a frame with none four lines
-    paint = self.yellow.update(paint, v_ego, dt, changing)
     if changing and self._lc_dir is None:
       self.lines.reset()
       self._before = self._last_lanes
     self.lines.update(lanes, dt)
     self._last_lanes = lanes
+    # a change just ended, ours or the driver's; or the car crossed a line with no change of DesireHelper's (openpilot off, a
+    # manual change). The yellow holds move with the lines before this frame's paint goes into them: by this frame the model
+    # has relabelled its lines, so this frame's yellow is already the lane the car is in. Shifted after it, a far-left centre
+    # line read on the frame a change left ended came to sit on the ego line: the next change toward it read lineNotBroken
+    # for YELLOW_HOLD_M (a three-lane road's second change never went), and the curb side's count went to 0 (the car placed
+    # in the curb lane, the turn lane "Can't Confirm Lane")
+    ended = not changing and self._lc_dir is not None
+    crossed = not changing and self._lc_dir is None and self.lines.moved
+    made = ended and self._lc_dir != 0 and (self.lines.moved == self._lc_dir or counts_shifted(self._before, lanes, self._lc_dir))
+    if ended or crossed:
+      self.yellow.shift(self._lc_dir if made else 0)
+    paint = self.yellow.update(paint, v_ego, dt, changing)
     if changing:  # never cancelled once started: the car is already moving over
       if self._lc_dir is None:  # ours, or the driver's by the blinker
         req = self.offer if self.phase == Phase.REQUEST else \
@@ -724,19 +758,17 @@ class LanePlanner:
       self.lane_unknown = False
       self._reset()
       return self._decision()
-    if self._lc_dir is not None:  # a change just ended, ours or the driver's
-      made = self._lc_dir != 0 and (self.lines.moved == self._lc_dir or counts_shifted(self._before, lanes, self._lc_dir))
-      self.yellow.shift(self._lc_dir if made else 0)
+    if ended:
       if made and self.done is not None:
         self.done += self._lc_dir
       else:  # a way not seen, or the car not seen to get there: nothing to dead reckon from for the rest of this maneuver
         self.done, self._start = None, None
+      self._carry = _toward(self._lc_dir) if made and self.ours else LaneChange.none  # its lamp on for the next (signal_side)
       self._lc_dir = None
       self.lines.reset()
       self._cooldown = max(self._cooldown, LC_COOLDOWN_S)
       self._lane_seen = self._curb_marked = False  # read from the lane the car left
-    elif self.lines.moved:  # the car crossed a line with no change of DesireHelper's (openpilot off, a manual change)
-      self.yellow.shift(0)
+    elif crossed:
       self.done, self._start = None, None
       self.lines.reset()
       self._lane_seen = self._curb_marked = False
@@ -747,16 +779,19 @@ class LanePlanner:
     fast = v_ego > LC_SPEED_MIN
     wanted = desired_changes(maneuver, lanes, right_hand_traffic, paint, self.done, self._start)
     want = wanted if fast else 0
-    start, end = lane_change_window(v_ego, abs(wanted))
+    room = offer_room_s(v_ego, lead_m if not driver_signals else None)
+    start, end = lane_change_window(v_ego, abs(wanted), room)
     if len(paint) == 4 and 0. < distance < start:  # 4.10: a curb-side line read solid or yellow is never less than paint
       ego = paint[2 if right_hand_traffic else 1]
       self._curb_marked = self._curb_marked or _yellow(ego) or (ego.kind == 'solid' and ego.confidence >= SOLID_WHITE_CONF_MIN)
     # a curb-side change on less than paint (curb_lane_unpainted), only on paint read this frame
     unpainted = self.always_drive and not self._curb_marked and read
-    room = offer_room_s(v_ego, lead_m if not driver_signals else None)
     win_start, win_end, stop_wait = stop_window(v_ego, distance, stop_d, abs(wanted), room)
     self._want = wanted
     want_dir = LEFT if want > 0 else RIGHT if want < 0 else 0
+    if _toward(LEFT if wanted > 0 else RIGHT if wanted < 0 else 0) != self._carry or distance <= win_end or \
+       not self.paint_rule or not inputs_valid or car_block:
+      self._carry = LaneChange.none
     nav = _nav_lanes(maneuver)
     if nav and want_dir:
       lo, hi = nav_lane_span(len(nav), paint_lanes(lanes, paint), right_hand_traffic, self.done, self._start)
@@ -956,7 +991,7 @@ class LanePlanner:
     return self._decision(ABORT_TEXT[reason])
 
   def _reset(self) -> None:
-    self.phase, self.offer, self.countdown = Phase.IDLE, LaneChange.none, 0.
+    self.phase, self.offer, self.countdown, self._carry = Phase.IDLE, LaneChange.none, 0., LaneChange.none
     self._confirm, self._candidate, self._wait_t, self._pre_t = 0, LaneChange.none, 0., 0.
     self._pending, self._pending_t = '', 0.
     self._hold, self._clear_t = 'none', 0.

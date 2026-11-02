@@ -1250,6 +1250,83 @@ def test_car_signal_short_window_is_too_late():
   assert not drive.requests and [a for a, _ in drive.aborts][:1] in (['tooLate'], [])
 
 
+def test_where_the_car_signals_the_window_has_the_car_in_its_lane_by_its_end():
+  """The first drive (2026-11-01): the car into its turn lane only at the light. The lamp's 300 ft took most of a city window,
+  the change starting by its end at best (at 18 mph the offer at 181 m, the change at 84 m, in the lane 50 m out), and a
+  second change got no time at all. With the offer's room the window opens early enough for the whole of the change, and a
+  driver's warning (LC_OFFER_ROOM_S) leaves every window as it was; nor does a highway's past LC_START_MAX_M."""
+  from openpilot.selfdrive.turnpilot.lane_planner import (LC_CHANGE_S, LC_OFFER_ROOM_S, LC_SPARE_S, LC_START_MAX_M, LC_EXTRA_LANE_S,
+                                                          offer_room_s)
+  for v in (3., 5.4, 8., 11.2, 13.4, 15.6, 20., 25., 31.):
+    for n in (1, 2):
+      assert lane_change_window(v, n, LC_OFFER_ROOM_S) == lane_change_window(v, n), (v, n)
+    start, end = lane_change_window(v, 1, offer_room_s(v, 91.44))
+    assert start >= lane_change_window(v)[0] and lane_change_window(v, 1, offer_room_s(v, 91.44))[1] == lane_change_window(v)[1]
+    need = end + v * (LC_CONFIRM_FRAMES * DT_MDL + offer_room_s(v, 91.44) + LC_CHANGE_S + LC_SPARE_S)
+    assert start == pytest.approx(max(lane_change_window(v)[0], min(need, LC_START_MAX_M))), v
+    assert lane_change_window(v, 2, offer_room_s(v, 91.44))[0] == pytest.approx(start + LC_EXTRA_LANE_S * v)
+  assert lane_change_window(31., 1, offer_room_s(31., 91.44)) == lane_change_window(31.)  # a highway's: as it was
+  # closed loop at 18 mph, the car's lamp leading the change by 300 ft: in the turn lane before the window's end
+  for v in (5.4, 8.):
+    drive = car_drive(v=v)
+    m = maneuver("turn", "right", TWO_LANES_RIGHT_TURN)
+    start, end = lane_change_window(v, 1, offer_room_s(v, 91.44))
+    distance = start + 10.
+    while drive.lp.changes == 0 and distance > 0.:
+      drive.step(m, distance)
+      distance -= v * DT_MDL
+    assert drive.lp.changes == 1 and not drive.aborts and distance > end, (v, distance, end)
+    assert drive.offers[0][1] > lane_change_window(v)[0]  # earlier than the window was
+
+
+def centre_line(lanes_left, lanes_right):
+  """Our lanes beside a solid yellow centre line: broken white between them, solid white at the curb, the next line out of
+  each ego line read too."""
+  left, far_left = (BW, SY if lanes_left == 1 else BW) if lanes_left else (SY, UNKNOWN)
+  right, far_right = (BW, SW if lanes_right == 1 else BW) if lanes_right else (SW, UNKNOWN)
+  return far_left, left, right, far_right
+
+
+def test_a_centre_line_read_as_a_change_ends_is_held_on_its_own_line():
+  """test_fundamentals' three-lane left: the centre line comes into view as the far-left line when the first change ends. The
+  yellow holds moved with the lines after that frame's paint went into them, so its yellow came to sit on the ego line: the
+  second change toward it read lineNotBroken for YELLOW_HOLD_M, and the turn was skipped. On a two-lane road the change
+  into the lane by the centre line put its yellow on the ego right line: the curb side counted 0, and the turn lane the car
+  was in said "Can't Confirm Lane". The holds now move before the frame's paint goes in."""
+  left = maneuver("turn", "left", THREE_LANES_LEFT_TURN)
+  drive = Drive(lanes_left=2, lanes_right=0, paint=centre_line)
+  drive.run(left, 500., 40.)
+  assert drive.lp.changes == 2 and (drive.lanes_left, drive.lanes_right) == (0, 2) and not drive.aborts
+  assert 'lineNotBroken' not in {d.wait for d in drive.decisions}
+  two = maneuver("turn", "left", ((("left",), True), (("straight",), False)))
+  drive = Drive(lanes_left=1, lanes_right=0, paint=centre_line)
+  drive.run(two, 400., 30.)
+  assert drive.lp.changes == 1 and (drive.lanes_left, drive.lanes_right) == (0, 1)
+  assert not drive.lp.lane_unknown and 'laneUnknown' not in {d.wait for d in drive.decisions}
+
+
+def test_the_cars_lamp_stays_lit_between_two_changes_the_same_way():
+  """Where the car signals, its lamp stays on its side from the first of two changes the same way to the second (signal_side
+  through the cooldown): one signal across both lanes, and the second change's lead is the lamp's whole run, so it goes at its
+  warning's end, never another 300 ft on. Dark between them, its lead started over and a three-lane road's second change had
+  no window left. The carry ends with the changes the route wants that way."""
+  drive = Drive(lanes_left=2, lanes_right=0, v=11.2)
+  drive.car_kw, drive.car_lamp = {'lit_m': 0., 'lead_m': 91.44}, True
+  m = maneuver("turn", "left", THREE_LANES_LEFT_TURN)
+  distance, sides = 500., []
+  while drive.lp.changes < 2 and distance > 0.:
+    drive.step(m, distance)
+    sides.append(drive.lp.signal_side)
+    distance -= drive.v * DT_MDL
+  assert drive.lp.changes == 2 and not drive.aborts and len(drive.offers) == 2
+  first = next(i for i, s in enumerate(sides) if s != LaneChange.none)
+  assert set(sides[first:-1]) == {LaneChange.left}  # (the last: the second change over, nothing more wanted that way)
+  (_, _, t_offer), (_, _, t_req) = drive.offers[1], drive.requests[1]
+  assert abs((t_req - t_offer) - LC_WARN_S) < 2 * DT_MDL  # its lead already lit: the warning alone
+  drive.run(m, distance, 5.)
+  assert drive.lp.signal_side == LaneChange.none  # in the turn lane: nothing carried
+
+
 def test_car_signal_failed_mid_offer_prompts_the_driver():
   drive = car_drive()
   m = maneuver("turn", "right", TWO_LANES_RIGHT_TURN)

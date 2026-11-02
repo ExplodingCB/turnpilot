@@ -133,13 +133,14 @@ class FakeNavd:
                            wrong_way=self.wrong_way.get(self.step, 0.))
 
 
-def road(lanes_left, lanes_right, line_prob=0.9, edge_std=0.3, lane_width=LANE_WIDTH, shoulder=0.5):
-  """(line_ys, line_probs, edge_ys, edge_stds) as modelV2 sees a straight road: the car centered in its lane with
-  lanes_left and lanes_right more lanes beside it; y positive right, as modelV2 publishes it."""
+def road(lanes_left, lanes_right, line_prob=0.9, edge_std=0.3, lane_width=LANE_WIDTH, shoulder=0.5, offset=0.):
+  """(line_ys, line_probs, edge_ys, edge_stds) as modelV2 sees a straight road: the car in its lane, offset m right of its
+  centre (a lane change under way), with lanes_left and lanes_right more lanes beside it; y positive right, as modelV2
+  publishes it."""
   half = lane_width / 2
-  line_ys = [-half - lane_width, -half, half, half + lane_width]
+  line_ys = [y - offset for y in (-half - lane_width, -half, half, half + lane_width)]
   line_probs = [line_prob if lanes_left else 0.05, line_prob, line_prob, line_prob if lanes_right else 0.05]
-  edge_ys = [-half - lanes_left * lane_width - shoulder, half + lanes_right * lane_width + shoulder]
+  edge_ys = [-half - lanes_left * lane_width - shoulder - offset, half + lanes_right * lane_width + shoulder - offset]
   return line_ys, line_probs, edge_ys, [edge_std, edge_std]
 
 
@@ -147,8 +148,9 @@ DRIVING_PLAN_V = 5.  # m/s: the speed plan of a model driving on (go_override.mo
 
 
 def model_v2(lanes_left=0, lanes_right=0, lane_change_state='off', big=False, lead_prob=None, lead_x=30., holds=False, accel=0.,
-             should_stop=None, curvature=0., **kwargs):
-  """A modelV2 reader with flat lane lines and road edges from road(); big: from the big (chestnut) driving model;
+             should_stop=None, curvature=0., lane_change_direction='none', **kwargs):
+  """A modelV2 reader with flat lane lines and road edges from road(); lane change state and direction: DesireHelper's,
+  as modeld publishes them in meta; big: from the big (chestnut) driving model;
   lead_prob: leadsV3[0].prob, lead_x m ahead (no leads without it). holds: the model holds the car (action.shouldStop, a
   speed plan of 0, G0's stand); otherwise it drives on (shouldStop false, DRIVING_PLAN_V planned). accel: its
   action.desiredAcceleration; should_stop: its action.shouldStop, if not holds's; curvature: its action.desiredCurvature
@@ -172,6 +174,7 @@ def model_v2(lanes_left=0, lanes_right=0, lane_change_state='off', big=False, le
     edge.y = [float(y)] * len(x)
   m.roadEdgeStds = [float(s) for s in edge_stds]
   m.meta.laneChangeState = lane_change_state
+  m.meta.laneChangeDirection = lane_change_direction
   m.big = big
   if lead_prob is not None:
     m.init('leadsV3', 3)
