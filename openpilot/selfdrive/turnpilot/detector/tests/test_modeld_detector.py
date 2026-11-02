@@ -860,3 +860,22 @@ def test_the_side_views_maps_and_warm_up_are_on_the_frames_device(monkeypatch, t
   # compiled for another device than the frame's: refused at load, logged, never run
   loaded['art'] = art(Device.DEFAULT)
   assert md.load_side(state, 1344, 760, 1, None) is None and not loaded['art']['run'].devices
+
+
+def test_side_maps_run_off_modelds_realtime_core(monkeypatch):
+  """The side maps' worker drops modeld's SCHED_FIFO 54 and core 7 (dmonitoringmodeld's core) before its first recompute, in
+  its own thread."""
+  import threading
+  import openpilot.common.realtime as realtime
+  import openpilot.selfdrive.turnpilot.detector.modeld_detector as md
+  calls = []
+  monkeypatch.setattr(realtime, 'drop_realtime', lambda: calls.append(('drop', threading.current_thread().name)))
+  monkeypatch.setattr(realtime, 'set_core_affinity', lambda cores: calls.append((tuple(cores), threading.current_thread().name)))
+  executor = md.side_maps_executor()
+  try:
+    worker = executor.submit(lambda: threading.current_thread().name).result(timeout=5)
+  finally:
+    executor.shutdown()
+  assert worker.startswith('side_maps') and worker != threading.current_thread().name
+  assert calls == [('drop', worker), (tuple(md.SIDE_MAPS_CORES), worker)]
+  assert 7 not in md.SIDE_MAPS_CORES

@@ -321,6 +321,42 @@ def plan_accel(accel_cap: float, speed_cap: float, v_ego: float) -> float:
   return min(accel_cap, max((speed_cap - v_ego) / SPEED_CAP_TAU, SPEED_CAP_ACCEL_MIN))
 
 
+# Driver monitoring's view of TurnPilot's maneuvers (dmonitoringd -> policy.DriverMonitoring.run_step's maneuver_scan): while one
+# has the driver checking the junction or the mirrors, DM lets the head turn either way by stock's own steering allowance
+# (_POSE_YAW_STEER_MAX_OFFSET, 22.5 deg past its yaw threshold). Stock openpilot is handed back at a junction; TurnPilot stays
+# engaged through the stop, the creep, the go and the turn, where an attentive driver looks left and right. Speed caps the
+# junction states: above JUNCTION_SCAN_V_MAX the car is through the junction, and the eyes belong ahead.
+JUNCTION_SCAN_V_MAX = 10.     # m/s (22 mph): city turns and the launch from a stop line run under it
+JUNCTION_SCAN_M = 50.         # m: approaching a turn this close, the driver checks its crosswalk and cross traffic
+SCAN_PROMPTS = ('yieldAhead', 'waitingForGap', 'creepingForView', 'leftGo', 'waitingForCross', 'stopGo')
+SCAN_MAP_ACTIONS = ('held', 'awaitingDriver', 'waitingCross', 'creeping', 'going', 'committed')
+SCAN_STOP_GO = ('stopped', 'rollUp', 'observe', 'going', 'committed', 'inLane')
+SCAN_LEFT = ('waitGap', 'creep', 'go', 'committed')
+SCAN_VIEWS = ('stopSweep', 'stopSweepGo')
+
+
+def dm_maneuver_scan(plan, v_ego: float) -> bool:
+  """Whether TurnPilot's maneuver has an attentive driver turning their head: its lane change from the warning until it ends
+  (the mirrors, at any speed), or under JUNCTION_SCAN_V_MAX a junction it is working (a stop, yield or unprotected left held,
+  waited, crept or gone from; its stop sweep; a turn under way or within JUNCTION_SCAN_M). plan: active_plan's, so a stale,
+  shadow or disabled plan (TurnPilot not driving) never relaxes DM. Pitch, eyes, phone and sleep stay stock's (policy.py)."""
+  if plan is None:
+    return False
+  if plan.laneChangeOffer != custom.TurnpilotPlan.LaneChange.none or plan.laneChange != custom.TurnpilotPlan.LaneChange.none:
+    return True
+  if v_ego > JUNCTION_SCAN_V_MAX:
+    return False
+  if str(plan.controlPrompt) in SCAN_PROMPTS or str(plan.detectorView) in SCAN_VIEWS:
+    return True
+  if str(plan.mapControl.kind) != 'none' and str(plan.mapControl.action) in SCAN_MAP_ACTIONS:
+    return True
+  if str(plan.stopGo.state) in SCAN_STOP_GO or str(plan.unprotectedLeft.state) in SCAN_LEFT:
+    return True
+  State = custom.TurnpilotPlan.State
+  return plan.state == State.turning or (plan.state == State.approaching and not plan.maneuverBend and
+                                         0. <= plan.maneuverDistance <= JUNCTION_SCAN_M)
+
+
 # TurnPilot's turn signal (car_signals.py, DESIGN phase4/blinker 7.7): one event, turnpilotCarSignal, whose line is chosen
 # here. The skips go through the tooFastToTurn alert (too_fast_title). (title, text, sound) with sound an AudibleAlert name
 CAR_SIGNAL_FAULT_TEXT = {
