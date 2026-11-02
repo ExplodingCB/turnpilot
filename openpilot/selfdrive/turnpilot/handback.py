@@ -9,7 +9,8 @@ and chime, then a disengage SOFT_DISABLE_TIME later, not an abrupt cut.
 Like upstream's bigModelFailed, the soft disable is latched on the handback starting while engaged and held until
 openpilot is disengaged, so a detector that blinks back during the countdown can't cancel it halfway. Engaging later
 goes by the event's other types: a stopped detector, or one that never started, blocks it (NO_ENTRY) while it stays so;
-after a model fallback openpilot engages again on the small model, without TurnPilot.
+after a model fallback openpilot engages again on the small model, without TurnPilot: paused, its route kept, until the
+big model is back and the driver engages again (turnpilotd.py), which no soft disable here holds up.
 """
 from openpilot.cereal import custom, log
 
