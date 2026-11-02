@@ -5,7 +5,8 @@
 
 Publishes deviceState (started), pandaStates (ignition), carState, selfdriveState, driver monitoring (a face, so the
 DM icon draws), navInstruction and turnpilotPlan, plus a synthetic map (mapsd) and road camera (camerad) over
-VisionIPC, and saves one 536x240 PNG per scene.
+VisionIPC, and saves one 536x240 PNG per scene. The nav view's scenes (nav_*) add a synthetic route (navRoute) near
+latitude and longitude 0, a GPS fix on it and calibration; --nav renders only those.
 
 To watch the real UI instead, run both in one prefix:
   OPENPILOT_PREFIX=tp python -m openpilot.selfdrive.ui.tests.turnpilot_screenshots --publish 4
@@ -25,6 +26,7 @@ from openpilot.common.prefix import OpenpilotPrefix
 
 FPS = 60
 SETTLE_FRAMES = 90  # filters, fades and nav animations settle within 1.5 s
+NAV_SETTLE_FRAMES = 150  # 2.5 s: a GPS fix counts for 2 s (latest_gps_source), so the GPS-lost scene needs the last one gone
 
 ROUTE = {'maneuverPrimaryText': 'W Washington St', 'maneuverDistance': 180., 'maneuverType': 'turn', 'maneuverModifier': 'left',
          'distanceRemaining': 5200., 'timeRemaining': 610.}
@@ -40,6 +42,11 @@ class Scene:
   alert: tuple | None = None  # (text1, text2, size, status) from selfdriveState
   started: bool = True
   engaged: bool = True
+  # the nav view's: navRoute's (longitude, latitude) points, a GPS fix (longitude, latitude, bearing, speed), extrinsicsCalibration
+  # (status, percent). None publishes nothing, as before the nav view
+  route: np.ndarray | None = None
+  gps: tuple | None = None
+  calibration: tuple | None = None
 
 
 def onroad_scenes() -> list[Scene]:
@@ -75,6 +82,51 @@ def onroad_scenes() -> list[Scene]:
     Scene('16_disengaged_holding', {'state': 'holding', 'reason': 'pedestrian in path', 'routeValid': True}, engaged=False),
     Scene('17_disengaged_shadow_turning', dict(turning, shadow=True), nav=dict(ROUTE, maneuverDistance=12.),
           params={'TurnPilotShadowMode': True}, engaged=False),
+  ]
+
+
+def synthetic_route(step_m: float = 10.) -> np.ndarray:
+  """(longitude, latitude) of a made-up 3 km route out of (0, 0), in the sea: 600 m north, left 400 m, right 800 m, right 700 m,
+  left 500 m to the destination. Never a real place."""
+  from openpilot.selfdrive.navigation.route import METERS_PER_DEGREE
+  corners = np.array([(0, 0), (0, 600), (-400, 600), (-400, 1400), (300, 1400), (300, 1900)], dtype=np.float64)
+  legs = []
+  for a, b in zip(corners[:-1], corners[1:], strict=True):
+    length = np.linalg.norm(b - a)
+    legs.append(a + (b - a) * (np.arange(0, length, step_m) / length)[:, None])
+  meters = np.vstack(legs + [corners[-1:]])
+  return meters / METERS_PER_DEGREE  # east, north at the equator: degrees of longitude and latitude alike
+
+
+def nav_scenes() -> list[Scene]:
+  """The nav view: the car 420 m up the synthetic route's first leg, 180 m before its left turn, 2580 m from the end."""
+  from openpilot.selfdrive.navigation.route import METERS_PER_DEGREE
+  route = synthetic_route()
+  car = (0., 420. / METERS_PER_DEGREE, 0., 12.)
+  nav = {'maneuverPrimaryText': 'Example Ave', 'maneuverDistance': 180., 'maneuverType': 'turn', 'maneuverModifier': 'left',
+         'distanceRemaining': 2580., 'timeRemaining': 230.}
+  params = {'NavDestination': {'latitude': 1900. / METERS_PER_DEGREE, 'longitude': 300. / METERS_PER_DEGREE, 'place_name': 'Example'}}
+  calibrated = ('calibrated', 100)
+  stop_ahead = {'kind': 'stop', 'action': 'approaching', 'distance': 95.}
+  red_held = {'kind': 'signal', 'action': 'held', 'lightState': 'red', 'lightSource': 'camera', 'distance': 2.}
+
+  def scene(name, plan, **kw):
+    return Scene(name, plan, **({'nav': dict(nav), 'params': dict(params), 'route': route, 'gps': car, 'calibration': calibrated} | kw))
+  return [
+    scene('nav_01_following', {'state': 'following', 'routeValid': True, 'laneChangeOffer': 'left', 'laneChangeCountdown': 2.3,
+                               'mapControl': stop_ahead}),
+    scene('nav_02_red_light', {'state': 'holding', 'reason': 'Red light', 'shouldStop': True, 'routeValid': True, 'mapControl': red_held},
+          car={'vEgo': 0., 'standstill': True}, gps=car[:3] + (0.,)),
+    scene('nav_03_gps_lost_calibrating', {'state': 'approaching', 'routeValid': True, 'laneChangeWant': 1, 'laneChangeWait': 'blindspot'},
+          gps=None, calibration=('uncalibrated', 40)),
+    scene('nav_04_disengaged_turning', {'state': 'turning', 'desire': 1, 'maneuverModifier': 'left', 'routeValid': True},
+          nav=dict(nav, maneuverDistance=12.), engaged=False),
+    scene('nav_05_unavailable', {'state': 'unavailable', 'reason': 'detector stopped: take control'}),
+    # navd's invalid instruction with no route (navInstruction stays alive 10 s after the last valid one, so one is sent)
+    scene('nav_06_no_destination', {'state': 'noRoute'}, nav={'valid': False}, route=np.empty((0, 2)), params={'NavDestination': None}),
+    scene('nav_07_arriving', {'state': 'following', 'routeValid': True},
+          nav=dict(nav, maneuverType='arrive', maneuverModifier='straight', maneuverPrimaryText='Example', maneuverDistance=60.,
+                   distanceRemaining=60., timeRemaining=8.), gps=(300. / METERS_PER_DEGREE, 1840. / METERS_PER_DEGREE, 0., 8.)),
   ]
 
 
@@ -116,7 +168,7 @@ class FakePublisher:
 
     self.params = Params()
     self.pm = messaging.PubMaster(['deviceState', 'pandaStates', 'carState', 'selfdriveState', 'driverStateV2', 'driverMonitoringState',
-                                   'navInstruction', 'turnpilotPlan'])
+                                   'navInstruction', 'turnpilotPlan', 'navRoute', 'gpsLocationExternal', 'extrinsicsCalibration'])
     cam_w, cam_h = 1928, 1208
     self.camera = VisionIpcServer('camerad')
     self.camera.create_buffers(VisionStreamType.VISION_STREAM_NARROW_ROAD, 4, cam_w, cam_h)
@@ -168,10 +220,25 @@ class FakePublisher:
                          ('driverStateV2', dsv), ('driverMonitoringState', dms)):
       self.pm.send(service, msg)
     if scene.nav is not None:
-      ni = messaging.new_message('navInstruction', valid=True)
+      ni = messaging.new_message('navInstruction', valid=scene.nav.get('valid', True))
       for k, v in scene.nav.items():
-        setattr(ni.navInstruction, k, v)
+        if k != 'valid':
+          setattr(ni.navInstruction, k, v)
       self.pm.send('navInstruction', ni)
+    if scene.route is not None:
+      nr = messaging.new_message('navRoute', valid=True)
+      nr.navRoute.coordinates = [{'longitude': lon, 'latitude': lat} for lon, lat in scene.route.tolist()]
+      self.pm.send('navRoute', nr)
+    if scene.gps is not None:
+      gps = messaging.new_message('gpsLocationExternal', valid=True)
+      g = gps.gpsLocationExternal
+      g.longitude, g.latitude, g.bearingDeg, g.speed = scene.gps
+      g.hasFix = True
+      self.pm.send('gpsLocationExternal', gps)
+    if scene.calibration is not None:
+      cal = messaging.new_message('extrinsicsCalibration', valid=True)
+      cal.extrinsicsCalibration.calStatus, cal.extrinsicsCalibration.calPerc = scene.calibration
+      self.pm.send('extrinsicsCalibration', cal)
     if scene.plan:
       tp = messaging.new_message('turnpilotPlan', valid=True)
       tp.turnpilotPlan.accelCap = 10.
@@ -202,7 +269,7 @@ def publish(seconds_per_scene: float):
         time.sleep(1 / 20)
 
 
-def screenshots(out_dir: str):
+def screenshots(out_dir: str, nav_only: bool = False):
   from openpilot.common.qrcode import decode
   from openpilot.selfdrive.ui.ui_state import ui_state
   from openpilot.system.ui.lib.application import gui_app
@@ -236,6 +303,28 @@ def screenshots(out_dir: str):
     print(path)
     return gray
 
+  def nav_shots():
+    """The nav view's scenes, then the swipe to it from the camera view caught halfway, as the main scroller moves the pages."""
+    from openpilot.selfdrive.ui.mici.onroad.nav_view import NavView
+    from openpilot.system.ui.widgets.scroller import Scroller
+    gui_app.push_widget(NavView())
+    for scene in nav_scenes():
+      settle(scene, NAV_SETTLE_FRAMES)
+      shot(scene.name)
+    pages = Scroller(snap_items=False, spacing=0, pad=0, scroll_indicator=False, edge_shadows=False)
+    for page in (NavView(), AugmentedRoadView(lambda: None)):
+      page.set_rect(rl.Rectangle(0, 0, gui_app.width, gui_app.height))
+      pages._scroller.add_widget(page)
+    gui_app.push_widget(pages)
+    pages._scroller.scroll_panel.set_offset(-gui_app.width * 0.6)
+    settle(nav_scenes()[0], NAV_SETTLE_FRAMES)
+    shot('nav_08_swipe_from_camera')
+
+  if nav_only:
+    nav_shots()
+    gui_app.close()
+    return
+
   for scene in onroad_scenes():
     settle(scene)
     shot(scene.name)
@@ -260,6 +349,7 @@ def screenshots(out_dir: str):
   pair._scroller.scroll_to(pair._url_button.rect.x - (gui_app.width - pair._url_button.rect.width) / 2)
   settle(offroad, 30)
   shot('22_pair_phone_url')
+  nav_shots()  # last, so the GPS and calibration it publishes change none of the shots above
   gui_app.close()
 
 
@@ -268,6 +358,7 @@ def main():
   parser.add_argument('out_dir', nargs='?', help='where the PNGs go')
   parser.add_argument('--publish', type=float, metavar='SECONDS',
                       help='only publish, cycling the scenes every SECONDS, in the current OPENPILOT_PREFIX')
+  parser.add_argument('--nav', action='store_true', help="only the nav view's scenes")
   args = parser.parse_args()
   if args.publish:
     # fake started/ignition must never reach a real device's namespace
@@ -278,7 +369,7 @@ def main():
   elif args.out_dir:
     os.makedirs(args.out_dir, exist_ok=True)
     with OpenpilotPrefix():
-      screenshots(os.path.abspath(args.out_dir))
+      screenshots(os.path.abspath(args.out_dir), nav_only=args.nav)
   else:
     parser.error('give OUT_DIR or --publish')
 

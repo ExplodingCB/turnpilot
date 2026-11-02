@@ -24,6 +24,20 @@ MAP_COLORS = np.repeat(np.round(np.arange(256) * 0.45).astype(np.uint8)[:, None]
 MAP_COLORS[ROUTE_INTENSITY - 1:ROUTE_INTENSITY + 2] = (72, 235, 132)
 
 
+def draw_maneuver_arrow(cx: float, cy: float, modifier: str, color: rl.Color):
+  """The maneuver arrow on a 1.4x grid around (cx, cy), with round joins for the thick stroke. The nav panel's and the nav view's."""
+  flip = -1 if 'left' in modifier else 1
+  if modifier in ('straight', ''):
+    shape = [(0, 14), (0, -12), (-6, -5), (0, -12), (6, -5)]
+  else:
+    shape = [(-flip*9, 14), (-flip*9, -4), (-flip*2, -9), (flip*9, -9), (flip*3, -15), (flip*9, -9), (flip*3, -3)]
+  points = [rl.Vector2(cx + 1.4*px, cy + 1.4*py) for px, py in shape]
+  for a, b in zip(points[:-1], points[1:], strict=True):
+    rl.draw_line_ex(a, b, 7, color)
+  for point in points:
+    rl.draw_circle_v(point, 3.5, color)
+
+
 def format_distance(meters: float) -> str:
   """m / ft under 1000 m / 300 m, km / mi beyond."""
   if ui_state.is_metric:
@@ -85,18 +99,7 @@ class NavigationPanel(Widget):
     instruction = ui_state.sm['navInstruction']
     street = instruction.maneuverPrimaryText if self.routing and ui_state.turnpilot_enabled else ''
     if self.routing:
-      direction = instruction.maneuverModifier
-      flip = -1 if 'left' in direction else 1
-      # The maneuver arrow on a 1.4x grid, centered in the header's icon box, with round joins for the thick stroke.
-      if direction in ('straight', ''):
-        shape = [(0, 14), (0, -12), (-6, -5), (0, -12), (6, -5)]
-      else:
-        shape = [(-flip*9, 14), (-flip*9, -4), (-flip*2, -9), (flip*9, -9), (flip*3, -15), (flip*9, -9), (flip*3, -3)]
-      points = [rl.Vector2(x + 31 + 1.4*px, y + 30 + 1.4*py) for px, py in shape]
-      for a, b in zip(points[:-1], points[1:], strict=True):
-        rl.draw_line_ex(a, b, 7, self._accent)
-      for point in points:
-        rl.draw_circle_v(point, 3.5, self._accent)
+      draw_maneuver_arrow(x + 31, y + 30, instruction.maneuverModifier, self._accent)  # centered in the header's icon box
       gui_label(rl.Rectangle(x+64, y+11, rect.width-72, 40), format_distance(max(0, instruction.maneuverDistance)), 34, rl.WHITE, FontWeight.BOLD,
                 alignment_vertical=TextAlignmentVertical.TOP)
     else:
