@@ -188,6 +188,25 @@ def test_step_never_waits_on_the_spawn():
   assert max(took) < 0.01 and rec.state in (cr.LOADING, cr.LOADED)
 
 
+def test_an_attempt_thread_that_cannot_leave_modelds_slot_is_a_failed_attempt_not_a_stuck_recovery():
+  # on the comma attempt_thread's sched_setscheduler/sched_setaffinity can raise (EINVAL from a cpuset): in the real thread
+  # that once killed it before its result, the recovery held in STARTING for the drive with no note and no retry. Now it
+  # spawns nothing (the successor would inherit core 7 at FIFO 54) and the next slot retries
+  spawned, notes = [], []
+  rec = cr.ChestnutRecovery(spawn=lambda: spawned.append(1) or FakeSuccessor(), present=lambda: True,
+                            note=lambda kind, why: notes.append((kind, why)))
+  with mock.patch.object(cr, 'attempt_thread', side_effect=OSError(22, 'Invalid argument')):
+    rec.failed(0.)
+    t = 2.
+    while rec.state != cr.WAITING or not notes:
+      rec.step(t, False)
+      t += 0.05
+      time.sleep(0.005)
+      assert t < 5., f"stuck in {rec.state}"
+  assert spawned == [] and notes[0][0] == 'retry failed' and 'thread priority failed' in notes[0][1]
+  assert rec.failures == 1 and rec.next_t == pytest.approx(t - 0.05 + cr.retry_delay(1), abs=0.06)
+
+
 @pytest.mark.parametrize("close_handle", [False, True])
 def test_the_dead_chestnut_goes_inert_then_is_let_go_of(close_handle):
   fd = os.open(os.devnull, os.O_RDONLY)

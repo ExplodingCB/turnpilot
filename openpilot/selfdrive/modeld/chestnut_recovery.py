@@ -292,10 +292,7 @@ class ChestnutRecovery:
 
   @staticmethod
   def _thread(fn: Callable[[], None]) -> None:
-    def run():
-      attempt_thread()
-      fn()
-    threading.Thread(target=run, daemon=True, name='chestnut_retry').start()
+    threading.Thread(target=fn, daemon=True, name='chestnut_retry').start()
 
   @property
   def active(self) -> bool:
@@ -328,8 +325,15 @@ class ChestnutRecovery:
     self.state, self.next_t = WAITING, now + retry_delay(self.failures)
 
   def _attempt(self) -> None:
-    """In the attempt's thread: let go of the dead chestnut, check it enumerated, spawn."""
+    """In the attempt's thread: off modeld's slot, let go of the dead chestnut, check it enumerated, spawn. A failure anywhere
+    is the attempt's (noted, retried at the next slot): a thread that died before its result held the recovery in STARTING
+    for the drive. Off the slot first: if that fails, nothing is spawned onto modeld's core at its priority."""
     try:
+      try:
+        attempt_thread()
+      except Exception as e:
+        self._result = (None, f'thread priority failed: {type(e).__name__}: {e}')
+        return
       for m in self.abandon:
         abandon_chestnut(m)
       self.abandon = []
