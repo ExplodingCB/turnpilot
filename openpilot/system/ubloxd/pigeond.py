@@ -278,6 +278,11 @@ def deinitialize_and_exit(pigeon: TTYPigeon | None):
   if pigeon is not None:
     # controlled GNSS stop
     pigeon.send(b"\xB5\x62\x06\x04\x04\x00\x00\x00\x08\x00\x16\x74")
+    # TurnPilot: the backup saved at the stop, u-blox's save-on-shutdown order (GNSS stopped, UPD-SOS create, power off), so
+    # the next boot restores what the receiver had this moment (ephemeris good for hours), not what it had at the last
+    # periodic save, up to an hour old offroad (almanac_save_due): a hot start when the car is next woken soon after
+    time.sleep(0.1)
+    save_almanac(pigeon)
 
   # turn off power and exit cleanly
   set_power(False)
@@ -325,7 +330,7 @@ def cold_start_once(pigeon: TTYPigeon) -> None:
     cloudlog.exception("TurnPilot: ublox cold start failed")
 
 
-def init(pigeon: TTYPigeon) -> None:
+def init(pigeon: TTYPigeon) -> bool:
   # register exit handler
   signal.signal(signal.SIGINT, lambda sig, frame: deinitialize_and_exit(pigeon))
 
@@ -347,12 +352,21 @@ def init(pigeon: TTYPigeon) -> None:
     init_pigeon(pigeon)
   cold_start_once(pigeon)
 
-  if system_time_valid():
-    try:
-      send_time(pigeon)
-      send_position(pigeon)
-    except Exception:
-      cloudlog.exception("failed to send time and position to ublox")
+  return send_time_and_position(pigeon)
+
+
+def send_time_and_position(pigeon: TTYPigeon) -> bool:
+  """The time and the last position to the receiver, which cut its search: True once sent, False with the clock not valid
+  yet. TurnPilot: the comma boots on a clock months behind until NTP or GPS sets it, so at init the clock is often not
+  valid; the loop sends them as soon as it is (run_receiving), not only at the next init."""
+  if not system_time_valid():
+    return False
+  try:
+    send_time(pigeon)
+    send_position(pigeon)
+  except Exception:
+    cloudlog.exception("failed to send time and position to ublox")
+  return True
 
 ALMANAC_SAVE_S = 60*5  # comma's: the backup in the receiver's flash, every 5 minutes
 OFFROAD_ALMANAC_SAVE_S = 3600.
@@ -370,7 +384,8 @@ def run_receiving(duration: int = 0):
   params = Params()
 
   pigeon = TTYPigeon()
-  init(pigeon)
+  time_sent = init(pigeon)
+  last_time_check = time.monotonic()
 
   start_time = time.monotonic()
   last_almanac_save = time.monotonic()
@@ -392,6 +407,10 @@ def run_receiving(duration: int = 0):
   threading.Thread(target=download_assistnow, daemon=True).start()
 
   while (duration == 0) or (time.monotonic() - start_time < duration):
+    if not time_sent and time.monotonic() - last_time_check > 1.:
+      last_time_check = time.monotonic()
+      time_sent = send_time_and_position(pigeon)
+
     if assist_messages is not None and not assist_attempted:
       assist_attempted = True
       try:
@@ -406,7 +425,7 @@ def run_receiving(duration: int = 0):
     if len(dat) > 0:
       if dat[0] == 0x00:
         cloudlog.warning("received invalid data from ublox, re-initing!")
-        init(pigeon)
+        time_sent = init(pigeon)
         assist_attempted = False
         continue
 
