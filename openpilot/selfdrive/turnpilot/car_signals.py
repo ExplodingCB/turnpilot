@@ -298,6 +298,22 @@ def promote(params) -> None:
   params.remove("TurnPilotCarSignalsExterior")
 
 
+def ensure_signal_check(params) -> bool:
+  """Once per comma: car signals off with no verified record, the lamp check is queued for the next ignition (mode check),
+  with TurnPilotCarSignalsVinless on, since a Tesla's VIN reads as zeros and a record could match it no other way. Kellen,
+  2026-11-02: "we need blinkers". In Park the check runs by itself 3 s after the start, and the phone asks whether the outside
+  lamps flashed; a yes turns the car's own signal on (TurnPilot web: set_car_signals). Returns whether it queued the check."""
+  if params.get_bool("TurnPilotCarSignalsAutoCheck"):
+    return False
+  queued = read_mode(params) == 'off' and not params.get("TurnPilotCarSignalsVerified")
+  if queued:
+    params.put_bool("TurnPilotCarSignalsVinless", True, block=True)
+    params.put("TurnPilotCarSignals", "check", block=True)
+    cloudlog.warning("turnpilot: car signal lamp check queued for the next ignition (once per comma)")
+  params.put_bool("TurnPilotCarSignalsAutoCheck", True, block=True)
+  return queued
+
+
 def resolver(params, simulation: bool = False):
   """card's callback for get_car: (vin, car_fw) -> CarSignalsConfig, read once per drive."""
   def resolve(vin: str, car_fw) -> CarSignalsConfig:

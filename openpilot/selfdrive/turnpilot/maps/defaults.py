@@ -31,3 +31,23 @@ def ensure_map_defaults(params) -> list[str]:
       params.put(key, value, block=True)
       written.append(key)
   return written
+
+
+LEFT_RANGE_PARAM, LEFT_RANGE_MARK = 'TurnPilotLeftRangeM', 'TurnPilotLeftRangeProvisional'
+
+
+def ensure_left_range(params) -> bool:
+  """Once per comma: an unmeasured TurnPilotLeftRangeM (0) becomes unprotected_left.PROVISIONAL_RANGE_M, so the car drives
+  unprotected lefts across roads of 25 mph or less (R_req 134-141 m) instead of routing around or skipping every one.
+  Kellen, 2026-11-02: "we need the left turns, just do it and if he has to disengage he has to disengage". The range is the
+  pixel arithmetic's (a car ~6.5 px wide at 150 m), not a measured recall; a measured value set later is never touched.
+  Returns whether it wrote the range."""
+  from openpilot.selfdrive.turnpilot.unprotected_left import PROVISIONAL_RANGE_M
+  if params.get_bool(LEFT_RANGE_MARK):
+    return False
+  value = params.get(LEFT_RANGE_PARAM)
+  wrote = value is None or float(value) <= 0.
+  if wrote:
+    params.put(LEFT_RANGE_PARAM, PROVISIONAL_RANGE_M, block=True)
+  params.put_bool(LEFT_RANGE_MARK, True, block=True)
+  return wrote

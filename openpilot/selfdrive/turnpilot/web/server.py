@@ -23,11 +23,11 @@ from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.time_helpers import system_time_valid
 from openpilot.selfdrive.turnpilot import diagnostics
-from openpilot.selfdrive.turnpilot.car_signals import MODES as CAR_SIGNAL_MODES, read_mode
+from openpilot.selfdrive.turnpilot.car_signals import MODES as CAR_SIGNAL_MODES, ensure_signal_check, read_mode
 from openpilot.selfdrive.turnpilot.maps import coverage as coverage_cache
 from openpilot.selfdrive.turnpilot.maps.client import MapError, cert_fingerprint, check_cert, check_key, missing_config, normalize_host
 from openpilot.selfdrive.turnpilot.maps.coverage import CoverageCache, CoverageRefresher, check_trip
-from openpilot.selfdrive.turnpilot.maps.defaults import ensure_map_defaults
+from openpilot.selfdrive.turnpilot.maps.defaults import ensure_map_defaults, ensure_left_range
 from openpilot.selfdrive.turnpilot.maps.paths import wall_time
 from openpilot.selfdrive.turnpilot.maps.status import for_destination, read_status
 from openpilot.selfdrive.turnpilot.routing.sources import local_override
@@ -263,6 +263,8 @@ class App:
         if not check.get("pass") or check.get("exterior") != "pending" or body.get("checkId") != check.get("checkId"):
           raise ApiError(409, "No pending check with that id: run the check again")
         params.put("TurnPilotCarSignalsExterior", f"{verdict}:{check['checkId']}", block=True)
+        if verdict == "yes":  # the lamps flashed: the car signals its own turns from the next ignition, nothing more to set
+          params.put("TurnPilotCarSignals", "on", block=True)
       else:
         raise ApiError(400, "send mode, startInDrive or exterior")
     return self.car_signals()
@@ -484,6 +486,8 @@ def main():
   params = Params()
   ensure_token(params)
   ensure_map_defaults(params)  # the shipped map server's address and certificate: the phone only adds the key
+  ensure_signal_check(params)  # the lamp check queued for the next ignition, once, so the car can signal itself
+  ensure_left_range(params)  # an unmeasured left range (0) becomes the provisional 150 m, once (maps/defaults.py)
   if not PC:  # the map engine installs itself on the comma; a PC has its own (or the sim's local tiles)
     SetupThread(params).start()
   reader = StatusReader(diagnostics.EventLog(params))  # the diagnostics' recent events, from every plan and logged error
