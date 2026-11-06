@@ -121,6 +121,13 @@ code { display: block; word-break: break-all; margin: 4px 0 12px; padding: 8px; 
   </form>
 </details>
 
+<details id="restartcomma">
+  <summary>Restart the comma</summary>
+  <div class="note">A Tesla stays on while you're in it, so the comma never restarts by itself. Restart it here to apply an
+    update, a turn signal check or a setting that waits for the next start. Disengage first; it takes about a minute.</div>
+  <button class="go" type="button" id="restartbtn">Restart now</button>
+</details>
+
 <details id="carsignals">
   <summary>Car turn signal</summary>
   <div class="note">On a verified Tesla the car works its own turn signal for TurnPilot's turns and lane changes. Off, you signal,
@@ -494,6 +501,10 @@ async function loadCarSignals() {
 function answer(verdict, checkId) {
   act(async function () { await api("/api/car-signals", "POST", { exterior: verdict, checkId: checkId }); await loadCarSignals(); });
 }
+
+$("restartbtn").onclick = function () {
+  act(async function () { await api("/api/restart", "POST", {}); $("restartbtn").textContent = "Restarting..."; });
+};
 
 $("csdrive").onclick = function () {
   act(async function () { await api("/api/car-signals", "POST", { startInDrive: true }); await loadCarSignals(); });

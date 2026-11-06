@@ -242,6 +242,16 @@ class App:
       last["gear"] = (check.get("record") or {}).get("gear")
     return {"mode": mode, "check": last, "verified": bool(record), "verified_vin": (record or {}).get("vin")}
 
+  def restart(self) -> dict:
+    """Reboot the comma from the phone (DoReboot, as Settings > Device > Reboot). A Tesla stays awake while anyone is in it,
+    so the comma never sees the car turn off: what applies at the next start (the car signal check and mode, an update
+    downloaded, a fresh big model load) needed getting out and back in (Kellen, 2026-11-06). Refused while openpilot is
+    engaged: the driver disengages first, and the car is the driver's for the minute the comma takes to come back."""
+    if self.store.params.get_bool("IsEngaged"):
+      raise ApiError(409, "Disengage openpilot first: the comma takes about a minute to come back")
+    self.store.params.put_bool("DoReboot", True, block=True)
+    return {"restarting": True}
+
   def set_car_signals(self, body) -> dict:
     """One of: {"mode": off|check|on}; {"startInDrive": true} (TurnPilotCarSignalsCheckNow, honoured only on a check
     ignition with the car stopped in D and the brake held); {"exterior": yes|no, "checkId": ...}, the answer to "did the
@@ -400,6 +410,8 @@ class Handler(BaseHTTPRequestHandler):
       return {"ok": True, **app.set_map_settings(self.body())}
     if method == "GET" and path == "/api/diagnostics":
       return app.diagnostics()
+    if method == "POST" and path == "/api/restart":
+      return {"ok": True, **app.restart()}
     if method == "GET" and path == "/api/car-signals":
       return app.car_signals()
     if method == "POST" and path == "/api/car-signals":

@@ -1112,6 +1112,17 @@ class TestMapDefaultsOnTheWeb(WebTestCase):
     assert "Key works." in script and "Not saved: " in script
 
 
+class TestRestart(WebTestCase):
+  def test_restart_reboots_the_comma_unless_engaged(self):
+    self.params.put_bool("IsEngaged", True, block=True)
+    assert self.call("POST", "/api/restart", {})[0] == 409
+    assert not self.params.get_bool("DoReboot")
+    self.params.put_bool("IsEngaged", False, block=True)
+    code, body, _ = self.call("POST", "/api/restart", {})
+    assert code == 200 and body["restarting"] and self.params.get_bool("DoReboot")
+    assert '$("restartbtn")' in server.INDEX.read_text()
+
+
 class TestCarSignalsPage(WebTestCase):
   def test_the_drive_check_is_offered_and_the_lamp_question_opens_itself(self):
     script = server.INDEX.read_text().split("<script>")[1]
