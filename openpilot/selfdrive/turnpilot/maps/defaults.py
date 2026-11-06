@@ -34,20 +34,24 @@ def ensure_map_defaults(params) -> list[str]:
 
 
 LEFT_RANGE_PARAM, LEFT_RANGE_MARK = 'TurnPilotLeftRangeM', 'TurnPilotLeftRangeProvisional'
+# the car's default range for oncoming traffic: 210 m covers unprotected lefts across roads of 35 mph or less (R_req 183-203
+# m at the line, 1 to 3 lanes). Kellen, 2026-11-06, after a 35 mph left was routed round at 150 m: "it just needs to be more
+# confident at lefts". The native full pass reads the whole 1344x760 frame, where a car 1.8 m wide is ~10 px at 200 m, about
+# the smallest the detector finds: past that (40-45 mph, and roads with no mapped limit, taken as 45) lefts stay rerouted
+CAR_LEFT_RANGE_M = 210.
+EARLIER_CAR_RANGES_M = (150.,)  # the defaults earlier builds wrote: a comma still on one of them takes the current one
 
 
 def ensure_left_range(params) -> bool:
-  """Once per comma: an unmeasured TurnPilotLeftRangeM (0) becomes unprotected_left.PROVISIONAL_RANGE_M, so the car drives
-  unprotected lefts across roads of 25 mph or less (R_req 134-141 m) instead of routing around or skipping every one.
-  Kellen, 2026-11-02: "we need the left turns, just do it and if he has to disengage he has to disengage". The range is the
-  pixel arithmetic's (a car ~6.5 px wide at 150 m), not a measured recall; a measured value set later is never touched.
-  Returns whether it wrote the range."""
-  from openpilot.selfdrive.turnpilot.unprotected_left import PROVISIONAL_RANGE_M
-  if params.get_bool(LEFT_RANGE_MARK):
-    return False
+  """An unmeasured TurnPilotLeftRangeM (0), once per comma, or a range an earlier build wrote as its default
+  (EARLIER_CAR_RANGES_M), becomes CAR_LEFT_RANGE_M. Kellen, 2026-11-02: "we need the left turns, just do it and if he has
+  to disengage he has to disengage". The range is pixel arithmetic, not a measured recall; any other value (a measurement,
+  or one set by hand) is never touched. Returns whether it wrote the range."""
   value = params.get(LEFT_RANGE_PARAM)
-  wrote = value is None or float(value) <= 0.
+  value = None if value is None else float(value)
+  first = not params.get_bool(LEFT_RANGE_MARK) and (value is None or value <= 0.)
+  wrote = first or value in EARLIER_CAR_RANGES_M
   if wrote:
-    params.put(LEFT_RANGE_PARAM, PROVISIONAL_RANGE_M, block=True)
+    params.put(LEFT_RANGE_PARAM, CAR_LEFT_RANGE_M, block=True)
   params.put_bool(LEFT_RANGE_MARK, True, block=True)
   return wrote

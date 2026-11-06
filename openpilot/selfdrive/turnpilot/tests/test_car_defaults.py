@@ -5,8 +5,7 @@ import pytest
 from openpilot.common.params import Params
 from openpilot.common.prefix import OpenpilotPrefix
 from openpilot.selfdrive.turnpilot.car_signals import ensure_signal_check
-from openpilot.selfdrive.turnpilot.maps.defaults import ensure_left_range
-from openpilot.selfdrive.turnpilot.unprotected_left import PROVISIONAL_RANGE_M
+from openpilot.selfdrive.turnpilot.maps.defaults import CAR_LEFT_RANGE_M, ensure_left_range
 
 
 @pytest.fixture(autouse=True)
@@ -22,9 +21,17 @@ def fresh():
 def test_an_unmeasured_left_range_becomes_the_provisional_one_once():
   p = fresh()
   p.put("TurnPilotLeftRangeM", 0., block=True)
-  assert ensure_left_range(p) and p.get("TurnPilotLeftRangeM") == PROVISIONAL_RANGE_M
+  assert ensure_left_range(p) and p.get("TurnPilotLeftRangeM") == CAR_LEFT_RANGE_M == 210.
   p.put("TurnPilotLeftRangeM", 0., block=True)  # set back on purpose: left alone
   assert not ensure_left_range(p) and p.get("TurnPilotLeftRangeM") == 0.
+
+
+def test_a_comma_on_the_earlier_150_m_default_takes_210():
+  p = fresh()
+  p.put("TurnPilotLeftRangeM", 150., block=True)
+  p.put_bool("TurnPilotLeftRangeProvisional", True, block=True)
+  assert ensure_left_range(p) and p.get("TurnPilotLeftRangeM") == 210.
+  assert not ensure_left_range(p)
 
 
 def test_a_measured_left_range_is_never_touched():

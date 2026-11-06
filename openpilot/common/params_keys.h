@@ -110,7 +110,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"TurnPilotLeftGoProfile", {PERSISTENT, STRING, "left"}},
     {"TurnPilotNoMoveS", {PERSISTENT, FLOAT, "20.0"}},
     {"TurnPilotAutoLeft", {PERSISTENT, STRING, "auto"}},
-    {"TurnPilotLeftRangeM", {PERSISTENT, FLOAT, "150.0"}},
+    {"TurnPilotLeftRangeM", {PERSISTENT, FLOAT, "210.0"}},
     {"TurnPilotLeftRangeProvisional", {PERSISTENT, BOOL, "0"}},
     {"TurnPilotGoOverride", {PERSISTENT, BOOL, "1"}},
     {"TurnPilotFarCrop", {PERSISTENT, BOOL, "1"}},

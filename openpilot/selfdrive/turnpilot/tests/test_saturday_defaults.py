@@ -26,7 +26,7 @@ SATURDAY = {
   'TurnPilotFarPeds': ('BOOL', '1', True),
   'TurnPilotAvoidStops': ('BOOL', '1', True),
   'TurnPilotCurbPedCap': ('BOOL', '1', True),
-  'TurnPilotLeftRangeM': ('FLOAT', '150.0', 150.),  # provisional 150 m (Kellen, 11-02: lefts on); a measurement replaces it
+  'TurnPilotLeftRangeM': ('FLOAT', '210.0', 210.),  # the car's 210 m (Kellen, 11-06: 35 mph lefts); a measurement replaces it
   'TurnPilotLeftFarRangeM': ('FLOAT', '0.0', 0.),
   'TurnPilotAutoLeft': ('STRING', 'auto', 'auto'),
   'TurnPilotGoOverride': ('BOOL', '1', True),
