@@ -40,7 +40,8 @@ from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, 
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser
 from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_driving_model_data, fill_pose_msg, PublishState
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
-from openpilot.selfdrive.modeld.helpers import MODELS_DIR, chestnut_present, chestnut_compiled, modeld_pkl_path, load_oob, wait_for_chestnut
+from openpilot.selfdrive.modeld.helpers import (MODELS_DIR, chestnut_present, chestnut_compiled, modeld_pkl_path, load_oob, reset_chestnut,
+                                              wait_for_chestnut)
 
 SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
 
@@ -315,6 +316,7 @@ def main(demo=False, successor: str | None = None):
   cloudlog.warning("loading model")
   model = None
   retry = False  # TurnPilot diagnostics: this load is the onroad cycle's retry
+  big_loaded = True  # TurnPilot: False once the big model failed its load on the onroad retry too (the recovery takes over)
   load: dict = {"waited_s": None, "wait_error": None}
   if link is not None:
     # the successor's load holds nothing up (its parent publishes meanwhile, and gives it LOAD_DEADLINE_S); a failure ends it
@@ -355,12 +357,14 @@ def main(demo=False, successor: str | None = None):
       loader_timed_out.set()
       note_big_model(params, "timed out", None, BIG_MODEL_TIMEOUT, retry, load["waited_s"], load["wait_error"])
     if model is None and not params.get_bool("ChestnutRetry"):
-      # a crank can cut the chestnut power during the load, retry once with an onroad cycle
-      cloudlog.error("big model load failed, cycling onroad to retry")
+      # a crank can cut the chestnut power during the load, retry once with an onroad cycle. TurnPilot: from a freshly
+      # powered GPU (helpers.reset_chestnut: a Tesla never cuts the chestnut's 12 V while occupied)
+      cloudlog.error(f"big model load failed, cycling onroad to retry; {reset_chestnut()}")
       params.put_bool("ChestnutRetry", True)
       params.put_bool("OnroadCycleRequested", True)
     else:
       params.put_bool("ChestnutActive", model is not None)
+      big_loaded = model is not None
 
   small_model = ModelState(vipc_client_main.width, vipc_client_main.height, False) if link is None and (model is None or CHESTNUT) else None
   if model is None:
@@ -398,8 +402,12 @@ def main(demo=False, successor: str | None = None):
     from openpilot.selfdrive.modeld.chestnut_recovery import ChestnutRecovery, Successor
     cmd = [sys.executable, '-m', 'openpilot.selfdrive.modeld.modeld'] + (['--demo'] if demo else []) + ['--successor']
     recovery = ChestnutRecovery(spawn=lambda: Successor.spawn(cmd), present=chestnut_present,
-                                note=lambda kind, why: note_recovery(params, kind, why))
+                                note=lambda kind, why: note_recovery(params, kind, why), reset=reset_chestnut)
     atexit.register(recovery.close)
+    if not big_loaded:
+      # the load failed on its onroad retry too: the successor keeps trying in the background (each attempt from a power
+      # cycled GPU) instead of the small model for the rest of the drive
+      recovery.failed(time.monotonic(), why='the big model failed to load at start')
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState",
                   "carControl", "controlsState", "lateralDelay", "turnpilotPlan"],
                  ignore_alive=["turnpilotPlan"], ignore_avg_freq=["turnpilotPlan"], ignore_valid=["turnpilotPlan"])

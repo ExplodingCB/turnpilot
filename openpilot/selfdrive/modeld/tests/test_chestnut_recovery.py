@@ -327,3 +327,35 @@ def test_stop_kills_a_successor_at_once():
   s.stop()
   assert time.monotonic() - t0 < 0.2
   assert wait_for(lambda: s.exited() is not None, 5.) and s.exited() < 0
+
+
+def test_each_attempt_power_cycles_the_gpu_before_its_spawn():
+  # 2026-11-06: a Tesla never cuts the chestnut's 12 V while occupied, so a GPU left stuck stays stuck across retries
+  order = []
+  rig = Rig()
+  rig.rec.reset = lambda: order.append('reset') or 'GPU power cycled (2 s off) and USB reset'
+  spawn = rig.rec.spawn
+  rig.rec.spawn = lambda: order.append('spawn') or spawn()
+  rig.rec.failed(rig.t, why='the big model failed to load at start')
+  rig.run(2.1)
+  assert order == ['reset', 'spawn']
+  assert [(round(t - 100., 1), w) for t, k, w in rig.notes if k == 'reset'] == [(2.0, 'GPU power cycled (2 s off) and USB reset')]  # its first slot
+
+
+def test_reset_chestnut_switches_the_gpu_off_then_on_then_resets_the_port_and_never_raises():
+  from openpilot.selfdrive.modeld import helpers
+  dev = {"vendorId": 0xADD1, "productId": 0x0001, "product": helpers.CHESTNUT_USB_PRODUCT}
+  handle = mock.MagicMock()
+  ctx = mock.MagicMock()
+  ctx.__enter__.return_value.openByVendorIDAndProductID.return_value = handle
+  with mock.patch.object(helpers, 'get_usb_state', return_value=[dev]), mock.patch.object(helpers, 'is_chestnut_usb_id', return_value=True), \
+       mock.patch('usb1.USBContext', return_value=ctx), mock.patch.object(helpers.time, 'sleep'):
+    assert helpers.reset_chestnut() == "GPU power cycled (2 s off) and USB reset"
+  assert [c.args[:3] for c in handle.controlWrite.call_args_list] == [(0x40, helpers.PCIE_POWER_REQUEST, 0), (0x40, helpers.PCIE_POWER_REQUEST, 1)]
+  handle.resetDevice.assert_called_once()
+  handle.controlWrite.side_effect = RuntimeError("pipe")
+  with mock.patch.object(helpers, 'get_usb_state', return_value=[dev]), mock.patch.object(helpers, 'is_chestnut_usb_id', return_value=True), \
+       mock.patch('usb1.USBContext', return_value=ctx), mock.patch.object(helpers.time, 'sleep'):
+    assert helpers.reset_chestnut().startswith("reset failed: RuntimeError")
+  with mock.patch.object(helpers, 'get_usb_state', return_value=[]):
+    assert helpers.reset_chestnut() == "reset skipped: chestnut not enumerated"

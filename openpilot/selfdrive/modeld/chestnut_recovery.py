@@ -274,8 +274,10 @@ class ChestnutRecovery:
   taking (kind, why), a thread per attempt)."""
 
   def __init__(self, spawn: Callable[[], Successor] | None = None, present: Callable[[], bool] | None = None,
-               note: Callable[[str, str], None] | None = None, run_async: Callable[[Callable[[], None]], None] | None = None):
+               note: Callable[[str, str], None] | None = None, run_async: Callable[[Callable[[], None]], None] | None = None,
+               reset: Callable[[], str] | None = None):
     self.spawn = spawn or Successor.spawn
+    self.reset = reset  # helpers.reset_chestnut: the GPU power cycled before each attempt's spawn
     self.present = present
     self.note = note or (lambda kind, why: None)
     self.run_async = run_async or self._thread
@@ -340,6 +342,8 @@ class ChestnutRecovery:
       if self.present is not None and not self.present():
         self._result = (None, 'chestnut not enumerated')
         return
+      if self.reset is not None:
+        self.note('reset', self.reset())
       self._result = (self.spawn(), '')
     except Exception as e:
       self._result = (None, f'spawn failed: {type(e).__name__}: {e}')
