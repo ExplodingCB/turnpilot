@@ -303,7 +303,7 @@ def ensure_signal_check(params) -> bool:
   with TurnPilotCarSignalsVinless on, since a Tesla's VIN reads as zeros and a record could match it no other way. Kellen,
   2026-11-02: "we need blinkers". In Park the check runs by itself 3 s after the start, and the phone asks whether the outside
   lamps flashed; a yes turns the car's own signal on (TurnPilot web: set_car_signals). Returns whether it queued the check."""
-  if params.get_bool("TurnPilotCarSignalsAutoCheck"):
+  if params.get_bool("TurnPilotCarSignalsAutoCheck") or forced_on(params):
     return False
   queued = read_mode(params) == 'off' and not params.get("TurnPilotCarSignalsVerified")
   if queued:
@@ -314,11 +314,29 @@ def ensure_signal_check(params) -> bool:
   return queued
 
 
+# Kellen, 2026-11-06: "never disable turn signals for now they should always be enabled for this test i dont wanna have to
+# run the test". With this on (the default) the car signals TurnPilot's turns and lane changes with no lamp check and no
+# verified record, at the default ON reason; a mode of check still runs the check when asked. The port's own guards stay:
+# a request no lamp answers is said and the driver is prompted, as with car signals off
+FORCE_ON_KEY = "TurnPilotCarSignalsForceOn"
+
+
+def forced_on(params) -> bool:
+  """TurnPilotCarSignalsForceOn, its default (on) when unset: Params.get_bool reads an unset key as False."""
+  try:
+    return bool(params.get(FORCE_ON_KEY, return_default=True))
+  except Exception:
+    return False
+
+
 def resolver(params, simulation: bool = False):
   """card's callback for get_car: (vin, car_fw) -> CarSignalsConfig, read once per drive."""
   def resolve(vin: str, car_fw) -> CarSignalsConfig:
     promote(params)
     mode = read_mode(params)
+    if forced_on(params) and mode != 'check':
+      cloudlog.warning("turnpilot: car signals on without a lamp check (TurnPilotCarSignalsForceOn)")
+      return CarSignalsConfig(mode='on')
     if mode == 'off':
       return CarSignalsConfig()
     if mode == 'check':

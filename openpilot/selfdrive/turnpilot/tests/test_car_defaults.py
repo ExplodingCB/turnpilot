@@ -42,6 +42,7 @@ def test_a_measured_left_range_is_never_touched():
 
 def test_the_lamp_check_is_queued_once_with_the_vinless_match():
   p = fresh()
+  p.put_bool("TurnPilotCarSignalsForceOn", False, block=True)
   assert ensure_signal_check(p)
   assert p.get("TurnPilotCarSignals") == "check" and p.get_bool("TurnPilotCarSignalsVinless")
   p.put("TurnPilotCarSignals", "off", block=True)  # card set it back after the check, or the driver turned it off: never queued again
@@ -50,5 +51,22 @@ def test_the_lamp_check_is_queued_once_with_the_vinless_match():
 
 def test_a_verified_car_is_not_checked_again():
   p = fresh()
+  p.put_bool("TurnPilotCarSignalsForceOn", False, block=True)
   p.put("TurnPilotCarSignalsVerified", {"vin": "x"}, block=True)
   assert not ensure_signal_check(p) and p.get("TurnPilotCarSignals") in (None, "off")
+
+
+def test_car_signals_are_on_by_default_with_no_check_or_record():
+  # Kellen, 2026-11-06: "never disable turn signals for now"
+  from openpilot.selfdrive.turnpilot.car_signals import resolver
+  p = fresh()
+  assert not ensure_signal_check(p)  # nothing queued
+  for mode in (None, "off", "on"):
+    if mode is not None:
+      p.put("TurnPilotCarSignals", mode, block=True)
+    assert resolver(p)("00000000000000000", []).mode == "on"
+  p.put("TurnPilotCarSignals", "check", block=True)
+  assert resolver(p)("00000000000000000", []).mode == "check"  # asked for: the check still runs
+  p.put_bool("TurnPilotCarSignalsForceOn", False, block=True)
+  p.put("TurnPilotCarSignals", "off", block=True)
+  assert resolver(p)("00000000000000000", []).mode == "off"
