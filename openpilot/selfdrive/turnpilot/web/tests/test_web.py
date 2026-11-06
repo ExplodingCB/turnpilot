@@ -1113,10 +1113,10 @@ class TestMapDefaultsOnTheWeb(WebTestCase):
 
 
 class TestCarSignalsPage(WebTestCase):
-  def test_the_drive_check_is_for_developers_and_the_lamp_question_opens_itself(self):
+  def test_the_drive_check_is_offered_and_the_lamp_question_opens_itself(self):
     script = server.INDEX.read_text().split("<script>")[1]
-    assert '$("csdrive").hidden = !devMode ||' in script  # the guided setup runs the check in Park only
-    assert 'get("dev") === "1"' in script
+    # 2026-11-06: a Model 3 lit no lamp for the check in Park, so the check in Drive is offered without ?dev=1
+    assert '$("csdrive").hidden = !(d.check === null || d.mode !== "on");' in script
     assert '$("carsignals").open = true' in script and "loadCarSignals().catch" in script
 
 

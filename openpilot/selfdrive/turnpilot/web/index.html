@@ -477,8 +477,9 @@ async function loadCarSignals() {
     b.onclick = function () { act(async function () { await api("/api/car-signals", "POST", { mode: m }); await loadCarSignals(); }); };
     modes.appendChild(b);
   });
-  // the check in Drive is a developer's: the guided setup only ever runs it in Park, so the button needs ?dev=1
-  $("csdrive").hidden = !devMode || !(d.check === null || d.mode !== "on");
+  // the check in Drive, stopped with the brake held: a Model 3 lit no lamp for the check in Park (2026-11-06, every ON reason
+  // echoed onto the car's bus, no lamp), so Drive is where a Tesla's check passes, not a developer's extra
+  $("csdrive").hidden = !(d.check === null || d.mode !== "on");
   var pending = d.check && d.check.pass && d.check.exterior === "pending";
   $("csexterior").hidden = !pending;
   if (pending && !$("carsignals").open) {  // the comma's setup says "answer on the phone": open the question
