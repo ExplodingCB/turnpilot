@@ -168,7 +168,6 @@ code { display: block; word-break: break-all; margin: 4px 0 12px; padding: 8px; 
 // phone's storage after that. The link's copy is stored only once the comma accepts it, so a bad link can't replace a good token.
 var urlToken = new URLSearchParams(location.search).get("t");
 var token = urlToken, paired = true, timer, ticks = 0;
-var devMode = new URLSearchParams(location.search).get("dev") === "1";
 try { if (!token) token = localStorage.getItem("tp_token"); } catch (e) {}
 
 function $(id) { return document.getElementById(id); }
