@@ -88,7 +88,9 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"LongitudinalManeuverMode", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, BOOL}},
     {"LongitudinalPersonality", {PERSISTENT, INT, std::to_string(static_cast<int>(cereal::LongitudinalPersonality::STANDARD))}},
     {"NavigationEnabled", {PERSISTENT, BOOL, "1"}},  // TurnPilot: on, TurnPilot follows navd's route
-    {"NavDestination", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, JSON}},
+    // TurnPilot: not CLEAR_ON_OFFROAD_TRANSITION, so an onroad cycle (modeld's big-model retry) keeps the phone's destination;
+    // navd ends the trip 30 min offroad after a drive (navd.py DESTINATION_OFFROAD_S)
+    {"NavDestination", {CLEAR_ON_MANAGER_START, JSON}},
     // TurnPilot: the defaults are Saturday's values (SATURDAY_PARAMS.md), so a fresh install is ready to drive with nothing set
     {"TurnPilotEnabled", {PERSISTENT, BOOL, "1"}},
     {"TurnPilotShadowMode", {PERSISTENT, BOOL, "0"}},

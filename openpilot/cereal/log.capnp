@@ -2535,6 +2535,19 @@ struct NavInstruction {
   positionSource @37 :PositionSource;
   positionUncertainty @38 :Float32;
   gpsLostS @39 :Float32;
+  # TurnPilot (slight far-side turns, 2026-11-06): the opposing road's leg off straight on (deg, + right, -45 to 45), the road
+  # maneuverOpposing is present for (the other road at the junction nearest straight on: routing/guidance.py maneuver_junction),
+  # in the logs and on route_follower.py's Maneuver: no verdict hangs on it (2026-11-07, slight_far_turn). By its bearing alone a
+  # road off the far side is no side road: on the 11-06 drives' tiles it was more often the approach's own road going on, whose
+  # oncoming traffic a slight left off it crosses (routing/guidance.py docstring). NaN none or unknown (no such road, no
+  # junction data, an invalid message, a navd before the field): never 0, which is a road dead ahead
+  maneuverOpposingRelBearing @40 :Float32 = nan;
+  # TurnPilot (route start, 2026-11-06): set on every message, valid or not, while navd's route waits on its start direction
+  # check (navd.py: heading_due): made with no heading (standing, parked, nose-in in a space), rerouted for the heading, or come
+  # back across the heading it was made with. The message is invalid then, with the route kept, and no guidance goes out until
+  # the car's own heading or its travel along the route verifies it (or a reroute replaces it). false with no route, on a
+  # verified one, and from a navd before the field
+  routeHeadingUnverified @41 :Bool;
 
   enum PositionSource {
     gps @0;
@@ -2768,6 +2781,7 @@ struct NavInstruction {
     opposingLanes @9 :UInt8;
     opposingStraightM @10 :Float32;  # as maneuverOpposingStraightM
     wrongWayM @11 :Float32;  # as maneuverWrongWayM
+    opposingRelBearing @12 :Float32 = nan;  # as maneuverOpposingRelBearing: NaN none or unknown
   }
 }
 

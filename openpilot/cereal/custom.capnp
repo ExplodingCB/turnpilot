@@ -324,6 +324,7 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
       undecided @6;  # a fault: handed back (leftUndecidedTakeControl)
       announce @7;   # TurnPilotAutoLeft announce: held and handed back, saying whether it would go
       skipped @8;    # its R_req past the detector's proven range: skipped at route time (tooFastToTurn), navd reroutes
+                     # (not set since 2026-11-06: each left is driven to its line)
     }
     state @0 :State;
     tReq @1 :Float32;          # s the oncoming lanes must stay clear
@@ -468,7 +469,8 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
   }
   turnSignal @36 :TurnSignal;   # tp/blinker's, after tp/integrate's routeNotice @35
   skipReason @37 :Text;         # while tooFastToTurn: why the maneuver ahead is skipped (turn_skip.py's reason: tooFast, tooLate,
-                                # keepNoLine, ...), for selfdrived's line; empty otherwise
+                                # keepNoLine, signalStop, ...; unprotectedRange before 2026-11-06), for selfdrived's line; empty
+                                # otherwise
   # LC-01 (ALWAYS_DRIVE.md step S4, TurnPilotAlwaysDrive): an offered lane change held while the car's blind spot that way reads
   # occupied, its request withdrawn (blindspot: selfdrived's line has no sound), then released once it has read clear 0.5 s:
   # said again with the lane change chime and laneChangeCountdown's 1.5 s before the request (clear). none otherwise, and
@@ -524,8 +526,13 @@ struct TurnpilotDetections @0xaedffd8f31e7b55d {
     read @1;
     wideCamera @2;   # this run was on the wide camera; the paint is only read on the road camera
     noModel @3;      # no modelV2 for this very frame yet, or no device type to pick the lens
-    disabled @4;     # the paint failed earlier and is off for the drive, or modeld has no road camera
+    disabled @4;     # modeld has no road camera (logs before 2026-11-06: also a paint read that failed or ran over its budget,
+                     # off for the drive; since then a slow read is skipped where it doesn't fit, a failed one retried)
     sweep @5;        # a stop sweep runs (turnpilotPlan.detectorView): no paint read
+    noRoom @6;       # not read on this road run, to leave the light reader the step's time: the time budget had room for the
+                     # run without the paint and not with it, or the car stands near a mapped signal with the light reader
+                     # reading (modeld_detector.py)
+    retrying @7;     # the paint read failed (logged each time) and waits out its retry backoff: not read
   }
   lanePaintStatus @6 :LanePaintStatus;
   lanePaintTime @7 :Float32;      # s spent reading the paint in this step, 0 when not read; executionTime is the detector's alone
@@ -537,9 +544,12 @@ struct TurnpilotDetections @0xaedffd8f31e7b55d {
     read @1;
     wideCamera @2;   # this run was on the wide camera; lights are only read on the road camera
     noCalibration @3;  # no calibration yet, so no horizon to gate the boxes by: nothing read
-    disabled @4;     # the reader failed or ran over its budget earlier and is off for the drive
+    disabled @4;     # the reader failed LIGHT_DISABLED_FAILS (3) reads in a row: said on its road runs until a read succeeds,
+                     # still retried on its backoff (turnpilotd keeps it past its age-out, map_controls says it once:
+                     # camera_lights_off); logs before 2026-11-06: failed or over budget, off for the drive
     off @5;          # TurnPilotCameraLights off, or modeld has no road camera
     sweep @6;        # a stop sweep runs with no signal mapped within SWEEP_SIGNAL_M (60 m): no colour read (lightBoxes are)
+    retrying @7;     # the reader failed (logged each time), fewer than 3 in a row, and waits out its retry backoff: nothing read
   }
   lightStatus @9 :LightStatus;
   lightTime @10 :Float32;         # s spent reading the lights in this step, 0 when not read
@@ -560,7 +570,9 @@ struct TurnpilotDetections @0xaedffd8f31e7b55d {
     unset @0;          # a log from before the field
     read @1;           # the far crop ran within FAR_STATUS_S
     off @2;            # TurnPilotFarCrop off, no far pkl for this device, or no road camera
-    disabled @3;       # it failed, or ran over its budget or the step's: off for the drive (logged, said once)
+    disabled @3;       # it failed, or ran over its budget or the step's: off for the drive (logged, said once); with the native
+                       # schedule in its slot, the far crop off for the drive (or none) and no native run for NATIVE_NO_RUN_S
+                       # of its slot's free, calibrated time
     noCalibration @4;  # no calibrated horizon to aim it by yet
     noRoom @5;         # on, but no frame between the full runs had room for it within FAR_STATUS_S
     sweep @6;          # on, suspended while a stop sweep runs (its frames are the side views')
@@ -618,7 +630,9 @@ struct TurnpilotDetections @0xaedffd8f31e7b55d {
     full @2;         # the native 1344x512 strips, the frame's top and bottom alternating, in the far crop's place
     fallback @3;     # it failed, or ran over its budget or the step's: the far crop for the drive (logged)
     unavailable @4;  # on, but no native pkl for this device and camera, it failed to load, or the param has changed since the
-                     # detector loaded: the far crop
+                     # detector loaded: the far crop; or loaded but never run in NATIVE_NO_RUN_S (30 s) of its slot's free,
+                     # calibrated time (stop sweeps, TurnPilotFarCrop off, no calibration and gaps in the steps don't count):
+                     # no room beside the driving model (logged once)
   }
   nativeStatus @19 :NativeStatus;
 }
@@ -683,6 +697,11 @@ struct TurnpilotLights @0xda96579883444c35 {
     bearing @5 :Float32;   # deg left of the calibrated forward axis
     votes @6 :UInt8;       # of the last VOTE_M reads of this head (light_state.py), how many read this state
     governs @7 :Bool;      # its bearing lies over the car's lane (within GOVERN_BEARING_DEG)
+    # this frame's read of the head (light_state.read_head), so a night drive's rlog says which gate kills the colour
+    reason @8 :Text;       # 'read', or the gate that stopped it: aspect, dark, twoLit, noColor, positionMismatch, tooFewLampPx,
+                           # arrow (a red arrow keeps its colour). Boxes stopped before they are heads (small, belowHorizon,
+                           # overCap) are never published: lightBoxes has them, and modeld's turnpilot.light_gates log counts
+    read @9 :State;        # this frame's state (state is the vote over the last VOTE_M reads)
   }
   source @0 :Source;
   lights @1 :List(Light);
