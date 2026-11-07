@@ -774,7 +774,7 @@ class TurnPilot:
     self.limits = (NO_ACCEL_CAP, NO_SPEED_CAP, False)  # the last plan's (accelCap, speedCap, shouldStop)
     self.oracle_ok = False  # the sim light oracle is accepted: SIMULATION=1 and TurnPilotSimLightOracle (main())
     self.yellow_decel = YELLOW_DECEL  # TurnPilotYellowDecel (main())
-    self.camera_mode = LIGHT_MODE_DEFAULT  # TurnPilotCameraLights (main()): the camera's lights, shadow unless addOnly
+    self.camera_mode = LIGHT_MODE_DEFAULT  # TurnPilotCameraLights (main()): the camera's lights, add-only unless shadow or off
     self.map_now = None  # this frame's map control decision, once update() has made it
     self.post_go_profile = POST_GO_DEFAULT  # TurnPilotPostGoProfile (main()): a standstill turn's post-go profile
     self.left_go_profile = LEFT_GO_PROFILE  # TurnPilotLeftGoProfile (main()): an unprotected turn's
@@ -1257,8 +1257,11 @@ class TurnPilot:
     turn_side = None if upcoming is None or upcoming.kind != TURN or upcoming.side == 0 else 'left' if upcoming.side == LEFT else 'right'
     self.decider_turn_id = rf.maneuver_id if sg.acting and sg.state not in ('off', 'done') and self.sg_route_maneuver == turn_side \
       else None
+    # the route's turn junction, any side, skipped or not: a red the camera reads there stops the car at it though the map has
+    # no signal for it (map_controls.camera_signal; 2026-11-06, a right rolled on red at an unmapped signal)
+    junction = (rf.maneuver_id, rf.distance) if upcoming is not None and upcoming.kind == TURN else None
     mapd = self.map_update(sm, v_ego, cs.gasPressed, turn, left_cmd, release=sg.release, creep=sg.creep,
-                           stop=StopCommand(sg.latch, sg.reason, sg.action))
+                           stop=StopCommand(sg.latch, sg.reason, sg.action), junction=junction)
     took_over = cs.gasPressed and not sm['carControl'].enabled  # the driver driving, never a go (module docstring)
     # the autonomous left holds its turn's pulse until its go from the line (unprotected_left.py: approach), so its first pulse
     # is that go, never too late (turn_skip.py: pulse_at_go); so does a turn at a stop sign the decider acts for (2.4 item 3:
@@ -3173,10 +3176,11 @@ class TurnPilot:
     return SIGNAL_STOPPED_REASON if self.stopped_signal else STOPPED_REASON
 
   def map_update(self, sm, v_ego: float, gas_pressed: bool, turn=None, left: LeftCommand | None = None, release=None, creep=None,
-                 stop: StopCommand | None = None):
+                 stop: StopCommand | None = None, junction=None):
     """This frame's MapControlPolicy decision, from navInstruction's controls and turnpilotLights (once a frame), the
     route's unprotected turn (MapControlPolicy.update's turn) and the unprotected left's command for it, and the stop-sign
-    decider's release, creep and command for its latch (a fault's call carries none: the latch as it was told last)."""
+    decider's release, creep and command for its latch (a fault's call carries none: the latch as it was told last), and the
+    route's turn junction (MapControlPolicy.update's junction)."""
     if self.map_now is not None:
       return self.map_now
     data = getattr(sm, 'data', {})
@@ -3196,7 +3200,7 @@ class TurnPilot:
       signs = (len(forward), [s for raw in forward for s in getattr(raw, 'signs', ())])
     self.map_now = self.map_controls.update(sm['navInstruction'], sm.updated['navInstruction'], sm.valid['navInstruction'], v_ego,
                                             gas_pressed, lights, DT_MDL, turn=turn, left=left, release=release, creep=creep, stop=stop,
-                                            signs=signs, engaged=bool(sm['carControl'].enabled))
+                                            signs=signs, engaged=bool(sm['carControl'].enabled), junction=junction)
     return self.map_now
 
   def camera_lights(self, sm, data):

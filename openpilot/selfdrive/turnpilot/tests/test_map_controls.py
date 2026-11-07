@@ -30,6 +30,7 @@ class Car:
     self.nav_valid = True
     self.lead_stop: float | None = None  # a lead stopped here: the car stops 0.5 m short of it
     self.turn: tuple | None = None  # (s of the junction, maneuver id, 'left'): a far-side turn there, unprotected-shaped
+    self.junction: tuple | None = None  # (s of the junction, maneuver id): the route's turn there, any side (update()'s junction)
     self.off_route = None  # off the route (nav_valid False): navd's lookup ahead, [(s, kind)], or None for none (no destination)
     self.off_status = 'ok'
     self.rows = []
@@ -53,6 +54,8 @@ class Car:
     due = self.frame % 20 == 0
     self.frame += 1
     turn = None if self.turn is None else (self.turn[1], self.turn[0] - self.s, self.turn[2])
+    if self.junction is not None:
+      kw.setdefault('junction', (self.junction[1], self.junction[0] - self.s))
     out = self.policy.update(self.nav() if due else None, due, self.nav_valid, self.v, gas, lights, DT_MDL, turn=turn, **kw)
     dec = decide(out.stops, self.v)
     dec.accel_cap = self.scene.ramp(dec.accel_cap, DT_MDL)

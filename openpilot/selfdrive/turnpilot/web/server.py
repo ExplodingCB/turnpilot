@@ -27,7 +27,7 @@ from openpilot.selfdrive.turnpilot.car_signals import MODES as CAR_SIGNAL_MODES,
 from openpilot.selfdrive.turnpilot.maps import coverage as coverage_cache
 from openpilot.selfdrive.turnpilot.maps.client import MapError, cert_fingerprint, check_cert, check_key, missing_config, normalize_host
 from openpilot.selfdrive.turnpilot.maps.coverage import CoverageCache, CoverageRefresher, check_trip
-from openpilot.selfdrive.turnpilot.maps.defaults import ensure_map_defaults, ensure_left_range
+from openpilot.selfdrive.turnpilot.maps.defaults import ensure_camera_lights, ensure_map_defaults, ensure_left_range
 from openpilot.selfdrive.turnpilot.maps.paths import wall_time
 from openpilot.selfdrive.turnpilot.maps.status import for_destination, read_status
 from openpilot.selfdrive.turnpilot.routing.sources import local_override
@@ -500,6 +500,7 @@ def main():
   ensure_map_defaults(params)  # the shipped map server's address and certificate: the phone only adds the key
   ensure_signal_check(params)  # the lamp check queued for the next ignition, once, so the car can signal itself
   ensure_left_range(params)  # an unmeasured left range (0) becomes the provisional 150 m, once (maps/defaults.py)
+  ensure_camera_lights(params)  # a comma on the camera lights' old shadow default takes addOnly, once (maps/defaults.py)
   if not PC:  # the map engine installs itself on the comma; a PC has its own (or the sim's local tiles)
     SetupThread(params).start()
   reader = StatusReader(diagnostics.EventLog(params))  # the diagnostics' recent events, from every plan and logged error

@@ -30,7 +30,8 @@ SATURDAY = {
   'TurnPilotLeftFarRangeM': ('FLOAT', '0.0', 0.),
   'TurnPilotAutoLeft': ('STRING', 'auto', 'auto'),
   'TurnPilotGoOverride': ('BOOL', '1', True),
-  'TurnPilotCameraLights': ('STRING', 'shadow', 'shadow'),
+  'TurnPilotCameraLights': ('STRING', 'addOnly', 'addOnly'),  # camera reds stop the car (11-06: a right rolled on red)
+  'TurnPilotCameraLightsMoved': ('BOOL', '0', False),
   'TurnPilotCameraStopSigns': ('STRING', 'shadow', 'shadow'),
   'TurnPilotFarCrop': ('BOOL', '1', True),
   'TurnPilotNativeDetect': ('STRING', 'full', 'full'),  # the whole frame natively in the far crop's slot (35.7 ms step)

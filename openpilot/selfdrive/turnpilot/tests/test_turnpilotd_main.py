@@ -287,7 +287,8 @@ def test_a_model_fallback_before_this_process_still_hands_back():
     assert all(p.turnpilotPlan.handback == Handback.none for p in plans)
 
 
-@pytest.mark.parametrize("value,mode", [(None, 'shadow'), ('addOnly', 'addOnly'), ('off', 'off'), ('bogus', 'shadow')])
+@pytest.mark.parametrize("value,mode", [(None, 'addOnly'), ('addOnly', 'addOnly'), ('shadow', 'shadow'), ('off', 'off'),
+                                        ('bogus', 'addOnly')])
 def test_main_reads_the_camera_lights_mode(value, mode):
   made, real = [], turnpilotd.TurnPilot
   def make():

@@ -19,7 +19,8 @@ Gated boxes are counted, never published. A box past the gates is a head, and it
   arrow is a permissive left, and blocking on it would stall the autonomous left in the phase it is built for. A red
   arrow keeps its colour (reason arrow): it never permits a go, so the autonomous left's go (map_controls.turn_light)
   and every lift (release_light) at its junction see it as a red; a green ball beside a red left arrow is not a left's
-  green. The camera's reds never brake the car (shadow), so this only ever keeps a go off. This is a proxy at these
+  green. Under add-only (the default) a camera red adds a stop at its signal, so a red arrow alone over the car's lane
+  stops it there too, as a red: a stop and a loud handback, never a run. This is a proxy at these
   sizes: on the comma demo route it caught 24-78% of two red left arrows' reads, and called 10 reads of a red ball, 30
   of a yellow ball and 25 of a green ball arrows, so a red arrow must never turn unknown on it alone.
 A head's state is its vote: VOTE_N of its last VOTE_M reads (a frame it wasn't seen in counts as unknown), which also
@@ -63,15 +64,18 @@ GOVERN_BEARING_DEG = 10.    # a head within this of the lane's bearing governs i
 MAX_READ_HEADS = 8          # heads read a frame, the most confident first (decode_lights' order): the read's time stays bounded
 STATES = ('red', 'yellow', 'green')
 LIGHT_MODES = ('off', 'shadow', 'addOnly')  # TurnPilotCameraLights
-LIGHT_MODE_DEFAULT = 'shadow'  # read and logged, never acted on (CRITIQUE: no stop authority until the replay gate passes)
+# a camera red adds a stop, never removes one (map_controls: add-only). Shadow until 2026-11-06, when the real car rolled a right
+# on red at a junction the map has no signal for, the reader reading the red and nothing acting on it (Kellen: a red light is
+# a hard rail; never ship a feature in shadow)
+LIGHT_MODE_DEFAULT = 'addOnly'
 
 
 def camera_lights_mode(params) -> str:
-  """TurnPilotCameraLights, read by modeld and turnpilotd: off, shadow (the default, and anything unknown) or addOnly."""
+  """TurnPilotCameraLights, read by modeld and turnpilotd: off, shadow or addOnly (the default, and anything unknown)."""
   try:
     value = params.get("TurnPilotCameraLights")
   except UnknownKeyName:
-    cloudlog.error("turnpilot: TurnPilotCameraLights unknown to this build's params, camera lights in shadow; run scons")
+    cloudlog.error("turnpilot: TurnPilotCameraLights unknown to this build's params, camera lights add-only; run scons")
     return LIGHT_MODE_DEFAULT
   value = value.decode() if isinstance(value, bytes) else value
   return value if value in LIGHT_MODES else LIGHT_MODE_DEFAULT

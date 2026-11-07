@@ -268,3 +268,209 @@ def test_turnpilotd_says_a_camera_reader_off_once():
   alerts = [p.controlAlert for _, _, p in sim.trace]
   assert 'lightSourceRejected' in alerts and alerts[-1] == 'none'
   assert any(p.reason == "Camera light reader off for this drive" for _, _, p in sim.trace if p.controlAlert == 'lightSourceRejected')
+
+
+# --- the route turn's junction the map has no signal for (2026-11-06: a right rolled on red at an unmapped signal) ---
+
+def cam_junction(state, s_head, shadow=False):
+  """The camera reading a governing head at s_head (road position) as the car moves: add-only unless shadow."""
+  return lambda car: Lights(camera=camera(state, s_head - car.s, shadow))
+
+
+def right_at(s_junction=200., mid=7, v=13.4):
+  car = Car([], v=v)
+  car.junction = (s_junction, mid)
+  return car
+
+
+def test_unmapped_right_camera_red_stops_at_the_junction_line_and_holds():
+  from openpilot.selfdrive.turnpilot.map_controls import CONTROL_LINE_M, SIGNAL_UNSEEN_REASON, SIGNAL_UNSEEN_S
+  car = right_at()
+  out, dec = car.run_until(held, lights=cam_junction('red', 215.))
+  line = 200. - CONTROL_LINE_M
+  assert -2. < line - car.s < 5. and all(r[3] >= MAP_DECEL_MAX - 1e-6 for r in car.rows)  # never past -2.0
+  assert out.shown.kind == 'signal' and car.policy.camera_signal is not None
+  assert out.stops[0].reason == "Red light (camera)"
+  s_held = car.s
+  # waiting at the red: held, no handback while the camera reads it, never a roll
+  for _ in range(int(30. / DT_MDL)):
+    out, dec, _ = car.step(lights=cam_junction('red', 215.))
+    assert held(out, dec) and out.prompt == 'none'
+  # the camera reads green: never a go on the camera's green alone (no accepted source on the car); held, then handed
+  # back loudly after the stand
+  for _ in range(int((SIGNAL_UNSEEN_S - 0.5) / DT_MDL)):
+    out, dec, _ = car.step(lights=cam_junction('green', 215.))
+    assert held(out, dec) and out.prompt == 'none'
+  out, dec, _ = car.run(1., lights=cam_junction('green', 215.))
+  assert held(out, dec) and out.prompt == 'signalUnseenTakeControl' and out.stops[0].reason == SIGNAL_UNSEEN_REASON
+  assert abs(car.s - s_held) < 0.05
+
+
+def test_unmapped_right_camera_red_released_by_an_accepted_green():
+  # the sim oracle (an accepted source) reading green there once the camera's red is gone lets the car go
+  car = right_at()
+  car.run_until(held, lights=cam_junction('red', 215.))
+
+  def green(car):
+    return replace(lights('green', 215. - car.s), camera=camera('green', 215. - car.s, False))
+  out, dec, _ = car.run(GREEN_STEADY_S + 0.2, lights=green)
+  assert not dec.should_stop
+  car.run(10., lights=green)
+  assert car.s > 220.
+
+
+@pytest.mark.parametrize("state", ['green', 'unknown'])
+def test_unmapped_right_camera_green_or_unknown_adds_nothing(state):
+  base, car = right_at(), right_at()
+  for _ in range(int(25. / DT_MDL)):
+    a = base.step()
+    b = car.step(lights=cam_junction(state, 215.))
+    assert a[0].stops == b[0].stops == [] and a[2] == b[2]
+  assert car.s > 300. and car.policy.camera_signal is None
+
+
+def test_unmapped_right_shadow_camera_red_adds_nothing():
+  base, car = right_at(), right_at()
+  for _ in range(int(25. / DT_MDL)):
+    a = base.step()
+    b = car.step(lights=cam_junction('red', 215., shadow=True))
+    assert a[0].stops == b[0].stops and a[2] == b[2]
+  assert car.policy.camera_signal is None
+
+
+def test_no_route_turn_no_camera_signal():
+  # a red no mapped signal owns with no route turn there (a straight road): logged, as before (camera_light_unmapped)
+  car = Car([])
+  out, dec, _ = car.run(3., lights=lambda car: Lights(camera=camera('red', 40., False)))
+  assert out.stops == [] and not dec.should_stop and car.policy.camera_signal is None
+
+
+def test_a_camera_red_head_far_from_the_turn_junction_is_not_its():
+  # a head 80 m past the turn's junction (the next junction's) makes no signal at the turn
+  car = right_at()
+  car.run(5., lights=cam_junction('red', 280.))
+  assert car.policy.camera_signal is None
+
+
+def test_a_mapped_signal_at_the_right_turn_stops_on_the_camera_red_at_its_own_line():
+  car = Car([(192., 'signal', True)])
+  car.junction = (200., 7)
+  out, dec = car.run_until(held, lights=cam_junction('red', 215.))
+  assert -2. < 192. - car.s < 5. and car.policy.camera_signal is None  # the mapped signal's own add-only stop
+  assert out.shown.kind == 'signal' and out.shown.line_mapped
+
+
+def test_unmapped_right_yellow_far_enough_stops_too_late_goes():
+  car = right_at()
+  out, dec = car.run_until(held, lights=cam_junction('yellow', 215.))
+  assert -2. < 190. - car.s < 5.
+  # first read at the line's 9 m at 13.4 m/s: too late to stop for at -2.0, the car goes (a yellow decided so)
+  car = Car([], v=13.4)
+  car.junction = (200., 7)
+  car.s = 181.
+  for _ in range(int(5. / DT_MDL)):
+    out, dec, _ = car.step(lights=cam_junction('yellow', 215.))
+    assert not dec.should_stop
+  assert car.s > 220. and car.policy.camera_signal is None
+
+
+def test_unmapped_unprotected_left_keeps_its_own_hold():
+  # an unprotected left's own hold line holds the car at its junction already; no second stop is made there
+  car = Car([])
+  car.turn = (200., 7, 'left')
+  car.junction = (200., 7)
+  out, dec = car.run_until(held, lights=cam_junction('red', 215.))
+  assert car.policy.camera_signal is None and out.shown.kind == 'unprotectedTurn'
+
+
+def test_unmapped_right_camera_red_read_past_the_line_makes_no_stop_in_the_junction():
+  car = right_at()
+  car.v, car.s = 5., 192.  # past the junction's line, turning
+  for _ in range(int(3. / DT_MDL)):
+    out, dec, _ = car.step(lights=cam_junction('red', 215.))
+    assert out.stops == []
+
+
+def test_an_unengaged_camera_signal_drops_when_the_maneuver_moves_on():
+  car = right_at()
+  car.run(3., lights=cam_junction('red', 215.))  # read far out, not engaged yet at 13.4 m/s 150 m out
+  cs = car.policy.camera_signal
+  assert cs is not None
+  car.junction = (600., 8)  # the route's maneuver moved on (a reroute) before the curve engaged: dropped
+  car.step(lights=lambda car: NO_LIGHTS)
+  assert car.policy.camera_signal is None
+
+
+def test_an_engaged_camera_signal_dead_reckons_through_a_frame_without_the_junction():
+  car = right_at()
+  car.run_until(lambda out, dec: car.policy.camera_signal is not None and car.policy.camera_signal.engaged,
+                lights=cam_junction('red', 215.))
+  d = car.policy.camera_signal.d
+  car.junction = None  # a fault's frame (KEEP_TURN): no route this frame
+  out, dec, _ = car.step(lights=cam_junction('red', 215.))
+  cs = car.policy.camera_signal
+  assert cs is not None and abs(cs.d - (d - car.rows[-2][2] * DT_MDL)) < 0.05 and out.stops
+
+
+# --- through turnpilotd: an unmapped right on a camera red ---
+
+def right_sim(mode, state, controls=(), s_head=215.):
+  from openpilot.cereal import messaging
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Sim
+  sim = Sim([(200., "turn", "right"), (1500., "turn", "left")], controls=controls)
+  sim.tp.camera_mode = mode
+  none = messaging.new_message('turnpilotLights').as_reader().turnpilotLights
+
+  def lights(sim):
+    if int(round(sim.t / DT_MDL)) % 2 == 0:
+      sim.sm.put('turnpilotDetections', detections(state, s_head - sim.s, shadow=mode != 'addOnly'))
+    return none
+  sim.lights = lights
+  return sim
+
+
+def test_turnpilotd_unmapped_right_on_a_camera_red_stops_at_the_line_and_holds():
+  from openpilot.cereal import log
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import stop_at
+  sim = right_sim('addOnly', 'red')
+  plan = stop_at(sim, 190.)
+  assert plan.shouldStop and -2. < 190. - sim.s < 6. and all(p.accelCap >= MAP_DECEL_MAX - 1e-6 for _, _, p in sim.trace)
+  assert str(plan.mapControl.kind) == 'signal'
+  s_held = sim.s
+  sim.run(20.)
+  assert sim.s - s_held < 0.1 and all(p.shouldStop for _, _, p in sim.trace[-int(19. / DT_MDL):])
+  # no turn desire out while held at the red (the desire waits for the go)
+  assert all(p.desire != log.Desire.turnRight for s, _, p in sim.trace if s < 190.)
+
+
+def test_turnpilotd_unmapped_right_camera_green_goes():
+  # as with nothing read: through the junction on the turn, never stopped
+  base, sim = right_sim('addOnly', 'unknown'), right_sim('addOnly', 'green')
+  for _ in range(int(30. / DT_MDL)):
+    a, b = base.step(), sim.step()
+    assert (a.accelCap, a.speedCap, a.shouldStop, a.desire) == (b.accelCap, b.speedCap, b.shouldStop, b.desire)
+  assert sim.s > 210. and not any(p.shouldStop for _, _, p in sim.trace)
+
+
+def test_turnpilotd_mapped_signal_right_on_a_camera_red_stops_at_its_line_first():
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import stop_at
+  sim = right_sim('addOnly', 'red', controls=[(192., 'signal')])
+  plan = stop_at(sim, 192.)
+  assert plan.shouldStop and -2. < 192. - sim.s < 6. and str(plan.mapControl.kind) == 'signal'
+  assert sim.tp.map_controls.camera_signal is None
+
+
+def test_turnpilotd_shadow_camera_red_at_an_unmapped_right_is_logged_only():
+  # the 7c37f66 behaviour, kept under shadow (set by hand): nothing stops the car
+  sim = right_sim('shadow', 'red')
+  sim.run(25.)
+  assert not any(p.shouldStop for _, _, p in sim.trace) and sim.tp.map_controls.camera_signal is None
+
+
+def test_a_mapped_signal_set_far_back_of_the_turn_junction_keeps_its_heads():
+  # its line 35 m short of the junction (outside PROTECT_BEFORE_M), the head 5 m past the junction its own: the stop is at the
+  # mapped line, never moved up to the junction's
+  car = Car([(165., 'signal', True)])
+  car.junction = (200., 7)
+  out, dec = car.run_until(held, lights=cam_junction('red', 195.))
+  assert -2. < 165. - car.s < 5. and car.policy.camera_signal is None

@@ -5,7 +5,7 @@ import pytest
 from openpilot.common.params import Params
 from openpilot.common.prefix import OpenpilotPrefix
 from openpilot.selfdrive.turnpilot.car_signals import ensure_signal_check
-from openpilot.selfdrive.turnpilot.maps.defaults import CAR_LEFT_RANGE_M, ensure_left_range
+from openpilot.selfdrive.turnpilot.maps.defaults import CAR_LEFT_RANGE_M, ensure_camera_lights, ensure_left_range
 
 
 @pytest.fixture(autouse=True)
@@ -38,6 +38,25 @@ def test_a_measured_left_range_is_never_touched():
   p = fresh()
   p.put("TurnPilotLeftRangeM", 95., block=True)
   assert not ensure_left_range(p) and p.get("TurnPilotLeftRangeM") == 95.
+
+
+def test_a_comma_on_the_camera_lights_shadow_default_takes_add_only_once():
+  """2026-11-06: the car rolled a right on red its reader read in shadow. A comma still on shadow (or nothing) takes addOnly,
+  once; off, or shadow set back after the move, is left alone."""
+  p = fresh()
+  p.put("TurnPilotCameraLights", "shadow", block=True)
+  assert ensure_camera_lights(p) and p.get("TurnPilotCameraLights") == "addOnly"
+  p.put("TurnPilotCameraLights", "shadow", block=True)  # set back on purpose: left alone
+  assert not ensure_camera_lights(p) and p.get("TurnPilotCameraLights") == "shadow"
+
+
+@pytest.mark.parametrize("value, wrote, after", [(None, True, "addOnly"), ("off", False, "off"), ("addOnly", False, "addOnly")])
+def test_camera_lights_unset_off_or_add_only(value, wrote, after):
+  p = fresh()
+  if value is not None:
+    p.put("TurnPilotCameraLights", value, block=True)
+  assert ensure_camera_lights(p) == wrote and p.get("TurnPilotCameraLights") == after
+  assert p.get_bool("TurnPilotCameraLightsMoved")
 
 
 def test_the_lamp_check_is_queued_once_with_the_vinless_match():

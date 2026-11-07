@@ -55,3 +55,21 @@ def ensure_left_range(params) -> bool:
     params.put(LEFT_RANGE_PARAM, CAR_LEFT_RANGE_M, block=True)
   params.put_bool(LEFT_RANGE_MARK, True, block=True)
   return wrote
+
+
+CAMERA_LIGHTS_PARAM, CAMERA_LIGHTS_MARK = 'TurnPilotCameraLights', 'TurnPilotCameraLightsMoved'
+CAMERA_LIGHTS_DEFAULT = 'addOnly'
+
+
+def ensure_camera_lights(params) -> bool:
+  """A comma holding TurnPilotCameraLights shadow (the default every build wrote before 2026-11-06), or nothing, takes
+  addOnly, once per comma: the camera's reds stop the car (map_controls: add-only). Kellen, 2026-11-06, after the car rolled a
+  right on red its reader had read in shadow: a red light is a hard rail, and no feature ships in shadow. off, or a shadow
+  set after the move, is never touched. Returns whether it wrote the mode."""
+  value = params.get(CAMERA_LIGHTS_PARAM)
+  value = value.decode() if isinstance(value, bytes) else value
+  wrote = not params.get_bool(CAMERA_LIGHTS_MARK) and value in (None, '', 'shadow')
+  if wrote:
+    params.put(CAMERA_LIGHTS_PARAM, CAMERA_LIGHTS_DEFAULT, block=True)
+  params.put_bool(CAMERA_LIGHTS_MARK, True, block=True)
+  return wrote
