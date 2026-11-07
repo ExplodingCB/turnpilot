@@ -52,7 +52,8 @@ class BeamNGConfig:
   restore: bool = False  # on exit, undo the global game changes above (signals, HUD, particles, light): the game is shared
   # the car signals TurnPilot's turns itself, as a verified Tesla (tesla.py car_signals): TurnPilotCarSignals on and a sim
   # verified record written before the car's first CAN (bridge.car_signals_at_start). On by default in the sim, so the game's
-  # indicator lights and the autonomous left goes on a signalled left; run_bridge.py --no-car-signals writes it off
+  # indicator lights and the autonomous left goes on a signalled left; run_bridge.py --no-car-signals writes it off, and
+  # TurnPilotCarSignalsForceOn 0 with it (since 2026-11-06: under ForceOn, 1 by default, card would signal anyway)
   car_signals: bool = True
   # where openpilot's wheel speeds come from (pose.car_speed): 'ground', the car's travel (the IMU pose); 'wheels',
   # electrics.wheelspeed, which over-reads 10-20% while the car speeds up or brakes (BeamNG build findings D4-speed)

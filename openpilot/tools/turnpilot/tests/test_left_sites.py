@@ -1,5 +1,5 @@
-"""left_sites (LEFT_RANGE.md): junctions near a point where a left across one oncoming approach passes this fork's own route
-time for a given TurnPilotLeftRangeM. judge() is route time's checks on a route's steps, its opposing road and its
+"""left_sites (LEFT_RANGE.md): junctions near a point where a left across one oncoming approach would go from its line for a
+given TurnPilotLeftRangeM (one that fails hands back there). judge() is route time's reach on a route's steps, its opposing road and its
 controls: the left's reach against the range (and the far crop's), the opposing road straight past it, its speed and lanes
 or the unknown rules, no signal, stop or yield of its own, a turn and not a keep, its side not in doubt, and the controls
 known. The junctions come from Valhalla's locate (its graph, the one navd routes on): faked here."""
@@ -118,11 +118,14 @@ def test_the_far_crop_extends_the_reach_only_past_a_measured_road_range():
 def test_only_a_left_turn_across_one_oncoming_approach():
   # a T's stem: no road straight on, so no oncoming traffic to judge (route time's unprotected_turn is false)
   assert ls.judge(turn_steps(bearings=(90, 180, 270), i_in=1, out=2), ROAD_25, [], 'ok', 400.).codes == ['notUnprotected']
-  assert ls.judge(turn_steps(modifier='slight left', after=330.), ROAD_25, [], 'ok', 400.).codes == ['notUnprotected']
+  # a slight left of SLIGHT_TURN_MIN_DEG (25) or more across the road straight on is a left across oncoming traffic, as
+  # turnpilotd takes it since the 11-06 drives (route_follower.slight_far_turn): judged as one; a gentler one is a keep
+  assert ls.judge(turn_steps(modifier='slight left', after=330.), ROAD_25, [], 'ok', 400.).ok
+  assert ls.judge(turn_steps(modifier='slight left', after=340.), ROAD_25, [], 'ok', 400.).codes == ['notUnprotected']
   assert ls.judge(turn_steps(modifier='right', out=1, after=90.), ROAD_25, [], 'ok', 400.).codes == ['notUnprotected']
   # two roads within OPPOSING_DEG of straight on: which one the band looks up isn't one approach
   assert ls.judge(turn_steps(bearings=(350, 30, 90, 180, 270), i_in=3, out=4), ROAD_25, [], 'ok', 400.).codes == ['twoOncoming']
-  # the bearings turn right under a left modifier: route time skips it, sideUncertain
+  # the bearings turn right under a left modifier: turnpilotd skips it, sideUncertain
   assert ls.judge(turn_steps(after=90., out=1), ROAD_25, [], 'ok', 400.).codes == ['sideUncertain']
 
 

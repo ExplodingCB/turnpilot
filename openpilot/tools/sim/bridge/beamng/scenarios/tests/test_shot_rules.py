@@ -302,63 +302,132 @@ class TestDetectorSilentAtTheHandback:
     assert [score.fault_event(k) for k in score.FAULT_HANDBACKS] == ['turnpilotDetectorStopped', 'turnpilotModelFellBack', 'turnpilotNoDetector']
 
 
-def range_skip(hold=False, reroute=True, past=True):
-  """S05: the left skipped for range 80 m out (left_state skipped, tooFastToTurn), straight on past the junction (or to 10 m
-  short of it), rerouted 1 s after passing it; with hold, TurnPilot holds the car to a stop 28 m out first."""
-  segs = [(4.0, {'v': 8., 'left_state': 'skipped', 'too_fast': True, 'nav_mod': 'left', 'j_dist': lambda tau: 80. - 8 * tau,
-                 'j_ahead': lambda tau: 80. - 8 * tau})]
-  j = 48.
-  if hold:
-    segs += [(5.0, {'v': lambda tau: max(8. - 1.6 * tau, 0.), 'left_state': 'skipped', 'state': 'holding', 'reason': 'Junction ahead',
-                    'nav_mod': 'left', 'j_dist': lambda tau: 48. - 8. * tau + 0.8 * tau * tau, 'j_ahead': lambda tau: 48. - 8. * tau + 0.8 * tau * tau}),
-             (5.0, {'v': 0., 'left_state': 'skipped', 'state': 'holding', 'reason': 'Junction ahead', 'nav_mod': 'left', 'j_dist': 28.,
-                    'j_ahead': 28.})]
-    j = 28.
-  end = -24. if past else 10.
-  run_s = (j - end) / 8.
-  segs += [(run_s, {'v': 8., 'left_state': 'skipped', 'nav_mod': 'left', 'j_dist': lambda tau: abs(j - 8. * tau), 'j_ahead': lambda tau: j - 8. * tau,
-                    'route': lambda tau: 2 if reroute and j - 8. * tau < -8. else 1})]
-  return drive(segs)
+LINE_M = 18.  # where S05's left stands at its line: the junction this far ahead
+GAP_CAR_T = 13.  # the one oncoming car through the junction at this t, 4 s into the stand; an empty road after it
 
 
-class TestRangeSkipDrivesOn:
-  """S05 'the skip alert before the junction; no turn desire; no hold at the line; ... a reroute' (B5): the left's range
-  skip met explains the left's wait, go and arrival only if TurnPilot never held the car near the junction after it
-  (NEAR_JUNCTION_M) and navd rerouted once the car was past the junction (a new navRoute after the first row with the
-  junction behind it)."""
-  EXPECT = ('skip',)
+def left_at_line(line_m=LINE_M, handback_from=None, why='range', go=False):
+  """S05 (2026-11-06 on: the left past its range driven to its line): from line_m + 52 m at 8 m/s, braking at 1.6 m/s^2 to
+  a stand at its line line_m short of the junction from t=9, waiting there (waitGap) 3 s, then undecided (why) and handed
+  back with the car held (leftUndecidedTakeControl) to the run's end at t=32. One oncoming car passes the junction at
+  GAP_CAR_T, then the road is empty: a gap of tReq offered at the line. handback_from: the undecided and its handback from
+  that t instead (before the stand: rolling up the approach). go: no handback, the wait at the line through the car's pass
+  and the left's go at t=16, then its turn."""
+  segs = [(4.0, {'v': 8., 'left_state': 'approach', 'nav_mod': 'left', 'j_dist': lambda tau: line_m + 52. - 8. * tau,
+                 'j_ahead': lambda tau: line_m + 52. - 8. * tau}),
+          (5.0, {'v': lambda tau: max(8. - 1.6 * tau, 0.), 'left_state': 'approach', 'nav_mod': 'left', 'state': 'holding',
+                 'reason': 'Stopping at unprotected turn', 'j_dist': lambda tau: line_m + 20. - 8. * tau + 0.8 * tau * tau,
+                 'j_ahead': lambda tau: line_m + 20. - 8. * tau + 0.8 * tau * tau})]
+  stand = {'v': 0., 'left_treq': 8.4, 'state': 'holding', 'nav_mod': 'left', 'j_dist': line_m, 'j_ahead': line_m}
+  segs.append((7.0 if go else 3.0, {**stand, 'left_state': 'waitGap', 'reason': 'Waiting for a gap', 'control_prompt': 'waitingForGap'}))
+  if go:
+    segs.append((16.0, {'v': lambda tau: min(2. * tau, 8.), 'left_state': 'go', 'state': 'turning',
+                        'nav_mod': 'left', 'control_prompt': 'leftGo', 'j_dist': lambda tau: abs(line_m - min(tau * tau, 8. * tau)),
+                        'j_ahead': lambda tau: line_m - min(tau * tau, 8. * tau)}))
+  else:
+    segs.append((20.0, {**stand, 'left_state': 'undecided', 'left_why': why, 'control_prompt': 'leftUndecidedTakeControl',
+                        'reason': "Can't see oncoming far enough: take control"}))
+  rows = drive(segs)
+  for r in rows:
+    r['onc'] = [[round(abs(11. * (GAP_CAR_T - r['t'])), 2), round(11. * (GAP_CAR_T - r['t']), 2)]]
+    r['car_j_dist'] = r['onc'][0][0]
+    if handback_from is not None and handback_from <= r['t'] < 9.:
+      r.update(left_state='undecided', left_why=why, control_prompt='leftUndecidedTakeControl')
+  return rows
 
-  def test_a_hold_at_the_line_and_no_reroute_fail(self):
-    # the skeptic's B5: the range skip 80 m out, then a hold to a stop 28 m out, then straight on, one route id throughout
-    res = score.summarize('unprotected_left_visible', range_skip(hold=True, reroute=False), 'timeout', expect=self.EXPECT)
-    assert not res['passed'] and not res['expected'][0]['met']
-    assert any(f.startswith("TurnPilot held the car at t=") and "(Junction ahead)" in f and "after the range skip: no hold at the line" in f
-               for f in res['failures']), res['failures']
-    assert any(f.startswith("no reroute after passing the skipped junction at t=") for f in res['failures']), res['failures']
-    assert any('never went' in f for f in res['failures'])  # unmet: the left's checks stand
 
-  def test_each_alone_fails(self):
-    res = score.summarize('unprotected_left_visible', range_skip(hold=True), 'timeout', expect=self.EXPECT)
-    assert any('no hold at the line' in f for f in res['failures']) and not any('no reroute' in f for f in res['failures']), res['failures']
-    res = score.summarize('unprotected_left_visible', range_skip(reroute=False), 'timeout', expect=self.EXPECT)
-    assert any('no reroute' in f for f in res['failures']) and not any('no hold' in f for f in res['failures']), res['failures']
+def range_skip():
+  """The retired S05: the left skipped for range 80 m out (left_state skipped, tooFastToTurn), straight on past the
+  junction, rerouted 1 s after passing it, as turnpilotd did until 2026-11-06."""
+  return drive([(4.0, {'v': 8., 'left_state': 'skipped', 'too_fast': True, 'nav_mod': 'left', 'j_dist': lambda tau: 80. - 8 * tau,
+                       'j_ahead': lambda tau: 80. - 8 * tau}),
+                (9.0, {'v': 8., 'left_state': 'skipped', 'nav_mod': 'left', 'j_dist': lambda tau: abs(48. - 8. * tau),
+                       'j_ahead': lambda tau: 48. - 8. * tau, 'route': lambda tau: 2 if 48. - 8. * tau < -8. else 1})])
 
-  def test_a_run_ending_short_of_the_junction_never_shows_the_reroute(self):
-    res = score.summarize('unprotected_left_visible', range_skip(past=False), 'timeout', expect=self.EXPECT)
-    assert "never passed the skipped junction: no reroute seen" in res['failures'], res['failures']
 
-  def test_straight_on_and_rerouted_passes(self):
-    res = score.summarize('unprotected_left_visible', range_skip(), 'timeout', expect=self.EXPECT)
+class TestLeftAtItsLine:
+  """S05 since 2026-11-06 (Kellen: "drive to the line; go where the camera covers the oncoming road, else hold and hand back
+  loudly; never route around or skip a left for range"): the left past its range is driven to its line and hands back there,
+  the car held (handback:leftUndecidedTakeControl), or, where the camera covers it, goes from there (the left's own checks,
+  no expectation). The handback met explains the left's undecided with a gap offered (the reach is the shot), and only at
+  the line and for the reach: the car standing within NEAR_JUNCTION_M before the junction at its first row, no skip before
+  it, its why one of REACH_WHYS. Until then S05 expected the range skip and a reroute past the junction (B5), which now
+  fails the left."""
+  EXPECT = ('handback:leftUndecidedTakeControl',)
+
+  def test_the_handback_at_the_line_passes_only_as_expected(self):
+    plain = score.summarize('unprotected_left_visible', left_at_line(), 'timeout')
+    assert not plain['passed'] and plain['left']['gap_before_undecided']
+    assert any(f.startswith("undecided at t=12.0 s with a gap of") for f in plain['failures']), plain['failures']
+    res = score.summarize('unprotected_left_visible', left_at_line(), 'timeout', expect=self.EXPECT)
     assert res['passed'], res['failures']
-    assert res['expect_facts']['after_range_skip']['rerouted_t'] is not None
+    (e,) = res['expected']
+    assert e['met'] and e['t'] == 12.0 and any(x.startswith('undecided at t=12.0 s') for x in e['explains']), e
+    # every reach fault alike: day, night and the bend, at a set-back line too
+    for why in ('farUnmeasured', 'farOff', 'night', 'curve'):
+      assert score.summarize('unprotected_left_visible', left_at_line(why=why), 'timeout', expect=self.EXPECT)['passed'], why
+    assert score.summarize('unprotected_left_visible', left_at_line(line_m=30.), 'timeout', expect=self.EXPECT)['passed']
 
-  def test_s19s_skip_isnt_held_to_it(self):
-    # too_fast_right ends 30 m past its junction ('past junction'), before navd's reroute: not the left's range skip
-    rows = range_skip(reroute=False)
+  def test_a_handback_rolling_up_the_approach_isnt_at_the_line(self):
+    res = score.summarize('unprotected_left_visible', left_at_line(handback_from=2.), 'timeout', expect=self.EXPECT)
+    assert not res['passed'] and not res['expected'][0]['met']
+    assert "handed back leftUndecidedTakeControl at t=2.0 s rolling at 8.0 m/s, 54 m from the junction: not standing at its line" \
+      in res['failures'], res['failures']
+    assert any(f.startswith('undecided at t=2.0 s') for f in res['failures'])  # unmet: the left's checks stand
+
+  def test_a_handback_standing_short_of_the_junctions_reach_isnt_at_the_line(self):
+    # standing 50 m out (a stand behind a queue, a signal further back): not the left's line
+    res = score.summarize('unprotected_left_visible', left_at_line(line_m=50.), 'timeout', expect=self.EXPECT)
+    assert not res['expected'][0]['met']
+    assert "handed back leftUndecidedTakeControl at t=12.0 s standing 50 m from the junction: not at its line (within 35 m " + \
+      "before it)" in res['failures'], res['failures']
+
+  def test_a_handback_at_the_line_for_another_fault_isnt_the_reach(self):
+    # review 2026-11-06: S05's junction is signalled, so at the 210 m default (R_req 133-141 m, no reach fault) run without
+    # the oracle it hands back 'light' at its line unless the camera reads its green; 'noGap' or 'stale' on the gap offered
+    # is a left that should have gone. None is the range shot, and none may explain the undecided away
+    for why in ('noGap', 'light', 'stale', 'position', 'yaw', 'standing', 'unsignalled', 'farStale', 'farBlocked'):
+      res = score.summarize('unprotected_left_visible', left_at_line(why=why), 'timeout', expect=self.EXPECT)
+      assert not res['passed'] and not res['expected'][0]['met'], why
+      want = f"handed back leftUndecidedTakeControl for '{why}' at t=12.0 s: not the reach (range, farUnmeasured, farOff, " + \
+        "night, curve), S05's shot"
+      assert want in res['failures'], res['failures']
+      assert any(f.startswith('undecided at t=12.0 s with a gap of') for f in res['failures']), (why, res['failures'])
+    # rows from before left_why (6e8a3a459) aren't judged on it: at the line, the handback is met as before
+    rows = left_at_line()
     for r in rows:
-      r['left_state'] = 'off'
-    res = score.summarize('too_fast_right', rows, 'past junction', expect=self.EXPECT)
-    assert res['expected'][0]['met'], res['failures']
+      r.pop('left_why', None)
+    assert score.summarize('unprotected_left_visible', rows, 'timeout', expect=self.EXPECT)['passed']
+
+  def test_a_skip_before_the_handback_isnt_the_shot(self):
+    rows = left_at_line()
+    for r in rows:
+      r['too_fast'] = 1. <= r['t'] < 3.
+    res = score.summarize('unprotected_left_visible', rows, 'timeout', expect=self.EXPECT)
+    assert not res['expected'][0]['met']
+    assert "the left was skipped (tooFastToTurn) at t=1.0 s, before the leftUndecidedTakeControl handback: a left is driven to " + \
+      "its line" in res['failures'], res['failures']
+    assert "skipped the left at t=1.0 s (tooFastToTurn): a left is driven to its line, to go or hand back there" in res['failures']
+
+  def test_the_retired_range_skip_fails_the_left(self):
+    # the B5 run that used to be S05's pass: the range skip 80 m out, straight on, the reroute past the junction
+    plain = score.summarize('unprotected_left_visible', range_skip(), 'timeout')
+    assert any(f.startswith("skipped the left at t=0.0 s (for its range, unprotectedLeft.state skipped)") for f in plain['failures']), \
+      plain['failures']
+    res = score.summarize('unprotected_left_visible', range_skip(), 'timeout', expect=self.EXPECT)
+    assert not res['passed'] and "expected handback leftUndecidedTakeControl: none came" in res['failures'], res['failures']
+
+  def test_a_go_from_the_line_is_the_lefts_own_shot(self):
+    # where the camera covers the oncoming road the left goes from its line: no expectation, the left's checks
+    rows = left_at_line(go=True)
+    plain = score.summarize('unprotected_left_visible', rows, 'timeout')
+    lr = plain['left']
+    assert lr['gos'] == [16.0] and lr['skipped'] is None and lr['undecided_t'] is None and not lr['false_goes']
+    assert lr['pet_s'] >= score.PET_MIN_S
+    # the rows carry no route: arriving and the maneuvers are all it fails (TestGasTaps' left_run passes with them)
+    assert set(plain['failures']) == {'ended timeout, not arrived', 'took 0 of 0 maneuvers'}, plain['failures']
+    res = score.summarize('unprotected_left_visible', rows, 'timeout', expect=self.EXPECT)
+    assert "expected handback leftUndecidedTakeControl: none came" in res['failures'], res['failures']
 
 
 def red_pull_away(missed_from, missed_s=3.0, turn_deg=0.):

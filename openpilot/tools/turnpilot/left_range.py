@@ -7,10 +7,11 @@ mode (the checklist's step 17 drive), never set by it (LEFT_RANGE.md).
 What the range has to mean. The unprotected left certifies a gap from the absence of road camera boxes (unprotected_left.py:
 band_blockers): every full-pass run's vehicle boxes at RAW_CONF or more in the oncoming band whose nearest plausible range
 (RawBox.near_m, the box bottom NEAR_PX lower) is within R_req break the clear window, and CLEAR_WINDOW_S of runs with none is
-the go. A left is attempted only where R_req fits under TurnPilotLeftRangeM (turnpilotd's route time, reach_at_line), and
-past it under TurnPilotLeftFarRangeM while the far crop reads, whose boxes in the band block at any range. So the range is
-safe only if an oncoming car inside it is boxed on the road runs, with no stretch of them long enough for the window to
-fill: CRITIQUE REQUIRED 2 sets the window at least 3x the longest dropout at R_req, so a car is confirmed from the
+the go. Every left is driven to its line (2026-11-06: never skipped or rerouted for its range), and goes from there only
+where R_req, judged where the car stands, fits under TurnPilotLeftRangeM, or past it under TurnPilotLeftFarRangeM while the
+far crop reads, whose boxes in the band block at any range; else it hands back at the line (unprotected_left.reach_fault).
+So the range is safe only if an oncoming car inside it is boxed on the road runs, with no stretch of them long enough for
+the window to fill: CRITIQUE REQUIRED 2 sets the window at least 3x the longest dropout at R_req, so a car is confirmed from the
 farthest near_m from which it never went MAX_DROPOUT_S (CLEAR_WINDOW_S / 3) without a box at the left. The drive is not the
 left: its full pass is on the road camera every run and the car closes at the oncoming car's speed plus its own, while held
 at the line the left's road runs are 2 in WIDE_EVERY (roadAndWide) and the car closes at its own speed alone. So a gap on
@@ -63,6 +64,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from openpilot.selfdrive.turnpilot.detector.modeld_detector import WIDE_EVERY
+from openpilot.selfdrive.turnpilot.maps.defaults import CAR_LEFT_RANGE_M
 from openpilot.selfdrive.turnpilot.route_follower import LEFT
 from openpilot.selfdrive.turnpilot.scene.tracker import GROUND_GATE_FRAC, GROUND_GATE_M, NEAR_PX, iou, is_calibrated
 from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_Y_FAR_M, ONCOMING_Y_NEAR_M, velocity_trusted
@@ -601,7 +603,10 @@ def render(res: Result) -> list[str]:
     if res.far.range_m is not None:
       out.append("  the far range counts only with TurnPilotFarCrop on")
   else:
-    out.append("nothing to set: TurnPilotLeftRangeM stays 0, and every unprotected left is skipped and rerouted")
+    # until 2026-11-06 this said the range stayed 0 and every unprotected left was skipped and rerouted: neither is so since
+    out.append(f"nothing to set: TurnPilotLeftRangeM keeps its value ({CAR_LEFT_RANGE_M:g} m by default, maps/defaults.CAR_LEFT_RANGE_M: " +
+               "pixel arithmetic, not a measurement), and a left whose R_req at its line is past it is driven to its line and " +
+               "hands back there")
   return out
 
 

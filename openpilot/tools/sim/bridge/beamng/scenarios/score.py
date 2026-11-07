@@ -40,10 +40,10 @@ A scenario's expectations (EXPECTS: catalog Entry.expect, or the runner's --expe
 what its shot exists to show: a handback, a skip, a missed turn, the driver's gas press, hard braking. Each is required of
 the run (not seen: a failure), and explains only the generic failure it causes (the disengagement after the handback, the
 press itself, the route not finished), so a run's verdict means what its shot shows. One is met only as its shot's
-pass_rule shows it (handback_problems, range_skip_problems, missed_problems, the skip's junction and kind): a handback the
-car wasn't held after, or late after its go or its stand, a drop's handback late or with the detector still running, a
-skip past its junction or held for after it, a missed turn said away from the pass or for a turn taken, is seen but unmet,
-and explains nothing.
+pass_rule shows it (handback_problems, missed_problems, the skip's junction): a handback the car wasn't held after, or
+late after its go or its stand, the left's handback away from its line, a drop's handback late or with the detector still
+running, a skip past its junction, a missed turn said away from the pass or for a turn taken, is seen but unmet, and
+explains nothing.
 
 Rescore a saved result: python -m openpilot.tools.sim.bridge.beamng.scenarios.score result.json
 Score a recorded drive: python -m openpilot.tools.sim.bridge.beamng.scenarios.score --scenario route_demo rlog...
@@ -116,13 +116,25 @@ OCCLUDED = 'unprotected_left_occluded'
 CREEP_SLACK_M = 1.
 TURN_DESIRES = (1, 2)  # log.Desire.turnLeft, turnRight
 # expectations (module docstring): 'handback:<kind>' (a turnpilotPlan.handback, or a take-control controlPrompt),
-# 'gasDisengage', 'skip' (tooFastToTurn, or the left skipped at route time), 'turnMissed', 'hardBrake' (controlAlert).
-# An unprotected left's skip is its range skip (unprotectedLeft.state skipped: turnpilotd sets it for turn_skip's
-# unprotectedRange only); tooFastToTurn alone there is another skip (tooLate, laneUnreachable or tooFast), not its shot.
-# A skip's alert comes before its junction (S05, S19): one first seen with the junction behind the car (j_ahead) isn't met.
-# The left's range skip drives on (S05 'no hold at the line ... a reroute', after_range_skip): no TurnPilot hold within
-# NEAR_JUNCTION_M of the junction after it, and a new navRoute once the car is past the junction (navd reroutes past a
-# skipped turn only: navd.skipped_turn_passed)
+# 'gasDisengage', 'skip' (tooFastToTurn), 'turnMissed', 'hardBrake' (controlAlert).
+# A skip's alert comes before its junction (S19): one first seen with the junction behind the car (j_ahead) isn't met.
+# An unprotected left is never skipped for its range (Kellen, 2026-11-06: "drive to the line; go where the camera covers the
+# oncoming road, else hold and hand back loudly; never route around or skip a left for range"). Until then S05 expected the
+# range skip (unprotectedLeft.state skipped, turn_skip's unprotectedRange) and a reroute past the junction; now the left is
+# driven to its line, and there it goes (the left's own checks, no expectation) or hands back with the car held
+# (handback:leftUndecidedTakeControl, the reach's 'range', 'farUnmeasured', 'farOff', 'night' or 'curve' where the range
+# is too short for its R_req). That handback is met only at its line (LINE_HANDBACKS, at_line): the car standing within
+# NEAR_JUNCTION_M before the junction at its first row, no skip before it, and its why one of the reach's (REACH_WHYS:
+# unprotected_left.reach_fault's four and the bend). Any other why is a fault S05 doesn't exist to show, and met it would
+# explain away the undecided with a gap offered (review 2026-11-06: S05's junction is signalled, S18's trafficLight 46,
+# so at the 210 m default, R_req 133-141 m, run without the oracle it hands back 'light' at its line unless the camera
+# reads its green; a 'noGap' or 'stale' on an offered gap is a left that should have gone). 'farStale' and 'farBlocked'
+# are the far crop's own faults, judged while it covers the band, not the reach. Rows without left_why (before
+# 6e8a3a459, 2026-10-30) aren't judged on it. S08's 'blocked' needs no expectation (its own rule).
+# A left run skipped (tooFastToTurn before its junction, or the retired range skip in older rows) fails unless it
+# expects the skip
+LINE_HANDBACKS = ('leftUndecidedTakeControl',)
+REACH_WHYS = ('range', 'farUnmeasured', 'farOff', 'night', 'curve')
 # A missed turn is said at the pass (S18 'the alert within 3 s of passing the junction', missed_turn): turnMissed first
 # comes with the junction behind the car (the first row with j_ahead at or under 0) and within TURN_MISSED_S of it;
 # turnpilotd says it only for a turn its car has turned under MISSED_TURN_DEG (its own), so the car's heading has turned
@@ -187,7 +199,7 @@ RED_NEAR_M = 30.      # a stand within this before the stop line is at the red
 # TurnPilot's accel request (the rows' tp_accel) below the -2.0 m/s^2 floor of every map, light and speed-cap stop
 # (hooks.SPEED_CAP_ACCEL_MIN) fails a run (most shots' 'no TurnPilot accel below -2.0'): only a confirmed track's hard stop
 # asks for more (scene_policy.py), said on the same plan (controlAlert hardBrake), and only where the scenario has a
-# pedestrian or oncoming traffic to brake for (a run expecting the left's skip never meets its oncoming traffic); one
+# pedestrian or oncoming traffic to brake for (a run expecting a skip goes past its junction, and meets nothing there); one
 # without the alert is never anyone's (the float32 plan read back: ACCEL_TOL)
 ACCEL_FLOOR = SPEED_CAP_ACCEL_MIN
 ACCEL_TOL = 0.01
@@ -617,7 +629,9 @@ def span_gap(a, b) -> float:
 
 def unprotected_left(rows) -> dict:
   """The autonomous left's numbers (module constants): the minimum post-encroachment time with any oncoming car, false gos,
-  the gaps offered at the line, those missed, and whether it ended undecided (before or after a gap of tReq was offered)."""
+  the gaps offered at the line, those missed, whether it ended undecided (before or after a gap of tReq was offered), and
+  its skip (skipped: {t, range}, the first row skipping it before its junction, tooFastToTurn or the retired range skip's
+  unprotectedLeft.state skipped; None without one)."""
   n = max((len(r['onc']) for r in rows if r.get('onc')), default=0)
   ego = zone_spans(rows, lambda r: r.get('j_dist'))
   cars = [zone_spans(rows, lambda r, k=k: r['onc'][k][0] if r.get('onc') and len(r['onc']) > k else None) for k in range(n)]
@@ -668,7 +682,10 @@ def unprotected_left(rows) -> dict:
           'gap_before_undecided': undecided_t is not None and (t_req <= 0. or any(t_line is not None and b > t_line for a, b in offered)),
           'stalls': sorted({r['control_prompt'] for r in rows if r.get('control_prompt') in LEFT_STALLS}),
           'turn_missed': any(r.get('turn_missed') for r in rows),
-          'blocked_at_undecided': blocked_at_undecided, 'go_blocked': go_blocked, 'creep_m': creep_m}
+          'blocked_at_undecided': blocked_at_undecided, 'go_blocked': go_blocked, 'creep_m': creep_m,
+          'skipped': next(({'t': r['t'], 'range': r.get('left_state') == 'skipped'} for r in rows
+                           if (r.get('too_fast') or r.get('left_state') == 'skipped') and (r.get('j_ahead') is None or r['j_ahead'] > 0.)),
+                          None)}
 
 
 def rising(rows, on) -> list[int]:
@@ -822,6 +839,10 @@ def _fails(name: str, res: dict) -> list[tuple[str, str]]:
       fails.append(('stall', "did not move on after the crosswalk cleared"))
   elif name.startswith('unprotected_left'):  # and its variants at other approaches, gap streams and the occluded view
     lr = res['left']
+    if (sk := lr.get('skipped')) is not None:  # driven to its line since 2026-11-06 (LINE_HANDBACKS' comment)
+      how = "for its range, unprotectedLeft.state skipped" if sk['range'] else "tooFastToTurn"
+      fails.append(('left_skipped', f"skipped the left at t={sk['t']:.1f} s ({how}): a left is driven to its line, to go or " +
+                    "hand back there"))
     if name == OCCLUDED:
       if lr.get('go_blocked'):
         fails.append(('left_go_blocked', f"went with the view blocked at t={lr['go_blocked'][0]:.1f} s"))
@@ -989,8 +1010,8 @@ def expect_facts(rows) -> dict:
   first: dict[str, dict] = {'handback': {}, 'alert': {}}
   det_t: dict[str, float | None] = {}  # each handback's detector: its last detections at the handback's first row
   det_age: dict[str, float | None] = {}  # ...and their age then
-  skip_t = range_skip_t = missed_t = gas_t = None
-  ahead: dict[str, float | None] = {}  # j_ahead at the first skip row of each kind
+  skip_t = missed_t = gas_t = None
+  ahead: dict[str, float | None] = {}  # j_ahead at the first skip row
   engaged = False
   for r in rows:
     engaged = engaged or r['enabled']
@@ -1002,19 +1023,18 @@ def expect_facts(rows) -> dict:
         det_age[k] = r.get('det_age')
     if r.get('control_alert', 'none') not in ('', 'none'):
       first['alert'].setdefault(r['control_alert'], r['t'])
-    if skip_t is None and (r.get('too_fast') or r.get('left_state') == 'skipped'):
+    if skip_t is None and r.get('too_fast'):
       skip_t, ahead['skip'] = r['t'], r.get('j_ahead')
-    if range_skip_t is None and r.get('left_state') == 'skipped':
-      range_skip_t, ahead['range_skip'] = r['t'], r.get('j_ahead')
     if missed_t is None and r.get('turn_missed'):
       missed_t = r['t']
     if gas_t is None and engaged and r.get('gas'):
       gas_t = r['t']
-  return {'handbacks': first['handback'], 'control_alerts': first['alert'], 'skip_t': skip_t, 'range_skip_t': range_skip_t,
-          'skip_ahead_m': ahead.get('skip'), 'range_skip_ahead_m': ahead.get('range_skip'), 'turn_missed_t': missed_t,
+  return {'handbacks': first['handback'], 'control_alerts': first['alert'], 'skip_t': skip_t,
+          'skip_ahead_m': ahead.get('skip'), 'turn_missed_t': missed_t,
           'gas_t': gas_t,
           'handback_det_t': det_t, 'handback_det_age': det_age,
-          'after_range_skip': after_range_skip(rows, range_skip_t), 'missed': missed_turn(rows, missed_t),
+          'missed': missed_turn(rows, missed_t),
+          'at_line': {k: at_line(rows, t) for k, t in first['handback'].items() if k in LINE_HANDBACKS},
           'held': {k: held_after(rows, t) for k, t in first['handback'].items() if k in TAKE_CONTROL_PROMPTS},
           'stood_at': {k: stood_at(rows, t) for k, t in first['handback'].items() if k in FULL_STOP_HANDBACKS},
           'go_before': {k: go_before(rows, t) for k, t in first['handback'].items() if k in GO_TIMED},
@@ -1023,21 +1043,12 @@ def expect_facts(rows) -> dict:
           'prompts_after_gas': sorted({k for k, t in first['handback'].items() if gas_t is not None and t >= gas_t})}
 
 
-def after_range_skip(rows, t: float | None) -> dict | None:
-  """After the left's range skip at t: the first TurnPilot hold near the junction ({t, reason, j_dist}, NEAR_JUNCTION_M),
-  when the car first had the junction behind it (passed_t; None: never, or no junction in the rows: has_j), and the first
-  row from then on with a navRoute other than the one the car came up to the junction on (rerouted_t). None without the
-  skip."""
-  if t is None:
-    return None
-  after = [r for r in rows if r['t'] >= t]
-  hold = next(({'t': r['t'], 'reason': r.get('reason', ''), 'j_dist': r.get('j_dist')} for r in after
-               if r.get('state') == 'holding' and near_junction(r)), None)
-  i = next((i for i, r in enumerate(after) if r.get('j_ahead') is not None and r['j_ahead'] <= 0.), None)
-  passed_t = None if i is None else after[i]['t']
-  base = None if i is None else after[max(i - 1, 0)].get('route')
-  rerouted_t = None if i is None else next((r['t'] for r in after[i:] if r.get('route') != base), None)
-  return {'hold': hold, 'passed_t': passed_t, 'rerouted_t': rerouted_t, 'has_j': any(r.get('j_ahead') is not None for r in after)}
+def at_line(rows, t: float) -> dict:
+  """Where the car was at the handback at t (LINE_HANDBACKS): its speed, the junction's distance and how far it is ahead along
+  the car's heading (None without one in the rows), and the left's why (unprotectedLeft.why, the undecided's fault: '' or
+  None in rows without it), at the handback's own first row."""
+  r = next((r for r in rows if r['t'] >= t), rows[-1])
+  return {'v': r['v'], 'j_dist': r.get('j_dist'), 'j_ahead': r.get('j_ahead'), 'why': r.get('left_why')}
 
 
 def _heading_turn(rows, a: int, b: int) -> float | None:
@@ -1094,23 +1105,6 @@ def missed_problems(m: dict | None) -> list[str]:
   return out
 
 
-def range_skip_problems(a: dict | None) -> list[str]:
-  """Why the left's range skip met isn't its shot's (after_range_skip): a hold at the line after it, no reroute past it."""
-  if a is None:
-    return []
-  out = []
-  if (h := a['hold']) is not None:
-    where = '' if h['j_dist'] is None else f", {h['j_dist']:.0f} m from the junction,"
-    out.append(f"TurnPilot held the car at t={h['t']:.1f} s ({h['reason']}){where} after the range skip: no hold at the line")
-  if not a['has_j']:
-    out.append("no junction in the rows after the range skip: its reroute was not checked")
-  elif a['passed_t'] is None:
-    out.append("never passed the skipped junction: no reroute seen")
-  elif a['rerouted_t'] is None:
-    out.append(f"no reroute after passing the skipped junction at t={a['passed_t']:.1f} s (one navRoute to the run's end)")
-  return out
-
-
 def drop_problems(t: float, det_t: float | None, drop: dict | None, det_age: float | None = None) -> list[str]:
   """Why the detectorStopped handback at t isn't the drop's (DROP_HANDBACK_S): det_t, the detector's last detections
   before it, and det_age, their age at the handback's row (None: the rows don't say); drop, the runner's (summarize)."""
@@ -1148,8 +1142,9 @@ def fault_event(arg: str) -> str:
 def handback_problems(name: str, arg: str, t: float, facts: dict, res: dict) -> list[str]:
   """Why a handback of kind arg first seen at t isn't its shot's: another handback before it; a take-control handback the
   car wasn't held after (held_after), the left's withdrawn go not held short of the junction's conflict zone
-  (SHORT_OF_LANES), the stop sign's without its full stop; a fault's disengagement not its soft disable; the detection
-  drop's not within DROP_HANDBACK_S of the detector going silent after the drop (drop_problems)."""
+  (SHORT_OF_LANES), the left's undecided away from its line or after a skip (LINE_HANDBACKS: S05), the stop sign's
+  without its full stop; a fault's disengagement not its soft disable; the detection drop's not within DROP_HANDBACK_S of
+  the detector going silent after the drop (drop_problems)."""
   out = [f"handed back {k} at t={tk:.1f} s, before the expected handback {arg}"
          for k, tk in sorted(facts['handbacks'].items(), key=lambda kv: kv[1]) if k != arg and tk < t]
   h = facts.get('held', {}).get(arg)
@@ -1166,6 +1161,22 @@ def handback_problems(name: str, arg: str, t: float, facts: dict, res: dict) -> 
       if h['went_m'] > h['zone_m']:
         out.append(f"moved {h['went_m']:.1f} m engaged after the {arg} handback, past the {h['zone_m']:.1f} m to the junction's " +
                    f"{CONFLICT_M:.0f} m conflict zone")
+  if arg in LINE_HANDBACKS and name.startswith('unprotected_left'):
+    if facts.get('skip_t') is not None and facts['skip_t'] <= t:
+      out.append(f"the left was skipped (tooFastToTurn) at t={facts['skip_t']:.1f} s, before the {arg} handback: a left is " +
+                 "driven to its line")
+    a = facts.get('at_line', {}).get(arg)
+    if a is None or a['j_dist'] is None:
+      out.append(f"no junction distance in the rows at the {arg} handback: 'at its line' was not checked")
+    elif a['v'] >= STOPPED_V:
+      out.append(f"handed back {arg} at t={t:.1f} s rolling at {a['v']:.1f} m/s, {a['j_dist']:.0f} m from the junction: " +
+                 "not standing at its line")
+    elif a['j_dist'] > NEAR_JUNCTION_M or (a['j_ahead'] is not None and a['j_ahead'] <= 0.):
+      where = 'past the junction' if a['j_ahead'] is not None and a['j_ahead'] <= 0. else 'from the junction'
+      out.append(f"handed back {arg} at t={t:.1f} s standing {a['j_dist']:.0f} m {where}: not at its line (within " +
+                 f"{NEAR_JUNCTION_M:.0f} m before it)")
+    if a is not None and a.get('why') and a['why'] not in REACH_WHYS:
+      out.append(f"handed back {arg} for '{a['why']}' at t={t:.1f} s: not the reach ({', '.join(REACH_WHYS)}), S05's shot")
   if arg in GO_TIMED:
     g = facts.get('go_before', {}).get(arg)
     if g is None:
@@ -1231,7 +1242,7 @@ def expectations(name: str, res: dict, fails: list[tuple[str, str]], expect) -> 
         if before:
           extra.append(_disengage_text(before, f" before the expected handback {arg}"))
         explain(e, ('not_arrived', 'maneuvers') + (('stall',) if arg in LEFT_STALLS else ()) +
-                (('stop_met',) if arg == 'stopSignTakeControl' else ()) +
+                (('stop_met',) if arg == 'stopSignTakeControl' else ()) + (('left_undecided',) if arg in LINE_HANDBACKS else ()) +
                 (('left_go', 'left_wait') if arg == 'cantStartTakeControl' else ()))
     elif kind == 'gasDisengage':
       t = facts['gas_t']
@@ -1247,23 +1258,15 @@ def expectations(name: str, res: dict, fails: list[tuple[str, str]], expect) -> 
         if facts['prompts_after_gas']:
           extra.append(f"TurnPilot handed back after the gas press ({', '.join(facts['prompts_after_gas'])})")
     elif kind == 'skip':
-      range_skip = name.startswith('unprotected_left')  # its range skip (EXPECTS)
-      t = facts['range_skip_t'] if range_skip else facts['skip_t']
-      a = facts['range_skip_ahead_m' if range_skip else 'skip_ahead_m']
+      t, a = facts['skip_t'], facts['skip_ahead_m']
       late = t is not None and a is not None and a <= 0.
-      problems = range_skip_problems(facts.get('after_range_skip')) if range_skip and t is not None and not late else []
-      met = t is not None and not late and not problems
+      met = t is not None and not late
       if late:
         extra.append(f"the skip came at t={t:.1f} s with the junction {-a:.0f} m behind the car: its alert is before the junction")
-      elif problems:
-        extra += problems  # seen, but not the shot: it explains nothing
-      elif not met and range_skip and facts['skip_t'] is not None:
-        extra.append("expected skip: the left never skipped for range (unprotectedLeft.state skipped); tooFastToTurn at " +
-                     f"t={facts['skip_t']:.1f} s is another skip (tooLate, laneUnreachable or tooFast)")
       elif not met:
         extra.append("expected skip: no turn skipped (tooFastToTurn)")
       else:
-        explain(e, ('left_wait', 'left_go', 'not_arrived', 'maneuvers'))
+        explain(e, ('left_skipped', 'left_wait', 'left_go', 'not_arrived', 'maneuvers'))
         if facts['desire_after_skip_t'] is not None:
           extra.append(f"a turn desire after the skip, at t={facts['desire_after_skip_t']:.1f} s")
     elif kind == 'turnMissed':

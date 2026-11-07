@@ -13,10 +13,11 @@ the destination DEST_PAST_M straight across. Then route_audit's audit and navd's
 spawn's heading as navd sends the car's bearing (certified as navd would, mode auto, the side views on).
 
 A pair is good when the first route meets the stop, the kept route is clean (no stop or yield), and neither route has a
-junction turn (route_follower.classify: TURN, not a keep) the car can't take at the defaults: one within FIRST_TURN_MIN_M
-of the start (the rolling start engages about 30 m out at 30 km/h, past a first pulse's latest point for a turn that
-close), or an unprotected left (a road straight across, two-way, and no stop sign of its own: skipped at route time at
-TurnPilotLeftRangeM's default, 0).
+junction turn (route_follower.classify: TURN, not a keep) the shot can't rest on: one within FIRST_TURN_MIN_M of the
+start (the rolling start engages about 30 m out at 30 km/h, past a first pulse's latest point for a turn that close), or
+an unprotected left (a road straight across, two-way, and no stop sign of its own). That left was skipped at route time at
+TurnPilotLeftRangeM's old default, 0; since 2026-11-06 it is driven to its line and goes or hands back there, a second
+decision S23's stop-sign shot isn't about.
 Shortest detour first.
 """
 import argparse

@@ -194,9 +194,10 @@ class TestWestCoastUSA:
   def test_navd_fills_the_lanes_before_a_left_and_the_planner_changes_lane(self, tiles, demos):
     from openpilot.selfdrive.navigation.navd import RouteEngine  # needs the params library, which the geometry tests don't
     demo = demos["left"][0]
-    # the lane fill is under test, not the left's autonomy: in auto (the default) with the range unmeasured, navd routes round
-    # every left the car would skip (routing/lefts.py), this one too (+24 s, its opposing road not known straight out to its
-    # R_req), and the route kept has no lane tags at its first left. In announce no left is refused for its range
+    # the lane fill is under test, not the left's autonomy. Until 2026-11-06 navd routed round every left the car would skip
+    # for its range in auto (routing/lefts.py), this one too (+24 s, its opposing road not known straight out to its R_req),
+    # keeping a route with no lane tags at its first left, so this ran in announce, where none was refused. Since then navd
+    # routes round no left in any mode (route_lefts keeps U-turns only): announce stays, and the route is auto's too
     values = {"TurnPilotValhallaTiles": tiles["lanes"], "TurnPilotRouteSource": "valhalla", "LanguageSetting": "main_en",
               "TurnPilotAutoLeft": ANNOUNCE}
     params, pm = MagicMock(), MagicMock()

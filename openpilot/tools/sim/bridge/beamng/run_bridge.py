@@ -50,8 +50,8 @@ def parse_args(add_args=None):
   p.add_argument('--light-latency', type=float, default=0.3, help='with --light-oracle, publish the lights this late, s')
   p.add_argument('--car-signals', action=argparse.BooleanOptionalAction, default=d.car_signals,
                  help="the car signals TurnPilot's turns itself (default on): writes TurnPilotCarSignals on and a sim verified " +
-                      "record (SIM ONLY: card takes a sim record only with SIMULATION=1); --no-car-signals writes it off, the " +
-                      "driver prompted")
+                      "record (SIM ONLY: card takes a sim record only with SIMULATION=1); --no-car-signals writes it off and " +
+                      "TurnPilotCarSignalsForceOn 0, the driver prompted")
   p.add_argument('--speed-source', choices=SPEED_SOURCES, default=d.speed_source,
                  help="openpilot's wheel speeds from the car's travel (ground, the IMU pose) or electrics.wheelspeed (wheels, " +
                       "which over-reads 10-20%% while the car speeds up or brakes)")

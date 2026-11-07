@@ -2,6 +2,8 @@ import hashlib
 import random
 from types import SimpleNamespace
 
+import pytest
+
 from opendbc.can import CANParser
 from opendbc.car import gen_empty_fingerprint, structs
 from opendbc.car.structs import car
@@ -351,18 +353,30 @@ def test_sim_record_matches_the_sim_car_only_in_the_sim():
 
 
 class FakeParams(dict):
-  def get(self, key, *a, **kw):
-    return super().get(key)
+  """Params as card's resolver reads them: an unset key reads None, or its params_keys.h default with return_default (as
+  car_signals.forced_on asks for TurnPilotCarSignalsForceOn, default 1). Until 2026-11-06 this read every key None, so a
+  forced-on car read as off here and the bridge's off path passed while card, on the real Params, signalled."""
+  DEFAULTS = {"TurnPilotCarSignalsForceOn": True}
+
+  def get(self, key, block=False, return_default=False):
+    return super().get(key, self.DEFAULTS.get(key) if return_default else None)
+
+  def get_bool(self, key, block=False):
+    return bool(self.get(key))
 
   def put(self, key, value, *a, **kw):
     self[key] = value
+
+  def put_bool(self, key, value, *a, **kw):
+    self[key] = bool(value)
 
   def remove(self, key):
     self.pop(key, None)
 
 
 def test_car_signals_flag_writes_on_and_the_sim_record():
-  params = FakeParams()
+  # TurnPilotCarSignalsForceOn 0, so the record decides: the sim record only with SIMULATION (under ForceOn none is read)
+  params = FakeParams(TurnPilotCarSignalsForceOn=False)
   write_sim_car_signals(params)
   assert params["TurnPilotCarSignals"] == "on"
   config = resolver(params, simulation=True)(VIN_UNKNOWN, [])
@@ -383,9 +397,57 @@ def test_the_sim_runs_with_the_cars_own_turn_signal_on_unless_told_not_to():
   params = FakeParams()
   assert car_signals_at_start(params, True)
   assert params["TurnPilotCarSignals"] == "on" and params["TurnPilotCarSignalsVerified"] == sim_car_signals_record()
+  assert params["TurnPilotCarSignalsForceOn"] is True  # the car's default, put back after an earlier --no-car-signals
   assert resolver(params, simulation=True)(VIN_UNKNOWN, []).mode == 'on'
   assert not car_signals_at_start(params, False) and params["TurnPilotCarSignals"] == "off"
+  assert params["TurnPilotCarSignalsForceOn"] is False
   assert resolver(params, simulation=True)(VIN_UNKNOWN, []) == CarSignalsConfig()
+
+
+def test_no_car_signals_turns_force_on_off_so_card_and_the_bridge_agree():
+  """--no-car-signals on a comma at TurnPilotCarSignalsForceOn's default (unset, 1): until 2026-11-06 it wrote the mode off
+  alone, card's resolver still put the car's signal on (forced) and sent DAS_bodyControls, and the bridge, reading the mode
+  off, ran no body: neither path. Now the off path puts ForceOn 0, card resolves off, and the body state is card's."""
+  from openpilot.tools.sim.bridge.beamng.bridge import car_signals_at_start
+  for on in (True, False):
+    params = FakeParams()
+    assert params.get("TurnPilotCarSignalsForceOn", return_default=True) is True  # unset: the default, on
+    body = car_signals_at_start(params, on)
+    card = resolver(params, simulation=True)(VIN_UNKNOWN, [])
+    assert body == on and (card.mode == 'on') == on and (card == CarSignalsConfig()) == (not on), (on, body, card)
+  # a comma left at mode off by hand, ForceOn at its default: the bridge reads card's forced on and runs the body
+  from openpilot.selfdrive.turnpilot.car_signals import forced_on
+  params = FakeParams(TurnPilotCarSignals="off")
+  assert forced_on(params) and resolver(params, simulation=True)(VIN_UNKNOWN, []).mode == 'on'
+  # FakeParams writes as it's told, at once: this checks the logic only. The real Params' put returns before its write
+  # lands, which test_the_bridges_body_is_what_card_reads_on_the_real_params checks.
+
+
+@pytest.mark.parametrize('on', [True, False], ids=['on', 'off'])
+def test_the_bridges_body_is_what_card_reads_on_the_real_params(on):
+  """car_signals_at_start on the real Params, after an earlier run that left the other choice (launch_openpilot.sh's
+  TURNPILOT_CAR_SIGNALS and the bridge's --no-car-signals told apart, or the sim's last run): the bridge's body is what
+  card's resolver reads when it fingerprints the car. Until 2026-11-06 its writes didn't block: Params.put without
+  block=True queues the write on params.cc's async thread, and the read-back on the next line read the disk before it
+  landed, so the bridge decided its body from the earlier run's values (review probe: 150 of 150 calls on a fresh handle
+  read the previous state). Launcher off and bridge on, the bridge ran no body under a card that sent DAS_bodyControls;
+  launcher on and bridge off, a body under a card that resolved off."""
+  from openpilot.common.params import Params
+  from openpilot.common.prefix import OpenpilotPrefix
+  from openpilot.tools.sim.bridge.beamng.bridge import car_signals_at_start
+  with OpenpilotPrefix():
+    for _ in range(5):
+      earlier = Params()  # the other choice, landed (blocking), as an earlier run leaves it
+      earlier.put("TurnPilotCarSignals", "off" if on else "on", block=True)
+      earlier.put_bool("TurnPilotCarSignalsForceOn", not on, block=True)
+      if on:
+        earlier.remove("TurnPilotCarSignalsVerified")
+      else:
+        earlier.put("TurnPilotCarSignalsVerified", sim_car_signals_record(), block=True)
+      del earlier
+      body = car_signals_at_start(Params(), on)  # a fresh handle, as BeamNGBridge's run does
+      card = resolver(Params(), simulation=True)(VIN_UNKNOWN, [])
+      assert body == on and (card.mode == 'on') == body, (on, body, card)
 
 
 def test_game_lights_one_set_lights_per_change():

@@ -529,7 +529,7 @@ class TestTurnPilotAccel:
     for name in ('straight_cruise', 'too_fast_right', 'red_right_g62'):
       res = score.summarize(name, self.cruise(-3.2, 'hardBrake'), 'arrived')
       assert any(f.startswith("TurnPilot braked hard (-3.2 m/s^2, hardBrake) at t=2.0 s") for f in res['failures']), (name, res['failures'])
-    # the left skipped at route time (S05) never meets its oncoming traffic: nothing there to brake hard for
+    # a run expecting a skip goes straight past its junction (S05's until 2026-11-06): nothing there to brake hard for
     res = score.summarize('unprotected_left_visible', self.cruise(-3.2, 'hardBrake'), 'arrived', expect=('skip',))
     assert any(f.startswith("TurnPilot braked hard") for f in res['failures']), res['failures']
 

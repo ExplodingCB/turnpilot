@@ -4,12 +4,12 @@ from multiprocessing import Queue
 
 from openpilot.common.params import Params
 from openpilot.common.realtime import Ratekeeper
-from openpilot.selfdrive.turnpilot.car_signals import read_mode
+from openpilot.selfdrive.turnpilot.car_signals import FORCE_ON_KEY, forced_on, read_mode
 from openpilot.tools.sim.bridge.common import QueueMessageType, SimulatorBridge
 from openpilot.tools.sim.bridge.beamng.control import AccelController
 from openpilot.tools.sim.bridge.beamng.driver import PromptedDriver
 from openpilot.tools.sim.bridge.beamng.sensors import BeamNGSensors
-from openpilot.tools.sim.bridge.beamng.tesla import SimulatedTesla, write_sim_car_signals
+from openpilot.tools.sim.bridge.beamng.tesla import SimulatedTesla, sim_car_signals_record
 from openpilot.tools.sim.bridge.beamng.world import BeamNGConfig, BeamNGState, BeamNGWorld
 
 MANUAL_STEER_DEG = 90.0  # steering wheel degrees for a full manual steer input
@@ -18,12 +18,27 @@ MANUAL_STEER_DEG = 90.0  # steering wheel degrees for a full manual steer input
 def car_signals_at_start(params, on: bool) -> bool:
   """The car's own turn signal for this drive, written before the car's first CAN so card's resolver reads it when it
   fingerprints the car (SIMULATION=1: launch_openpilot.sh): on, TurnPilotCarSignals on and the sim verified record (the
-  sim's default, BeamNGConfig.car_signals); off (--no-car-signals), TurnPilotCarSignals off. True when the body is on."""
+  sim's default, BeamNGConfig.car_signals), with TurnPilotCarSignalsForceOn back at the car's default, 1; off
+  (--no-car-signals), TurnPilotCarSignals off and TurnPilotCarSignalsForceOn 0. True when the body is on: whenever card's
+  resolver may send DAS_bodyControls (car_signals.resolver), read back through card's own readers (read_mode, forced_on),
+  so the bridge never runs the driver's path under a card that signals. Until 2026-11-06 off wrote the mode alone:
+  TurnPilotCarSignalsForceOn (default 1, 7c37f664a) resolved the car's signal on in any mode but check, so card sent
+  DAS_bodyControls while the bridge, reading the mode off, ran no body to light the lamps or echo them, neither path.
+  Every write blocks (block=True), so the read-back sees this run's values: Params.put without it queues the write on
+  params.cc's async thread (putNonBlocking), and the read-back read the disk first, an earlier run's choice (2026-11-06
+  review probe: 150 of 150 calls on a fresh handle read the previous state; launch_openpilot.sh's TURNPILOT_CAR_SIGNALS
+  off with the bridge at its default ran no body under a card that signalled). tesla.write_sim_car_signals doesn't block,
+  so its two writes are here."""
   if on:
-    write_sim_car_signals(params)
+    params.put("TurnPilotCarSignalsVerified", sim_car_signals_record(), block=True)
+    params.put("TurnPilotCarSignals", "on", block=True)
+    params.put_bool(FORCE_ON_KEY, True, block=True)
   else:
-    params.put("TurnPilotCarSignals", "off")
-  return read_mode(params) in ('on', 'check')
+    params.put("TurnPilotCarSignals", "off", block=True)
+    params.put_bool(FORCE_ON_KEY, False, block=True)
+  return read_mode(params) in ('on', 'check') or forced_on(params)
+
+
 STEER_NM_PER_UNIT = 12.5  # manual steer input as torsion bar torque; the port reads > 1 Nm as the driver steering
 SET_SPEED_STEP_KPH = 5.0
 DT = 0.01  # s, the loop period
@@ -36,7 +51,8 @@ class BeamNGBridge(SimulatorBridge):
   Queue commands (tools/sim/bridge/common.py control_cmd_gen, from the keyboard, the CLI or a scenario script):
   cruise_up engages (or raises the set speed by 5 km/h), cruise_down engages at the current speed (or lowers it),
   cruise_cancel cancels, plus upstream's steer_/throttle_/brake_/blinker_ commands, reset and quit; with the car's own
-  turn signal (car_signals, the sim's default: TurnPilotCarSignals on with the sim verified record; --no-car-signals off)
+  turn signal (car_signals, the sim's default: TurnPilotCarSignals on with the sim verified record; --no-car-signals off,
+  TurnPilotCarSignalsForceOn 0 with it)
   blinker_ works the driver's stalk in the car's body and hazard toggles its hazards.
   `scenario` runs in the bridge process with the world after the first sensor data: scenario(bridge) -> None, called at
   100 Hz until it returns True (done)."""

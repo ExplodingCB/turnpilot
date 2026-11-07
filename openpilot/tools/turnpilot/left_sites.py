@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""left_sites: junctions near a point where an unprotected left across one oncoming approach passes this fork's own route
-time for a given TurnPilotLeftRangeM (and TurnPilotLeftFarRangeM), ranked by margin, with why every other one fails
-(LEFT_RANGE.md).
+"""left_sites: junctions near a point where an unprotected left across one oncoming approach would go from its line for a
+given TurnPilotLeftRangeM (and TurnPilotLeftFarRangeM), ranked by margin, with why every other one fails (LEFT_RANGE.md).
+Since 2026-11-06 turnpilotd drives every unprotected left to its hold line and judges it there, never skipping or rerouting
+one for its range (Kellen: "never route around or skip a left for range"), so a site that fails here is no route the car
+avoids: it is a left the car drives up to and hands back at its line, the car held.
 
   python3 -m openpilot.tools.turnpilot.left_sites --tiles DIR --range M [--far-range M] [--radius M] [--sidecar DIR] LAT,LON
 
@@ -16,17 +18,20 @@ OPPOSING_DEG of straight across (guidance.py's oncoming approach). Each is route
 approach to EXIT_M down its exit, and the route's steps go through what navd and turnpilotd do with them:
 guidance.upcoming_maneuvers and route_follower's Maneuver, map_controls.unprotected_turn, the opposing road's mapped limit,
 lanes and straight span (routing/controls.py's opposing_roads, through the source as navd asks it) and the route's controls
-(route_controls). judge() then takes route time's checks (turnpilotd: reach_at_line at LINE_D plus ROUTE_REACH_MARGIN_M,
-or the junction's mapped line's setback; the reach against TurnPilotLeftRangeM, or the far crop's past it; bent past the
-opposing road's straight span) and what the left itself would hand back at the line, all said:
-  notUnprotected  a keep, a T's stem, or no left at all: not the autonomous left
+(route_controls). judge() then takes route time's reach (unprotected_left.route_range's, logged by navd and turnpilotd: reach_at_line
+at LINE_D plus ROUTE_REACH_MARGIN_M, or the junction's mapped line's setback, so a car standing that far past its 9 m line
+still clears; the reach against TurnPilotLeftRangeM, or the far crop's past it; bent past the opposing road's straight span)
+and what the left itself would hand back at the line, all said:
+  notUnprotected  a keep (a slight left under 25 deg among them), a T's stem, or no left at all: not the autonomous left
   sideUncertain   the bearings turn the other way from the modifier: skipped and rerouted in every mode
   twoOncoming     two roads straight across: the band looks up one, so not one oncoming approach (safer than route time)
   controls        the controls unknown (unsupported tiles, a failed match): a signal or stop there can't be ruled out
-  signal          the go needs a green from an accepted source (SIGNAL_NEEDS_GREEN), and the camera's reader is shadow
+  signal          the go needs a green read at the line (SIGNAL_NEEDS_GREEN), and only an accepted source's green lifts the
+                  model's hold (release_light: the camera's reader adds stops, never a lift)
   stop, yield     ours at the junction: the stop-sign decider's, not the left's (TurnPilotStopSignGo off: a handback)
-  range           R_req past the range: skipped at route time (unprotectedRange) and rerouted
-  curve           the opposing road not mapped straight past R_req (unknown is not straight): skipped the same way
+  range           R_req past the range: driven to its line and handed back there (undecided 'range'), the car held
+  curve           the opposing road not mapped straight past R_req (unknown is not straight): handed back the same way
+                  (undecided 'curve')
 An unmapped limit is 45 mph and unmapped lanes two, as route time takes them (noted). Controls partial (the OSM sidecar
 missing: Valhalla's flags only, which miss about a quarter of OSM's stops) pass, said: check the junction for a stop
 sign by eye. Nothing here sees the sightline (a crest, a hedge, a parked truck short of R_req), the signals or signs the
@@ -185,8 +190,8 @@ def fail(v: Verdict, code: str, reason: str) -> None:
 
 def judge(steps, opposing, controls, status: str, range_m: float, far_m: float = 0., idx: int = 0,
           right_hand_traffic: bool = True) -> Verdict:
-  """Route time's verdict on the left that ends steps[idx] (module docstring), given the route's opposing roads ({step
-  index: (m/s, lanes, straight m)}), its controls and their status, and the ranges."""
+  """The verdict on the left that ends steps[idx] at route time's reach (module docstring), given the route's opposing roads
+  ({step index: (m/s, lanes, straight m)}), its controls and their status, and the ranges."""
   v = Verdict()
   if idx + 1 >= len(steps):
     fail(v, 'notUnprotected', "no maneuver after this step")
@@ -213,7 +218,8 @@ def judge(steps, opposing, controls, status: str, range_m: float, far_m: float =
     fail(v, 'controls', f"controls {status}: a signal or stop sign there can't be ruled out")
   elif status == 'partial':
     v.notes.append("controls partial (Valhalla's flags only, no OSM sidecar): check for a stop sign by eye")
-  for kind, why in (('signal', "a traffic signal: the go needs a green from an accepted source, and the camera's reader is shadow"),
+  for kind, why in (('signal', "a traffic signal: the go needs a green read at the line, and only an accepted source's green " +
+                     "lifts the model's hold (the camera's reader adds stops, never a lift)"),
                     ('stop', "a stop sign of ours: the stop-sign decider's, a handback with TurnPilotStopSignGo off"),
                     ('yield', "a yield of ours: the stop-sign decider's, not the left's")):
     if any(c.kind == kind for c in own):
@@ -230,10 +236,11 @@ def judge(steps, opposing, controls, status: str, range_m: float, far_m: float =
   v.limit_m = max(range_m, far_m) if far else range_m
   if v.reach > v.limit_m:
     what = "the far crop's range" if far else "TurnPilotLeftRangeM"
-    fail(v, 'range', f"R_req {v.reach:.0f} m past {what} {v.limit_m:.0f} m: skipped at route time (unprotectedRange)")
+    fail(v, 'range', f"R_req {v.reach:.0f} m past {what} {v.limit_m:.0f} m: handed back at its line (undecided 'range')")
   straight_need = v.reach - LINE_D - margin
   if v.reach > LINE_D + margin + v.straight:
-    fail(v, 'curve', f"the opposing road is mapped straight {v.straight:.0f} m on, {straight_need:.0f} m needed: skipped at route time")
+    fail(v, 'curve', f"the opposing road is mapped straight {v.straight:.0f} m on, {straight_need:.0f} m needed: handed back at its " +
+         "line (undecided 'curve')")
   v.margin = min(v.limit_m - v.reach, LINE_D + margin + v.straight - v.reach)
   v.ok = not v.codes
   return v
@@ -265,7 +272,7 @@ def render(sites: list[Site], range_m: float, far_m: float, facts: dict | None =
          f"oncoming approach; {ranges}"]
   if facts.get('status'):
     out.append("controls status: " + ', '.join(f"{k} {n}" for k, n in sorted(facts['status'].items())))
-  out.append(f"passing route time ({len(ok)}), most margin first:")
+  out.append(f"passing: the left would go from its line ({len(ok)}), most margin first:")
   out += [f"  {i + 1}. " + site_line(s) for i, s in enumerate(ok)] or ["  none"]
   out.append(f"failing ({len(rest)}):")
   counts: dict = {}
@@ -342,7 +349,7 @@ def main(argv=None) -> int:
   from openpilot.selfdrive.turnpilot.routing import osm_sidecar
   from openpilot.selfdrive.turnpilot.routing.controls import MARKER
   from openpilot.selfdrive.turnpilot.routing.valhalla_source import ValhallaSource
-  ap = argparse.ArgumentParser(description="unprotected-left sites that pass TurnPilot's route time near a point: read only")
+  ap = argparse.ArgumentParser(description="unprotected-left sites near a point where the left would go from its line: read only")
   ap.add_argument('center', type=point, help='lat,lon')
   ap.add_argument('--tiles', required=True, help="what route_audit takes: a map-server region, tiles directory, tiles.tar or valhalla.json")
   ap.add_argument('--sidecar', help="the directory with osm_controls/ and the tiles' stamp (default: the tiles' own)")

@@ -263,6 +263,10 @@ def test_too_few_oncoming_cars_recommend_nothing(tmp_path, capsys):
   assert len(result.samples) == 58 and result.road.range_m is None and result.far.range_m is None
   out = text(result)
   assert "58 oncoming" in out and "59" in out and "--set" not in out
+  # 2026-11-06: no range set leaves the 210 m default, and a left past it hands back at its line; this said the range stayed 0
+  # and every unprotected left was skipped and rerouted
+  assert "nothing to set: TurnPilotLeftRangeM keeps its value (210 m by default" in out and "hands back there" in out
+  assert "skipped" not in out and "rerouted" not in out and "stays 0" not in out
   path = tmp_path / "rlog.zst"
   save_log(str(path), msgs)
   assert lr.main([str(path)]) == 2

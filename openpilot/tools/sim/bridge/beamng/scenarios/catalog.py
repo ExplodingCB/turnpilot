@@ -184,8 +184,10 @@ SCENARIOS = {
   'ped_step_out_side': Entry('straight', junction=(-768.9, 661.4), turn='right', from_heading_deg=0., actor='step_out',
                              ped_before_m=45., end_on_stop_s=4., timeout_s=90., expect=('hardBrake',)),
   # forced reds (the module docstring's forced light). S13: the same straight through gate1's junction (group_80_81_82_83),
-  # its signal red from the start: with no accepted light source (the car this week) TurnPilot adds nothing for it, the
-  # model alone meets it. S14: ped_crosswalk_right's right turn without the walker, red until 8 s after the car stands.
+  # its signal red from the start: without the light oracle, as on the car, the camera's reader is its only light source
+  # (TurnPilotCameraLights addOnly, the default since 2026-11-06), so a red it reads stops the car at this mapped signal and
+  # a red it misses is the model's alone (reported, not scored). S14: ped_crosswalk_right's right turn without the walker,
+  # red until 8 s after the car stands.
   # S18: the right at (-650.1, 481.7) from the south-west (G0's 62R: every pull-away at a 20 m hold went straight), its
   # miss expected (likely, not certain)
   'red_straight': Entry('straight', junction=(-768.9, 661.4), turn='right', from_heading_deg=0., light='red', green_after_s=8.,
@@ -776,8 +778,8 @@ def _turn_plan(name: str, e: Entry, graph: RoadGraph) -> Plan:
     link = graph.links.get((jn.straight, jn.node)) or graph.links.get((jn.node, jn.straight)) or {}
     lanes_in = graph.lanes_toward(jn.node, jn.straight).count('+')
     notes['left_r_req_m'] = round(reach_at_line(link.get('speedLimit'), lanes_in), 1)
-    # route time's (BUILD_FINDINGS D4: LINE_D plus ROUTE_REACH_MARGIN_M without a mapped stop line): over the shot's
-    # TurnPilotLeftRangeM the left is skipped and rerouted before its junction
+    # route time's (BUILD_FINDINGS D4: LINE_D plus ROUTE_REACH_MARGIN_M without a mapped stop line), for the logs only: since
+    # 2026-11-06 a left over the shot's TurnPilotLeftRangeM is never skipped or rerouted, it hands back at its line (S05)
     notes['left_r_req_route_m'] = round(reach_at_line(link.get('speedLimit'), lanes_in, ROUTE_REACH_MARGIN_M), 1)
     notes['left_reach'] = left_reach(link.get('speedLimit'), lanes_in)
   notes['ego_lane_offset_m'] = round(lane_offset(lanes, radius, ego_lane(e.turn)), 2)

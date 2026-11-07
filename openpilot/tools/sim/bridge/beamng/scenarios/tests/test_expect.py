@@ -301,15 +301,19 @@ class TestGasDisengage:
 
 class TestSkip:
   def skipped(self, desire_after=False):
-    """S05: the left skipped at route time (unprotectedRange): no hold, the car straight on past the junction, a reroute."""
-    return drive([(4.0, {'left_state': 'skipped', 'too_fast': True, 'j_dist': lambda tau: 40. - 8. * tau,
-                         'j_ahead': lambda tau: 40. - 8. * tau, 'nav_mod': 'left'}),
-                  (3.0, {'left_state': 'skipped', 'too_fast': False, 'nav_mod': 'left', 'route': 2, 'j_dist': lambda tau: 8. * tau,
+    """A turn skipped too fast to turn (tooFastToTurn) 40 m out, the car straight on past its junction, a reroute: S19's
+    shot, and on a left the same skip (since 2026-11-06 no left is skipped for its range: S05 is its handback at the line,
+    test_shot_rules)."""
+    return drive([(4.0, {'too_fast': True, 'j_dist': lambda tau: 40. - 8. * tau, 'j_ahead': lambda tau: 40. - 8. * tau,
+                         'nav_mod': 'left'}),
+                  (3.0, {'too_fast': False, 'nav_mod': 'left', 'route': 2, 'j_dist': lambda tau: 8. * tau,
                          'j_ahead': lambda tau: -8. * tau, 'desire': int(log.Desire.turnLeft) if desire_after else 0})])
 
   def test_the_left_checks_fail_a_skip_unless_it_is_expected(self):
     plain = score.summarize('unprotected_left_visible', self.skipped(), 'timeout')
     assert any('never went' in f for f in plain['failures'])
+    assert "skipped the left at t=0.0 s (tooFastToTurn): a left is driven to its line, to go or hand back there" in plain['failures'], \
+      plain['failures']
     res = score.summarize('unprotected_left_visible', self.skipped(), 'timeout', expect=('skip',))
     assert res['passed'], res['failures']
 
@@ -317,20 +321,24 @@ class TestSkip:
     res = score.summarize('unprotected_left_visible', self.skipped(desire_after=True), 'timeout', expect=('skip',))
     assert not res['passed'] and any('turn desire after the skip' in f for f in res['failures']), res['failures']
 
-  def test_the_lefts_skip_is_the_range_skip(self):
-    # the skeptic's P4 (S05): tooFastToTurn set, but the left never 'skipped': a tooLate or laneUnreachable skip, not the
-    # range skip the shot is about ("Can't See Far Enough to Turn")
+  def test_a_lefts_skip_is_too_fast_to_turn_as_anywhere(self):
+    # the skeptic's P4 (S05) asked a left's skip to be its range skip (unprotectedLeft.state skipped), never tooFastToTurn
+    # alone. Since 2026-11-06 turnpilotd never skips a left for its range (Kellen: "never route around or skip a left for
+    # range"), so a left's skip is tooFastToTurn as S19's is, and S05 expects the handback at the line instead
     rows = drive([(4.0, {'v': 8., 'left_state': 'approach', 'j_dist': 60., 'j_ahead': 60.}),
                   (6.0, {'v': 8., 'too_fast': True, 'left_state': 'approach', 'j_dist': 30., 'j_ahead': 30.}),
                   (4.0, {'v': 8., 'j_dist': 10., 'j_ahead': -10.})])
     res = score.summarize('unprotected_left_visible', rows, 'timeout', expect=('skip',))
-    assert not res['passed']
-    want = ("expected skip: the left never skipped for range (unprotectedLeft.state skipped); tooFastToTurn at t=4.0 s is " +
-            "another skip (tooLate, laneUnreachable or tooFast)")
-    assert want in res['failures'], res['failures']
-    assert any('never went' in f for f in res['failures'])  # unmet: nothing explained
-    # elsewhere tooFastToTurn is the skip (S19)
+    assert res['expected'][0]['met'] and res['expected'][0]['t'] == pytest.approx(4.0), res['failures']
     assert score.summarize('too_fast_right', rows, 'timeout', expect=('skip',))['expected'][0]['met']
+    # unexpected, it fails the left, and so does the retired range skip in older rows, said as such
+    assert any(f.startswith("skipped the left at t=4.0 s (tooFastToTurn)") for f in
+               score.summarize('unprotected_left_visible', rows, 'timeout')['failures'])
+    old = [dict(r, left_state='skipped') if r['t'] >= 4.0 else r for r in rows]
+    res = score.summarize('unprotected_left_visible', old, 'timeout')
+    assert any(f.startswith("skipped the left at t=4.0 s (for its range, unprotectedLeft.state skipped)") for f in res['failures']), \
+      res['failures']
+    assert not res['passed']
 
   def test_the_skip_comes_before_the_junction(self):
     # the skeptic's P5 (S19, 'the alert before the junction'): tooFastToTurn only once the junction is 5 m behind the car
@@ -340,9 +348,8 @@ class TestSkip:
     assert not res['passed'] and not res['expected'][0]['met']
     assert "the skip came at t=6.0 s with the junction 5 m behind the car: its alert is before the junction" in res['failures'], \
       res['failures']
-    # the left's range skip likewise (S05)
-    late = [dict(r, left_state='skipped' if r['t'] >= 6.0 else 'approach') for r in rows]
-    res = score.summarize('unprotected_left_visible', late, 'timeout', expect=('skip',))
+    # a left's likewise
+    res = score.summarize('unprotected_left_visible', rows, 'timeout', expect=('skip',))
     assert any(f.startswith("the skip came at t=6.0 s with the junction 5 m behind") for f in res['failures']), res['failures']
     # skipped 54 m out (the smoke run's), the shot
     early = [dict(r, too_fast=r['t'] >= 2.7) for r in rows]

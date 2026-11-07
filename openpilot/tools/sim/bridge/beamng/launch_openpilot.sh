@@ -53,13 +53,19 @@ tiles = os.environ.get('TURNPILOT_TILES') or p.get('TurnPilotValhallaTiles') or 
 p.put('TurnPilotValhallaTiles', tiles)
 print(f'TurnPilotValhallaTiles: {tiles}')
 # the car's own turn signal (README, The car's own turn signal): on with the sim verified record before card fingerprints
-# the car, as the bridge writes at its start; TURNPILOT_CAR_SIGNALS=0 with the bridge's --no-car-signals for the driver's
+# the car, as the bridge writes at its start (bridge.car_signals_at_start); TURNPILOT_CAR_SIGNALS=0 with the bridge's
+# --no-car-signals for the driver's, TurnPilotCarSignalsForceOn 0 with it: under its default, 1, card signals in any mode
+# but check (since 2026-11-06), with no body in the bridge to light the lamps
+# (what it wrote is printed, not read back: Params.put returns before its write lands, so a read here can be the old value)
 if os.environ.get('TURNPILOT_CAR_SIGNALS', '1') == '0':
-  p.put('TurnPilotCarSignals', 'off')
+  signals, force_on = 'off', False
+  p.put('TurnPilotCarSignals', signals)
 else:
   from openpilot.tools.sim.bridge.beamng.tesla import write_sim_car_signals
+  signals, force_on = 'on', True
   write_sim_car_signals(p)
-print(f\"TurnPilotCarSignals: {p.get('TurnPilotCarSignals')}\")
+p.put_bool('TurnPilotCarSignalsForceOn', force_on)
+print(f\"TurnPilotCarSignals: {signals}, TurnPilotCarSignalsForceOn: {int(force_on)}\")
 "
 
 # after the manager clears TurnPilotSimLightOracle at its start (CLEAR_ON_MANAGER_START)

@@ -85,8 +85,13 @@ The sim car signals TurnPilot's turns and lane changes itself, as a verified Tes
 a sim verified record (`tesla.py`'s `sim_car_signals_record`) before the car's first CAN, and `launch_openpilot.sh`
 writes the same before the manager starts. card takes a sim record only with `SIMULATION=1`, and reads it when it
 fingerprints the car, so restart openpilot along with the bridge after changing it. `--no-car-signals` (with
-`TURNPILOT_CAR_SIGNALS=0` for `launch_openpilot.sh`) writes `TurnPilotCarSignals` off: every frame is the same as before
-the car's own signal, and the driver is prompted to signal each turn. With it on:
+`TURNPILOT_CAR_SIGNALS=0` for `launch_openpilot.sh`) writes `TurnPilotCarSignals` off and `TurnPilotCarSignalsForceOn`
+0 (`put_bool('TurnPilotCarSignalsForceOn', False)` in `bridge.car_signals_at_start` and in the launcher), for every frame
+the same as before the car's own signal and the driver prompted to signal each turn. ForceOn (default 1,
+`car_signals.forced_on`) resolves the car's signal on for every drive in any mode but `check`, so with the mode off alone
+card would still signal while the bridge ran no body; the default path writes it back to 1, the car's default.
+
+With it on:
 
 - The car's body is opendbc's `BodyModel` (`opendbc/car/tesla/body_model.py`), the model the port's tests use. Its stock
   `DAS_bodyControls` goes out on bus 2 at 2 Hz, and UI_warning's lamps come from it.
@@ -276,11 +281,20 @@ It runs `maplanes.py`, then `mapsignals.py` on the committed `wcusa_map_node_sig
 control's real stop line) and the `controls_built` marker. Tiles without the marker are reported unsupported: on the old
 `west_coast_usa` and `west_coast_usa_lanes` tiles navd sends no controls, and TurnPilot says so on screen.
 `launch_openpilot.sh` uses the signals tiles by default once they are built, and turns `DisengageOnAccelerator` on, as
-on the car: there is no gas go (2026-10-28), any press disengages. A stop sign stops and hands back ("Stop sign: take
-control to proceed"), and so does an unprotected turn at its hold line.
+on the car: there is no gas go (2026-10-28), any press disengages. A stop sign stops at its line. Under
+`TurnPilotStopSignGo` `vision`, the default in the sim as on the car, the stop-sign decider goes from there by itself
+only where it can clear the junction, as the `stop_` scenarios score it with the sim gate on (`scenarios/README.md`), and
+otherwise hands back ("Stop sign: take control to proceed"). An unprotected left stops at its line and goes from there
+on a gap the camera clears, or hands back there with the car held.
 
-A signal adds nothing unless a light source reads red or yellow for it (no light source on the car this week). The sim's light oracle gives
-turnpilotd the game's light states instead, SIM ONLY:
+Going straight through, a signal adds nothing unless a light source reads red or yellow for it. The camera's reader is
+one, on the car and in the sim alike (`TurnPilotCameraLights` `addOnly`, the default since 2026-11-06): its red, or a
+yellow the car can still stop for gently, stops the car at a mapped signal and at a route turn's junction with none
+mapped, and it may only ever add a stop. A route turn at a mapped signal stops at its line for want of a steady green,
+and held there with no light read for 5 s it hands back ("Turn at a light: take control"), still held. A green only an accepted source
+reads lifts the model's own hold (plannerd's lift, `map_controls.release_light`); the camera's green lets go of
+TurnPilot's own latch and nothing more. The sim's light oracle is that accepted source: it gives turnpilotd the game's
+light states, SIM ONLY:
 
 ```bash
 TURNPILOT_LIGHT_ORACLE=1 OPENPILOT_PREFIX=tpsim openpilot/tools/sim/bridge/beamng/launch_openpilot.sh
@@ -319,10 +333,11 @@ stand at its line, then an empty road. No gas tap anywhere; the score (`scenario
 under 2 s, a false go, a stall or an unmoving go, a missed turn, and undecided after a gap of tReq was offered, and counts
 missed gaps.
 
-What the gate can't prove: `TurnPilotLeftRangeM` is unset by default (unmeasured: 0), which skips every autonomous left at
-route time and reroutes, so the gate sets it to `unprotected_left.PROVISIONAL_RANGE_M` (150 m, pixel arithmetic, not a
-measurement; on the car it is set only from a measured recall range). And the junction's straight arm across is about
-106 m, under its R_req of 133 m: a car beyond the bend is out of sight, so a go here is certified past the sightline. The
+What the gate can't prove: the range. The gate's shots are planned at `unprotected_left.PROVISIONAL_RANGE_M` (150 m,
+pixel arithmetic, not a measurement), and `notes.left_reach` works its slack against that. `TurnPilotLeftRangeM` defaults to
+210 m (`maps/defaults.CAR_LEFT_RANGE_M`, also pixel arithmetic), and turnpilot_web's start writes 210 over an unset range once
+per comma and over a 150 at every start (`ensure_left_range`), in the sim as on the car. So set 150 by hand once the stack is
+up (below): a stack restart puts 210 back. And the junction's straight arm across is about 106 m, under its R_req of 133 m: a car beyond the bend is out of sight, so a go here is certified past the sightline. The
 gate checks the left's logic (waiting through the streams, going after them, never a false go, PET, no stall), never its
 reach; nothing in the stack checks a junction's sightline, so the demo junction is chosen by eye for a straight, flat
 approach of R_req or more.
@@ -333,8 +348,10 @@ the car may stand, or its junction be read, before the left is undecided there (
 (-650.1, 481.7), one lane across, and 2.0 m at S08's wpTown_5, two lanes across. The round-2 smoke's S08 and the diag's S02
 went undecided at R_req 204 and 172.9 m because TurnPilot's junction ran 13 m and 6.5 m short of navd's on the wheels'
 over-read speed (now the ground speed, above); an undecided left's result says where the car stood, navd's junction and
-TurnPilot's (`left.undecided_at`). tp/integrate's planned route-time margin (BeamNG build findings D4) would make lefts with
-so little slack range skips: re-check these shots once it lands.
+TurnPilot's (`left.undecided_at`). No left is skipped at route time for its range (Kellen, 2026-11-06: "never route around
+or skip a left for range"): route time's margin (BeamNG build findings D4) only goes in the logs, and a left whose R_req
+at the line is past the range rolls up to its line and hands back there (undecided, `range`: "Can't see oncoming far
+enough: take control"), the car held.
 
 The junction is signalized and mapped, so the left goes only on a read green (`unprotected_left.SIGNAL_NEEDS_GREEN`: it
 doesn't check the cross traffic). Run it with the light oracle (`TURNPILOT_LIGHT_ORACLE=1` on the launch, `--light-oracle`
@@ -342,7 +359,7 @@ on the bridge; without `--signals` the game's lights are held green, so it reads
 hands back on the light it can't read ("Can't read the light: take control").
 
 ```sh
-python -c "from openpilot.common.params import Params; Params().put('TurnPilotLeftRangeM', 150.0)"  # sim only, see above
+python -c "from openpilot.common.params import Params; Params().put('TurnPilotLeftRangeM', 150.0)"  # after the stack is up: see above
 for h in 4 6 8 10; do
   python -m openpilot.tools.sim.bridge.beamng.scenarios.run unprotected_left_gap$h --runs 3 -- --light-oracle <bridge args>
 done
@@ -351,8 +368,8 @@ done
 | param | values | default |
 | --- | --- | --- |
 | `TurnPilotAutoLeft` | `off` (hand back at the line, G1), `announce` (hold, say whether it would go, hand back), `auto` | `auto` |
-| `TurnPilotLeftRangeM` | m, 0 to 400: the detector's proven range for oncoming traffic, from a measurement; a left whose R_req is past it is skipped at route time | `0.0` (unmeasured: every autonomous left skipped and rerouted) |
-| `TurnPilotLeftFarRangeM` | m, 0 to 400: the far crop's proven range (below); while the far crop reads it extends the reach, so a 45-55 mph left (R_req 231-296 m) needs it | `0.0` (unmeasured: no left past `TurnPilotLeftRangeM`) |
+| `TurnPilotLeftRangeM` | m, 0 to 400: the detector's range for oncoming traffic. A left whose R_req at its line is past it (and past the far crop's) is driven to its line and hands back there, the car held (undecided, `range`); none is skipped at route time or rerouted (2026-11-06) | `210.0` (pixel arithmetic, not a measurement; turnpilot_web writes it over an unset range, and over 150, an earlier default) |
+| `TurnPilotLeftFarRangeM` | m, 0 to 400: the far crop's proven range (below); while the far crop reads it extends the reach, so a 45-55 mph left (R_req 231-296 m) needs it | `0.0` (unmeasured: a left past `TurnPilotLeftRangeM` hands back at its line, `farUnmeasured`) |
 | `TurnPilotFarCrop` | the far crop on (`1`) or off (`0`) in modeld | `1` (runs when its pkl is in `selfdrive/turnpilot/models`) |
 
 The far crop (DESIGN phase 4 G5): modeld runs a 640x384 window of the road frame at native resolution (twice the full pass's
@@ -382,9 +399,10 @@ A `turnRelease` go (a turn TurnPilot's own hold let go of: its walker cleared, i
 TurnPilot's blocker left the path, never why the model still holds the car, so it rests on its junction's own
 certification, as the left's go rests on its gap: the junction's signal read green by an accepted source (here the light
 oracle), checked at the go and on every frame of it (`turnpilot.go_not_certified` why `light`, `turnpilot.go_end` reason
-`light`). The camera's shadow reader never certifies one (its red or yellow keeps one off), and with no signal mapped at
-the junction there is none (`RELEASE_UNSIGNALIZED` in `turnpilotd.py`). On the car, where no light source is accepted,
-a walker clearing at a signal is the model's go or the no-move handback, as before G5. Nor is a `turnRelease` ever
+`light`). The camera's reader never certifies one: it may add a stop (addOnly), never lift the model's hold
+(`release_light`), and its red or yellow keeps one off. With no signal mapped at the junction there is none
+(`RELEASE_UNSIGNALIZED` in `turnpilotd.py`). On the car, where the camera's reader is the only light source and no source
+is accepted, a walker clearing at a signal is the model's go or the no-move handback, as before G5. Nor is a `turnRelease` ever
 certified for a turn across the oncoming road (its go is the left's, on its gap) or for a far-side turn released in the
 junction (why `unprotected`, `junction`): nothing the lift checks sees the lanes it crosses, and the stall's handback
 (`stalledTakeControl`) covers that stand.

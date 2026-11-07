@@ -1,15 +1,17 @@
 # Left range and left sites
 
-`TurnPilotLeftRangeM` and `TurnPilotLeftFarRangeM` default to 0, so turnpilotd skips and reroutes every left across an oncoming approach. Two tools on this branch, both read only, decide whether a demo left is possible:
+`TurnPilotLeftRangeM` defaults to 210 m and `TurnPilotLeftFarRangeM` to 0 (unmeasured). The 210 m is pixel arithmetic for the native full pass (a car 1.8 m wide is about 10 px at 200 m), not a measurement: it covers lefts across roads of 35 mph or less (`maps/defaults.py`). turnpilot_web's start writes it over an unmeasured 0 once per comma, and over the earlier 150 m default, and leaves any other value alone.
+
+Since 2026-11-06 turnpilotd drives every left across an oncoming approach to its hold line and judges it there, never skipping or rerouting one for its range (Kellen: "drive to the line; go where the camera covers the oncoming road, else hold and hand back loudly"). Where R_req fits the range the left waits for a clear gap and goes. Past it, the car is held at the line and the driver is told to take control ("Can't see oncoming far enough: take control"). Two tools on this branch, both read only, help pick the range and the junctions where a left goes by itself:
 
 - `left_range.py` measures the two ranges on rlogs this fork recorded on the car, and prints the `preflight --set` line only when the evidence supports a range.
-- `left_sites.py` lists the junctions near a point where a left passes route time at a given range, ranked by margin, with the reason every other candidate fails.
+- `left_sites.py` lists the junctions near a point where a left would go from its line at a given range, ranked by margin, with the reason every other candidate fails (most of them hand back at the line).
 
 Neither tool writes a param. Kellen runs the `--set` line on the comma, parked, if he decides to.
 
 ## What the range means
 
-The left goes when no road camera box (a vehicle at confidence 0.35 or more in the oncoming band) with a nearest plausible range (`near_m`) inside R_req has appeared for `CLEAR_WINDOW_S` (2.5 s). Route time attempts a left only when R_req fits under `TurnPilotLeftRangeM`, or past it under `TurnPilotLeftFarRangeM` while the far crop reads. So the range is safe only if every oncoming car inside it is boxed, with no gap long enough for the window to fill.
+The left goes when no road camera box (a vehicle at confidence 0.35 or more in the oncoming band) with a nearest plausible range (`near_m`) inside R_req has appeared for `CLEAR_WINDOW_S` (2.5 s). It judges a gap only when R_req, from where the car stands at its line, fits under `TurnPilotLeftRangeM`, or past it under `TurnPilotLeftFarRangeM` while the far crop reads; otherwise it hands back there. So the range is safe only if every oncoming car inside it is boxed, with no gap long enough for the window to fill. After dark the reach is capped at 50 m (`NIGHT_LEFT_RANGE_M`, what the detector was seen to reach at night), whatever the ranges say, so at night every left across a road faster than about 8 mph hands back at its line.
 
 `left_range.py` counts a car as confirmed from the farthest `near_m` after which it never went `CLEAR_WINDOW_S / 3` (0.83 s) without a box at the left. CRITIQUE REQUIRED 2 sets that ratio: the window must be at least 3 times the longest dropout. A stretch with no road run (the full pass on the wide camera, an uncalibrated spell, the detector stopped) counts as no box, so unknown is never a clear road.
 
@@ -28,16 +30,17 @@ The recommendation is the shortest confirmed range among at least 59 oncoming ca
 
 The units are `near_m`, the same units the gap rule compares with R_req: the box bottom 3 px lower, so a pitch error of that size can't stretch the range. A car first boxed at a ground range of 150 m reads about 113 m, one at 300 m about 182 m (camera 1.22 m up). The report prints each car's ground range too, for context only.
 
-Route time's R_req includes the D4 margin (`ROUTE_REACH_MARGIN_M`, 15 m past the 9 m hold line at a junction with no mapped stop line). With that margin the reach is much longer than DESIGN's 134-141 m at 25 mph:
+At the 9 m hold line R_req is DESIGN's figure. Route time's R_req adds the D4 margin (`ROUTE_REACH_MARGIN_M`, 15 m past the 9 m hold line at a junction with no mapped stop line), the reach a car standing that far back would need. Until 2026-11-06 a left whose route-time R_req was past the range was skipped and rerouted; now that figure only goes in the logs (navd's `turnpilot lefts:` line names the steps that may hand back), and the line's own check decides:
 
-| Opposing limit | R_req, one lane mapped | R_req, lanes unmapped (two) |
-| --- | --- | --- |
-| 20 mph | 165 m | 171 m |
-| 25 mph | 200 m | 207 m |
-| 30 mph | 234 m | 243 m |
-| 35 mph | 269 m | 279 m |
+| Opposing limit | At the line, one lane | At the line, lanes unmapped (two) | Route time, one lane | Route time, two lanes |
+| --- | --- | --- | --- | --- |
+| 20 mph | 110 m | 115 m | 165 m | 171 m |
+| 25 mph | 134 m | 141 m | 200 m | 207 m |
+| 30 mph | 158 m | 167 m | 234 m | 243 m |
+| 35 mph | 183 m | 193 m | 269 m | 279 m |
+| 40 mph | 207 m | 219 m | 303 m | 315 m |
 
-A 25 mph left therefore needs oncoming cars confirmed out to a `near_m` of 200 m, which is a ground range of about 350 m. The road camera's full pass alone is unlikely to reach that, so a demo left rests on the far crop. The far range only counts once `TurnPilotLeftRangeM` is above 0, because turnpilotd extends the reach by the far crop only past a measured road range.
+So a 25 mph left goes from its line once oncoming cars are confirmed out to a `near_m` of about 134-141 m, and the 210 m default covers 35 mph only if the road camera's full pass really boxes cars that far out, which `left_range.py` is there to show. The far range only counts once `TurnPilotLeftRangeM` is above 0, because turnpilotd extends the reach by the far crop only past a road range.
 
 ## Measure the range on Saturday
 
@@ -71,11 +74,11 @@ If a range is recommended and Kellen decides to use it, the report ends with the
 python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotLeftRangeM=110 --set TurnPilotLeftFarRangeM=180
 ```
 
-After that, `car_preflight` prints NO-GO on `TurnPilotLeftRangeM`, because Saturday morning's required value is 0. That line is expected once the range is set deliberately.
+`car_preflight` requires 210, this build's default: GO at 210, a WARN at any other range above 0 (a measured one is the owner's call), and NO-GO at 0, where no left would ever go.
 
 ## Find a site
 
-Give `left_sites.py` the measured ranges and a point to search around. Use the map server's region, which is what the car's corridors are cut from:
+Give `left_sites.py` the measured ranges (or the 210 m default) and a point to search around. Use the map server's region, which is what the car's corridors are cut from:
 
 ```sh
 cd ~/Projects/turnpilot/.claude/worktrees/tp-chase-range
@@ -88,8 +91,8 @@ It finds junctions in Valhalla's graph, routes each left from 150 m back on its 
 
 - The turn is a left across one road straight on, and its bearings agree with its modifier.
 - The controls are known, and the junction has no signal, stop or yield of ours.
-- R_req, from the opposing road's mapped limit and lanes (45 mph and two lanes when unmapped), fits under the range.
-- The opposing road is mapped straight past R_req.
+- R_req, from the opposing road's mapped limit and lanes (45 mph and two lanes when unmapped), fits under the range. A left that fails here is driven to its line and hands back there.
+- The opposing road is mapped straight past R_req. A left that fails here hands back at its line too ("Oncoming road bends out of view: take control").
 
 Every failing candidate prints each check it fails. On the Indianapolis region the controls read as partial, because the region has no OSM stop-sign sidecar and Valhalla's flags miss about a quarter of OSM's stop signs. Partial passes, with a note to check the junction for a stop sign by eye.
 

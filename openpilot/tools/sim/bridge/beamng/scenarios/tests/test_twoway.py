@@ -80,4 +80,4 @@ def test_a_route_is_drivable_only_without_an_unprotected_left_or_a_turn_at_the_s
   left = {'m': 230, 'turn': True, 'unprotected_left': False}
   assert tp.drivable([keep, left]) and tp.drivable([])
   assert not tp.drivable([{**left, 'm': 30}])                    # S23's first pick: a right 27-30 m out, engaged past it
-  assert not tp.drivable([keep, {**left, 'unprotected_left': True}])  # skipped at route time at TurnPilotLeftRangeM 0
+  assert not tp.drivable([keep, {**left, 'unprotected_left': True}])  # a go or a handback at its line: not S23's shot
