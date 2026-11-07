@@ -74,6 +74,11 @@ CONTROL_ALERT_EVENTS = ('stopOverrun', 'proceedingOnYellow', 'junctionUncertain'
 CONTROL_STATUS_ALERTS = ('mapControlsUnavailable', 'lightSourceRejected', 'farViewOff', 'sideCamerasOff',  # last of all, a status line
                          'mapControlsUnavailableSilent')
 SILENT_STATUS_ALERTS = ('mapControlsUnavailableSilent',)  # ...that line with no sound (MC-03)
+# ...of them, the lights unknown (the camera's light reader failing all its spell, map_controls S2; a source not accepted):
+# above the lane planner's can't-confirm line and a keep's status line, both up for long stretches of a night drive, so it
+# can't be lost under them (review 2026-11-07: said once for 2 s, a laneUnknown frame hid it); below a lane change and the
+# wrong lane for the turn ahead, which end
+LIGHTS_UNKNOWN_ALERTS = ('lightSourceRejected',)
 # TurnpilotPlan.skipReason for a keep that can't be sent under TurnPilotAlwaysDrive (ALWAYS_DRIVE.md R7, turnpilotd.keep_unsent):
 # skipped with navd's skip mark (tooFastToTurn) while the model drives the fork, said as a status line (KEEP_FOLLOW); navd
 # recomputing past it, the skip's chime and 'Rerouting' (KEEP_REROUTED, held turnpilotd.MISSED_HOLD_S, tooFastToTurn false)
@@ -109,9 +114,11 @@ def plan_events(sm, now: float | None = None) -> list[str]:
   6. a map control's other alerts (turnpilotControlAlert: a stop line overrun, going on a yellow, an unprotected turn's
      junction uncertain, the car stopped with nothing holding it: the stopped note's chime);
   7. a planned lane change, offered or just aborted (turnpilotLaneChangeLeft/Right/Aborted, LaneChangeEvents);
-  8. the wrong lane, or a lane it can't confirm (turnpilotWrongLane);
+  8. the wrong lane for the turn ahead (turnpilotWrongLane), then the lights unknown (turnpilotControlAlert,
+     LIGHTS_UNKNOWN_ALERTS: the camera's light reader failing, up for its whole spell), then a lane it can't confirm
+     (turnpilotWrongLane);
   9. a keep the model drives under TurnPilotAlwaysDrive (turnpilotTooFastToTurn, KEEP_FOLLOW: a status line), then the map
-     controls' status (turnpilotControlAlert: map stops unavailable, light source rejected).
+     controls' other status (turnpilotControlAlert: map stops unavailable, a view off).
   The alerts of 4 to 9 are all Priority.LOW or lower, where AlertManager shows the newest, so the order is kept by not
   raising the lower ones: the wrong lane isn't raised while a lane change is offered or its abort holds (the car is in a
   turn-only lane at an intersection before the turn the change is for), and lane_change_events raises nothing while the
@@ -148,7 +155,12 @@ def plan_events(sm, now: float | None = None) -> list[str]:
     return ['turnpilotControlAlert']
   if lane_change_events(plan):
     return []  # the lane change outranks the wrong lane
-  if plan.laneMismatch != custom.TurnpilotPlan.LaneMismatch.none:
+  Mismatch = custom.TurnpilotPlan.LaneMismatch
+  if plan.laneMismatch in (Mismatch.turnOnlyGoingStraight, Mismatch.wrongLaneForTurn):
+    return ['turnpilotWrongLane']
+  if alert in LIGHTS_UNKNOWN_ALERTS:  # the lights unknown: over the lane it can't confirm and a keep's status line
+    return ['turnpilotControlAlert']
+  if plan.laneMismatch != Mismatch.none:
     return ['turnpilotWrongLane']
   if plan.tooFastToTurn:  # a keep the model drives under TurnPilotAlwaysDrive (KEEP_FOLLOW): its status line, last of TurnPilot's own
     return ['turnpilotTooFastToTurn']
@@ -192,7 +204,7 @@ CONTROL_ALERT_TEXT = {
   'proceedingOnYellow': 'Too close to stop for the yellow',
   'mapControlsUnavailable': 'Map stops and signals unavailable',
   'mapControlsUnavailableSilent': 'Map stops and signals unavailable',  # its status said already (MC-03): no sound
-  'lightSourceRejected': 'Light source not accepted: lights unknown',
+  'lightSourceRejected': "Lights can't be read: watch every light",  # a source not accepted, or the reader failing (S2)
   'junctionUncertain': 'GPS unsure where the junction is: slow, may stop short of it',
   'offRouteStopsUnknown': 'Map stops unknown: take control or wait for reroute',
   'hardBrake': 'Braking hard',
@@ -307,7 +319,7 @@ def lane_change_text(plan, side: str) -> str:
     return f'Lane Change {side.capitalize()} in {math.ceil(plan.laneChangeCountdown)}'
   if str(plan.laneChange) == side:
     return f'Changing Lanes {side.capitalize()} Once Clear'
-  return f'Signal {side.capitalize()} to Change Lanes'
+  return f'Signal {side.upper()} to Change Lanes'
 
 
 def plan_desire(desire: int, lat_active: bool) -> tuple[int, bool]:
@@ -468,7 +480,11 @@ class CarSignalEvents:
     if flags & TeslaFlags.CAR_SIGNALS_RECHECK and not flags & TeslaFlags.CAR_SIGNALS_CHECK and stage in ('left', 'right', 'waiting') \
        and str(car_signal.status) == 'verifying':
       recheck = ("Turn Signal Re-check", "Stay in Park" if stage != 'waiting' else str(car_signal.checkWhy))
-    # a fault, said once when it happens
+    # a fault, said once when it happens: once per failed spell, since the port can come back from one (2026-11-06:
+    # noStockFrame clears after steady stock frames, failed -> ready), and a second fault later in the drive is said too.
+    # A live plan's status only: a stale plan (None) for a frame reads 'off' and would say a fault still on again
+    if ts is not None and status != 'failed':
+      self._fault_said = False
     if status == 'failed' and not self._fault_said:
       self._fault_said = True
       fault = str(car_signal.fault)
@@ -518,9 +534,11 @@ class CarSignalEvents:
     if prompt != 'none':
       if prompt != self._prompt_side or self._prompt_quiet >= PROMPT_QUIET_S:
         self._prompt_chime.ended()
-        self._prompt_chime = Chime('tpLaneChangeLeft' if prompt == 'left' else 'tpLaneChangeRight')
+        # repeating until the driver's lamp is lit (car_signals drops the prompt then): one soft chime was missed on 11-06
+        # (Kellen, 2026-11-07: make it more obvious, and very clear left from right: the side's own chime, the side in capitals)
+        self._prompt_chime = Chime('tpSignalLeft' if prompt == 'left' else 'tpSignalRight')
       self._prompt_side, self._prompt_quiet = prompt, 0.
-      prompt_line = (f"Signal {prompt.capitalize()}", "For the turn ahead")
+      prompt_line = (f"Signal {prompt.upper()} Now", f"Turn {prompt.upper()} ahead: put your {prompt} signal on")
     else:
       if self._prompt_quiet == 0.:
         self._prompt_chime.ended()

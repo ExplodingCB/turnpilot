@@ -10,6 +10,7 @@ import pytest
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot import stop_go as sg_mod
 from openpilot.selfdrive.turnpilot import stop_rules as sr
+from openpilot.selfdrive.turnpilot.desire_timing import CURB_FIRST_PULSE_M, CURB_TURN_PULSE_M, STANDSTILL_REARM_S, STANDSTILL_SPEED
 from openpilot.selfdrive.turnpilot.go_override import GO_ACCEL, GO_END_SPEED
 from openpilot.selfdrive.turnpilot.hooks import plan_accel
 from openpilot.selfdrive.turnpilot.map_controls import STOP_SIGN_REASON
@@ -22,7 +23,9 @@ from openpilot.selfdrive.turnpilot.turnpilotd import stop_sign_mode_for
 
 CYCLE = ('full', 'sideLeft', 'road', 'sideRight')
 S_LINE = 200.  # the stop point along the route
+TURN_J = S_LINE + 13.  # a turn at the stop sign: its junction, info()'s stopPointDistance past the stop point
 MPH = sr.MPH
+TURN_DESIRES = (Desire.turnLeft, Desire.turnRight)
 
 
 def info(mph=25., maneuver='straight', tiers=None, certification=None):
@@ -126,6 +129,35 @@ def run_to_line(sim, limit=60.):
 
 def go_frame(sim):
   return next((k for k, p in enumerate(sim.plans()) if str(p.goCertified.cause) == 'stopSign'), None)
+
+
+def assert_curb_pulse(trace, go, desire=Desire.turnRight, junction_s=TURN_J):
+  """A curb-side turn at the stop sign (a right where traffic keeps right), the decider's go at frame go of trace [(s, v,
+  plan)]: no turn desire through the go, and its one pulse (desire_timing.turn_lead, 2026-11-06: in 1e every fresh edge started
+  the right where the car then was, 11-25 m out on a 12-15 m radius, cutting the inside curb) rolling inside CURB_TURN_PULSE_M
+  of its junction and short of turn_skip's CURB_FIRST_PULSE_M deadline, the turn's only rising edge (no repeat, no entry
+  pulse after it). The stop point is 13 m out, past CURB_TURN_PULSE_M plus CURB_GO_SLACK_M, so the go is the straight go
+  (watch_curb_go arms its bookkeeping at the pulse). Returns the pulse's frame."""
+  assert not any(p.desire in TURN_DESIRES for _, _, p in trace[:go + 1]), "a turn desire at or before the decider's go"
+  k = next((i for i, (_, _, p) in enumerate(trace) if p.desire in TURN_DESIRES), None)
+  assert k is not None, "the turn was never pulsed"
+  s, v, p = trace[k]
+  assert p.desire == desire, p.desire
+  assert v >= STANDSTILL_SPEED, f"pulsed standing at {v:.2f} m/s: the pulse comes rolling inside {CURB_TURN_PULSE_M} m"
+  assert CURB_FIRST_PULSE_M < junction_s - s <= CURB_TURN_PULSE_M + 0.3, f"pulsed {junction_s - s:.2f} m from the junction"
+  edges = [i for i in range(1, len(trace)) if trace[i][2].desire == desire and trace[i - 1][2].desire != desire]
+  assert edges == [k], f"rising edges at {edges}, the pulse at {k}"
+  return k
+
+
+def assert_stop_turn_pulse(trace, maneuver, go, junction_s=TURN_J):
+  """The first pulse of a turn at the stop sign the decider acts for (2.4 item 3: no turn desire before its go): a far-side
+  turn's (a left) is the decider's go itself; a curb-side turn's (a right), its one pulse rolling inside 8 m
+  (assert_curb_pulse). Returns its frame."""
+  if maneuver == 'right':
+    return assert_curb_pulse(trace, go, Desire.turnRight, junction_s)
+  assert all(p.desire == Desire.none for _, _, p in trace[:go]) and trace[go][2].desire == Desire.turnLeft, trace[go][2].desire
+  return go
 
 
 # ------------------------------------------------------------------------------------------------------------- the tests
@@ -336,18 +368,27 @@ def test_after_the_clear_the_decider_reads_its_own_controls_maneuver_junction_an
 
 
 @pytest.mark.parametrize('maneuver', ['right', 'left'])
-def test_a_turn_at_the_stop_sign_takes_its_first_pulse_at_the_deciders_go_never_skipped_too_late(tmp_path, maneuver):
+def test_a_turn_at_the_stop_sign_is_pulsed_from_the_deciders_go_never_skipped_too_late(tmp_path, maneuver):
   # its pulse waits for the go (2.4 item 3), 13 m from the turn: on the go frame the decider is 'going', which had let
-  # turn_skip skip the turn tooLate (no desire ever, 'Turn missed', a reroute, the car across the junction straight)
+  # turn_skip skip the turn tooLate (no desire ever, 'Turn missed', a reroute, the car across the junction straight). A left's
+  # first pulse is the go; a right's one pulse (2026-11-06, desire_timing.turn_lead) is no longer the go from 13 m out but
+  # comes rolling inside 8 m on it, judged by its 5 m deadline only once rolling (turn_skip: pulse_at_go), and the go's
+  # bookkeeping (go_id, the post-go profile, the stall watch) is armed at that pulse as the decider's (watch_curb_go)
+  from unittest import mock
   sim = StopSim(tmp_path, model='goes', info_kw={'maneuver': maneuver},
                 maneuvers=[(S_LINE + 13., 'turn', maneuver), (2000., 'turn', 'right' if maneuver == 'left' else 'left')])
-  run_to_line(sim)
-  sim.run(8.)
+  with mock.patch('openpilot.selfdrive.turnpilot.turnpilotd.cloudlog.event') as event:
+    run_to_line(sim)
+    sim.run(8.)
   plans = sim.plans()
   k = go_frame(sim)
   assert k is not None and not any(p.tooFastToTurn for p in plans) and not sim.tp.skip.skipped
-  want = Desire.turnRight if maneuver == 'right' else Desire.turnLeft
-  assert all(p.desire == Desire.none for p in plans[:k]) and plans[k].desire == want
+  assert_stop_turn_pulse(sim.trace, maneuver, k)
+  armed = [c.kwargs for c in event.call_args_list if c.args[0] == 'turnpilot.curb_go_armed']
+  if maneuver == 'right':  # the decider's go from 13 m, armed once at the pulse
+    assert len(armed) == 1 and armed[0]['decider'] and armed[0]['go_distance'] > CURB_TURN_PULSE_M, armed
+  else:  # its go was the pulse (turn_go)
+    assert not armed, armed
   # a holding model: the go withdrawn short, and its own pulse is no reason to wait out the static bound: it goes again
   sim = StopSim(tmp_path, model='holds', info_kw={'maneuver': maneuver},
                 maneuvers=[(S_LINE + 13., 'turn', maneuver), (2000., 'turn', 'right' if maneuver == 'left' else 'left')])
@@ -357,6 +398,45 @@ def test_a_turn_at_the_stop_sign_takes_its_first_pulse_at_the_deciders_go_never_
   gos = {p.goCertified.id for p in plans if str(p.goCertified.cause) == 'stopSign'}
   assert len(gos) >= 2 and not any(p.tooFastToTurn for p in plans)
   assert not any("isn't straight" in p.reason for p in plans)
+
+
+@pytest.mark.parametrize('maneuver', ['right', 'left'])
+def test_a_turn_handed_back_at_the_stop_sign_never_gets_a_turn_desire_with_the_car_held_standing(tmp_path, maneuver):
+  # a model that never takes over: the go withdrawn, the retry withdrawn (a right's car braked to rest 7.25 m from the turn,
+  # inside CURB_TURN_PULSE_M) and the decider's H5 handback ('ladder', stopSignTakeControl, shouldStop, the car held from then
+  # on). 2026-11-06 review: a right's go from 13 m out sends no desire (desire_timing.turn_lead), so its one pulse was still
+  # due where the car stood; on the handback frame hold_pulse let go ('ladder' is not STOP_GO_HOLDS_PULSE) and DesireTiming's
+  # standing branch held only a started turn at none, so a fresh turnRight edge went into the model's 6.6 s queue on a turn
+  # just handed back, the car standing on the hold, against desire_timing's own rule (a hold that has the car standing: the
+  # turn desire is none). No turn's first pulse goes while a hold has the car standing either: it goes on the hold's go. A
+  # left, pulsed at each go, has its edges on go frames only. The 'holds' half of the go test above stops at 14 s, before
+  # H5 at about 16 s; this one runs past it
+  from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
+  sim = StopSim(tmp_path, model='holds', info_kw={'maneuver': maneuver},
+                maneuvers=[(TURN_J, 'turn', maneuver), (2000., 'turn', 'right' if maneuver == 'left' else 'left')])
+  run_to_line(sim)
+  sim.run(22.)
+  trace = sim.trace
+  h5 = next((k for k, (_, _, p) in enumerate(trace) if p.controlPrompt == 'stopSignTakeControl' and
+             str(p.stopGo.state) == 'ladder'), None)
+  assert h5 is not None, "the decider never handed back"
+  s, v, p = trace[h5]
+  assert p.shouldStop and v < STANDSTILL_SPEED, v
+  if maneuver == 'right':  # the premise: handed back standing where the right's one pulse is due, the stand fresh (one
+    # older than STANDSTILL_REARM_S holds any pulse for motion anyway, so this would pass whatever the hold did)
+    assert TURN_J - s < CURB_TURN_PULSE_M, f"handed back {TURN_J - s:.2f} m from the junction"
+    rest = h5
+    while rest > 0 and trace[rest - 1][1] < STANDSTILL_SPEED:
+      rest -= 1
+    assert (h5 - rest) * DT_MDL < STANDSTILL_REARM_S, f"the stand at the handback is {(h5 - rest) * DT_MDL:.2f} s old"
+  assert all(q.shouldStop for _, _, q in trace[h5:])  # held from the handback on
+  assert trace[-1][2].controlPrompt == 'stopSignTakeControl' and trace[-1][2].reason == "Can't start: take control"
+  held = [(k, round(TURN_J - s_, 2), str(q.stopGo.state)) for k, (s_, v_, q) in enumerate(trace)
+          if q.shouldStop and v_ < STANDSTILL_SPEED and q.desire in TURN_DESIRES]
+  assert not held, f"a turn desire with the car held standing: {held}"
+  handed = [(k, str(q.controlPrompt)) for k, (_, _, q) in enumerate(trace)
+            if str(q.controlPrompt) in TAKE_CONTROL_PROMPTS and q.desire in TURN_DESIRES]
+  assert not handed, f"a turn desire under a take-control prompt: {handed}"
 
 
 @pytest.mark.parametrize('short', [4.3, 7.])
@@ -572,11 +652,23 @@ def test_C11_the_camera_stop_signs_param_off_reads_none_anything_else_reads_them
   assert not camera_signs_read(FakeParams(TurnPilotCameraStopSigns=b'off'))
 
 
-def test_the_ladders_other_turn_pulses_its_own_turn_at_the_go_never_the_routes_and_publishes_the_planned_turn_missed(tmp_path):
+def turning_into(sim, turned: float) -> bool:
+  """The sim's car turning into the decider's turn this frame: rolling, from the decider's commit point on (the sim's views
+  and visibility file are for a car straight on its approach), once the turn's pulse is out (the model turns on its edge: a
+  left's is the go, a right's comes rolling inside 8 m, desire_timing.turn_lead), then on to its 80 deg (a 90 deg turn's
+  clear at its angle, CLEAR_MARGIN_DEG short of it, counted from the pulse). Yawed from the commit with a right's pulse a
+  frame later (2026-11-06), the clear counted 77.3 deg and never came, the turn's lamp lit to the miss."""
+  return sim.v > 0.5 and str(sim.trace[-1][2].stopGo.state) in ('committed', 'inLane') and turned < 80. and \
+    (turned > 0. or sim.tp.desires.started)
+
+
+def test_the_ladders_other_turn_pulses_its_own_turn_never_the_routes_and_publishes_the_planned_turn_missed(tmp_path):
   # 7.1 rung 2, 3.5: going straight, a car stopped on the exit leg (no room past the junction: a static wait); at its bound
   # the decider takes a right (single-lane approach), said (otherTurn, stopGo.alternate, stopGo.maneuver right). turnpilotd
-  # feeds DesireTiming the synthesized right (its own maneuver id) from the go: turnRight goes out at the go and never a turn
-  # for the route; once the encounter is done the route's planned turn is published missed (turnMissed) for navd to reroute
+  # feeds DesireTiming the synthesized right (its own maneuver id) from the go: turnRight is its desire and never a turn for
+  # the route, its one pulse rolling inside 8 m of the decider's junction on the go from the stop point 13 m out (a curb-side
+  # turn's, 2026-11-06; it had gone at the go); once the encounter is done the route's planned turn is published missed
+  # (turnMissed) for navd to reroute
   sim = StopSim(tmp_path)
   def stopped(s):  # on the exit leg 26 m ahead while we stand at the line (out of the scene once we move)
     return ({'cls': 'car', 'x': 26., 'y': 0., 'vx': 0., 'vy': 0., 'inPath': True, 'camera': 'wide', 'view': 'full',
@@ -585,8 +677,7 @@ def test_the_ladders_other_turn_pulses_its_own_turn_at_the_go_never_the_routes_a
   start = len(sim.trace)
   turned = 0.
   while sim.t < 80. and not any(p.turnMissed for p in sim.plans()[start:]):
-    moving = sim.v > 0.5 and str(sim.trace[-1][2].stopGo.state) in ('committed', 'inLane')
-    yaw = -0.6 if moving and turned < 80. else 0.
+    yaw = -0.6 if turning_into(sim, turned) else 0.
     turned += abs(yaw) * DT_MDL * 57.3
     sim.step(objects=stopped(sim), yaw_rate=yaw)
   plans = sim.plans()[start:]
@@ -595,10 +686,53 @@ def test_the_ladders_other_turn_pulses_its_own_turn_at_the_go_never_the_routes_a
   assert plans[alt].stopGo.alternate and str(plans[alt].stopGo.maneuver) == 'right'
   go = next(k for k, p in enumerate(plans) if str(p.goCertified.cause) == 'stopSign')
   assert go > alt
-  desires = [p.desire for p in plans]
-  assert Desire.turnLeft not in desires and Desire.turnRight in desires[go:go + 3] and Desire.turnRight not in desires[:go]
-  assert any(p.turnMissed for p in plans[go:]) and not any(p.turnMissed for p in plans[:go])
+  assert Desire.turnLeft not in [p.desire for p in plans]
+  pulse = assert_curb_pulse(sim.trace[start:], go)
+  assert any(p.turnMissed for p in plans[pulse:]) and not any(p.turnMissed for p in plans[:go])
   assert all(p.accelCap >= -2. - 1e-9 for p in plans)
+
+
+def test_the_ladders_other_right_not_started_by_its_deadline_is_handed_back_never_driven_on_in_silence(tmp_path):
+  # curb-turn-timing risk 5 (2026-11-06): the ladder's other turn gets no TurnSkip judgment (the route's turn isn't the car's
+  # there), so a curb-side other turn whose one pulse waited on the model's turn-scale steer-in (0.06 1/m from 9 m) with the
+  # car not following got no pulse and no word: the car rolled on straight across a junction the decider had cleared for the
+  # right's conflicts alone. Rolling past its deadline (CURB_FIRST_PULSE_M to the decider's junction) with no pulse out it is
+  # said: past the go's withdrawable point (committed here), handed back with no hold in the junction ("Turn not started: take
+  # control", stopSignTakeControl), until the encounter is over. Never a pulse late into it. Without the steer-in the right is
+  # pulsed rolling inside 8 m as before, and nothing is handed back
+  from openpilot.selfdrive.turnpilot.turnpilotd import ALT_LATE_REASON
+
+  def drive(steer):
+    sim = StopSim(tmp_path)
+
+    def stopped(s):
+      return ({'cls': 'car', 'x': 26., 'y': 0., 'vx': 0., 'vy': 0., 'inPath': True, 'camera': 'wide', 'view': 'full',
+               'tSeen': s.t_cam},) if s.v < 0.5 and abs(S_LINE - s.s) < 6. else ()
+    base = sim.model
+
+    def model(s):
+      if steer and s.trace and str(s.trace[-1][2].stopGo.state) in ('going', 'committed', 'inLane') and TURN_J - s.s < 9. and \
+         s.tp.desires.maneuver_id == -7:
+        return model_v2(holds=False, curvature=0.06)
+      return base(s)
+    sim.model = model
+    run_to_line(sim)
+    start = len(sim.trace)
+    while sim.t < 80. and sim.s < TURN_J + 30.:
+      sim.step(objects=stopped(sim))
+    return sim, sim.trace[start:]
+  sim, trace = drive(True)
+  plans = [p for _, _, p in trace]
+  assert any(str(p.controlAlert) == 'otherTurn' for p in plans) and not any(p.desire == Desire.turnRight for p in plans)
+  handed = [i for i, p in enumerate(plans) if p.controlPrompt == 'stopSignTakeControl']
+  assert handed and plans[handed[0]].reason == ALT_LATE_REASON, sorted({(str(p.controlPrompt), p.reason) for p in plans})
+  assert CURB_FIRST_PULSE_M - 1. < TURN_J - trace[handed[0]][0] < CURB_FIRST_PULSE_M + 0.1, TURN_J - trace[handed[0]][0]
+  assert not any(p.shouldStop for p in plans[handed[0]:]), "never held in the junction"
+  assert all(p.controlPrompt == 'stopSignTakeControl' for p in plans[handed[0]:handed[-1] + 1])
+  assert str(plans[handed[-1] + 1].stopGo.state) in ('done', 'off'), "handed back until the encounter is over"
+  sim, trace = drive(False)
+  plans = [p for _, _, p in trace]
+  assert any(p.desire == Desire.turnRight for p in plans) and not any(p.controlPrompt == 'stopSignTakeControl' for p in plans)
 
 
 def test_the_route_start_and_pre_stop_notices_reach_the_plan_disengaged(tmp_path):
@@ -783,8 +917,7 @@ def test_the_ladders_other_turn_is_the_scenes_maneuver_and_the_turn_caps_never_t
   while sim.t < 90. and not any(p.turnMissed for p in sim.plans()[start:]):
     if st['go'] is None and str(sim.tp.stop_go.state) == 'going':
       st['go'] = len(sim.trace)
-    moving = sim.v > 0.5 and str(sim.trace[-1][2].stopGo.state) in ('committed', 'inLane')
-    yaw = -0.6 if moving and turned < 80. else 0.
+    yaw = -0.6 if turning_into(sim, turned) else 0.
     turned += abs(yaw) * DT_MDL * 57.3
     sim.step(objects=objects(sim), yaw_rate=yaw)
   plans = sim.plans()
@@ -801,7 +934,10 @@ def test_the_ladders_other_turn_is_the_scenes_maneuver_and_the_turn_caps_never_t
   assert not any(x[4] for x in seen[alt + 1:done]), sorted({x[4] for x in seen[alt + 1:done]})
   assert all(p.accelCap >= -2. - 1e-9 for p in plans)
   assert all(p.speedCap <= turn_speed_cap(m, d, v) + 1e-6 for p, (m, d, _, v, _) in zip(plans[alt + 1:done], seen[alt + 1:done], strict=True))
-  assert any(p.desire == Desire.turnRight for p in plans[go:go + 3]) and Desire.turnLeft not in [p.desire for p in plans]
+  # the right's desire, never the route's left: its one pulse rolling inside 8 m of the decider's junction (a curb-side
+  # turn's, 2026-11-06), not at the go from the stop point 13 m out
+  assert Desire.turnLeft not in [p.desire for p in plans]
+  assert go < assert_curb_pulse(sim.trace, go) < done
 
 
 def test_a_left_taken_instead_of_the_routes_right_gets_the_scenes_oncoming_hold(tmp_path):
@@ -862,9 +998,10 @@ def test_a_left_taken_instead_of_the_routes_right_gets_the_scenes_oncoming_hold(
 
 def other_turn_drive(tmp_path, route, err_after_s=None, setup=None, each=None):
   """The route's turn at the stop sign (route left: the left's exit blocked, the right taken; route right: its exit and straight
-  across blocked, the left taken; straight: the exit blocked, the right taken), driven through the other turn until the turn
-  is missed. err_after_s: one decider frame raises this long after its commit (None: none). setup(sim): once, before the
-  drive (the car's own turn signal, test_turnpilotd_stop_signal); each(sim): every frame from the line, True ends the drive.
+  across blocked, the left taken; straight: the exit blocked, the right taken), driven through the other turn (turning_into:
+  from the commit once its pulse is out) until the turn is missed. err_after_s: one decider frame raises this long after its
+  commit (None: none). setup(sim): once, before the drive (the car's own turn signal, test_turnpilotd_stop_signal);
+  each(sim): every frame from the line, True ends the drive.
   Returns (plans, the go's frame, the commit's frame, the bad frame, (junction hold reason, shouldStop) of the scene each frame)."""
   if route == 'straight':
     sim = StopSim(tmp_path)
@@ -921,8 +1058,7 @@ def other_turn_drive(tmp_path, route, err_after_s=None, setup=None, each=None):
       st['go'] = len(sim.trace)
     if st['commit'] is None and str(sim.tp.stop_go.state) in ('committed', 'inLane'):
       st['commit'] = len(sim.trace)
-    moving = sim.v > 0.5 and str(sim.trace[-1][2].stopGo.state) in ('committed', 'inLane')
-    yaw = sign if moving and turned < 80. else 0.
+    yaw = sign if turning_into(sim, turned) else 0.
     turned += abs(yaw) * DT_MDL * 57.3
     sim.step(objects=objects(sim), yaw_rate=yaw)
   return sim.plans(), st['go'], st['commit'], st['raised'], seen

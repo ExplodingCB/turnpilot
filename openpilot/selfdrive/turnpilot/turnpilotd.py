@@ -45,8 +45,9 @@ TurnPilot acts only while it can do its job (Kellen, 2026-10-27: no degraded mod
 On either, plan.handback is set and selfdrived soft-disables (handback.py). TurnPilot stops at once: no new desire,
 lane change, signal prompt, skipped-turn reroute or wrong-lane flag, and the maneuver in hand is dropped. A turn whose
 desire already went out is never cancelled (desire_timing.py): its desire is held, with no new pulse, and cleared from
-the model at the turn's angle as usual; a keep desire is dropped. The scene's stops in force stay, and so does the turn
-speed cap of a turn whose desire already went out: a handback must not speed the car up. Nor does the route going away
+the model at the turn's angle as usual; a keep desire is dropped. The scene's stops in force stay, as does the stop for want
+of a green at the signal of the turn in hand (update()'s junction), and so does the turn speed cap of a turn whose desire
+already went out: a handback must not speed the car up. Nor does the route going away
 under a committed turn cancel it (route_follower.py: gaps, navd going quiet, reroutes are dead-reckoned through). Nor does a cap the car
 was slowing for going away with the maneuver or the route: from the handback until openpilot stops steering (the soft
 disable's end) the speed cap holds the car at no more than its speed then, and at no more than it has slowed to since
@@ -55,25 +56,56 @@ A fault (plan()) is a disabled plan; it carries the handback, so a fault never h
 and the scene's stops in force run on through it (only turning TurnPilot off resets them). So does a committed turn:
 its route and desire state are kept (its desire, dropped by the disabled plan, pulses again only as on re-engaging), its
 junction dead-reckoned and its yaw counted through the fault (fault_track), and
-the car is held to its speed while faulted (hold_v), as on a handback. A faulted plan carries the
+the car is held to its speed while faulted (hold_v), as on a handback. So is a curb-side turn in hand (below). A faulted plan carries the
 scene's limits (live pedestrians, or those carried through a detector gap, and the junction hold in force where it
 was; scene_policy.py), which plannerd acts on (hooks.limits_plan), so a turnpilotd failing every frame still never
 drives the car on through a pedestrian. Its desire and lane change are never acted on.
 Once the detector is back and TurnPilot acts again, the dropped maneuver is taken up or skipped out loud, never left
 half driven (_take_up_dropped).
+A curb-side turn (a right where traffic keeps right) is committed only at its one pulse 8 m out (desire_timing.py,
+2026-11-06); at HEAD its 40 m pulse had it committed from there, and what hung off that commitment left the right unguarded
+from its cap's lead to 8 m (the 2026-11-06 reviews). So from turn_speed.TURN_CAP_LEAD_M in to its junction (by the nearest
+reading: past it an unpulsed turn gets no pulse), a curb-side TURN TurnPilot acts on, not dropped at a
+handback, not skipped, not the stop-sign ladder's other turn's, its desire not done, is IN HAND
+(in_hand_now; hand_id, by last frame's state as turn_committed is), and gets HEAD's protections for it (Kellen, 2026-11-06:
+HEAD parity): the follower holds it through gaps in the route as a committed turn (route_follower.py: junction_hold, but a
+new route that doesn't turn there is taken and a short outlier still re-baselines it); a fault keeps it (its route and its
+desire state, dead-reckoned, the car held to its speed) as a committed turn; a handback keeps its corner cap; section 4.5's
+unstick never lifts a model stand within STOPPED_CONTROL_M of it (at its line: an unmapped red, a walker the detector doesn't
+score, its crosswalk at the corner), as none did with its desire out; and any skip of it but too fast (tooLate, a signal or
+walker veto at its hold line, braking to it, at rest behind a lead, its lane unreachable, a signal its take-up can't stop for)
+keeps its corner cap to the pass, so the car never speeds from 3 to 7.5 m/s straight through the junction it was slowing to
+turn at (tests-signal probe1: from its walker hold line 8.26 m out). A too-fast skip keeps none (turn_skip.py: no hard braking
+for a turn). A skip is still decided as for any turn not committed (a veto while rolling skips it, where a committed turn
+goes on: no desire is in the model's queue to cancel), and turn_skip still judges it (tooFast, its deadline, its crossing).
+The follower moving off it for another maneuver of the same route while the car is short of it is never silent
+(check_hand_dropped: turnMissed, navd reroutes).
+Never in silence either (2026-11-06, the lifecycle follow-ups): a started curb-side turn whose re-engage repeat DesireTiming
+refuses past its first pulse's bounds is skipped out loud (say_refused_repeat: desireDropped, its pulse cleared, its cap kept),
+but for a blip (a fault frame, a frame or three of latActive gone) or a car turning on its first pulse already, which that pulse
+drives on with nothing said or cleared (desire_timing REPEAT_BLIP_FRAMES);
+a route turn whose junction's signal map_controls first knew too close to stop for is skipped out loud before it begins
+(signalStop) or, begun, finished and said (signal_turn_late); the stop-sign ladder's other curb-side turn not pulsed by its
+deadline is handed back with no hold in the junction (alt_turn_late); a curb-side turn skipped tooLate that the car then turns
+TURN_STARTED_DEG into is the model's own again, its cap and crosswalk hold back (adopt_skipped); a turn's skip is carried to a
+new route's id at the same junction, one skip per junction, its cap kept through the reroute's gap (carry_skip, skipped_cap),
+the same junction by its readings' span at the reroute turn's first sight, never the next right on (SKIP_SAME_M);
+a curb-side turn's go from further out than its pulse runs the no-move clock with the switch off too (curb_release); navd's
+route waiting on its start direction is said as starting, not off route (route_starting).
 No gas go anywhere (Kellen, 2026-10-28; DESIGN phase 4, G1): any gas press disengages (DisengageOnAccelerator, on by
 default; preflight fails without it, and TurnPilot faults while it is off: Fault.disengageOnAccelerator), which is the
 driver taking over, never TurnPilot's go. A gas press with openpilot disengaged (the driver driving) is what releases the
 scene's junction hold at its line (scene_policy.py).
 A turn the car pulls away into from a standstill (a hold's go, the turn's pulse in that frame) is unverified: in BeamNG it
-was taken about half the time (2026-10-28). Past its junction (the follower's pass) having turned under MISSED_TURN_DEG,
-its desire not cleared at the turn's angle (a turn under 20 deg clears under MISSED_TURN_DEG, and that one was taken),
-it was missed: turnMissed for MISSED_HOLD_S, which selfdrived chimes as a skip ("Turn Missed", "Rerouting") and on which
-navd reroutes at once. Nothing brakes for it. Standing more than STALL_PROMPT_S in any route turn in progress (its desire
-out and not done; after a go of TurnPilot's for it, done or not), STALL_MIN_DEG to STALL_MAX_DEG into it (from its start,
-after a go of TurnPilot's that came in the junction), whoever stopped the car (TurnPilot's go, or the model on its own:
-BUILD_FINDINGS D2; under STALL_MIN_DEG too once past the maneuver point, where a red's stop line never is), with no
-hold of TurnPilot's and no lead within STOPPED_LEAD_M that the live scene corroborates
+was taken about half the time (2026-10-28). A curb-side turn whose one pulse waits for 8 m (desire_timing) let go from a line
+further out than that is such a go too, its bookkeeping armed at its first pulse (watch_curb_go). Past its junction (the
+follower's pass) having turned under MISSED_TURN_DEG, its desire not cleared at the turn's angle (a turn under 20 deg clears
+under MISSED_TURN_DEG, and that one was taken), it was missed: turnMissed for MISSED_HOLD_S, which selfdrived chimes as a
+skip ("Turn Missed", "Rerouting") and on which navd reroutes at once. Nothing brakes for it. Standing more than
+STALL_PROMPT_S in any route turn in progress (its desire out and not done; after a go of TurnPilot's for it, done or not),
+STALL_MIN_DEG to STALL_MAX_DEG into it (from its start, after a go of TurnPilot's that came in the junction), whoever
+stopped the car (TurnPilot's go, or the model on its own: BUILD_FINDINGS D2; under STALL_MIN_DEG too once past the
+maneuver point, where a red's stop line never is), with no hold of TurnPilot's and no lead within STOPPED_LEAD_M that the live scene corroborates
 (watch_lead: a vehicle track or box at it; one it corroborates holds the car LEAD_STAND_MAX_S at most), it stalled in the
 junction: handed back loudly (controlPrompt stalledTakeControl, STALLED_REASON), never held there, and TurnPilot never
 goes itself. Moving in such a turn past its hold
@@ -105,8 +137,12 @@ The route's unprotected left (map_controls.unprotected_turn) is driven by unprot
 TurnPilotAutoLeft: auto (the default: Kellen, 2026-10-28, "No it has to ship taking the turn"), announce or off (G1's
 handback at the line). Each frame it is fed the hold line's latch and the scene from the last frame, this frame's raw
 detector run (main(): SceneTracker.raw), the car's yaw toward the turn (track_yaw) and the opposing road's mapped speed and
-lanes, and checked against TurnPilotLeftRangeM (the detector's proven range; unset: unmeasured, ROAD_RANGE_M 0, so every
-left is skipped and rerouted). Its command goes to
+lanes, and checked at its line against TurnPilotLeftRangeM (the detector's proven range; unset: unmeasured, ROAD_RANGE_M 0),
+the full pass's never past FULL_PASS_RANGE_M (what the letterboxed pass can box: left_ranges; past it the band is the far
+slot's, the native schedule's at TurnPilotLeftRangeM or the far crop's measured range), capped after dark to
+NIGHT_LEFT_RANGE_M (TurnPilot.dark: darkness.DarkFilter on narrowRoadCameraState's exposure, the car starting dark). Every left
+is driven to its line, never skipped or rerouted for its range (Kellen, 2026-11-06) nor its lane (LC-03's verdict: wrongLane,
+2026-11-07): there it goes on a gap the camera can certify, or hands back loudly with the car held. Its command goes to
 the latch (map_controls.LeftCommand: hold, creep, go, or a fault's handback), its own hold after a withdrawn go joins the
 scene's stops, and no turn pulse goes on its approach (may_start off; turn_skip's pulse_at_go): its go from the line is the
 first. It asks modeld for the road camera (turnpilotPlan.detectorView) and publishes its state (unprotectedLeft); its wait
@@ -187,15 +223,18 @@ from openpilot.common.params import Params, UnknownKeyName
 from openpilot.common.realtime import DT_MDL, Ratekeeper
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
-from openpilot.selfdrive.turnpilot.desire_timing import ENTRY_M, TURN_STARTED_DEG, DesireTiming, keep_last
+from openpilot.selfdrive.turnpilot.desire_timing import (CURB_TURN_PULSE_M, ENTRY_M, TURN_STARTED_DEG, DesireTiming, curb_side_turn,
+                                                          first_pulse_by, keep_last, pulse_distance)
 from openpilot.selfdrive.turnpilot.control_text import STOPPED_NOTE, calibration_reason
 from openpilot.selfdrive.turnpilot.go_override import GO_ACCEL, GO_CLEAR_M, GO_WINDOW_S, GoCertifier, Takeover
 from openpilot.selfdrive.turnpilot.handback import Handback
 from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, CLEAR_DESIRE, CONTROL_STATUS_ALERTS, KEEP_FOLLOW, KEEP_REROUTED, TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.detector.light_state import LIGHT_MODE_DEFAULT, camera_lights_mode
-from openpilot.selfdrive.turnpilot.map_controls import (CAMERA_STALE_S, KEEP_TURN, LATCH_PAST_M, LIGHT_STALE_S, MAP_MARGIN_M, PROTECT_PAST_M, YELLOW_DECEL,
-                                                         YELLOW_DECEL_MAX, LeftCommand, MapControlPolicy, StopCommand, camera_light_input,
-                                                         is_stop, light_input, turn_stop_feasible, unprotected_turn)
+from openpilot.selfdrive.turnpilot.map_controls import (CAMERA_STALE_S, COMMIT_SPEED, CONTROL_LINE_M, KEEP_TURN, LATCH_PAST_M, LIGHT_STALE_S,
+                                                         MAP_DECEL_MAX, MAP_MARGIN_M, OFF_ROUTE_DRIVE_REASON, OFF_ROUTE_REASON, PROTECT_BEFORE_M,
+                                                         PROTECT_PAST_M, SIGNAL_COMMITTED, SIGNAL_STOP, YELLOW_DECEL, YELLOW_DECEL_MAX, LeftCommand,
+                                                         MapControlPolicy, StopCommand, camera_light_input, is_stop, light_input, needed,
+                                                         turn_stop_feasible, unprotected_turn)
 from openpilot.selfdrive.turnpilot import stop_rules as sr
 from openpilot.selfdrive.turnpilot.control_tracker import OFF_ROUTE
 from openpilot.selfdrive.turnpilot.stop_go import MODE_DEFAULT, STOP_SWEEP_M, Frame, StopGo, StopGoDecision, mode_for, side_views_live
@@ -203,8 +242,8 @@ from openpilot.selfdrive.turnpilot.car_signals import (TurnSignalIntent, TurnSig
                                                         read_mode, record_matches)
 from openpilot.selfdrive.turnpilot.lane_planner import (SAMPLE_IDX, LanePlanner, Phase, keep_blocker, lane_change_window,
                                                         lane_mismatch, model_lanes_from_msg)
-from openpilot.selfdrive.turnpilot.route_follower import (KEEP, LEFT, RIGHT, SAME_TURN_M, TURN, UNCERTAIN_M, Maneuver, RouteFollower,
-                                                           same_junction, turn_angle)
+from openpilot.selfdrive.turnpilot.route_follower import (KEEP, LEFT, PASSED_DIST_M, RIGHT, SAME_TURN_M, TURN, UNCERTAIN_M, Maneuver,
+                                                           RouteFollower, same_junction, turn_angle)
 from openpilot.selfdrive.turnpilot.route_notice import RouteNotices
 from openpilot.selfdrive.turnpilot.scene.lane_paint import LINE_PROB_MIN as PAINT_LINE_PROB_MIN, UNKNOWN as UNKNOWN_PAINT, lane_paint_from_msg
 from openpilot.selfdrive.turnpilot.scene.tracker import (MAX_COAST_S, STALE_S, SWEEP_COAST_S, RawFrame, SceneTracker, default_yaw_rate,
@@ -220,15 +259,18 @@ from openpilot.selfdrive.turnpilot.scene_policy import (CONFIRM_STEADY_HITS, CRO
                                                          HOLD_LINE_M, NO_ACCEL_CAP, ONCOMING_ENTRY_M, PATH_HALF_WIDTH_M, PERSON_FRONT_BUMPER_M,
                                                          PERSON_FRONT_HALF_M, PERSON_FRONT_NOTE, PERSON_FRONT_X_M, STOP_DECEL, VEHICLES, ScenePolicy,
                                                          far_side_turn, in_path, velocity_trusted)
-from openpilot.selfdrive.turnpilot.turn_skip import SkipState, TurnSkip, can_make_turn
-from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, PostGo, turn_speed_cap
-from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DEFAULT_OPPOSING_SPEED, DRIVEN, LIGHT_RED_MAX_S, OFF, ROAD_RANGE_M,
-                                                           STAND_UNDECIDED_S,
-                                                           ROUTE_REACH_MARGIN_M, LeftInput, UnprotectedLeft, left_mode_for,
-                                                           left_reach, range_param, reach_at_line, route_range)
+from openpilot.selfdrive.turnpilot.turn_skip import (CURB_FIRST_PULSE_M, SKIP_CONFIRM_FRAMES, STOP_BEFORE_TURN_M, SkipState, TurnSkip,
+                                                      can_make_turn)
+from openpilot.selfdrive.turnpilot.turn_speed import (LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, TURN_CAP_LEAD_M, PostGo,
+                                                      turn_done_deg, turn_speed_cap)
+from openpilot.selfdrive.turnpilot.darkness import EXPOSURE_LOG_S, LEAVE_MOVING_V, SUN_EVERY_S, car_fix, dark_filter_for, sun_elevation
+from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DRIVEN, FULL_PASS_RANGE_M, LIGHT_RED_MAX_S, OFF, ROAD_RANGE_M,
+                                                           STAND_UNDECIDED_S, LeftInput, UnprotectedLeft, left_mode_for,
+                                                           left_reach, range_param, route_range)
 
 FAR_OFF_ALERT_S = ABORT_HOLD_S  # farViewOff is shown this long, once, when the far crop goes off for the drive
 FAR_STATUS_STALE_S = 1.         # the full pass's farStatus older than this: the far crop isn't known to read
+NATIVE_ON = ('full', 'strip')   # nativeStatus with the native schedule in the far crop's slot (left_ranges)
 # farStatus of a far crop that is on (route time: far_live); a stop sweep suspends it (sweep) without turning it off
 FAR_ON = ('read', 'noRoom', 'noCalibration', 'sweep')
 SIDE_OFF_ALERT_S = ABORT_HOLD_S  # sideCamerasOff is shown this long, once, when the side views go off for the drive
@@ -308,6 +350,9 @@ LIGHT_UNREAD_REASON = "No red seen: car not moving"
 # a turn released from a standstill (a hold's go: BeamNG 2026-10-28, taken about half the time) is checked, never trusted:
 MISSED_TURN_DEG = 15.  # past its junction (the follower's pass) turned less than this, it was missed: said and rerouted
 MISSED_HOLD_S = 3.     # turnMissed is held this long, for the alert and for navd (1 Hz) to see it
+# a curb-side turn in hand skipped for these keeps no corner cap (keep_hand_cap): too fast for it, so no hard braking for it
+# (turn_skip.py); every other skip of one keeps its cap to its pass (module docstring)
+NO_CAP_SKIPS = ('tooFast', 'unprotectedStop')
 # the stop-sign ladder's other turn (stop_go.py: 7.1 rung 2, O12) is a maneuver of its own for DesireTiming, never a route's id, so
 # navd's reroute after it (turnMissed) never clears its pulse as a replaced maneuver's
 ALT_MANEUVER_ID = -7
@@ -372,7 +417,8 @@ TURN_ABANDONED_REASON = "Turn abandoned: take control"
 # MISSED_TURN_DEG toward the turn and under TURN_MISSED_AWAY_DEG away from it (turned_deg is signed toward the turn: a car
 # yawed away from it in the junction is heading for the oncoming lanes or the far kerb, a mess-up, never a straight drive;
 # the plan's test has 10 deg away break it), and desiredCurvature under TURN_MISSED_CURV either way on every frame (inside
-# S20's -0.012 to -0.019 unwind above, so a curvature read once proves nothing): missed at the pass (turnMissed) and
+# S20's -0.012 to -0.019 unwind above, so a curvature read once proves nothing), but on frames the model steers into the turn
+# (2026-11-06: watch_straight; a steer-in then a dead-straight drive was said by nothing): missed at the pass (turnMissed) and
 # rerouted, its last pulse cleared from the model's queue on that frame (WARGAME_FIXES WF-11). Under TurnPilotAlwaysDrive
 # R8's fire inside both bounds is that too: its desire cleared at the fire (CLEAR_DESIRE), no handback, the bounds then held
 # on every frame to the pass, and either broken on the way is R8's handback, latched as R8's own (turn_abandoned)
@@ -457,6 +503,26 @@ OFF_ROUTE_TURN_REASON = "Off route: take control"
 # gap, route_follower.py), and that is handed back loudly (gpsLostTakeControl, GPS_LOST_REASON) from its first frame engaged
 # and acting, once a spell, held until the driver takes over or navd has the car again: no braking, no steering
 GPS_LOST_REASON = "GPS lost: take control"
+# navd withholding the route until the car's start direction is checked (navInstruction.routeHeadingUnverified: a destination
+# set standing, parked or nose-in, a reroute made for the heading; navd heading_due): its messages invalid, the stops ahead are
+# unknown and the off-route cap holds (map_controls: OFF_ROUTE_SPEED, the switch's OFF_ROUTE_DRIVE_SPEED), but the car isn't
+# off any route. The status line says the route starts (ROUTE_STARTS_REASON standing, ROUTE_STARTING_REASON moving), with no
+# sound (mapControlsUnavailableSilent), instead of "Off route, map stops unknown: take control or wait for reroute" and its
+# chime at every route start (navd-cereal-3 / round 2's navd-2 item 2, 2026-11-06)
+ROUTE_STARTS_REASON = "Route starts once moving: map stops unknown"
+ROUTE_STARTING_REASON = "Route starting: map stops unknown"
+# a route turn whose junction's signal map_controls first knew too close to stop for at MAP_DECEL_MAX (its own refusal: a mapped
+# or camera signal's signal_turn_late, a camera head's camera_signal_late) is never driven through that unread signal in
+# silence (signal_turn_late): SKIP_CONFIRM_FRAMES of it, its first pulse held meanwhile, and a turn not begun is skipped out
+# loud (signalStop: "Can't Stop for the Light", navd reroutes); one begun (its desire out, or the car TURN_STARTED_DEG into it)
+# is finished, said: cannotStopComfortably ("Take Control", "Cannot stop gently for the stop/signal") for
+# SIGNAL_LATE_ALERT_S, SIGNAL_LATE_REASON on the status line, never a hard brake for it
+SIGNAL_LATE_REASON = "Light too close to stop for: take control"
+SIGNAL_LATE_ALERT_S = MISSED_HOLD_S
+# the stop-sign ladder's other turn (stop_go 7.1 rung 2, O12), a curb-side one, rolling past its one pulse's deadline with no
+# pulse out (desire_timing: waiting on a turn-scale steer-in the car didn't follow), or its re-engage repeat refused: the
+# decider's go was made for that turn's conflicts alone, never for the car going straight across (alt_turn_late)
+ALT_LATE_REASON = "Turn not started: take control"
 LEAD_CORROBORATE_M = 3.
 LEAD_BEARING_TOL_DEG = 3.
 LEAD_SEEN_HOLD_S = 1.
@@ -529,9 +595,10 @@ LEFT_LIFT_ROOM_M = 0.5 * GO_ACCEL * GO_WINDOW_S ** 2 + (GO_ACCEL * GO_WINDOW_S) 
 RELEASE_UNSIGNALIZED = False
 # ...under TurnPilotAlwaysDrive (ALWAYS_DRIVE.md LEFT-20) it is True for a curb-side or straight release where release_light reads
 # 'none' (navd's controls ok: the sidecar served) and section 4.5's conditions hold, since 'ok' means the sidecar came, not that
-# OSM has every signal and stop sign (unsignalized_why): no map control within STOPPED_CONTROL_M, the camera's shadow reader
-# live and reading no head of any colour, no detector stop-sign box in a forward run in the last SIGN_CLEAR_M driven (and the
-# camera's signs read at all). A red or yellow from any source still blocks, a mapped signal still needs an accepted green
+# OSM has every signal and stop sign (unsignalized_why): no map control within STOPPED_CONTROL_M, not after dark, the camera's
+# shadow reader live and no head of any colour or bearing read in the last HEAD_CLEAR_M driven, no detector stop-sign box in a
+# forward run in the last SIGN_CLEAR_M driven (and the camera's signs read at all). A red or yellow from any source still
+# blocks, a mapped signal still needs an accepted green
 # The stop-sign memory is in metres driven, never seconds standing (watch_signs, every frame, TurnPilot planning or not): an
 # unmapped stop sign at the line stands beside the car, outside the road camera's view (half of it is 20 deg on the AR/OX
 # cameras, 30 deg on the OS; a sign 3-8 m to the side leaves it 5-22 m before the car is level with it), so its last box comes
@@ -543,6 +610,18 @@ RELEASE_UNSIGNALIZED = False
 # nothing. turnpilotd's start counts as a sign just seen
 SIGN_CLEAR_M = 50.
 SIGN_RUN_FRESH_S = 1.
+# ...and the camera's: no head of any colour or bearing (turnpilotDetections lights, before map_controls.camera_light_input
+# keeps the governing ones) in a road run's read in the last HEAD_CLEAR_M driven (watch_heads), the stop-sign memory's rule:
+# metres driven, a head read resets it, standing adds nothing, moving with no road read for CAMERA_STALE_S counts as a head
+# seen. Review 2026-11-07 (rails-1): the gate read one frame's governing heads, so a junction whose heads all read off the
+# lane's bearing, a red among them, passed as no signal, and at an unmapped signal the unstick lifted the model's red-light
+# hold at 10 s ('Nothing ahead is holding the car: going on'). The car's own stands at signals (11-06): 1e 10:24, 128 road
+# reads at the stand, 126 with heads, none governing (unknown and red, about 22 m out, -15 deg); 1d 5:32, 54 with no head at
+# all, its heads read on the approach. Where one was read on the approach the last came 0-12 m before the stand (1e 3:13.9,
+# 4:11.6, 10:24; 1d 5:32), and a near-side head on a mast leaves the top of the road frame about 15 m before its line. And
+# never after dark (unsignalized_why: 'dark'): 1d 6:34 stood at a mapped signal whose heads no road read had in its last
+# 188 m, and the light reader's night gates gave no colour on 85% of plausible heads (11-06)
+HEAD_CLEAR_M = 50.
 # TurnPilotAlwaysDrive, section 4.5 (the owner's yes): a model stop off any hold (stopped_unheld's stand) gets one lift of its own
 # cause (unstick) from UNSTICK_S, only where release_light reads 'none' (controls ok), unsignalized_why reads nothing, nothing
 # is in the path and no model lead within GO_CLEAR_M (go_blocked), and no far-side turn or the left is near; said with a chime
@@ -581,6 +660,13 @@ LINE_VETO_MOVED_M = 2.
 # reroute at 0 m, N1's nearer reading at 10 m), never to the next left on along the road (skeptic m-behaviour3 P1: a left 25
 # m past the vetoed one, same bearings, was taken for it within SAME_TURN_M, its request ended with nothing said)
 LINE_VETO_SAME_M = UNCERTAIN_M + 5.
+# a turn's skip is carried to a reroute's turn (TurnPilot.carry_skip) whose junction navd's first reading of it puts within this
+# of the skipped junction's span, from its nearest reading to its latest confirmed one (SkippedTurn): the reroute's own first
+# reading's error, the outlier band of one reading (8-10 m short: test_gps_outlier, the 2026-11-06 drives; N1's nearer reading
+# at 10 m). The span holds the readings' own spread, so none of that is in it. Never SAME_TURN_M about the nearest: one short
+# reading put the junction 9 m short at the skip, and the next right on along the street, the same bearings, 20 and 30 m past
+# the skipped one, was carried as it and skipped too (the 2026-11-06 review of the carry), as LINE_VETO_SAME_M's next left was
+SKIP_SAME_M = 10.
 STOP_GO_HOLDS_PULSE = ('approach', 'stopped', 'rollUp', 'observe')  # the decider's states a turn's pulse waits for its go in
 
 
@@ -741,6 +827,25 @@ class StraightDrive:
   deg: float = 0.
   fired: bool = False
   ok: bool = True
+  steered: bool = False  # the model steered into the turn past TURN_MISSED_CURV on some frame, the car inside the deg bounds
+
+
+@dataclass
+class SkippedTurn:
+  """A route turn or keep TurnSkip skipped, by its junction (TurnPilot.record_skip, carry_skip): its maneuver (type, modifier,
+  bearings), where its junction is on turnpilotd's odometer (odo_m plus the follower's nearest at the skip), the skip's reason,
+  the id and navd's routeCount it is skipped under now, and whether its corner cap is kept to its pass (skip_cap_id).
+  junction_conf_odo: where the latest confirmed reading put it (RouteFollower.junction_latest, never short of the nearest):
+  the span the skipped junction lies in, with junction_odo. judged_id: the last reroute's id carry_skip found another junction
+  at its first sight (never carried after)."""
+  maneuver: object
+  junction_odo: float
+  reason: str
+  maneuver_id: int
+  route_count: int
+  capped: bool
+  junction_conf_odo: float = field(kw_only=True)
+  judged_id: int = field(default=-1, kw_only=True)
 
 
 @dataclass
@@ -782,6 +887,11 @@ class TurnPilot:
     self.auto_left = AUTO  # TurnPilotAutoLeft (main()): the unprotected left's mode (unprotected_left.py)
     self.left_range_m = ROAD_RANGE_M  # TurnPilotLeftRangeM (main()): the detector's proven range its R_req is checked against
     self.left_far_range_m = 0.  # TurnPilotLeftFarRangeM (main()): the far crop's proven range (unmeasured: 0, none)
+    # what the letterboxed full pass can box at all (unprotected_left.FULL_PASS_RANGE_M): the left's range_m never past it,
+    # whatever TurnPilotLeftRangeM says (left_ranges); the tests' simulated detector, which boxes every car it is given, lifts it
+    self.full_pass_range_m = FULL_PASS_RANGE_M
+    self.native_status = 'off'  # the full pass's latest nativeStatus (watch_far): what fills the far crop's slot
+    self.left_lane_id: int | None = None  # the autonomous left LC-03 placed in a lane it doesn't leave from (update(): wrongLane)
     self.far_status = 'off'     # the full pass's latest farStatus (watch_far)
     self.far_status_age = float('inf')
     self.far_off_t = 0.         # s farViewOff has left to show
@@ -825,8 +935,26 @@ class TurnPilot:
     self.alt_scene_id = ALT_SCENE_ID  # the scene's maneuver id for the ladder's other turn in hand (a new one per encounter)
     self.alt_was_on = False
     self.alt_route_id: int | None = None  # the route's maneuver the ladder's other turn was taken in place of (turn_skip's)
-    self.not_straight_id: int | None = None  # the left last logged as skipped for an opposing road not known straight
-    self.route_reach_m = 0.  # route time's last R_req for the unprotected left (its plan's rReq when skipped for it)
+    self.not_straight_id: int | None = None  # the left last logged for an opposing road not known straight (left_not_straight)
+    self.cap_released_id: int | None = None  # the turn last logged as turned to its angle, its corner cap let go (update)
+    self.clear_at: tuple[int, float] | None = None  # (maneuver id, m to its junction) where its desire went done, for the release
+    # after dark (watch_dark; darkness.py): the unprotected left's reach capped to NIGHT_LEFT_RANGE_M at its line. Dark on the car
+    # (fail closed: dark_filter_for, no SIMULATION) and light in the sim, from here, so no entry point that builds a TurnPilot
+    # fails open (review 2026-11-06: built light, only main() made it dark, and a replay harness or a second entry point would
+    # have judged a night left on the day range); a test harness that wants daylight sets it (test_turnpilotd's Sim)
+    self.dark_filter = dark_filter_for(os.environ)
+    self.exposure_seen = False    # a road camera reading has come this drive (watch_dark: the drive's first logged once)
+    self.exposure_ev: float | None = None  # ...the last one (% exposureValPercent), and its sensor
+    self.exposure_sensor = ''
+    self.exposure_win: list = []  # ...the readings since the last summary (turnpilot.exposure, every EXPOSURE_LOG_S)
+    self.exposure_log_t = 0.      # ...s since it
+    self.exposure_moving_s = 0.   # ...s of those readings with the car moving over LEAVE_MOVING_V (the light count's gate)
+    # ...and the sun under 0 deg (review LN-3, 2026-11-07; darkness.py): its elevation every SUN_EVERY_S (watch_sun) at the
+    # car's last fix (sun_fix: LastGPSPosition through main()'s Params, None without them) on decider_clock's wall clock
+    self.sun_fix = lambda: car_fix(self.params)
+    self.sun_t = SUN_EVERY_S      # s since the sun was last worked out (the first frame works it out)
+    self.dark_why_said: tuple | None = None  # (why, sun known) last logged (turnpilot.dark_why: once per change)
+    self.night_left_id: int | None = None  # the left last logged handed back for the night (turnpilot.left_night)
     self.last_holding = False     # the last plan's scene held the car (the decider's clearBox waits it out)
     self.params = None            # Params (main()): TurnPilotJunctionOverrides is written through it (signal_seen_override)
     self.override_failed_t = 0.   # s overrideWriteFailed has left to show
@@ -835,6 +963,8 @@ class TurnPilot:
     self.rht = True               # this frame's right_hand_traffic (update())
     self.sign_clear_m = 0.        # m driven, forward runs seeing the road, since one had a stop-sign box (watch_signs), 0 at the start
     self.forward_age = 0.         # s since a forward detector run came (watch_signs)
+    self.head_clear_m = 0.        # m driven, road runs reading the lights, since one published a head (watch_heads), 0 at the start
+    self.head_read_age = 0.       # s since a road run read the lights (watch_heads)
     self.rel_takeover = Takeover()  # the model's takeover predicate frame by frame, a go out or not (watch_release)
     self.rel_takeover_held = False  # ...held this frame
     self.reset()
@@ -924,6 +1054,9 @@ class TurnPilot:
     self.lead_held = False         # this frame: a close lead the scene corroborates, within LEAD_SEEN_HOLD_S (watch_lead)
     self.lead_still_s = 0.         # ...s since a vehicle track at it was last seen moving (QUEUE_MOVING_SPEED), while close
     self.missed_t = 0.             # turnMissed is held while this counts down
+    self.late_alert_t = 0.         # a begun turn at a signal too close to stop for: its alert while this counts down
+    self.alt_late_said: int | None = None  # the ladder's other turn's encounter (alt_scene_id) said late (alt_turn_late)...
+    self.alt_late_on = False       # ...handed back for it, no hold, until the driver takes over or the encounter is over
     self.notices = RouteNotices()  # the route's stop signs said at its start and 300 m before each it couldn't avoid (3.4)
     if not keep_turn:
       # maneuver ids never repeat: the scene kept through a fault holds ids (its commitment, a gas release, a carried hold)
@@ -935,6 +1068,7 @@ class TurnPilot:
         self.desires.carry_clear(old)
       self.skip = TurnSkip()
       self.dropped_id: int | None = None  # the maneuver in hand at a handback: not taken up again
+      self.hand_id: int | None = None  # the curb-side turn in hand as this frame began (in_hand_now): kept through a fault
       self.turn_cap_id: int | None = None  # ...whose turn speed cap stays, its desire having gone out
       self.turn_held_id: int | None = None  # ...whose turn desire was out: held to its clear, never cancelled
       self.skip_cap_id: int | None = None  # a dropped turn skipped on taking it up: its cap stays until it is passed
@@ -942,8 +1076,17 @@ class TurnPilot:
       self.keep_rerouted_t = 0.  # ...navd recomputed past it: the skip's chime and 'Rerouting' while this counts down
       self.veto_hold_id: int | None = None  # a turn vetoed standing at a hold: the hold keeps it until it lets go
       self.vetoed: VetoedTurn | None = None  # the turn the driver overruled, by its junction: skipped across a reroute
+      self.skipped_turn: SkippedTurn | None = None  # the last turn skipped, by its junction: one skip per junction (carry_skip)
+      self.adopt_watch: list | None = None  # [maneuver id, side, deg turned toward it] of a curb-side turn skipped tooLate (adopt_skipped)
+      self.late_id: int | None = None  # the route turn whose signal was refused as too close to stop for (signal_turn_late)...
+      self.late_frames = 0             # ...its frames in a row so
+      self.late_said_id: int | None = None  # ...the turn skipped or said for it
       self.line_deferred_id: int | None = None  # the maneuver last logged as waiting on a line veto's record (line_veto_defers)
       self.go_id: int | None = None  # the turn a hold let go of at standstill: checked for a miss and a stall
+      # a curb-side turn's go from further out than its pulse: (maneuver id, odo_m, m to its junction, the decider's), armed at
+      # its first pulse (watch_curb_go); ...the car has rolled since
+      self.curb_go: tuple[int, float, float, bool] | None = None
+      self.curb_go_rolled = False
       self.go_rolled = False         # ...the car has rolled since that go (STANDSTILL_SPEED or more)
       self.go_spent = False          # ...and then come to rest again short of the hold line: no longer under way (went)
       self.go_clock_again = False    # ...its release's no-move clock run again from that stand (go_spent): a bound, no relift
@@ -1001,11 +1144,52 @@ class TurnPilot:
     d, rf = self.desires, self.follower
     return d.maneuver_id == rf.maneuver_id and d.started and not d.done and d.side != 0 and rf.upcoming is not None
 
+  def in_hand_now(self) -> bool:
+    """The route's maneuver is a curb-side turn in hand (module docstring): a curb-side TURN (desire_timing.curb_side_turn,
+    this frame's right_hand_traffic as last set) under turn_speed.TURN_CAP_LEAD_M away by the nearest reading and still short of
+    its junction by it (as desire_timing's first pulse and turn_skip's crossing go), TurnPilot acting on it (or it kept in hand
+    through a fault: hand_id), not dropped at a handback, not the stop-sign ladder's other turn's (alt_route_id), not skipped, its desire not
+    done (a turn whose desire is out and not done is committed as well). Past its junction an unpulsed turn gets no first
+    pulse (desire_timing) and was skipped out loud as it crossed (its cap kept) or turned by the driver: held on to its pass,
+    a right the driver had turned was kept against navd's next step and skipped 'Too Fast to Turn' 6-8 m past its junction
+    (1d 5:07.8, 1e 7:18.4, replayed with the logged engagement)."""
+    d, rf = self.desires, self.follower
+    m, mid = rf.upcoming, rf.maneuver_id
+    if m is None or rf.arrived or not curb_side_turn(m, self.rht) or not 0. < rf.distance < TURN_CAP_LEAD_M:
+      return False
+    if not (self.acting or self.hand_id == mid) or mid in (self.dropped_id, self.alt_route_id):
+      return False
+    return not (self.skip.skipped and self.skip.maneuver_id == mid) and not (d.maneuver_id == mid and d.done)
+
+  def keep_hand_cap(self, hand_now: bool, rf) -> None:
+    """A curb-side turn in hand at this frame's start (hand_now; module docstring) skipped, for anything but too fast
+    (NO_CAP_SKIPS): its corner cap kept to its pass (skip_cap_id), as for a skipped turn whose desire went out."""
+    if hand_now and self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id and self.skip.reason not in NO_CAP_SKIPS:
+      self.skip_cap_id = rf.maneuver_id
+
+  def check_hand_dropped(self, hand, rf) -> None:
+    """The follower moved off a curb-side turn in hand this update (hand: its id, maneuver and distance last frame;
+    module docstring): never in silence. A new route (replaced) is navd's: one that doesn't turn there drops it as it should,
+    one that does is the same turn under a new id; so is the follower's re-baselining of one short outlier (the same junction
+    by the route: same_junction). Any other maneuver of the same route, the car short of the turn's junction, is the turn
+    lost: turnMissed for MISSED_HOLD_S (selfdrived's 'Turn Missed', 'Rerouting'; navd reroutes at once), logged. The follower
+    holds a turn in hand through every such case it can tell (route_follower.py: junction_hold), so this is the rail for
+    the rest."""
+    mid, old, near = hand
+    new = rf.upcoming
+    if rf.replaced or not near > 0. or (new is not None and same_junction(new, old)):
+      return
+    self.missed_t = MISSED_HOLD_S
+    cloudlog.event("turnpilot.turn_in_hand_dropped", error=True, maneuver_id=mid, junction=round(near, 1), type=old.type,
+                   modifier=old.modifier, new='' if new is None else f"{new.type} {new.modifier}", distance=round(rf.distance, 1),
+                   valid=rf.valid)
+
   def fault_track(self, sm) -> None:
     """A fault (plan()) with a turn committed: the frame's dead-reckoning and yaw, if update() didn't get to them, so the
     turn is over where it would have been (passed, or cleared at its angle). Frozen through the fault, the junction stayed
-    ahead of the car and the turn was held, and pulsed again, out on the road after it."""
-    if not self.turn_committed:
+    ahead of the car and the turn was held, and pulsed again, out on the road after it. A curb-side turn in hand too, which
+    the fault keeps (module docstring): its junction runs down with the car through the fault."""
+    if not (self.turn_committed or self.in_hand_now()):
       return
     try:
       cs = sm['carState']
@@ -1130,7 +1314,7 @@ class TurnPilot:
       self.stop_abort, self._stop_abort_t = reason, ABORT_HOLD_S
     if reason == 'turnedOff':
       self.hold_v = None
-    keep_turn = reason == 'fault' and self.turn_committed
+    keep_turn = reason == 'fault' and (self.turn_committed or self.in_hand_now())  # a curb-side turn in hand too (HEAD parity)
     if reason == 'fault':
       self.scene.fault(self.follower.maneuver_id)
     self.reset(detector=reason == 'turnedOff', keep_turn=keep_turn)
@@ -1176,9 +1360,20 @@ class TurnPilot:
       driver_signals = driver_signals_for(signal_status)
     self.watch_far(sm)
     rf = self.follower
+    # right_hand_traffic: which side's turns are curb-side, for make_maneuver's slight far-side turns (route_follower.py), as
+    # for DesireTiming's lead and TurnSkip's deadline below: under left-hand traffic a left is the curb-side turn (one pulse at
+    # 8 m) and a right the far-side, unprotected one; given to one and not the other, every right there was skipped tooLate
+    # a curb-side turn in hand (module docstring), by last frame's state as the commitment is: held through gaps in the route
+    # as a committed turn (route_follower.py: junction_hold), and never dropped in silence (check_hand_dropped)
+    self.hand_id = rf.maneuver_id if self.in_hand_now() else None
+    hand = (rf.maneuver_id, rf.upcoming, rf.distance) if self.hand_id is not None else None
+    self.record_skip()  # last frame's skip, by its junction, before navd's reroute can give it a new id
     rf.update(sm['navInstruction'], sm.updated['navInstruction'], sm.valid['navInstruction'], v_ego, DT_MDL,
-              committed=self.turn_committed or self.straight_fired)
+              committed=self.turn_committed or self.straight_fired, right_hand_traffic=right_hand_traffic,
+              junction_hold=self.hand_id is not None)
     self._rf_ticked = True
+    if hand is not None and rf.maneuver_id != hand[0]:
+      self.check_hand_dropped(hand, rf)
     upcoming = None if rf.arrived else rf.upcoming
     available = scene.available
     objects = list(scene.objects) if available else []
@@ -1202,7 +1397,8 @@ class TurnPilot:
       d = self.desires
       in_turn = d.maneuver_id == rf.maneuver_id and d.started and not d.done and d.side != 0
       self.dropped_id = rf.maneuver_id
-      self.turn_cap_id = rf.maneuver_id if d.started else None
+      # ...and a curb-side turn's in hand, its desire not out yet (module docstring: HEAD had it out from 40 m)
+      self.turn_cap_id = rf.maneuver_id if d.started or self.hand_id == rf.maneuver_id else None
       self.turn_held_id = rf.maneuver_id if in_turn else None
       if not in_turn:
         d.abandon()
@@ -1210,13 +1406,14 @@ class TurnPilot:
       self.lanes.cancel('handedBack')
       self.paint_rule_lanes.cancel('handedBack')
     elif acting and not self.acting and self.dropped_id is not None:
-      self._take_up_dropped(upcoming, rf, v_ego, right_hand_traffic)
+      self._take_up_dropped(upcoming, rf, v_ego, right_hand_traffic, lat_active)
     self.acting = acting
     self.check_straight(rf, v_ego, acting, said=self.check_missed(rf, v_ego, acting))
     self.check_keep_followed(rf)
     self.check_driven_left(rf, default_yaw_rate(cs, model), v_ego, acting)
     self.track_yaw(upcoming, rf, default_yaw_rate(cs, model), v_ego)
     self.track_yaw20(default_yaw_rate(cs, model), v_ego)
+    self.adopt_skipped(upcoming, rf, default_yaw_rate(cs, model), v_ego, acting)
 
     # the map's stop signs and signals: every frame, whatever the maneuver (a skipped turn keeps its stop). And the route's
     # unprotected turn while TurnPilot drives it: not skipped (too fast: skipped out loud and rerouted, never braked for at
@@ -1259,7 +1456,25 @@ class TurnPilot:
       else None
     # the route's turn junction, any side, skipped or not: a red the camera reads there stops the car at it though the map has
     # no signal for it (map_controls.camera_signal; 2026-11-06, a right rolled on red at an unmapped signal)
-    junction = (rf.maneuver_id, rf.distance) if upcoming is not None and upcoming.kind == TURN else None
+    # The third field says TurnPilot is taking the turn, or had it in hand when it handed back (not skipped, not replaced by
+    # the stop-sign ladder's other turn): only then does its signal stop the car for want of a green
+    # (map_controls.driving_turn). A turn it won't take goes straight through its signal on the model, as any straight one
+    # does; a camera red still stops it. So does one that comes up while TurnPilot isn't acting (handed back, never acted,
+    # paused on a model fallback for the drive): no desire will ever go for it.
+    # The turn in hand at a handback keeps it (review 2026-11-06): the stops in force stay through a handback, and a handback
+    # must not speed the car up (module docstring). On the car a detector handback keeps openpilot engaged SOFT_DISABLE_TIME
+    # (handback.py), and in that window round 1's field (`driving`) sped the car up through the light: a T-left whose desire
+    # was held out through a detectorStopped handback 25 m short of a mapped signal, nothing read, had its stop for want of a
+    # green dropped (signal_turn_dropped why=skipped) and drove the left through the unread signal at 4.3 m/s; a curb-side
+    # right (its one pulse not out until 8 m, so not even held) went through at 5.6 m/s, and the model may take a
+    # right-turn-only lane's right with no desire. At night that stop is the only thing holding a turn at a red (1e 8:20.4).
+    # Kept, it brings the car to its line and holds it there, its stand's handback said (TURN_UNSEEN_S); and the take-up finds
+    # the stop in force (mode SIGNAL_STOP, which signal_stop_lost passes over), never skipped signalStop for a stop the
+    # handback let lapse. Only the turn in hand: with every turn the route's (`not skipped` alone), a paused TurnPilot stood
+    # the car at every later route turn's signal of the drive, a take-control at each, for turns it would never pulse
+    taking = driving or (rf.maneuver_id == self.dropped_id and not skipped)
+    junction = (rf.maneuver_id, rf.distance, taking and not alt_replaced) if upcoming is not None and upcoming.kind == TURN \
+      else None
     mapd = self.map_update(sm, v_ego, cs.gasPressed, turn, left_cmd, release=sg.release, creep=sg.creep,
                            stop=StopCommand(sg.latch, sg.reason, sg.action), junction=junction)
     took_over = cs.gasPressed and not sm['carControl'].enabled  # the driver driving, never a go (module docstring)
@@ -1274,29 +1489,26 @@ class TurnPilot:
 
     # too fast to make the turn: skipped, so nothing below acts on it (no desire, no cap, no turn holds or lane changes)
     desire_out = self.desires.maneuver_id == rf.maneuver_id and self.desires.started
-    # an autonomous left the detector can't see far enough for (its R_req from the opposing road's mapped speed past
-    # TurnPilotLeftRangeM): never attempted, skipped as soon as it is the maneuver and rerouted (turn_skip.py)
-    # The far crop counts here while it is on (reading, or waiting for room or calibration), and once the left's stop is engaged
-    # nothing here skips it: a reach lost there (the far crop off for the drive) is the left's own handback at its line
-    # (unprotected_left: farOff), the car held, never a skip and a reroute from the line
-    # So is one whose opposing road isn't known straight out to that R_req (navd's maneuverOpposingStraightM: the band is straight
-    # on from our approach, skeptic G4), said by its own log line
-    # R_req is taken where the car may stand: LINE_D plus the junction's mapped stop line's setback, or ROUTE_REACH_MARGIN_M
-    # without one (BUILD_FINDINGS D4); the band straight on from our approach to that reach past where it stands
-    # The check is unprotected_left.route_range, the one navd's routing shares (routing/lefts.py): a route plans no left it fails
-    out_of_range = False
+    # an autonomous left is never skipped for its reach (Kellen, 2026-11-06: "never route around or skip a left for range"):
+    # driven to its hold line, it goes there on a gap the camera certifies or hands back loudly with the car held
+    # (unprotected_left: range, curve, night). Until then one whose R_req (route time's, LINE_D plus the mapped stop line's
+    # setback or ROUTE_REACH_MARGIN_M) was past TurnPilotLeftRangeM, or whose opposing road wasn't known straight out to it,
+    # was skipped here as soon as it was the maneuver (turn_skip: unprotectedRange) and navd rerouted: on the 11-06 drives
+    # five lefts 58-394 m out while engaged, three disengagements, the reroute loop of "kept wanting to turn left". One whose
+    # opposing road isn't known straight out to its reach is still logged (left_not_straight), as the handback its line will be
     if acting and self.auto_left == AUTO and unprotected_turn(upcoming, right_hand_traffic) and not engaged:
       rc = route_range(upcoming, self.map_controls.line_setback(rf.distance), self.left_reach_m(route=True), right_hand_traffic,
                        self.auto_left)
-      self.route_reach_m, out_of_range = rc.reach, rc.out_of_range
       if rc.bent and self.not_straight_id != rf.maneuver_id:
         self.not_straight_id = rf.maneuver_id
-        cloudlog.event("turnpilot.left_not_straight", error=True, r_req=round(rc.reach, 1), margin=round(rc.margin, 1),
-                       straight_m=round(float(upcoming.opposing_straight_m), 1), distance=round(rf.distance, 1))
+        cloudlog.event("turnpilot.left_not_straight", error=False, r_req=round(rc.reach, 1), margin=round(rc.margin, 1),
+                       straight_m=round(float(upcoming.opposing_straight_m), 1), distance=round(rf.distance, 1),
+                       note="opposing road not known straight to its reach: hands back at its line")
     self.carry_veto(upcoming, rf, v_ego)
+    self.carry_skip(upcoming, rf, v_ego)
     skip = self.skip.update(None if alt_replaced else upcoming, rf.distance, rf.maneuver_id, v_ego, desire_out, right_hand_traffic, lat_active,
                             rf.ahead, rf.ahead_distance, stop_d=self.map_controls.stop_ahead(), stop_infeasible=stop_infeasible,
-                            pulse_at_go=pulse_at_go, out_of_range=out_of_range)
+                            pulse_at_go=pulse_at_go, far=rf.distance + rf.junction_spread, last=rf.junction_latest)
     # a turn whose bearings turn the other way from its modifier: the side the car would signal and steer is in doubt,
     # so it is skipped out loud and rerouted as soon as it is the maneuver, in every mode (car_signals.py), never a
     # committed one
@@ -1304,6 +1516,16 @@ class TurnPilot:
        upcoming.bearing_side != upcoming.side and not skip.skipped and not desire_out:
       self.skip.skip(upcoming, rf.distance, rf.maneuver_id, v_ego, 'sideUncertain')
       skip = SkipState(True, False)
+    # a route turn whose junction's signal was first known too close to stop for: never driven through it in silence
+    # (SIGNAL_LATE_REASON's module comment); its first pulse waits while that is confirmed
+    late_wait = self.signal_turn_late(upcoming, rf, v_ego, acting and lat_active and not skip.skipped and not alt_replaced and
+                                      rf.maneuver_id != self.dropped_id, desire_out)
+    if self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id:
+      skip = SkipState(True, False)
+    # a curb-side turn in hand skipped (module docstring): its corner cap to its pass, as when its desire was out from 40 m
+    # (HEAD), never sped up into the junction it was slowing to turn at; a too-fast skip keeps none (no hard braking for a turn)
+    hand_now = self.hand_id is not None and self.hand_id == rf.maneuver_id
+    self.keep_hand_cap(hand_now, rf)
     maneuver = None if skip.skipped else upcoming
     # navd reroutes on it and selfdrived alerts: only while TurnPilot is driving the route (handback outranks it). A turn
     # just past a bend that will be skipped once it is the maneuver is announced now, before its junction (turn_skip.py)
@@ -1315,6 +1537,27 @@ class TurnPilot:
     cap_on = act_on if act_on is not None else (maneuver if rf.maneuver_id == self.turn_cap_id else None)
     if cap_on is None and rf.maneuver_id == self.skip_cap_id:
       cap_on = upcoming  # the skipped turn's pulse may have been taken before it was cleared: never sped up into it
+    gap_cap = self.skipped_cap(rf, acting, v_ego)  # ...nor through the gap navd's reroute makes before its junction (carry_skip)
+    # a junction turn the car has turned to its angle (DesireTiming's clear, turn_speed.turn_done_deg: the car straight on its
+    # exit road) keeps no corner cap: from there the model drives at its own pace (comma first). Held to the pass, the cap's
+    # floor (V_CORNER 4.3, a right's 3.0 m/s) bound 7.5 s of the 11-06 night drive (1e) out to d -6.5 to -8.8 m after the
+    # turn's desire had cleared at its angle, the model asking 1.12 m/s^2 over it on average. Only a turn turned that far,
+    # never one whose desire was cancelled (a veto's skip: its cap stays to its pass), abandoned at a handback or passed
+    # short of its angle; the post-go profile of a hold's go is its own (PostGo, below), unchanged. Only a turn turned there at
+    # its junction, its desire done with the car within ENTRY_M of it (clear_at, by the nearest reading) and the car there
+    # still: DesireTiming counts the yaw from the first pulse, so a bend toward the turn's side on the approach clears its
+    # desire early, and that turn keeps its corner cap to its pass (review 2026-11-06), as it would have before. On the 11-06
+    # drives the three rights turned to their angle cleared at d 0.6, -1.0 and -4.9 m; the one early clear, 1e's first left (a
+    # 40 m pulse at a crawl that took an opening on its way), at 21.8 m
+    d = self.desires
+    turned_here = self.clear_at is not None and self.clear_at[0] == rf.maneuver_id and self.clear_at[1] < ENTRY_M
+    if cap_on is not None and cap_on.kind == TURN and d.maneuver_id == rf.maneuver_id and d.started and d.done and \
+       d.turned_deg >= turn_done_deg(cap_on.angle_deg) and turned_here and rf.distance < ENTRY_M:
+      if self.cap_released_id != rf.maneuver_id:
+        self.cap_released_id = rf.maneuver_id
+        cloudlog.event("turnpilot.turn_cap_released", turned_deg=round(d.turned_deg, 1), angle_deg=round(cap_on.angle_deg, 1),
+                       distance=round(rf.distance, 1), v=round(v_ego, 2))
+      cap_on = None
     cap_d = rf.distance
 
     # the scene's holds only ever brake, so they keep the real maneuver through a handback, and through a veto's skip
@@ -1406,16 +1649,33 @@ class TurnPilot:
     desire = self.desires.update(d_on, d_dist, d_id, d_passed, v_ego, cs.steeringAngleDeg,
                                  not keep_why[LEFT], not keep_why[RIGHT], DT_MDL, default_yaw_rate(cs, model),
                                  lat_active=lat_active, replaced=d_replaced,
-                                 may_start=skip.feasible_now and not held and not hold_pulse, go=self.release_go,
+                                 may_start=skip.feasible_now and not held and not hold_pulse and not late_wait, go=self.release_go,
                                  holding=decision.should_stop or withdrawn or red_here,
                                  far=d_dist + (rf.junction_spread if d_id == rf.maneuver_id else 0.),
-                                 curvature=float(model.action.desiredCurvature))
+                                 last=rf.junction_latest if d_id == rf.maneuver_id else None,
+                                 curvature=float(model.action.desiredCurvature), right_hand_traffic=right_hand_traffic)
     if red_here and desire in (Desire.turnLeft, Desire.turnRight) and self.desires.turned_deg < TURN_STARTED_DEG:
       desire = Desire.none
     self._yaw_ticked = True
+    if self.say_refused_repeat(act_on, rf, v_ego):
+      plan.tooFastToTurn = True  # its pulse comes out of the model's queue from the next plan (CLEAR_DESIRE)
+    self.alt_turn_late(sg, d_on if d_id == ALT_MANEUVER_ID else None, v_ego, bool(sm['carControl'].enabled))
+    if self.desires.maneuver_id == rf.maneuver_id and self.desires.done and (self.clear_at is None or self.clear_at[0] != rf.maneuver_id):
+      self.clear_at = (rf.maneuver_id, rf.distance)  # where its desire went done: the cap release's turned_here, next frame
     self.keep_unsent(act_on, rf, v_ego, lat_active, keep_why, model, plan)
     d = self.desires
     turn_go = self.release_go and d.maneuver_id == rf.maneuver_id and d.started and d.side != 0 and not d.done and upcoming is not None
+    # a curb-side turn's go from a stand further out than its one pulse (watch_curb_go's: the route's curb-side turn acted on,
+    # its desire not out, its junction within STOP_BEFORE_TURN_M) is TurnPilot's go from a standstill all the same, whatever
+    # hold let it go: its no-move clock runs from the go as any such go's (the branch below), with the switch off too. A scene
+    # hold's (a walker's) let go 11 m out at a green had none (tests-go-red risk 1, 2026-11-06): the model holding, the car
+    # stood silent under 'Green (sim oracle)' until carStoppedTakeControl at 90 s, where HEAD (its desire out from 40 m, so the
+    # go was turn_go) handed back cantStartTakeControl at 3 s. Never certified with the switch off (review 2026-11-06: nothing
+    # rests on a turn whose desire isn't out), so the clock alone: NO_MOVE_S standing, nothing else holding it, then held and
+    # handed back loudly (no_move)
+    curb_release = self.release_go and not turn_go and act_on is not None and act_on is upcoming and \
+      curb_side_turn(upcoming, right_hand_traffic) and d.maneuver_id == rf.maneuver_id and not d.started and not d.done and \
+      0. < rf.distance <= STOP_BEFORE_TURN_M
     if turn_go:
       self.go_id, self.stall_s, self.go_rolled, self.go_spent, self.go_clock_again = rf.maneuver_id, 0., False, False, False
       self.go_in_junction = not self.go_at_line(rf.distance)
@@ -1426,10 +1686,10 @@ class TurnPilot:
         else:
           self.certify_go(sm, cs, available, objects, raw, decision, took_over, rf.distance, upcoming, right_hand_traffic)
     elif self.release_go and not decider_go and sm['carControl'].enabled and not took_over and \
-         (mapd.released_stopped or (self.always_drive_on and (self.left_now is None or self.left_now.state == 'off'))):
-      # any other go of TurnPilot's from a standstill (a map control let go, a straight road's too): the no-move clock (gap B).
-      # Under the switch a scene hold let go on a straight too, and certified as a turn's go is, at the junction it stands at
-      # (ALWAYS_DRIVE.md ST-12: release_distance)
+         (mapd.released_stopped or curb_release or (self.always_drive_on and (self.left_now is None or self.left_now.state == 'off'))):
+      # any other go of TurnPilot's from a standstill (a map control let go, a straight road's too, a curb-side turn's from
+      # further out than its pulse: curb_release): the no-move clock (gap B). Under the switch a scene hold let go on a straight
+      # too, and certified as a turn's go is, at the junction it stands at (ALWAYS_DRIVE.md ST-12: release_distance)
       self.go_wait_s, self.go_withdrawn, self.go_moved, self.go_lifted, self.go_in_junction = 0., False, False, False, False
       self.go_lead_s, self.go_left, self.rel_gap_s, self.go_straight = 0., False, 0., True
       self.no_move_limit, self.go_cert_id, self.go_clock_again = self.no_move_s, None, False
@@ -1437,7 +1697,8 @@ class TurnPilot:
       if self.always_drive_on:
         self.certify_go(sm, cs, available, objects, raw, decision, took_over, self.release_distance(rf.distance), None,
                         right_hand_traffic)
-    if self.post_go is not None and not turn_go:
+    armed = self.watch_curb_go(sm, rf, upcoming, act_on, v_ego, turn_go, desire_out, decider_go, took_over, right_hand_traffic)
+    if self.post_go is not None and not turn_go and not armed:
       self.post_go.update(v_ego, default_yaw_rate(cs, model), DT_MDL)
     if held and desire not in (Desire.none, CLEAR_DESIRE) and desire != self.last_desire:
       desire = Desire.none  # held: the desire out stays out, but never a new rising edge (a repeat pulse under way)
@@ -1459,16 +1720,33 @@ class TurnPilot:
     plan.laneChangeWait, plan.laneChangeWant = lc.wait, max(min(lc.want, 127), -128)
     plan.laneChangeHold = lc.hold  # held for the blind spot, or its release (LC-01, under the switch)
     committed = self.desires.maneuver_id == rf.maneuver_id and self.desires.started  # this frame's desire included
-    if (lc.unreachable or lc.blocked) and act_on is not None and not committed and not self.skip.skipped:
+    # a far-side (unprotected) left: LC-03 never skips nor reroutes it. Kellen, 2026-11-06: never route around a left; review
+    # 2026-11-07 (LN-5): 1e seg 5's left was skipped laneBlocked 60 m out and rerouted, and at night (no change offered on
+    # 16,798 plan frames of 1e) every left needing one would be. Kellen, 2026-11-07, "no, no handbacks": it is driven from the
+    # lane it is in, no handback, said once per maneuver (turnpilot.left_wrong_lane; the left's own left_reach carries it)
+    left_lane = act_on is not None and unprotected_turn(act_on, right_hand_traffic)
+    wrong_lane = lc.unreachable or lc.blocked
+    if wrong_lane and act_on is not None and not committed and not self.skip.skipped and left_lane:
+      if self.left_lane_id != rf.maneuver_id:
+        self.left_lane_id = rf.maneuver_id
+        cloudlog.event("turnpilot.left_wrong_lane", why='laneUnreachable' if lc.unreachable else 'laneBlocked',
+                       want=lc.want, distance=round(rf.distance, 1), v=round(v_ego, 2), maneuver_id=rf.maneuver_id)
+    elif wrong_lane and act_on is not None and not committed and not self.skip.skipped:
       # a map stop leaves no room to get into the maneuver's lane before it nor after its go, or the change it needs hadn't
       # gone by the window's end, the car placed in a lane it doesn't leave from (LC-03, lane_planner.py): skipped out loud
       # and rerouted (turn_skip.py), never a turn from the wrong lane. Never one whose desire went out: a committed turn goes on
       self.skip.skip(act_on, rf.distance, rf.maneuver_id, v_ego, 'laneUnreachable' if lc.unreachable else 'laneBlocked')
       plan.tooFastToTurn = True
+      self.keep_hand_cap(hand_now, rf)  # a curb-side turn in hand: its corner cap to its pass (module docstring)
     rule = lc if paint_rule else self.paint_rule_lanes.update(*lane_args, **lane_kw)  # its offers and aborts are never raised
     plan.laneChangePaintRule = rule.lane_change if rule.lane_change != LaneChange.none else rule.prompt
-    found = lane_mismatch(act_on, rf.distance, rf.through_lanes, rf.through_distance, lanes, v_ego, right_hand_traffic) \
-      if acting else LaneMismatch.none  # handback outranks it, and with the maneuver dropped it would misread the lane
+    # handback outranks it, and with the maneuver dropped it would misread the lane. The bay rule's judgement is the lane
+    # planner's own latch (lane_planner.BayLatch: bay.shut), as its desired_changes goes by it: a far-side turn's bay not open
+    # yet is never 'Wrong Lane' while the plan wants no change for it (2026-11-06 review: LEFT_BAY's list on a one-lane
+    # approach, the centre line yellow, said wrongLaneForTurn inside the window's end). Not the frame's paint: at night the
+    # centre line's raw read is unknown on about 41% of frames (1e), and the banner would flicker with it
+    found = lane_mismatch(act_on, rf.distance, rf.through_lanes, rf.through_distance, lanes, v_ego, right_hand_traffic,
+                          bay_shut=self.lanes.bay.shut) if acting else LaneMismatch.none
     if found == LaneMismatch.none and acting and self.lanes.lane_unknown:
       found = LaneMismatch.laneUnknown  # no change from a lane it can't place: said instead
     plan.laneMismatch = self.unknown_sound(self._lane_mismatch(found), rf.maneuver_id)
@@ -1477,9 +1755,20 @@ class TurnPilot:
     # once the step is dead-reckoned past, until navd moves on to the turn
     ahead_on = acting and rf.valid and rf.maneuver_id != self.dropped_id
     ahead_cap = turn_speed_cap(rf.ahead, rf.ahead_distance, v_ego, right_hand_traffic) if ahead_on else NO_SPEED_CAP
-    plan.speedCap = min(decision.speed_cap, turn_speed_cap(cap_on, cap_d, v_ego, right_hand_traffic), ahead_cap,
+    plan.speedCap = min(decision.speed_cap, turn_speed_cap(cap_on, cap_d, v_ego, right_hand_traffic), ahead_cap, gap_cap,
                         NO_SPEED_CAP if self.hold_v is None else self.hold_v)
     plan.shouldStop = decision.should_stop
+    # a go's post-go profile is its turn's: the turn skipped since (a signal veto, its lane, too late), the car goes straight on
+    # the model and the skip's own cap holds it (skip_cap_id: the corner cap to the pass where its desire was out or it was in
+    # hand). tests-signal's flag (2026-11-06): a T-left let go by a mid-block walker 27 m out, vetoed standing behind a lead
+    # 18 m out, was held to the graduated profile's 3.0 m/s (its v_start to 15 deg turned, not a right's floor) straight
+    # through the junction it no longer turned at, and on to 60 m from the go (POST_GO_MAX_M). Unvetoed, that 3.0 m/s is the
+    # profile's own for a T-left from a standstill, by design (graduated: every turn's go but the unprotected left's)
+    if self.post_go is not None and self.go_id is not None and self.go_id == rf.maneuver_id and self.skip.skipped and \
+       self.skip.maneuver_id == self.go_id:
+      cloudlog.event("turnpilot.post_go_dropped", why='skipped', reason=self.skip.reason, distance=round(rf.distance, 1),
+                     turned_deg=round(self.post_go.turned_deg, 1))
+      self.post_go = None
     if self.post_go is not None and self.post_go.over:
       self.post_go = None
     if self.post_go is not None:  # only ever lowers: a positive accel cap, a speed cap braking at -2.0 at most
@@ -1594,12 +1883,16 @@ class TurnPilot:
         # too close to pulse again: the hold's go is never the vetoed turn
         self.skip.skip(act_on, rf.distance, rf.maneuver_id, v_ego, ts.skip)
         plan.tooFastToTurn = True
-        self.vetoed = VetoedTurn(act_on, self.odo_m + rf.distance, ts.skip, rf.maneuver_id, committed, veto_odo=self.odo_m)
+        self.vetoed = VetoedTurn(act_on, self.odo_m + rf.distance, ts.skip, rf.maneuver_id, committed or hand_now, veto_odo=self.odo_m)
         if sg_withdrawable:
           self.sg_veto = ts.skip  # the decider withdraws its go on it next frame (stop_go._going)
         if committed:
           self.desires.cancel()
           self.skip_cap_id = rf.maneuver_id
+        else:
+          # a curb-side turn in hand (module docstring): its corner cap to its pass, as at HEAD with its desire out from 40 m
+          # (tests-signal probe1: from its walker hold line, 0.9 m/s standing to 7.5 m/s 5 s after the hold let go, straight on)
+          self.keep_hand_cap(hand_now, rf)
         if stopping:
           self.veto_hold_id = rf.maneuver_id
       else:
@@ -1618,13 +1911,22 @@ class TurnPilot:
       plan.skipReason = KEEP_REROUTED  # R7: navd recomputed past the fork the model drove: the skip's chime now (keep_unsent)
     self.keep_rerouted_t = max(self.keep_rerouted_t - DT_MDL, 0.)
     hazards_hold = ts.side != LaneChange.none and str(port.block) == 'hazard'
-    plan.reason = decision.reason or (TURN_MISSED_REASON if plan.turnMissed else "") or lane_reason or mapd.reason or \
-      (HAZARDS_REASON if hazards_hold else "") or (NO_JUNCTION_DATA_REASON if no_junction_data else "")
+    # the camera's light reader failing (map_controls.MapDecision.reader_line, S2 2026-11-07): its status line's words over
+    # the lane planner's for its whole spell, and over a hold's in its chimed onset where no map prompt or hard brake says them
+    reader_line = getattr(mapd, 'reader_line', '')
+    reader = mapd.reason if reader_line else ''
+    onset = reader if reader_line == 'onset' and not decision.hard_brake else ''
+    plan.reason = onset or decision.reason or (TURN_MISSED_REASON if plan.turnMissed else "") or reader or lane_reason or \
+      mapd.reason or (HAZARDS_REASON if hazards_hold else "") or (NO_JUNCTION_DATA_REASON if no_junction_data else "")
     fill_map_control(plan, mapd)
+    self.route_starting(sm, plan, v_ego)
     self.fill_left(plan, decision)
     self.fill_stop_go(plan, sg, decision)
     if mapd.driven and str(plan.controlPrompt) == mapd.prompt:
       plan.reason = mapd.driven  # a line crossed with no go: said for what it is (map_controls.Driven)
+    if self.late_alert_t > 0. and acting and str(plan.controlAlert) in ('none', 'cannotStopComfortably') + CONTROL_STATUS_ALERTS:
+      plan.controlAlert, plan.reason = 'cannotStopComfortably', SIGNAL_LATE_REASON  # a begun turn at a signal too close (signal_turn_late)
+    self.late_alert_t = max(self.late_alert_t - DT_MDL, 0.)
     # the stop sweep at every engaged stop and yield, engaged or not, at walking pace only, the left's own view first
     # (junction_watch.py), the stop-sign decider's too while it holds or launches; the watch logs the control's whole window
     # whatever the speed. From the decider's commit point the crossing cycle (stopSweepGo) at any speed
@@ -1637,12 +1939,6 @@ class TurnPilot:
     self.watch_junction(sweep, v_ego)
     if acting:
       self.go_cert.fill(plan)
-    if skip.skipped and self.skip.reason == 'unprotectedRange' and upcoming is not None:
-      ul = plan.unprotectedLeft
-      ul.state, ul.rangeM = 'skipped', float(self.left_range_m)
-      ul.vLimit = float(upcoming.opposing_speed or DEFAULT_OPPOSING_SPEED)
-      ul.rReq = float(self.route_reach_m or reach_at_line(upcoming.opposing_speed, upcoming.opposing_lanes or None, ROUTE_REACH_MARGIN_M))
-      ul.farRangeM, ul.farNeeded = float(self.left_far_range_m if self.far_live(route=True) else 0.), ul.rReq > self.left_range_m
     if self.far_off_t > 0. and str(plan.controlAlert) == 'none':  # the far crop off for the drive: said once, a status line
       plan.controlAlert = 'farViewOff'
     self.far_off_t = max(self.far_off_t - DT_MDL, 0.)
@@ -1679,6 +1975,8 @@ class TurnPilot:
       plan.controlPrompt, plan.reason = 'pedestrianWaitingTakeControl', PED_WAITING_REASON
     elif abandoned:
       plan.controlPrompt, plan.reason = 'turnAbandonedTakeControl', TURN_ABANDONED_REASON
+    elif self.alt_late_on:  # the ladder's other turn not started by its deadline (alt_turn_late): no hold in the junction
+      plan.controlPrompt, plan.reason = 'stopSignTakeControl', ALT_LATE_REASON
     elif wrong_side:
       plan.controlPrompt, plan.reason = 'wrongSideTakeControl', WRONG_SIDE_REASON
     elif off_route:
@@ -1810,6 +2108,71 @@ class TurnPilot:
       self.skip_cap_id = rf.maneuver_id
     v.maneuver_id = rf.maneuver_id
 
+  def record_skip(self) -> None:
+    """The route's turn or keep skipped last frame (TurnSkip, any reason but a signal veto's, which carry_veto keeps, and a
+    keep the model drives under the switch, KEEP_FOLLOW, which check_keep_followed follows), by its junction: SkippedTurn,
+    for carry_skip. Its cap kept to its pass is noted as it is kept (skip_cap_id). Forgotten once the car is SAME_TURN_M
+    past where the skip put the junction. Before this frame's route update."""
+    rf, sk, r = self.follower, self.skip, self.skipped_turn
+    if r is not None and self.odo_m > r.junction_odo + SAME_TURN_M:
+      self.skipped_turn = r = None
+    if not (rf.valid and rf.upcoming is not None and sk.skipped and sk.maneuver_id == rf.maneuver_id) or \
+       sk.reason in ('driverSignal', 'hazards', 'signalLost', KEEP_FOLLOW):
+      return
+    capped = self.skip_cap_id == rf.maneuver_id
+    if r is not None and r.maneuver_id == rf.maneuver_id:
+      r.capped = r.capped or capped
+      return
+    self.skipped_turn = SkippedTurn(rf.upcoming, self.odo_m + rf.distance, sk.reason, rf.maneuver_id, rf.route_count, capped,
+                                    junction_conf_odo=self.odo_m + max(rf.distance, rf.junction_latest))
+
+  def carry_skip(self, upcoming, rf, v_ego: float) -> None:
+    """One skip per junction (curb-turn-timing risk 8, 2026-11-06): the turn or keep skipped (record_skip) stays skipped at its
+    junction under a new route's id, as a vetoed one does (carry_veto): navd's reroute before the junction (an ETA drift, the
+    stop-avoidance re-run, off the route for a fix) that turns the same way there again is a new maneuver id, and taken up
+    fresh it was judged again: skipped a second time, said again, its corner cap dropped with the old route (a right skipped
+    tooLate 8.7 m short of its junction on one short reading, rerouted through a separator: 'Too Fast to Turn' again at 2.9
+    m, the car sped from 3.1 to 4.6 m/s into the junction), or taken after all where 'Too Fast to Turn, Rerouting' was just
+    said. A new route only (navd's routeCount on): navd moving on early along the same route, a short outlier's
+    re-baselining (route_follower ADVANCE_NEAR_M), is no reroute, and its true readings take the turn as they may
+    (test_turnpilotd's 'retake'). The same junction: same_junction, and navd's first reading of the reroute's turn (its
+    follower span, which a reroute's same junction carries) within SKIP_SAME_M of the skipped junction's span (SkippedTurn:
+    its nearest reading to its latest confirmed one). Judged once, at that first sight: a reroute's turn found another
+    junction is never carried after (judged_id), so a later reading of the next right on, one short outlier, never brings it
+    in. Not SAME_TURN_M about the nearest (the 2026-11-06
+    review of the carry): one short reading put the junction 9 m short at the skip, and navd's usual reroute after a skipped
+    right, the next right on along the street, its bearings the same, 20 and 30 m past it was carried as the skipped one and
+    skipped out loud too, 'Too Fast to Turn' on to its pass and navd rerouting again. (No cutoff once the car is past the
+    skipped junction: a turn inside the window then is under a curb-side pulse's 8 m ahead, which TurnSkip would skip too,
+    said a second time.) Skipped for the same reason (tooFastToTurn, skipReason as said), logged once
+    (turnpilot.skip_carried, never a second turnpilot_turn_skipped), its cap kept if the skipped turn's was. Before this
+    frame's TurnSkip.update, which then keeps it."""
+    r = self.skipped_turn
+    if r is None or upcoming is None or upcoming.kind not in (TURN, KEEP) or rf.maneuver_id in (r.maneuver_id, r.judged_id) or \
+       rf.route_count == r.route_count or (self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id):
+      return
+    r.judged_id = rf.maneuver_id  # judged at its first sight, once
+    near, far = self.odo_m + rf.distance, self.odo_m + rf.distance + rf.junction_spread
+    if not same_junction(upcoming, r.maneuver) or near > r.junction_conf_odo + SKIP_SAME_M or far < r.junction_odo - SKIP_SAME_M:
+      cloudlog.event("turnpilot.skip_not_carried", skipped_id=r.maneuver_id, maneuver_id=rf.maneuver_id, distance=round(rf.distance, 1),
+                     off_m=round(near - r.junction_conf_odo, 1), same=same_junction(upcoming, r.maneuver))
+      return
+    cloudlog.event("turnpilot.skip_carried", error=True, why=r.reason, skipped_id=r.maneuver_id, maneuver_id=rf.maneuver_id,
+                   distance=round(rf.distance, 1), off_m=round(near - r.junction_conf_odo, 1), capped=r.capped)
+    self.skip.skip(upcoming, rf.distance, rf.maneuver_id, v_ego, r.reason, log=False)
+    if r.capped:
+      self.skip_cap_id = rf.maneuver_id
+    r.maneuver_id, r.route_count = rf.maneuver_id, rf.route_count
+
+  def skipped_cap(self, rf, acting: bool, v_ego: float) -> float:
+    """m/s: the skipped turn's corner cap (SkippedTurn.capped) by the odometer while navd has no route under the car (a
+    reroute's separator, before its first instruction), up to PASSED_DIST_M past where the skip put its junction: a skip that
+    kept its cap to its pass is never sped up into the junction through the gap (carry_skip). NO_SPEED_CAP otherwise."""
+    r = self.skipped_turn
+    if r is None or not r.capped or not acting or rf.valid or self.odo_m > r.junction_odo + PASSED_DIST_M:
+      return NO_SPEED_CAP
+    return turn_speed_cap(r.maneuver, r.junction_odo - self.odo_m, v_ego, self.rht)
+
   def line_veto_defers(self, rf) -> bool:
     """A veto's record at the unprotected left's line (VetoedTurn.line) is live, the car still short of that junction where
     the veto found it, and the route's maneuver now is another turn (navd's reroute to a left further on: never the vetoed
@@ -1833,9 +2196,11 @@ class TurnPilot:
     or its move on to the next step if the model took the route's branch anyway), logged once, never sent after (a late
     swerve), its cap kept to its pass (a car slowing for it never speeds up into it). Never one whose desire went out, nor with
     openpilot not steering (no desire goes then: the driver steers).
-    Under TurnPilotAlwaysDrive (ALWAYS_DRIVE.md R7) the model drives the fork: skipped all the same, navd's skip mark and its
-    cap as above, but said as a status line (skipReason KEEP_FOLLOW), never the chime and 'Rerouting' while the model may yet
-    take the branch; those come only if navd recomputes past it (check_keep_followed)."""
+    Under TurnPilotAlwaysDrive (ALWAYS_DRIVE.md R7) the model drives the fork: skipped all the same, navd's skip mark as above,
+    but said as a status line (skipReason KEEP_FOLLOW), never the chime and 'Rerouting' while the model may yet take the branch;
+    those come only if navd recomputes past it (check_keep_followed). It keeps no cap: the model drives the fork at its own pace
+    (comma first). Kept to the pass, the keep's corner cap bound 8.1 s (1e) and 16.7 s (1d) of the 11-06 drives past the skip,
+    the model asking +0.3 to +1.0 m/s^2 over it on a road it was driving straight on."""
     d = self.desires
     reason = why.get(keep.side, '') if keep is not None and keep.kind == KEEP else ''
     if not reason or not lat_active or self.skip.skipped or d.maneuver_id != rf.maneuver_id or d.started or d.done or \
@@ -1843,7 +2208,8 @@ class TurnPilot:
       return
     follow = self.always_drive_on
     self.skip.skip(keep, rf.distance, rf.maneuver_id, v_ego, KEEP_FOLLOW if follow else reason)
-    self.skip_cap_id = rf.maneuver_id
+    if not follow:
+      self.skip_cap_id = rf.maneuver_id  # the plain skip: its corner cap to its pass (a car slowing for it never sped up into it)
     self.keep_follow_id = rf.maneuver_id if follow else None
     plan.tooFastToTurn = True
     cloudlog.event("turnpilot.keep_not_sent", error=True, side='left' if keep.side == LEFT else 'right', reason=reason, follow=follow,
@@ -1863,6 +2229,220 @@ class TurnPilot:
     if rf.replaced:
       self.keep_rerouted_t = MISSED_HOLD_S
       cloudlog.event("turnpilot.keep_rerouted", error=True, maneuver_id=k)
+
+  def watch_curb_go(self, sm, rf, upcoming, act_on, v_ego: float, turn_go: bool, desire_out: bool, decider_go: bool,
+                    took_over: bool, right_hand_traffic: bool) -> bool:
+    """A curb-side turn's go from a stand further out than its one pulse (desire_timing: CURB_TURN_PULSE_M, CURB_GO_SLACK_M)
+    is the turn's go all the same: its bookkeeping is armed at its first pulse, as a go with its pulse would have it at its
+    hold's let-go (turn_go). Since the rights' one 8 m pulse (2026-11-06), TurnPilot's go from a line more than 9 m out (a
+    signal's 10-15 m from navd's node, the sim's 10 m, a stop sign's 13 m) sent no desire, so turn_go was false and go_id, the
+    post-go profile and the stall watch after a go were never armed for it; check_missed, which needs go_id, never said "Turn
+    Missed" for a right from a red the model didn't take (R8b's watch, check_straight, catches one only inside its
+    curvature bound on every frame), and a right that was taken got none of its post-go caps (a go at the hold line's: 1.0
+    m/s^2, 3.0 m/s to 15 deg, 4.3 by 45). Remembered at the go (curb_go: TurnPilot's go, openpilot engaged and nobody's foot,
+    the route's curb-side turn in hand with its desire not out, its junction within STOP_BEFORE_TURN_M: the turn's own stop);
+    forgotten on another maneuver, a handback, its turn done or skipped, the car STOP_BEFORE_TURN_M on from the go, or come to
+    rest again after rolling (the next go is a new one). Its first pulse while remembered arms go_id and the post-go profile
+    from there (start_post_go), the go's no-move clock as it stood (it ran from the go; the decider's own watchdog has none),
+    never a certification: the car is rolling by then, its lift for a standstill. Returns whether it armed this frame (the
+    profile's first frame, not yet updated)."""
+    d, cg = self.desires, self.curb_go
+    if self.release_go and not turn_go:
+      if sm['carControl'].enabled and not took_over and act_on is not None and act_on is upcoming and \
+         curb_side_turn(upcoming, right_hand_traffic) and d.maneuver_id == rf.maneuver_id and not d.started and not d.done and \
+         0. < rf.distance <= STOP_BEFORE_TURN_M:
+        self.curb_go, self.curb_go_rolled = (rf.maneuver_id, self.odo_m, rf.distance, decider_go), False
+        cloudlog.event("turnpilot.curb_go", distance=round(rf.distance, 1), pulse_m=CURB_TURN_PULSE_M, decider=decider_go)
+        return False
+    if cg is None:
+      return False
+    if v_ego >= STANDSTILL_SPEED:
+      self.curb_go_rolled = True
+    if cg[0] != rf.maneuver_id or not self.acting or not sm['carControl'].enabled or d.maneuver_id != rf.maneuver_id or \
+       d.done or self.skip.skipped or self.odo_m - cg[1] > STOP_BEFORE_TURN_M or \
+       (self.curb_go_rolled and v_ego < STANDSTILL_SPEED):
+      self.curb_go = None
+      return False
+    if desire_out or not d.started or d.side == 0 or d.done or upcoming is None:
+      return False
+    self.curb_go = None
+    wait = self.go_wait_s
+    self.go_id, self.stall_s, self.go_rolled, self.go_spent, self.go_clock_again = rf.maneuver_id, 0., self.curb_go_rolled, False, False
+    self.go_in_junction = not self.go_at_line(cg[2])  # where the car stood at the go
+    self.start_post_go(upcoming, rf.distance, d.turned_deg, right_hand_traffic)
+    self.go_wait_s = None if cg[3] else wait
+    cloudlog.event("turnpilot.curb_go_armed", go_distance=round(cg[2], 1), distance=round(rf.distance, 1),
+                   travelled=round(self.odo_m - cg[1], 1), v=round(v_ego, 2), decider=cg[3])
+    return True
+
+  def signal_refused(self, upcoming, rf, v_ego: float):
+    """The signal of the route turn's junction map_controls refused to stop the turn at for being too close (its own record:
+    _signal_turns' signal_turn_late of a mapped signal or the camera's own, (key, maneuver id); _camera_signal's
+    camera_signal_late of a head seen there with no signal made), the stop still not made at MAP_DECEL_MAX or gentler, with
+    nothing else to let the car through it: the control (or 'camera' for the heads), else None. Not marked the turn's since,
+    neither held nor stopping already (a red's, a yellow's, the turn's own: SIGNAL_STOP), not gone through (committed on a
+    yellow, crossed faster than COMMIT_SPEED), no steady green letting it go (turn_go) nor an accepted one (release_light), its
+    line ahead (LATCH_PAST_M). The camera's heads with a camera green read there now aren't. Never the unprotected left's: its
+    own hold needs a green there (map_controls.turn_light). signal_stop_lost is the take-up's, on map_controls' rule; this is
+    its own refusal, read on every frame, so a signal 30 m back read once in the junction's window (route_follower's jitter) is
+    no turn's (JunctionLine.most) and never skips it."""
+    if upcoming is None or upcoming.kind != TURN or unprotected_turn(upcoming, self.rht):
+      return None
+    mc = self.map_controls
+    if mc.release_light(rf.distance) == 'green':
+      return None
+    late = mc.turn_late_key(rf.maneuver_id)
+    if late is not None:
+      for c in mc.all_controls():
+        st = c.state
+        if c.key != late or c.kind != 'signal' or c.held or c.d <= -LATCH_PAST_M or st is None or st.done or \
+           st.turn_id == rf.maneuver_id or st.mode in (SIGNAL_STOP, SIGNAL_COMMITTED) or st.crossed_v > COMMIT_SPEED or st.turn_go:
+          continue
+        if needed(v_ego, c.d) < MAP_DECEL_MAX - 1e-9:
+          return c
+    if mc.head_late(rf.maneuver_id):
+      cs, line = mc.camera_signal, rf.distance - CONTROL_LINE_M
+      _, camera = mc.junction_lights(rf.distance)
+      if (cs is None or cs.key[1] != rf.maneuver_id) and line > -LATCH_PAST_M and 'green' not in camera and \
+         needed(v_ego, line) < MAP_DECEL_MAX - 1e-9:
+        return 'camera'
+    return None
+
+  def signal_turn_late(self, upcoming, rf, v_ego: float, judge: bool, desire_out: bool) -> bool:
+    """A route turn TurnPilot drives (judge: acting, openpilot steering, not skipped, not the ladder's other turn's, not
+    dropped at a handback) whose junction's signal map_controls refused as too close to stop for (signal_refused) is never
+    driven through that unread signal with nothing said (turnpilotd-followups' open item, 2026-11-06: refused as
+    signal_turn_late and then turned through the light with nothing on the plan; signal_stop_lost ran only at a take-up).
+    Reachable on the car where the turn's signal is first known inside the stopping distance: a reroute's turn at a mapped
+    signal 30-40 m ahead at speed (needed -2.25 m/s^2 at 12 m/s 32 m from the line), a junction re-read so a set-back signal
+    first counts as the turn's late, a camera head first seen at the turn's unmapped junction in its second run too close.
+    After SKIP_CONFIRM_FRAMES of it in a row (one dead-reckoning jump nearer doesn't skip a turn: as TurnSkip's tooFast), once
+    a maneuver: a turn not begun (its desire not out, the car under TURN_STARTED_DEG into it) is skipped out loud (signalStop:
+    "Can't Stop for the Light", navd reroutes; a curb-side one in hand keeps its corner cap, keep_hand_cap); one begun is
+    finished, never cancelled mid-turn, and said (SIGNAL_LATE_ALERT_S of cannotStopComfortably, SIGNAL_LATE_REASON), never a
+    hard brake for it. Returns whether the turn's first pulse waits: its lateness confirmed or not yet, the turn not begun."""
+    c = self.signal_refused(upcoming, rf, v_ego) if judge else None
+    if c is None:
+      self.late_frames = 0
+      return False
+    if self.late_id != rf.maneuver_id:
+      self.late_id, self.late_frames = rf.maneuver_id, 0
+    self.late_frames += 1
+    d = self.desires
+    mine = d.maneuver_id == rf.maneuver_id
+    begun = (desire_out and d.side != 0) or (mine and max(d.turned_deg, d.approach_deg) >= TURN_STARTED_DEG)
+    if self.late_said_id == rf.maneuver_id:
+      return False
+    if self.late_frames < SKIP_CONFIRM_FRAMES:
+      return not begun
+    self.late_said_id = rf.maneuver_id
+    d_line = rf.distance - CONTROL_LINE_M if c == 'camera' else c.d
+    cloudlog.event("turnpilot.signal_turn_late_driven" if begun else "turnpilot.signal_turn_late_skipped", error=True,
+                   key=['camera', rf.maneuver_id] if c == 'camera' else list(c.key), maneuver=rf.maneuver_id, d=round(d_line, 1),
+                   junction=round(rf.distance, 1), v=round(v_ego, 2), needed=round(needed(v_ego, d_line), 2), desire_out=desire_out,
+                   turned_deg=round(d.turned_deg if mine else 0., 1))
+    if begun:
+      self.late_alert_t = SIGNAL_LATE_ALERT_S
+    else:
+      self.skip.skip(upcoming, rf.distance, rf.maneuver_id, v_ego, 'signalStop')
+    return False
+
+  def route_starting(self, sm, plan, v_ego: float) -> None:
+    """navd's route waiting on its start direction check (navInstruction.routeHeadingUnverified on its latest message, which
+    is invalid while it waits; ROUTE_STARTS_REASON's module comment): the off-route words (OFF_ROUTE_REASON, the switch's
+    OFF_ROUTE_DRIVE_REASON) and their alert (offRouteStopsUnknown, the switch's mapControlsUnavailable after its onset) are
+    the route starting instead, a status line with no sound. The off-route cap is the map's and stays: nothing ahead is known.
+    A navd before the field reads False (getattr): as before."""
+    ni = sm['navInstruction']
+    if sm.valid['navInstruction'] or not bool(getattr(ni, 'routeHeadingUnverified', False)) or \
+       plan.reason not in (OFF_ROUTE_REASON, OFF_ROUTE_DRIVE_REASON):
+      return
+    plan.reason = ROUTE_STARTS_REASON if v_ego < STANDSTILL_SPEED else ROUTE_STARTING_REASON
+    if str(plan.controlAlert) in ('offRouteStopsUnknown', 'mapControlsUnavailable'):
+      plan.controlAlert = 'mapControlsUnavailableSilent'
+
+  def adopt_skipped(self, upcoming, rf, yaw_rate: float, v_ego: float, acting: bool) -> None:
+    """A curb-side turn skipped tooLate with no pulse out (turn_skip: its pulse waiting on a steer-in it never followed by its
+    deadline, its nearest crossing the junction) that the car then turns TURN_STARTED_DEG into before the follower's pass (the
+    model taking it after all) is the car's turn again, the model's own (curb-turn-timing risk 1, 2026-11-06): skipped, its
+    maneuver was None to the scene and the desire, so the walker hold on its crosswalk was gone mid-turn, and nothing watched
+    the turn (its clear at its angle, R8's and R8b's watches, the stall's); its corner cap a tooLate skip of a turn in hand
+    already keeps (keep_hand_cap). Adopted: TurnSkip no longer skips it (adopt), DesireTiming takes it as the model's own
+    (adopt: started, own, never pulsed into), the skip's record dropped (no reroute carries it: carry_skip). The car's turn
+    toward it counts from the model's steer-in on its approach (DesireTiming.approach_deg at the skip), moving
+    (YAW_MIN_SPEED). The skip was said ("Too Fast to Turn"); navd's skipped_turn_taken finds the car on the turn's road."""
+    sk, d, w = self.skip, self.desires, self.adopt_watch
+    if w is not None and (w[0] != rf.maneuver_id or upcoming is None or rf.passed or not (sk.skipped and sk.maneuver_id == w[0])):
+      self.adopt_watch = w = None
+    if w is None:
+      if acting and upcoming is not None and sk.skipped and sk.maneuver_id == rf.maneuver_id and sk.reason == 'tooLate' and \
+         curb_side_turn(upcoming, self.rht) and d.maneuver_id == rf.maneuver_id and not d.started and not d.done:
+        self.adopt_watch = w = [rf.maneuver_id, upcoming.side, d.approach_deg]
+      return
+    if v_ego >= YAW_MIN_SPEED:
+      w[2] += math.degrees(yaw_rate * DT_MDL) * w[1]
+    if w[2] < TURN_STARTED_DEG or not acting:
+      return
+    cloudlog.event("turnpilot.skipped_turn_adopted", maneuver_id=rf.maneuver_id, turned_deg=round(w[2], 1), distance=round(rf.distance, 1),
+                   v=round(v_ego, 2))
+    sk.adopt(rf.maneuver_id)
+    d.adopt(upcoming, rf.maneuver_id, w[2])
+    self._yaw_id, self.approach_yaw_deg = rf.maneuver_id, w[2]  # the scene's road frame turned as far as the car is (track_yaw)
+    if self.skipped_turn is not None and self.skipped_turn.maneuver_id == rf.maneuver_id:
+      self.skipped_turn = None
+    self.adopt_watch = None
+
+  def alt_turn_late(self, sg, alt, v_ego: float, enabled: bool) -> None:
+    """The stop-sign ladder's other turn (alt: its synthesized maneuver while DesireTiming has it, ALT_MANEUVER_ID), a
+    curb-side one, rolling past its one pulse's deadline (CURB_FIRST_PULSE_M to the decider's junction, as turn_skip's for a
+    route turn) with no pulse out, or with its re-engage repeat refused (desire_timing repeat_refused): never driven on in
+    silence (curb-turn-timing risk 5, 2026-11-06). TurnSkip never judges that turn (the route's isn't the car's there), so a
+    right the model steered into at a turn's scale from 9 m with the car not following got no pulse and no word, and the car
+    rolled straight across a junction the decider had cleared for the right's conflicts alone. Said once an encounter: its
+    pulse, if out, cleared from the model's queue; while the decider's go can still be withdrawn short of dEdgeMin (going,
+    withdrawable) it is told as a veto is (sg_veto: the decider withdraws the go and hands back with the car held, H3); past
+    that, handed back with no hold (stopSignTakeControl, ALT_LATE_REASON: never held in the junction), until the driver
+    takes over or the encounter is over."""
+    if self.alt_late_on:
+      self.alt_late_on = enabled and sg.alt is not None and sg.state not in ('off', 'done')
+    d = self.desires
+    if alt is None or not sg.acting or sg.alt is None or sg.state in ('off', 'done') or d.maneuver_id != ALT_MANEUVER_ID or \
+       not curb_side_turn(alt, self.rht) or self.alt_late_said == self.alt_scene_id or d.done:
+      return
+    to_node = float(sg.alt['toNode']) - sg.position_m
+    late = (not d.started and v_ego >= STANDSTILL_SPEED and to_node < first_pulse_by(alt, CURB_FIRST_PULSE_M)) or \
+      (d.started and d.repeat_refused)
+    if not late:
+      return
+    self.alt_late_said = self.alt_scene_id
+    withdraw = sg.state == 'going' and sg.withdrawable
+    cloudlog.event("turnpilot.alt_turn_late", error=True, maneuver=str(sg.alt['maneuver']), to_node=round(to_node, 1), v=round(v_ego, 2),
+                   started=d.started, state=sg.state, withdraw=withdraw)
+    if d.started:
+      d.cancel()
+    if withdraw:
+      self.sg_veto = 'tooLate'  # the decider withdraws its go short of dEdgeMin and hands back, held (stop_go H3)
+    else:
+      self.alt_late_on = enabled
+
+  def say_refused_repeat(self, act_on, rf, v_ego: float) -> bool:
+    """The route's curb-side turn TurnPilot acts on (act_on) had its re-engage repeat refused this frame or before
+    (desire_timing: repeat_refused, past its first pulse's bounds once openpilot steered again; 2026-11-06 review: with no
+    handback and no take-up a started right was pulsed again at 1.95 m and 0.45 m): never silent. Skipped out loud
+    (desireDropped: 'Too Fast to Turn', navd reroutes), its pulse cleared from the model's queue (CLEAR_DESIRE) and its corner
+    cap kept to its pass, as _take_up_dropped does for the same turn after a handback. Never for a blip in openpilot's steering
+    (or one of turnpilotd's faults), nor for a car turning on its first pulse: DesireTiming spares those (REPEAT_BLIP_FRAMES,
+    OWN_FOLLOW_DEG: repeat_refused stays off), the first pulse still in the model's queue driving the turn on, its cap and
+    crosswalk hold kept with the maneuver (2026-11-06 review: one fault frame 4.5-2.5 m out skipped a right 0-12.9 degrees in
+    and cleared its pulse mid-entry). Whether it was skipped now."""
+    d = self.desires
+    if not d.repeat_refused or act_on is None or d.maneuver_id != rf.maneuver_id or d.done or \
+       (self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id):
+      return False
+    self.skip.skip(act_on, rf.distance, rf.maneuver_id, v_ego, 'desireDropped')
+    d.cancel()
+    self.skip_cap_id = rf.maneuver_id
+    return True
 
   def check_missed(self, rf, v_ego: float, acting: bool) -> bool:
     """The turn a hold let go of at standstill is passed (the follower's pass, this update) having turned under
@@ -1913,6 +2493,17 @@ class TurnPilot:
       return
     if live and straight_inside(w.deg, curvature):
       return
+    if live and not w.fired and -TURN_MISSED_AWAY_DEG < w.deg < MISSED_TURN_DEG and -w.side * curvature >= TURN_MISSED_CURV:
+      # the model steering INTO the turn (desiredCurvature positive right, side positive left), the car still inside the deg
+      # bounds: no break. It latched the watch off on the first steer-in frame, so a committed right the model steered into
+      # and then drove dead straight past its junction under MISSED_TURN_DEG was said by nothing (curb-turn-timing risk 3,
+      # 2026-11-06: turn_abandoned needs the model steering away, check_missed a go). A turn the car takes breaks the deg bound
+      # (MISSED_TURN_DEG) or is cleared at its angle, and the pass is PASSED_DIST_M past the furthest reading of a committed
+      # turn's junction (route_follower), where a right taken (a 12.6 m arc on an 8 m radius) is far past 15 deg: so at the
+      # pass the turn is judged by the deg bounds alone (check_straight). Steering away past TURN_MISSED_CURV is R8's
+      # (turn_abandoned), and after R8b's fire any break is R8's handback, as before
+      w.steered = True
+      return
     w.ok = False
     if w.fired and live:
       self.abandoned_id = rf.maneuver_id
@@ -1921,7 +2512,8 @@ class TurnPilot:
 
   def check_straight(self, rf, v_ego: float, acting: bool, said: bool = False) -> None:
     """R8b at the follower's pass (module constants TURN_MISSED_*): a route turn whose watch held both bounds on every
-    frame, from its hold line with its desire still out and R8 never fired (unconditional: R9's detector catching more), or
+    frame (the curvature's but on frames the model steered into the turn: watch_straight, StraightDrive.steered), from its
+    hold line with its desire still out and R8 never fired (unconditional: R9's detector catching more), or
     from R8b's fire under TurnPilotAlwaysDrive, was driven straight through: missed (turnMissed: "Turn Missed",
     "Rerouting", navd's reroute at once), its post-go profile dropped, and a desire still out comes out of the model's queue
     on this very frame (CLEAR_DESIRE: WF-11). said: check_missed said it already (a go's turn): cleared, not said again.
@@ -1939,7 +2531,7 @@ class TurnPilot:
     if not said:
       self.missed_t = MISSED_HOLD_S
       self.post_go = None
-      cloudlog.event("turnpilot_turn_missed", error=True, straight=True, fired=w.fired, turned_deg=round(w.deg, 1),
+      cloudlog.event("turnpilot_turn_missed", error=True, straight=True, fired=w.fired, steered=w.steered, turned_deg=round(w.deg, 1),
                      v_ego=round(v_ego, 2), distance=round(rf.distance, 1))
 
   def check_driven_left(self, rf, yaw_rate: float, v_ego: float, acting: bool) -> None:
@@ -2004,6 +2596,73 @@ class TurnPilot:
                      state=str(self.left_now.state), why=str(self.left_now.why))
       d.withdraw()
 
+  @property
+  def dark(self) -> bool:
+    """After dark: the road camera's exposure says so, or the sun is under 0 deg (watch_dark, darkness.DarkFilter.is_dark)."""
+    return self.dark_filter.is_dark
+
+  def watch_sun(self) -> None:
+    """The sun's elevation at the car into the dark filter every SUN_EVERY_S (darkness.py: under 0 deg it is dark whatever the
+    exposure reads): sun_fix's last fix on decider_clock's wall clock (the stop-sign go's, so the two agree on dusk). Either
+    missing is no sun (the exposure's verdict alone, fail closed as before). A failure here is logged (rate-limited) and is no
+    sun, never a stop of the exposure's filter."""
+    self.sun_t += DT_MDL
+    if self.sun_t < SUN_EVERY_S - 1e-6:
+      return
+    self.sun_t = 0.
+    try:
+      el = sun_elevation(self.sun_fix(), self.decider_clock())
+    except Exception:
+      log_error("turnpilotd.watch_sun_failed")
+      el = None
+    self.dark_filter.set_sun(el)
+
+  def watch_dark(self, sm) -> None:
+    """The road camera's exposure (narrowRoadCameraState.exposureValPercent) through the dark filter on every frame it came,
+    whatever TurnPilot is doing (the road's state, ready for the next left: plan_inner, before anything else), its light count
+    only while the car moves faster than LEAVE_MOVING_V (carState.vEgo: a lit forecourt or a bright junction stand never makes
+    a night drive light; darkness.py). No message this frame keeps the state (darkness.py). The sun as well (watch_sun).
+    Logged, since darkness.py's thresholds are one comma four's (os04c10) and have to be checked from the logs (review
+    2026-11-06: a drive dark all the way logged nothing at all, nor did a day drive stuck dark): turnpilot.dark with the
+    drive's first reading (initial, the state it starts in) and on every change of the exposure's verdict, with the reading
+    and the sensor; every EXPOSURE_LOG_S turnpilot.exposure, the exposure's verdict and the readings since the last one (min,
+    median, max, how many, the seconds of them the car was moving over LEAVE_MOVING_V), from the first reading on (no camera,
+    no summaries); and turnpilot.dark_why, the state the left reads (dark: the exposure's verdict or the sun's) and what makes
+    it so (the exposure, the sun, both, or light) on each change of that or of the sun being known, from the first reading or
+    the first sun, camera or not (review LN-3, 2026-11-07: a sun that turned it dark or let it go is said once, its elevation
+    with it; never a position; nothing read and no sun, nothing said)."""
+    data = getattr(sm, 'data', {})
+    if self.exposure_seen:
+      self.exposure_log_t += DT_MDL
+      if self.exposure_log_t >= EXPOSURE_LOG_S - 1e-6:
+        win = sorted(self.exposure_win)
+        cloudlog.event("turnpilot.exposure", dark=self.dark_filter.dark, n=len(win), sensor=self.exposure_sensor,
+                       ev_min=round(win[0], 3) if win else None, ev_p50=round(win[len(win) // 2], 3) if win else None,
+                       ev_max=round(win[-1], 3) if win else None, moving_s=round(self.exposure_moving_s, 1))
+        self.exposure_win, self.exposure_log_t, self.exposure_moving_s = [], 0., 0.
+    self.watch_sun()
+    if 'narrowRoadCameraState' in data and sm.updated['narrowRoadCameraState']:
+      cam = sm['narrowRoadCameraState']
+      ev, sensor, was = float(cam.exposureValPercent), str(cam.sensor), self.dark_filter.dark
+      moving = 'carState' in data and float(sm['carState'].vEgo) > LEAVE_MOVING_V
+      self.dark_filter.update(ev, DT_MDL, moving)
+      if math.isfinite(ev):
+        self.exposure_ev, self.exposure_sensor = ev, sensor
+        self.exposure_win.append(ev)
+        self.exposure_moving_s += DT_MDL if moving else 0.
+      if not self.exposure_seen:
+        self.exposure_seen = True
+        cloudlog.event("turnpilot.dark", initial=True, dark=self.dark_filter.dark, ev=round(ev, 2) if math.isfinite(ev) else None,
+                       sensor=sensor)
+      elif self.dark_filter.dark != was:
+        cloudlog.event("turnpilot.dark", dark=self.dark_filter.dark, ev=round(ev, 2), sensor=sensor)
+    f = self.dark_filter
+    why = (f.why, f.sun_el is not None)
+    if why != self.dark_why_said and (self.exposure_seen or f.sun_el is not None):  # nothing read, nothing said (the dark start)
+      self.dark_why_said = why
+      cloudlog.event("turnpilot.dark_why", dark=f.is_dark, why=f.why, sun_el=round(f.sun_el, 1) if f.sun_el is not None else None,
+                     ev=round(self.exposure_ev, 2) if self.exposure_ev is not None else None)
+
   def watch_far(self, sm) -> None:
     """The far crop's state from the full pass's latest farStatus: read, or off for the drive (said once, farViewOff,
     and logged). Its shadow heads are logged on every change of what they read (never acted on). The side views going off
@@ -2016,6 +2675,7 @@ class TurnPilot:
         self.far_off_t = FAR_OFF_ALERT_S
         cloudlog.event("turnpilot.far_view_off", error=True, was=self.far_status)
       self.far_status, self.far_status_age = status, 0.
+      self.native_status = str(sm['turnpilotDetections'].nativeStatus)
       side = str(sm['turnpilotDetections'].sideViewStatus)
       if side == 'disabled' and self.side_status != 'disabled':
         self.side_off_t = SIDE_OFF_ALERT_S
@@ -2034,10 +2694,24 @@ class TurnPilot:
     without room at its line starts its window over and, past STALE_UNDECIDED_S, is its farStale fault, never farOff)."""
     return self.far_status in (FAR_ON if route else ('read',)) and self.far_status_age <= FAR_STATUS_STALE_S
 
+  def left_ranges(self) -> tuple[float, float]:
+    """(range_m, far_range_m) an unprotected left is judged on (LeftInput; review 2026-11-07, LN-2). The full pass's:
+    TurnPilotLeftRangeM, never past what the letterboxed pass can box at all (full_pass_range_m, FULL_PASS_RANGE_M on the car,
+    about 98 m). The far slot's, which judges the band past it on its own runs (far_needed: one covering it every FAR_FRESH_S
+    or the window starts over, farStale at the line without them, whatever farStatus says): TurnPilotLeftRangeM while the native
+    schedule fills the slot (nativeStatus full or strip, fresh: Kellen's 210 m is pixel arithmetic for the native frame,
+    maps/defaults), else the far crop's measured TurnPilotLeftFarRangeM (0 unmeasured: none). Until 2026-11-07 range_m was
+    TurnPilotLeftRangeM itself, 210 m on the car, where native never ran and the far crop went off (11-06, both drives): a
+    35 mph left (R_req 182.6 m at its line) was certified on the full pass's runs alone, which box nothing past ~100 m, the
+    far slot never asked for. Now with neither it hands back at its line ('farUnmeasured'), the car held, never skipped."""
+    native = self.native_status in NATIVE_ON and self.far_status_age <= FAR_STATUS_STALE_S
+    full = min(self.left_range_m, self.full_pass_range_m)
+    return full, max(self.left_far_range_m, self.left_range_m) if native else self.left_far_range_m
+
   def left_reach_m(self, route: bool = False) -> float:
-    """The range an unprotected left's R_req may reach: the full pass's proven range, or the far crop's while it reads (route:
-    while it is on, far_live) and the full pass's is measured (the far crop covers the band only past it)."""
-    return left_reach(self.left_range_m, self.left_far_range_m, self.far_live(route))
+    """The range an unprotected left's R_req may reach: the full pass's (left_ranges), or the far slot's while it reads (route:
+    while it is on, far_live) and the full pass's is measured (the far slot covers the band only past it)."""
+    return left_reach(*self.left_ranges(), self.far_live(route))
 
   def unprotected_left(self, turn, upcoming, rf, v_ego: float, acting: bool, objects, raw, raw_far=None,
                        enabled: bool = True) -> LeftCommand | None:
@@ -2064,19 +2738,28 @@ class TurnPilot:
     # its line crossed with no go (map_controls.Driven: the latch let go as the driver's, last frame's): the left is done,
     # never a go nor a pulse of a left nobody checked (owner decision (b))
     driven = self.map_controls.driven
+    range_m, far_range_m = self.left_ranges()  # the full pass's and the far slot's (review 2026-11-07, LN-2)
     inp = LeftInput(mode, rf.maneuver_id, upcoming.side, rf.distance, v_ego, held or stray, raw, objects, self.approach_yaw_deg,
-                    upcoming.opposing_speed or None, upcoming.opposing_lanes or None, self.left_range_m,
+                    upcoming.opposing_speed or None, upcoming.opposing_lanes or None, range_m,
                     scene_clear=scene.junction is None and not scene.carried and scene.person_front is None,
                     junction_uncertain=rf.junction_spread > UNCERTAIN_M or stray,
                     go_withdrawn=self.go_withdrawn, committed=rf.maneuver_id == scene.committed_id,
                     released=rf.maneuver_id == scene.released_id,
                     spread_m=rf.junction_spread, other_hold=stop_d is not None and stop_d <= rf.distance + PROTECT_PAST_M,
-                    light=self.map_controls.turn_light(int(turn[0]), turn[1]), far=raw_far, far_range_m=self.left_far_range_m,
+                    light=self.map_controls.turn_light(int(turn[0]), turn[1]), far=raw_far, far_range_m=far_range_m,
                     far_live=self.far_live(route=True),  # on: a spell without room is waited through on its runs' freshness
                     straight_m=float(upcoming.opposing_straight_m),
                     signal_lit=self.signal_out.signal_lit, signal_veto=self.signal_out.left_veto,
-                    enabled=enabled, driven=driven is not None and driven.maneuver_id == rf.maneuver_id)
+                    enabled=enabled, driven=driven is not None and driven.maneuver_id == rf.maneuver_id, dark=self.dark,
+                    wrong_lane=self.left_lane_id == rf.maneuver_id)  # LC-03's verdict, last frame's (update())
     d = self.left_now = self.left.update(inp, DT_MDL)
+    if self.dark and d.state not in ('off', 'approach') and self.night_left_id != rf.maneuver_id:
+      # a left judged after dark (no cap since 2026-11-07: unprotected_left's left_reach says how far the band reached), with
+      # what made it dark: the state, the last exposure reading (None: none read this drive, the car's dark start), its sensor
+      self.night_left_id = rf.maneuver_id
+      cloudlog.event("turnpilot.left_night", dark=self.dark, ev=round(self.exposure_ev, 2) if self.exposure_ev is not None else None,
+                     sensor=self.exposure_sensor, r_req=round(d.r_req, 1), range_m=round(range_m, 1),
+                     distance=round(rf.distance, 1), maneuver_id=rf.maneuver_id)
     return LeftCommand(mode, d.go, d.creep_m, d.state == 'undecided', d.reason, crossed=d.crossed)
 
   def observe_runs(self, tracker) -> None:
@@ -2115,7 +2798,10 @@ class TurnPilot:
     if d.state != 'off':
       plan.farCropBearing = float(d.far_bearing)  # up the oncoming approach while the left is in hand
     ul = plan.unprotectedLeft
-    ul.state, ul.tReq, ul.rReq, ul.vLimit, ul.rangeM = d.state, float(d.t_req), float(d.r_req), float(d.v_limit), float(self.left_range_m)
+    # rangeM: the full pass's range the left is judged on (left_ranges: never past FULL_PASS_RANGE_M), by day or after dark
+    # (no night cap since 2026-11-07); farRangeM the far slot's, while it is on
+    go_range = self.left_ranges()[0]
+    ul.state, ul.tReq, ul.rReq, ul.vLimit, ul.rangeM = d.state, float(d.t_req), float(d.r_req), float(d.v_limit), float(go_range)
     ul.clearS, ul.blockers, ul.viewBlocked, ul.crosswalkClear = float(d.clear_s), min(d.blockers, 255), d.view_blocked, d.crosswalk_clear
     ul.creepM, ul.why = float(d.creep_m), d.why or d.verdict
     ul.farRangeM, ul.farNeeded, ul.farBlockers = float(d.far_range_m), d.far_needed, min(d.far_blockers, 255)
@@ -2560,15 +3246,19 @@ class TurnPilot:
   def unsignalized_why(self, distance: float) -> str:
     """Why release_light's 'none' at the junction distance m ahead can't stand for no signal there under the switch, '' if
     it can (ALWAYS_DRIVE.md LEFT-20 and section 4.5's conditions): a map control within STOPPED_CONTROL_M of the car or the
-    junction, the camera's shadow reader not live or reading a head of any colour, or a stop-sign box seen in a forward run
-    in the last SIGN_CLEAR_M driven (watch_signs; or the camera's signs not read)."""
+    junction, after dark ('dark'), the camera's shadow reader not live, reading a governing head, or having read a head of any
+    colour or bearing in the last HEAD_CLEAR_M driven (watch_heads), or a stop-sign box seen in a forward run in the last
+    SIGN_CLEAR_M driven (watch_signs; or the camera's signs not read). It gates section 4.5's unstick and the release at a
+    junction navd maps with no signal (release_blocked) alike."""
     mc = self.map_controls
     controls = [c for c in list(mc.tracker.controls.values()) + [mc.turn] if c is not None]
     if any(abs(c.d) < STOPPED_CONTROL_M or abs(c.d - distance) < STOPPED_CONTROL_M for c in controls):
       return 'control'
+    if self.dark:
+      return 'dark'  # the camera can't vouch for no signal at night (HEAD_CLEAR_M): 1d 6:34's heads unread for 188 m
     camera = mc._lights.camera  # the camera's reader as the last map update had it (None: off, stale or not read)
-    if camera is None or camera.status != 'read' or camera.heads:
-      return 'camera'
+    if camera is None or camera.status != 'read' or camera.heads or self.head_clear_m < HEAD_CLEAR_M - 1e-6:
+      return 'camera'  # ...or a head of any colour or bearing read in the last HEAD_CLEAR_M driven (watch_heads)
     if not self.camera_signs or self.sign_clear_m < SIGN_CLEAR_M - 1e-6:
       return 'stopSign'
     return ''
@@ -2586,6 +3276,26 @@ class TurnPilot:
       self.sign_clear_m += v_ego * DT_MDL
     elif v_ego >= STANDSTILL_SPEED:
       self.sign_clear_m = 0.
+
+  def watch_heads(self, sm, v_ego: float) -> None:
+    """unsignalized_why's head memory, every frame (module constants, HEAD_CLEAR_M): the metres driven since a road run's light
+    read (turnpilotDetections, lightStatus read, source camera) published a head of any colour or bearing (all of them, before
+    camera_light_input keeps the governing ones), 0 on such a read or on a frame driven at STANDSTILL_SPEED or more with no
+    road read for CAMERA_STALE_S (road the reader didn't see never clears it); a frame standing adds nothing, and a head read
+    at the stand resets it as on the approach."""
+    data = getattr(sm, 'data', {})
+    self.head_read_age += DT_MDL
+    if 'turnpilotDetections' in data and sm.updated['turnpilotDetections']:
+      td = sm['turnpilotDetections']
+      if str(td.lightStatus) == 'read' and str(td.lights.source) == 'camera':
+        self.head_read_age = 0.
+        if len(td.lights.lights):
+          self.head_clear_m = 0.
+          return
+    if self.head_read_age <= CAMERA_STALE_S + 1e-6:
+      self.head_clear_m += v_ego * DT_MDL
+    elif v_ego >= STANDSTILL_SPEED:
+      self.head_clear_m = 0.
 
   def withdraw_go(self, sm, cs, acting: bool, available: bool, objects, raw, decision, took_over: bool, distance: float) -> None:
     """The certified go out withdrawn this frame, plannerd's lift with it, once anything it was certified on stops holding
@@ -2837,7 +3547,11 @@ class TurnPilot:
       return
     m, rf = self.follower.upcoming, self.follower
     far_turn = m is not None and far_side_turn(m, right_hand_traffic) and rf.distance < STOPPED_CONTROL_M
-    if self.go_blocked(sm, cs, available, objects, raw, decision, took_over) or far_turn or \
+    # ...nor a curb-side turn in hand within STOPPED_CONTROL_M (module docstring: a model stand at its line, an unmapped red or a
+    # walker the detector doesn't score, its crosswalk at the corner, never lifted at HEAD with its desire out from 40 m; probe
+    # wf3 probe_unstick: lifted at 10.0 s 9-25 m short once its pulse moved to 8 m)
+    curb_turn = self.in_hand_now() and rf.distance < STOPPED_CONTROL_M
+    if self.go_blocked(sm, cs, available, objects, raw, decision, took_over) or far_turn or curb_turn or \
        (self.left_now is not None and self.left_now.state != 'off') or self.unstick_veto() or \
        self.rel_lift_m > RELEASE_LIFT_M - RELIFT_MIN_M:
       return
@@ -3079,7 +3793,7 @@ class TurnPilot:
       return False
     self.gps_lost_on = self.gps_lost_said = True
     cloudlog.event("turnpilot.gps_lost", error=True, gps_lost_s=round(ni.gpsLostS, 1), uncertainty_m=round(ni.positionUncertainty, 1),
-                   committed=self.turn_committed, maneuver_id=self.follower.maneuver_id)
+                   committed=self.turn_committed, in_hand=self.in_hand_now(), maneuver_id=self.follower.maneuver_id)
     return True
 
   def route_shape_turn(self, right: float) -> float | None:
@@ -3217,7 +3931,7 @@ class TurnPilot:
       return None
     return cam
 
-  def _take_up_dropped(self, upcoming, rf, v_ego: float, right_hand_traffic: bool = True) -> None:
+  def _take_up_dropped(self, upcoming, rf, v_ego: float, right_hand_traffic: bool = True, lat_active: bool = True) -> None:
     """TurnPilot acts again after a handback (the detector is back): the maneuver dropped at the handback is never left
     half driven, capped with no desire and no alert. A held turn desire still out (openpilot stayed engaged) drives on,
     as does a turn the driver has already started and one a standstill re-armed (it pulses again as the car pulls away);
@@ -3226,9 +3940,26 @@ class TurnPilot:
     lead: the first pulse may still be in the model's queue). Otherwise it is skipped out loud (tooFastToTurn, navd
     reroutes), and as its first pulse may still be in the model's queue, that is cleared (CLEAR_DESIRE) and the turn's
     cap kept until it is passed: the model never turns from it at speed, and the car never speeds up into the junction.
-    So is an unprotected turn whose stop at the line never engaged and can't be made now: never crossed blind."""
+    So is an unprotected turn whose stop at the line never engaged and can't be made now: never crossed blind.
+    A curb-side turn's one pulse is its entry pulse (desire_timing: CURB_TURN_PULSE_M, 8 m), so its fresh pulse goes while
+    the car is still short of that pulse's own deadline (turn_skip.CURB_FIRST_PULSE_M, 5 m, by the reading the pulse goes by:
+    desire_timing.pulse_distance), never only from ENTRY_M out: a right whose 8 m pulse was dropped was always skipped there
+    (desireDropped), with 3 m of road left to take it from. That room is judged here, so it holds only with openpilot
+    steering now (lat_active): one taken up while it isn't is skipped as before (desireDropped, its desire cleared, its cap
+    kept). Its fresh pulse would go whenever openpilot steers again (review 2026-11-06: taken up at 6.5 m with openpilot
+    steering again at 4.0, 2.0 and 0.5 m, a fresh turnRight went at 3.95, 1.95 and 0.45 m, the late pulse into the exit
+    road's far lanes the deadline is for); DesireTiming now bounds that re-engage repeat as the first pulse is, with or without
+    a handback, and say_refused_repeat skips it out loud where it refuses (desireDropped). And a turn
+    at a signal (signal_stop_lost: a signal of its junction,
+    PROTECT_BEFORE_M before it to PROTECT_PAST_M past it, neither held nor the turn's stop already) whose stop at its line can't
+    be made at MAP_DECEL_MAX now, with no green read for it, is skipped out loud as the left is (signalStop: navd reroutes), its
+    desire cleared and its cap kept, never re-marked as late with nothing said (map_controls: signal_turn_late) and turned
+    through a light nobody read; one the car has turned TURN_STARTED_DEG into is finished. A signal known through the handback
+    keeps its stop for want of a green through it (update()'s junction: the turn in hand at a handback is still TurnPilot's),
+    so that is a signal first known in the handback already too close (a tile loaded late) or never marked for being too close."""
     d = self.desires
     dropped = self.dropped_id == rf.maneuver_id and d.maneuver_id == rf.maneuver_id
+    capped = self.turn_cap_id == rf.maneuver_id  # its cap kept through the handback (its desire out, or a curb-side turn in hand)
     self.dropped_id = self.turn_cap_id = self.turn_held_id = None
     if not dropped or upcoming is None:
       return
@@ -3242,15 +3973,55 @@ class TurnPilot:
       d.cancel()
       self.skip_cap_id = rf.maneuver_id
       return
+    # (a turn whose desire never went out was abandoned at the handback, done until resume() below: not over)
+    over = (d.started and d.done) or d.turned_deg >= TURN_STARTED_DEG or (self.skip.skipped and self.skip.maneuver_id == rf.maneuver_id)
+    lost = None if unprotected_turn(upcoming, right_hand_traffic) or over else self.signal_stop_lost(upcoming, rf, v_ego)
+    if lost is not None:
+      cloudlog.event("turnpilot.signal_turn_taken_up_late", error=True, key=list(lost.key), maneuver=rf.maneuver_id, d=round(lost.d, 1),
+                     junction=round(rf.distance, 1), v=round(v_ego, 2), needed=round(needed(v_ego, lost.d), 2), started=d.started)
+      self.skip.skip(upcoming, rf.distance, rf.maneuver_id, v_ego, 'signalStop')
+      if d.started and d.side != 0:
+        d.cancel()  # its pulse may still be in the model's queue: cleared, and its cap kept to its pass
+        self.skip_cap_id = rf.maneuver_id
+      elif capped:
+        self.skip_cap_id = rf.maneuver_id  # a curb-side turn in hand at the handback: the cap it kept, to its pass
+      return
     if d.started and d.side != 0 and not d.done and d.held_off and d.turned_deg < TURN_STARTED_DEG:
-      curb_side = (upcoming.side == LEFT) != right_hand_traffic
-      if rf.distance >= ENTRY_M and can_make_turn(v_ego, rf.distance, upcoming.angle_deg, curb_side):
+      curb_side = curb_side_turn(upcoming, right_hand_traffic)
+      far, last = rf.distance + rf.junction_spread, rf.junction_latest
+      room = (lat_active and rf.distance > 0. and
+              pulse_distance(upcoming, rf.distance, far, right_hand_traffic, last) >= CURB_FIRST_PULSE_M) \
+        if curb_side else rf.distance >= ENTRY_M
+      if room and can_make_turn(v_ego, pulse_distance(upcoming, rf.distance, far, right_hand_traffic, last), upcoming.angle_deg,
+                                curb_side):
         return  # pulses again on its own, as on re-engaging
       self.skip.skip(upcoming, rf.distance, rf.maneuver_id, v_ego, 'desireDropped')
       d.cancel()
       self.skip_cap_id = rf.maneuver_id
     else:
       d.resume()
+
+  def signal_stop_lost(self, upcoming, rf, v_ego: float):
+    """The signal of the route turn's junction whose stop at its line can no longer be made at MAP_DECEL_MAX, with nothing
+    else to let the car through it (_take_up_dropped), or None: a signal (mapped, or the camera's at an unmapped junction)
+    PROTECT_BEFORE_M before the junction to PROTECT_PAST_M past it, its line still ahead (LATCH_PAST_M), neither held nor
+    stopping already (a red's, a yellow's, the turn's own: SIGNAL_STOP), not gone through (committed on a yellow, or crossed
+    faster than COMMIT_SPEED), no green letting it go (a steady green's turn_go, or one an accepted source reads: release_light).
+    map_controls' own marking rule (_signal_turns' late check), read here because a turn taken up there is turnpilotd's."""
+    if upcoming is None or upcoming.kind != TURN:
+      return None
+    if self.map_controls.release_light(rf.distance) == 'green':
+      return None
+    for c in self.map_controls.all_controls():
+      if c.kind != 'signal' or c.held or not rf.distance - PROTECT_BEFORE_M <= c.d <= rf.distance + PROTECT_PAST_M or \
+         c.d <= -LATCH_PAST_M:
+        continue
+      st = c.state
+      if st is not None and (st.done or st.mode in (SIGNAL_STOP, SIGNAL_COMMITTED) or st.crossed_v > COMMIT_SPEED or st.turn_go):
+        continue
+      if needed(v_ego, c.d) < MAP_DECEL_MAX - 1e-9:
+        return c
+    return None
 
   def plan(self, sm, scene, enabled: bool, shadow: bool, *args, long_control: bool | None, disengage_on_accel: bool = True,
            **kwargs):
@@ -3294,6 +4065,15 @@ class TurnPilot:
     except Exception:
       log_error("turnpilotd.watch_signs_failed")
       self.sign_clear_m = 0.  # nothing known of the road behind: as a sign seen
+    try:
+      self.watch_heads(sm, max(float(sm['carState'].vEgo), 0.))
+    except Exception:
+      log_error("turnpilotd.watch_heads_failed")
+      self.head_clear_m = 0.  # nothing known of the road behind: as a head seen
+    try:
+      self.watch_dark(sm)
+    except Exception:
+      log_error("turnpilotd.watch_dark_failed")  # the state as it was: on the car dark from the start (dark_filter_for)
     if enabled and long_control and not disengage_on_accel:
       self.fault_track(sm)
       self.stop('fault')
@@ -3318,7 +4098,7 @@ class TurnPilot:
       log_error("turnpilotd.plan_failed")
       self.fault_track(sm)
       self.stop('fault')
-      if self.turn_committed and self.hold_v is None:
+      if (self.turn_committed or self.in_hand_now()) and self.hold_v is None:
         try:  # the turn's cap is gone with the plan: the car is held to its speed (module docstring), not sped up in the turn
           if sm['carControl'].latActive:
             self.hold_v = max(sm['carState'].vEgo, 0.)
@@ -3711,7 +4491,7 @@ def main():
                            ignore_alive=optional, ignore_avg_freq=optional, ignore_valid=optional, frequency=PLAN_FREQ)
   drain = DetectionDrain(messaging.sub_sock(DetectionDrain.SERVICE, conflate=False))
   rk = Ratekeeper(1. / DT_MDL, print_delay_threshold=None)
-  tp = TurnPilot()
+  tp = TurnPilot()  # dark on the car (fail closed), light in the sim: TurnPilot's own (dark_filter_for)
   tracker = None
   tracker_b: TrackerB | None = None  # TurnPilotFarPeds: tracker B beside tracker A (scene/tracker_b.py)
   far_peds = b_failed = False        # ...b_failed: B raised, dropped for the drive

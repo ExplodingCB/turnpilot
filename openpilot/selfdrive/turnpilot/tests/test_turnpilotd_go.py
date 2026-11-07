@@ -8,14 +8,17 @@ from collections import deque
 from openpilot.cereal import messaging
 from openpilot.common.params import UnknownKeyName
 from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.turnpilot.desire_timing import CURB_FIRST_PULSE_M, CURB_GO_SLACK_M, CURB_TURN_PULSE_M
 from openpilot.selfdrive.turnpilot.go_override import GO_ACCEL, GO_CLEAR_M, GO_WINDOW_S, TAKEOVER_S
 from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
+from openpilot.selfdrive.turnpilot.map_controls import TURN_LIGHT_REASON
 from openpilot.selfdrive.turnpilot.scene.tracker import RawBox, RawFrame
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, ONCOMING_ENTRY_M, SceneDecision
 from openpilot.selfdrive.turnpilot.tests.synthetic import model_v2
 from openpilot.selfdrive.turnpilot.tests.test_go_override import WARM_S, new_planner, planner_sm
-from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, WALKER, WALKER_CLEAR, FakeParams, Sim, go_from_a_red, go_from_the_hold,
-                                                                 junction_of, oracle_lights, stand, stop_at, walker_stops_the_car)
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, WALKER, WALKER_CLEAR, FakeParams, Sim, curb_turn_from_a_red,
+                                                                 go_from_a_red, go_from_the_hold, junction_of, oracle_lights, stand, stop_at,
+                                                                 walker_stops_the_car)
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import JUNCTION, LEFT_25, TEST_RANGE_M, V_25, drive, left_sim, road_runs, run_objects
 from openpilot.selfdrive.turnpilot.turnpilotd import (GO_OVERRIDE_DEFAULT, LEFT_LAUNCH_SPEED, LEFT_LIFT_ROOM_M, NO_MOVE_REASON, NO_MOVE_S,
                                                        RELEASE_UNSIGNALIZED, STALL_PROMPT_S, go_override_for)
@@ -61,9 +64,10 @@ def test_the_go_ends_on_the_models_takeover():
 
 def test_the_go_ends_at_its_window():
   # in the junction (never withdrawn for not moving, G3): the model holds 3 s, the go's window ends it there. A curb-side
-  # turn's: a far-side one released in the junction is never certified (skeptic G5)
+  # turn's: a far-side one released in the junction is never certified (skeptic G5). The right's go from its 10 m line sends
+  # no desire, its one pulse goes rolling 8 m out (2026-11-06: curb_turn_from_a_red), and the car turns from there
   sim = Sim(RIGHT_AT_A_SIGNAL, controls=[(290., 'signal')])
-  go_from_a_red(sim, desire=Desire.turnRight)
+  curb_turn_from_a_red(sim)
   while sim.tp.desires.turned_deg < 45.:
     sim.step(engaged=True, yaw_rate=-0.3 if sim.v > 0.5 else 0.)
     assert sim.t < 200.
@@ -413,15 +417,19 @@ def camera_reads(state, s_head=308.):
   return lights
 
 
-def walker_clears_at_the_models_red(lights=None, controls=((290., 'signal'),)):
-  """Skeptic G5 probe: RIGHT_AT_A_SIGNAL on red, the model alone holding the car at its line (no source TurnPilot accepts
-  reads the red), plannerd in the loop with the model holding for the red throughout. A walker crosses in front (they have
-  the walk while the car has the red): TurnPilot's in-path hold. They clear: the hold lets go at a standstill. lights: the
-  Sim's lights function, or None. Returns (sim, the plans from the walker clearing, the car's s there)."""
-  sim = Sim(RIGHT_AT_A_SIGNAL, controls=list(controls))
+def walker_clears_at_the_models_red(lights=None, controls=((290., 'signal'),), maneuvers=RIGHT_AT_A_SIGNAL, s_stop=289.,
+                                    always_drive=False):
+  """Skeptic G5 probe: RIGHT_AT_A_SIGNAL (or maneuvers) on red, the model stopping the car at s_stop, its line (no source
+  TurnPilot accepts need read the red), plannerd in the loop with the model holding for the red throughout. A walker crosses
+  in front (they have the walk while the car has the red): TurnPilot's in-path hold. They clear: the hold lets go at a
+  standstill, unless another of TurnPilot's holds stands (a route turn's stop for want of a green at its signal, 2026-11-06:
+  map_controls' turn_stop). lights: the Sim's lights function, or None. always_drive: TurnPilotAlwaysDrive (the car ships it
+  on, params_keys.h; the Sim's default is off). Returns (sim, the plans from the walker clearing, the car's s there)."""
+  sim = Sim(maneuvers, controls=list(controls))
+  sim.tp.always_drive = always_drive
   sim.go_taps = False
   sim.lights = lights
-  sim.accel = model_stops_at(289.)
+  sim.accel = model_stops_at(s_stop)
   while not (sim.v < 0.05 and sim.s > 280.):
     sim.step(engaged=True)
     assert sim.t < 80.
@@ -437,36 +445,95 @@ def test_a_walker_clearing_at_a_red_only_the_model_holds_for_is_no_certified_go(
   red-light hold: the car rolled 3.0 m past where the model stopped for the red, 1.75 m past the line, at 1.5 m/s. At a
   signal it is certified only on a green an accepted source reads (map_controls.release_light), and on the car no source is
   accepted, nor is the camera's shadow reader's green (a phantom green would lift the car into a red); its red keeps it off
-  too. Uncertified, the go is as before G5: the model holds, and the no-move handback comes with the car held."""
+  too. Uncertified, the model's hold stands: no go, no lift, the car still. Since 2026-11-07 (Kellen: no handbacks) a turn at
+  a light with no colour read is no TurnPilot stop and no handback; a red the camera reads still stops the car at the line."""
   for lights in (None, camera_reads('green'), camera_reads('red')):
     sim, plans, s0 = walker_clears_at_the_models_red(lights)
     assert all(go(p)[0] == 'none' for p in plans) and not any(lifted for _, _, lifted in sim.planned)
     assert sim.s - s0 < 0.1 and max(v for _, v, _ in sim.trace[-len(plans):]) < 0.1
-    handed = next(i for i, p in enumerate(plans) if p.controlPrompt == 'cantStartTakeControl')
-    assert handed * DT_MDL <= NO_MOVE_S + 0.2 and all(p.shouldStop for p in plans[handed:])
+    assert not any(p.controlPrompt == 'signalUnseenTakeControl' or p.reason == TURN_LIGHT_REASON for p in plans), \
+      "never a handback for the light"
 
 
 def test_turn_release_is_certified_on_an_accepted_green_only():
   """The same walker clearing with the sim's oracle (an accepted source) reading the signal: green certifies the go, red
   doesn't (its own hold stays); the camera's shadow red over the oracle's green keeps it off (it only ever keeps a go off).
   Where navd maps no signal at the junction (an unmapped one, a stop sign, cross traffic would go unchecked): none
-  (RELEASE_UNSIGNALIZED)."""
-  def certified(lights, controls=((290., 'signal'),)):
-    sim, plans, _ = walker_clears_at_the_models_red(lights, controls)
+  (RELEASE_UNSIGNALIZED). Whose go: the walker's release is a turn's go (turn_go) only with the turn's desire out or pulsed
+  by the go. LEFT_AT_A_RED's T-left (desire out from its lead) and the right stood at its own hold line (its one pulse at
+  the go: desire_timing CURB_GO_SLACK_M) are; since 2026-11-06 a right stood further out (the model's stop 11 m out) has no
+  desire at the go, its pulse coming rolling 8 m out. There the release is certified only under TurnPilotAlwaysDrive
+  (turnpilotd-followups; the car ships it on): with the switch off nothing certifies at all, the oracle's green included
+  (review 2026-11-06), so its negatives are checked with the switch on, where the green does certify and they can fail.
+  Each light is checked where a green certifies."""
+  def certified(lights, controls=((290., 'signal'),), maneuvers=RIGHT_AT_A_SIGNAL, s_stop=289.):
+    sim, plans, _ = walker_clears_at_the_models_red(lights, controls, maneuvers, s_stop)
     return {go(p)[0] for p in plans} - {'none'}
 
-  def oracle(state, camera=None):
+  def oracle(state, camera=None, s_signal=290.):
     def lights(sim):
       if camera is not None:
         camera_reads(camera)(sim)
       sim.tp.oracle_ok = True
-      return oracle_lights(state, 290.)(sim)
+      return oracle_lights(state, s_signal)(sim)
     return lights
-  assert certified(oracle('green')) == {'turnRelease'}
-  assert certified(oracle('red')) == set()
-  assert certified(oracle('green', camera='red')) == set()
-  assert certified(None, controls=()) == set()
+  # the right's: its signal's line at its hold line, 8 m out, the model stopping it just short of that
+  for maneuvers, s_stop, s_signal in ((LEFT_AT_A_RED, 289., 290.), (RIGHT_AT_A_SIGNAL, 300. - HOLD_LINE_M - 0.5, 292.)):
+    case, kw = (maneuvers[0][2], s_stop), {'controls': ((s_signal, 'signal'),), 'maneuvers': maneuvers, 's_stop': s_stop}
+    assert certified(oracle('green', s_signal=s_signal), **kw) == {'turnRelease'}, case
+    assert certified(oracle('red', s_signal=s_signal), **kw) == set(), case
+    assert certified(oracle('green', camera='red', s_signal=s_signal), **kw) == set(), case
+    assert certified(None, **{**kw, 'controls': ()}) == set(), case
+  # the right stood 11 m out, its desire not out, under the switch: the green certifies it and lifts the model's hold (the
+  # car rolls on toward its 8 m pulse), never a red, the camera's red over the oracle's green, nor a junction with no signal
+  # mapped: no go, no lift, the car where the model stopped it
+  def released(lights, controls=((290., 'signal'),)):
+    sim, plans, s0 = walker_clears_at_the_models_red(lights, controls, always_drive=True)
+    return {go(p)[0] for p in plans} - {'none'}, any(lifted for _, _, lifted in sim.planned), sim.s - s0
+  causes, lifted, moved = released(oracle('green'))
+  assert causes == {'turnRelease'} and lifted and moved > 1., (causes, lifted, moved)
+  for name, lights, controls in (('red', oracle('red'), ((290., 'signal'),)), ('camera red', oracle('green', camera='red'), ((290., 'signal'),)),
+                                 ('unmapped', None, ())):
+    causes, lifted, moved = released(lights, controls)
+    assert causes == set() and not lifted and moved < 0.1, (name, causes, lifted, moved)
   assert RELEASE_UNSIGNALIZED is False
+
+
+def test_a_curb_side_turns_go_from_further_out_than_its_pulse_has_its_no_move_clock_with_the_switch_off():
+  """tests-go-red risk 1 (2026-11-06): with TurnPilotAlwaysDrive off, a walker's hold let go 11 m short of a right at a green
+  the oracle reads (accepted) is TurnPilot's go from a standstill, but the right's one pulse is 8 m out, so the go was no
+  turn_go and nothing armed its no-move clock: the model holding the car, it stood silent ('Green (sim oracle)') until
+  carStoppedTakeControl at 90 s, where HEAD (the desire out from 40 m) handed back at 3 s. The curb-side go now runs the
+  no-move clock from the go as any go of TurnPilot's from a standstill: NO_MOVE_S standing with nothing else holding the car,
+  then the go withdrawn, the car held standing (shouldStop) and handed back loudly (cantStartTakeControl). Never certified
+  with the switch off (no lift: nothing rests on a turn whose desire isn't out)."""
+  def lights(sim):
+    sim.tp.oracle_ok = True
+    return oracle_lights('green', 290.)(sim)
+  sim, plans, s0 = walker_clears_at_the_models_red(lights)
+  assert not sim.tp.always_drive and 300. - s0 > CURB_TURN_PULSE_M + CURB_GO_SLACK_M
+  assert not any(p.desire == Desire.turnRight for p in plans), "the right's one pulse is 8 m out: none at the go 11 m out"
+  handed = next(i for i, p in enumerate(plans) if p.controlPrompt == 'cantStartTakeControl')
+  assert abs(handed * DT_MDL - NO_MOVE_S) <= 2 * DT_MDL and plans[handed].reason == NO_MOVE_REASON, handed * DT_MDL
+  assert all(p.controlPrompt == 'none' for p in plans[:handed]), sorted({str(p.controlPrompt) for p in plans[:handed]})
+  assert all(p.controlPrompt == 'cantStartTakeControl' and p.shouldStop for p in plans[handed:])
+  assert all(go(p)[0] == 'none' for p in plans) and not any(lifted for _, _, lifted in sim.planned) and sim.s - s0 < 0.1
+  # the control: the same go with the model pulling away (no planner holding it) is followed, nothing said, and the right's one
+  # pulse goes rolling 8 m out
+  sim = Sim(RIGHT_AT_A_SIGNAL, controls=[(290., 'signal')])
+  sim.go_taps, sim.lights = False, lights
+  sim.accel = model_stops_at(289.)
+  while not (sim.v < 0.05 and sim.s > 280.):
+    sim.step(engaged=True)
+    assert sim.t < 80.
+  stand(sim, 2., objects=WALKER)
+  sim.accel = None
+  after = [sim.step(WALKER_CLEAR, engaged=True)]
+  while sim.s < 300. - CURB_FIRST_PULSE_M:
+    after.append(sim.step(engaged=True))
+    assert sim.t < 120.
+  assert sim.tp.go_wait_s is None and not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in after)
+  assert any(p.desire == Desire.turnRight for p in after) and not any(p.tooFastToTurn for p in after)
 
 
 def test_a_shadow_camera_red_coming_mid_go_withdraws_it():
@@ -544,7 +611,10 @@ def test_a_curb_side_turn_released_in_the_junction_at_a_green_is_certified_and_a
   handback."""
   def released_in_the_junction(maneuvers, desire, side):
     sim = Sim(maneuvers, controls=[(290., 'signal')])
-    assert go(go_from_a_red(sim, desire=desire))[0] == 'turnRelease'  # from its line, on the oracle's green
+    if side == 1:  # the right's go from its 10 m line: no desire, its one pulse rolling 8 m out (2026-11-06)
+      curb_turn_from_a_red(sim, desire=desire)
+    else:
+      assert go(go_from_a_red(sim, desire=desire))[0] == 'turnRelease'  # from its line, on the oracle's green
     while sim.tp.desires.turned_deg < 45.:
       sim.step(engaged=True, yaw_rate=-0.3 * side if sim.v > 0.5 else 0.)
       assert sim.t < 200.

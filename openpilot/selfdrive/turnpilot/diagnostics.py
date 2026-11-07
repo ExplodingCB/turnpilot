@@ -47,8 +47,11 @@ TURNPILOT_DAEMONS = frozenset(("turnpilotd", "turnpilot_web"))
 GPS_SERVICES = ("gpsLocation", "gpsLocationExternal")
 GPS_DAEMONS = ("ubloxd", "pigeond", "qcomgpsd")
 QCOM_NO_FIX_V_ACC = 500.  # qcomgpsd: the modem clips verticalAccuracy at 500, and hasFix is False there
+# nativeStatus unavailable is either cause (the schema's NativeStatus): never loaded, or loaded and never run in its first
+# 30 s of free, calibrated slot for no room beside the driving model (11-06: the car's case, both drives)
 NATIVE_WORDS = {"off": "off (the far crop)", "strip": "strip", "full": "full (the whole frame natively)",
-                "fallback": "fell back to the far crop for the drive", "unavailable": "on, but not loaded: the far crop"}
+                "fallback": "fell back to the far crop for the drive",
+                "unavailable": "on, but not running (not loaded, or no room beside the driving model): the far crop where it fits"}
 
 
 def scrub(text: str, secrets=()) -> str:

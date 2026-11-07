@@ -245,7 +245,7 @@ def test_lane_change_events_and_text():
   # a new offer can follow an abort while its reason still holds
   assert lane_change_events(lane_change_plan('left', 3., abort='noSignal')) == ('turnpilotLaneChangeLeft', 'turnpilotLaneChangeAborted')
   assert lane_change_text(lane_change_plan('left', 2.2), 'left') == 'Lane Change Left in 3'
-  assert lane_change_text(lane_change_plan('left', 0.), 'left') == 'Signal Left to Change Lanes'
+  assert lane_change_text(lane_change_plan('left', 0.), 'left') == 'Signal LEFT to Change Lanes'
   assert lane_change_text(lane_change_plan('right', 0., 'right'), 'right') == 'Changing Lanes Right Once Clear'
   assert all(reason in ABORT_TEXT for reason in custom.TurnpilotPlan.LaneChangeAbort.schema.enumerants if reason != 'none')
 

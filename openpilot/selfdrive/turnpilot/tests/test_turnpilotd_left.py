@@ -13,7 +13,7 @@ from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of, nav_instr
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Sim
 from openpilot.selfdrive.turnpilot.turn_speed import POST_GO_PROFILES
 from openpilot.selfdrive.turnpilot.turnpilotd import GO_LINE_M, LEFT_NO_MOVE_S, TurnPilot, auto_left_for, left_range_for
-from openpilot.selfdrive.turnpilot.unprotected_left import (CLEAR_WINDOW_S, CREEP_STALL_S, HELD_MIN_M, LIGHT_UNKNOWN_S, ROAD_RANGE_M,
+from openpilot.selfdrive.turnpilot.unprotected_left import (CLEAR_WINDOW_S, CREEP_STALL_S, HELD_MIN_M, ROAD_RANGE_M,
                                                            STALE_UNDECIDED_S, STAND_UNDECIDED_S,
                                                            r_req, t_req)
 
@@ -304,14 +304,17 @@ def test_off_and_announce_hand_back_at_the_line():
     assert any(p.reason == reason for p in held), (mode, {p.reason for p in held})
 
 
-def test_a_left_past_the_proven_range_is_never_taken_from_its_line():
-  # 45 mph mapped: R_req past the road camera's range: skipped at route time (below), never a go from its line
+def test_a_left_past_the_proven_range_is_taken_from_its_line_on_the_band_it_sees():
+  # 45 mph mapped: R_req past the road camera's range (the far crop's unmeasured). Kellen, 2026-11-07 ("no, no handbacks"; a
+  # safety driver supervises): driven to its line and gone from it on the band the camera covers, never handed back for range
   sim = Sim([(JUNCTION, "turn", "left", (0., 270., 2, 'present', 20.1, 1, STRAIGHT_M)), (1500., "turn", "right", junction_of("right"))])
   sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps, sim.raw = 'auto', TEST_RANGE_M, False, road_runs()
   sim.answers_prompt = True
   assert r_req(20.1, t_req(HOLD_LINE_M + 1., 1), HOLD_LINE_M + 1.) > TEST_RANGE_M
   plans = drive(sim, 60.)
-  assert not any(p.desire == Desire.turnLeft for p in plans if p.maneuverDistance > 0.)
+  assert any(p.desire == Desire.turnLeft for p in plans)
+  assert not any(p.tooFastToTurn for p in plans)
+  assert not any(str(p.unprotectedLeft.state) == 'undecided' or str(p.controlPrompt) == 'leftUndecidedTakeControl' for p in plans)
 
 
 def test_main_reads_the_auto_left_and_its_range():
@@ -332,58 +335,57 @@ def test_main_reads_the_auto_left_and_its_range():
   assert TurnPilot().auto_left == 'auto'
 
 
-def test_a_left_the_detector_cant_see_far_enough_for_is_skipped_at_route_time():
-  # the mapped opposing speed sets R_req; past the detector's proven range the left is never attempted: skipped as soon as
-  # it is the route's maneuver (chimed as a skip, navd reroutes), before any lane change toward it, and driven straight on
+def held_at_the_line(sim, line, hold_s=4., limit_s=120.):
+  """Drives sim (no turn yaw) until it has stood held at the hold line at line for hold_s, or limit_s: its plans and the skip
+  reasons TurnPilot gave meanwhile."""
+  plans, reasons, held_s = [], set(), 0.
+  while held_s < hold_s:
+    plans += drive(sim, DT_MDL, yaw=False)
+    reasons.add(sim.tp.skip.reason)
+    held_s = held_s + DT_MDL if plans[-1].shouldStop and sim.v < 0.05 else 0.
+    assert sim.t < limit_s and sim.s < line + 1., (sim.t, sim.s)
+  return plans, reasons
+
+
+def test_a_left_the_detector_cant_see_far_enough_for_is_driven_to_its_line_and_gone_from_it():
+  # 2026-11-06 (Kellen: never route around or skip a left for range): past the detector's proven range the left was skipped as
+  # soon as it was the route's maneuver (unprotectedRange) and navd rerouted. 2026-11-07 ("no, no handbacks"): driven to its
+  # hold line, never skipped, and gone from it on the band the camera covers, never handed back for the reach
   for junction in ((0., 270., 2, 'present', 20.1, 1, STRAIGHT_M), (0., 270., 2, 'present', 0., 0, STRAIGHT_M)):  # 45 mph, unknown (45)
     sim = Sim([(600., "turn", "left", junction), (2000., "turn", "right", junction_of("right"))])
     sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps, sim.raw = 'auto', TEST_RANGE_M, False, road_runs()
     sim.answers_prompt = True
-    plans, reasons = [], set()
-    while sim.s < 650.:
-      plans += drive(sim, DT_MDL, yaw=False)
-      reasons.add(sim.tp.skip.reason)
-      assert sim.t < 120.
+    plans = drive(sim, 90., yaw=False)
     first = plans[2]
-    assert first.tooFastToTurn and str(first.unprotectedLeft.state) == 'skipped' and first.maneuverDistance > 500.
-    assert first.unprotectedLeft.rReq > first.unprotectedLeft.rangeM
-    assert not any(p.shouldStop or p.desire != Desire.none or str(p.laneChange) != 'none' for p in plans)
-    assert 'unprotectedRange' in reasons
-  # within range (TurnPilotLeftRangeM measured further): taken
-  sim = Sim([(600., "turn", "left", (0., 270., 2, 'present', 20.1, 1, STRAIGHT_M)), (2000., "turn", "right", junction_of("right"))])
-  sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps, sim.raw = 'auto', 350., False, road_runs()  # past route time's 337 m
-  sim.answers_prompt = True
-  plans = drive(sim, 5.)
-  assert not any(p.tooFastToTurn for p in plans)
-  # off: the line's handback, as G1's, never skipped for range
+    assert str(first.unprotectedLeft.state) == 'approach' and first.maneuverDistance > 500. and not first.tooFastToTurn
+    assert not any(p.tooFastToTurn or str(p.unprotectedLeft.state) == 'skipped' for p in plans), junction
+    assert not any(str(p.skipReason) for p in plans)
+    assert any(p.shouldStop and p.mapControl.kind == 'unprotectedTurn' for p in plans), "held at its line"
+    assert not any(str(p.unprotectedLeft.state) == 'undecided' for p in plans), junction
+    assert any(p.desire == Desire.turnLeft for p in plans), junction
+    assert any(p.unprotectedLeft.rReq > p.unprotectedLeft.rangeM == TEST_RANGE_M for p in plans if str(p.unprotectedLeft.state) != 'off')
+  # off: the line's handback, as G1's, never skipped for range (nor it ever was)
   sim = Sim([(600., "turn", "left", (0., 270., 2, 'present', 20.1, 1)), (2000., "turn", "right", junction_of("right"))])
   sim.tp.auto_left, sim.go_taps = 'off', False
   assert not any(p.tooFastToTurn for p in drive(sim, 5.))
 
 
-def test_a_left_whose_opposing_road_isnt_known_straight_over_r_req_is_skipped_at_route_time():
-  # skeptic G4 (residual): an oncoming car up a road curving away from the turn was outside the straight band, and the left went
-  # into it (300 m radius at the limit: PET 1.70 s; a 1.3x speeder 0.44-1.68 s). The straight span navd maps from our approach
-  # (maneuverOpposingStraightM) must reach R_req from the line: short of it, or not known, the left is never attempted, skipped
-  # out loud at route time (unprotectedRange: "Can't See Far Enough to Turn", navd reroutes) and logged as not straight
+def test_a_left_whose_opposing_road_isnt_known_straight_over_r_req_is_gone_on_its_straight_band():
+  # skeptic G4 (residual): a car up a road curving away from the turn is outside the straight band. Until 2026-11-07 such a
+  # left was handed back at its line ('curve'); Kellen, 2026-11-07 ("no, no handbacks"; the safety driver supervises): judged
+  # on the band the camera covers and gone when it is clear, never skipped, still logged once on the way as not straight
   from unittest import mock
   for straight in (0., 60.):
     sim = Sim([(600., "turn", "left", (0., 270., 2, 'present', V_25, 1, straight)), (2000., "turn", "right", junction_of("right"))])
     sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps, sim.raw = 'auto', TEST_RANGE_M, False, road_runs()
+    sim.answers_prompt = True
     with mock.patch('openpilot.selfdrive.turnpilot.turnpilotd.cloudlog') as log:
-      plans = []
-      while sim.s < 650.:
-        plans += drive(sim, DT_MDL, yaw=False)
-        assert sim.t < 120.
-    first = plans[2]
-    assert first.tooFastToTurn and str(first.unprotectedLeft.state) == 'skipped' and first.maneuverDistance > 500., straight
-    assert not any(p.shouldStop or p.desire != Desire.none for p in plans), straight
+      plans = drive(sim, 90., yaw=False)
+    assert not any(p.tooFastToTurn or str(p.unprotectedLeft.state) == 'skipped' for p in plans), straight
+    assert not any(str(p.unprotectedLeft.state) == 'undecided' for p in plans), straight
+    assert any(p.desire == Desire.turnLeft for p in plans), straight
     events = [c.kwargs for c in log.event.call_args_list if c.args[0] == 'turnpilot.left_not_straight']
     assert len(events) == 1 and events[0]['straight_m'] == straight and events[0]['r_req'] > straight + HOLD_LINE_M + 1., straight
-  # straight past R_req: attempted as before
-  sim = Sim([(600., "turn", "left", (0., 270., 2, 'present', V_25, 1, STRAIGHT_M)), (2000., "turn", "right", junction_of("right"))])
-  sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps, sim.raw = 'auto', TEST_RANGE_M, False, road_runs()
-  assert not any(p.tooFastToTurn for p in drive(sim, 5.))
 
 
 def bend_run(bend_deg, standstill_yaw=0.):
@@ -921,15 +923,14 @@ def test_a_hold_after_the_go_withdraws_it_and_the_car_waits_for_a_fresh_go():
   assert sim.s > JUNCTION + 10.
 
 
-def test_a_signal_whose_light_nothing_reads_is_handed_back_never_gone():
-  # a left at a mapped signal with no light read (no source, or the camera's reader can't see the head): it can't tell red
-  # from green, so it never goes; said out loud after LIGHT_UNKNOWN_S at its line
+def test_a_signal_whose_light_nothing_reads_is_gone_on_the_clear_band():
+  # a left at a mapped signal with no light read (no source, or the camera's reader can't see the head). Kellen, 2026-11-07
+  # (no handbacks): an unread light is no reason to wait; the left goes on the clear band, never handed back for the light
+  # (a red or yellow read still holds it: the tests above)
   sim = signal_sim(oracle=False)
   plans = run_objects(sim, 50.)
-  held = next(i for i, p in enumerate(plans) if p.shouldStop and p.mapControl.kind == 'unprotectedTurn')
-  und = next(i for i, p in enumerate(plans) if str(p.controlPrompt) == 'leftUndecidedTakeControl')
-  assert (und - held) * DT_MDL <= LIGHT_UNKNOWN_S + 1. and plans[und].reason == "Can't read the light: take control"
-  assert not any(p.desire == Desire.turnLeft for p in plans) and sim.s < LINE + 1.
+  assert any(p.desire == Desire.turnLeft for p in plans)
+  assert not any(str(p.controlPrompt) == 'leftUndecidedTakeControl' or str(p.unprotectedLeft.state) == 'undecided' for p in plans)
 
 
 def route_time_left(range_m, controls=()):
@@ -946,14 +947,14 @@ def route_time_left(range_m, controls=()):
   return sim, plans
 
 
-def test_route_time_takes_the_lefts_reach_where_the_car_may_stand():
+def test_route_times_reach_refuses_nothing_and_the_line_judges_from_where_the_car_stands():
   """BUILD_FINDINGS D4 (smoke S08, diag s02_nomove_handback): route time checked R_req at LINE_D with no margin (134 m at 25
   mph, one lane, under a 150 m range), and the live check at the line, from where the car stands and the furthest reading
-  (S08: d_far 23.6 m, 204 m), ended the left undecided there: a takeover at any left with a set-back line or about 2 m of
-  spread. With no mapped stop line route time now takes LINE_D plus ROUTE_REACH_MARGIN_M (UNCERTAIN_M, a spread just short of
-  the junctionUncertain alert): 200 m, so at 150 m the left is skipped before its junction out loud (unprotectedRange) and
-  rerouted, its plan's rReq the reach it was skipped for; with a range covering that it is attempted as before. The live
-  check at the line is unchanged."""
+  (S08: d_far 23.6 m, 204 m), ended the left undecided there. Route time then took LINE_D plus ROUTE_REACH_MARGIN_M (200 m)
+  and skipped the left out loud (unprotectedRange) under a 150 m range: on the 11-06 night that margin alone refused the two
+  lefts the line could judge (1e L1: 267.8 m at route time, 182.1 m at the line, under 210 m). Since 2026-11-06 route time
+  refuses nothing: the left is driven to its line under the same 150 m range, held there, and judged from where it stands
+  (134 m at LINE_D: in range), so it goes on the empty band."""
   from openpilot.selfdrive.turnpilot.route_follower import UNCERTAIN_M
   from openpilot.selfdrive.turnpilot.unprotected_left import ROUTE_REACH_MARGIN_M
   from openpilot.selfdrive.turnpilot.unprotected_left import LINE_D, reach_at_line
@@ -961,47 +962,47 @@ def test_route_time_takes_the_lefts_reach_where_the_car_may_stand():
   route_reach = reach_at_line(V_25, 1, ROUTE_REACH_MARGIN_M)
   assert reach_at_line(V_25, 1) < 150. < route_reach < TEST_RANGE_M, (reach_at_line(V_25, 1), route_reach)
   assert math.isclose(route_reach, r_req(V_25, t_req(LINE_D + UNCERTAIN_M, 1), LINE_D + UNCERTAIN_M))
-  sim, plans = route_time_left(150.)
-  skipped = [p for p in plans if str(p.unprotectedLeft.state) == 'skipped']
-  assert skipped and all(p.tooFastToTurn and str(p.skipReason) == 'unprotectedRange' for p in skipped)
-  assert skipped[0].maneuverDistance > 100., "skipped as soon as it is the maneuver, well before its junction"
-  assert abs(skipped[0].unprotectedLeft.rReq - route_reach) < 0.1 and skipped[0].unprotectedLeft.rangeM == 150.
-  assert not any(p.shouldStop or p.desire != Desire.none for p in plans)
-  sim, plans = route_time_left(TEST_RANGE_M)
-  assert not any(p.tooFastToTurn for p in plans)
-  assert any(p.shouldStop and p.mapControl.kind == 'unprotectedTurn' for p in plans), "attempted: held at its line"
+  for range_m in (150., TEST_RANGE_M):
+    sim, plans = route_time_left(range_m)
+    assert not any(p.tooFastToTurn or str(p.unprotectedLeft.state) == 'skipped' for p in plans), range_m
+    assert any(p.shouldStop and p.mapControl.kind == 'unprotectedTurn' for p in plans), "attempted: held at its line"
+    plans += drive(sim, 25.)
+    go = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
+    assert str(plans[go].unprotectedLeft.state) == 'go' and plans[go].unprotectedLeft.rReq <= range_m, range_m
+    assert not any(p.tooFastToTurn or str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans) and sim.s > JUNCTION + 10.
 
 
-def test_route_time_takes_a_mapped_stop_lines_setback_in_place_of_the_margin():
-  # a mapped stop line at the junction (a signal's, its line 10 m before it: 1 m back of the hold line) is where the car may
-  # stand: route time takes R_req there, 138 m, under a 150 m range, so the left isn't skipped for range. One mapped 20 m
-  # back (11 m) takes 182 m: skipped
-  from openpilot.selfdrive.turnpilot.unprotected_left import reach_at_line
-  for line_m, skip in ((10., False), (20., True)):
+def test_a_mapped_stop_lines_setback_never_skips_the_left_and_it_is_judged_at_the_line():
+  # a mapped stop line at the junction (a signal's, its line 10 m before it: 1 m back of the hold line; or 20 m back, 11 m) is
+  # where the car may stand: route time's R_req there (138 m, 182 m) was its refusal under a 150 m range for the 20 m one.
+  # Neither is skipped now: each is driven to its line and judged there, never skipped out loud nor rerouted; its light unread,
+  # it goes on the clear band (2026-11-07: no handbacks)
+  for line_m in (10., 20.):
     sim, plans = route_time_left(150., controls=[(JUNCTION - line_m, 'signal', True)])
-    assert any(p.tooFastToTurn and str(p.skipReason) == 'unprotectedRange' for p in plans) == skip, line_m
-    if skip:
-      rreq = next(p.unprotectedLeft.rReq for p in plans if str(p.unprotectedLeft.state) == 'skipped')
-      assert abs(rreq - reach_at_line(V_25, 1, line_m - HOLD_LINE_M - 1.)) < 0.5, (line_m, rreq)
+    plans += drive(sim, 20., yaw=False)
+    assert not any(p.tooFastToTurn or str(p.skipReason) or str(p.unprotectedLeft.state) == 'skipped' for p in plans), line_m
+    assert any(p.desire == Desire.turnLeft for p in plans), line_m
+    assert not any(str(p.unprotectedLeft.state) == 'undecided' for p in plans), line_m
 
 
 def test_an_unmeasured_detector_range_attempts_no_left_blind():
   # skeptic G4 (blocker 6): TurnPilotLeftRangeM defaulted to 150 m, pixel arithmetic never measured on real comma frames
   # (CRITIQUE SEV2: even a 25 mph R_req of 134-141 m is past the uncropped detector at 6.5-8 px), so 25 mph lefts were
-  # attempted on an unmeasured range. Unset, the range is unmeasured (0): every autonomous left is past it, skipped at route
-  # time out loud and rerouted, never taken from its line. A drive sets it from a measurement (TEST_RANGE_M here)
+  # attempted on an unmeasured range. Unset, the range is unmeasured (0): every autonomous left is past it, never taken from its
+  # line. Since 2026-11-06 it is driven to its line, never skipped and rerouted; since 2026-11-07 (Kellen: no handbacks) it is
+  # gone from there on the band the camera covers, never handed back for the range. A drive sets the range from a measurement
   assert ROAD_RANGE_M == 0.
   sim = Sim(LEFT_25)
   assert sim.tp.left_range_m == ROAD_RANGE_M
   sim.tp.auto_left, sim.go_taps, sim.raw = 'auto', False, road_runs()
   sim.answers_prompt = True
   plans, reasons = [], set()
-  for _ in range(int(40. / DT_MDL)):
-    plans += drive(sim, DT_MDL, yaw=False)
+  while sim.s < JUNCTION + 30. and sim.t < 120.:
+    plans += drive(sim, DT_MDL)
     reasons.add(sim.tp.skip.reason)
-  assert any(p.tooFastToTurn for p in plans) and 'unprotectedRange' in reasons
-  assert not any(p.shouldStop or p.desire != Desire.none for p in plans)
-  assert all(str(p.unprotectedLeft.state) == 'skipped' for p in plans[2:] if p.maneuverDistance > 0. and str(p.maneuverModifier) == 'left')
+  assert not any(p.tooFastToTurn for p in plans) and 'unprotectedRange' not in reasons
+  assert not any(str(p.unprotectedLeft.state) in ('skipped', 'undecided') for p in plans)
+  assert any(p.desire == Desire.turnLeft for p in plans) and sim.s > JUNCTION + 30.
 
 
 # DESIGN phase 4 G5 (this run's G6): the far crop's runs, between the full pass's
@@ -1073,22 +1074,29 @@ def test_a_car_far_up_the_oncoming_road_seen_only_by_the_far_crop_holds_it():
   assert go * DT_MDL > passed and any(p.unprotectedLeft.farBlockers for p in plans[:go])
 
 
-def test_without_the_far_crop_a_45_mph_left_is_skipped_and_its_loss_at_the_line_is_loud():
-  # the far crop off (no pkl, the param, off for the drive) or its range unmeasured: skipped at route time and rerouted
+def test_without_the_far_crop_a_45_mph_left_goes_on_the_band_it_covers_and_its_loss_there_is_loud():
+  # the far crop off (no pkl, the param, off for the drive) or its range unmeasured: driven to its line (never skipped at route
+  # time and rerouted since 2026-11-06) and, since 2026-11-07 (Kellen: no handbacks), gone from it on the band the full pass
+  # covers, never handed back for what it can't see
   for status, far_range in (('off', FAR_RANGE_M), ('disabled', FAR_RANGE_M), ('read', 0.)):
     sim = far_sim(status=status, far_range=far_range)
     plans = drive(sim, 3.)
-    assert plans[-1].tooFastToTurn and str(plans[-1].unprotectedLeft.state) == 'skipped', status
-    assert plans[-1].unprotectedLeft.farRangeM == (far_range if status == 'read' else 0.) and plans[-1].unprotectedLeft.farNeeded
-  # the full pass's range unmeasured: the far crop extends nothing (it covers the band only past that range)
+    assert not plans[-1].tooFastToTurn and str(plans[-1].unprotectedLeft.state) == 'approach', status
+    assert plans[-1].unprotectedLeft.farRangeM == (far_range if status == 'read' else 0.) and not plans[-1].unprotectedLeft.farNeeded
+    while sim.s < JUNCTION + 30. and sim.t < 120.:
+      plans += drive(sim, DT_MDL)
+    assert any(p.desire == Desire.turnLeft for p in plans), status
+    assert not any(p.tooFastToTurn or str(p.unprotectedLeft.state) == 'undecided' for p in plans), status
+  # the full pass's range unmeasured: the far crop extends nothing (it covers the band only past that range): not skipped either
   sim = far_sim()
   sim.tp.left_range_m = 0.
-  assert drive(sim, 3.)[-1].tooFastToTurn
+  assert not drive(sim, 3.)[-1].tooFastToTurn
   # on but waiting for room or calibration at route time (a spell): not skipped, judged at the line
   for status in ('noRoom', 'noCalibration'):
     sim = far_sim(status=status)
     assert not any(p.tooFastToTurn for p in drive(sim, 3.)), status
-  # it goes off for the drive while the car waits at its line: said once (farViewOff), and the left hands back (farOff)
+  # it goes off for the drive while the car waits at its line for its cars: said once (farViewOff), and the left, judged from
+  # then on on the full pass's band, never hands back
   stream = [JUNCTION + 200. + k * 30. for k in range(40)]
   off_at = [None]
 
@@ -1104,10 +1112,11 @@ def test_without_the_far_crop_a_45_mph_left_is_skipped_and_its_loss_at_the_line_
   after = [p for p, (_, _, _) in zip(plans, sim.trace, strict=True) if p is not None][-int(round((sim.t - off_at[0]) / DT_MDL)):]
   assert any(str(p.controlAlert) == 'farViewOff' for p in after[:3])
   assert sum(str(p.controlAlert) == 'farViewOff' for p in plans) * DT_MDL <= 2.1  # said once
-  # held at the line and handed back, never skipped and rerouted from it
-  assert all(str(p.unprotectedLeft.state) == 'undecided' and p.unprotectedLeft.why == 'farOff' for p in after[2:])
-  assert all(str(p.controlPrompt) == 'leftUndecidedTakeControl' and p.shouldStop and not p.tooFastToTurn for p in after[2:])
-  assert not any(p.desire == Desire.turnLeft for p in plans) and sim.s < LINE + 0.1
+  # the far crop's cars held it at the line while it read them; never handed back, never skipped and rerouted from it
+  before = plans[:len(plans) - len(after)]
+  assert not any(p.desire == Desire.turnLeft for p in before) and any(p.unprotectedLeft.farBlockers for p in before)
+  assert not any(str(p.unprotectedLeft.state) == 'undecided' or str(p.controlPrompt) == 'leftUndecidedTakeControl' for p in plans)
+  assert not any(p.tooFastToTurn for p in plans)
 
 
 def test_a_far_crop_spell_without_room_at_the_line_is_waited_through():

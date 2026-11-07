@@ -7,8 +7,9 @@ import pytest
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot import map_controls
-from openpilot.selfdrive.turnpilot.map_controls import (CAMERA_STALE_S, GREEN_STEADY_S, MAP_DECEL_MAX, NO_LIGHTS, CameraLights, Lights,
-                                                         MapControlPolicy, camera_light_input)
+from openpilot.selfdrive.turnpilot.map_controls import (CAMERA_OFF_AGAIN_S, CAMERA_OFF_REASON, CAMERA_OFF_STILL_REASON,
+                                                         CAMERA_STALE_S, GREEN_STEADY_S, MAP_DECEL_MAX, NO_LIGHTS, CameraLights,
+                                                         Lights, MapControlPolicy, camera_light_input)
 from openpilot.selfdrive.turnpilot.scene_policy import decide
 from openpilot.selfdrive.turnpilot.tests.test_map_controls import Car, held, lights, oracle
 
@@ -85,13 +86,100 @@ def test_shadow_camera_logs_an_unmapped_red_and_does_nothing(monkeypatch):
   assert len(ev.named('turnpilot.camera_light_unmapped')) == 1
 
 
-def test_camera_light_reader_off_is_said_once():
-  car = Car([(300., 'signal')])
+def test_camera_light_reader_failing_is_a_status_line_for_its_whole_spell():
+  # S2 (review 2026-11-07): a reader failing every read was said once for 2.0 s and never again (probe_camera_off: 40 frames in
+  # 600 s), and for the rest of the drive no camera red could stop the car with nothing saying so. Its line stays up the whole
+  # spell: the chimed onset's words for ABORT_HOLD_S, then the same line silent, down at the reader's first good read
+  car = Car([])
   off = Lights(camera=CameraLights([], True, 'disabled'))
   out, dec, _ = car.step(lights=off)
-  assert out.alert == 'lightSourceRejected' and 'Camera light reader off' in out.reason
-  out, dec, _ = car.run(10., lights=off)
-  assert out.alert == 'none'  # once for the drive, not a status line for the rest of it
+  assert out.alert == 'lightSourceRejected' and out.reason == CAMERA_OFF_REASON and out.reader_line == 'onset'
+  outs = [car.step(lights=off)[0] for _ in range(int(120. / DT_MDL))]
+  assert all(o.alert == 'lightSourceRejected' for o in outs)
+  onset = 1 + sum(o.reason == CAMERA_OFF_REASON for o in outs)
+  assert abs(onset * DT_MDL - map_controls.ABORT_HOLD_S) <= 2 * DT_MDL
+  assert outs[-1].reason == CAMERA_OFF_STILL_REASON and outs[-1].reader_line == 'still'
+  # a read with no input at all (a sweep, the wide runs, a retry's backoff) is still the spell: only a good read ends it
+  out, _, _ = car.run(5., lights=NO_LIGHTS)
+  assert out.alert == 'lightSourceRejected' and out.reason == CAMERA_OFF_STILL_REASON
+  out, _, _ = car.step(lights=Lights(camera=CameraLights([], False, 'read')))
+  assert out.alert == 'none' and out.reader_line == '' and out.reason == ''
+
+
+def test_a_reader_failing_before_the_driver_engages_is_said_at_the_engagement():
+  # S2 (skeptic): the reader failing from the drive's start, parked, openpilot off: its 2 s ran down while nothing could show
+  # it (turnpilotControlAlert is a WARNING, engaged only), and engaged at 10 s the driver heard nothing for the rest of the
+  # drive. Its onset runs down only on frames it could be shown: said in full at the engagement, then the line stays
+  car = Car([])
+  for _ in range(int(10. / DT_MDL)):
+    out, _, _ = car.step(lights=OFF, engaged=False)
+    assert out.alert == 'lightSourceRejected' and out.reason == CAMERA_OFF_REASON
+  outs = [car.step(lights=OFF, engaged=True)[0] for _ in range(int(5. / DT_MDL))]
+  onset = [i for i, o in enumerate(outs) if o.reason == CAMERA_OFF_REASON]
+  assert onset == list(range(len(onset))) and abs(len(onset) * DT_MDL - map_controls.ABORT_HOLD_S) <= 2 * DT_MDL
+  assert all(o.alert == 'lightSourceRejected' for o in outs) and outs[-1].reason == CAMERA_OFF_STILL_REASON
+
+
+def test_the_camera_light_readers_words_say_it_is_failing_not_off_for_the_drive():
+  # detector-2 (2026-11-06): disabled is three failed reads in a row, still retried and read again at its first good read.
+  # "Camera light reader off for this drive" was false from then on
+  assert CAMERA_OFF_REASON == "Camera light reader failing: lights unknown"
+  for text in (CAMERA_OFF_REASON, map_controls.__doc__, map_controls.camera_light_input.__doc__):
+    assert 'off for this drive' not in text and 'off for the drive (disabled)' not in text
+  assert 'no green in 667 reads, and no colour on any' in ' '.join(map_controls.__doc__.split())
+  assert '667 governing heads' not in map_controls.__doc__ and "Saturday's log" not in map_controls.__doc__
+  assert 'G2 is shadow' not in map_controls.MapControlPolicy.release_light.__doc__
+
+
+def spell(car, lights, seconds):
+  """seconds of car steps with lights: the frames the reader's failing line is said."""
+  outs = [car.step(lights=lights)[0] for _ in range(int(round(seconds / DT_MDL)))]
+  return [i for i, o in enumerate(outs) if o.alert == 'lightSourceRejected' and o.reason == CAMERA_OFF_REASON]
+
+
+OFF = Lights(camera=CameraLights([], True, 'disabled'))
+READING = Lights(camera=CameraLights([], False, 'read'))
+
+
+def test_a_camera_light_reader_failing_again_later_in_the_night_is_said_again(monkeypatch):
+  # a failing spell, the reader reading again for a minute, a second failing spell: said both times, each its full hold.
+  # Before: said once for the drive, the second spell silent (and "off for this drive" untrue after the first read)
+  ev = Events(monkeypatch)
+  car = Car([])
+  first = spell(car, OFF, 5.)
+  back = spell(car, READING, CAMERA_OFF_AGAIN_S)
+  second = spell(car, OFF, 5.)
+  assert first and not back and second
+  assert len(first) * DT_MDL >= map_controls.ABORT_HOLD_S - 2 * DT_MDL and len(second) == len(first)
+  assert len(ev.named('turnpilot.camera_lights_off')) == 2 and len(ev.named('turnpilot.camera_lights_back')) == 1
+
+
+def test_a_camera_light_reader_never_reading_again_is_never_said_again(monkeypatch):
+  # disabled, then no read at all for over a minute (a sweep, wide runs, a retry's backoff: no camera input), then disabled:
+  # one spell, said once. Only a good read ends a spell
+  ev = Events(monkeypatch)
+  car = Car([])
+  first = spell(car, OFF, 3.)
+  gap = spell(car, NO_LIGHTS, CAMERA_OFF_AGAIN_S + 5.)
+  again = spell(car, OFF, 5.)
+  assert first and not gap and not again
+  assert len(ev.named('turnpilot.camera_lights_off')) == 1 and not ev.named('turnpilot.camera_lights_back')
+
+
+def test_a_camera_light_reader_flapping_is_said_at_most_once_a_minute(monkeypatch):
+  # three failed reads (about 3 s, disabled), one good read, again: as a reader that throws on a head in view and reads a run
+  # without one would at every signal. Said once, then again only CAMERA_OFF_AGAIN_S after it, the spell still on
+  ev = Events(monkeypatch)
+  car = Car([])
+  said = []
+  t = 0.
+  while t < CAMERA_OFF_AGAIN_S + 6.:
+    said += [t + i * DT_MDL for i in spell(car, OFF, 3.)]
+    spell(car, READING, DT_MDL)
+    t += 3. + DT_MDL
+  starts = [s for k, s in enumerate(said) if k == 0 or s - said[k - 1] > 2 * DT_MDL]
+  assert len(starts) == 2 and CAMERA_OFF_AGAIN_S - 0.1 <= starts[1] - starts[0] <= CAMERA_OFF_AGAIN_S + 3.5
+  assert len(ev.named('turnpilot.camera_lights_off')) == 2
 
 
 @pytest.mark.parametrize("prior", ['cannotStopComfortably', 'stopOverrun', 'proceedingOnYellow', 'mapControlsUnavailable'])
@@ -104,12 +192,13 @@ def test_camera_light_reader_off_never_masks_a_live_alert(prior):
   off = Lights(camera=CameraLights([], True, 'disabled'))
   out, _, _ = car.step(lights=off)
   assert out.alert == prior
-  alerts = [car.step(lights=off)[0].alert for _ in range(int(6. / DT_MDL))]
-  assert alerts[0] == prior and 'lightSourceRejected' in alerts and alerts[-1] == 'none'
+  outs = [car.step(lights=off)[0] for _ in range(int(6. / DT_MDL))]
+  alerts = [o.alert for o in outs]
+  assert alerts[0] == prior and 'lightSourceRejected' in alerts and alerts[-1] == 'lightSourceRejected'  # the spell's line stays
   first = alerts.index('lightSourceRejected')
   assert all(a == prior for a in alerts[:first])  # never in place of it
-  shown = alerts.count('lightSourceRejected')
-  assert shown * DT_MDL >= map_controls.ABORT_HOLD_S - 2 * DT_MDL  # said in full once the prior alert is done
+  onset = sum(o.reason == CAMERA_OFF_REASON for o in outs[first:])
+  assert onset * DT_MDL >= map_controls.ABORT_HOLD_S - 2 * DT_MDL  # its chimed onset in full once the prior alert is done
 
 
 def test_a_camera_source_is_never_rejected():
@@ -257,17 +346,49 @@ def test_turnpilotd_keeps_the_last_road_read_through_wide_runs_and_ages_it_out()
   sim.run(1. + CAMERA_STALE_S - 0.2)
   assert sim.tp.map_update(sim.sm, sim.v, False).shown.light_state == 'red'  # the road read still holds
   sim.run(0.5)
-  # aged out: the camera says nothing; the stop it added stays until an accepted green (map_controls docstring)
+  # aged out: the camera says nothing; the stop it added stays until a steady green, the camera's or an accepted one
+  # (map_controls docstring)
   assert sim.tp.map_update(sim.sm, sim.v, False).shown.light_state == 'unknown'
   assert sim.tp.map_controls.stop_ahead() is not None
 
 
-def test_turnpilotd_says_a_camera_reader_off_once():
+def test_turnpilotd_keeps_a_failing_camera_readers_line_up_and_says_its_onset_engaged():
+  # S2: the plan carried the line 2 s, all of it disengaged (the Sim's default), and selfdrived showed it on 0 frames. Now the
+  # plan carries it the whole spell, its onset's words until it has been up ABORT_HOLD_S engaged, then the silent line
   sim = camera_sim('shadow', lambda sim: detections('unknown', 0., status='disabled'))
   sim.run(10.)
-  alerts = [p.controlAlert for _, _, p in sim.trace]
-  assert 'lightSourceRejected' in alerts and alerts[-1] == 'none'
-  assert any(p.reason == "Camera light reader off for this drive" for _, _, p in sim.trace if p.controlAlert == 'lightSourceRejected')
+  plans = [p for _, _, p in sim.trace]
+  first = next(i for i, p in enumerate(plans) if p.controlAlert == 'lightSourceRejected')
+  assert all(p.controlAlert == 'lightSourceRejected' and p.reason == CAMERA_OFF_REASON for p in plans[first:])
+  engaged = [sim.step(engaged=True) for _ in range(int(5. / DT_MDL))]
+  assert all(p.controlAlert == 'lightSourceRejected' for p in engaged)
+  onset = [i for i, p in enumerate(engaged) if p.reason == CAMERA_OFF_REASON]
+  assert onset == list(range(len(onset))) and abs(len(onset) * DT_MDL - map_controls.ABORT_HOLD_S) <= 3 * DT_MDL
+  assert engaged[-1].reason == CAMERA_OFF_STILL_REASON
+
+
+def test_turnpilotd_says_a_failing_camera_readers_onset_in_its_own_words_over_a_holds():
+  # S2: turnpilotd's plan.reason put a decision's reason first, so the reader failing on a stop sign's approach said "Stop sign
+  # ahead" under the reader's title and its onset's words never reached the driver. Its chimed onset's words now go over a
+  # hold's (no map prompt, no hard brake); after it the hold's reason is the plan's again (the line then shows its own plain
+  # words, events.py)
+  from openpilot.cereal import messaging
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Sim
+  sim = Sim([(1000., "turn", "right"), (2000., "turn", "left")], controls=[(150., 'stop')])
+  sim.tp.camera_mode, sim.go_taps = 'addOnly', False
+  none = messaging.new_message('turnpilotLights').as_reader().turnpilotLights
+
+  def lights(sim):
+    if int(round(sim.t / DT_MDL)) % 2 == 0:
+      sim.sm.put('turnpilotDetections', detections('unknown', 0., status='disabled' if sim.s > 80. else 'read'))
+    return none
+  sim.lights = lights
+  plans = [sim.step(engaged=True) for _ in range(int(14. / DT_MDL))]
+  said = [i for i, p in enumerate(plans) if p.controlAlert == 'lightSourceRejected']
+  assert said and all(plans[i].controlAlert == 'lightSourceRejected' for i in range(said[0], len(plans)))
+  onset = [i for i in said if plans[i].reason == CAMERA_OFF_REASON]
+  assert onset[0] == said[0] and abs(len(onset) * DT_MDL - map_controls.ABORT_HOLD_S) <= 3 * DT_MDL
+  assert plans[said[0] - 1].reason == 'Stop sign ahead' and plans[-1].reason == 'Stop sign ahead'  # a hold's reason around it
 
 
 # --- the route turn's junction the map has no signal for (2026-11-06: a right rolled on red at an unmapped signal) ---
@@ -283,8 +404,8 @@ def right_at(s_junction=200., mid=7, v=13.4):
   return car
 
 
-def test_unmapped_right_camera_red_stops_at_the_junction_line_and_holds():
-  from openpilot.selfdrive.turnpilot.map_controls import CONTROL_LINE_M, SIGNAL_UNSEEN_REASON, SIGNAL_UNSEEN_S
+def test_unmapped_right_camera_red_stops_at_the_junction_line_and_holds_until_a_steady_camera_green():
+  from openpilot.selfdrive.turnpilot.map_controls import CAMERA_GREEN_STEADY_S, CONTROL_LINE_M
   car = right_at()
   out, dec = car.run_until(held, lights=cam_junction('red', 215.))
   line = 200. - CONTROL_LINE_M
@@ -296,14 +417,14 @@ def test_unmapped_right_camera_red_stops_at_the_junction_line_and_holds():
   for _ in range(int(30. / DT_MDL)):
     out, dec, _ = car.step(lights=cam_junction('red', 215.))
     assert held(out, dec) and out.prompt == 'none'
-  # the camera reads green: never a go on the camera's green alone (no accepted source on the car); held, then handed
-  # back loudly after the stand
-  for _ in range(int((SIGNAL_UNSEEN_S - 0.5) / DT_MDL)):
+  # the camera reads green: the stop it added is TurnPilot's own, let go on its steady green (2026-11-06: until then every
+  # camera stop ended in the stand handback), never before CAMERA_GREEN_STEADY_S
+  for _ in range(int((CAMERA_GREEN_STEADY_S - 0.1) / DT_MDL)):
     out, dec, _ = car.step(lights=cam_junction('green', 215.))
     assert held(out, dec) and out.prompt == 'none'
-  out, dec, _ = car.run(1., lights=cam_junction('green', 215.))
-  assert held(out, dec) and out.prompt == 'signalUnseenTakeControl' and out.stops[0].reason == SIGNAL_UNSEEN_REASON
   assert abs(car.s - s_held) < 0.05
+  out, dec = car.run_until(lambda out, dec: not dec.should_stop, max_s=0.3, lights=cam_junction('green', 215.))
+  assert out.released_stopped and out.prompt == 'none'
 
 
 def test_unmapped_right_camera_red_released_by_an_accepted_green():
@@ -319,14 +440,23 @@ def test_unmapped_right_camera_red_released_by_an_accepted_green():
   assert car.s > 220.
 
 
-@pytest.mark.parametrize("state", ['green', 'unknown'])
-def test_unmapped_right_camera_green_or_unknown_adds_nothing(state):
+def test_unmapped_right_camera_green_read_before_the_stop_adds_nothing():
+  # the junction's head read green from far out: its signal is made (a light is there), and its steady green lets the turn
+  # go before its stop engages, so nothing slows the car
   base, car = right_at(), right_at()
   for _ in range(int(25. / DT_MDL)):
     a = base.step()
-    b = car.step(lights=cam_junction(state, 215.))
+    b = car.step(lights=cam_junction('green', 215.))
     assert a[0].stops == b[0].stops == [] and a[2] == b[2]
-  assert car.s > 300. and car.policy.camera_signal is None
+  assert car.s > 300.
+
+
+def test_unmapped_right_camera_head_of_unknown_colour_goes_with_the_model():
+  # Kellen, 2026-11-07: a colourless head makes no stop (no want of a green), and no handback for the unread light
+  car = right_at()
+  for _ in range(int(30. / DT_MDL)):
+    out, dec, _ = car.step(lights=cam_junction('unknown', 215.))
+    assert not held(out, dec) and out.prompt == 'none' and car.policy.camera_signal is None
 
 
 def test_unmapped_right_shadow_camera_red_adds_nothing():
@@ -444,12 +574,14 @@ def test_turnpilotd_unmapped_right_on_a_camera_red_stops_at_the_line_and_holds()
 
 
 def test_turnpilotd_unmapped_right_camera_green_goes():
-  # as with nothing read: through the junction on the turn, never stopped
-  base, sim = right_sim('addOnly', 'unknown'), right_sim('addOnly', 'green')
+  # as with no head there at all: through the junction on the turn, never stopped (its steady green read from far out)
+  base, sim = right_sim('addOnly', 'green', s_head=1000.), right_sim('addOnly', 'green')  # base: the head no junction's
   for _ in range(int(30. / DT_MDL)):
     a, b = base.step(), sim.step()
     assert (a.accelCap, a.speedCap, a.shouldStop, a.desire) == (b.accelCap, b.speedCap, b.shouldStop, b.desire)
   assert sim.s > 210. and not any(p.shouldStop for _, _, p in sim.trace)
+
+
 
 
 def test_turnpilotd_mapped_signal_right_on_a_camera_red_stops_at_its_line_first():

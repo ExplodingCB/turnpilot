@@ -60,9 +60,13 @@ def test_turnpilot_chimes_load_and_differ():
   from openpilot.selfdrive.ui.soundd import Soundd, sound_list
   s = Soundd()
   tp = [name for name, value in AudibleAlert.schema.enumerants.items() if name.startswith('tp')]
-  assert len(tp) == 5 and all(AudibleAlert.schema.enumerants[name] in sound_list for name in tp)
+  assert len(tp) == 7 and all(AudibleAlert.schema.enumerants[name] in sound_list for name in tp)
   left, right = s.loaded_sounds[AudibleAlert.tpLaneChangeLeft], s.loaded_sounds[AudibleAlert.tpLaneChangeRight]
   assert len(left) == len(right) and not (left == right).all()
+  # the driver's prompt to signal (2026-11-07): each side's own chime, on repeat, very clear left from right
+  sl, sr = s.loaded_sounds[AudibleAlert.tpSignalLeft], s.loaded_sounds[AudibleAlert.tpSignalRight]
+  assert len(sl) == len(sr) > len(left) and not (sl == sr).all()
+  assert sound_list[AudibleAlert.tpSignalLeft][1] is None and sound_list[AudibleAlert.tpSignalRight][1] is None
 
 
 def test_turnpilot_handback_ramps_like_warning_soft():

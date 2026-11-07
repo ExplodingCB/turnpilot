@@ -584,7 +584,12 @@ def test_unprotected_turn_from_map_data():
   assert not unprotected_turn(m('turn', 'right', after=90.), True)       # curb side
   assert unprotected_turn(m('turn', 'right', after=90.), False)          # driving on the left, a right is the far side
   assert not unprotected_turn(m('turn', 'left'), False)
-  assert not unprotected_turn(m('turn', 'slight left', after=330.), True)  # a keep
+  # a slight left across an oncoming approach is a turn since 11-06 (route_follower.slight_far_turn: 1e seg 5 and 1d seg 9's
+  # slight lefts of 29 and 38 deg were keeps, driven straight): unprotected. Under SLIGHT_TURN_MIN_DEG, or with no oncoming
+  # approach (or one not known), a keep as before
+  assert unprotected_turn(m('turn', 'slight left', after=330.), True)
+  assert not unprotected_turn(m('turn', 'slight left', after=340.), True)  # 20 deg: a keep
+  assert not unprotected_turn(m('turn', 'slight left', opposing='none', after=330.), True)
   assert not unprotected_turn(m('turn', 'left', branches=0), True)        # a bend: the model's, not a turn
   assert not unprotected_turn(None, True)
 
@@ -1365,7 +1370,7 @@ def test_the_turn_light_is_the_signal_at_the_lefts_junction_from_any_source():
   car.run(0.1, lights=lambda car: lights('red', 239. - car.s))
   assert car.policy.turn_light(7, 250. - car.s) == 'red'
   car.run(0.1)
-  assert car.policy.turn_light(7, 250. - car.s) == 'unknown'
+  assert car.policy.turn_light(7, 250. - car.s) == 'none'  # unread: no reason to wait (Kellen, 2026-11-07)
   shadow = Lights(None, 'none', camera=CameraLights([('red', 250. + 20. - car.s)], shadow=True))
   car.run(0.1, lights=shadow)
   assert car.policy.turn_light(7, 250. - car.s) == 'red'
@@ -1374,7 +1379,7 @@ def test_the_turn_light_is_the_signal_at_the_lefts_junction_from_any_source():
   assert car.policy.turn_light(7, 250. - car.s) == 'yellow'
   # a light past the junction's window (the next junction on) isn't its
   car.run(0.1, lights=Lights(None, 'none', camera=CameraLights([('red', 250. + 60. - car.s)], shadow=True)))
-  assert car.policy.turn_light(7, 250. - car.s) == 'unknown'
+  assert car.policy.turn_light(7, 250. - car.s) == 'none'
   # another maneuver's junction isn't this one's
   assert car.policy.turn_light(8, 400.) == 'none'
   # navd's controls failing (no junction data is never clear): whether there is a signal isn't known, so its light isn't

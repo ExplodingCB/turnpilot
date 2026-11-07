@@ -862,6 +862,8 @@ struct SelfdriveState {
     tpLaneChangeAbort @13;
     tpTooFastTurn @14;
     tpHandback @15;
+    tpSignalLeft @16;   # the driver prompted to signal: the side's chime on repeat until their lamp is lit
+    tpSignalRight @17;
   }
 
   enum OpenpilotState @0xdbe58b96d2d1ac61 {

@@ -13,7 +13,9 @@ from openpilot.selfdrive.turnpilot.hooks import CLEAR_DESIRE, plan_events
 from openpilot.selfdrive.turnpilot.route_follower import LEFT, NONE, TURN, RouteFollower, maneuver_from_instruction
 from openpilot.selfdrive.turnpilot.tests.synthetic import FakeNavd, junction_of, nav_instruction
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Sim
-from openpilot.selfdrive.turnpilot.turn_skip import MIN_FIRST_PULSE_M, SKIP_CONFIRM_FRAMES, TurnSkip, can_make_turn, safe_turn_speed
+from openpilot.selfdrive.turnpilot.turn_skip import (CURB_FIRST_PULSE_M, FAR_FIRST_PULSE_MIN_M, MIN_FIRST_PULSE_M, SKIP_CONFIRM_FRAMES,
+                                                      STANDING_PULSE_MIN_M, STANDING_PULSE_V, TurnSkip, can_make_turn, first_pulse_latest,
+                                                      safe_turn_speed)
 from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP
 
 Desire = log.Desire
@@ -210,14 +212,18 @@ def test_turn_ahead_of_a_bend_too_close_for_its_first_pulse_is_announced_skipped
   bend = maneuver_from_instruction(nav_instruction(0., "turn", "right", junction=junction_of("right", 0, 60.)))
   left = maneuver_from_instruction(nav_instruction(30., "turn", "left", junction=junction_of("left")))
   assert bend.kind == NONE and left.kind == TURN
-  state = skip.update(bend, 0., 1, 4., False, ahead=left, ahead_distance=30.)
+  # at 7 m/s, where a far-side turn's deadline is MIN_FIRST_PULSE_M (first_pulse_latest)
+  state = skip.update(bend, 0., 1, 7., False, ahead=left, ahead_distance=30.)
   assert not state.skipped and state.feasible_now and not state.ahead_skipped
-  state = skip.update(bend, 0., 1, 4., False, ahead=left, ahead_distance=MIN_FIRST_PULSE_M - 1.)
+  state = skip.update(bend, 0., 1, 7., False, ahead=left, ahead_distance=MIN_FIRST_PULSE_M - 1.)
   assert not state.skipped and state.feasible_now and state.ahead_skipped
   # not while openpilot isn't steering (no first pulse would go, nor is the turn skipped under the driver)
-  assert not skip.update(bend, 0., 1, 4., False, lat_active=False, ahead=left, ahead_distance=5.).ahead_skipped
+  assert not skip.update(bend, 0., 1, 7., False, lat_active=False, ahead=left, ahead_distance=5.).ahead_skipped
+  # nor at or past its junction, nor standing or crawling STANDING_PULSE_MIN_M or more short of it (as tooLate itself)
+  for ahead_distance, v in ((0., 7.), (-4.8, 7.), (12.3, 0.39), (STANDING_PULSE_MIN_M, 0.)):
+    assert not TurnSkip().update(bend, 0., 1, v, False, ahead=left, ahead_distance=ahead_distance).ahead_skipped, (ahead_distance, v)
   # once it is the maneuver, it is skipped as too late
-  assert skip.update(left, MIN_FIRST_PULSE_M - 6., 2, 4., False).skipped
+  assert skip.update(left, MIN_FIRST_PULSE_M - 6., 2, 7., False).skipped
 
 
 def test_a_turn_waiting_past_a_wrong_way_opening_is_too_late_only_past_it():
@@ -283,7 +289,7 @@ def test_a_turn_whose_first_pulse_is_its_go_is_never_too_late():
     state = skip.update(left, d, 1, 3., False, pulse_at_go=True)
     assert not state.skipped, d
   # without it, as before
-  assert TurnSkip().update(left, MIN_FIRST_PULSE_M - 1., 1, 3., False).skipped
+  assert TurnSkip().update(left, MIN_FIRST_PULSE_M - 1., 1, 7., False).skipped
 
 
 @pytest.mark.parametrize("stop_infeasible", [False, True], ids=["tooFast", "unprotectedStop"])
@@ -340,3 +346,412 @@ def test_a_turn_engaged_for_inside_its_stopping_distance_is_driven_under_always_
       plans.append(sim.step(engaged=True))
     assert any(p.tooFastToTurn for p in plans) == want_skip, always_drive
     assert any(p.desire == Desire.turnLeft for p in plans) == (not want_skip), always_drive
+
+
+RIGHT_M = maneuver_from_instruction(nav_instruction(40., "turn", "right", junction=junction_of("right")))
+LEFT_M = maneuver_from_instruction(nav_instruction(40., "turn", "left", junction=junction_of("left")))
+END_LEFT_M = maneuver_from_instruction(nav_instruction(40., "end of road", "left", junction=junction_of("left", opposing='none')))
+
+
+def test_engaged_standing_short_of_a_turn_is_never_too_late():
+  """1d 4:54.0 (engaged standing 9.9 m from a right, v 0.0) and 1e 2:07.7 (12.3 m from an end-of-road left, v 0.39): both
+  were skipped tooLate at once, 'Too Fast to Turn' at 0 mph, and both drives ended in a disengagement (gas at 2:14.9, brake
+  and steer at 4:57.1). A car under STANDING_PULSE_V STANDING_PULSE_MIN_M or more short of its junction is never too late:
+  it pulses from where it is, a turn from the line as a hold's go is."""
+  for m, d, v in ((RIGHT_M, 9.9, 0.), (END_LEFT_M, 12.3, 0.39), (LEFT_M, 20., 1.4), (RIGHT_M, STANDING_PULSE_MIN_M, 0.), (LEFT_M, 24., 0.)):
+    state = TurnSkip().update(m, d, 1, v, False)
+    assert not state.skipped and state.feasible_now, (m.side, d, v)
+  # moving, inside its deadline: still too late (a far-side turn 20 m out at turning speed, 9 m out at 1.6 m/s; a curb-side
+  # one 4 m out). The plan's "1.6 m/s at 20 m" was written against the flat 40 m lead: a far-side turn at 1.6 m/s now pulses
+  # 15 m out (desire_timing.turn_lead) and a curb-side one 8 m out, so 20 m isn't late for either
+  for m, d, v in ((LEFT_M, 20., 7.), (LEFT_M, 9., STANDING_PULSE_V + 0.1), (RIGHT_M, 4., STANDING_PULSE_V + 0.1), (RIGHT_M, 4., 3.)):
+    assert TurnSkip().update(m, d, 1, v, False).skipped, (m.side, d, v)
+  assert not TurnSkip().update(LEFT_M, 20., 1, STANDING_PULSE_V + 0.1, False).skipped
+  # standing or crawling, but under STANDING_PULSE_MIN_M: still too late (a first pulse there turns the car into the curb)
+  for m in (LEFT_M, RIGHT_M, END_LEFT_M):
+    assert TurnSkip().update(m, 3., 1, 0.3, False).skipped, m.side
+
+
+@pytest.mark.parametrize("v", [0., 3., 7.])
+@pytest.mark.parametrize("distance", [0., -4.8, -12.1])
+def test_never_too_late_at_or_past_the_junction(distance, v):
+  """1e 8:36.47: tooLate at -12.1 m for a right finished 4 s before (a one-message navd blip made it a new maneuver behind
+  the car), and 1e 9:43.5 at -4.8 m (a stale reroute's first step): both said 'Too Fast to Turn / Rerouting' for a turn the
+  car had made. No first pulse goes at or past a junction (desire_timing.py), so tooLate never fires there; nor the announced
+  skip of one ahead of a bend."""
+  for m in (LEFT_M, RIGHT_M):
+    skip = TurnSkip()
+    skip.update(m, distance, 1, v, False)
+    assert skip.reason != 'tooLate', (m.side, distance, v)
+  bend = maneuver_from_instruction(nav_instruction(0., "turn", "right", junction=junction_of("right", 0, 60.)))
+  assert not TurnSkip().update(bend, 0., 1, v, False, ahead=RIGHT_M, ahead_distance=distance).ahead_skipped
+
+
+def test_the_first_pulse_deadline_is_always_short_of_its_lead():
+  """turn_skip's tooLate deadline follows the pulse's own timing (desire_timing.turn_lead, 2026-11-06), never ahead of it at
+  any speed: a far-side turn's lead is FAR_LEAD_S out (15-40 m) and its deadline FIRST_PULSE_S out (10-25 m); a curb-side
+  turn's one pulse goes 8 m out and its deadline is CURB_FIRST_PULSE_M. Mirrored where traffic keeps left."""
+  from openpilot.selfdrive.turnpilot.desire_timing import CURB_TURN_PULSE_M, turn_lead
+  for rht in (True, False):
+    far, curb = (LEFT_M, RIGHT_M) if rht else (RIGHT_M, LEFT_M)
+    for k in range(300):
+      v = k * 0.1
+      for m in (far, curb):
+        assert first_pulse_latest(m, v, rht) <= turn_lead(m, v, rht) - 3., (rht, m.side, v)
+      assert first_pulse_latest(curb, v, rht) == CURB_FIRST_PULSE_M < CURB_TURN_PULSE_M
+      assert FAR_FIRST_PULSE_MIN_M <= first_pulse_latest(far, v, rht) <= MIN_FIRST_PULSE_M
+    assert first_pulse_latest(far, 7., rht) == MIN_FIRST_PULSE_M  # at turning speed, the 25 m it was
+
+
+def start_standing(maneuvers, stand_s=3., pull_away=4., seconds=10.):
+  """Sim: engaged standing at s 0 (the model holding the car) for stand_s, then pulling away toward pull_away m/s. The
+  plans."""
+  sim = Sim(maneuvers, cruise=pull_away)
+  sim.v = 0.
+  sim.accel = lambda sim, plan: 0.
+  plans = [sim.step(engaged=True) for _ in range(int(stand_s / DT_MDL))]
+  sim.accel = None
+  turning = maneuvers[0][0]
+  while sim.t < seconds:
+    yaw = -sim.v / 8. if maneuvers[0][2] == 'right' and abs(turning - sim.s) < 6. else \
+      (sim.v / 10. if maneuvers[0][2] == 'left' and abs(turning - sim.s) < 8. else 0.)
+    plans.append(sim.step(engaged=True, yaw_rate=yaw))
+  return sim, plans
+
+
+def test_engaged_at_a_standstill_short_of_a_turn_it_is_driven_from_where_the_car_stands():
+  """Closed loop, as 1d 4:54 and 1e 2:07 were engaged: a right 12 m out standing is taken, its one pulse 8 m out once the car
+  pulls away (desire_timing.CURB_TURN_PULSE_M); the end-of-road left 12.3 m out pulses at once, standing, inside its lead's
+  15 m floor. Neither is skipped, nor said 'Too Fast to Turn'."""
+  from openpilot.selfdrive.turnpilot.desire_timing import CURB_TURN_PULSE_M
+  sim, plans = start_standing([(12., "turn", "right", junction_of("right")), (900., "turn", "left", junction_of("left"))])
+  assert not any(p.tooFastToTurn for p in plans)
+  edges = [(s, v) for (s, v, p), (_, _, q) in zip(sim.trace[1:], sim.trace, strict=False) if p.desire == Desire.turnRight and q.desire != Desire.turnRight]
+  assert len(edges) == 1 and CURB_TURN_PULSE_M - 0.5 < 12. - edges[0][0] < CURB_TURN_PULSE_M + 0.5, edges
+  sim, plans = start_standing([(12.3, "end of road", "left", junction_of("left", opposing='none')),
+                               (900., "turn", "right", junction_of("right"))])
+  assert not any(p.tooFastToTurn for p in plans)
+  first = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
+  assert first < 5, first  # at once, standing
+
+
+def test_a_curb_side_turn_is_judged_by_the_reading_its_pulse_goes_by():
+  """A curb-side turn's one pulse goes by the furthest reading of its junction (desire_timing.pulse_distance), so turn_skip
+  judges it by the same reading (update's far): a reading 20 m short at 28 m out at the cap's 5.4 m/s is no tooFast skip
+  (test_turnpilotd's GPS bias case: the pulse waits for the true 8 m, the cap brakes for the nearest meanwhile), nor is a
+  4 m nearest with the furthest 12 m out too late; once the furthest is inside its deadline it is, and past the junction by
+  the nearest it never is. Without a furthest, the nearest as before. A far-side turn is judged by the nearest."""
+  for _ in range(SKIP_CONFIRM_FRAMES + 1):
+    skip = TurnSkip()
+    state = skip.update(RIGHT_M, 8.4, 1, 5.42, False, far=28.2)
+  assert not state.skipped and state.feasible_now
+  skip = TurnSkip()
+  states = [skip.update(RIGHT_M, 8.4, 1, 5.42, False) for _ in range(SKIP_CONFIRM_FRAMES)]
+  assert states[-1].skipped and skip.reason == 'tooFast'  # by the nearest alone
+  assert not TurnSkip().update(RIGHT_M, 4., 1, 3., False, far=12.).skipped
+  assert TurnSkip().update(RIGHT_M, 3., 1, 3., False, far=4.5).skipped
+  assert TurnSkip().update(RIGHT_M, 4., 1, 3., False).skipped  # no far: the nearest
+  skip = TurnSkip()
+  skip.update(RIGHT_M, -1., 1, 3., False, far=-0.5)
+  assert skip.reason != 'tooLate'  # first seen past the junction by every reading: never
+  skip = TurnSkip()
+  skip.update(RIGHT_M, -1., 1, 3., False, far=4.)
+  assert skip.reason == 'tooLate'  # ...but split across it, no pulse can go by the nearest: said at once (2026-11-06)
+  # standing: by the furthest too (5 m or more short of it, never too late)
+  assert not TurnSkip().update(RIGHT_M, 3., 1, 0.2, False, far=6.).skipped
+  # a far-side turn: the nearest, whatever the furthest
+  assert TurnSkip().update(LEFT_M, 20., 1, 7., False, far=40.).skipped
+
+
+def test_a_turn_whose_nearest_crosses_its_junction_with_no_first_pulse_is_skipped_out_loud():
+  """No first pulse goes past a junction by the nearest (desire_timing.py: a late pulse is the dangerous one), so a turn that
+  gets there unpulsed is lost: 1e 8:32 (a 91 deg right, one follower over the whole drive) had its furthest reading still
+  8.8 m out with the nearest at the junction, and its pulse by the furthest never went, with no skip, alert or prompt. A turn
+  whose nearest crosses the junction with openpilot steering and no first pulse out is skipped tooLate there and then (navd
+  reroutes, the driver hears it). Only on the crossing: a turn first seen past its junction (1e 8:36's phantom, 9:43's stale
+  reroute) or first steered for there (a re-engage after the driver's own turn) is not, nor one whose desire went out, nor
+  one whose first pulse is its hold line's go (pulse_at_go)."""
+  for kw in ({'far': 9.}, {}, {'far': 9., 'last': 7.}):
+    skip = TurnSkip()
+    assert not skip.update(RIGHT_M, 20., 1, 3., False, **kw).skipped  # approached from outside its deadline
+    assert not skip.update(RIGHT_M, 0.3, 1, 3., False, **kw).skipped
+    state = skip.update(RIGHT_M, -0.1, 1, 3., False, **kw)
+    assert state.skipped and not state.feasible_now and skip.reason == 'tooLate', kw
+    assert skip.update(RIGHT_M, -0.3, 1, 3., False, **kw).skipped  # latched
+  # the desire out: never
+  skip = TurnSkip()
+  skip.update(RIGHT_M, 0.3, 1, 3., True, far=9.)
+  assert not skip.update(RIGHT_M, -0.1, 1, 3., True, far=9.).skipped
+  # openpilot not steering on the update before (the driver's turn, engaged in the junction): never
+  skip = TurnSkip()
+  skip.update(RIGHT_M, 0.3, 1, 3., False, lat_active=False, far=9.)
+  assert not skip.update(RIGHT_M, -0.1, 1, 3., False, far=9.).skipped
+  # nor once openpilot is off
+  skip = TurnSkip()
+  skip.update(RIGHT_M, 0.3, 1, 3., False, far=9.)
+  assert not skip.update(RIGHT_M, -0.1, 1, 3., False, lat_active=False, far=9.).skipped
+  # nor a turn whose first pulse is its hold line's go
+  skip = TurnSkip()
+  skip.update(LEFT_M, 0.3, 1, 0., False, pulse_at_go=True)
+  assert not skip.update(LEFT_M, -0.1, 1, 0., False, pulse_at_go=True).skipped
+  # a new maneuver past its junction by every reading from its first: never (test_never_too_late_at_or_past_the_junction)
+  skip = TurnSkip()
+  skip.update(RIGHT_M, 0.3, 1, 3., False, far=9.)
+  assert not skip.update(RIGHT_M, -0.1, 2, 3., False, far=-0.1).skipped
+  # ...but first seen with its readings split across the junction (a reroute's same junction carrying a short outlier as its
+  # nearest: test_route_follower), the furthest short of it: no pulse can go by the nearest, so it is said at once
+  skip = TurnSkip()
+  skip.update(RIGHT_M, 0.3, 1, 3., False, far=9.)
+  state = skip.update(RIGHT_M, -0.1, 2, 3., False, far=9.)
+  assert state.skipped and skip.reason == 'tooLate'
+  skip = TurnSkip()  # only on its first update: a later one past the junction with no crossing seen (openpilot off before) is not
+  skip.update(RIGHT_M, -0.1, 3, 3., False, lat_active=False, far=9.)
+  assert not skip.update(RIGHT_M, -0.2, 3, 3., False, far=9.).skipped
+  # standing: a new reading puts the nearest past the junction under a car stopped short of it (a queue, a red): skipped too
+  skip = TurnSkip()
+  skip.update(RIGHT_M, 6., 1, 0., False, far=9.)
+  assert skip.update(RIGHT_M, -1., 1, 0., False, far=9.).skipped and skip.reason == 'tooLate'
+  # a far-side turn too: one waiting past a wrong-way opening 4 m short of its junction has no deadline short of it
+  # (desire_timing.first_pulse_by: 4 - 2 - 3 m, at least 0)
+  left = maneuver_from_instruction(nav_instruction(30., "turn", "left", junction=junction_of("left"), wrong_way=4.))
+  skip = TurnSkip()
+  assert not skip.update(left, 0.4, 1, 3., False).skipped
+  assert skip.update(left, -0.1, 1, 3., False).skipped and skip.reason == 'tooLate'
+
+
+def test_without_the_reading_its_pulse_goes_by_a_curb_side_turn_approached_under_openpilot_is_its_pulses_to_time():
+  """turnpilotd hands TurnSkip neither the furthest nor the latest reading (DesireTiming has the furthest): judged by the
+  nearest's 5 m deadline, a right whose readings spread 3 m or more was skipped tooLate before its pulse by the furthest was
+  due (closed loop, the probe's +4/+6/+9 m long and -4/-6 m short: all skipped; 3 of the 8 logged rights). So without them
+  the nearest's deadline holds for a curb-side turn only until openpilot has steered for it, without a break, from outside it:
+  a turn that comes up inside it (navd past a bend 10 m before it) or that openpilot engages for there is still skipped; one
+  approached from outside it is its pulse's to time, and its nearest crossing the junction unpulsed is skipped out loud.
+  Given the furthest, the deadline is by the pulse's reading on every update, as before."""
+  def approach(skip, to_m, kw=None, lat_from=None):
+    for k in range(60):
+      d = 20. - k * (20. - to_m) / 59.
+      state = skip.update(RIGHT_M, d, 1, 3., False, lat_active=lat_from is None or d <= lat_from, **(kw or {}))
+    return state
+  assert not approach(TurnSkip(), 4.).skipped
+  assert not approach(TurnSkip(), 0.).skipped  # at the junction itself: the crossing's
+  # given the furthest: the deadline by it (5 m) on every update
+  skip = TurnSkip()
+  state = approach(skip, 4., {'far': 4.5})
+  assert state.skipped and skip.reason == 'tooLate'
+  # first seen inside the deadline, or first steered for there (engaged late, or again after a break): skipped
+  assert TurnSkip().update(RIGHT_M, 4., 1, 3., False).skipped
+  skip = TurnSkip()
+  assert approach(skip, 4., lat_from=4.).skipped and skip.reason == 'tooLate'
+  skip = TurnSkip()
+  approach(skip, 10.)
+  skip.update(RIGHT_M, 9., 1, 3., False, lat_active=False)
+  assert skip.update(RIGHT_M, 4., 1, 3., False).skipped
+  # a far-side turn: its deadline by the nearest as ever (25 m at turning speed)
+  skip = TurnSkip()
+  for d in (40., 30., 26.):
+    assert not skip.update(LEFT_M, d, 1, 7., False).skipped
+  assert skip.update(LEFT_M, 24., 1, 7., False).skipped
+
+
+def test_a_curb_side_turn_is_too_late_by_the_latest_reading_short_of_where_its_pulse_is_due_by_it():
+  """The curb-side pulse is due by the furthest at CURB_TURN_PULSE_M or by navd's latest reading at CURB_LATEST_PULSE_M
+  (desire_timing.pulse_distance); its tooLate deadline (CURB_FIRST_PULSE_M, 5 m, of that same reading) is 3 m by the latest,
+  always after the latest's pulse point, so a pulse it calls due is never one it calls too late."""
+  from openpilot.selfdrive.turnpilot.desire_timing import CURB_LATEST_PULSE_M, CURB_TURN_PULSE_M, pulse_distance
+  latest_deadline = CURB_FIRST_PULSE_M - (CURB_TURN_PULSE_M - CURB_LATEST_PULSE_M)
+  assert 0. < latest_deadline < CURB_LATEST_PULSE_M
+  assert TurnSkip().update(RIGHT_M, 2., 1, 3., False, far=12., last=latest_deadline - 0.5).skipped
+  assert not TurnSkip().update(RIGHT_M, 2., 1, 3., False, far=12., last=latest_deadline + 0.5).skipped
+  assert not TurnSkip().update(RIGHT_M, 2., 1, 3., False, far=12.).skipped  # by the furthest alone: 12 m, not late
+  for far in (3., 6., 8., 12., 30.):
+    for last_ in (2., 3.5, 5., 6., 9.):
+      d = pulse_distance(RIGHT_M, min(2., last_), far, last=last_)
+      due = d < CURB_TURN_PULSE_M
+      late = d < CURB_FIRST_PULSE_M
+      assert due or not late, (far, last_)
+  # a far-side turn: the latest no matter
+  assert pulse_distance(LEFT_M, 20., 40., last=3.) == 20.
+
+
+def test_a_curb_side_turn_is_short_of_its_junction_or_past_it_by_its_nearest_reading_alone():
+  """2026-11-06 review: a curb-side turn's crossing, its split and its deadline's own bound at the junction go by the nearest
+  reading, one reading alone included, as its first pulse does (desire_timing.py): with the furthest and the latest 9 m
+  ahead (one short outlier the nearest keeps, or one TRUE reading inside a lasting long bias: the same readings), the nearest
+  crossing the junction unpulsed is skipped tooLate out loud there. Judged by the second-nearest that round, the bias's right
+  was pulsed 0.3-2.3 m past its junction, nothing said (route_follower module docstring)."""
+  from openpilot.selfdrive.turnpilot.turn_skip import too_late
+  # the nearest crosses with the furthest and the latest 9 m ahead: skipped
+  skip = TurnSkip()
+  assert not skip.update(RIGHT_M, 0.3, 1, 3., False, far=9.3, last=9.3).skipped
+  state = skip.update(RIGHT_M, -0.1, 1, 3., False, far=8.9, last=8.9)
+  assert state.skipped and skip.reason == 'tooLate'
+  # first seen split across the junction by the nearest alone: skipped at once
+  skip = TurnSkip()
+  skip.update(RIGHT_M, 0.3, 1, 3., False, far=9.)
+  assert skip.update(RIGHT_M, -0.1, 2, 3., False, far=9.).skipped and skip.reason == 'tooLate'
+  # its deadline (CURB_FIRST_PULSE_M by the reading its pulse goes by) holds short of the junction, never past it
+  skip = TurnSkip()
+  skip.update(RIGHT_M, 20., 1, 3., False, far=29.)
+  assert skip.update(RIGHT_M, 4.6, 1, 3., False, far=CURB_FIRST_PULSE_M - 0.5, last=CURB_FIRST_PULSE_M - 0.5).skipped
+  assert skip.reason == 'tooLate'
+  assert not too_late(RIGHT_M, -0.1, 3., far=CURB_FIRST_PULSE_M - 0.5, last=CURB_FIRST_PULSE_M - 0.5)
+  # a far-side turn: the nearest's crossing as ever
+  skip = TurnSkip()
+  skip.update(LEFT_M, 0.3, 1, 3., False, far=9.)
+  assert skip.update(LEFT_M, -0.1, 1, 3., False, far=9.).skipped
+
+def test_a_crossing_is_seen_only_on_consecutive_updates_of_the_turn_itself():
+  """The stop-sign ladder's other turn stands in for the route's turn (turnpilotd hands TurnSkip None meanwhile: alt_replaced);
+  the route's turn coming back past its junction after it is no crossing seen with no pulse out, so no 'Too Fast to Turn' for
+  a turn the other one replaced (stop_go's turnMissed says that one)."""
+  skip = TurnSkip()
+  assert not skip.update(RIGHT_M, 20., 1, 3., False, far=29.).skipped
+  assert not skip.update(RIGHT_M, 0.4, 1, 3., False, far=9.4).skipped  # the furthest 9 m long: no pulse yet, nor too late
+  skip.update(None, 0.2, 1, 3., False)
+  assert not skip.update(RIGHT_M, -0.2, 1, 3., False, far=8.8).skipped
+  # the same updates with the turn's own in between: the crossing, skipped
+  skip = TurnSkip()
+  skip.update(RIGHT_M, 20., 1, 3., False, far=29.)
+  skip.update(RIGHT_M, 0.4, 1, 3., False, far=9.4)
+  assert skip.update(RIGHT_M, -0.2, 1, 3., False, far=8.8).skipped
+
+
+@pytest.mark.parametrize("pulse_at_go", [False, True], ids=["route", "decider"])
+@pytest.mark.parametrize("follow", [0., 0.05])
+def test_a_curb_side_pulse_held_while_the_model_steers_in_is_skipped_out_loud_at_its_deadline(pulse_at_go, follow):
+  """2026-11-06: a curb-side turn's one pulse waits while the model steers into the turn at a turn's scale with the car rolling
+  (desire_timing.py: STEER_IN_TURN_CURV; a fresh edge then restarts the model's turn, BeamNG right_green). Still waiting at
+  CURB_FIRST_PULSE_M, the car not following the model round (under OWN_FOLLOW_DEG since its steer-in: the model at 0.06 1/m
+  from 9 m at the cap's 3 m/s, the car yawing with none or a twentieth of it), it is skipped tooLate there, out loud, and no
+  pulse ever goes: never late into a model mid-steer, never at or past the junction, never lost in silence. The stop-sign
+  decider's right (pulse_at_go, rolling from a line further out than its pulse point) too: its go spares it only while the car
+  stands (test_a_curb_side_turns_go_spares_it_only_while_the_car_stands)."""
+  from openpilot.selfdrive.turnpilot.desire_timing import CURB_TURN_PULSE_M, OWN_FOLLOW_DEG, STEER_IN_TURN_CURV
+  from openpilot.selfdrive.turnpilot.tests.test_desire_timing import curb_turn
+  trace, dt_, skip = curb_turn(lambda d: 0.06 if d < 9. else 0., pulse_at_go=pulse_at_go, follow=follow)
+  at = next(i for i, (*_, sk) in enumerate(trace) if sk)
+  d, _, _, deg, _ = trace[at]
+  assert CURB_FIRST_PULSE_M - 3. * DT_MDL - 1e-6 <= d < CURB_FIRST_PULSE_M and skip.reason == 'tooLate', trace[at]
+  assert trace[at - 1][3] < OWN_FOLLOW_DEG and (follow == 0. or trace[at - 1][3] > 0.5), trace[at - 1]
+  assert all(desire != Desire.turnRight for _, desire, *_ in trace) and not dt_.started
+  assert all(not sk for dd, *_, sk in trace if dd >= CURB_FIRST_PULSE_M)  # nothing said before its deadline...
+  assert any(c >= STEER_IN_TURN_CURV for dd, _, c, *_ in trace if dd < CURB_TURN_PULSE_M)  # ...the pulse waiting from 8 m
+
+
+def brake_to(line, v0=3., a=2.):
+  """A speed profile v(d, v) braking at a to a stand at a line m before the junction, from v0."""
+  def f(d, _v):
+    return min(v0, math.sqrt(2. * a * max(d - line, 0.)))
+  return f
+
+
+def to_a_line(line, curv=0., follow=0., hold=True, d0=30., seconds=20., go_after_s=2.):
+  """TurnSkip then DesireTiming each frame as turnpilotd runs them, a right d0 m ahead braking to a map stop at line m before
+  its junction (stop_d: MapControlPolicy.stop_ahead, the line's distance while the car is to stop there, 0 held at it), the
+  model steering in at curv from 10 m (the car yawing follow * v * curv); hold: the stop-sign decider's turn (its pulse held to
+  its go, pulse_at_go), else a red (the pulse not held). go_after_s standing at the line, the stop is released (stop_d None)
+  and the hold's go comes. Returns ([(d, v, desire, skipped)], TurnSkip, DesireTiming)."""
+  from openpilot.selfdrive.turnpilot.route_follower import Maneuver, classify
+  m = Maneuver(*classify("turn", "right"), "turn", "right", 90.)
+  dt_, skip, d, v, out, stood, released, gone = DesireTiming(), TurnSkip(), d0, 3., [], 0., False, False
+  speed = brake_to(line)
+  for _ in range(int(seconds / DT_MDL)):
+    v = 3. if gone else speed(d, v)
+    stood = stood + DT_MDL if v < 0.05 else stood
+    released = released or stood > go_after_s
+    go, gone = released and not gone, gone or released  # the hold's go: the one frame it lets go, standing
+    c = curv if d < 10. else 0.
+    stop_d = None if released else max(d - line, 0.)
+    st = skip.update(m, d, 1, v, dt_.started, stop_d=stop_d, pulse_at_go=hold and not dt_.done, far=d, last=d)
+    des = dt_.update(None if st.skipped else m, d, 1, False, v, 0., True, True, DT_MDL, -follow * v * c,
+                     may_start=st.feasible_now and not (hold and not released), go=go, holding=not released and v < 0.05,
+                     far=d, last=d, curvature=c)
+    out.append((round(d, 2), round(v, 2), des, st.skipped, go))
+    d -= v * DT_MDL
+  return [o[:4] for o in out], skip, dt_
+
+
+@pytest.mark.parametrize("line", [3., 4., 4.5, 6.])
+@pytest.mark.parametrize("hold, curv", [(True, 0.), (False, 0.), (False, 0.06)], ids=["decider", "red", "red_steer_in"])
+def test_a_right_braking_to_a_stop_line_inside_its_deadline_is_never_skipped_short_of_it(line, hold, curv):
+  """The 2026-11-06 review: TurnSkip judged a right by its 5 m deadline rolling whatever stood between the car and the junction,
+  so a right braking to a stop line 3-4 m from navd's node was skipped tooLate at about 4.9 m, rolling at 1.9-2.8 m/s, short
+  of the line it was stopping at: the stop-sign decider's right (its pulse held to the go, pulse_at_go: since 2026-11-06 a
+  curb-side one rolling is judged by its deadline), and a right braking to a red with the model steering in at a turn's scale
+  (its pulse waiting, the car not following it round). A map stop the car will stop at between it and the junction
+  (stop_d, MapControlPolicy.stop_ahead) puts the deadline off: the turn pulses from the line (standing: whatever the model
+  steers; the decider's go a pulse at once), never skipped short of it, never pulsed at or past the junction."""
+  trace, skip, dt_ = to_a_line(line, curv=curv, hold=hold)
+  assert not skip.skipped and not any(sk for *_, sk in trace), (skip.reason, next(o for o in trace if o[3]))
+  first = next(i for i, (_, _, des, _) in enumerate(trace) if des == Desire.turnRight)
+  d, v, _, _ = trace[first]
+  from openpilot.selfdrive.turnpilot.desire_timing import STANDSTILL_SPEED
+  assert 0. < d and (d >= CURB_FIRST_PULSE_M or v < STANDSTILL_SPEED), trace[first]  # rolling by its deadline, or standing
+  assert all(des == Desire.none for _, _, des, _ in trace[:first]) and dt_.started
+  # with no map stop between it and the junction (one past it, none, one behind the car) the deadline holds, as before
+  if line < CURB_FIRST_PULSE_M:
+    for stop_d in (None, 2., -1.):
+      st = TurnSkip()
+      st.update(RIGHT_M, 6., 1, 2.5, False, stop_d=stop_d, far=6., last=6.)
+      assert st.update(RIGHT_M, 4.9, 1, 2.5, False, stop_d=None if stop_d is None else stop_d + 1.1 if stop_d > 0. else stop_d,
+                       far=4.9, last=4.9).skipped == (stop_d is None or stop_d < 0. or stop_d + 1.1 > 4.9), stop_d
+
+
+def test_a_curb_side_turns_go_spares_it_only_while_the_car_stands():
+  """pulse_at_go (the stop-sign decider's turn, the autonomous left) made a turn never too late and never skipped on its
+  crossing: its first pulse is its go. A curb-side turn's go is its pulse only from a line within the pulse point
+  (desire_timing.CURB_TURN_PULSE_M + CURB_GO_SLACK_M); from one further out the pulse waits for the pulse point as the car
+  rolls, and waits there while the model steers in, so with pulse_at_go blocking both rails such a right was lost in silence.
+  Standing or crawling (under STANDING_PULSE_V) at a line inside its deadline it is spared, its go pulsing it at once; rolling,
+  its deadline holds; its nearest crossing the junction unpulsed is skipped however slow. A far-side turn's go is its first
+  pulse from wherever its line is: unchanged."""
+  # standing at a line 4 m out (inside the 5 m deadline), waiting for the decider's go: spared
+  skip = TurnSkip()
+  for _ in range(10):
+    assert not skip.update(RIGHT_M, 4., 1, 0., False, pulse_at_go=True, far=4., last=4.).skipped
+  # rolling past its deadline with no pulse out: skipped tooLate
+  skip = TurnSkip()
+  assert not skip.update(RIGHT_M, 6., 1, 3., False, pulse_at_go=True, far=6., last=6.).skipped
+  assert skip.update(RIGHT_M, 4.9, 1, 3., False, pulse_at_go=True, far=4.9, last=4.9).skipped and skip.reason == 'tooLate'
+  # crawling (1 m/s) inside it: spared to the junction, then skipped on the crossing
+  skip = TurnSkip()
+  assert not skip.update(RIGHT_M, 3., 1, 1., False, pulse_at_go=True, far=3., last=3.).skipped
+  assert not skip.update(RIGHT_M, 0.05, 1, 1., False, pulse_at_go=True, far=0.05, last=0.05).skipped
+  assert skip.update(RIGHT_M, -0.01, 1, 1., False, pulse_at_go=True, far=-0.01, last=-0.01).skipped and skip.reason == 'tooLate'
+  # its pulse out (the go's at the line, or the pulse point's): never
+  skip = TurnSkip()
+  for d in (4.9, 2., 0.05, -0.1):
+    assert not skip.update(RIGHT_M, d, 1, 3., True, pulse_at_go=True, far=d, last=d).skipped
+  # a far-side turn's go is its first pulse wherever its line is: never too late, never skipped on its crossing (as before)
+  skip = TurnSkip()
+  for d in (MIN_FIRST_PULSE_M - 1., 9., 0.3, -0.1):
+    assert not skip.update(LEFT_M, d, 1, 3., False, pulse_at_go=True).skipped, d
+
+
+def test_out_of_range_skip_is_gone_and_its_old_reason_still_read():
+  """turnpilotd stopped passing out_of_range on 2026-11-06 (lefts to the line: never route around or skip a left for range),
+  so its unprotectedRange branch was dead: removed. Logs before then can carry skipReason unprotectedRange; the module says
+  what it meant."""
+  import inspect
+  import openpilot.selfdrive.turnpilot.turn_skip as turn_skip
+  assert 'out_of_range' not in inspect.signature(TurnSkip.update).parameters
+  with pytest.raises(TypeError):
+    TurnSkip().update(LEFT_M, 100., 1, 10., False, out_of_range=True)  # pylint: disable=unexpected-keyword-arg
+  assert 'unprotectedRange' in turn_skip.__doc__
+  assert not TurnSkip().update(LEFT_M, 100., 1, 10., False).skipped
+
+
+@pytest.mark.parametrize("curvature", [0.05, 0.07, 0.12])
+@pytest.mark.parametrize("start", [12., 8.5])
+def test_the_models_own_curb_side_turn_with_the_car_following_it_is_never_skipped(curvature, start):
+  """Replayed over 1e with the logged model's curvature (a stress case: it ran under the old 40 m pulse and was turning), the
+  two engaged rights whose pulse waited had the car 10.7 and 13.4 deg round at the deadline, skipped 'Too Fast to Turn' by a
+  TURN_STARTED_DEG mark while the model drove them. The model steering in at a turn's scale with the car turning with it is
+  its own turn: OWN_TURN_DEG round on its approach (from 12 m: the car's turn counted from the model's steer-in, not from the
+  pulse point), or following it OWN_FOLLOW_DEG round once its pulse waits (from 8.5 m: at 0.05, a 20 m radius, 8.2 deg by the
+  deadline counted from 8 m, skipped there before 2026-11-06's review): never skipped, never pulsed."""
+  from openpilot.selfdrive.turnpilot.tests.test_desire_timing import curb_turn
+  trace, dt_, skip = curb_turn(lambda d: curvature if d < start else 0.)
+  assert all(desire != Desire.turnRight for _, desire, *_ in trace)
+  assert dt_.own and not skip.skipped and not any(sk for *_, sk in trace)
+  assert dt_.own_at > CURB_FIRST_PULSE_M

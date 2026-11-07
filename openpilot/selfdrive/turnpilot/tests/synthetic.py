@@ -15,20 +15,26 @@ def set_lanes(builder, field, lanes):
 
 def nav_instruction(distance, mtype="turn", modifier="left", remaining=None, lanes=(), valid=True, junction=None,
                     through=None, route_count=0, ahead=(), controls=(), controls_status=None, off_route=(), off_route_status=None,
-                    route_turns=None, wrong_way=0.):
+                    route_turns=None, wrong_way=0., route_heading_unverified=False, speed_limit=0.):
   """A navInstruction reader. lanes: ((directions, active), ...) left to right. junction: (bearing_before,
-  bearing_after, branches[, opposing[, opposing speed m/s[, opposing lanes[, opposing straight m]]]]) from Valhalla, or None for a
-  route without intersection data; opposing is NavInstruction.Opposing's name, unknown when left out; its speed, lanes and
-  straight span 0 (unknown). through: (lanes, distance).
+  bearing_after, branches[, opposing[, opposing speed m/s[, opposing lanes[, opposing straight m[, opposing rel deg]]]]]) from
+  Valhalla, or None for a route without intersection data; opposing is NavInstruction.Opposing's name, unknown when left out;
+  its speed, lanes and straight span 0 (unknown); opposing rel deg (maneuverOpposingRelBearing, + right of straight on) NaN
+  (unknown: the schema's default) when left out or None. through: (lanes, distance).
   route_count: navd's routeCount. ahead: the maneuvers after this one for allManeuvers, [(distance, type, modifier[,
   junction]), ...]; allManeuvers starts with this one, as navd's does. controls: map stop controls, [(id, kind, distance[,
   line_mapped, junction, cross_suspect[, junctionInfo dict]]), ...]; controls_status: navd's controlsStatus ('ok' when there are controls).
   off_route, off_route_status: offRouteControls as controls, and offRouteControlsStatus ('ok' when there are controls).
   route_turns: (routeTurns, routeTurnsStart, routeTurnsStep), the route's shape around the car, or None for none.
-  wrong_way: maneuverWrongWayM (and its allManeuvers entry's), m before the junction of an opening the car may not enter."""
+  wrong_way: maneuverWrongWayM (and its allManeuvers entry's), m before the junction of an opening the car may not enter.
+  route_heading_unverified: routeHeadingUnverified, navd's route waiting on its start direction check (navd heading_due).
+  speed_limit: speedLimit, m/s, the route's mapped limit at the car (navd speed_limit_at), 0 unknown: against a junction's
+  opposing speed, whether the road off a slight turn's far side is minor (routing/guidance.py docstring)."""
   msg = messaging.new_message('navInstruction', valid=valid)
   ni = msg.navInstruction
   ni.routeCount = route_count
+  ni.routeHeadingUnverified = bool(route_heading_unverified)
+  ni.speedLimit = float(speed_limit)
   maneuvers = [(distance, mtype, modifier, junction)] + [tuple(a) + (None,) * (4 - len(a)) for a in ahead]
   ni.init('allManeuvers', len(maneuvers))
   for m, (m_distance, m_type, m_modifier, m_junction) in zip(ni.allManeuvers, maneuvers, strict=True):
@@ -40,6 +46,8 @@ def nav_instruction(distance, mtype="turn", modifier="left", remaining=None, lan
       m.opposingSpeed = float(m_junction[4]) if len(m_junction) > 4 else 0.
       m.opposingLanes = int(m_junction[5]) if len(m_junction) > 5 else 0
       m.opposingStraightM = float(m_junction[6]) if len(m_junction) > 6 else 0.
+      if len(m_junction) > 7 and m_junction[7] is not None:
+        m.opposingRelBearing = float(m_junction[7])
   ni.allManeuvers[0].wrongWayM = ni.maneuverWrongWayM = float(wrong_way)
   ni.maneuverDistance = float(distance)
   ni.maneuverType = mtype
@@ -54,6 +62,8 @@ def nav_instruction(distance, mtype="turn", modifier="left", remaining=None, lan
     ni.maneuverOpposingSpeed = float(junction[4]) if len(junction) > 4 else 0.
     ni.maneuverOpposingLanes = int(junction[5]) if len(junction) > 5 else 0
     ni.maneuverOpposingStraightM = float(junction[6]) if len(junction) > 6 else 0.
+    if len(junction) > 7 and junction[7] is not None:
+      ni.maneuverOpposingRelBearing = float(junction[7])
   if through is not None:
     set_lanes(ni, 'throughLanes', through[0])
     ni.throughLanesDistance = float(through[1])
@@ -200,6 +210,15 @@ def car_state(v_ego=10., steering_angle_deg=0., left_blinker=False, right_blinke
   cs.brakePressed = brake_pressed
   cs.leftBlindspot, cs.rightBlindspot = left_blindspot, right_blindspot
   return msg.as_reader().carState
+
+
+def camera_state(exposure_pct, sensor='os04c10'):
+  """A narrowRoadCameraState reader: camerad's road frame metadata, exposureValPercent exposure_pct (% of the sensor's range:
+  this comma four read 0.01-0.13 by day, 3-10 at night; darkness.py), on sensor."""
+  msg = messaging.new_message('narrowRoadCameraState')
+  msg.narrowRoadCameraState.exposureValPercent = float(exposure_pct)
+  msg.narrowRoadCameraState.sensor = sensor
+  return msg.as_reader().narrowRoadCameraState
 
 
 def car_control(lat_active=True, enabled=False):

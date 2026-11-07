@@ -4,6 +4,7 @@ import pytest
 
 from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.turnpilot.desire_timing import CURB_FIRST_PULSE_M, CURB_GO_SLACK_M, CURB_TURN_PULSE_M
 from openpilot.selfdrive.turnpilot.hooks import plan_accel
 from openpilot.selfdrive.turnpilot.map_controls import RED_PAST_REASON
 from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of
@@ -12,6 +13,7 @@ from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import LEFT_AT_A_RED, S
 Desire = log.Desire
 TURNS = (Desire.turnLeft, Desire.turnRight)
 S_SIGNAL = 290.
+J_TURN = 300.  # the right's and the left's junction
 ROUTES = {'right': ([(300., "turn", "right", junction_of("right")), (2000., "turn", "left")], Desire.turnRight),
           'left': (LEFT_AT_A_RED, Desire.turnLeft),
           'straight': ([(2000., "turn", "right")], Desire.none)}
@@ -50,7 +52,18 @@ def test_no_turn_desire_lift_or_go_comes_on_a_red(maneuver, overrun):
   while sim.trace[-1][2].shouldStop:
     go.append(sim.step(engaged=True))
     assert len(go) < 100
-  assert go[-1].desire == want  # the go's pulse at standstill on the green (none straight on)
+  if maneuver == 'right' and J_TURN - sim.s > CURB_TURN_PULSE_M + CURB_GO_SLACK_M:
+    # a right let go further out than its one pulse (the 10 m line; 2026-11-06, desire_timing CURB_TURN_PULSE_M): no desire
+    # at the go, the car pulls away straight on the model, and the one pulse goes rolling on the green, 8 m out
+    assert go[-1].desire == Desire.none
+    rolled = []
+    while sim.trace[-1][2].desire != want:
+      rolled.append(sim.step(engaged=True))
+      assert J_TURN - sim.s > CURB_FIRST_PULSE_M, "the right's pulse never came"
+    assert all(p.desire == Desire.none for p in rolled[:-1]) and sim.v > 0.3 and J_TURN - sim.s <= CURB_TURN_PULSE_M + 0.5
+    assert not any(p.shouldStop for p in rolled) and light['state'] == 'green'
+  else:
+    assert go[-1].desire == want  # the go's pulse at standstill on the green (none straight on)
 
 
 def test_the_cameras_shadow_red_alone_holds_the_turn_desire_until_it_reads_green():

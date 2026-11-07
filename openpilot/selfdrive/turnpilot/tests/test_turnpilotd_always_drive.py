@@ -13,19 +13,20 @@ import pytest
 from openpilot.cereal import log, messaging
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
+from openpilot.selfdrive.turnpilot.desire_timing import CURB_TURN_PULSE_M
 from openpilot.selfdrive.turnpilot.go_override import GO_CLEAR_M, GO_END_SPEED, TAKEOVER_S
 from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN
 from openpilot.selfdrive.turnpilot.scene.tracker import RawFrame
-from openpilot.selfdrive.turnpilot.scene_policy import (CROSSWALK_X_AFTER_M, CROSSWALK_X_BEFORE_M, CROSSWALK_Y_FAR_M, CROSSWALK_Y_NEAR_M,
+from openpilot.selfdrive.turnpilot.scene_policy import (CROSSWALK_X_AFTER_M, CROSSWALK_X_BEFORE_M, CROSSWALK_Y_FAR_M, CROSSWALK_Y_NEAR_M, HOLD_LINE_M,
                                                          NO_ACCEL_CAP, SceneDecision)
 from openpilot.selfdrive.turnpilot.stop_go import Frame
 from openpilot.selfdrive.turnpilot.tests.test_camera_lights import detections
 from openpilot.selfdrive.turnpilot.tests.test_go_override import WARM_S
 from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of, model_v2
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, RIGHT_AT_A_CORNER, T_LEFT, WALKER, WALKER_CLEAR, WHITE, YELLOW, Sim,
-                                                                 go_from_a_red, model_stands_in_the_turn, oracle_lights, stand, stop_at,
-                                                                 walker_stops_the_car)
+                                                                 go_from_a_red, let_go_at_a_green, model_stands_in_the_turn, oracle_lights,
+                                                                 stand, stop_at, walker_stops_the_car)
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_go import attach_planner, holding, model_stops_at, raw_person
 from openpilot.selfdrive.turnpilot.unprotected_left import LIGHT_RED_MAX_S, STAND_UNDECIDED_S
 from openpilot.selfdrive.turnpilot.turnpilotd import (LEAD_STAND_MAX_S, LIGHT_GREEN_REASON, LIGHT_UNREAD_REASON, LIGHT_UNREAD_S, LIGHT_WAIT_NOTE,
@@ -36,6 +37,7 @@ from openpilot.selfdrive.turnpilot.turnpilotd import (LEAD_STAND_MAX_S, LIGHT_GR
                                                       STALL_MIN_DEG, STALL_PROMPT_S, STALL_REPULSE_S, STANDSTILL_SPEED, STOPPED_HANDBACK_S,
                                                       SIGN_CLEAR_M, SIGN_RUN_FRESH_S, STOPPED_NOTE, STOPPED_NOTE_S, TurnPilot,
                                                       UNSTICK_S)
+from openpilot.selfdrive.turnpilot.turnpilotd import HEAD_CLEAR_M, UNSTICK_REASON
 
 Desire = log.Desire
 
@@ -308,30 +310,36 @@ def test_a_scene_hold_let_go_on_a_straight_starts_the_release_clock():
 
 # --- ST-08: a cap-only hold the car came to rest under ---
 
-def test_a_cap_only_hold_the_car_came_to_rest_under_is_a_go_when_it_drops():
+@pytest.mark.parametrize("maneuvers,at,started", [(LEFT_AT_A_RED, 12., True), (RIGHT_AT_A_CORNER, HOLD_LINE_M + 0.25, False)],
+                         ids=['tLeft12m', 'rightAtItsHoldLine'])
+@pytest.mark.parametrize("on", [True, False])
+def test_a_cap_only_hold_the_car_came_to_rest_under_is_a_go_when_it_drops(maneuvers, at, started, on):
   """ALWAYS_DRIVE.md ST-08: a TurnPilot hold that only caps the speed (decision.holding, no shouldStop) with the car come to
-  rest under it counts as a hold under the switch: its drop is TurnPilot's go (release_go: the turn's pulse again, go_id),
-  keyed on the cap dropping, not the frame after the car stands. With the switch off nothing goes, as today."""
-  for on in (True, False):
-    sim = Sim(RIGHT_AT_A_CORNER, cruise=8.)
-    sim.tp.always_drive = on
-    while 300. - sim.s > 12.:
-      sim.step(engaged=True)
-      assert sim.t < 120.
-    assert sim.tp.desires.started
-    real = sim.tp.scene.update
-    cap = {'on': True}
+  rest under it counts as a hold under the switch: its drop is TurnPilot's go (release_go: the turn's pulse, go_id),
+  keyed on the cap dropping, not the frame after the car stands. With the switch off nothing goes, as today. A T's left 12 m
+  out, its desire out from its lead: the pulse again. A right's one pulse goes 8 m out (2026-11-06, desire_timing
+  CURB_TURN_PULSE_M), so one comes to rest at its hold line, short of it, with no desire out: its first pulse is the go's
+  (CURB_GO_SLACK_M)."""
+  want = Desire.turnLeft if maneuvers is LEFT_AT_A_RED else Desire.turnRight
+  sim = Sim(maneuvers, cruise=8.)
+  sim.tp.always_drive = on
+  while 300. - sim.s > at:
+    sim.step(engaged=True)
+    assert sim.t < 120.
+  assert sim.tp.desires.started is started
+  real = sim.tp.scene.update
+  cap = {'on': True}
 
-    def update(*a, real=real, cap=cap, **kw):
-      d = real(*a, **kw)
-      return SceneDecision(NO_ACCEL_CAP, 0.2, False, True, "pedestrian in crosswalk") if cap['on'] else d
-    with mock.patch.object(sim.tp.scene, 'update', side_effect=update):
-      held = stand(sim, 2.)
-      assert all(not q.shouldStop for q in held) and sim.tp.go_id is None, on
-      cap['on'] = False
-      q = stand(sim, DT_MDL)[0]
-    assert (sim.tp.go_id == sim.tp.follower.maneuver_id) is on, on
-    assert (q.desire == Desire.turnRight) is on, on
+  def update(*a, real=real, cap=cap, **kw):
+    d = real(*a, **kw)
+    return SceneDecision(NO_ACCEL_CAP, 0.2, False, True, "pedestrian in crosswalk") if cap['on'] else d
+  with mock.patch.object(sim.tp.scene, 'update', side_effect=update):
+    held = stand(sim, 2.)
+    assert all(not q.shouldStop for q in held) and sim.tp.go_id is None
+    cap['on'] = False
+    q = stand(sim, DT_MDL)[0]
+  assert (sim.tp.go_id == sim.tp.follower.maneuver_id) is on
+  assert (q.desire == want) is on
 
 
 # --- LEFT-21 (ST-03 (stalls)): a stall in a curb-side turn: a fresh pulse at 2 s, clearBox lifts from 3 s, then the handback ---
@@ -909,6 +917,86 @@ def test_a_stand_in_a_turn_never_gets_the_unstick_lift():
   assert any(q.controlPrompt == 'stalledTakeControl' for q in plans)
 
 
+# --- review 2026-11-07 (rails-1): the camera's head memory, every head of any bearing, and never after dark ---
+
+def heads_where(heads, where=lambda sim: True, read=lambda sim: True):
+  """The camera's reader (lightStatus read, add-only as on the car) on the frames read(sim) holds, none on the others (a wide
+  run's frame), publishing heads [(state, s of the head, governs)] on those where(sim) holds and none on the rest. governs
+  False: a head off the lane's bearing, which map_controls.camera_light_input drops (1e 10:24: 126 of 128 road reads at its
+  stand had heads, at -15 deg, none governing)."""
+  none = messaging.new_message('turnpilotLights').as_reader().turnpilotLights
+
+  def lights(sim):
+    if read(sim):
+      msg = messaging.new_message('turnpilotDetections')
+      td = msg.turnpilotDetections
+      td.camera, td.lightStatus = 'road', 'read'
+      td.lights.source, td.lights.shadow = 'camera', False
+      shown = heads if where(sim) else ()
+      td.lights.lights = [{'state': st, 'distance': s - sim.s, 'governs': gov, 'votes': 4, 'conf': 0.7} for st, s, gov in shown]
+      sim.sm.put('turnpilotDetections', msg.as_reader().turnpilotDetections)
+    return none
+  return lights
+
+
+def approaching(near_m, far_m):
+  """where(): the car between far_m and near_m short of STAND_AT_M, on the approach."""
+  return lambda sim: STAND_AT_M - far_m < sim.s < STAND_AT_M - near_m
+
+
+@pytest.mark.parametrize('heads, where', [
+  ((('red', STAND_AT_M + 22., False),), None),                                            # a red off the lane's bearing
+  ((('unknown', STAND_AT_M + 20., False), ('unknown', STAND_AT_M + 24., False)), None),   # 1e 10:24's: unknown, not governing
+  ((('unknown', STAND_AT_M + 22., True),), approaching(15., 40.)),                        # read on the approach only (1d 5:32)
+  ((('red', STAND_AT_M + 22., False),), approaching(15., 40.)),
+])
+def test_a_head_of_any_bearing_read_at_the_stand_or_on_its_approach_bars_the_unstick_lift(heads, where):
+  """An unmapped signal straight on, the car first in line, the model holding it at the red. The gate read one frame's governing
+  heads, so heads all read off the lane's bearing, a red among them, or read only on the approach (the stand's reads with
+  none), passed as no signal, and at 10 s the lift went over the line ('Nothing ahead is holding the car: going on'; probe
+  wf4 lens_rails, 4 of 4). Every head of any colour or bearing in the last HEAD_CLEAR_M driven bars it, however long the stand."""
+  sim, plans = stood_off_any_hold(True, UNSTICK_S + 5., lights=heads_where(heads, where or (lambda sim: True)))
+  assert sim.tp.map_controls._lights.camera is not None and not sim.tp.map_controls._lights.camera.heads  # no governing head
+  assert not unstick_spans(plans), heads
+  assert not any(str(q.controlAlert) == 'unstickLift' for q in plans) and not any(q.reason == UNSTICK_REASON for q in plans)
+  assert sim.tp.unstick_veto() == 'camera'
+
+
+def test_a_head_read_further_back_than_head_clear_m_or_none_at_all_leaves_the_unstick_lift():
+  """The memory is metres driven, bounded: heads read until HEAD_CLEAR_M + 10 m short of the stand, none after, and none at all,
+  the stand still gets its one lift at UNSTICK_S (a genuinely unsignalized stand: section 4.5 stays)."""
+  for where in (lambda sim: sim.s < STAND_AT_M - HEAD_CLEAR_M - 10., lambda sim: False):
+    sim, plans = stood_off_any_hold(True, UNSTICK_S + 2., lights=heads_where((('unknown', STAND_AT_M + 300., False),), where))
+    assert len(unstick_spans(plans)) == 1
+
+
+def test_metres_driven_with_no_road_read_never_clear_the_head_memory():
+  # the reader reads only once the car stands (its approach all wide camera, or the reader in its backoff): the road it drove
+  # wasn't read, so a head there can't be ruled out, and the stand's reads with none never clear it
+  sim, plans = stood_off_any_hold(True, UNSTICK_S + 4., lights=heads_where((), read=lambda sim: sim.v < STANDSTILL_SPEED))
+  assert not unstick_spans(plans) and sim.tp.head_clear_m == 0.
+  # the memory unit: a head resets it, a fresh read with none adds the metres driven, standing adds nothing
+  tp = TurnPilot()
+  sim = Sim(STRAIGHT)
+  for heads, v, after in (((('red', 50., False),), 10., 0.), ((), 10., 10. * DT_MDL), ((), 0., 10. * DT_MDL)):
+    heads_where(heads)(sim)
+    tp.watch_heads(sim.sm, v)
+    assert abs(tp.head_clear_m - after) < 1e-9, (heads, v)
+
+
+def test_after_dark_no_stand_gets_the_unstick_lift_and_none_is_released_unsignalized():
+  """At night the camera can't vouch for no signal (1d 6:34 stood at a mapped signal whose heads no road read had in its last
+  188 m): the unstick never lifts there, nothing read, and the stand ends in its loud handback as any other; so does LEFT-20's
+  release where navd maps no signal."""
+  with mock.patch.object(TurnPilot, 'dark', new_callable=mock.PropertyMock, return_value=True):
+    sim, plans = stood_off_any_hold(True, STOPPED_HANDBACK_S + 1.)
+    assert sim.tp.dark and sim.tp.unstick_veto() == 'dark'
+    assert not unstick_spans(plans) and not any(str(q.controlAlert) == 'unstickLift' for q in plans)
+    assert plans[-1].controlPrompt == 'carStoppedTakeControl'
+    assert certified_causes(released_where_no_signal_is(True)) == set()
+  assert certified_causes(released_where_no_signal_is(True)) == {'turnRelease'}  # by day as before
+
+
 # --- SC-02 (unconditional): the right-turn crosswalk hold's standoff ---
 
 def held_at_the_corner(on: bool, walker):
@@ -965,19 +1053,23 @@ def test_a_walker_moving_in_the_crosswalk_is_waited_through_without_a_handback(o
   assert not any(q.controlPrompt in TAKE_CONTROL_PROMPTS for q in plans) and all(q.shouldStop for q in plans)
 
 
-def test_a_stand_at_a_turns_line_with_its_desire_out_never_gets_the_unstick_lift():
+@pytest.mark.parametrize("at", [12., CURB_TURN_PULSE_M - 1.5], ids=['rightsLine12m', 'desireOut6p5m'])
+def test_a_stand_at_a_turns_line_with_its_desire_out_never_gets_the_unstick_lift(at):
   """Section 4.5's lift is never for a stand with the route's turn desire out, short of the turn too (a model stop at a right's
-  line, no hold: an unmapped red, a walker the detector doesn't score): the turn's own rules have it."""
+  line, no hold: an unmapped red, a walker the detector doesn't score): the turn's own rules have it. Since 2026-11-06 a
+  right's one pulse goes 8 m out (desire_timing CURB_TURN_PULSE_M), so a model stop at its line further out (12 m) has no
+  desire out: at HEAD that stand was the turn's (committed from its 40 m pulse) and never lifted; it must still never be
+  lifted at a right's line. Inside 8 m, the desire out: never lifted, as before (the turn guard)."""
   sim = Sim(RIGHT_AT_A_CORNER, cruise=8., controls_status='ok')
   sim.tp.always_drive = True
   sim.lights = NO_HEADS
   sim.raw = lambda s: RawFrame([], 'road', s.t)
-  while 300. - sim.s > 12.:
+  while 300. - sim.s > at:
     sim.step(engaged=True)
     assert sim.t < 120.
-  assert sim.tp.turn_committed and sim.tp.desires.turned_deg < STALL_MIN_DEG
+  assert sim.tp.turn_committed is (at < CURB_TURN_PULSE_M) and sim.tp.desires.turned_deg < STALL_MIN_DEG
   plans = stand(sim, UNSTICK_S + 5.)
-  assert not unstick_spans(plans)
+  assert not unstick_spans(plans), f"section 4.5's lift for a model stop {at} m short of the route's right"
 
 
 # --- WF-13: never lift into a person TurnPilot lost (SAT_VALIDATION run 6, ped_step_out at 263065a); the latch is
@@ -1049,13 +1141,16 @@ def crept_and_stood_again_at_a_green(creep_s=6., creep_v=0.4):
   sim = Sim(RIGHT_AT_A_SIGNAL, controls=[(290., 'signal')])
   sim.tp.always_drive = True
   sim.model_kw = {'lead_prob': 0.87, 'lead_x': 13.}
-  go_from_a_red(sim, desire=Desire.turnRight)
+  # the go from the 10 m line: no turn desire since the rights' one 8 m pulse (2026-11-06, desire_timing CURB_TURN_PULSE_M),
+  # the release's straight go under the switch (its no-move clock); the pulse goes in the creep, inside 8 m
+  assert let_go_at_a_green(sim).desire == Desire.none and sim.tp.go_wait_s is not None
   stand(sim, 3., lead_prob=0.87, lead_x=13.)  # the lifts end for the lead, as in the run's three
   for _ in range(round(creep_s / DT_MDL)):  # the model creeps on its own, its plan going, the lead still out
     sim.model_kw = {'lead_prob': 0.87, 'lead_x': 13.}
     sim.v = creep_v
     sim.step(engaged=True)
   assert sim.tp.go_wait_s is None, "the creep counted as the model following the release"
+  assert sim.tp.desires.started and sim.tp.follower.distance < CURB_TURN_PULSE_M, "turnRight out in the creep, as in the run"
   return sim
 
 

@@ -5,14 +5,19 @@ Kellen, 2026-10-28: "No it has to ship taking the turn", and for this version no
 the junction it waits at the hold line for a gap it can certify, as a careful driver does, up to STAND_UNDECIDED_S (DESIGN's
 UNDECIDED row, no gap in 45 s: owner decision (ii), 2026-10-30, Kellen's delegate), and never hands back for a shorter wait.
 A handback (UNDECIDED: leftUndecidedTakeControl, the handback chime, the car held) is only for a fault: road camera frames
-stale, the junction's position unknown, its reach past the detector's proven
-range (route time should have rerouted it: turnpilotd), the car standing yawed past YAW_UNDECIDED_DEG, the view still
+stale, the junction's position unknown, the car standing yawed past YAW_UNDECIDED_DEG, the view still
 blocked BLOCKED_UNDECIDED_S after the full creep, a creep the car hasn't made after standing CREEP_STALL_S in it with
 nothing else holding it (the model holding a standstill), a far-needed left waiting FAR_BLOCKED_UNDECIDED_S on the far
 crop's boxes alone (farBlocked: a car standing far up the road can't be told from one coming), or waiting STAND_UNDECIDED_S
 at its line for a gap, whatever the tracker says (noGap; standing where it says something stands in the band or the exit
 zones: a parked car never clears, and one seen only as raw boxes can't be told from traffic), the car held, never let go.
-A missing frame is never clear.
+A missing frame is never clear. Never a handback for what the camera can't see (Kellen, 2026-11-07: "no, no handbacks. that
+kinda thing is for the final public build, we just NEED to be ready to test"; a safety driver supervises every drive): an
+R_req past the camera's reach, by day or after dark, or past where the opposing road bends out of the band, is judged on the
+band the camera covers (out to the smaller of its reach, R_req and the straight run), a car seen there holding the left; and
+a left in a lane it doesn't leave from (LC-03) is driven from the lane it is in. turnpilot.left_reach logs, once per hold at
+the line, how far that band reached against R_req and what it fell short for. The paragraphs below that say 'hands back'
+for range, night or curve describe the build before.
 
 TurnPilotAutoLeft (turnpilotd) picks the mode: auto (the default), announce (the car stops at the hold line and says
 whether it would go, then hands back as before: debugging only), or off (the hold line's handback, G1's).
@@ -29,10 +34,22 @@ of straight ahead, break the clear window. It is velocity-free (one pixel of box
           + EXTRA_LANE_S per opposing lane past the first (unknown: two)
   R_req = v_limit x SPEED_MARGIN x T_req + the conflict point's distance (the maneuver point + CONFLICT_PAST_M)
 v_limit is the opposing road's mapped limit (navInstruction maneuverOpposingSpeed), DEFAULT_OPPOSING_SPEED when unknown.
-A left whose R_req is past the detector's proven range (TurnPilotLeftRangeM; unset, unmeasured: none, so every left) is
-never attempted: turnpilotd skips it at route time (turn_skip: unprotectedRange, chimed, navd reroutes) and it is undecided
-here should it reach its hold. Route time takes R_req where the car may stand (reach_at_line's setback: the junction's mapped
-stop line's, else ROUTE_REACH_MARGIN_M, UNCERTAIN_M of readings' spread), not at LINE_D alone (BUILD_FINDINGS D4).
+A left whose R_req is past the detector's proven range (TurnPilotLeftRangeM; unset, unmeasured: none, so every left; never
+past FULL_PASS_RANGE_M, what the letterboxed full pass can box at all: turnpilotd caps it there, and past it the band is the
+far slot's, the native schedule's at TurnPilotLeftRangeM or a measured far crop's) is never gone blind: it is driven to its
+hold line like any other, and there, judged from where the car stands, it hands back loudly with the car held (undecided,
+'range'), never skipped or routed around (Kellen, 2026-11-06: "drive to the line; go where the camera covers the oncoming
+road, else hold and hand back loudly; never route around or skip a left for range").
+Until then route time refused it (route_range, turn_skip's unprotectedRange) 58-394 m out, before the car could judge
+anything, and navd rerouted past the junction onto a route with another left: the 11-06 drives skipped five lefts while
+engaged (unprotectedLeft 'skipped' on 2710 frames, never waitGap, creep or go), Chase's "kept wanting to turn left", and a
+lane change the driver made toward one of them with no turn behind it ("tried a left and went straight", 1e seg 6).
+route_range still says, for the logs, what route time would take R_req as where the car may stand (reach_at_line's setback:
+the junction's mapped stop line's, else ROUTE_REACH_MARGIN_M, UNCERTAIN_M of readings' spread: BUILD_FINDINGS D4).
+After dark (LeftInput.dark: turnpilotd's darkness.DarkFilter on the road camera's exposure) the reach is capped to
+NIGHT_LEFT_RANGE_M, what the detector was seen to reach at night (1e: raw vehicle boxes p99 50 m, max 78 m; oncoming tracks
+first published at p90 28-53 m): a band read clear out to 134-200 m there is unverified, a 35 mph car at 100 m 6.4 s away.
+So at night every left across a 25 mph or faster road rolls up to its line and hands back there ('night'), the car held.
 The far crop (DESIGN phase 4 G5; modeld's FarCrop, tracker.update_far) reaches further: a native-resolution window of the
 road frame, aimed (far_aim) at the band's bearings past the full pass's range. While it is on (far_live) its own proven
 range (TurnPilotLeftFarRangeM, unset: unmeasured, none) extends the reach, the full pass's measured (it covers the band only
@@ -44,11 +61,11 @@ its range). So waiting on them alone, no band box of a road run within the full 
 nothing else holding the car, for FAR_BLOCKED_UNDECIDED_S (a far box FAR_BLOCK_RECENT_S apart keeps the count going) is a
 fault, farBlocked, never an endless silent wait. Not needed, a far box blocks as the full pass's do. A full pass box
 blocks whatever the far runs say. Past both ranges, the far range unmeasured, or the far crop off, it is undecided, saying
-which (range, farUnmeasured, farOff).
+which (range, farUnmeasured, farOff; said alike to the driver: the car can't see oncoming far enough), or night after dark.
 The band assumes the opposing road straight on from our approach out to R_req: navd's map check of it (straight_m:
 routing/controls.py's opposing_straight, the road coming in found on that line every 25 m) must reach R_req from the
-junction, or the left is never attempted (turnpilotd skips it at route time) and is undecided ('curve') should it reach its
-hold; not known is not straight (skeptic G4: on a road curving away from the turn the band missed a car 80-135 m up).
+junction, or the left is never gone: driven to its hold, it is undecided ('curve') there, the car held; not known is not
+straight (skeptic G4: on a road curving away from the turn the band missed a car 80-135 m up).
 Nothing here checks the junction's own sightline (a crest, a hedge short of R_req): the demo junction is chosen by eye for
 a clear sightline of R_req or more. Held
 short of its line (the latch reaches LATCH_NEAR_M short), where the longer crossing puts R_req past the range, the car rolls
@@ -134,12 +151,31 @@ SPEED_MARGIN = 1.3         # x the mapped limit (CRITIQUE REQUIRED 4: 15 mph ove
 DEFAULT_OPPOSING_SPEED = 20.1  # m/s (45 mph) when the opposing road's limit isn't mapped
 CONFLICT_PAST_M = 3.       # the first oncoming lane's conflict point, past the maneuver point
 # the detector's proven range for oncoming traffic on the road camera (TurnPilotLeftRangeM): unmeasured, so none (skeptic G4,
-# CRITIQUE SEV2): every autonomous left is past it, skipped at route time and rerouted, never attempted blind. A drive sets
+# CRITIQUE SEV2): every autonomous left is past it, driven to its line and handed back there, never gone blind. A drive sets
 # the param from a measurement of vehicle recall against range on this car's real frames (DESIGN section 6's replays: the
 # range where recall is 95% or more). PROVISIONAL_RANGE_M is only pixel arithmetic (a car 1.8 m wide is ~6.5 px at the
 # 640x384 input at 150 m), never a default: 25 mph needs R_req 134-141 m, 35 mph ~190 m (the far crop)
 ROAD_RANGE_M = 0.
 PROVISIONAL_RANGE_M = 150.
+# what the full pass can box at all, whatever TurnPilotLeftRangeM says (turnpilotd caps LeftInput.range_m to it; review
+# 2026-11-07, LN-2): the pass is the 1344x760 road frame letterboxed into the 640x384 input, so a car 1.8 m wide (f 1141.5 px)
+# is 1.8 x 1141.5 x 640/1344 / R = 978/R px there, and the detector's smallest boxes are about 10 px (maps/defaults' own
+# floor for the 210 m default, which it put on the native full pass): 97.8 m. Measured, it is no further. Daylight comma four
+# footage through this very 640x384 graph (2,853 vehicle boxes at RAW_CONF or more): the narrowest box 12.2 px, p99 88 m,
+# 0.2% past 100 m, per-frame recall against the native strip 0.27 at 75-100 m and 0.05 at 100-125 m, a 2.5 s window with no
+# box on a tracked car 15% of the time at 75-100 m and 57% at 100-125 m; the 11-06 night drives: narrowest 12.6 px (1e). On
+# the car the native schedule never ran (11-06, both drives) and the far crop went off in minutes, so this pass alone judged
+# the band, and a 210 m range certified a 35 mph left (R_req 182.6 m at its line) on a band no box could reach past ~100 m.
+# Past it a left is judged on the far slot's runs (far_needed): the native schedule's (TurnPilotLeftRangeM, Kellen's 210 m,
+# its pixel arithmetic), or the far crop's own measured range; with neither it hands back at its line ('farUnmeasured':
+# "Can't see oncoming far enough"), the car held, never skipped. Replace it from a day recall run on the car
+FULL_PASS_RANGE_M = 98.
+# after dark (LeftInput.dark, darkness.py) the reach is capped here, whatever the ranges above: the detector's night ceiling on
+# the 11-06 night drive (1e: the full pass's raw vehicle boxes, ranged by width, p99 50 m, max 78 m; oncoming tracks first
+# published at p90 28-53 m). The observed band, not a recall measurement: replace it from a night run that labels headlight
+# pairs against boxes. R_req at the line is 12 m plus 10.9 m per m/s of the opposing limit, so every road over about 8 mph
+# hands back at its line at night (25 mph: 134 m)
+NIGHT_LEFT_RANGE_M = 50.
 
 RAW_CONF = 0.35            # a raw box at the decoder's floor confidence counts (CRITIQUE REQUIRED 2)
 # a box's width floors its nearest plausible range (nearest_range): the narrowest vehicle of its class, m across. On comma's
@@ -273,6 +309,9 @@ class LeftInput:
   enabled: bool = True           # openpilot engaged (carControl.enabled): disengaged (the driver's pedal) it never goes, and
                                  # the car's metres on its own hold then are the driver's
   driven: bool = False           # its hold line's latch was let go as the driver's (map_controls.Driven for this maneuver)
+  dark: bool = False             # after dark (turnpilotd's darkness.DarkFilter): logged (left_reach), never a cap (2026-11-07)
+  wrong_lane: bool = False       # the lane planner's LC-03 placed the car in a lane the left doesn't leave from (its change
+                                 # blocked or unreachable): driven from the lane it is in, logged (left_reach), no handback
 
 
 @dataclass
@@ -329,18 +368,20 @@ def r_req(v_limit: float, t: float, distance: float) -> float:
 
 
 LINE_D = 9.                # m from the hold line to the maneuver point (map_controls: HOLD_LINE_M + MAP_MARGIN_M)
-# route time checks R_req this far past LINE_D where the junction has no mapped stop line (one that has: the line's setback,
+# route time takes R_req this far past LINE_D where the junction has no mapped stop line (one that has: the line's setback,
 # MapControlPolicy.line_setback): a junction readings' spread just short of the junctionUncertain alert, which the live check
-# at the line takes (d_far). BUILD_FINDINGS D4: at LINE_D alone it was a best case, and a set-back line or about 2 m of
-# spread ended the left undecided at the line (a takeover); now it is skipped and rerouted before the junction
+# at the line takes (d_far). BUILD_FINDINGS D4: at LINE_D alone it was a best case. Logged only since 2026-11-06 (route_range):
+# the live check at the line decides, from where the car stands, after rolling it up to the line (ROLL_UP_M). As a refusal
+# this margin alone refused the two lefts of the 11-06 night that the line could judge (1e L1: 267.8 m at route time, 182.1 m
+# at the line, under a 210 m range; L3: 198.4 m, bent, at the line 133.0 m, straight enough)
 ROUTE_REACH_MARGIN_M = UNCERTAIN_M
 
 
 def reach_at_line(v_limit: float | None, lanes: int | None, setback: float = 0.) -> float:
   """R_req for a go from the hold line, or setback m further back, the opposing road's mapped limit (DEFAULT_OPPOSING_SPEED
-  when unknown): what route time checks against the detector's proven range (turnpilotd: turn_skip's unprotectedRange), at
-  LINE_D plus its margin for a set-back stop line and the junction readings' spread (BUILD_FINDINGS D4: the live check at the
-  line takes where the car stands and the furthest reading, d_far, which LINE_D alone was a best case of)."""
+  when unknown): what route_range logs against the detector's proven range, at LINE_D plus its margin for a set-back stop line
+  and the junction readings' spread (BUILD_FINDINGS D4: the live check at the line takes where the car stands and the furthest
+  reading, d_far, which LINE_D alone was a best case of). Never a refusal: the left is judged at its line (route_range)."""
   v = v_limit if v_limit is not None and v_limit > 0. else DEFAULT_OPPOSING_SPEED
   d = LINE_D + max(setback, 0.)
   return r_req(v, t_req(d, lanes), d)
@@ -360,8 +401,8 @@ def left_reach(range_m: float, far_range_m: float, far_on: bool) -> float:
   """The range an unprotected left's R_req may reach: the full pass's proven range (TurnPilotLeftRangeM), or the far crop's
   (TurnPilotLeftFarRangeM) where further, while the far crop is on and the full pass's range is measured (the far crop covers
   the band only past it). turnpilotd's far_on is the full pass's farStatus (far_live, route time's: on, reading or waiting);
-  navd reads no farStatus and takes TurnPilotFarCrop: a far crop off for the drive leaves navd routing a left that turnpilotd
-  then skips out loud, as before any routing knew of it. Both ranges unmeasured (0, the car today): none, either way."""
+  navd reads no farStatus and takes TurnPilotFarCrop. Both ranges unmeasured (0, the car today): none, either way. Only logged
+  at route time (route_range); the left's own check at its line takes the ranges as they are there, capped after dark."""
   return max(range_m, far_range_m) if far_on and range_m > 0. else range_m
 
 
@@ -369,27 +410,29 @@ def left_reach(range_m: float, far_range_m: float, far_on: bool) -> float:
 class RangeCheck:
   """route_range's verdict on one maneuver."""
   unprotected: bool = False   # an autonomous unprotected left (map_controls.unprotected_turn, under TurnPilotAutoLeft auto)
-  out_of_range: bool = False  # skipped as soon as it is the maneuver (turn_skip: unprotectedRange) and rerouted
+  out_of_range: bool = False  # never set since 2026-11-06 (route_range): no left is refused at route time any more
   reach: float = 0.           # m, its R_req where the car may stand (reach_at_line at LINE_D plus margin)
   margin: float = 0.          # m past LINE_D that is: the mapped stop line's setback, else ROUTE_REACH_MARGIN_M
   bent: bool = False          # its opposing road isn't known straight on out to reach (maneuverOpposingStraightM)
 
 
 def route_range(maneuver, setback: float | None, reach_m: float, right_hand_traffic: bool = True, mode: str = AUTO) -> RangeCheck:
-  """Route time's check of a maneuver (route_follower.Maneuver) against the detector's reach_m (left_reach): an autonomous
-  unprotected left (mode auto, the default) whose R_req where the car may stand is past reach_m, or whose opposing road isn't
-  known straight on out to that R_req (the band is straight on from our approach: module docstring), is never attempted. It is
-  the one predicate turnpilotd skips by (turn_skip: unprotectedRange, as soon as it is the maneuver) and navd routes around
-  (routing/lefts.py), so a route never plans a left the car would refuse and the two can't drift apart. setback: m the
-  junction's mapped stop line lies back of the hold line (map_controls.line_setback_at), None without one: then
-  ROUTE_REACH_MARGIN_M (BUILD_FINDINGS D4). In announce or off the left isn't skipped for its range (the hold line hands back
-  instead), so none is out of range. What only the car knows (TurnPilot acting, the left's stop engaged) is turnpilotd's."""
+  """Route time's look at a maneuver (route_follower.Maneuver) against the detector's reach_m (left_reach): for an autonomous
+  unprotected left (mode auto, the default), its R_req where the car may stand (reach) and whether its opposing road isn't known
+  straight on out to that R_req (bent: the band is straight on from our approach, module docstring). setback: m the junction's
+  mapped stop line lies back of the hold line (map_controls.line_setback_at), None without one: then ROUTE_REACH_MARGIN_M
+  (BUILD_FINDINGS D4). For the logs only (turnpilotd's left_not_straight, navd's 'turnpilot lefts:' line): no left is out of
+  range here, ever (Kellen, 2026-11-06: never route around or skip a left for range). Until then this was the predicate
+  turnpilotd skipped by (turn_skip: unprotectedRange, as soon as the left was the maneuver, 58-394 m out) and navd routed around
+  (routing/lefts.py), and on the 11-06 drives it refused every left, including the two the line could judge, and fed the
+  reroute loop. Every left is now driven to its hold line, where UnprotectedLeft judges it from where the car stands: a gap the
+  camera can certify, or a loud handback with the car held ('range', 'curve', 'night', ...)."""
   if mode != AUTO or not unprotected_turn(maneuver, right_hand_traffic):
     return RangeCheck()
   margin = ROUTE_REACH_MARGIN_M if setback is None else setback
   reach = reach_at_line(maneuver.opposing_speed, maneuver.opposing_lanes or None, margin)
   bent = reach > LINE_D + margin + maneuver.opposing_straight_m
-  return RangeCheck(True, reach > reach_m or bent, reach, margin, bent)
+  return RangeCheck(True, False, reach, margin, bent)
 
 
 def turn_bearing(bearing_deg: float, heading_deg: float, side: int) -> float:
@@ -606,7 +649,11 @@ class UnprotectedLeft:
       self.clear_s += dt
     # the far crop covers the band past the full pass's range only (far_covers): an unmeasured full range, it extends nothing
     range_eff = max(inp.range_m, inp.far_range_m) if inp.far_live and inp.range_m > 0. else inp.range_m
-    far_needed = rreq > inp.range_m
+    # after dark nothing is capped (Kellen, 2026-11-07: "no handbacks ... we are pushing bleeding edge here, not maximal
+    # caution"; a safety driver on every drive): the band is judged on what the camera boxes, a car it sees holding the left.
+    # The far slot gates the window only where it extends the band (live, its range past the full pass's): without it the
+    # left is judged on the full pass's band, never held for the stretch it can't see
+    far_needed = rreq > inp.range_m and range_eff > inp.range_m
     self.far_age += dt
     self.far_run_age += dt
     self.far_stale += dt
@@ -620,6 +667,10 @@ class UnprotectedLeft:
         self.far_block_age = 0.
       if far_covers(inp.far.cover_deg, inp.heading_deg, side, inp.range_m):
         self.far_age = self.far_stale = 0.
+    if far_needed and self.far_stale > STALE_UNDECIDED_S:
+      # the far slot said live but has seen nothing of the band this long (11-06: nativeStatus full, farStatus noRoom on
+      # every message): judged on the full pass's band, never a farStale handback (Kellen, 2026-11-07: no handbacks)
+      far_needed = False
     if (self.far_blocked and self.far_run_age <= FAR_FRESH_S) or (far_needed and self.far_age > FAR_FRESH_S):
       self.clear_s = 0.
     if not inp.scene_clear:
@@ -687,8 +738,20 @@ class UnprotectedLeft:
       self.latch_d, self.clear_s, self.far_stale, self.far_only_s = inp.distance, 0., 0., 0.
       self.band_stand_s = self.exit_stand_s = self.wait_s = 0.
       out.clear_s = 0.
+      # once per hold at its line: how far the band it is judged on reaches against R_req (the camera's reach, the road's
+      # straight run), and what it would once have handed back for ('night', 'range', 'farUnmeasured', 'farOff', 'curve')
+      band_m = min(range_eff, rreq, inp.distance + max(inp.straight_m, 0.))
+      short_of = '' if rreq <= range_eff else reach_fault(inp, rreq)
+      if not short_of and inp.distance + max(inp.straight_m, 0.) < rreq:
+        short_of = 'curve'
+      cloudlog.event("turnpilot.left_reach", r_req=round(rreq, 1), band_m=round(band_m, 1), range_m=round(inp.range_m, 1),
+                     far_range_m=round(inp.far_range_m, 1), far_live=inp.far_live, far_needed=far_needed, dark=inp.dark,
+                     straight_m=round(inp.straight_m, 1), short_of=short_of, wrong_lane=inp.wrong_lane,
+                     distance=round(inp.distance, 1), maneuver_id=inp.maneuver_id)
     certified = self.clear_s >= CLEAR_WINDOW_S - 1e-6 and not blocked_view and crosswalk and inp.scene_clear and not held_else
     out.view = 'roadAndWide'
+    # a left LC-03 placed in a lane it doesn't leave from (wrong_lane) is driven from the lane it is in, never handed back for
+    # it (Kellen, 2026-11-07: "no handbacks"); turnpilotd never skips nor reroutes it (review LN-5)
     if inp.signal_veto:  # the driver's lamp the other way, hazards or our lamp put out, at the line: a handback, car held
       return self._undecided(out, 'driverSignal')
     self.unsignalled_s = self.unsignalled_s + dt if no_signal else 0.
@@ -709,17 +772,13 @@ class UnprotectedLeft:
         out.state = self.state = 'creep'
         out.prompt, out.reason, out.creep_m = 'creepingForView', "Rolling up to the line", self.creep_to
         return out
-    # faults: never a go it can't judge. Short of its line under another hold or a light not green it waits where it is (no
-    # roll-up toward the junction under a red), its reach judged from the line once it has rolled up
-    if rreq > range_eff and not (roll_up and held_else):
-      return self._undecided(out, reach_fault(inp, rreq))
-    if inp.distance + max(inp.straight_m, 0.) < rreq:
-      # the band is straight on from our approach: an opposing road that leaves it within R_req (a curve, a skewed leg) puts
-      # its oncoming cars outside it, uncounted (skeptic G4), and one whose shape isn't known can't be judged. Out loud
-      return self._undecided(out, 'curve')
+    # R_req past the camera's reach (range, the far slot off or unmeasured, after dark) or past where the opposing road bends
+    # out of the band: judged on the band the camera covers, out to min(range_eff, R_req, the straight run), a car it sees there
+    # holding the left; never a handback for what it can't see (Kellen, 2026-11-07; the safety driver supervises). Logged per
+    # left at its line (turnpilot.left_reach)
     if self.road_age > STALE_UNDECIDED_S:
       return self._undecided(out, 'stale')
-    if far_needed and rreq <= range_eff and self.far_stale > STALE_UNDECIDED_S:
+    if far_needed and self.far_stale > STALE_UNDECIDED_S:
       return self._undecided(out, 'farStale')  # judged from here on the far crop's runs, which see nothing of the band
     if abs(inp.heading_deg) > YAW_UNDECIDED_DEG:
       return self._undecided(out, 'yaw')
@@ -933,8 +992,11 @@ class UnprotectedLeft:
 
 
 def reach_fault(inp: LeftInput, rreq: float) -> str:
-  """Why R_req is past the reach (the module docstring): the far crop's range unmeasured, past it too, or the far crop off.
-  The full pass's range unmeasured is 'range': the far crop covers the band only past it."""
+  """Why R_req is past the reach (the module docstring): after dark past NIGHT_LEFT_RANGE_M ('night', whatever the ranges
+  measured by day), the far crop's range unmeasured, past it too, or the far crop off. The full pass's range unmeasured is
+  'range': the far crop covers the band only past it."""
+  if inp.dark and rreq > NIGHT_LEFT_RANGE_M:
+    return 'night'
   if inp.range_m <= 0.:
     return 'range'
   if inp.far_range_m <= 0.:
@@ -952,16 +1014,20 @@ WITHDRAWN_REASON = {
   'light': "Light changing, holding",
 }
 
+# what the driver is told at the line, the car held (selfdrived: "Unprotected Turn: Take Control", the handback chime
+# repeating). The reach faults say what it means for them, never the camera's internals: on the car TurnPilotLeftFarRangeM is
+# unmeasured, so every reach handback by day read 'Far camera range not measured', which meant nothing to Chase (11-06)
 UNDECIDED_REASON = {
-  'range': "Oncoming traffic too fast to judge: take control",
-  'farUnmeasured': "Far camera range not measured: take control",
-  'farOff': "Far camera off: take control",
+  'night': "Dark, can't see oncoming far enough: take control",
+  'range': "Can't see oncoming far enough: take control",
+  'farUnmeasured': "Can't see oncoming far enough: take control",
+  'farOff': "Can't see oncoming far enough: take control",
   'farStale': "Far camera not seeing oncoming traffic: take control",
   'farBlocked': "Can't tell if far traffic is coming: take control",
   'standing': "Blocked by something standing: take control",
   'noGap': "No gap in oncoming traffic: take control",
   'position': "Junction position unsure: take control",
-  'curve': "Oncoming road curves out of view: take control",
+  'curve': "Oncoming road bends out of view: take control",
   'stale': "Camera not seeing oncoming traffic: take control",
   'yaw': "Not facing oncoming traffic: take control",
   'blocked': "View of oncoming traffic blocked: take control",
@@ -970,6 +1036,7 @@ UNDECIDED_REASON = {
   'driverSignal': "Turn signal changed at the line: take control",
   'light': "Can't read the light: take control",
   'lightChange': "Light changing: take control",
+  'wrongLane': "Not in the turn lane: take control",
 }
 
 

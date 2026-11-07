@@ -234,7 +234,8 @@ def test_lane_change_outranks_the_turn():
 def test_prompt_whenever_not_ready(status):
   drive = Drive(v=12., distance=150., status=status)
   drive.until(100.)
-  assert drive.out.prompt == LaneChange.none  # held above 20 mph
+  # at any speed (2026-11-07: no 20 mph floor; DesireHelper reads the driver's lamp on the armed side as the turn's)
+  assert drive.out.prompt == LaneChange.left
   drive.v = LANE_CHANGE_SPEED_MIN - 0.5
   assert drive.step().prompt == LaneChange.left
   assert drive.step(lane_pending=True).prompt == LaneChange.none  # a lane change wanted or offered holds it

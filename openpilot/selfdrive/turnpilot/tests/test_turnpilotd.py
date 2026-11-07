@@ -14,7 +14,8 @@ from openpilot.selfdrive.turnpilot.lane_planner import LANE_UNKNOWN_REASON, LC_W
 from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN, LinePaint, fill_lane_paint
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, NO_ACCEL_CAP, ONCOMING_TTA_S, PED_STOP_GAP_M
 from openpilot.selfdrive.turnpilot.tests.synthetic import FakeNavd, car_control, car_state, junction_of, model_v2, nav_instruction, scene
-from openpilot.selfdrive.turnpilot.desire_timing import TURN_DESIRE_LEAD_M
+from openpilot.selfdrive.turnpilot.desire_timing import (CURB_FIRST_PULSE_M, CURB_GO_SLACK_M, CURB_LATEST_PULSE_M, CURB_TURN_PULSE_M, FAR_LEAD_MIN_M,
+                                                         TURN_DESIRE_LEAD_M)
 from openpilot.selfdrive.turnpilot.turn_skip import MIN_FIRST_PULSE_M
 from openpilot.selfdrive.turnpilot.route_follower import Maneuver, classify
 from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP, POST_GO_PROFILES, V_TURN_MIN
@@ -28,6 +29,7 @@ from openpilot.selfdrive.turnpilot.turnpilotd import (CAR_UNKNOWN_REASON, DETECT
                                                        TURN_MISSED_REASON, WAITING_REASON, TurnPilot, long_control_for, plan_paint)
 from openpilot.selfdrive.turnpilot.handback import Handback
 from openpilot.selfdrive.turnpilot.scene.tracker import STALE_S
+from openpilot.selfdrive.turnpilot.unprotected_left import LEFT_RANGE_MAX_M
 
 State = custom.TurnpilotPlan.State
 Fault = custom.TurnpilotPlan.Fault
@@ -64,9 +66,15 @@ class Sim:
                paint_rule=True, long_control=True, controls=(), controls_status=None, disengage_on_accel=True, shape=None, lag=0.):
     self.navd = FakeNavd(maneuvers, nav_lanes, controls=controls, controls_status=controls_status, shape=shape, lag=lag)
     self.tp, self.sm = TurnPilot(), FakeSM()
+    from openpilot.selfdrive.turnpilot.darkness import DarkFilter
+    self.tp.dark_filter = DarkFilter(dark=False)  # daylight: TurnPilot starts dark off the sim (darkness.py); the night is its tests'
     # the hold line's handback at an unprotected left (G1's), for the tests here; the autonomous left (TurnPilotAutoLeft auto,
     # the default) is test_turnpilotd_left's
     self.tp.auto_left = 'off'
+    # the sim's detector boxes every car it is given (raw), at any range: its full pass reaches whatever TurnPilotLeftRangeM a test
+    # sets, so the car's cap on it (unprotected_left.FULL_PASS_RANGE_M, what the letterboxed pass can box) is lifted here and
+    # tested on its own (test_turnpilotd_left_range)
+    self.tp.full_pass_range_m = LEFT_RANGE_MAX_M
     self.raw = None  # the detector's raw boxes (scene.tracker.RawFrame) of this frame's run, a function of the sim, or None
     self.raw_far = None  # the far crop's run (RawFrame, view far) of this frame, a function of the sim, or None
     self.far_status = None  # turnpilotDetections.farStatus to send each frame (a full pass message), a function of the sim
@@ -420,6 +428,29 @@ def test_lane_not_confirmed_is_said_not_changed():
   sim.run(25.)
   assert any(plan.laneChange == LaneChange.left for _, _, plan in sim.trace)
   assert all(plan.laneMismatch == custom.TurnpilotPlan.LaneMismatch.none for _, _, plan in sim.trace)
+
+
+# drive 1e seg 5's lane list for its left: the bay's lane the list's far-most, two through lanes beside it
+LEFT_BAY = ((("left",), True), (("straight",), False), (("straight",), False))
+
+
+def test_a_far_side_turns_bay_not_open_yet_is_never_wrong_lane():
+  """lanes-2's bay rule (lane_planner.BayLatch) through turnpilotd (2026-11-06 review): a T-left with LEFT_BAY's list on a
+  one-lane approach, the centre line read yellow: once the latch has BAY_YELLOW_READS reads the plan wants no change (the car
+  beside the centre line is in the far-most lane of its direction, the one the bay opens from) and turnpilotd's
+  lane_mismatch goes by the same latch (bay.shut), so 'Wrong Lane: This lane doesn't turn with the route' is never said
+  inside the window's end (60 m at 10 m/s). Without the latch handed over it was, from 52 m to the line, every approach."""
+  SY, SW = LinePaint('solid', 'yellow', 0.9, 0.95), LinePaint('solid', 'white', 0.9, 0.95)
+  sim = Sim([(400., 'turn', 'left', T_LEFT), (2000., 'turn', 'right')], cruise=10., nav_lanes={0: LEFT_BAY}, model_lanes=(0, 0),
+            paint=(UNKNOWN, SY, SW, UNKNOWN))
+  sim.v = 10.
+  assert lane_change_window(10.)[1] == 60.
+  while sim.s < 395.:
+    sim.step(engaged=True)
+  assert sim.tp.lanes.bay.shut
+  near = [p for s, _, p in sim.trace if 400. - s < 70.]
+  assert near and all(p.laneMismatch == custom.TurnpilotPlan.LaneMismatch.none and p.laneChangeWant == 0 for p in near), \
+    sorted({(str(p.laneMismatch), p.laneChangeWant) for p in near})
 
 
 @pytest.mark.parametrize("always_drive", [False, True])
@@ -823,13 +854,17 @@ SOFT_DISABLE_S = 3.  # selfdrived/state.py SOFT_DISABLE_TIME: lat stays active t
 
 def recover_after_outage(cruise, outage, reengage=1.):
   """The turn desire goes out, then the detector stops for outage s: handback, soft disable (lat active SOFT_DISABLE_S),
-  then openpilot disengaged until the driver engages again reengage s after the detector comes back. Returns the sim
-  and the trace index at which TurnPilot acts again."""
+  then openpilot disengaged until the driver engages again reengage s after the detector comes back. Returns the sim,
+  the trace index at which TurnPilot acts again and the trace indices of the frames run with openpilot not steering
+  (lat_active False: none when the detector is back inside the soft disable). The outage starts the frame the left's first
+  pulse goes: its lead, 40 m out at turning speed (TURN_DESIRE_LEAD_M) and FAR_LEAD_S out below it (21 m at 3.5 m/s;
+  2026-11-06, desire_timing.py)."""
   sim = Sim([(300., "turn", "left", T_LEFT), (1500., "turn", "right", junction_of("right"))], cruise=cruise)
-  while sim.distance() > TURN_DESIRE_LEAD_M - 1. or sim.s < 10.:
+  while not sim.trace or sim.trace[-1][2].desire != Desire.turnLeft or sim.s < 10.:
     sim.step()
-  assert sim.trace[-1][2].desire == Desire.turnLeft
-  t, handback_t, back_t, back_i = 0., None, None, None
+    assert sim.s < 300., "the left's first pulse never went"
+  assert sim.distance() > FAR_LEAD_MIN_M
+  t, handback_t, back_t, back_i, lat_off = 0., None, None, None, []
   while sim.s < 310.:
     available = t >= outage
     if handback_t is None and not sim.tp.acting:
@@ -838,17 +873,27 @@ def recover_after_outage(cruise, outage, reengage=1.):
       back_t, back_i = t, len(sim.trace)
     disengaged = handback_t is not None and t - handback_t >= SOFT_DISABLE_S
     lat = not disengaged or (back_t is not None and t - back_t >= reengage)
+    if not lat:
+      lat_off.append(len(sim.trace))  # the frame step appends next
     sim.step(available=available, lat_active=lat)
     t += DT_MDL
-  return sim, back_i
+  return sim, back_i, lat_off
 
 
 def test_turn_dropped_while_disengaged_is_not_left_half_driven():
   # the detector is back after a long outage and the driver engages again before the left, whose desire was dropped
   # while openpilot was off: once openpilot steers again, TurnPilot never drives on toward it capped, 'approaching' and
-  # with no desire and no alert (a fresh pulse, or the turn skipped out loud)
-  for cruise in (13., 3.5):
-    sim, back = recover_after_outage(cruise, outage=5.)
+  # with no desire and no alert (a fresh pulse, or the turn skipped out loud). At 3.5 m/s the left's first pulse goes FAR_LEAD_S
+  # (21 m) out, not 40 m (2026-11-06), so the outage that leaves the car short of the junction once openpilot steers again
+  # is shorter there than the 5 s one from the old 40 m lead. Not as short as 2 s: the handback comes about 1 s into the outage
+  # and lat stays on SOFT_DISABLE_S after it, so a driver engaging 1 s after a 2 s outage never saw openpilot off, and the
+  # desire was never dropped (review 2026-11-06: 0 lat-off frames at 3.5 m/s, 2 s). 3.5 s at 3.5 m/s and 4 s at 5 m/s are
+  # 11 and 21 frames off, the desire going to none in them, the driver engaging 4.6 and 5.7 m out. The premise is asserted:
+  # the desire still out up to openpilot going off, and dropped once it was (on its first frame off, in every case here)
+  for cruise, outage in ((13., 5.), (3.5, 3.5), (5., 4.)):
+    sim, back, lat_off = recover_after_outage(cruise, outage=outage)
+    assert lat_off and sim.trace[lat_off[0] - 1][2].desire == Desire.turnLeft, (cruise, len(lat_off))
+    assert any(sim.trace[i][2].desire == Desire.none for i in lat_off), (cruise, len(lat_off))
     engaged = back + int(round(1. / DT_MDL))
     assert any(p.desire == Desire.turnLeft or p.tooFastToTurn for _, _, p in sim.trace[engaged:engaged + 5]), cruise
     after = [p for s, _, p in sim.trace[engaged + 5:] if s < 300.]
@@ -886,7 +931,8 @@ def test_dropped_turn_taken_up_or_skipped_with_its_pulse_cleared():
 
 def test_detector_back_within_the_soft_disable_keeps_the_turn():
   # back before openpilot disengaged: the held desire stays out with no new rising edge, and TurnPilot drives the turn on
-  sim, back = recover_after_outage(13., outage=2.)
+  sim, back, lat_off = recover_after_outage(13., outage=2.)
+  assert not lat_off  # openpilot steered throughout: back inside the soft disable
   after = [p for s, _, p in sim.trace[back:] if s < 300.]
   assert after and all(p.desire in (Desire.turnLeft, Desire.none) and not p.tooFastToTurn for p in after)
   assert after[0].desire == Desire.turnLeft and all(p.state == State.turning for p in after[:5])
@@ -1253,41 +1299,101 @@ def test_gps_jump_on_the_committed_turns_step_keeps_its_junction_where_it_was():
     drive_through_the_left(sim, n)
 
 
-def test_gps_outlier_that_brings_the_turns_first_pulse_out_doesnt_hold_its_junction_short():
-  # one navd update reads the turn off m closer from near m out, and that reading brings the turn's first pulse out.
-  # Which reading is right can't be told: the junction is held at the nearest (off m short), so the turn isn't read as
-  # passed short of it, its cap stays to the junction, and the car isn't sped up into it. On an unprotected left the car
-  # stops at or short of its hold line, never past it, and short by more than 15 m only said out loud
+@pytest.mark.parametrize("side,off,near,want", [('right', -20., 60., 'take'), ('right', -12., 50., 'take'), ('right', -15., 55., 'take'),
+                                                 ('right', -25., 70., 'take'), ('right', -7., 45., 'take'), ('left', -20., 60., 'take'),
+                                                 ('right', -9., 20., 'skip'), ('right', -9., 45., 'skip'), ('right', -10., 30., 'skip'),
+                                                 ('right', -8., 45., 'skip'), ('right', -10., 45., 'skip'), ('right', -8., 30., 'skip'),
+                                                 ('right', -12., 20., 'take'), ('right', -15., 20., 'retake'), ('right', 9., 20., 'take')])
+def test_gps_outlier_that_brings_the_turns_first_pulse_out_doesnt_hold_its_junction_short(side, off, near, want):
+  # one navd update reads the turn off m closer from near m out. Which reading is right can't be told: the junction is held at
+  # the nearest (off m short), so the turn isn't read as passed short of it, its cap stays to the junction, and the car isn't
+  # sped up into it. On an unprotected left the car stops at or short of its hold line, never past it, and short by more
+  # than 15 m only said out loud. The left's first pulse goes at its 40 m lead by the nearest, so the outlier is what brings
+  # it out. A right's one pulse (2026-11-06, desire_timing CURB_TURN_PULSE_M) goes by the furthest of the readings, the
+  # true one here: the outlier holds its cap and its junction short, never its pulse, which goes within 1 m of the true 8 m,
+  # the right taken, never skipped for the outlier, nor turned in early for it. One 9-15 m short about 20 m out was navd's
+  # latest reading until its next true one, and before the latest had to be confirmed (route_follower LATEST_AGREE_M) the pulse
+  # went 14.8-17.1 m out on it (1e's clipped rights were turned in early), or at 15 m short the right was skipped tooLate
+  # 17 m out: 12-15 m short it is taken at 8 m now (the next true reading's jump up from inside ADVANCE_NEAR_M). One 8-10 m
+  # short 20-45 m out (the nearest keeps it to the end) has the nearest cross the junction before the furthest reaches 8 m,
+  # and the right is skipped tooLate out loud 7.7-9.8 m short of its junction with every later reading saying it is ahead
+  # (want 'skip'; HEAD, pulsing at 40 m, took it), its corner cap kept so the car is never sped up through the junction it was
+  # slowing to turn at. Kept on purpose (2026-11-06 review): the same readings are one TRUE reading inside a lasting long bias,
+  # and judged by the second-nearest (that round) that right was pulsed past its junction in silence
+  # (test_one_true_reading_inside_a_lasting_long_bias_never_has_a_right_pulsed_past_its_junction). The -9 m case 20 m out
+  # (the known-red [right--9.0-20.0-take] of the round before) was red for its 14.8 m early pulse, which the confirmed latest
+  # ended; it is in that band, so 'skip'. One long (9 m) holds the furthest long: the pulse goes by the latest, confirmed, at
+  # 6 m (within 2.5 m of 8: abs(... - CURB_TURN_PULSE_M) < 2.5 below). One 15 m short 20 m out ('retake') puts the nearest
+  # 2.3 m out, and it crosses before navd's next reading: skipped tooLate out loud 14.8 m short, its cap kept, then that next
+  # true reading's jump up from inside ADVANCE_NEAR_M is navd moving on, a new maneuver with fresh readings, and the right is
+  # taken at 8 m after all (navd: skipped_turn_taken). The second-nearest took it with no skip; by the nearest the brief loud
+  # skip is the price of never discounting one reading (as round 2 had it, at 17.1 m with the cap dropped). Two readings that
+  # agree on a short junction are
+  # test_two_readings_that_agree_on_a_rights_junction_behind_the_car_skip_it_out_loud_and_keep_its_cap's.
+  # The car's yaw goes round the junction only once the turn's desire has gone
   J = 400.
-  for side, off, near in (('right', -20., 60.), ('right', -12., 50.), ('right', -15., 55.), ('right', -25., 70.),
-                          ('right', -8., 45.), ('left', -20., 60.)):
-    nxt = 'left' if side == 'right' else 'right'
-    mans = [(J, "turn", side, junction_of(side)), (J + 1200., "turn", nxt, junction_of(nxt, 2))]
-    sim = Sim(mans)
-    def outlier(sim, instr, side=side, off=off, near=near, mans=mans, done=[]):  # noqa: B006 (once per sim)
-      if sim.s < J - near or done:
-        return instr, True
-      done.append(sim.s)
-      return nav_instruction(J - sim.s + off, "turn", side, remaining=J + 1300. - sim.s + off, junction=junction_of(side),
-                             ahead=[(mans[1][0] - sim.s + off,) + tuple(mans[1][1:])]), True
-    sim.nav_filter = outlier
-    committed_at, stops, errors = None, [], []
-    while sim.s < J + 30.:
-      sim.step(yaw_rate=turn_yaw(sim, side, J - 2. < sim.s < J + 12.))
-      if committed_at is None and sim.tp.turn_committed:
-        committed_at = sim.s
-      if sim.v < 0.3:
-        stops.append(J - sim.s)
-      if committed_at is not None and committed_at + 15. < sim.s < J:  # navd's next update in
-        errors.append(sim.distance() - (J - sim.s))
-    case = (side, off, near)
-    assert committed_at is not None and committed_at >= J - near - 1., case  # the outlier is what brought the pulse out
-    before = [(s, v, p) for s, v, p in sim.trace if committed_at <= s < J + 8.]
-    assert all(p.speedCap < NO_SPEED_CAP and p.desire != CLEAR_DESIRE for _, _, p in before), case
+  nxt = 'left' if side == 'right' else 'right'
+  turn = Desire.turnRight if side == 'right' else Desire.turnLeft
+  mans = [(J, "turn", side, junction_of(side)), (J + 1200., "turn", nxt, junction_of(nxt, 2))]
+  sim = Sim(mans)
+  done = []
+  def outlier(sim, instr):
+    if sim.s < J - near or done:
+      return instr, True
+    done.append(sim.s)
+    return nav_instruction(J - sim.s + off, "turn", side, remaining=J + 1300. - sim.s + off, junction=junction_of(side),
+                           ahead=[(mans[1][0] - sim.s + off,) + tuple(mans[1][1:])]), True
+  sim.nav_filter = outlier
+  committed_at, stops, errors, pulsed = None, [], [], False
+  while sim.s < J + 30.:
+    sim.step(yaw_rate=turn_yaw(sim, side, J - 2. < sim.s < J + 12. and pulsed))
+    pulsed = pulsed or sim.trace[-1][2].desire == turn
+    if committed_at is None and sim.tp.turn_committed:
+      committed_at = sim.s
+    if sim.v < 0.3:
+      stops.append(J - sim.s)
+    if done and done[0] + 15. < sim.s < J:  # navd's next update in
+      errors.append(sim.distance() - (J - sim.s))
+  case = (side, off, near, want)
+  assert done, case
+  skipped = [(round(J - s, 1), str(p.skipReason)) for s, _, p in sim.trace if p.tooFastToTurn]
+  if want == 'skip':
+    # the 8-10 m band: never pulsed (not early by the outlier, nor late past the junction), skipped tooLate out loud as the
+    # nearest crosses, 7.7-9.8 m short, its corner cap kept through the junction (turnpilotd keep_hand_cap)
+    assert not rising(sim.trace, 'desire', Desire.turnRight) and committed_at is None, case
+    onsets = [(s, str(p.skipReason)) for (s, _, p), (_, _, q) in zip(sim.trace[1:], sim.trace, strict=False)
+              if p.tooFastToTurn and not q.tooFastToTurn]
+    assert len(onsets) == 1 and onsets[0][1] == 'tooLate' and -off - 1.5 < J - onsets[0][0] < -off + 0.5, (case, onsets)
+    assert all(p.speedCap < NO_SPEED_CAP for s, _, p in sim.trace if done[0] <= s < J), case
+    assert max(v for s, v, _ in sim.trace if J - 15. < s < J + 2.) < 3.5, case  # held to its cap through the junction
     assert errors and max(errors) < 1., (case, max(errors))  # the junction never further than it is
-    assert max(v for s, v, _ in before if s > J - 15.) < 5., case  # held to the turn's cap, 4.3 m/s here
-    if side == 'left':
-      assert_hold_line_kept(sim, stops, case)
+    return
+  if want == 'retake':
+    # skipped out loud at the nearest's crossing, short of the junction, the cap kept, then taken at 8 m as navd moving on
+    onsets = [(s, str(p.skipReason)) for (s, _, p), (_, _, q) in zip(sim.trace[1:], sim.trace, strict=False)
+              if p.tooFastToTurn and not q.tooFastToTurn]
+    assert len(onsets) == 1 and onsets[0][1] == 'tooLate' and 10. < J - onsets[0][0] < -off + 0.5, (case, onsets)
+    assert all(p.speedCap < NO_SPEED_CAP for s, _, p in sim.trace if done[0] <= s < J), case
+    pulse = rising(sim.trace, 'desire', Desire.turnRight)
+    assert len(pulse) == 1 and abs(J - pulse[0] - CURB_TURN_PULSE_M) < 1., (case, [round(J - s, 1) for s in pulse])
+    assert max(v for s, v, _ in sim.trace if J - 15. < s < J + 2.) < 3.5, case
+    return
+  assert not skipped, (case, skipped[:1])  # the turn taken: one reading off is no reason to skip it
+  assert committed_at is not None, case
+  if side == 'right':
+    pulse = rising(sim.trace, 'desire', Desire.turnRight)
+    within = 1. if off < 0. else CURB_TURN_PULSE_M - CURB_LATEST_PULSE_M + 0.5  # a long one: by the latest, at 6 m
+    assert len(pulse) == 1 and abs(J - pulse[0] - CURB_TURN_PULSE_M) < within and J - pulse[0] < CURB_TURN_PULSE_M + 1., \
+      (case, [round(J - s, 1) for s in pulse])
+    assert abs(committed_at - pulse[0]) < 1e-6, case  # committed at its one pulse, by the true reading
+  else:
+    assert committed_at >= J - near - 1., case  # the outlier is what brought the pulse out
+  before = [(s, v, p) for s, v, p in sim.trace if done[0] <= s < J + 8.]
+  assert all(p.speedCap < NO_SPEED_CAP and p.desire != CLEAR_DESIRE for _, _, p in before), case
+  assert errors and max(errors) < 1., (case, max(errors))  # the junction never further than it is
+  assert max(v for s, v, _ in before if s > J - 15.) < 5., case  # held to the turn's cap, 4.3 m/s here
+  if side == 'left':
+    assert_hold_line_kept(sim, stops, case)
 
 
 def assert_hold_line_kept(sim, stops, case):
@@ -1394,16 +1500,18 @@ def test_a_gps_bias_long_before_the_turn_or_lasting_into_it_never_holds_its_junc
 def test_gps_outlier_that_commits_the_turn_and_a_fault_after_it_dont_pass_the_turn_short():
   # navd's reading 60 m out is 20 m short and brings the turn's first pulse out; turnpilotd faults from 56 m for
   # frames frames, dead-reckoning the committed turn. It is on the track navd's readings agree on, not on the outlier's:
-  # not read as passed short of the junction once the fault is over, its cap kept to it
+  # not read as passed short of the junction once the fault is over, its cap kept to it. A far-side turn's (a T's left,
+  # its 40 m lead by the nearest): a right's one pulse goes 8 m out by the furthest (2026-11-06, desire_timing
+  # CURB_TURN_PULSE_M), so no outlier 60 m out commits it, and the fault would come with nothing committed to keep
   J = 400.
   for frames in (60, 100, 120, 160):
-    mans = [(J, "turn", "right", junction_of("right")), (J + 1200., "turn", "left", junction_of("left", 2))]
+    mans = [(J, "turn", "left", T_LEFT), (J + 1200., "turn", "right", junction_of("right", 2))]
     sim = Sim(mans)
     def outlier(sim, instr, mans=mans, done=[]):  # noqa: B006
       if sim.s < J - 60. or done:
         return instr, True
       done.append(sim.s)
-      return nav_instruction(J - sim.s - 20., "turn", "right", remaining=J + 1300. - sim.s - 20., junction=junction_of("right"),
+      return nav_instruction(J - sim.s - 20., "turn", "left", remaining=J + 1300. - sim.s - 20., junction=T_LEFT,
                              ahead=[(mans[1][0] - sim.s - 20.,) + tuple(mans[1][1:])]), True
     sim.nav_filter = outlier
     update, faulted = sim.tp.follower.update, [0]
@@ -1415,7 +1523,7 @@ def test_gps_outlier_that_commits_the_turn_and_a_fault_after_it_dont_pass_the_tu
     sim.tp.follower.update = failing
     committed_at = None
     while sim.s < J + 30.:
-      sim.step(yaw_rate=turn_yaw(sim, 'right', J - 2. < sim.s < J + 12.))
+      sim.step(yaw_rate=turn_yaw(sim, 'left', J - 2. < sim.s < J + 12.))
       if committed_at is None and sim.tp.turn_committed:
         committed_at = sim.s
     assert committed_at is not None and committed_at >= J - 61., frames
@@ -1476,27 +1584,436 @@ def test_gps_outlier_on_the_last_reading_of_a_straight_on_step_doesnt_hold_the_t
   assert_junction_kept(sim, J, 'right', 'none step', J - 30., errors)
 
 
-def test_navd_moving_on_early_to_a_turn_the_same_way_without_junction_data_keeps_the_committed_turn():
+@pytest.mark.parametrize("at,gap", [(8., 40.), (14., 50.), (7., 40.), (5., 50.)])
+def test_navd_moving_on_early_to_a_turn_the_same_way_without_junction_data_keeps_the_committed_turn(at, gap):
   # a route without junction data: a right, and another right gap m on. navd moves on to the second at m before the
-  # first: with no bearings the two read as the same junction, but the committed right's junction stays where it was
-  # dead-reckoned: the same maneuver to the junction, its cap kept, the car not sped up into it, no CLEAR before it
-  for at, gap in ((8., 40.), (14., 50.)):
-    sim = Sim([(300., "turn", "right"), (300. + gap, "turn", "right"), (1500., "turn", "left", T_LEFT)])
-    while sim.distance() > at + 3. or sim.s < 10.:
-      sim.step()
-    assert sim.tp.turn_committed
-    n, turn = len(sim.trace), sim.tp.follower.maneuver_id
-    def early(sim, instr, at=at, gap=gap):
-      if 300. - at <= sim.s < 300. + gap - 10. and instr.maneuverModifier == 'right':
-        return nav_instruction(300. + gap - sim.s, "turn", "right", remaining=1500. - sim.s), True
+  # first (a sharp turn's next step, up to 10 m before its end; GPS noise forward): with no bearings the two read as the
+  # same junction, but the right's junction stays where it was dead-reckoned: the same maneuver to the junction, its one
+  # pulse at 8 m (2026-11-06, desire_timing CURB_TURN_PULSE_M: before that a right was committed from its 40 m pulse, so
+  # navd moving on from 14 m found it committed), its cap kept, the car not sped up into it, no CLEAR before it. Never the
+  # right passed in silence, unpulsed, for navd's early move. From 14 m (2026-11-06 review) the follower switched to the second
+  # right 2.9 m short of the first, which got no pulse, no skip and no 'Turn Missed': the right is in hand from its cap's lead
+  # (turnpilotd.in_hand_now), so the follower holds it through navd's early move (route_follower junction_hold: a reading of
+  # the second right beyond SAME_TURN_M of the first's readings is a gap)
+  sim = Sim([(300., "turn", "right"), (300. + gap, "turn", "right"), (1500., "turn", "left", T_LEFT)])
+  while sim.distance() > at + 3. or sim.s < 10.:
+    sim.step()
+  n, turn = len(sim.trace), sim.tp.follower.maneuver_id
+  def early(sim, instr):
+    if 300. - at <= sim.s < 300. + gap - 10. and instr.maneuverModifier == 'right':
+      return nav_instruction(300. + gap - sim.s, "turn", "right", remaining=1500. - sim.s), True
+    return instr, True
+  sim.nav_filter = early
+  while sim.s < 305.:
+    sim.step(yaw_rate=-0.5 if sim.s > 298. else 0.)
+    if sim.s < 300.:
+      assert sim.tp.follower.maneuver_id == turn, (at, gap, round(sim.s, 1), "the right dropped for navd's early move")
+  pulse = rising(sim.trace[n:], 'desire', Desire.turnRight)
+  assert len(pulse) == 1 and CURB_FIRST_PULSE_M < 300. - pulse[0] <= CURB_TURN_PULSE_M + 1., (at, gap, pulse)
+  assert_turn_held(sim, n)
+  assert all(p.desire != CLEAR_DESIRE for s, _, p in sim.trace[n:] if s < 302.), (at, gap)
+
+
+# --- a curb-side turn in hand (turnpilotd.in_hand_now, 2026-11-06): from turn_speed.TURN_CAP_LEAD_M to its one 8 m pulse, the
+# protections a right had at HEAD with its desire out from 40 m ---
+
+RIGHT_THEN_LEFT = [(300., "turn", "right", junction_of("right")), (340., "turn", "left", (90., 0., 2, 'present')),
+                   (1500., "turn", "right", junction_of("right", 3))]
+
+
+def right_in_hand(at, mans=None, cruise=13.):
+  """A Sim on mans (a right at 300 m with junction data, a left 40 m after it) driven to at m from the right: in hand, its one
+  pulse not yet out."""
+  sim = Sim(mans or RIGHT_THEN_LEFT, cruise=cruise)
+  while sim.distance() > at or sim.s < 10.:
+    sim.step()
+    assert sim.t < 120.
+  assert sim.tp.in_hand_now() and not sim.tp.turn_committed
+  return sim
+
+
+def drive_the_right(sim, until=320.):
+  """On to until, the car's yaw round the right at 300 m once its desire is out (a right's 8 m radius at its cap). Returns
+  [(s, the follower's maneuver id)] of each frame."""
+  ids = []
+  while sim.s < until:
+    out = sim.tp.desires.started and sim.tp.desires.side != 0
+    sim.step(yaw_rate=-sim.v / 8. if out and 298. < sim.s < 310. else 0.)
+    ids.append((sim.s, sim.tp.follower.maneuver_id))
+    assert sim.t < 200.
+  return ids
+
+
+def test_a_gps_jump_20_m_before_a_right_in_hand_keeps_its_cap():
+  """navd's reading of a right 20 m out jumps 60 m up for one fix or two (the same step, the same bearings): at HEAD the right
+  was committed from its 40 m pulse and the follower held it (route_follower: a reading beyond SAME_TURN_M of its readings is
+  a gap); with its one pulse at 8 m it was a new maneuver 80 m out (a jump of more than ROUTE_JUMP_M), its cap lifted for a
+  second and the car sped up into the junction. In hand, it is held: the same maneuver, its cap kept, the car never faster
+  than when the jump came, its one pulse at 8 m."""
+  for fixes in (1, 2):
+    sim = right_in_hand(20.)
+    n, mid, jumped = len(sim.trace), sim.tp.follower.maneuver_id, []
+
+    def jump(sim, instr, fixes=fixes, jumped=jumped):
+      if len(jumped) < fixes and instr.maneuverModifier == 'right':
+        jumped.append(sim.s)
+        return nav_instruction(instr.maneuverDistance + 60., "turn", "right", remaining=instr.distanceRemaining + 60.,
+                               junction=junction_of("right"), ahead=[(340. - sim.s + 60., "turn", "left", (90., 0., 2, 'present'))]), True
+      return instr, True
+    sim.nav_filter = jump
+    ids = drive_the_right(sim)
+    assert len(jumped) == fixes
+    before = [(s, v, p) for s, v, p in sim.trace[n:] if s < 300.]
+    assert all(i == mid for s, i in ids if s < 300.), fixes
+    assert all(p.speedCap <= sim.trace[n - 1][2].speedCap + 0.5 for _, _, p in before), fixes
+    assert max(v for _, v, _ in before) <= sim.trace[n - 1][1] + 0.05, fixes
+    pulse = rising(sim.trace[n:], 'desire', Desire.turnRight)
+    assert len(pulse) == 1 and abs(300. - pulse[0] - CURB_TURN_PULSE_M) < 1., (fixes, pulse)
+    assert not any(p.tooFastToTurn or p.turnMissed for _, _, p in sim.trace[n:]), fixes
+
+
+def test_a_reroute_that_doesnt_turn_at_a_right_in_hand_drops_its_cap_and_floor():
+  """A new route 30 m before a right in hand (a destination changed from the phone, a reroute), going straight on through its
+  junction (its first maneuver a left 600 m on): the right is the new route's to drop, never a gap held to the pass. No pulse
+  for it, its cap and its 3 m/s floor gone with it (the car on at the cruise), nothing said: navd's reroute, not a turn lost.
+  With navd's separator between the routes (one invalid message with the new routeCount) or without. One that turns there (the
+  same right, its bearings) keeps it: pulsed at 8 m, capped to its junction."""
+  for separator in (True, False):
+    for turns_there in (False, True):
+      sim = right_in_hand(30.)
+      switch, n, mid = sim.s, len(sim.trace), sim.tp.follower.maneuver_id
+      new = [(300., "turn", "right", junction_of("right")), (340., "turn", "left", (90., 0., 2, 'present'))] if turns_there else \
+        [(switch + 600., "turn", "left", junction_of("left"))]
+      sim.navd = FakeNavd(new + [(switch + 1500., "turn", "right", junction_of("right", 3))], route_count=1)
+      sent = []
+
+      def sep(sim, instr, separator=separator, sent=sent):
+        if separator and not sent:
+          sent.append(sim.s)
+          return nav_instruction(0., valid=False, route_count=1), False
+        return instr, True
+      sim.nav_filter = sep
+      ids = drive_the_right(sim, 330.)
+      after = [(s, v, p) for s, v, p in sim.trace[n:]]
+      taken = next(s for s, i in ids if i != mid)  # the new route's first valid update (a separator held to it)
+      assert taken - switch < 7., (separator, turns_there, taken - switch)
+      case = (separator, turns_there)
+      assert not any(p.tooFastToTurn or p.turnMissed for _, _, p in after), case
+      pulse = rising(sim.trace[n:], 'desire', Desire.turnRight)
+      if turns_there:
+        assert len(pulse) == 1 and abs(300. - pulse[0] - CURB_TURN_PULSE_M) < 1., (case, pulse)
+        assert max(v for s, v, _ in after if 285. < s < 300.) < 3.5, case
+      else:
+        assert not pulse, case
+        assert max(v for s, v, _ in after if s < 300.) > 6., case  # its 3 m/s floor gone: the car on at the cruise
+        assert all(p.speedCap > 6. for s, _, p in after if taken < s < 300.), case
+
+
+def test_navd_moving_on_early_from_a_right_in_hand_keeps_it_and_a_drop_is_never_silent():
+  """navd moves on to the next step (a left 40 m on, its bearings) 12 m before a right in hand: the follower holds the right
+  (route_follower junction_hold) to its one pulse at 8 m and its pass, nothing said, then takes up the left. Were it dropped for
+  another maneuver of the same route short of its junction (the follower patched to hold nothing), that is never silent:
+  turnMissed (selfdrived's 'Turn Missed', 'Rerouting'; navd reroutes at once), logged turnpilot.turn_in_hand_dropped."""
+  from openpilot.selfdrive.turnpilot.turnpilotd import MISSED_HOLD_S
+  for patched in (False, True):
+    sim = right_in_hand(14.)
+    n, mid = len(sim.trace), sim.tp.follower.maneuver_id
+
+    def early(sim, instr):
+      if 300. - sim.s <= 12. and instr.maneuverModifier == 'right':
+        return nav_instruction(340. - sim.s, "turn", "left", remaining=1500. - sim.s, junction=(90., 0., 2, 'present')), True
       return instr, True
     sim.nav_filter = early
-    while sim.s < 305.:
-      sim.step(yaw_rate=-0.5 if sim.s > 298. else 0.)
-      if sim.s < 300.:
-        assert sim.tp.follower.maneuver_id == turn, (at, gap, sim.s)
-    assert_turn_held(sim, n)
-    assert all(p.desire != CLEAR_DESIRE for s, _, p in sim.trace[n:] if s < 302.), (at, gap)
+    if patched:
+      update = sim.tp.follower.update
+      sim.tp.follower.update = lambda *a, junction_hold=False, update=update, **k: update(*a, **k)
+    with mock.patch('openpilot.selfdrive.turnpilot.turnpilotd.cloudlog') as log:
+      ids = drive_the_right(sim)
+    events = [c.args[0] for c in log.event.call_args_list]
+    missed = [s for s, _, p in sim.trace[n:] if p.turnMissed]
+    if patched:
+      assert missed and 300. - missed[0] > 8., missed[:1]  # said at the drop, short of the junction
+      assert sum(1 for s, _, p in sim.trace[n:] if p.turnMissed) * DT_MDL == pytest.approx(MISSED_HOLD_S, abs=2 * DT_MDL)
+      assert 'turnpilot.turn_in_hand_dropped' in events
+    else:
+      assert not missed and 'turnpilot.turn_in_hand_dropped' not in events
+      assert all(i == mid for s, i in ids if s < 300.)
+      pulse = rising(sim.trace[n:], 'desire', Desire.turnRight)
+      assert len(pulse) == 1 and abs(300. - pulse[0] - CURB_TURN_PULSE_M) < 1., pulse
+      assert sim.tp.follower.maneuver.side == 1  # the left after it, once the right is over
+
+
+@pytest.mark.parametrize("separator", [False, True])
+def test_a_reroute_onto_a_skipped_turns_junction_never_skips_it_again(separator):
+  """curb-turn-timing risk 8 (2026-11-06): one skip per junction. A right skipped tooLate out loud as one reading 9 m short 45 m
+  out has its nearest cross the junction 8.7 m short of it (the outlier band, its cap kept), and navd reroutes at once with the
+  same right there (an ETA drift, the stop-avoidance re-run): routeCount 1, straight on (the follower carries the old span and
+  its short nearest: split at first sight) or after a separator (navd's own, carrying the new routeCount: the old route
+  dropped, the new one fresh). Taken up fresh the reroute's id was judged again and skipped a second time ('Too Fast to Turn'
+  at 2.9 m after the separator), and through the separator the skipped right's corner cap went with the old route, the car
+  speeding from 3.1 to 4.6 m/s into the junction it was slowing to turn at. The skip is carried to the new id (carry_skip: one
+  turnpilot_turn_skipped, the same reason), its cap kept, through the gap too (skipped_cap): never pulsed, never faster than
+  its cap through the junction."""
+  J, off, near = 400., -9., 45.
+  mans = [(J, "turn", 'right', junction_of('right')), (J + 1200., "turn", 'left', junction_of('left', 2))]
+  sim = Sim(mans)
+  st = {'outlier': None, 'skipped': None, 'k': 0}
+
+  def navd(sim, instr):
+    if st['skipped'] is not None:  # navd's reroute, the same right, from the next update after the skip
+      st['k'] += 1
+      if separator and st['k'] == 1:
+        return nav_instruction(0., "", "", route_count=1, valid=False), False
+      return nav_instruction(J - sim.s, "turn", 'right', remaining=J + 1300. - sim.s, junction=junction_of('right'), route_count=1,
+                             ahead=[(mans[1][0] - sim.s,) + tuple(mans[1][1:])]), True
+    if sim.s < J - near or st['outlier'] is not None:
+      return instr, True
+    st['outlier'] = sim.s
+    return nav_instruction(J - sim.s + off, "turn", 'right', remaining=J + 1300. - sim.s + off, junction=junction_of('right'),
+                           ahead=[(mans[1][0] - sim.s + off,) + tuple(mans[1][1:])]), True
+  sim.nav_filter = navd
+  judged = []
+  skip = sim.tp.skip.skip
+
+  def counted(*a, log=True, **kw):
+    judged.append((a[4], log))
+    return skip(*a, log=log, **kw)
+  sim.tp.skip.skip = counted
+  while sim.s < J + 30.:
+    p = sim.step()
+    if p.tooFastToTurn and st['skipped'] is None:
+      st['skipped'] = sim.s
+  assert st['skipped'] is not None and st['k'] > 1, "navd's reroute came"
+  first = next(p for _, _, p in sim.trace if p.tooFastToTurn)
+  assert str(first.skipReason) == 'tooLate' and judged[0] == ('tooLate', True), judged
+  # the TurnSkip judgement made once; the reroute's id skipped by carry_skip, unlogged as a second skip
+  assert sum(log for _, log in judged) == 1 and all(r == 'tooLate' for r, _ in judged), judged
+  assert any(r == 'tooLate' and not log for r, log in judged), "the reroute's id carried the skip"
+  assert sim.tp.skipped_turn is not None and sim.tp.skipped_turn.route_count == 1
+  assert not rising(sim.trace, 'desire', Desire.turnRight), "a skipped right pulsed after its reroute"
+  assert all(str(p.skipReason) in ('', 'tooLate') for _, _, p in sim.trace)
+  assert max(v for s, v, _ in sim.trace if st['skipped'] <= s < J + 2.) < 3.5, "its corner cap kept through the reroute"
+  if not separator:
+    onsets = [s for (s, _, p), (_, _, q) in zip(sim.trace[1:], sim.trace, strict=False) if p.tooFastToTurn and not q.tooFastToTurn]
+    assert len(onsets) == 1, [round(J - s, 1) for s in onsets]
+
+
+@pytest.mark.parametrize("gap,outlier", [(20., None), (30., None), (12., 3.)])
+def test_a_reroute_onto_the_next_right_on_after_a_skipped_one_is_never_carried_as_it(gap, outlier):
+  """The 2026-11-06 review of the carry above: a right skipped tooLate on one reading 9 m short (the test above's), then
+  navd's usual reroute after a skipped right, routeCount 1: the next right on along the street, gap m past it, its bearings the
+  same. The carry's window was SAME_TURN_M about the skip's nearest reading, itself 9 m short, so the next right 20 and 30 m
+  on was carried as the skipped one: never pulsed, 'Too Fast to Turn' held on past the skipped junction (264 and 316 frames)
+  and navd rerouting again off a turn the car could make. Carried only within SKIP_SAME_M of the skipped junction's span (its
+  nearest to its latest confirmed reading), judged at the reroute turn's first sight (outlier: a later reading of a right 12 m
+  on, outlier m short, puts it in the window: never carried after): the next right is pulsed at its 8 m, one skip said, the
+  right skipped never re-said."""
+  J, off, near = 400., -9., 45.
+  B = J + gap
+  mans = [(J, "turn", 'right', junction_of('right')), (J + 1200., "turn", 'left', junction_of('left', 2))]
+  sim = Sim(mans)
+  st = {'outlier': None, 'skipped': None, 'k': 0}
+
+  def navd(sim, instr):
+    if st['skipped'] is not None and sim.s > st['skipped'] + 2.:  # navd's reroute: the next right on, B
+      st['k'] += 1
+      short = outlier if outlier is not None and st['k'] == 3 else 0.
+      return nav_instruction(B - sim.s - short, "turn", 'right', remaining=B + 1300. - sim.s - short, junction=junction_of('right'),
+                             route_count=1, ahead=[(B + 1200. - sim.s - short, "turn", "left", junction_of('left', 2))]), True
+    if sim.s < J - near or st['outlier'] is not None:
+      return instr, True
+    st['outlier'] = sim.s
+    return nav_instruction(J - sim.s + off, "turn", 'right', remaining=J + 1300. - sim.s + off, junction=junction_of('right'),
+                           ahead=[(mans[1][0] - sim.s + off,) + tuple(mans[1][1:])]), True
+  sim.nav_filter = navd
+  with mock.patch('openpilot.selfdrive.turnpilot.turnpilotd.cloudlog') as log:
+    while sim.s < B + 25.:
+      out = sim.tp.desires.started and sim.tp.desires.side != 0
+      p = sim.step(yaw_rate=-sim.v / 8. if out and B - 2. < sim.s < B + 10. else 0.)
+      if p.tooFastToTurn and st['skipped'] is None:
+        st['skipped'] = sim.s
+      assert sim.t < 200.
+  case = (gap, outlier)
+  events = [c.args[0] for c in log.event.call_args_list]
+  assert st['skipped'] is not None and st['k'] > 3, ("navd's reroute came", case)
+  assert 'turnpilot.skip_carried' not in events and 'turnpilot.skip_not_carried' in events, case
+  onsets = [s for (s, _, p), (_, _, q) in zip(sim.trace[1:], sim.trace, strict=False) if p.tooFastToTurn and not q.tooFastToTurn]
+  assert len(onsets) == 1 and onsets[0] < J, (case, [round(s, 1) for s in onsets])
+  assert not any(p.tooFastToTurn for s, _, p in sim.trace if s > J + 2.), case
+  pulses = rising(sim.trace, 'desire', Desire.turnRight)
+  assert len(pulses) == 1 and abs(B - pulses[0] - CURB_TURN_PULSE_M) < 1.5, (case, [round(B - s, 1) for s in pulses])
+
+
+def test_two_readings_that_agree_on_a_rights_junction_behind_the_car_skip_it_out_loud_and_keep_its_cap():
+  """Two navd readings in a row 10 m short of a right 40 m out, then true again: the nearest reading has the junction 10 m
+  short (as one reading alone does: test_gps_outlier's skip band), so the right's pulse by the furthest at 8 m would go past
+  it by them: none goes, and the right is skipped out loud (tooLate, navd reroutes) as that reading crosses the junction, 10 m short
+  of it, never in silence and never pulsed late. In hand, its corner cap is kept to its pass, as with its desire out from 40 m
+  at HEAD: the car never speeds from 3 m/s straight through the junction it was slowing to turn at (the 2026-11-06 review's
+  skip band: 7.5-7.9 m/s from 8-10 m out)."""
+  J = 400.
+  mans = [(J, "turn", "right", junction_of("right")), (J + 1200., "turn", "left", junction_of("left", 2))]
+  sim = Sim(mans)
+  done = []
+
+  def biased(sim, instr):
+    if sim.s < J - 40. or len(done) >= 2:
+      return instr, True
+    done.append(sim.s)
+    return nav_instruction(J - sim.s - 10., "turn", "right", remaining=J + 1300. - sim.s - 10., junction=junction_of("right"),
+                           ahead=[(mans[1][0] - sim.s - 10.,) + tuple(mans[1][1:])]), True
+  sim.nav_filter = biased
+  while sim.s < J + 25.:
+    sim.step()
+  assert len(done) == 2
+  assert not rising(sim.trace, 'desire', Desire.turnRight)  # never pulsed: none late
+  onsets = [(s, str(p.skipReason)) for (s, _, p), (_, _, q) in zip(sim.trace[1:], sim.trace, strict=False) if p.tooFastToTurn and not q.tooFastToTurn]
+  assert len(onsets) == 1 and onsets[0][1] == 'tooLate' and abs(J - onsets[0][0] - 10.) < 1.5, onsets
+  after = [(s, v, p) for s, v, p in sim.trace if onsets[0][0] <= s < J]
+  assert after and all(p.tooFastToTurn and p.speedCap < NO_SPEED_CAP for _, _, p in after)
+  assert max(v for s, v, _ in sim.trace if J - 15. < s < J + 2.) < 3.5  # held to its cap through the junction
+
+
+@pytest.mark.parametrize("bias,true_at", [(8., 30.), (8., 9.), (8., 6.), (10., 30.), (10., 9.), (10., 6.)])
+def test_one_true_reading_inside_a_lasting_long_bias_never_has_a_right_pulsed_past_its_junction(bias, true_at):
+  """Every navd reading of a right bias m long (GPS behind the car), but for one true one inside true_at m: the furthest and
+  the latest (confirmed: the true one disagreed with the reading before it) stay long to the end, and only the nearest holds
+  the truth. Judged by the second-nearest (JunctionSpan.firm, the 2026-11-06 round before its review; removed), the true
+  reading was dropped as one reading alone: the pulse went by the furthest at its 8 m, 0.3 m past the junction under an 8 m
+  bias and 2.3 m past under 10 m, nothing said, a turn started past the corner. By the nearest no first pulse goes past the
+  junction and the right is skipped tooLate out loud as the nearest crosses it, its corner cap kept: the car held to 3 m/s
+  through it, rerouted. (The same readings are one outlier 8-10 m short: test_gps_outlier's skip band.)"""
+  J = 400.
+  mans = [(J, "turn", "right", junction_of("right")), (J + 1200., "turn", "left", junction_of("left", 2))]
+  sim = Sim(mans)
+  true = []
+
+  def biased(sim, instr):
+    if instr.maneuverModifier != 'right':
+      return instr, True
+    if J - sim.s < true_at and not true:
+      true.append(sim.s)
+      return instr, True
+    return nav_instruction(J - sim.s + bias, "turn", "right", remaining=J + 1300. - sim.s + bias, junction=junction_of("right"),
+                           ahead=[(mans[1][0] - sim.s + bias,) + tuple(mans[1][1:])]), True
+  sim.nav_filter = biased
+  while sim.s < J + 25.:
+    out = sim.tp.desires.started and sim.tp.desires.side != 0
+    sim.step(yaw_rate=turn_yaw(sim, 'right', J - 2. < sim.s < J + 12. and out))
+  case = (bias, true_at)
+  assert len(true) == 1, case
+  assert not rising(sim.trace, 'desire', Desire.turnRight), (case, [round(J - s, 1) for s in rising(sim.trace, 'desire', Desire.turnRight)])
+  onsets = [(s, str(p.skipReason)) for (s, _, p), (_, _, q) in zip(sim.trace[1:], sim.trace, strict=False) if p.tooFastToTurn and not q.tooFastToTurn]
+  assert len(onsets) == 1 and onsets[0][1] == 'tooLate' and abs(J - onsets[0][0]) < 1., (case, onsets)
+  assert all(p.speedCap < NO_SPEED_CAP for s, _, p in sim.trace if J - 30. < s < J), case
+  assert max(v for s, v, _ in sim.trace if J - 10. < s < J + 2.) < 3.5, case  # held to its cap through the junction
+
+
+def test_a_fault_with_a_right_in_hand_keeps_it():
+  """turnpilotd faults (update raising) for 1 s from 25 m before a right in hand: as a committed turn is (HEAD had it committed
+  from 40 m), its route and state are kept through the fault, its junction dead-reckoned (fault_track): the same maneuver
+  after the fault, its cap in force on the first plan (a fresh follower had no route until navd's next update), its one pulse
+  at 8 m, nothing skipped."""
+  sim = right_in_hand(25.)
+  mid = sim.tp.follower.maneuver_id
+  sim.tp.update = mock.Mock(side_effect=RuntimeError("synthetic failure"))
+  for _ in range(int(1. / DT_MDL)):
+    assert sim.step().fault == Fault.error
+  del sim.tp.update
+  n = len(sim.trace)
+  first = sim.step()
+  assert sim.tp.follower.maneuver_id == mid and first.speedCap < NO_SPEED_CAP
+  drive_the_right(sim)
+  pulse = rising(sim.trace[n:], 'desire', Desire.turnRight)
+  assert len(pulse) == 1 and abs(300. - pulse[0] - CURB_TURN_PULSE_M) < 1., pulse
+  assert not any(p.tooFastToTurn for _, _, p in sim.trace[n:])
+
+
+def test_a_handback_with_a_right_in_hand_keeps_its_corner_cap():
+  """The driving model falls back 25 m before a right in hand (its one pulse not out until 8 m): TurnPilot hands back, and
+  through the soft disable (openpilot still steering) the right's corner cap stays, as it did at HEAD with its desire out from
+  40 m (a handback must not speed the car up): the car slowing on to the right's 3 m/s floor by its junction, never only held to
+  its speed at the handback."""
+  sim = right_in_hand(25.)
+  sim.big = True
+  sim.step()
+  v0 = sim.v
+  sim.big = False
+  start = len(sim.trace)
+  for _ in range(int(SOFT_DISABLE_S / DT_MDL)):
+    sim.step()
+  held = sim.trace[start:]
+  assert all(p.handback == Handback.modelFellBack for _, _, p in held)
+  assert v0 > 4. and held[-1][1] < 3.3 and held[-1][0] < 300., (v0, held[-1][:2])  # on to the floor, short of the junction
+
+
+@pytest.mark.parametrize("back_at,said", [(1.95, True), (0.45, True), (CURB_FIRST_PULSE_M + 0.5, False)])
+def test_a_rights_reengage_repeat_past_its_deadline_is_skipped_out_loud_never_pulsed_late(back_at, said):
+  """turnpilotd-followups' open item (2026-11-06 review): openpilot's steering off 6 m before a right whose one 8 m pulse went
+  out, and back with no handback and no take-up (TurnPilot acting throughout), sent a fresh turnRight wherever it came back
+  under TURN_STARTED_DEG: 1.95 m and 0.45 m out, the late pulse into the exit road's far lanes. Bounded as the right's first
+  pulse is (desire_timing: repeat_refused), it never goes past CURB_FIRST_PULSE_M, and the right is skipped out loud there
+  (desireDropped: 'Too Fast to Turn', navd's reroute), its pulse cleared from the model's queue and its corner cap kept to its
+  pass, as its take-up after a handback is. Back inside the bound, the fresh pulse goes as before and nothing is skipped."""
+  sim = right_in_hand(20.)
+  plans = []
+  while 300. - sim.s > back_at:
+    plans.append(sim.step(lat_active=not 300. - sim.s <= 6.))
+    assert sim.t < 120.
+  back = len(plans)
+  while sim.s < 320.:
+    plans.append(sim.step())
+  edges = [i for i in range(1, len(plans)) if plans[i].desire == Desire.turnRight and plans[i - 1].desire != Desire.turnRight]
+  assert edges and 300. - sim.trace[edges[0]][0] > 6., "the right's one pulse, before openpilot stopped steering"
+  if not said:
+    assert len(edges) == 2 and edges[1] >= back and not any(p.tooFastToTurn for p in plans)
+    return
+  assert len(edges) == 1, [round(300. - sim.trace[i][0], 2) for i in edges]
+  skipped = [i for i, p in enumerate(plans) if p.tooFastToTurn]
+  assert skipped and skipped[0] - back <= 1 and str(plans[skipped[0]].skipReason) == 'desireDropped', \
+    (skipped[:1], back, [str(p.skipReason) for p in plans if p.tooFastToTurn][:1])
+  assert any(p.desire == CLEAR_DESIRE for p in plans[skipped[0]:skipped[0] + 3])
+  assert all(p.speedCap < NO_SPEED_CAP for s, _, p in sim.trace[skipped[0]:] if s < 300.), "its corner cap kept to its pass"
+
+
+@pytest.mark.parametrize("yaw_from,how,at", [(6., 'fault', 4.5), (4., 'fault', 4.5), (4., 'fault', 3.5), (4., 'fault', 2.5),
+                                             (6., 'lat1', 4.5), (4., 'lat1', 4.5), (4., 'lat3', 4.5), (4., 'lat1', 3.5),
+                                             (4., 'lat3', 3.5), (4., 'lat1', 2.5), (5.5, 'lat7', 5.)])
+def test_a_blip_in_a_right_taken_on_its_pulse_never_skips_it_nor_clears_its_pulse(yaw_from, how, at):
+  """The 2026-11-06 review of the re-engage bound (test above): its skip went on any frame openpilot wasn't steering, so a
+  right taken on its 7.7 m pulse (the car yawing round from yaw_from m, the model's 0.3-1.5 s at the 3 m/s cap) was skipped
+  'Too Fast to Turn' with its pulse cleared from the model's queue (CLEAR_DESIRE) mid-entry by one frame of turnpilotd faulting
+  (plan_inner: stop('fault'), hold_off) or one to three latActive frames lost at m out: skipped at 4.1, 3.2 and 2.15 m, the car
+  0-12.9 degrees into it, its crosswalk hold gone with the maneuver, navd rerouting off a turn being taken. A blip, or a longer
+  gap the car comes out of following the pulse round (lat7: 7 frames from 5 m, the car yawing from 5.5, back 11 degrees into
+  it), leaves the first pulse
+  to drive the turn: no skip, no second edge, no turnMissed, no clear before the car is CLEAR_MIN_DEG round, its corner cap kept
+  to the junction, the turn cleared at its angle."""
+  from openpilot.selfdrive.turnpilot.desire_timing import CLEAR_MIN_DEG
+  sim = right_in_hand(20.)
+  n0 = len(sim.trace)
+  plans, turned, off, n = [], [], 0, int(how[3:]) if how.startswith('lat') else 1
+  while sim.s < 320.:
+    lat = True
+    if 300. - sim.s <= at and off < n:
+      off += 1
+      if how == 'fault':
+        sim.tp.update = mock.Mock(side_effect=RuntimeError("synthetic failure"))
+      else:
+        lat = False
+    p = sim.step(lat_active=lat, yaw_rate=-sim.v / 8. if sim.tp.desires.started and 300. - yaw_from < sim.s < 310. else 0.)
+    if isinstance(sim.tp.__dict__.get('update'), mock.Mock):
+      del sim.tp.update
+    plans.append(p)
+    turned.append(sim.tp.desires.turned_deg)
+    assert sim.t < 200.
+  assert off == n
+  edges = [i for i in range(1, len(plans)) if plans[i].desire == Desire.turnRight and plans[i - 1].desire != Desire.turnRight]
+  assert len(edges) == 1 and abs(300. - sim.trace[n0 + edges[0]][0] - CURB_TURN_PULSE_M) < 1., [round(300. - sim.trace[n0 + i][0], 2) for i in edges]
+  assert not any(p.tooFastToTurn or p.turnMissed for p in plans), [(round(300. - s, 2), str(p.skipReason)) for s, _, p in sim.trace[n0:] if p.tooFastToTurn][:1]
+  clears = [i for i, p in enumerate(plans) if p.desire == CLEAR_DESIRE]
+  assert clears and all(turned[i] >= CLEAR_MIN_DEG for i in clears), [(round(300. - sim.trace[n0 + i][0], 2), round(turned[i], 1)) for i in clears[:1]]
+  assert all(p.speedCap < NO_SPEED_CAP for s, _, p in sim.trace[n0 + edges[0]:] if s < 300.), "its corner cap kept to the junction"
 
 
 def test_a_fault_in_a_committed_turn_doesnt_hold_it_past_its_junction():
@@ -1762,7 +2279,10 @@ def test_left_too_fast_to_make_is_skipped_out_loud_not_braked_for():
 
 def test_left_whose_stop_cant_be_made_is_skipped_though_the_turn_could_be():
   # first seen 31 m out at 10 m/s: slowing to the turn's speed by the junction is fine, but stopping at its hold line
-  # needs -2.3 m/s^2. An unprotected left is only taken from that stop: skipped out loud and rerouted, never braked for
+  # needs -2.3 m/s^2. Every unprotected left is driven to its hold line, and goes from there on a gap or hands back with the
+  # car held (Kellen, 2026-11-06: never skipped or rerouted for its range); one first seen too close to stop at that line at
+  # -2.0 can't be driven to it, so it is skipped out loud (unprotectedStop) and rerouted, never braked for at the floor nor
+  # crossed blind. A T-left (no oncoming road) has no such stop and is taken
   for junction, skipped in ((junction_of("left"), True), (T_LEFT, False)):
     sim = Sim([(31., "turn", "left", junction), (2000., "turn", "right")], cruise=10.)
     sim.v = 10.
@@ -1938,6 +2458,108 @@ def test_tiles_without_controls_are_said_out_loud():
   sim = Sim([(600., "turn", "right"), (1500., "turn", "left")])
   plans = [sim.step() for _ in range(int(20. / DT_MDL))]
   assert not any(p.controlAlert == 'mapControlsUnavailable' for p in plans)
+
+
+@pytest.mark.parametrize("always_drive", [False, True])
+def test_a_route_waiting_on_its_start_direction_says_it_starts_never_off_route(always_drive):
+  """navd withholds a new route's guidance until the car's start direction is checked (navInstruction.routeHeadingUnverified,
+  its messages invalid: a destination set standing, parked or nose-in), the stops ahead unknown (its lookup pending). That
+  was "Off route, map stops unknown: take control or wait for reroute" with offRouteStopsUnknown's chime at every route start,
+  the car on no route at all. While navd says so, the status line says the route starts (ROUTE_STARTS_REASON standing,
+  ROUTE_STARTING_REASON moving: a reroute made for the heading) with no sound (mapControlsUnavailableSilent), and the
+  off-route cap stays (map_controls OFF_ROUTE_SPEED, the switch's OFF_ROUTE_DRIVE_SPEED: nothing ahead is known). Without the
+  flag, off the route, the words and the alert are as they were."""
+  from openpilot.selfdrive.turnpilot.map_controls import OFF_ROUTE_DRIVE_REASON, OFF_ROUTE_DRIVE_SPEED, OFF_ROUTE_REASON, OFF_ROUTE_SPEED
+  from openpilot.selfdrive.turnpilot.turnpilotd import ROUTE_STARTING_REASON, ROUTE_STARTS_REASON
+  floor = OFF_ROUTE_DRIVE_SPEED if always_drive else OFF_ROUTE_SPEED
+
+  def run(unverified, standing):
+    sim = Sim([(400., "turn", "right"), (2000., "turn", "left")], cruise=13.)
+    sim.tp.always_drive, sim.v = always_drive, 0.  # from a standstill: moving, the car pulls away under the cap
+    sim.nav_filter = lambda s, i: (nav_instruction(0., "", "", valid=False, route_heading_unverified=unverified,
+                                                   off_route_status='pending', route_count=1), False)
+    plans = []
+    for _ in range(int(8. / DT_MDL)):
+      if standing:
+        sim.v = 0.
+      plans.append(sim.step(engaged=not standing))  # standing: parked, the destination set before engaging
+    return sim, plans[int(4. / DT_MDL):]  # past the tracker's grace (OFF_ROUTE_GRACE_S) and the cap's ramp down
+  for standing, words in ((True, ROUTE_STARTS_REASON), (False, ROUTE_STARTING_REASON)):
+    sim, plans = run(True, standing)
+    assert all(p.reason == words and p.controlAlert == 'mapControlsUnavailableSilent' for p in plans), \
+      sorted({(p.reason, str(p.controlAlert)) for p in plans})
+    assert all(p.speedCap <= floor + 1e-3 for p in plans) and sim.v <= floor + 0.3, (standing, sim.v)
+  sim, plans = run(False, False)
+  off = OFF_ROUTE_DRIVE_REASON if always_drive else OFF_ROUTE_REASON
+  assert all(p.reason == off for p in plans) and plans[0].speedCap <= floor + 1e-3
+  assert any(p.controlAlert == 'offRouteStopsUnknown' for _, _, p in sim.trace), "the off-route onset's alert, as before"
+
+
+def late_signal(turn: str, at: float, v: float = 6.):
+  """A route turn at 300 m whose junction's signal (its line 290 m) map_controls first knows too close to stop for at
+  MAP_DECEL_MAX. 'reroute': the route goes straight through the signal until navd reroutes at s = at onto a right there
+  (routeCount 1), the car at v; 'tleft': a T-left whose desire is out from its 40 m lead, its signal first listed from s = at (a
+  tile loaded late); 'camera': the reroute's right at a junction navd maps no signal at (controls ok), the camera's reader
+  acting (addOnly) and reading the junction's head (unknown, as every head of the 11-06 night read) from the start, so the
+  camera's own signal there (map_controls' camera_signal) comes due as the reroute makes the right, too close to stop for.
+  Driven on past the junction. Returns the sim."""
+  J, line = 300., 290.
+  if turn in ('reroute', 'camera'):
+    sim = Sim([(J, "turn", "right", junction_of("right")), (1500., "turn", "left", junction_of("left"))], cruise=v)
+    sim.v = v
+    if turn == 'camera':
+      from openpilot.selfdrive.turnpilot.tests.test_camera_lights import detections
+      none = messaging.new_message('turnpilotLights').as_reader().turnpilotLights
+      sim.tp.camera_mode = 'addOnly'
+
+      def lights(s):
+        if int(round(s.t / DT_MDL)) % 2 == 0:  # a road camera run every other frame, as modeld's
+          s.sm.put('turnpilotDetections', detections('unknown', J + 8. - s.s, shadow=False))
+        return none
+      sim.lights = lights
+
+    def navd(s, instr):
+      ctl = [(0, 'signal', line - s.s)] if turn == 'reroute' and -15. < line - s.s < 400. else []
+      if s.s < at:
+        return nav_instruction(1500. - s.s, "turn", "left", junction=junction_of("left"), controls=ctl, controls_status='ok'), True
+      return nav_instruction(J - s.s, "turn", "right", junction=junction_of("right"), route_count=1, controls=ctl, controls_status='ok',
+                             ahead=[(1500. - s.s, "turn", "left", junction_of("left"))]), True
+  else:
+    sim = Sim([(J, "turn", "left", T_LEFT), (1500., "turn", "right", junction_of("right"))])
+
+    def navd(s, instr):
+      ctl = [(0, 'signal', line - s.s)] if s.s >= at else []
+      return nav_instruction(J - s.s, "turn", "left", junction=T_LEFT, controls=ctl,
+                             ahead=[(1500. - s.s, "turn", "right", junction_of("right"))]), True
+  sim.nav_filter = navd
+  while sim.s < J + 20.:
+    sim.step(engaged=True)
+    assert sim.t < 90., "held at the signal: its stop was feasible after all"
+  return sim
+
+
+@pytest.mark.parametrize("turn,at,v", [('reroute', 280., 6.), ('reroute', 278., 7.), ('camera', 282., 6.)])
+def test_a_reroutes_right_at_a_signal_too_close_to_stop_for_is_driven_with_the_model(turn, at, v):
+  """turnpilotd-followups' open item (2026-11-06): a makeable route turn whose junction's signal is first known too close to
+  stop for (here navd's reroute onto a right at a mapped signal 10-12 m short of its line at 6-7 m/s: -2.4 m/s^2 or harder;
+  'camera': the same at an unmapped junction whose head the camera reads no colour of). It was skipped out loud
+  (signalStop). Since 2026-11-07 (Kellen: no handbacks) a turn at a light with no colour read is driven like a through
+  signal: never skipped for it, never a stop or a hard brake for it; a red the camera reads still stops the car."""
+  sim = late_signal(turn, at, v)
+  plans = [p for _, _, p in sim.trace]
+  assert not any(p.tooFastToTurn and str(p.skipReason) == 'signalStop' for p in plans), "never skipped for an unread light"
+  assert not any(p.shouldStop for p in plans) and min(a for a in (p.accelCap for p in plans)) > -2.1  # never braked for it
+
+
+def test_a_begun_turn_at_a_signal_too_close_to_stop_for_is_finished():
+  """...and a turn already begun there (a T-left whose desire is out from its 40 m lead, its signal first listed 6 m short of
+  its line at the left's 4.4 m/s: -2.4 m/s^2) is finished, never cancelled, never a stop or a hard brake for it, never
+  skipped (2026-11-07: an unread light is driven like a through signal)."""
+  sim = late_signal('tleft', 284.)
+  plans = [p for _, _, p in sim.trace]
+  assert not any(p.tooFastToTurn for p in plans)
+  assert not any(p.shouldStop for p in plans) and CLEAR_DESIRE not in [p.desire for s, _, p in sim.trace if s < 284.]
+  assert rising(sim.trace, 'desire', Desire.turnLeft), "the begun left finished"
 
 
 def stand(sim, seconds, **kw):
@@ -2122,9 +2744,9 @@ def test_a_turn_lane_with_a_map_stop_before_it_is_changed_into_before_the_stop()
 LEFT_AT_A_RED = [(300., "turn", "left", T_LEFT), (1500., "turn", "right", junction_of("right"))]
 
 
-def go_from_a_red(sim, s_signal=290., wait=1., limit=60., desire=Desire.turnLeft):
-  """Held at the signal s_signal, red in the sim's light oracle, for wait s, then its green: the hold lets go at
-  standstill, pulsing desire. Returns the plan that let go."""
+def let_go_at_a_green(sim, s_signal=290., wait=1., limit=60.):
+  """go_from_a_red's stand and green, nothing asserted of the go: held at the signal s_signal, red in the sim's light oracle,
+  for wait s, then its green, and the hold lets go at standstill. Returns the plan that let go."""
   sim.go_taps = False
   sim.tp.oracle_ok = True
   light = {'state': 'red'}
@@ -2141,9 +2763,34 @@ def go_from_a_red(sim, s_signal=290., wait=1., limit=60., desire=Desire.turnLeft
   while sim.trace[-1][2].shouldStop:
     sim.step(engaged=True)
     assert sim.t < limit + wait + 5.
-  plan = sim.trace[-1][2]
+  return sim.trace[-1][2]
+
+
+def go_from_a_red(sim, s_signal=290., wait=1., limit=60., desire=Desire.turnLeft):
+  """Held at the signal s_signal, red in the sim's light oracle, for wait s, then its green: the hold lets go at
+  standstill, pulsing desire. Returns the plan that let go."""
+  plan = let_go_at_a_green(sim, s_signal, wait, limit)
   assert plan.desire == desire  # the go pulse, at standstill
   return plan
+
+
+def curb_turn_from_a_red(sim, s_signal=290., wait=1., limit=60., desire=Desire.turnRight, junction=300.):
+  """A curb-side turn (a right; a left in left-hand traffic) at junction, held at its signal's line s_signal further out than
+  its one pulse goes (desire_timing: CURB_TURN_PULSE_M, and CURB_GO_SLACK_M for a go at its own hold line; the sim's signal
+  line is 10 m out), red in the sim's light oracle for wait s, then its green (let_go_at_a_green). Since the rights' one 8 m
+  pulse (2026-11-06, 1e's clipped rights) that go sends no turn desire: the car pulls away straight on the model, and the
+  turn's one pulse goes rolling CURB_TURN_PULSE_M out, nothing before it (never on the red, nor at the stand). Returns (the
+  plan that let go, the plan of the pulse)."""
+  go = let_go_at_a_green(sim, s_signal, wait, limit)
+  assert junction - sim.s > CURB_TURN_PULSE_M + CURB_GO_SLACK_M, "stood within the curb-side turn's pulse"
+  assert go.desire == Desire.none, "a turn desire at a go further out than the curb-side turn's one pulse"
+  while sim.trace[-1][2].desire != desire:
+    p = sim.step(engaged=True)
+    assert p.desire in (Desire.none, desire) and not p.tooFastToTurn and not p.shouldStop, (round(junction - sim.s, 2), p.desire)
+    assert junction - sim.s > CURB_FIRST_PULSE_M, "the curb-side turn's pulse never came"
+  pulse = sim.trace[-1][2]
+  assert sim.v > 0.3 and junction - sim.s <= CURB_TURN_PULSE_M + 0.5, (round(sim.v, 2), round(junction - sim.s, 2))
+  return go, pulse
 
 
 def go_from_the_hold(sim):
@@ -2338,6 +2985,9 @@ def test_a_model_stand_under_20_deg_past_the_maneuver_point_hands_back(controls,
   note at 5 s and carStoppedTakeControl only at 60 s, a mapped signal there or not. A red the map doesn't know stands the car
   at its line, short of the point, so a stand past it with the turn's desire out is the stall's from 0 deg."""
   sim = Sim(RIGHT_AT_A_CORNER, cruise=8., controls=list(controls))
+  if controls:  # the signal read green: the right drives through it (a route turn at a signal stops for want of a green)
+    sim.tp.oracle_ok = True
+    sim.lights = oracle_lights('green', controls[0][0])
   while 300. - sim.s > at:
     sim.step(engaged=True)
     assert sim.t < 120.
@@ -2453,9 +3103,11 @@ def test_a_turn_taken_or_a_brief_correction_never_reads_abandoned():
   into_a_right(sim, 20.)
   sim.model_kw = {'curvature': -0.5 * TURN_ABANDON_CURV}
   assert all(p.controlPrompt == 'none' for p in [sim.step(engaged=True) for _ in range(int(2. / DT_MDL))])
-  # on the approach, short of the hold line, the curvature away (the lane's own bend) is no abandoned turn
-  sim = Sim(RIGHT_AT_A_CORNER, cruise=8.)
-  sim.model_kw = {'curvature': -0.02}
+  # on the approach, short of the hold line, the curvature away (the lane's own bend) is no abandoned turn: a far-side turn's
+  # (a T's left, its desire out from its lead; a right's one pulse goes 8 m out, at its hold line, since 2026-11-06:
+  # desire_timing CURB_TURN_PULSE_M, so a right has no such approach with its desire out)
+  sim = Sim(LEFT_AT_A_RED, cruise=8.)
+  sim.model_kw = {'curvature': 0.02}
   plans = []
   while 300. - sim.s > HOLD_LINE_M + 1.:
     plans.append(sim.step(engaged=True))
@@ -2767,12 +3419,16 @@ def test_post_go_profiles_by_param_for_the_sweep():
 
 
 def test_no_post_go_profile_without_a_standstill_go():
-  """A turn driven through without stopping (signals pass through: no light source, no stop) keeps its own caps only."""
+  """A turn driven through without stopping (its signal read green: a route turn at a signal stops for want of one) keeps
+  its own caps only."""
   sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
+  sim.tp.oracle_ok = True
+  sim.lights = oracle_lights('green', 290.)
   plans = []
   while sim.s < 340.:
     plans.append(sim.step(engaged=True, yaw_rate=0.4 if 300. - sim.s < 10. and sim.tp.desires.turned_deg < 85. else 0.))
     assert sim.tp.post_go is None
+    assert sim.t < 60.
   assert all(p.accelCap == NO_ACCEL_CAP and not p.shouldStop for p in plans)
 
 
@@ -3325,12 +3981,20 @@ def test_a_curb_side_change_on_less_than_paint_never_goes_on_paint_nobody_read(s
     assert not any(p.tooFastToTurn for p in unread), on  # LC-03 judged at the window's end: nothing placed the car
 
 
-def test_a_turn_whose_desire_went_out_is_never_skipped_for_its_lane():
+@pytest.mark.parametrize("side", ['right', 'left'])
+def test_a_turn_whose_desire_went_out_is_never_skipped_for_its_lane(side):
   """A committed turn goes on (R13): the lane planner's block skips only a turn whose desire hasn't gone out. The block is
-  forced on here from the frame the turn's desire is out, never before it."""
-  sim = Sim([(400., 'turn', 'right'), (2000., 'turn', 'left')], cruise=15., nav_lanes={0: TWO_LANES_RIGHT_TURN}, model_lanes=(0, 1),
-            paint=BROKEN_WHITE_RIGHT)
-  sim.blindspot = lambda sim: (False, True)
+  forced on here from the frame the turn's desire is out, never before it, and the car driven to the junction: a right's
+  one pulse goes 8 m out (2026-11-06, desire_timing CURB_TURN_PULSE_M), past the lane window's end, so the drive runs on
+  to it; a T's left (a far-side turn, the car a lane right of its lane) pulses at its 40 m lead."""
+  if side == 'right':
+    sim = Sim([(400., 'turn', 'right'), (2000., 'turn', 'left')], cruise=15., nav_lanes={0: TWO_LANES_RIGHT_TURN}, model_lanes=(0, 1),
+              paint=BROKEN_WHITE_RIGHT)
+    sim.blindspot = lambda sim: (False, True)
+  else:
+    sim = Sim([(400., 'turn', 'left', T_LEFT), (2000., 'turn', 'right', junction_of('right'))], cruise=15.,
+              nav_lanes={0: THREE_LANES_LEFT_TURN}, model_lanes=(1, 1), paint=BROKEN_WHITE_LEFT)
+    sim.blindspot = lambda sim: (True, False)
   real = sim.tp.lanes.update
   committed = []
 
@@ -3339,6 +4003,9 @@ def test_a_turn_whose_desire_went_out_is_never_skipped_for_its_lane():
     committed.append(sim.tp.desires.started)
     return d._replace(blocked=sim.tp.desires.started)  # blocked only once the desire is out
   with mock.patch.object(sim.tp.lanes, 'update', side_effect=update):
-    sim.run(30.)
+    while sim.s < 405.:
+      sim.step()
+      assert sim.t < 90.
   assert any(committed)
+  assert rising(sim.trace, 'desire', Desire.turnRight if side == 'right' else Desire.turnLeft)
   assert not any(p.tooFastToTurn for _, _, p in sim.trace)

@@ -26,36 +26,41 @@ The loop (run), with route(exclude) the router's status-neutral reroute, which n
   - otherwise it ends 'clean' (nothing uncertifiable left) or 'unavoidable' (only unavoidable controls left).
 Whatever ends it, every stop and yield still uncertifiable on the kept route becomes unavoidable: the driver needs to know.
 
-The lefts the car would refuse (routing/lefts.py: an autonomous unprotected left past the detector's proven range, which
-turnpilotd skips as soon as it is the maneuver and navd reroutes) go round the same loop, excluded by their exit edge (that
-module says why not the approach), in the same set, under the same bounds and the same detour budget, with:
-  - lefts first: the route's new lefts are each iteration's batch while it has any, its stops only after. A left the car
-    refuses is a certain skip and a reroute at its junction; an unavoidable stop is a stop the line's own gate decides
-    (vision stop-go), so the lefts get the first claim on the budget, and a reroute for stops that brings more lefts the car
-    would skip is a failed iteration;
+The maneuvers the car refuses (routing/lefts.py: a Left, since 2026-11-06 only the route's U-turns, which the driving model
+can't drive) go round the same loop, excluded by their exit edge (that module says why not the approach), in the same set,
+under the same bounds and the same detour budget. The loop calls them lefts, as the code does: until 2026-11-06 they were
+also every autonomous unprotected left past the detector's proven range, which turnpilotd skipped as soon as it was the
+maneuver and navd rerouted. Since then no unprotected left is one (Kellen, 2026-11-06: "never route around or skip a left for
+range"): each is driven to its hold line and judged there (unprotected_left.py), so the route Valhalla gives keeps every
+left it has. On the 11-06 drives the loop refused every left 58-394 m out and each reroute brought another (1e: 19 route
+calculations, one "out of time after 5 reroutes"). The rules, the U-turns' since then:
+  - lefts first: the route's new lefts are each iteration's batch while it has any, its stops only after. A refused
+    maneuver is a certain miss and a reroute at its junction; an unavoidable stop is a stop the line's own gate decides
+    (vision stop-go), so the lefts get the first claim on the budget, and a reroute for stops that brings more of them is a
+    failed iteration;
   - a reroute around lefts with more of them than the route it would replace is a failed iteration too, so the count never
     goes up; one with as many is taken (excluding a left's exit often moves the route to the next block's left, and
     excluding that one may clear it), and the route with the fewest, then the quickest, of every route the lefts went
     through, plain included, is the one kept, the set's later exclusions dropped. On the region's real tiles (40 random
-    downtown trips, both ranges unmeasured, stops not avoided), taking any route within the budget left 6 trips with more
-    lefts than their plain route (5 for 3); so ruled, the plain routes' 94 lefts the car would skip were 61 on the kept
-    ones, none more than its own plain route's, at most +38 s, the loop at most 0.28 s on a Mac;
+    downtown trips, both ranges unmeasured, stops not avoided: the unprotected lefts, before 2026-11-06), taking any route
+    within the budget left 6 trips with more lefts than their plain route (5 for 3); so ruled, the plain routes' 94 lefts
+    the car would skip were 61 on the kept ones, none more than its own plain route's, at most +38 s, the loop at most
+    0.28 s on a Mac;
   - a batch of lefts that fails is retried one left at a time, nearest first (one too dear never costs the rest theirs); a
     single left that fails is unavoidable, and the loop goes on to the next, then to the stops, where a failed batch still
     ends it 'keptBest';
   - a left already in the set (an earlier route's for this destination) joins no batch, but the whole set goes out with every
-    reroute, and once even with no new left, so a reroute after a skip never brings a banned left back;
+    reroute, and once even with no new left, so a reroute after a miss never brings a banned one back;
   - a left still on a recomputed route whose point was sent is unavoidable, said loudly (the stops' 'failed' is about stops:
     the route-start notice says "Stop-sign routing failed"). Only the stops' own reroutes look for a stop's dropped point: one
     a reroute for lefts carried and Valhalla dropped is found by the stops' first pass as nothing more to send, unavoidable;
   - they don't ride TurnPilotAvoidStops (step S3 turns the stops' avoidance off to keep the junctions it validates), nor need
     the route's controls (unsupported tiles), only their exits (the same trace);
-  - every left still on the kept route is unavoidable: skipped out loud at its junction and rerouted, as before. The counts
-    (AvoidResult: lefts_avoided, the plain route's lefts not on the kept one; lefts_unavoidable, the kept one's) are what
-    navd's TurnPilotMapStatus says, never where.
-The route's U-turns (routing/lefts.py: a Left of kind 'uturn', which the driving model can't drive) are lefts to the loop,
-every rule above theirs too, but no unprotected left to the counts: lefts_avoided and lefts_unavoidable are the lefts' alone,
-what the phone page says of unprotected lefts, and the U-turns' are logged.
+  - every left still on the kept route is unavoidable: a U-turn there is driven past (turnpilotd sends nothing for it,
+    route_follower: UTURN) and navd reroutes. The counts (AvoidResult: lefts_avoided, the plain route's unprotected lefts not
+    on the kept one; lefts_unavoidable, the kept one's) are what navd's TurnPilotMapStatus says, never where. They count
+    unprotected lefts alone (kind 'left'), which routing/lefts.py no longer returns, so both stay 0 since 2026-11-06; the
+    fields stay for the status's schema, and the U-turns' counts are logged.
 avoidStatus stays the stops' (none with their avoidance off or unsupported, failed with their controls failed): a route whose
 lefts alone went round the loop says nothing about stop signs.
 """
@@ -138,8 +143,8 @@ class AvoidResult:
   iterations: int = 0          # reroutes made
   added_s: float = 0.          # s the kept route takes over the first
   sent: set = field(default_factory=set)
-  lefts_avoided: int = 0       # lefts the car would skip, routed around (excluded and not on the kept route)
-  lefts: list = field(default_factory=list)  # those still on the kept route, every one unavoidable (routing/lefts.py: Left)
+  lefts_avoided: int = 0       # unprotected lefts routed around (excluded and not on the kept route): 0 since 2026-11-06
+  lefts: list = field(default_factory=list)  # the refused maneuvers still on the kept route, every one unavoidable (routing/lefts.py: Left)
 
   @property
   def lefts_unavoidable(self) -> int:
@@ -177,7 +182,8 @@ def run(steps, controls, controls_status: str, avoid: AvoidSet, *, certify: Call
   local bearing stays): Valhalla correlates a point against the heading it computes itself, which a short curved approach
   can put 50 deg off the route's (Indianapolis way 17439639), and drops it, so the stop survives as 'failed'.
   A reroute past detour_budget_s of the plain route (steps, as given) is a failed iteration: its batch dropped, the best kept.
-  lefts(steps, controls) -> [Left], the route's lefts the car would skip (routing/lefts.py: route_lefts)."""
+  lefts(steps, controls) -> [Left], the route's maneuvers the car refuses (routing/lefts.py: route_lefts; its U-turns since
+  2026-11-06, never an unprotected left)."""
   first = duration(steps)
   budget = detour_budget_s(first)
   for c in stops(controls):

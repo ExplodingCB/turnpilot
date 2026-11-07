@@ -40,7 +40,9 @@ def test_lane_change_warning_left_and_right():
     a, = alerts(name, FakeSM(plan(laneChangeOffer=side, laneChangeCountdown=2.5)))
     assert a.alert_text_1 == f'Lane Change {side.capitalize()} in 3' and a.audible_alert == chime
     a, = alerts(name, FakeSM(plan(laneChangeOffer=side)))
-    assert a.alert_text_1 == f'Signal {side.capitalize()} to Change Lanes'
+    assert a.alert_text_1 == f'Signal {side.upper()} to Change Lanes'
+    # waiting on the driver's lamp (2026-11-07): the side's own chime on repeat
+    assert a.audible_alert == (AudibleAlert.tpSignalLeft if side == 'left' else AudibleAlert.tpSignalRight)
     assert a.alert_type == f'turnpilotLaneChange{side.capitalize()}/warning'  # separate names: a chime per side later
 
 
@@ -201,9 +203,10 @@ def test_map_control_alerts():
   for kind in ('stopOverrun', 'proceedingOnYellow', 'junctionUncertain'):
     a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert=kind)))
     assert a.audible_alert == AudibleAlert.prompt and a.duration >= 200, kind
-  for kind in ('mapControlsUnavailable', 'lightSourceRejected'):
-    a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert=kind, reason='Map stops/signals: unsupported')))
-    assert a.audible_alert == AudibleAlert.prompt, kind
+  a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='mapControlsUnavailable', reason='Map stops/signals: unsupported')))
+  assert a.audible_alert == AudibleAlert.prompt
+  a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='lightSourceRejected')))  # a source not accepted
+  assert a.audible_alert == AudibleAlert.prompt and a.alert_text_1 == 'Lights Unknown'
   # off the route with the map stops ahead unknown: up while it lasts, with a chime and the take-control hint
   a, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='offRouteStopsUnknown')))
   assert a.alert_text_1 == 'Off Route' and 'take control or wait for reroute' in a.alert_text_2
@@ -349,6 +352,21 @@ def test_a_keep_that_cant_be_sent_is_skipped_out_loud():
   # any other skip's title is as before
   a, = alerts(EventName.turnpilotTooFastToTurn, FakeSM(plan(tooFastToTurn=True, skipReason='tooFast', maneuverModifier='right')))
   assert a.alert_text_1 == "Too Fast to Turn"
+
+
+def test_a_turn_too_close_to_stop_for_its_light_says_so():
+  """turnpilotd.signal_stop_lost (skipReason signalStop): a turn at a signal taken up after a handback, whose stop at its line
+  can't be made now with no green read, is skipped and navd reroutes. Its own title, with the skip's words and chime: until
+  2026-11-06 it fell through to "Too Fast to Turn", which never named the light."""
+  a, = alerts(EventName.turnpilotTooFastToTurn, FakeSM(plan(tooFastToTurn=True, skipReason='signalStop', maneuverModifier='right')))
+  assert a.alert_text_1 == "Can't Stop for the Light" and a.alert_text_2 == 'Rerouting'
+  assert a.audible_alert == AudibleAlert.tpTooFastTurn and a.alert_status == log.SelfdriveState.AlertStatus.userPrompt
+  # the turn missed outranks it, as it does every skip title
+  a, = alerts(EventName.turnpilotTooFastToTurn, FakeSM(plan(tooFastToTurn=True, skipReason='signalStop', turnMissed=True)))
+  assert a.alert_text_1 == "Turn Missed"
+  for reason in ('unprotectedStop', 'tooLate', 'desireDropped'):  # the other turn skips keep the generic title
+    a, = alerts(EventName.turnpilotTooFastToTurn, FakeSM(plan(tooFastToTurn=True, skipReason=reason)))
+    assert a.alert_text_1 == "Too Fast to Turn", reason
 
 
 def test_side_cameras_off_is_a_status_line():
@@ -563,3 +581,62 @@ def test_a_person_who_may_be_in_front_is_a_loud_handback():
                                                             reason="Person may be in front: take control")))
   assert a.alert_text_1 == "Person may be in front: take control" and a.alert_text_2 == CONTROL_PROMPT_TEXT['personFrontTakeControl']
   assert a.audible_alert == AudibleAlert.tpHandback and a.visual_alert == VisualAlert.steerRequired
+
+
+# --- the camera's light reader failing: a status line for its whole spell (S2, review 2026-11-07) ---
+
+def test_a_failing_light_readers_line_is_plain_words_chimed_once_then_silent():
+  """S2: titled "Light Source Rejected" (a sim light-source term), said once for 2 s. Its line is "Lights Unknown" in its own
+  words: the onset (CAMERA_OFF_REASON) with a chime, the rest of the spell (CAMERA_OFF_STILL_REASON) silent, so the line coming
+  back from under another never chimes again; another line's reason on the plan (a hold's, after the onset) is never shown
+  under its title, nor chimes."""
+  from openpilot.selfdrive.turnpilot.hooks import CONTROL_ALERT_TEXT
+  from openpilot.selfdrive.turnpilot.map_controls import CAMERA_OFF_REASON, CAMERA_OFF_STILL_REASON
+  onset, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='lightSourceRejected', reason=CAMERA_OFF_REASON)))
+  assert onset.alert_text_1 == 'Lights Unknown' and onset.alert_text_2 == CAMERA_OFF_REASON
+  assert onset.audible_alert == AudibleAlert.prompt and onset.visual_alert == VisualAlert.none
+  still, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='lightSourceRejected', reason=CAMERA_OFF_STILL_REASON)))
+  assert still.alert_text_1 == 'Lights Unknown' and still.alert_text_2 == CAMERA_OFF_STILL_REASON
+  assert still.audible_alert == AudibleAlert.none
+  other, = alerts(EventName.turnpilotControlAlert, FakeSM(plan(controlAlert='lightSourceRejected', reason='Slowing for the turn')))
+  assert other.alert_text_2 == CONTROL_ALERT_TEXT['lightSourceRejected'] and other.audible_alert == AudibleAlert.none
+  for text in (onset.alert_text_1, still.alert_text_2, CONTROL_ALERT_TEXT['lightSourceRejected']):
+    assert 'Source' not in text and 'Rejected' not in text and 'sim' not in text.lower()
+
+
+def test_a_failing_light_readers_line_outranks_the_lane_it_cant_confirm_and_a_keeps_status_line():
+  """S2: the status line was raised last of all, so a laneUnknown frame (much of the 11-06 night) or a keep followed under the
+  switch hid it. It is raised over those two lines now; a lane change offered, the wrong lane for the turn ahead, a prompt
+  and every alert above them still come first."""
+  from openpilot.selfdrive.turnpilot.hooks import plan_events
+  from openpilot.selfdrive.turnpilot.map_controls import CAMERA_OFF_STILL_REASON
+
+  def events(**fields):
+    return plan_events(FakeSM(plan(controlAlert='lightSourceRejected', reason=CAMERA_OFF_STILL_REASON, **fields)))
+  assert events() == ['turnpilotControlAlert']
+  assert events(laneMismatch='laneUnknown') == ['turnpilotControlAlert']
+  assert events(laneMismatch='laneUnknownQuiet') == ['turnpilotControlAlert']
+  assert events(tooFastToTurn=True, skipReason='keepFollow') == ['turnpilotControlAlert']
+  assert events(laneMismatch='wrongLaneForTurn') == ['turnpilotWrongLane']
+  assert events(laneMismatch='turnOnlyGoingStraight') == ['turnpilotWrongLane']
+  assert events(laneChangeOffer='left') == []  # the lane change's own events (LaneChangeEvents) say it
+  assert events(controlPrompt='yieldAhead') == ['turnpilotControlPrompt']
+  assert events(controlPrompt='signalUnseenTakeControl') == ['turnpilotControlPrompt']
+  # the map stops' own status line is unchanged: still under the lane it can't confirm
+  assert plan_events(FakeSM(plan(controlAlert='mapControlsUnavailable', laneMismatch='laneUnknown'))) == ['turnpilotWrongLane']
+
+
+def test_a_failing_light_readers_line_chimes_once_through_a_lane_line_coming_and_going():
+  """S2, frame by frame through AlertManager: the spell's line, its onset chimed, a can't-confirm-lane line over it before (it
+  hid it) and the lane line coming and going: the reader's line stays shown throughout and is heard once."""
+  from openpilot.selfdrive.turnpilot.map_controls import CAMERA_OFF_REASON, CAMERA_OFF_STILL_REASON
+  slot, shown, sounds = AlertSlot(), [], []
+  for frame in range(1200):
+    reason = CAMERA_OFF_REASON if frame < 200 else CAMERA_OFF_STILL_REASON
+    mismatch = 'laneUnknown' if (frame // 150) % 2 == 1 else 'none'
+    a = slot.step(plan(controlAlert='lightSourceRejected', reason=reason, laneMismatch=mismatch))
+    shown.append(a.alert_type)
+    sounds.append(a.audible_alert)
+  assert set(shown) == {'turnpilotControlAlert/warning'}
+  onsets = [i for i, s in enumerate(sounds) if s != AudibleAlert.none and (i == 0 or sounds[i - 1] == AudibleAlert.none)]
+  assert onsets == [0]

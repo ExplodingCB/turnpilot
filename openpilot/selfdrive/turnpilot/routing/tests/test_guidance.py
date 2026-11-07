@@ -1,4 +1,5 @@
 import json
+import math
 import unittest
 from pathlib import Path
 
@@ -101,8 +102,10 @@ class TestGuidance(unittest.TestCase):
   def test_junction_or_bend(self):
     # recorded from Valhalla: a left at a four-way junction, then the road bending right where no other road meets it
     steps = steps_of('valhalla_left_then_right.json')
-    self.assertEqual(maneuver_junction(steps, 0), {'before': 90., 'after': 0., 'branches': 2, 'opposing': 'present'})
-    self.assertEqual(maneuver_junction(steps, 1), {'before': 0., 'after': 90., 'branches': 0, 'opposing': 'none'})
+    self.assertEqual(maneuver_junction(steps, 0), {'before': 90., 'after': 0., 'branches': 2, 'opposing': 'present', 'opposing_rel': 0.})
+    bend = maneuver_junction(steps, 1)
+    self.assertTrue(math.isnan(bend.pop('opposing_rel')))  # no road across: not known, never 0 (dead ahead)
+    self.assertEqual(bend, {'before': 0., 'after': 90., 'branches': 0, 'opposing': 'none'})
     self.assertIsNone(maneuver_junction(steps, 2))  # the arrival has no exit
     self.assertIsNone(maneuver_junction(steps, 3))  # nothing after the last step
     instruction = messaging.new_message('navInstruction').navInstruction
@@ -171,6 +174,95 @@ class TestGuidance(unittest.TestCase):
     blank = messaging.new_message('navInstruction').navInstruction
     blank.maneuverType, blank.maneuverModifier = 'turn', 'left'
     self.assertEqual(maneuver_from_instruction(blank).opposing, 'unknown')
+
+  def test_the_opposing_roads_bearing_off_straight_on(self):
+    """The rights review (2026-11-06): opposing present is any other road within OPPOSING_DEG of straight on, so a main road
+    bending 25-30 deg left past a lone side road 40 deg to the right read present, and route_follower made that slight left a
+    TURN (an autonomous unprotected left held at a line on a through road). A cone on the opposing road's leg off straight on
+    was to tell them apart, which navd never sent: maneuver_junction's opposing_rel (+ right), the road nearest straight on
+    (the one opposing_leg probes for the left's speed and lanes), NaN with none (never 0: dead ahead), into
+    maneuverOpposingRelBearing and each allManeuvers entry's opposingRelBearing. By its bearing alone that road off the far side
+    was more often the approach's own road going on, whose oncoming traffic the left crosses (review of 11-06, the module
+    docstring), so route_follower's cone is gone (2026-11-07): the slight left across any present approach is a TURN, the road
+    off the far side (40, and 30 past the old cone's 25) included, with nothing within OPPOSING_DEG a keep, as navd's message,
+    its look-ahead and route time (routing/lefts.py) read it alike."""
+    from openpilot.selfdrive.turnpilot.routing.guidance import OPPOSING_DEG, maneuver_entry, opposing_leg
+    from openpilot.selfdrive.turnpilot.routing.lefts import route_maneuver
+    from openpilot.selfdrive.turnpilot.route_follower import LEFT, maneuver_from_ahead
+
+    def steps(others, after=332., modifier='slight left', i_in=None):
+      """The car coming in heading north (in: the leg south, 180), leaving by `after`, with other roads at `others`."""
+      bearings = [180., after] + list(others)
+      first = {'location': [0., 0.], 'bearings': bearings, 'entry': [False] + [True] * (len(bearings) - 1),
+               'in': 0 if i_in is None else i_in, 'out': 1}
+      return [{'distance': 300., 'geometry': {'coordinates': [[0., -0.0027], [0., 0.]]}, 'bannerInstructions': []},
+              {'distance': 200., 'geometry': {'coordinates': [[0., 0.], [-0.0008, 0.0016]]}, 'bannerInstructions': [],
+               'maneuver': {'type': 'turn', 'modifier': modifier, 'bearing_before': 0., 'bearing_after': after},
+               'intersections': [first]},
+              {'distance': 0., 'geometry': {'coordinates': [[-0.0008, 0.0016], [-0.0008, 0.0016]]}, 'bannerInstructions': [],
+               'maneuver': {'type': 'arrive', 'modifier': ''}}]
+
+    def rel(others, **kw):
+      return maneuver_junction(steps(others, **kw), 0)['opposing_rel']
+    # signed off straight on, + right (route_follower's sense, JunctionApproach.relBearing's): ahead, kinked right, kinked left
+    self.assertEqual(rel([0.]), 0.)
+    self.assertAlmostEqual(rel([40.]), 40.)
+    self.assertAlmostEqual(rel([340.]), -20.)
+    # straight on from bearing_before when the leg the car comes in by isn't listed
+    self.assertAlmostEqual(rel([20.], i_in=-1), 20.)
+    # the road nearest straight on of two, whichever side
+    self.assertAlmostEqual(rel([10., 40.]), 10.)
+    self.assertAlmostEqual(rel([345., 20.]), -15.)
+    # none within OPPOSING_DEG (a road 60 deg off, a T's stem): opposing none, and the bearing not known
+    self.assertTrue(math.isnan(rel([60.])) and maneuver_junction(steps([60.]), 0)['opposing'] == 'none')
+    self.assertTrue(math.isnan(rel([])))
+    # present exactly when the bearing is known, and it is the road opposing_leg probes for the left's R_req
+    for b in range(0, 360, 5):
+      j = maneuver_junction(steps([float(b)]), 0)
+      self.assertEqual(j['opposing'] == 'present', math.isfinite(j['opposing_rel']), b)
+      self.assertEqual(math.isfinite(j['opposing_rel']), abs((b + 180.) % 360. - 180.) <= OPPOSING_DEG, b)
+      leg = opposing_leg(steps([float(b), (b + 180.) % 360.]), 0)
+      j2 = maneuver_junction(steps([float(b), (b + 180.) % 360.]), 0)
+      self.assertEqual(leg is None, math.isnan(j2['opposing_rel']), b)
+      if leg is not None:
+        self.assertAlmostEqual((j2['opposing_rel'] - leg[2] + 180.) % 360. - 180., 0., msg=b)
+
+    # into navInstruction and allManeuvers, and the slight left as turnpilotd and route time read it
+    instruction = messaging.new_message('navInstruction').navInstruction
+    def same(a, b):
+      return a == b or (math.isnan(a) and math.isnan(b))
+    # a road off the other side (40, and 30 past the old cone's 25: the approach's own road going on, whose oncoming lanes the
+    # left crosses), the road ahead (5, -10), one on the turn's side (-40): each a TURN; and one 60 deg off to the left (outside
+    # OPPOSING_DEG: opposing none, so a keep with nothing oncoming to cross)
+    for others, kind in (([40.], TURN), ([30.], TURN), ([5.], TURN), ([350.], TURN), ([320.], TURN), ([300.], KEEP)):
+      route = steps(others)
+      fill_guidance(instruction, route, 0, 100.)
+      self.assertTrue(same(instruction.allManeuvers[0].opposingRelBearing, instruction.maneuverOpposingRelBearing), others)
+      instruction.maneuverType, instruction.maneuverModifier = 'turn', 'slight left'
+      m = maneuver_from_instruction(instruction)
+      if math.isfinite(m.opposing_rel_deg or math.nan):
+        self.assertAlmostEqual(m.opposing_rel_deg, (others[0] + 180.) % 360. - 180., places=4)
+      self.assertEqual(m.side, LEFT, others)
+      ahead, at_route_time = maneuver_from_ahead(instruction.allManeuvers[0]), route_maneuver(route, 0)  # routing/lefts.py's
+      self.assertTrue(same(ahead.opposing_rel_deg if ahead.opposing_rel_deg is not None else math.nan,
+                           instruction.maneuverOpposingRelBearing), others)
+      self.assertTrue(same(at_route_time.opposing_rel_deg if at_route_time.opposing_rel_deg is not None else math.nan,
+                           instruction.maneuverOpposingRelBearing), others)
+      self.assertEqual((m.kind, ahead.kind, at_route_time.kind), (kind, kind, kind), others)
+      self.assertTrue(same(maneuver_entry(route, 0, 100.)['opposingRelBearing'], maneuver_junction(route, 0)['opposing_rel']), others)
+    fill_guidance(instruction, steps([300.]), 0, 100.)
+    self.assertEqual(str(instruction.maneuverOpposing), 'none')
+    self.assertTrue(math.isnan(instruction.maneuverOpposingRelBearing))
+    # no junction data, and the arrival: NaN (not known), never 0
+    fill_guidance(instruction, steps_of('valhalla_left_then_right.json'), 2, 0)
+    self.assertTrue(math.isnan(instruction.maneuverOpposingRelBearing))
+    fill_guidance(instruction, steps_of('valhalla_left_then_right.json'), 0, 300)
+    self.assertEqual(instruction.maneuverOpposingRelBearing, 0.)
+    self.assertEqual([a.opposingRelBearing for a in instruction.allManeuvers][0], 0.)
+    self.assertTrue(all(math.isnan(a.opposingRelBearing) for a in list(instruction.allManeuvers)[1:]))  # a bend, the arrival
+    self.assertTrue(math.isnan(maneuver_entry(steps_of('valhalla_left_then_right.json'), 2, 0.)['opposingRelBearing']))
+    # a message nothing filled (a navd before the field, an invalid one) reads NaN: the schema's default
+    self.assertTrue(math.isnan(messaging.new_message('navInstruction').navInstruction.maneuverOpposingRelBearing))
 
   def test_real_angle_and_side(self):
     instruction = messaging.new_message('navInstruction').navInstruction

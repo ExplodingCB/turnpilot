@@ -1,39 +1,38 @@
-"""Route time's unprotected lefts: the route's lefts the car would refuse, for the avoidance loop to route around (routing/avoid.py).
+"""Route time's refused maneuvers: the route's U-turns, for the avoidance loop to route around (routing/avoid.py), and a log
+line of its unprotected lefts, which are never routed around.
 
-turnpilotd never attempts an autonomous unprotected left whose required clear range is past the detector's proven range
-(TurnPilotLeftRangeM, the far crop's TurnPilotLeftFarRangeM): it is skipped out loud as soon as it is the maneuver
-(turn_skip: unprotectedRange) and navd reroutes. Both ranges are unmeasured on the car (0), so every left with an opposing
-approach was skipped, and Valhalla's routes were full of them: the first drive's routes "very sketchy", navigation giving up at a
-red light before a left. So the route plans none it can help: each maneuver is judged here exactly as turnpilotd judges it,
-  - the maneuver as turnpilotd reads it off allManeuvers (guidance.maneuver_entry, route_follower.maneuver_from_ahead): a
-    junction turn to the far side whose junction has an opposing approach, or might have (guidance.maneuver_junction: present,
-    or unknown without junction data; none at a T's stem or a bend);
+Unprotected lefts (Kellen, 2026-11-06: "drive to the line; go where the camera covers the oncoming road, else hold and hand
+back loudly; never route around or skip a left for range"). Until then this file returned every left whose required clear range
+was past the detector's proven range (TurnPilotLeftRangeM, the far crop's TurnPilotLeftFarRangeM) by unprotected_left.route_range,
+the predicate turnpilotd skipped them by (turn_skip: unprotectedRange), and the loop excluded their exits. On the 11-06 drives
+it refused every left 58-394 m out, before anything could be judged, and every reroute logged "N of the route's N unprotected
+lefts past the reach" and brought another left: Chase's "kept wanting to turn left" (1e: 19 route calculations, one "out of
+time after 5 reroutes"). Now no left is a Left here: turnpilotd drives each to its hold line, where unprotected_left judges it
+from where the car stands (a gap the camera certifies, or a loud handback with the car held), and the route Valhalla gives is
+the route driven. Each is still judged here exactly as turnpilotd would at route time, for the log line only:
+  - the maneuver as turnpilotd reads it off allManeuvers (guidance.maneuver_entry, route_follower.maneuver_from_ahead, under
+    the config's side of the road as turnpilotd's follower is: a slight turn to the far side across an opposing approach is a
+    TURN, so where traffic keeps left a slight right): a junction turn to the far side whose junction has an opposing
+    approach, or might have (guidance.maneuver_junction: present, or unknown without junction data; none at a T's stem or a
+    bend);
   - its opposing road's mapped limit, lanes and straight span (routing/controls.py: opposing_roads; {} on a failure: 45 mph and
     not known straight, as turnpilotd takes what navd then sends);
   - the junction's mapped stop line's setback from the route's controls (map_controls.line_setback_at, the car at the start);
-  - unprotected_left.route_range, the predicate turnpilotd skips by, under TurnPilotAutoLeft and the reach left_reach gives
-    (navd takes the far crop as on unless TurnPilotFarCrop is off: it reads no farStatus);
-and a left out of range is a Left, carrying its exit edge's exclusion (routing/controls.py: Exit) in the fields the avoidance
-loop reads for a stop's approach (approach_key, exclusion, first_edge, last_edge).
-Why the exit edge, directed, not the approach edge a stop is excluded by: the approach edge can never be excluded while the
-car is on it (avoid.py: the car's own edge is never sent), and a left the car is standing short of (at a red light before
-it, where the first drive's navigation gave up) always is; and it closes our own road into the junction to straight on and
-the right as well, where the exit edge leaves every movement from our road open and closes only the way into that one road
-away from the junction (the opposite approach's right and the cross road's straight on into it go with it; that road's other
-direction stays open). A point at the node with no heading would close the whole junction. On the BeamNG west_coast_usa
-tiles the one left the car would skip on the test trip went, its exit excluded, for a route 8 s quicker.
-A left whose exit is the route's last edge (onto the destination's street), or with none known, can't be routed around:
-unavoidable, as is one over the detour budget; turnpilotd skips it out loud at its junction and navd reroutes, as before. A
-measured range keeps the lefts within it, as ever.
-Positions never leave navd: the status says how many (TurnPilotMapStatus lefts: avoided, unavoidable), the logs say steps.
+  - unprotected_left.route_range under TurnPilotAutoLeft and the reach left_reach gives (navd takes the far crop as on unless
+    TurnPilotFarCrop is off: it reads no farStatus): its reach and bent say which lefts may hand back at their line ('turnpilot
+    lefts:', by step, never a position).
 
-A U-turn on the route (continue/uturn, any maneuver whose modifier is uturn) is refused the same way, whatever TurnPilotAutoLeft
-says: the driving model can't U-turn and turnpilotd sends nothing there (route_follower: UTURN), so the car drives on past it
-and navd reroutes, or the model stands short of it. The confirm round's route_demo (BeamNG): the reroute after the designed
-left skip asked a U-turn 100.9 m on, and the model stood 85 s at the green 7 m short of it. The lefts' rules never saw it
-(unprotected_turn: a junction turn only), so the lefts work didn't keep it off the reroute, which runs the same loop. A U-turn
-is a Left of kind 'uturn' here, excluded by its exit edge (the road it turns back onto) under the same loop and budget; it is
-no unprotected left, so the status's counts are the lefts' alone (avoid.py).
+A U-turn on the route (continue/uturn, any maneuver whose modifier is uturn) is refused, whatever TurnPilotAutoLeft says: the
+driving model can't U-turn and turnpilotd sends nothing there (route_follower: UTURN), so the car drives on past it and navd
+reroutes, or the model stands short of it. The confirm round's route_demo (BeamNG): a reroute asked a U-turn 100.9 m on, and the
+model stood 85 s at the green 7 m short of it. A U-turn is a Left of kind 'uturn', carrying its exit edge's exclusion (the road it
+turns back onto: routing/controls.py, Exit) in the fields the avoidance loop reads for a stop's approach (approach_key, exclusion,
+first_edge, last_edge), under the loop's detour budget. Why the exit edge, directed, not the approach edge a stop is excluded by:
+the approach edge can never be excluded while the car is on it (avoid.py: the car's own edge is never sent), and it would close
+our own road into the junction to every other movement as well; a point at the node with no heading would close the whole
+junction. One whose exit is the route's last edge, with none known, or over the detour budget stays on the route: unavoidable.
+It is no unprotected left, so the status's lefts counts (TurnPilotMapStatus lefts: avoided, unavoidable) stay 0.
+Positions never leave navd: the status says how many, the logs say steps.
 """
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -65,13 +64,13 @@ class LeftConfig:
 
 @dataclass
 class Left:
-  """One left the car would skip on a route, in the avoidance loop's fields for an exclusion (a stop's Control has the same):
-  approach_key and exclusion are its EXIT edge's (routing/controls.py: Exit), None with none known; never on the route's first
-  edge; last_edge: the exit is the route's last. unavoidable: it stays on the route (skipped out loud at its junction)."""
+  """One maneuver the car refuses on a route (a U-turn since 2026-11-06: module docstring), in the avoidance loop's fields for an
+  exclusion (a stop's Control has the same): approach_key and exclusion are its EXIT edge's (routing/controls.py: Exit), None
+  with none known; never on the route's first edge; last_edge: the exit is the route's last. unavoidable: it stays on the route."""
   step_idx: int        # the step its maneuver ends
   route_m: float       # m along the route to its junction (navd's step frame)
-  reach: float         # its R_req where the car may stand (route_range)
-  bent: bool           # its opposing road isn't known straight out to it
+  reach: float         # its R_req where the car may stand (route_range; a U-turn: 0)
+  bent: bool           # its opposing road isn't known straight out to it (a U-turn: False)
   approach_key: tuple | None = None
   exclusion: tuple[float, float, float] | None = None
   last_edge: bool = False
@@ -113,9 +112,11 @@ def left_config(params) -> LeftConfig:
                     flag(read(params, FAR_CROP_PARAM), True), not flag(read(params, 'IsRhdDetected'), False))
 
 
-def route_maneuver(steps, step_idx: int, opposing=None):
-  """The maneuver that ends step step_idx as turnpilotd reads it from allManeuvers (route_follower.Maneuver)."""
-  return maneuver_from_ahead(SimpleNamespace(**maneuver_entry(steps, step_idx, 0., opposing)))
+def route_maneuver(steps, step_idx: int, opposing=None, right_hand_traffic: bool = True):
+  """The maneuver that ends step step_idx as turnpilotd reads it from allManeuvers (route_follower.Maneuver), under the side
+  traffic keeps to (LeftConfig.right_hand_traffic): a slight turn to the far side across an opposing approach is a TURN
+  (route_follower.slight_far_turn), a slight right where traffic keeps left among them, as turnpilotd's follower takes it."""
+  return maneuver_from_ahead(SimpleNamespace(**maneuver_entry(steps, step_idx, 0., opposing)), right_hand_traffic)
 
 
 def setback_at(junction_m: float, controls) -> float | None:
@@ -127,34 +128,35 @@ def setback_at(junction_m: float, controls) -> float | None:
 
 
 def route_lefts(steps, controls, config: LeftConfig, opposing: Callable[[], dict], exits: Callable[[], dict]) -> list[Left]:
-  """The route's lefts the car would skip and its U-turns (module docstring), nearest first. opposing() -> {step index: (m/s,
-  lanes, straight m)} is asked only for a route with an unprotected left on it, exits() -> {step index: Exit} for one with
-  either (both cached by the route's controls() on the real router, so no second Valhalla call)."""
+  """The route's U-turns (module docstring), nearest first: never an unprotected left, each driven to its line. Those are
+  logged: how many, and the steps of those route_range says may hand back at their line (reach past config's, or bent).
+  opposing() -> {step index: (m/s, lanes, straight m)} is asked only for a route with an unprotected left on it (for that log
+  line), exits() -> {step index: Exit} only for one with a U-turn (both cached by the route's controls() on the real router, so
+  no second Valhalla call)."""
   ends, at = [], 0.
   for i in range(len(steps) - 1):
     at += float(steps[i].get('distance', 0.))
     ends.append(at)
-  candidates = [i for i in range(len(steps) - 1) if config.mode == AUTO and
-                unprotected_turn(route_maneuver(steps, i), config.right_hand_traffic)]
-  uturns = [i for i in range(len(steps) - 1) if route_maneuver(steps, i).kind == UTURN]
-  if not candidates and not uturns:
+  rht = config.right_hand_traffic
+  candidates = [i for i in range(len(steps) - 1) if config.mode == AUTO and unprotected_turn(route_maneuver(steps, i, None, rht), rht)]
+  uturns = [i for i in range(len(steps) - 1) if route_maneuver(steps, i, None, rht).kind == UTURN]
+  if candidates:
+    # a log line only: a failure here never changes the route (the U-turns below are the one thing decided)
+    try:
+      roads = opposing() or {}
+      checks = [(i, route_range(route_maneuver(steps, i, roads, rht), setback_at(ends[i], controls), config.reach_m, rht,
+                                config.mode)) for i in candidates]
+      back = [i for i, rc in checks if rc.reach > config.reach_m or rc.bent]
+      cloudlog.info(f"turnpilot lefts: {len(candidates)} unprotected lefts on the route, each driven to its line, never routed " +
+                    f"around; {len(back)} may hand back there (past the reach of {config.reach_m:.0f} m, or the oncoming road " +
+                    f"not known straight: steps {back})")
+    except Exception:
+      cloudlog.exception("turnpilot lefts: the route's lefts log failed")
+  if not uturns:
     return []
-  roads, edges, out = (opposing() or {}) if candidates else {}, exits() or {}, []
-  for i in candidates:
-    rc = route_range(route_maneuver(steps, i, roads), setback_at(ends[i], controls), config.reach_m, config.right_hand_traffic,
-                     config.mode)
-    if not rc.out_of_range:
-      continue
-    ex = edges.get(i)
-    out.append(Left(i, ends[i], rc.reach, rc.bent, ex.key if ex else None, ex.exclusion if ex else None, bool(ex and ex.last_edge)))
+  edges, out = exits() or {}, []
   for i in uturns:
     ex = edges.get(i)
     out.append(Left(i, ends[i], 0., False, ex.key if ex else None, ex.exclusion if ex else None, bool(ex and ex.last_edge), kind='uturn'))
-  out.sort(key=lambda t: t.route_m)
-  if uturns:
-    cloudlog.info(f"turnpilot lefts: {len(uturns)} U-turns on the route (steps {uturns}), the car can't drive one")
-  if len(out) > len(uturns):
-    lefts_out = [t for t in out if t.kind == 'left']
-    cloudlog.info(f"turnpilot lefts: {len(lefts_out)} of the route's {len(candidates)} unprotected lefts past the reach of " +
-                  f"{config.reach_m:.0f} m (steps {[t.step_idx for t in lefts_out]}), {sum(t.exclusion is None for t in lefts_out)} with no exit known")
+  cloudlog.info(f"turnpilot lefts: {len(uturns)} U-turns on the route (steps {uturns}), the car can't drive one")
   return out

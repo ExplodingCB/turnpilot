@@ -223,17 +223,20 @@ def test_a_gap_stream_goes_on_a_long_gap_and_waits_through_short_ones():
   assert conflict[1] - went >= SPEED_MARGIN * t_req(HOLD_D, 1) - 0.1  # the next car, at the limit, at the conflict point
 
 
-def test_beyond_the_proven_range_never_goes():
-  # 45 mph oncoming: its reach is past the road camera's proven range: never a go on a gap it can't see, said loudly
+def test_beyond_the_proven_range_it_goes_on_the_band_it_sees():
+  # 45 mph oncoming: its reach is past the road camera's proven range. Kellen, 2026-11-07 ("no, no handbacks"; a safety driver on
+  # every drive): judged on the band the camera covers, it goes when that band is clear, never a handback for what it can't see
   j = Junction(v_limit=20.1)
-  d = j.wait(CLEAR_WINDOW_S + 1.)
-  assert not any(x.go for x in j.decisions) and d.state == 'undecided' and d.prompt == 'leftUndecidedTakeControl'
-  # unknown speed is taken as 45 mph
+  j.wait(CLEAR_WINDOW_S + 1.)
+  assert any(x.go for x in j.decisions) and not any(x.state == 'undecided' for x in j.decisions)
+  # unknown speed is taken as 45 mph: the same
   j = Junction(v_limit=None)
-  assert j.wait(1.).state == 'undecided'
-  # a range measured further (TurnPilotLeftRangeM) takes it
-  j = Junction(v_limit=20.1, rng=300.)
-  assert any(x.go for x in [j.wait(CLEAR_WINDOW_S + 0.5)] + j.decisions)
+  j.wait(CLEAR_WINDOW_S + 1.)
+  assert any(x.go for x in j.decisions)
+  # a car it sees in the band still holds it
+  j = Junction(v_limit=20.1)
+  d = j.wait(CLEAR_WINDOW_S + 1., boxes=[raw(80., 3.6)])
+  assert not any(x.go for x in j.decisions) and d.state == 'waitGap'
 
 
 def test_an_occluder_is_no_traffic_but_blocks_the_view_and_the_car_creeps():
@@ -381,11 +384,11 @@ def test_held_short_of_its_line_it_rolls_up_before_judging_the_reach():
     assert d.state in ('creep', 'waitGap') and not d.go
   d = j.wait(CLEAR_WINDOW_S + 0.5, distance=LINE_D + 0.3, v=0.)
   assert any(x.go for x in j.decisions) and all(x.state != 'undecided' for x in j.decisions)
-  # a roll-up the car never makes (the model holding it): undecided on the reach after ROLL_UP_STALL_S, said (past the full
-  # pass's range with the far crop's unmeasured: farUnmeasured since G6, 'range' before it)
+  # a roll-up the car never makes (the model holding it): after ROLL_UP_STALL_S judged where it stands, on the band it sees
+  # (2026-11-07: no reach handback), and gone on it when clear
   j = Junction()
-  d = j.wait(ROLL_UP_STALL_S + 0.5, distance=16., v=0.)
-  assert d.state == 'undecided' and d.why == 'farUnmeasured'
+  j.wait(ROLL_UP_STALL_S + CLEAR_WINDOW_S + 0.5, distance=16., v=0.)
+  assert any(x.go for x in j.decisions) and not any(x.state == 'undecided' for x in j.decisions)
 
 
 def test_the_window_starts_at_the_hold_line():
@@ -503,17 +506,33 @@ def test_a_scene_commit_before_any_go_is_a_fault_moving_or_standing_and_only_the
   assert j.step(released=True).why == 'position'
 
 
-def test_an_opposing_road_not_known_straight_over_r_req_is_undecided_never_a_go():
-  # skeptic G4 (residual): the band is straight on from our approach (1.5-20 m to the turn side plus BAND_TOL_DEG), so on a road
-  # curving away from the turn an oncoming car 80-135 m up a 400 m radius was outside it, uncounted, and the left went with PET
-  # 0.44-1.71 s. navd's straight span (maneuverOpposingStraightM) must reach R_req from the junction, else 'curve', out loud;
-  # not known (0) is not straight
+def test_a_left_lc03_placed_in_the_wrong_lane_is_driven_from_its_lane_never_handed_back():
+  # review 2026-11-07 (LN-5): the lane planner's LC-03 verdict (its change blocked to the window's end) never skips the left;
+  # Kellen, 2026-11-07 ("no, no handbacks"): it is driven from the lane it is in, gone on the gap rule as any other, after dark
+  # too, and a car seen in the band still holds it
+  j = Junction()
+  j.held = False
+  d = j.step(wrong_lane=True)
+  assert d.state == 'approach' and d.prompt == 'none'
+  j.held = True
+  j.wait(CLEAR_WINDOW_S + 1., wrong_lane=True, dark=True)
+  assert any(x.go for x in j.decisions) and not any(x.state == 'undecided' for x in j.decisions)
+  j = Junction()
+  j.wait(CLEAR_WINDOW_S + 1., wrong_lane=True, boxes=[raw(60., 3.6)])
+  assert not any(x.go for x in j.decisions)
+
+
+def test_an_opposing_road_not_known_straight_over_r_req_is_judged_on_its_straight_band():
+  # skeptic G4 (residual): the band is straight on from our approach, so on a road curving away from the turn a car up the bend
+  # is outside it. Kellen, 2026-11-07 ("no, no handbacks"; the safety driver supervises): never 'curve' any more, judged on the
+  # band the camera covers, gone when clear; a car seen in it holds
   for straight in (0., 60., 120.):
     j = Junction()
-    d = j.wait(CLEAR_WINDOW_S + 1., straight_m=straight)
-    assert d.state == 'undecided' and d.why == 'curve' and d.prompt == 'leftUndecidedTakeControl', straight
-    assert not any(x.go for x in j.decisions) and d.reason == "Oncoming road curves out of view: take control"
-    assert straight + HOLD_D < d.r_req
+    j.wait(CLEAR_WINDOW_S + 1., straight_m=straight)
+    assert any(x.go for x in j.decisions) and not any(x.state == 'undecided' for x in j.decisions), straight
+    j = Junction()
+    j.wait(CLEAR_WINDOW_S + 1., straight_m=straight, boxes=[raw(40., 3.6)])
+    assert not any(x.go for x in j.decisions), straight
   j = Junction()
   j.wait(CLEAR_WINDOW_S + 0.2, straight_m=250.)
   assert any(x.go for x in j.decisions)
@@ -681,28 +700,22 @@ def test_45_and_55_mph_reach_needs_the_far_crop_and_its_measured_range():
     d = far_wait(j, CLEAR_WINDOW_S + 1., far_range_m=300., far_live=True)
     assert d.go and d.far_needed and d.r_req > RANGE, (v, lanes)
     assert d.clear_s >= CLEAR_WINDOW_S - 1e-6
-  # unmeasured far range (the default): undecided, saying why
-  j = Junction(v_limit=V_45)
-  d = far_wait(j, 1., far_live=True)
-  assert d.state == 'undecided' and d.why == 'farUnmeasured' and d.prompt == 'leftUndecidedTakeControl'
-  assert not any(x.go for x in j.decisions)
-  # past even the far crop's measured range
-  j = Junction(v_limit=V_55, lanes=2)
-  d = far_wait(j, 1., far_range_m=280., far_live=True)
-  assert d.state == 'undecided' and d.why == 'range'
-  # the far crop off (no pkl, the param, failed or over budget, no calibration): its range counts for nothing
-  j = Junction(v_limit=V_45)
-  d = far_wait(j, 1., far_range_m=300., far_live=False)
-  assert d.state == 'undecided' and d.why == 'farOff'
+  # unmeasured far range (the default), past even the far crop's measured range, or the far crop off: judged on the band the
+  # camera covers and gone when clear (Kellen, 2026-11-07: no handbacks), never undecided for the reach
+  for v, lanes, kw in ((V_45, 1, {'far_live': True}), (V_55, 2, {'far_range_m': 280., 'far_live': True}),
+                       (V_45, 1, {'far_range_m': 300., 'far_live': False})):
+    j = Junction(v_limit=v, lanes=lanes)
+    far_wait(j, CLEAR_WINDOW_S + 1., **kw)
+    assert any(x.go for x in j.decisions) and not any(x.state == 'undecided' for x in j.decisions), kw
   # 25 mph needs no far crop
   j = Junction()
   d = far_wait(j, CLEAR_WINDOW_S + 1., far_live=False)
   assert d.go and not d.far_needed
-  # the full pass's range unmeasured: the far crop covers the band only past it, so it extends nothing (said at once, never
-  # a stale far view two seconds later)
+  # the full pass's range unmeasured: the far crop covers the band only past it, so it extends nothing and its runs gate
+  # nothing (never a stale far view): judged on what the camera boxes
   j = Junction(v_limit=V_45, rng=0.)
-  d = far_wait(j, 0.1, far_range_m=300., far_live=True)
-  assert d.state == 'undecided' and d.why == 'range'
+  far_wait(j, CLEAR_WINDOW_S + 1., far_range_m=300., far_live=True)
+  assert any(x.go for x in j.decisions) and not any(x.state == 'undecided' for x in j.decisions)
 
 
 def test_a_far_box_in_the_band_blocks_at_any_range_when_the_far_crop_is_needed():
@@ -730,21 +743,32 @@ def test_a_far_box_in_the_band_blocks_at_any_range_when_the_far_crop_is_needed()
 
 def test_needed_far_runs_must_be_fresh_and_cover_the_band():
   from openpilot.selfdrive.turnpilot.unprotected_left import FAR_FRESH_S
-  # full runs clear, no far run: never a go, and a fault once stale
+  # full runs clear, no far run: no go while the far slot might still read; once it has seen nothing of the band for
+  # STALE_UNDECIDED_S, judged on the full pass's band and gone when clear, never a farStale handback (2026-11-07: no handbacks)
   j = Junction(v_limit=V_45)
-  d = j.wait(STALE_UNDECIDED_S + 0.2, far_range_m=300., far_live=True)
-  assert not any(x.go for x in j.decisions) and d.state == 'undecided' and d.why == 'farStale'
+  d = j.wait(STALE_UNDECIDED_S - 0.2, far_range_m=300., far_live=True)
+  assert not any(x.go for x in j.decisions)
+  d = j.wait(CLEAR_WINDOW_S + 1., far_range_m=300., far_live=True)
+  assert any(x.go for x in j.decisions) and not any(x.state == 'undecided' for x in j.decisions)
   # far runs further apart than FAR_FRESH_S
   j = Junction(v_limit=V_45)
   every = math.ceil(FAR_FRESH_S / DT_MDL) + 2
   d = far_wait(j, CLEAR_WINDOW_S + 1., every=every, far_range_m=300., far_live=True)
   assert not any(x.go for x in j.decisions)
   # far runs that don't cover the band's bearings past the full pass's range (aimed off, clamped at the frame's edge, the
-  # horizon out of the crop): seen nothing there, a fault once stale
+  # horizon out of the crop): seen nothing there, judged on the full pass's band once stale and gone when clear
   for cover in ((-20., 3.), (5., 30.), None):
     j = Junction(v_limit=V_45)
-    d = far_wait(j, STALE_UNDECIDED_S + 0.5, cover=cover, far_range_m=300., far_live=True)
-    assert not any(x.go for x in j.decisions) and d.state == 'undecided' and d.why == 'farStale', cover
+    d = far_wait(j, STALE_UNDECIDED_S - 0.2, cover=cover, far_range_m=300., far_live=True)
+    assert not any(x.go for x in j.decisions), cover
+    d = far_wait(j, CLEAR_WINDOW_S + 1., cover=cover, far_range_m=300., far_live=True)
+    assert any(x.go for x in j.decisions) and not any(x.state == 'undecided' for x in j.decisions), cover
+  # ...and a car the full pass boxes in the band still holds it there
+  j = Junction(v_limit=V_45)
+  far_wait(j, STALE_UNDECIDED_S + 0.2, cover=(-20., 3.), far_range_m=300., far_live=True)
+  for _ in range(round((CLEAR_WINDOW_S + 1.) / DT_MDL)):
+    d = j.step([raw(60., 3.6)], far_range_m=300., far_live=True)
+  assert not any(x.go for x in j.decisions) and d.clear_s == 0.
   # yawed 10 deg toward the turn (after a withdrawn go), the band is 10 deg to the right in the car's frame
   j = Junction(v_limit=V_45)
   d = far_wait(j, CLEAR_WINDOW_S + 1., cover=(-25.6, 5.6), heading_deg=10., far_range_m=300., far_live=True)
@@ -1104,3 +1128,93 @@ def test_a_re_engage_the_lefts_own_hold_takes_up_is_never_let_go_on_a_later_fram
     assert crossed in ([], [n]), (keep_m, crossed, n)
     if not crossed:
       assert j.left.hold_here and j.v == 0. and j.left.hold_m < entry and ds[-1].stops, (keep_m, j.left.hold_m, entry)
+
+
+# ------------------------------------------------------------------- after dark (2026-11-06: NIGHT_LEFT_RANGE_M, darkness.py)
+
+def test_after_dark_a_left_past_the_night_range_goes_on_the_band_it_sees():
+  """The 11-06 night drive (1e): the full pass's raw vehicle boxes reached p99 50 m, max 78 m. Until 2026-11-07 the reach was
+  capped there after dark and every such left handed back ('night'). Kellen, 2026-11-07 ("no, no handbacks ... we are pushing
+  bleeding edge here, not maximal caution"; a safety driver supervises): no cap, judged on the band the camera covers, gone
+  when it is clear; a car it sees there holds it."""
+  from openpilot.selfdrive.turnpilot.unprotected_left import NIGHT_LEFT_RANGE_M
+  for v_limit, lanes in ((V_25, 1), (V_25, 2), (8.94, 1), (None, None)):  # 25 mph, two lanes, 20 mph, unmapped (45 mph)
+    j = Junction(v_limit=v_limit, lanes=lanes)
+    d = j.step(dark=True)
+    assert d.r_req > NIGHT_LEFT_RANGE_M and d.state != 'undecided', (v_limit, d.state, d.why)
+    j.wait(CLEAR_WINDOW_S + 1., dark=True)
+    assert any(x.go for x in j.decisions) and not any(x.state == 'undecided' for x in j.decisions), v_limit
+    j = Junction(v_limit=v_limit, lanes=lanes)
+    j.wait(CLEAR_WINDOW_S + 1., dark=True, boxes=[raw(40., 3.6)])
+    assert not any(x.go for x in j.decisions), v_limit
+  # the far crop and its measured range as by day
+  j = Junction(v_limit=20.1)
+  far_wait(j, CLEAR_WINDOW_S + 1., far_range_m=300., far_live=True, dark=True)
+  assert any(x.go for x in j.decisions)
+
+
+def test_after_dark_a_left_held_short_of_its_line_rolls_up_to_it_then_judges_the_gap():
+  # held short of its line (the latch reaches LATCH_NEAR_M short), dark: rolled up to the line as by day for a reach past the
+  # range, then judged there on the band it sees (2026-11-07: no night handback), never a go from where it stood
+  from openpilot.selfdrive.turnpilot.unprotected_left import LINE_D, ROLL_UP_M
+  j = Junction()
+  d = j.step(distance=16., dark=True)
+  assert d.state == 'creep' and abs(d.creep_m - (16. - LINE_D)) < 1e-6 and d.reason == "Rolling up to the line"
+  for dist in (14., 12., LINE_D + ROLL_UP_M + 0.1):  # rolled up as by day (no night cap: R_req within the range nearer)
+    d = j.step(distance=dist, v=0.6, dark=True)
+    assert d.state in ('creep', 'waitGap') and not d.go, dist
+  d = j.step(distance=LINE_D + ROLL_UP_M - 0.1, v=0.3, dark=True)  # within ROLL_UP_M of its line: judged there
+  assert d.state != 'undecided' and not d.go
+  j.wait(CLEAR_WINDOW_S + 0.5, distance=LINE_D, v=0., dark=True)
+  assert any(x.go for x in j.decisions) and not any(x.state == 'undecided' for x in j.decisions)
+
+
+def test_a_go_under_way_when_it_gets_dark_is_never_taken_back_for_the_night():
+  # the go certified by day and moving: the reach isn't judged again in the go (only the band, the crosswalk, the view and the
+  # holds are), so the filter turning dark mid-launch never stops the car in the junction
+  j = Junction()
+  j.wait(CLEAR_WINDOW_S + 0.2)
+  assert j.decisions[-1].go or j.decisions[-1].state == 'go'
+  d = j.step(v=0.8, distance=HOLD_D - 0.2, dark=True)
+  assert d.state == 'go' and d.why == '' and not d.stops
+
+
+def test_the_reach_handbacks_are_gone_their_words_kept():
+  # 11-06: every reach handback read 'Far camera range not measured'; they said the car can't see oncoming far enough. Since
+  # 2026-11-07 none is raised (no handbacks): the same lefts go on the band they see; the words stay for the logs' readers
+  from openpilot.selfdrive.turnpilot.unprotected_left import UNDECIDED_REASON
+  for why in ('range', 'farUnmeasured', 'farOff'):
+    assert UNDECIDED_REASON[why] == "Can't see oncoming far enough: take control", why
+  for kw in ({}, {'far_range_m': 300.}, {'dark': True}):
+    j = Junction(v_limit=20.1)
+    far_wait(j, CLEAR_WINDOW_S + 1., far_live='far_range_m' not in kw, **kw)
+    assert any(x.go for x in j.decisions) and not any(x.state == 'undecided' for x in j.decisions), kw
+
+
+def test_route_range_refuses_no_left_and_still_says_its_reach_and_bend():
+  """2026-11-06 (Kellen: never route around or skip a left for range): route_range was the predicate turnpilotd skipped lefts
+  by (unprotectedRange) and navd routed around, and it refused every left of the 11-06 drives 58-394 m out. It refuses none
+  now, in any mode, whatever the range; its reach (R_req where the car may stand) and bent (the opposing road not known
+  straight out to it) are as before, for the logs."""
+  from openpilot.selfdrive.turnpilot.route_follower import TURN, Maneuver
+  from openpilot.selfdrive.turnpilot.unprotected_left import LINE_D, ROUTE_REACH_MARGIN_M, reach_at_line, route_range
+
+  def left(**kw):
+    return Maneuver(**{'kind': TURN, 'side': LEFT, 'type': 'turn', 'modifier': 'left', 'angle_deg': 90., 'geometry': True,
+                       'opposing': 'present', 'opposing_speed': V_25, 'opposing_lanes': 1, 'opposing_straight_m': 400.} | kw)
+  for maneuver in (left(), left(opposing_speed=0., opposing_lanes=0, opposing_straight_m=0.), left(opposing='unknown'),
+                   left(opposing_straight_m=60.)):
+    for reach_m in (0., 150., 210., 400.):
+      for setback in (None, 0., 11.):
+        rc = route_range(maneuver, setback, reach_m)
+        margin = ROUTE_REACH_MARGIN_M if setback is None else setback
+        reach = reach_at_line(maneuver.opposing_speed, maneuver.opposing_lanes or None, margin)
+        assert rc.unprotected and not rc.out_of_range, (maneuver, reach_m, setback)
+        assert rc.reach == pytest.approx(reach) and rc.margin == margin
+        assert rc.bent == (reach > LINE_D + margin + maneuver.opposing_straight_m)
+  # the 11-06 lefts' route-time numbers (scratchpad reach.py): 1e L1 267.8 m and L3 198.4 m bent, 1e L4/L5 (all unknown) bent
+  assert route_range(left(opposing_speed=15.6, opposing_straight_m=400.), None, 210.).reach == pytest.approx(267.8, abs=0.5)
+  rc = route_range(left(opposing_speed=11.1, opposing_straight_m=125.), None, 210.)
+  assert rc.reach == pytest.approx(198.4, abs=0.5) and rc.bent and not rc.out_of_range
+  rc = route_range(left(opposing_speed=0., opposing_lanes=0, opposing_straight_m=0.), None, 210.)
+  assert rc.bent and not rc.out_of_range

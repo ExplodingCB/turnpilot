@@ -1,13 +1,12 @@
 import math
 
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.turnpilot.desire_timing import TURN_DESIRE_LEAD_M
 from openpilot.selfdrive.turnpilot.route_follower import NOMINAL_ANGLE_DEG, Maneuver, classify
 from openpilot.selfdrive.turnpilot.hooks import plan_accel
 from openpilot.selfdrive.turnpilot.scene_policy import NO_ACCEL_CAP
 from openpilot.selfdrive.turnpilot.turn_speed import (CORNER_CURB_M, CORNER_M, LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT,
-                                                      POST_GO_MAX_M, POST_GO_PROFILES, V_CORNER, V_CORNER_CURB, V_TURN_MAX, V_TURN_MIN,
-                                                      PostGo, post_go_caps, turn_speed_cap, turn_target_speed)
+                                                      POST_GO_MAX_M, POST_GO_PROFILES, TURN_CAP_LEAD_M, V_CORNER, V_CORNER_CURB, V_TURN_MAX,
+                                                      V_TURN_MIN, PostGo, post_go_caps, turn_speed_cap, turn_target_speed)
 
 
 def maneuver(mtype, modifier):
@@ -67,7 +66,7 @@ def test_a_slight_turn_at_a_junction_is_capped_at_any_speed():
 
 def test_braking_curve():
   m = maneuver("turn", "right")
-  assert math.isclose(turn_speed_cap(m, 100. + TURN_DESIRE_LEAD_M, 0.), math.sqrt(V_TURN_MIN ** 2 + 2 * 1.5 * 100.))
+  assert math.isclose(turn_speed_cap(m, 100. + TURN_CAP_LEAD_M, 0.), math.sqrt(V_TURN_MIN ** 2 + 2 * 1.5 * 100.))
   assert turn_speed_cap(m, 300., 15.) > 25.  # far out it doesn't bite
 
 
@@ -81,9 +80,9 @@ def test_car_reaches_turn_speed_by_the_desire():
       min_a = min(min_a, a)
       v = max(v + a * DT_MDL, 0.)
       d -= v * DT_MDL
-      if at_desire is None and d < TURN_DESIRE_LEAD_M:
+      if at_desire is None and d < TURN_CAP_LEAD_M:
         at_desire = v
-    assert V_TURN_MIN - 0.5 < at_desire < V_TURN_MIN + 0.25, modifier  # gate 1's speed when the desire goes out
+    assert V_TURN_MIN - 0.5 < at_desire < V_TURN_MIN + 0.25, modifier  # gate 1's speed where its desire went out
     assert v < V_CORNER + 0.5, modifier                                  # and its own turn speed by the corner
     assert min_a > -1.6, modifier
 
@@ -207,3 +206,23 @@ def test_post_go_ends_where_a_shallow_turn_is_done():
   assert not pg.over
   pg.update(1., math.radians(1.5), 1.)
   assert pg.over
+
+
+def test_the_caps_braking_curve_is_its_own_not_the_desires_lead(monkeypatch):
+  """2026-11-06: a curb-side turn's one pulse goes 8 m out and a far-side one's lead comes in with speed (desire_timing.turn_lead),
+  so the cap's braking curve has its own anchor, TURN_CAP_LEAD_M, and the caps are what they were: 6.9 m/s by 40 m for any
+  junction turn, the curb side's 3 m/s by 20 m, the far side's 4.3 by 15 m; the car under them reaches those speeds there."""
+  import openpilot.selfdrive.turnpilot.desire_timing as dt
+  assert TURN_CAP_LEAD_M == 40.
+  right, left = maneuver("turn", "right"), maneuver("turn", "left")
+  before = [turn_speed_cap(m, d, v) for m in (right, left) for d in (300., 100., 60., 40., 30., 20., 15., 8., 0.) for v in (0., 3., 6.9, 12.)]
+  monkeypatch.setattr(dt, 'TURN_DESIRE_LEAD_M', 25.)  # nothing in the cap reads the desire's lead
+  assert before == [turn_speed_cap(m, d, v) for m in (right, left) for d in (300., 100., 60., 40., 30., 20., 15., 8., 0.) for v in (0., 3., 6.9, 12.)]
+  assert math.isclose(turn_speed_cap(left, 40., 6.9), V_TURN_MIN) and math.isclose(turn_speed_cap(right, 40., 6.9), V_TURN_MIN)
+  assert math.isclose(turn_speed_cap(right, CORNER_CURB_M, 3.), V_CORNER_CURB) and CORNER_CURB_M == 20.
+  assert math.isclose(turn_speed_cap(left, CORNER_M, 4.), V_CORNER)
+  for modifier in ("right", "left"):
+    v40, _ = approach(modifier, 40.)
+    assert V_TURN_MIN - 0.5 < v40 < V_TURN_MIN + 0.25, (modifier, v40)
+  v20, _ = approach("right", 20.)
+  assert v20 < V_CORNER_CURB + 0.6, v20

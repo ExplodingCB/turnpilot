@@ -3,8 +3,11 @@
 At a junction nothing in openpilot knows which way the route goes, so the car would reach a turn at road
 speed. The target speed comes from a lateral accel limit on the corner's radius, estimated from the turn angle
 (the junction's real one from Valhalla's bearings, else the modifier's nominal one; route_follower.py), but never
-under 25 km/h, with a braking curve back to where the turn desire goes out. That is the speed the big model took
-gate 1's turns from (a pulse 40 m out at 6.9 m/s, after which the model slows itself to about 4.5 m/s for the turn).
+under 25 km/h, with a braking curve back to TURN_CAP_LEAD_M (40 m), where gate 1's turn desire went out and a far-side
+turn's still does at that speed. That is the speed the big model took gate 1's turns from (a pulse 40 m out at 6.9 m/s,
+after which the model slows itself to about 4.5 m/s for the turn). The curve is its own constant, not the desire's lead:
+a curb-side turn's one pulse goes at 8 m and a far-side one's comes in with speed (desire_timing.turn_lead, 2026-11-06),
+and the cap still has the car at 6.9 m/s by 40 m and, for a curb-side turn, 3 m/s by 20 m, as before.
 Braking on to a geometric 4-5 m/s before the pulse put the car at the junction 6 s after it, by which time the
 model had dropped the desire and drove straight on (four junctions of four, 2026-10-27). Past the pulse a second
 curve brings a junction turn down to the 4.3 m/s gate 1's model chose by itself 15 m out: at junctions where the
@@ -47,7 +50,7 @@ more is V_CORNER where the car is, the profile's own 4.3.
 import math
 from dataclasses import dataclass
 
-from openpilot.selfdrive.turnpilot.desire_timing import CLEAR_MARGIN_DEG, CLEAR_MIN_FRACTION, TURN_DESIRE_LEAD_M
+from openpilot.selfdrive.turnpilot.desire_timing import CLEAR_MARGIN_DEG, CLEAR_MIN_FRACTION
 from openpilot.selfdrive.turnpilot.route_follower import KEEP, LEFT, TURN
 
 NO_SPEED_CAP = 100.
@@ -59,6 +62,7 @@ V_TURN_MAX = 15.0
 KEEP_CAP_SPEED_MAX = 15.0  # m/s: a keep is capped only below this...
 KEEP_CORNER_MIN_DEG = 20.  # ...or at any speed at a junction (its bearings, a branch) this sharp or more
 LAG_S = 2.0             # s the curve leads the car
+TURN_CAP_LEAD_M = 40.   # m: the braking curve reaches the turn's target speed here (gate 1's pulse; module docstring)
 V_CORNER = 4.3          # m/s a junction turn slows to by CORNER_M before the junction (gate 1's model, by itself)
 CORNER_M = 15.
 V_CORNER_CURB = 3.0     # m/s a curb-side one slows to by CORNER_CURB_M (module docstring: BeamNG's taken rights)
@@ -91,7 +95,7 @@ def turn_speed_cap(maneuver, distance: float, v_ego: float, right_hand_traffic: 
   curb_side = (maneuver.side == LEFT) != right_hand_traffic
   v_turn = turn_target_speed(maneuver.angle_deg, curb_side)
   lag = max(v_ego, 0.) * LAG_S
-  cap = math.sqrt(v_turn ** 2 + 2. * A_DECEL * max(distance - TURN_DESIRE_LEAD_M - lag, 0.))
+  cap = math.sqrt(v_turn ** 2 + 2. * A_DECEL * max(distance - TURN_CAP_LEAD_M - lag, 0.))
   if maneuver.kind == TURN and maneuver.angle_deg >= CORNER_ANGLE_MIN_DEG:
     v_corner, corner_m = (V_CORNER_CURB, CORNER_CURB_M) if curb_side else (V_CORNER, CORNER_M)
     cap = min(cap, math.sqrt(v_corner ** 2 + 2. * A_DECEL * max(distance - corner_m - lag / 2., 0.)))

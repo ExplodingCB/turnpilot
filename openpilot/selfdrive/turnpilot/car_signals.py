@@ -4,8 +4,8 @@ DESIGN phase4/blinker (2026-10-28). On a Tesla verified by the lamp check (opend
 works its own turn signal: TurnSignalIntent's side reaches controlsd through turnpilotPlan.turnSignal, controlsd puts it
 in CarControl's blinkers, and the Tesla port sends DAS_bodyControls and masks its own lamp out of the driver's blinker
 (opendbc car_signal.py). Everywhere else, and whenever the car's signal isn't ready, the driver signals, and every armed
-turn prompts "Signal Left/Right" under 20 mph with no lane change pending (STOP_SIGNS D15's holds: above DesireHelper's
-LANE_CHANGE_SPEED_MIN a one-sided driver's blinker is a lane change on a nudge).
+turn prompts "Signal LEFT/RIGHT Now", at any speed, with no lane change pending (2026-11-07: DesireHelper reads the driver's
+blinker on the armed turn's side as that turn's signal, never a lane change on a nudge).
 
 The legal distance (IC 9-21-8-25): a turn or lane change is signalled continuously for the last 200 ft, 300 ft where the
 limit is 50 mph or more. The car doesn't know its road's limit unless navd says (navInstruction.speedLimit), so 300 ft
@@ -59,6 +59,11 @@ LEAD_SHORT_M = 60.96        # 200 ft
 LEAD_LONG_M = 91.44         # 300 ft, where the limit is 50 mph or more, and whenever the limit isn't known
 LIMIT_LONG_MS = 22.35       # 50 mph
 ARM_LAG_S = 1.41            # the next stock frame (0.51 s), ON latency (0.5 s), UI_warning (0.1 s), margin (0.3 s)
+# the driver signals instead (the car's signal not ready): a second more of lead for the person to react to the prompt, at
+# any speed (Kellen, 2026-11-07: on 11-06 the car's lamps never lit and the prompt came late; "give him an extra second to
+# react", and no speed floor: DesireHelper reads the driver's blinker on the armed turn's side as that turn's, never a lane
+# change)
+PROMPT_REACT_S = 1.
 CAR_SIGNAL_WAIT_S = 15.     # mode on, no stock body frame this long: the car can't signal
 TRAVEL_BACKSTOP_M = 200.    # an armed turn's signal travels no further than this past its arming
 HANDED_OVER_S = 3.
@@ -511,7 +516,8 @@ class TurnSignalIntent:
           self.ended_id = self.armed_id  # never armed again for this maneuver
         self.armed_id, self.arm_side = None, LaneChange.none
     if self.armed_id is None and signals_turn and gates_ok and engaged and maneuver_id != self.ended_id:
-      if distance <= lead + v_ego * ARM_LAG_S or (d_this and desires.started):
+      lag = ARM_LAG_S + (PROMPT_REACT_S if status != Status.ready else 0.)
+      if distance <= lead + v_ego * lag or (d_this and desires.started):
         self.armed_id, self.arm_side, self.arm_travel = maneuver_id, m_side, 0.
         self.arm_m = max(distance, 0.)
     if self.armed_id is not None:
@@ -571,7 +577,7 @@ class TurnSignalIntent:
     # one this frame's veto skips (our lamp put out fails the port on the veto's own frame)
     if status != Status.ready and self.armed_id is not None and gates_ok and out.skip == 'none':
       own_lit = lamps[self.arm_side] and not lamps[other_side(self.arm_side)]
-      if v_ego < LANE_CHANGE_SPEED_MIN and not lane_pending and not own_lit:
+      if not lane_pending and not own_lit:
         out.prompt = self.arm_side
 
     # the unprotected left's go: the turn's side lit (ours or the driver's) with no long dark run, the other side dark

@@ -285,7 +285,11 @@ def turnpilot_lane_change_alert(side: str) -> AlertCallbackType:
     # held for the blind spot (LC-01): no sound, so its release ('clear') chimes again (soundd plays a sound it changes to)
     held = plan is not None and str(plan.laneChangeHold) == 'blindspot'
     sound = AudibleAlert.none if held else AudibleAlert.tpLaneChangeLeft if side == 'left' else AudibleAlert.tpLaneChangeRight
-    return Alert(lane_change_text(plan, side), "Car in blind spot" if held else "TurnPilot, for the route",
+    text = lane_change_text(plan, side)
+    if not held and text.startswith('Signal '):
+      # waiting on the driver's lamp: the side's chime on repeat until it is lit (Kellen, 2026-11-07: very clear left vs right)
+      sound = AudibleAlert.tpSignalLeft if side == 'left' else AudibleAlert.tpSignalRight
+    return Alert(text, "Car in blind spot" if held else "TurnPilot, for the route",
                  AlertStatus.userPrompt, AlertSize.mid,
                  Priority.LOW, VisualAlert.none, sound, .1)
   return func
@@ -316,9 +320,11 @@ def turnpilot_too_fast_to_turn_alert(CP: car.CarParams, CS: car.CarState, sm: me
   """The turn ahead is skipped and navd reroutes (turnpilotPlan.tooFastToTurn): too fast to make it, or a map stop left no
   room to get into its lane (laneChangeWait unreachable, lane_planner.py) or the change into it never went by the lane change
   window's end (skipReason laneBlocked: LC-03), or a keep the model can't be sent (skipReason
-  keepNoLine: no lane line that way; keepFarSide: no lane of ours beyond it toward the far side, turnpilotd.keep_unsent). Or a
-  turn the car pulled away into from a standstill went straight past its junction (turnpilotPlan.turnMissed, turnpilotd.py):
-  missed, and navd reroutes."""
+  keepNoLine: no lane line that way; keepFarSide: no lane of ours beyond it toward the far side, turnpilotd.keep_unsent), or a
+  turn at a signal taken up after a handback too close to stop at its line for want of a green read (skipReason signalStop,
+  turnpilotd.signal_stop_lost: "Can't Stop for the Light", never turned through a light nobody read). Or a turn the car pulled
+  away into from a standstill went straight past its junction (turnpilotPlan.turnMissed, turnpilotd.py): missed, and navd
+  reroutes."""
   plan = shown_plan(sm)
   # a keep the model drives under TurnPilotAlwaysDrive (ALWAYS_DRIVE.md R7, skipReason KEEP_FOLLOW): a status line, no chime;
   # the skip's chime and 'Rerouting' only once navd recomputes past it (KEEP_REROUTED)
@@ -328,12 +334,19 @@ def turnpilot_too_fast_to_turn_alert(CP: car.CarParams, CS: car.CarState, sm: me
   rerouted = plan is not None and str(plan.skipReason) == KEEP_REROUTED
   # a map stop leaving no room to get into the turn's lane, or a change it needed that never went (LC-03, skipReason laneBlocked)
   lane = plan is not None and (str(plan.laneChangeWait) == 'unreachable' or str(plan.skipReason) == 'laneBlocked')
+  # a turn at a signal whose stop at its line can't be made now with no green read for it (turnpilotd: skipReason signalStop):
+  # until 2026-11-06 it fell through to "Too Fast to Turn", which says nothing of the light the car couldn't stop for
+  light = plan is not None and str(plan.skipReason) == 'signalStop'
   missed = plan is not None and plan.turnMissed
-  blind = plan is not None and str(plan.unprotectedLeft.state) == 'skipped'  # oncoming too fast for the detector's range
+  # an unprotected left skipped at route time for the detector's range: turnpilotd sets unprotectedLeft.state 'skipped' no
+  # longer (2026-11-06, Kellen: "never route around or skip a left for range"; each left is driven to its line and hands
+  # back there, "Can't see oncoming far enough: take control"). The title stays for the append-only schema and older logs
+  blind = plan is not None and str(plan.unprotectedLeft.state) == 'skipped'
   signal = too_fast_title(plan) if plan is not None else None  # the turn signal's skips (car_signals.py: a veto, a side in doubt)
   keep = keep_skip_title(plan) if plan is not None else None
   return Alert("Turn Missed" if missed else "Fork Missed" if rerouted else signal if signal else keep if keep else
-               "Can't Reach Turn Lane" if lane else "Can't See Far Enough to Turn" if blind else "Too Fast to Turn", "Rerouting",
+               "Can't Reach Turn Lane" if lane else "Can't Stop for the Light" if light else
+               "Can't See Far Enough to Turn" if blind else "Too Fast to Turn", "Rerouting",
                AlertStatus.userPrompt, AlertSize.mid,
                Priority.LOW, VisualAlert.none, AudibleAlert.tpTooFastTurn, 3.)
 
@@ -362,7 +375,7 @@ CONTROL_PROMPT_TITLE = {'yieldAhead': "Yield Ahead", 'stopSignTakeControl': "Sto
                         'offRouteTakeControl': "Off Route: Take Control", 'gpsLostTakeControl': "GPS Lost: Take Control"}
 CONTROL_ALERT_TITLE = {'cannotStopComfortably': "Take Control", 'stopOverrun': "Stop Line Passed",
                        'proceedingOnYellow': "Proceeding on Yellow",
-                       'mapControlsUnavailable': "Map Stops Unavailable", 'lightSourceRejected': "Light Source Rejected",
+                       'mapControlsUnavailable': "Map Stops Unavailable", 'lightSourceRejected': "Lights Unknown",
                        'mapControlsUnavailableSilent': "Map Stops Unavailable",
                        'junctionUncertain': "Junction Position Uncertain", 'offRouteStopsUnknown': "Off Route",
                        'hardBrake': "Braking Hard", 'carCrossing': "Car Crossing", 'oncomingHolding': "Oncoming: Holding", 'farViewOff': "Far View Off",
@@ -420,6 +433,17 @@ def turnpilot_control_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.S
     drive = plan.reason == OFF_ROUTE_DRIVE_REASON
     return Alert(CONTROL_ALERT_TITLE[kind], plan.reason if drive else CONTROL_ALERT_TEXT[kind], AlertStatus.userPrompt, AlertSize.mid,
                  Priority.LOW, VisualAlert.none if drive else VisualAlert.steerRequired, AudibleAlert.prompt, .1)
+  if kind == 'lightSourceRejected':
+    # the camera's light reader failing (map_controls: a status line for its whole failing spell, S2 2026-11-07), or a light
+    # source not accepted here (the sim's). Its own words, never another line's reason under its title (turnpilotd puts the
+    # lane planner's under it, a hold's after the onset); its chime once, with its onset's words (CAMERA_OFF_REASON) or a
+    # source with none of its own, so the spell's line coming and going under other lines never chimes again
+    from openpilot.selfdrive.turnpilot.map_controls import CAMERA_OFF_REASON, CAMERA_OFF_REASONS
+    reason = str(plan.reason)
+    text = reason if reason in CAMERA_OFF_REASONS else CONTROL_ALERT_TEXT[kind]
+    chime = reason in ('', CAMERA_OFF_REASON)
+    return Alert(CONTROL_ALERT_TITLE[kind], text, AlertStatus.normal, AlertSize.mid, Priority.LOWER, VisualAlert.none,
+                 AudibleAlert.prompt if chime else AudibleAlert.none, .2)
   if kind in CONTROL_STATUS_ALERTS:
     return Alert(CONTROL_ALERT_TITLE[kind], plan.reason or CONTROL_ALERT_TEXT[kind], AlertStatus.normal, AlertSize.mid,
                  Priority.LOWER, VisualAlert.none, AudibleAlert.none if kind in SILENT_STATUS_ALERTS else AudibleAlert.prompt, .2)

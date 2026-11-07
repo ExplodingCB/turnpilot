@@ -17,9 +17,24 @@ counts: a hold too many, never one too few (turnpilot/map_controls.py). No junct
 road's mapped speed limit and lanes (maneuverOpposingSpeed, maneuverOpposingLanes: the unprotected left's R_req) come from a
 locate OPPOSING_PROBE_M out along it (opposing_leg; routing/controls.py: opposing_roads), 0 when unknown, and how far out it
 stays straight on from our approach (maneuverOpposingStraightM: approach_line; opposing_straight), 0 when unknown.
+The opposing road's leg off straight on (maneuverOpposingRelBearing, Maneuver.opposingRelBearing: deg, + right) is that same
+road's, the other road nearest straight on (nearest_ahead), sent for the 2026-11-06 rights review's slight-turn cone (a
+25-30 deg bend left past a lone side road 40 deg right reads present, and as a TURN would stand the car at a hold line on a
+through road). NaN with no opposing road or no junction data, never 0, which is a road dead ahead. Its bearing alone can't
+tell that side road from the approach's own road going on off the far side, whose oncoming traffic a slight left off it does
+cross (review of 11-06, on the local tiles around the 11-06 drives: of 140 distinct slight lefts on 2500 routes, 66 TURNs on
+present alone, the bare cone made keeps of 6; in 4 the far-side road, 26-43 deg right, carried the approach's own name, a
+5th, unnamed, its class and speed, those 5 at the approach's own mapped speed, the 6th service roads with none mapped; none
+of them the bend). A route that stays on a bending main road comes as 'continue' (11 of the 140), which route_follower's
+classify leaves to the model. So route_follower decides nothing on the bearing (2026-11-07, turnpilot/route_follower.py:
+slight_far_turn): a slight far-side turn across a present approach is a TURN whatever its bearing, and the bearing rides on
+navInstruction (so in the logs) and the maneuver. A road off the far side could be a side road only if shown minor (its mapped speed,
+maneuverOpposingSpeed, under the approach's, speedLimit), and no rule takes that yet.
 Within a step the route goes straight through intersections without a maneuver; the next one with a lane list is sent
 as throughLanes, so a car in a turn-only lane there is flagged.
 """
+import math
+
 import numpy as np
 
 from openpilot.selfdrive.navigation.route import along_path
@@ -75,10 +90,30 @@ def approach_lanes(steps, step_idx, distance_to_maneuver) -> list[dict]:
   return lanes
 
 
+def straight_on(first: dict, bearing_before: float) -> float:
+  """deg the car heads straight on through a junction (its first intersection, Valhalla's format=osrm): the reverse of its
+  road's bearing out of the junction, else bearing_before."""
+  bearings, i_in = first.get('bearings') or [], first.get('in')
+  return (float(bearings[i_in]) + 180.) % 360. if i_in is not None and 0 <= i_in < len(bearings) else float(bearing_before)
+
+
+def nearest_ahead(first: dict, bearing_before: float) -> tuple[float, float] | None:
+  """(rel, bearing) of the road at a junction (its first intersection) other than the route's in and out that is nearest
+  straight on (straight_on; a tie to the lower bearing): rel its leg off straight on (deg, + right, -180 to 180), bearing its
+  way out of the junction. Within OPPOSING_DEG it is the opposing road, the one maneuver_junction's opposing and
+  opposingRelBearing and opposing_leg's probe are all of. None with no other road."""
+  bearings, out, i_in = first.get('bearings') or [], first.get('out'), first.get('in')
+  ahead = straight_on(first, bearing_before)
+  others = [((float(bearings[i]) - ahead + 180.) % 360. - 180., float(bearings[i])) for i in range(len(bearings)) if i not in (i_in, out)]
+  return min(others, key=lambda r: (abs(r[0]), r[1])) if others else None
+
+
 def maneuver_junction(steps, step_idx) -> dict | None:
-  """{'before', 'after' (deg), 'branches'} for the junction of the maneuver that ends step step_idx, or None when the
-  route has no intersection data for it (or there is no next step). branches counts every other road at the node,
-  one-way roads coming in included: the model doesn't know a road is one-way, and could follow it."""
+  """{'before', 'after' (deg), 'branches', 'opposing', 'opposing_rel'} for the junction of the maneuver that ends step
+  step_idx, or None when the route has no intersection data for it (or there is no next step). branches counts every other
+  road at the node, one-way roads coming in included: the model doesn't know a road is one-way, and could follow it.
+  opposing: 'present' with another road within OPPOSING_DEG of straight on, else 'none'; opposing_rel: that road's leg off
+  straight on (deg, + right: nearest_ahead), NaN with none (module docstring)."""
   if step_idx + 1 >= len(steps):
     return None
   step = steps[step_idx + 1]
@@ -92,11 +127,10 @@ def maneuver_junction(steps, step_idx) -> dict | None:
     return None
   i_in = first.get('in')
   others = [i for i in range(len(bearings)) if i not in (i_in, out)]
-  # straight on is the way the car comes in: the reverse of its road's bearing out of the junction, or bearing_before
-  ahead = (float(bearings[i_in]) + 180.) % 360. if i_in is not None and 0 <= i_in < len(bearings) else float(maneuver['bearing_before'])
-  opposing = any(abs((float(bearings[i]) - ahead + 180.) % 360. - 180.) <= OPPOSING_DEG for i in others)
+  near = nearest_ahead(first, maneuver['bearing_before'])
+  opposing = near is not None and abs(near[0]) <= OPPOSING_DEG
   return {'before': float(maneuver['bearing_before']), 'after': float(maneuver['bearing_after']), 'branches': len(others),
-          'opposing': 'present' if opposing else 'none'}
+          'opposing': 'present' if opposing else 'none', 'opposing_rel': near[0] if near is not None and opposing else math.nan}
 
 
 def opposing_leg(steps, step_idx) -> tuple[float, float, float] | None:
@@ -111,15 +145,12 @@ def opposing_leg(steps, step_idx) -> tuple[float, float, float] | None:
   if not intersections or maneuver.get('bearing_before') is None or not intersections[0].get('location'):
     return None
   first = intersections[0]
-  bearings, out, i_in = first.get('bearings'), first.get('out'), first.get('in')
-  if not bearings or out is None:
+  if not first.get('bearings') or first.get('out') is None:
     return None
-  ahead = (float(bearings[i_in]) + 180.) % 360. if i_in is not None and 0 <= i_in < len(bearings) else float(maneuver['bearing_before'])
-  off = sorted((abs((float(bearings[i]) - ahead + 180.) % 360. - 180.), float(bearings[i]))
-               for i in range(len(bearings)) if i not in (i_in, out))
-  if not off or off[0][0] > OPPOSING_DEG:
+  near = nearest_ahead(first, maneuver['bearing_before'])
+  if near is None or abs(near[0]) > OPPOSING_DEG:
     return None
-  b = off[0][1]
+  b = near[1]
   lon, lat = (float(v) for v in first['location'])
   rad = np.radians(b)
   return (lat + OPPOSING_PROBE_M * np.cos(rad) / 111320., lon + OPPOSING_PROBE_M * np.sin(rad) / (111320. * np.cos(np.radians(lat))), b)
@@ -140,8 +171,7 @@ def approach_line(steps, step_idx) -> tuple[float, float, float, int] | None:
   step = steps[step_idx + 1]
   maneuver = step.get('maneuver') or {}
   first = step['intersections'][0]
-  bearings, i_in = first.get('bearings'), first.get('in')
-  ahead = (float(bearings[i_in]) + 180.) % 360. if i_in is not None and 0 <= i_in < len(bearings) else float(maneuver['bearing_before'])
+  ahead = straight_on(first, maneuver['bearing_before'])
   modifier = str(maneuver.get('modifier') or '')
   side = 1 if 'left' in modifier else -1 if 'right' in modifier else 0
   lon, lat = (float(v) for v in first['location'])
@@ -227,6 +257,7 @@ def maneuver_entry(steps, step_idx, distance, opposing=None) -> dict:
           'geometryValid': junction is not None, 'bearingBefore': junction['before'] if junction else 0.,
           'bearingAfter': junction['after'] if junction else 0., 'branches': min(junction['branches'], 255) if junction else 0,
           'opposing': junction['opposing'] if junction else 'unknown',
+          'opposingRelBearing': junction['opposing_rel'] if junction else math.nan,
           'opposingSpeed': float(opposing.get(step_idx, (0., 0))[0]),
           'opposingLanes': min(int(opposing.get(step_idx, (0., 0))[1]), 255),
           'opposingStraightM': straight_of(opposing.get(step_idx)),
@@ -249,6 +280,7 @@ def fill_guidance(instruction, steps, step_idx, distance_to_maneuver, opposing=N
     instruction.maneuverBearingAfter = junction['after']
     instruction.maneuverBranches = min(junction['branches'], 255)
   instruction.maneuverOpposing = junction['opposing'] if junction is not None else 'unknown'
+  instruction.maneuverOpposingRelBearing = junction['opposing_rel'] if junction is not None else math.nan
   instruction.maneuverWrongWayM = wrong_way_before(steps, step_idx)
   instruction.throughLanes, instruction.throughLanesDistance = through_lanes(steps, step_idx, distance_to_maneuver)
 

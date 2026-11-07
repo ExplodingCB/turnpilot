@@ -55,6 +55,8 @@ sound_list: dict[int, tuple[str, int | None, float]] = {
   AudibleAlert.tpLaneChangeAbort: ("tp_lane_change_abort.wav", 1, MAX_VOLUME),
   AudibleAlert.tpTooFastTurn: ("tp_too_fast_turn.wav", 1, MAX_VOLUME),
   AudibleAlert.tpHandback: ("tp_handback.wav", None, MAX_VOLUME),
+  AudibleAlert.tpSignalLeft: ("tp_signal_left.wav", None, MAX_VOLUME),    # the side's chime with a gap, on repeat
+  AudibleAlert.tpSignalRight: ("tp_signal_right.wav", None, MAX_VOLUME),
 
   AudibleAlert.warningSoft: ("critical.wav", None, MAX_VOLUME),
   AudibleAlert.warningImmediate: ("dm_critical.wav", None, MAX_VOLUME),

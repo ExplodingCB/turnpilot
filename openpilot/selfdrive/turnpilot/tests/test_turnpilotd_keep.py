@@ -183,9 +183,12 @@ def follow_sim(**road):
 def test_a_keep_that_cant_be_sent_under_always_drive_is_a_status_line_while_the_model_drives_the_fork():
   """ALWAYS_DRIVE.md R7 (S3), under TurnPilotAlwaysDrive: the keep the model sees no lane line for is still never sent, and
   still navd's skip at keep_last (tooFastToTurn: past the fork navd moves on if the model took the route's branch, or
-  reroutes), its corner cap kept to its pass, logged once with its reason; but it is said as a status line (skipReason
-  keepFollow), not the skip's chime and 'Rerouting'. The model taking the branch (navd moving on to the next step) says
-  nothing more."""
+  reroutes), logged once with its reason; but it is said as a status line (skipReason keepFollow), not the skip's chime and
+  'Rerouting'. Its corner cap slows the car on the approach up to the skip and is lifted there: the model drives the fork
+  at its own pace (comma first, turnpilotd.keep_unsent; on 2026-11-06 the cap kept to the pass bound 8.1 s of 1e and 16.7 s
+  of 1d past the skip, the model asking +0.3 to +1.0 m/s^2 over it on a road it was driving straight on). The plain skip,
+  with the switch off, keeps it to its pass (test_a_keep_the_model_sees_no_lane_line_for_is_said_and_rerouted). The model
+  taking the branch (navd moving on to the next step) says nothing more."""
   sim = follow_sim(line_prob=0.1)
   with mock.patch('openpilot.selfdrive.turnpilot.turnpilotd.cloudlog.event') as event:
     run_keep(sim, KEEP_J + 40.)
@@ -196,7 +199,9 @@ def test_a_keep_that_cant_be_sent_under_always_drive_is_a_status_line_while_the_
   assert abs(first.maneuverDistance - keep_last(first_v)) < 1. and str(first.skipReason) == KEEP_FOLLOW
   on_keep = [p for s, _, p in sim.trace if s >= first_s and str(p.maneuverModifier) == 'slight right' and p.routeValid]
   assert on_keep and all(p.tooFastToTurn and str(p.skipReason) == KEEP_FOLLOW for p in on_keep)
-  assert all(p.speedCap < NO_SPEED_CAP for p in on_keep if p.maneuverDistance > 0.)  # the corner cap to its pass
+  approach = [p for s, _, p in sim.trace if s <= first_s and 0. < p.maneuverDistance < keep_lead(first_v)]
+  assert approach and all(p.speedCap < NO_SPEED_CAP for p in approach)  # the corner cap on its approach, to the skip
+  assert len(on_keep) > 1 and all(p.speedCap == NO_SPEED_CAP for p in on_keep[1:])  # lifted from the skip: the model's pace
   assert not any(str(p.skipReason) == KEEP_REROUTED or p.turnMissed for _, _, p in sim.trace)  # navd moved on: nothing more
   logged = keep_events(event)
   assert len(logged) == 1 and logged[0].kwargs['reason'] == 'keepNoLine' and logged[0].kwargs['follow'] is True, logged
@@ -230,3 +235,36 @@ def test_a_keep_that_cant_be_sent_with_the_switch_off_is_the_skip_as_before():
   said = [p for _, _, p in sim.trace if p.tooFastToTurn]
   assert said and all(str(p.skipReason) == 'keepNoLine' for p in said)
   assert not any(str(p.skipReason) in (KEEP_FOLLOW, KEEP_REROUTED) for _, _, p in sim.trace)
+
+
+# 1e seg 5 (~23.4 s, 2026-11-06 after dark): a "turn, slight left" of 29 deg across an opposing approach, at 11.1 m/s; here on a
+# 25 mph opposing road straight past every R_req (test_turnpilotd_left's LEFT_25), so its left is judged at its line
+V_25, STRAIGHT_M = 11.18, 400.
+SLIGHT_LEFT_ACROSS = [(KEEP_J, "turn", "slight left", (0., 331., 2, 'present', V_25, 1, STRAIGHT_M)),
+                      (1500., "turn", "right", junction_of("right"))]
+
+
+def test_a_slight_left_across_oncoming_traffic_is_driven_as_an_unprotected_left_not_a_keep():
+  """1e seg 5 and 1d seg 9: slight lefts of 29 and 38 deg with an opposing approach were keeps; at night no lane line was read
+  that way (keepNoLine), the keep was said and skipped, the car drove straight on, 'Fork Missed', and navd rerouted into a
+  left. A keepLeft there would have crossed the oncoming lanes with no hold and no gap check. Now the follower makes it a TURN
+  (route_follower.make_maneuver), so turnpilotd drives it as the autonomous unprotected left: no keep desire, never
+  keep_not_sent, its pulse held on the approach and the car brought to its hold line, where the left decides (a gap the camera
+  sees, here an empty road; or a loud handback)."""
+  sim = keep_sim(SLIGHT_LEFT_ACROSS, cruise=11.1, model_lanes=(0, 1), line_prob=0.1)
+  sim.tp.auto_left, sim.tp.left_range_m = 'auto', 210.
+  sim.go_taps = False
+  sim.answers_prompt = True
+  with mock.patch('openpilot.selfdrive.turnpilot.turnpilotd.cloudlog.event') as event:
+    while sim.s < KEEP_J - 2. and sim.t < 60.:
+      sim.step(engaged=True)
+  plans = [p for _, _, p in sim.trace]
+  assert not keep_events(event), "said and skipped as a keep"
+  assert not any(p.desire in (Desire.keepLeft, Desire.keepRight) for p in plans)
+  assert not any(p.tooFastToTurn for p in plans), [str(p.skipReason) for p in plans if p.tooFastToTurn][:1]
+  states = {str(p.unprotectedLeft.state) for p in plans}
+  assert states - {'off'}, states  # the unprotected left's approach, and its hold line
+  approach = [p for p in plans if str(p.unprotectedLeft.state) not in ('off',)]
+  assert all(p.desire == Desire.none for p in plans[:plans.index(approach[0])]), "no pulse on its approach"
+  # it reached its line: standing short of the junction or gone from it on its own go, never driven straight through at speed
+  assert min(v for s, v, _ in sim.trace if KEEP_J - 30. < s < KEEP_J) < 0.5

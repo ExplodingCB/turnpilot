@@ -1,7 +1,8 @@
-"""Route time's unprotected lefts (routing/lefts.py) and the avoidance loop routing around them (routing/avoid.py): the shared
-predicate turnpilotd skips by (unprotected_left.route_range), the exits off the route's trace (routing/controls.py), and a
-synthetic street grid routed by a small Dijkstra with Valhalla's exclude_locations semantics (Grid), so a route the loop keeps
-is one a real router would give around the exclusions it sends. Synthetic coordinates only: metres from (0, 0)."""
+"""Route time's refused maneuvers (routing/lefts.py: U-turns; never an unprotected left since 2026-11-06, each driven to its
+line) and the avoidance loop routing around them (routing/avoid.py): unprotected_left.route_range, which refuses no left and
+still says its reach and bend for the log, the exits off the route's trace (routing/controls.py), and a synthetic street grid
+routed by a small Dijkstra with Valhalla's exclude_locations semantics (Grid), so a route the loop keeps is one a real router
+would give around the exclusions it sends. Synthetic coordinates only: metres from (0, 0)."""
 import heapq
 import math
 from collections import defaultdict
@@ -32,23 +33,27 @@ def left(**kw) -> Maneuver:
 
 
 class TestSharedPredicate:
-  """unprotected_left.route_range is the one check turnpilotd skips a left by (turn_skip: unprotectedRange) and navd routes
-  around: these are its rules, which test_turnpilotd_left.py pins on turnpilotd's side."""
+  """unprotected_left.route_range, which turnpilotd skipped a left by (turn_skip: unprotectedRange) and navd routed around
+  until 2026-11-06 (Kellen: never route around or skip a left for range). It refuses none now; its reach and bend are as
+  before, for turnpilotd's left_not_straight and navd's 'turnpilot lefts:' log line."""
 
-  def test_unmeasured_range_refuses_every_left_with_an_oncoming_approach(self):
+  def test_no_left_is_refused_whatever_the_range(self):
     reach = reach_at_line(V_20, 1, ROUTE_REACH_MARGIN_M)
-    rc = route_range(left(), None, 0.)
-    assert (rc.unprotected, rc.out_of_range, rc.bent, rc.margin) == (True, True, False, ROUTE_REACH_MARGIN_M)
+    rc = route_range(left(), None, 0.)  # both ranges unmeasured: the car today
+    assert (rc.unprotected, rc.out_of_range, rc.bent, rc.margin) == (True, False, False, ROUTE_REACH_MARGIN_M)
     assert rc.reach == pytest.approx(reach)
-    assert route_range(left(opposing='unknown'), None, 0.).out_of_range  # no junction data is never clear
+    rc = route_range(left(opposing='unknown'), None, 0.)  # no junction data: still an unprotected left, still not refused
+    assert rc.unprotected and not rc.out_of_range
+    for reach_m in (0., reach - 1., reach + 1., LEFT_RANGE_MAX_M):
+      assert not route_range(left(), None, reach_m).out_of_range, reach_m
 
-  def test_a_measured_range_keeps_the_lefts_within_it(self):
+  def test_the_reach_and_bend_are_still_said(self):
     reach = route_range(left(), None, 0.).reach
-    assert not route_range(left(), None, reach + 1.).out_of_range
-    assert route_range(left(), None, reach - 1.).out_of_range
-    # its road not known straight out to its R_req is never attempted, whatever the range (the band is straight on)
+    assert route_range(left(), None, LEFT_RANGE_MAX_M).reach == reach  # the reach is the left's, not the range's
+    # its road not known straight out to its R_req is bent (it hands back at its line), never refused
     rc = route_range(left(opposing_straight_m=reach - LINE_D - ROUTE_REACH_MARGIN_M - 1.), None, LEFT_RANGE_MAX_M)
-    assert rc.bent and rc.out_of_range
+    assert rc.bent and not rc.out_of_range
+    assert not route_range(left(opposing_straight_m=reach - LINE_D - ROUTE_REACH_MARGIN_M + 1.), None, 0.).bent
     # a mapped stop line's setback replaces the margin: a line at the hold line needs less reach
     assert route_range(left(), 0., 0.).reach < reach
 
@@ -57,7 +62,7 @@ class TestSharedPredicate:
                                                     (left(kind='keep', modifier='slight left'), True, 'auto'),
                                                     (left(), False, 'auto'),                             # left-hand traffic
                                                     (left(), True, 'announce'), (left(), True, 'off')])  # the line hands back
-  def test_what_is_never_skipped_for_its_range(self, maneuver, rht, mode):
+  def test_what_is_no_autonomous_left(self, maneuver, rht, mode):
     rc = route_range(maneuver, None, 0., rht, mode)
     assert not rc.out_of_range and not rc.unprotected
 
@@ -94,6 +99,26 @@ class TestLeftConfig:
     def get(key):
       raise KeyError(key)
     assert left_config(SimpleNamespace(get=get)) == LeftConfig()
+
+  def test_left_hand_traffic_reads_the_routes_maneuvers_as_turnpilotd_does(self):
+    """route_maneuver reads the route's maneuvers under the config's side of the road, as turnpilotd's follower now does
+    (2026-11-06 review: maneuver_from_ahead took the default, right-hand traffic): where traffic keeps left a slight right of
+    30 deg across an oncoming approach is a turn to the far side (route_follower.slight_far_turn), so an unprotected one in the
+    log line, driven to its line; where it keeps right it is a keep, and nothing is logged."""
+    from unittest import mock
+    steps = [{'distance': 300., 'maneuver': {'type': 'depart'}},
+             {'distance': 200., 'maneuver': {'type': 'turn', 'modifier': 'slight right', 'bearing_before': 0., 'bearing_after': 30.},
+              'intersections': [{'bearings': [0, 30, 180], 'in': 2, 'out': 1}]},
+             {'distance': 0., 'maneuver': {'type': 'arrive'}}]
+    lht, rht = route_maneuver(steps, 0, None, False), route_maneuver(steps, 0)
+    assert (lht.kind, lht.side, lht.opposing) == (TURN, RIGHT, 'present') and rht.kind == 'keep'
+    with mock.patch('openpilot.selfdrive.turnpilot.routing.lefts.cloudlog') as log:
+      assert route_lefts(steps, [], LeftConfig(right_hand_traffic=False), dict, dict) == []
+    (line,) = [c.args[0] for c in log.info.call_args_list]
+    assert line.startswith("turnpilot lefts: 1 unprotected lefts on the route") and "steps [0]" in line
+    with mock.patch('openpilot.selfdrive.turnpilot.routing.lefts.cloudlog') as log:
+      assert route_lefts(steps, [], LeftConfig(), dict, dict) == []
+    assert not log.info.call_args_list
 
 
 # ---- the exits, off the route's own trace (routing/controls.py)
@@ -322,62 +347,62 @@ def run_grid(g, start=START, bearing=NORTH, dest=DEST, config=CAR, own=None, avo
 
 
 class TestGrid:
-  def test_the_plain_route_turns_left_across_oncoming_traffic(self):
+  def test_the_plain_route_turns_left_across_oncoming_traffic_and_keeps_it(self):
+    """The left across B's oncoming lanes is an unprotected left as turnpilotd reads it, and is never a refused maneuver here:
+    driven to its line (2026-11-06). The log line says how many lefts the route has and which may hand back at their line
+    (both ranges unmeasured, the car today: this one), by step, never a position."""
+    from unittest import mock
     g = grid()
     plain = g.route(START, NORTH, DEST)
     assert turns_of(plain) == ['right', 'left', 'right']  # right at A x B, left at B x C (B's oncoming lanes), right onto D's row
     m = route_maneuver(plain, 1, g.opposing(plain))
     assert (m.kind, m.side, m.opposing, m.opposing_speed, m.opposing_straight_m) == (TURN, LEFT, 'present', 8., 400.)
-    assert [(t.step_idx, t.exclusion is not None, t.last_edge) for t in skipped(g, plain)] == [(1, True, False)]
+    with mock.patch('openpilot.selfdrive.turnpilot.routing.lefts.cloudlog') as log:
+      assert skipped(g, plain) == []
+    (line,) = [c.args[0] for c in log.info.call_args_list]
+    assert line.startswith("turnpilot lefts: 1 unprotected lefts on the route, each driven to its line, never routed around")
+    assert "1 may hand back there" in line and "steps [1]" in line and 'lat' not in line and '.' not in line.split('steps')[1]
+    # measured past its reach: none said to hand back
+    with mock.patch('openpilot.selfdrive.turnpilot.routing.lefts.cloudlog') as log:
+      assert skipped(g, plain, LeftConfig(range_m=LEFT_RANGE_MAX_M)) == []
+    assert "0 may hand back there" in log.info.call_args_list[0].args[0]
 
-  def test_routed_around_by_right_turns_within_the_budget(self):
-    """Both ranges unmeasured (the car today): the left is excluded by its exit, C northbound out of the junction, and the
-    route goes straight on up A and right instead, 0.5 s slower, well inside the detour budget."""
+  def test_the_plain_route_keeps_its_left_never_routed_around(self):
+    """2026-11-06 (Kellen: never route around or skip a left for range; 1e: 19 route calculations, each reroute bringing
+    another left): with both ranges unmeasured (the car today) the left is no longer excluded by its exit, and the route
+    Valhalla gives is the one driven: no reroute, nothing sent, no detour, no lefts counted."""
     g = grid()
     plain, r = run_grid(g)
-    assert turns_of(r.steps) == ['right'] and skipped(g, r.steps) == []
-    assert (r.lefts_avoided, r.lefts_unavoidable, r.iterations, r.status) == (1, 0, 1, 'clean')
-    (p,) = g.excludes[1]
-    assert xy(p['lat'], p['lon']) == pytest.approx((200., 100. + EXCLUDE_BACK_M), abs=0.01) and p['heading'] == pytest.approx(0.)
-    assert 0. < r.added_s <= avoid.detour_budget_s(avoid.duration(plain))
+    assert r.steps is plain and turns_of(r.steps) == ['right', 'left', 'right']
+    assert (r.lefts_avoided, r.lefts_unavoidable, r.iterations, r.added_s) == (0, 0, 0, 0.) and not r.lefts and not r.sent
+    assert g.excludes == [None]  # the plain route's call alone
 
-  def test_a_measured_range_keeps_the_left(self):
-    g = grid()
-    reach = skipped(g, g.route(START, NORTH, DEST))[0].reach
-    plain, r = run_grid(g, config=LeftConfig(range_m=reach + 10.))
-    assert r.steps is plain and r.iterations == 0 and (r.lefts_avoided, r.lefts_unavoidable) == (0, 0)
-    # its road not known straight that far (B ends 100 m past the junction) is refused whatever the range
-    g = grid(b_ends=300)
-    plain, r = run_grid(g, config=LeftConfig(range_m=LEFT_RANGE_MAX_M))
-    assert r.lefts_avoided == 1 and skipped(g, plain, LeftConfig(range_m=LEFT_RANGE_MAX_M))[0].bent
-
-  def test_over_the_budget_the_left_stays_and_is_said_unavoidable(self):
-    """A crawling block on A puts the way round past the budget, and every other way round turns left as often: the plain
-    route is kept, its left unavoidable (skipped out loud at the junction, rerouted), the set left as it was."""
-    g = grid(slow=1.)
+  @pytest.mark.parametrize('case', ['measured', 'bent', 'over_budget', 'destination_street', 'standing_short'])
+  def test_no_left_the_loop_used_to_route_around_is_routed_around(self, case):
+    """Each case the loop routed a left around before 2026-11-06, or kept it 'unavoidable' to be skipped at its junction: a
+    measured range covering it; its road not known straight that far (B ends 100 m past the junction); a crawling block on A
+    putting the way round past the budget; a left onto the destination's street; the car standing on the left's approach edge
+    (at a red light short of it). Now the plain route is kept in each, its left on it, the set as it was."""
     held = avoid.AvoidSet()
-    plain, r = run_grid(g, avoid_set=held)
-    assert r.steps is plain and (r.lefts_avoided, r.lefts_unavoidable) == (0, 1) and r.lefts[0].unavoidable
-    assert len(held) == 0 and r.iterations >= 1
-
-  def test_a_left_onto_the_destinations_street_is_unavoidable_without_a_reroute(self):
-    g = grid()
-    plain, r = run_grid(g, dest=(200, 200))
-    assert turns_of(plain) == ['right', 'left'] and skipped(g, plain)[0].last_edge
-    assert (r.iterations, r.lefts_unavoidable, len(g.excludes)) == (0, 1, 1)
-
-  def test_the_left_the_car_is_standing_short_of_is_routed_around_by_its_exit(self):
-    """The car on the left's approach edge (at a red light short of it): an approach exclusion could never be sent (the car's
-    own edge, never excluded), the exit can. The route goes straight on through the junction and round the corner at B's end,
-    a bend no other road meets (no left to skip there)."""
-    g = grid(b_ends=300, east_from=100)
-    start, east = (150, 100), 90.
-    own = g.own(start, east)
-    plain, r = run_grid(g, start=start, bearing=east, own=own)
-    assert turns_of(plain) == ['left', 'right'] and own == (21, True, tuple(round(v, 6) for v in ll((200, 100))))  # its approach
-    assert (r.lefts_avoided, r.lefts_unavoidable) == (1, 0) and turns_of(r.steps) == ['left']  # B's end: a bend, no left
-    assert route_maneuver(r.steps, 0).kind == 'none'
-    assert skipped(g, r.steps) == [] and all(avoid.same_edge(k, own) is False for k in r.sent)
+    kw = {'avoid_set': held}
+    if case == 'measured':
+      g = grid()
+      kw['config'] = LeftConfig(range_m=route_range(left(opposing_speed=8.), None, 0.).reach + 10.)
+    elif case == 'bent':
+      g = grid(b_ends=300)
+      kw['config'] = LeftConfig(range_m=LEFT_RANGE_MAX_M)
+    elif case == 'over_budget':
+      g = grid(slow=1.)
+    elif case == 'destination_street':
+      g = grid()
+      kw['dest'] = (200, 200)
+    else:
+      g = grid(b_ends=300, east_from=100)
+      kw.update(start=(150, 100), bearing=90., own=g.own((150, 100), 90.))
+    plain, r = run_grid(g, **kw)
+    assert 'left' in turns_of(plain), case
+    assert r.steps is plain and r.iterations == 0 and (r.lefts_avoided, r.lefts_unavoidable) == (0, 0) and not r.lefts, case
+    assert len(held) == 0 and g.excludes == [None], case
 
   def test_a_u_turn_the_car_cant_drive_is_routed_around_by_its_exit(self):
     """The confirm round's C8 (route_demo, BeamNG): the reroute after the designed left skip asked continue/uturn 100.9 m on,
@@ -403,9 +428,9 @@ class TestGrid:
     plain, r = run_grid(g, start=start, dest=dest)
     assert r.steps is plain and [t.kind for t in r.lefts] == ['uturn'] and r.lefts[0].unavoidable and r.lefts_unavoidable == 0
 
-  def test_navd_routes_around_it_and_says_how_many_never_where(self):
-    """The whole of navd: RouteJob's avoidance with the lefts (TurnPilotAutoLeft auto, both ranges unmeasured), and the route's
-    counts in TurnPilotMapStatus for the phone page."""
+  def test_navd_keeps_the_left_and_says_none_routed_around(self):
+    """The whole of navd: RouteJob's avoidance with the lefts (TurnPilotAutoLeft auto, both ranges unmeasured, the car today),
+    and the route's counts in TurnPilotMapStatus for the phone page: the left stays on the route, none counted."""
     g = grid()
     store = {}
 
@@ -433,10 +458,10 @@ class TestGrid:
     engine = RouteEngine(MagicMock(), MagicMock(), params=SimpleNamespace(get=values.get), router=Router(), background=False)
     engine.last_position, engine.last_bearing = (ll(START)[1], ll(START)[0]), NORTH
     engine.calculate_route((ll(DEST)[1], ll(DEST)[0]))
-    assert turns_of(engine.route) == ['right']
-    assert (engine.lefts_avoided, engine.lefts_unavoidable) == (1, 0)
+    assert turns_of(engine.route) == ['right', 'left', 'right']
+    assert (engine.lefts_avoided, engine.lefts_unavoidable) == (0, 0)
     status = store['TurnPilotMapStatus']
-    assert status['lefts'] == {'avoided': 1, 'unavoidable': 0} and set(status) == {'state', 'message', 'short', 'code', 'destination',
+    assert status['lefts'] == {'avoided': 0, 'unavoidable': 0} and set(status) == {'state', 'message', 'short', 'code', 'destination',
                                                                                     'lefts', 'at'}
 
 

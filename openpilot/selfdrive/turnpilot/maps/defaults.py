@@ -36,8 +36,17 @@ def ensure_map_defaults(params) -> list[str]:
 LEFT_RANGE_PARAM, LEFT_RANGE_MARK = 'TurnPilotLeftRangeM', 'TurnPilotLeftRangeProvisional'
 # the car's default range for oncoming traffic: 210 m covers unprotected lefts across roads of 35 mph or less (R_req 183-203
 # m at the line, 1 to 3 lanes). Kellen, 2026-11-06, after a 35 mph left was routed round at 150 m: "it just needs to be more
-# confident at lefts". The native full pass reads the whole 1344x760 frame, where a car 1.8 m wide is ~10 px at 200 m, about
-# the smallest the detector finds: past that (40-45 mph, and roads with no mapped limit, taken as 45) lefts stay rerouted
+# confident at lefts". It is pixel arithmetic for the native schedule (TurnPilotNativeDetect), which reads the whole 1344x760
+# frame at native resolution, where a car 1.8 m wide is ~10 px at 200 m, about the smallest the detector finds; never a
+# measured recall. So it is the reach only while the native schedule fills the far crop's slot (turnpilotd.left_ranges:
+# nativeStatus full or strip, its runs judged as the far crop's, every FAR_FRESH_S over the band past the full pass's range).
+# The full pass that always runs is the frame letterboxed into 640x384, where that car is ~10 px at 98 m
+# (unprotected_left.FULL_PASS_RANGE_M), and turnpilotd never certifies a band past that on its runs alone, whatever this
+# says. On the car the native schedule never ran (11-06, both drives: no room beside the 38.5 ms driving model) and the far
+# crop (TurnPilotLeftFarRangeM unmeasured) went off in minutes, so by day too a left past ~98 m (every road of about 18 mph
+# or more) is driven to its line and hands back there ("Can't see oncoming far enough: take control"), the car held, never
+# rerouted, until the native schedule or a measured far crop reads (review 2026-11-07, LN-2). Past 210 m (40-45 mph, and
+# roads with no mapped limit, taken as 45) it hands back so with them too
 CAR_LEFT_RANGE_M = 210.
 EARLIER_CAR_RANGES_M = (150.,)  # the defaults earlier builds wrote: a comma still on one of them takes the current one
 
