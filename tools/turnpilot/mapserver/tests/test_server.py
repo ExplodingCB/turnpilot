@@ -494,3 +494,79 @@ def test_logs_upload_list_fetch_and_refusals(tmp_path):
     assert r.status_code == 507
   finally:
     httpd.shutdown()
+
+
+@pytest.fixture
+def log_server(tmp_path):
+  from tools.turnpilot.mapserver.logstore import LogStore
+  maps = Maps([], KEY, logs=LogStore(tmp_path / 'logs', 10 ** 8))
+  httpd = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(maps))
+  threading.Thread(target=httpd.serve_forever, daemon=True).start()
+  yield f"http://127.0.0.1:{httpd.server_address[1]}", maps
+  httpd.shutdown()
+
+
+def post_log(base, seg, name, data):
+  return requests.post(f'{base}/v1/logs/0123456789abcdef/{seg}/{name}', data=data,
+                       headers={**auth(), 'X-Content-SHA256': hashlib.sha256(data).hexdigest()}, timeout=10)
+
+
+def test_a_qcamera_round_trip_beside_its_segments_logs_and_fetch_logs_brings_it_down(log_server, tmp_path, capsys):
+  """2026-11-06: the segment's small road video is stored, listed and served like its logs, and fetch_logs.py downloads it."""
+  from tools.turnpilot import fetch_logs
+  base, maps = log_server
+  seg = '0000001e--b0c00d3e96--7'
+  video, qlog = os.urandom(2_400_000), b'qlog bytes' * 1000  # a minute of qcamera.ts: over the store's 1 MiB chunks
+  r = post_log(base, seg, 'qcamera.ts', video)
+  assert r.status_code == 200 and r.json() == {'ok': True, 'stored': True}
+  assert post_log(base, seg, 'qcamera.ts', video).json()['stored'] is False  # a retry after a lost answer
+  assert post_log(base, seg, 'qlog.zst', qlog).status_code == 200
+  assert requests.get(base + '/v1/logs', headers=auth(), timeout=5).json() == \
+    {'0123456789abcdef': {seg: {'qcamera.ts': len(video), 'qlog.zst': len(qlog)}}}  # no digest sidecar, no temp file
+  assert requests.get(f'{base}/v1/logs/0123456789abcdef/{seg}/qcamera.ts', headers=auth(), timeout=5).content == video
+
+  s = requests.Session()
+  s.headers.update(auth())
+  out = tmp_path / 'fetched'
+  fetch_logs.fetch(s, base, None, out)
+  assert 'qcamera.ts 2.4 MB' in capsys.readouterr().out
+  got = fetch_logs.fetch(s, base, '0000001e--b0c00d3e96', out)
+  assert sorted(p.name for p in got) == ['qcamera.ts', 'qlog.zst']
+  assert (out / '0123456789abcdef' / seg / 'qcamera.ts').read_bytes() == video
+  assert fetch_logs.fetch(s, base, '0000001e--b0c00d3e96', out) == []  # already here at the same size
+  assert fetch_logs.fetch(s, base, '0000001d--eb755ddcbc', out) == []  # another route's
+
+
+@pytest.mark.parametrize('name', ['fcamera.hevc', 'ecamera.hevc', 'dcamera.hevc', 'qcamera.ts.lock', 'qcamera.ts.sha256',
+                                  'qcamera.hevc', 'QCAMERA.TS', 'qcamera.ts.part'])
+def test_only_the_logs_and_the_small_video_are_taken(log_server, name):
+  """The full-size videos are 38 MB a minute each, and the store's sidecars and a writer's lock are not files of a drive."""
+  base, maps = log_server
+  seg = '0000001e--b0c00d3e96--7'
+  video = b'ts' * 1000
+  assert post_log(base, seg, 'qcamera.ts', video).status_code == 200
+  assert post_log(base, seg, name, video).status_code == 404
+  assert requests.get(f'{base}/v1/logs/0123456789abcdef/{seg}/{name}', headers=auth(), timeout=5).status_code == 404
+  assert list(requests.get(base + '/v1/logs', headers=auth(), timeout=5).json()['0123456789abcdef'][seg]) == ['qcamera.ts']
+
+
+def test_a_qcamera_past_its_cap_is_refused_while_a_log_that_size_is_not(tmp_path):
+  """A qcamera.ts is 2.4-3.2 MB: 16 MiB is not one, and it is refused on its length before a byte is read. An rlog that size
+  passes the cap, and here meets the quota instead."""
+  from tools.turnpilot.mapserver.logstore import MAX_BYTES, MAX_QCAMERA_BYTES, LogRefusal, LogStore
+  assert MAX_BYTES == {'qlog.zst': 200 * 1024 * 1024, 'rlog.zst': 200 * 1024 * 1024, 'qcamera.ts': 16 * 1024 * 1024}
+  store = LogStore(tmp_path / 'logs', 10 ** 6)
+
+  def never(n):
+    raise AssertionError('read a refused body')
+  seg, digest = '0000001e--b0c00d3e96--7', 'a' * 64
+  with pytest.raises(LogRefusal) as e:
+    store.put('0123456789abcdef', seg, 'qcamera.ts', MAX_QCAMERA_BYTES + 1, digest, never)
+  assert e.value.code == 413
+  with pytest.raises(LogRefusal) as e:
+    store.put('0123456789abcdef', seg, 'rlog.zst', MAX_QCAMERA_BYTES + 1, digest, never)
+  assert e.value.code == 507
+  with pytest.raises(LogRefusal) as e:
+    store.put('0123456789abcdef', seg, 'fcamera.hevc', 10, digest, never)
+  assert e.value.code == 404
+  assert store.listing() == {}
