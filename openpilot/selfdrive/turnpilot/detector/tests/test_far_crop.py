@@ -9,9 +9,10 @@ from openpilot.common.test import OpenpilotTestCase
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.selfdrive.turnpilot.detector.decoder import CAR, TRAFFIC_LIGHT
 from openpilot.selfdrive.turnpilot.detector.graph import FAR_HORIZON_ROW, Crop
-from openpilot.selfdrive.turnpilot.detector.modeld_detector import (DEBT_CAP_S, FAR_BUDGET_S, FAR_STATUS_S, FORCE_RUN_FRAMES, PAINT_BUDGET_S,
-                                                                    RUN_EVERY, STEP_BUDGET_S, TIME_WINDOW, FarCrop, LanePaintStatus,
-                                                                    LightStatus)
+from openpilot.selfdrive.turnpilot.detector.modeld_detector import (DEBT_CAP_S, FAR_BUDGET_S, FAR_STATUS_S, FORCE_RUN_FRAMES,
+                                                                    NATIVE_NO_RUN_S, PAINT_BUDGET_S, RETRY_S, RUN_EVERY, STEP_BUDGET_S,
+                                                                    STEP_GAP_S, TIME_WINDOW, FarCrop, LanePaintStatus, LightStatus,
+                                                                    NativeStatus, NativeStrips)
 from openpilot.selfdrive.turnpilot.detector.tests.test_modeld_detector import FakeLights, FakeOutput, Meta, make_detector
 from openpilot.selfdrive.turnpilot.scene.ranging import road_lens
 
@@ -181,20 +182,50 @@ class TestFarCrop(OpenpilotTestCase):
     steps(det, pm, 2, start=10)
     assert pm.far[-1].run.lightStatus == LightStatus.off and len(det.far.lights.calls) == 1
 
-  def test_far_light_failure_turns_off_only_its_lights(self):
+  def test_far_light_failure_is_retried_and_touches_only_its_lights(self):
+    # its lights' rule is the full pass's lights' (never off for the drive): a failure is logged and retried after a backoff,
+    # its runs inside it saying retrying, and the far crop itself runs on
     det, pm = far_detector(), FarPM()
     det.light_mode, det.far.lights = 'shadow', FakeLights()
     det.far.lights.fail = True
     steps(det, pm, 2 * RUN_EVERY)
-    assert not det.far.disabled and len(pm.far) == 2 and all(fd.run.lightStatus == LightStatus.disabled for fd in pm.far)
-    assert all(len(fd.run.detections) == 1 for fd in pm.far)
+    assert not det.far.disabled and len(pm.far) == 2 and all(fd.run.lightStatus == LightStatus.retrying for fd in pm.far)
+    assert all(len(fd.run.detections) == 1 for fd in pm.far) and det.far.light_failures == 1 and det.far.lights is not None
+    assert RETRY_S - 0.5 < det.far.light_retry_at - time.monotonic() <= RETRY_S
+    det.far.lights.fail, det.far.light_retry_at = False, 0.
+    steps(det, pm, RUN_EVERY, start=100)
+    assert pm.far[-1].run.lightStatus == LightStatus.read and det.far.light_failures == 0
+    (light,) = pm.far[-1].run.lights.lights
+    assert str(light.read) == 'red' and light.reason == 'read'  # its heads carry this frame's read too
+    # LIGHT_DISABLED_FAILS in a row: disabled until a read succeeds, as the full pass's lights (light_failed)
+    from openpilot.selfdrive.turnpilot.detector.modeld_detector import LIGHT_DISABLED_FAILS
+    det.far.lights.fail = True
+    for k in range(LIGHT_DISABLED_FAILS):
+      det.far.light_retry_at = 0.
+      steps(det, pm, RUN_EVERY, start=200 + 10 * k)
+      want = LightStatus.disabled if k == LIGHT_DISABLED_FAILS - 1 else LightStatus.retrying
+      assert pm.far[-1].run.lightStatus == want and not det.far.disabled
+    steps(det, pm, RUN_EVERY, start=300)
+    assert pm.far[-1].run.lightStatus == LightStatus.disabled  # inside its backoff
+    det.far.lights.fail, det.far.light_retry_at = False, 0.
+    steps(det, pm, RUN_EVERY, start=400)
+    assert pm.far[-1].run.lightStatus == LightStatus.read and det.far.light_failures == 0
+
+  def test_slow_far_lights_stay_on(self):
+    det, pm = far_detector(), FarPM()
+    det.light_mode, det.far.lights = 'shadow', FakeLights()
+    det.far.light_times.extend([0.006] * TIME_WINDOW)  # over LIGHT_BUDGET_S: warned, never off
+    steps(det, pm, 2 * RUN_EVERY)
+    assert det.far.lights is not None and all(fd.run.lightStatus == LightStatus.read for fd in pm.far)
+    assert det.far.light_warn_t is not None
 
 
 class TestOddPaint(OpenpilotTestCase):
   """PF-03: while the full pass looks through the wide camera, the lane paint is read on the far crop's road frame."""
   def turn(self, det, pm, n, start=0, model_time=0.010):
+    # turning: the curvature of a turn (a turn desire alone, before the car turns, alternates the cameras: choose_camera)
     for k in range(n):
-      det.step(pm, det.model_state, model_time, 0.0, log.Desire.turnLeft, [Meta(start + 2 * k), Meta(start + 2 * k + 1)], 'auto', 0.)
+      det.step(pm, det.model_state, model_time, 0.05, log.Desire.turnLeft, [Meta(start + 2 * k), Meta(start + 2 * k + 1)], 'auto', 0.)
 
   def test_a_turn_reads_the_paint_on_the_far_crops_frame(self):
     det, pm = far_detector(), FarPM()
@@ -246,12 +277,16 @@ class TestOddPaint(OpenpilotTestCase):
     det.read_odd_paint(det.model_state, [Meta(2), Meta(3)], np.zeros((0, 6), np.float32), edge - 0.001)
     assert det.lane_paint.calls == [('host0', 2, 0)] and det.odd_paint is not None and len(det.paint_times) == 1
 
-  def test_paint_failure_on_the_far_frame_turns_only_the_paint_off(self):
+  def test_paint_failure_on_the_far_frame_is_the_paints_retry(self):
+    # the paint's own rule (read_lane_paint's): retried after a backoff, never off for the drive; the far crop runs on
     det, pm = far_detector(), FarPM()
     det.lane_paint.fail = True
     self.turn(det, pm, 3 * RUN_EVERY)
-    assert det.lane_paint is None and not det.far.disabled and len(pm.far) == 3 and len(pm.full) == 3
-    assert all(td.lanePaintStatus == LanePaintStatus.wideCamera and len(td.lanePaint) == 0 for td in pm.full)  # as before
+    assert det.lane_paint is not None and det.paint_failures == 1 and not det.far.disabled and len(pm.far) == 3
+    assert len(pm.full) == 3 and all(td.lanePaintStatus == LanePaintStatus.wideCamera and len(td.lanePaint) == 0 for td in pm.full)
+    det.lane_paint.fail, det.paint_retry_at = False, 0.
+    self.turn(det, pm, 2 * RUN_EVERY, start=100)
+    assert pm.full[-1].lanePaintStatus == LanePaintStatus.read and det.paint_failures == 0
 
 
 def test_crop_views_of_modelds_frame_buffer():
@@ -267,3 +302,257 @@ def test_crop_views_of_modelds_frame_buffer():
   (lo, ln), (co, cn) = crop_views(crop)
   assert crop_view_offsets(packed, size, 0, crop) == ((1000 + lo, ln), (1000 + co, cn))
   assert crop_view_offsets(packed, size, 1, crop) == ((1000 + size + lo, ln), (1000 + size + co, cn))
+
+
+def native_slot(det, mode='full', native_time=0.015):
+  """det with the native schedule of mode loaded and on in the far crop's slot (test_native_detect's, without its import)."""
+  native = NativeStrips(FakeFarRun(), 1344, 760, lambda crop: (f'luma{crop.x0},{crop.y0}', f'chroma{crop.x0},{crop.y0}'), None, mode)
+  native.lens, native.calibration, native.warmup_s = road_lens(ROAD), lambda: [0., 0., 0.], native_time
+  det.native, det.native_mode = native, mode
+  return native
+
+
+NO_ROOM_NATIVE_S = 0.030  # a native estimate that never fits beside view_steps' model (DEBT_CAP_S)
+
+
+class TestTruthfulFarView(OpenpilotTestCase):
+  """11-06, both drives: the native schedule never ran beside the car's 38.5 ms model and the far crop went off for the drive
+  in its first minutes (1d 1+18.5, 1e 3+8.8), yet every message said nativeStatus full and farStatus noRoom, so turnpilotd
+  took the far view for alive (FAR_ON) and never said farViewOff."""
+
+  def test_a_dead_slot_says_disabled(self):
+    det = far_detector()
+    native = native_slot(det)
+    det.far.disabled = True
+    native.why = FarStatus.noRoom
+    assert det.far_status() == FarStatus.noRoom  # just loaded: on, waiting for room
+    native.load_t -= NATIVE_NO_RUN_S + 1.
+    assert det.far_status() == FarStatus.disabled  # far crop off for the drive, native never run: the slot is dead
+    det.far = None  # no far crop at all: the same
+    assert det.far_status() == FarStatus.disabled
+
+  def test_a_native_that_ran_lately_is_on(self):
+    det = far_detector()
+    native = native_slot(det)
+    det.far.disabled = True
+    native.load_t -= 10 * NATIVE_NO_RUN_S
+    native.last_run_t, native.why = time.monotonic() - 0.6, FarStatus.noRoom
+    assert det.far_status() == FarStatus.noRoom  # ran 0.6 s ago: on, no room just now (never flaps to disabled)
+    native.last_run_t = time.monotonic() - 0.1
+    assert det.far_status() == FarStatus.read
+    native.last_run_t = time.monotonic() - NATIVE_NO_RUN_S - 1.
+    assert det.far_status() == FarStatus.disabled  # nothing in the slot for NATIVE_NO_RUN_S
+    # with the far crop alive the slot reads through it, as before
+    det.far.disabled = False
+    det.far.last_run_t = time.monotonic()
+    assert det.far_status() == FarStatus.read
+
+  def test_a_native_schedule_that_never_ran_says_unavailable_once(self):
+    from unittest import mock
+    from openpilot.selfdrive.turnpilot.detector import modeld_detector
+    det = far_detector()
+    native = native_slot(det)
+    assert det.native_status() == NativeStatus.full
+    native.load_t -= NATIVE_NO_RUN_S + 1.
+    det.model_time = 0.0385
+    with mock.patch.object(modeld_detector.cloudlog, 'error') as error:
+      assert det.native_status() == NativeStatus.unavailable and det.native_status() == NativeStatus.unavailable
+    assert [c.args[0] for c in error.call_args_list] == [
+      "turnpilot native schedule: no room in 30 s of its free, calibrated slot beside a 38 ms model"]
+    native.last_run_t = time.monotonic() - 100.  # it ran once: on, as before
+    assert det.native_status() == NativeStatus.full
+
+  def test_on_the_cars_budget_every_message_says_the_slot_is_dead(self):
+    # the car's frames: the strips (15 ms) never fit beside a model at the budget, the far crop off for the drive. Every
+    # full pass message says nativeStatus unavailable and farStatus disabled (which turnpilotd.watch_far raises as farViewOff)
+    det, pm = far_detector(), FarPM()
+    native = native_slot(det, native_time=0.015)
+    det.far.disabled = True
+    native.load_t -= NATIVE_NO_RUN_S + 1.
+    steps(det, pm, 4 * RUN_EVERY, model_time=STEP_BUDGET_S)
+    assert native.run.calls == [] and pm.far == [] and len(pm.full) == 4
+    assert all(td.farStatus == FarStatus.disabled and td.nativeStatus == NativeStatus.unavailable for td in pm.full)
+
+  @staticmethod
+  def view_steps(det, pm, n, view, start, model_time=STEP_BUDGET_S - 0.010):
+    """n steps under turnpilotPlan.detectorView view, standing (the side views' gate open), the model leaving the full pass
+    room (10 ms of slack: the debt never builds with the host's own step time, whatever its load) and none for a native of
+    NO_ROOM_NATIVE_S."""
+    for k in range(n):
+      det.step(pm, det.model_state, model_time, 0.0, log.Desire.none, [Meta(start + 2 * k), Meta(start + 2 * k + 1)], view, 0.,
+               v_ego=0.)
+
+  @staticmethod
+  def far_view_offs(statuses) -> int:
+    """turnpilotd.watch_far's rule: farViewOff (a chime and an error event) on every change into disabled."""
+    offs, prev = 0, None
+    for s in statuses:
+      offs += s == FarStatus.disabled and prev != FarStatus.disabled
+      prev = s
+    return offs
+
+  def test_a_dead_slot_stays_disabled_through_a_stop_sweep(self):
+    # 11-06 review: on the car's dead slot (far crop off for the drive, native never run) a stop sweep turned farStatus
+    # disabled into sweep, which turnpilotd takes for a live far view (FAR_ON), and back: farViewOff chimed after every hold
+    det, pm = far_detector(), FarPM()
+    native = native_slot(det, native_time=NO_ROOM_NATIVE_S)
+    det.far.disabled = True
+    native.load_t -= NATIVE_NO_RUN_S + 1.
+    assert det.far_status() == FarStatus.disabled
+    det.sweep = 'stopSweep'
+    assert det.far_status() == FarStatus.disabled  # as the far crop's own disabled outlasts a sweep (far_status)
+    det.sweep = None
+    for k, view in enumerate(('auto', 'stopSweep', 'stopSweepGo', 'auto', 'stopSweep', 'auto')):
+      self.view_steps(det, pm, 2 * RUN_EVERY, view, start=4 * RUN_EVERY * k)
+    assert native.run.calls == [] and len(pm.full) == 12
+    assert [td.farStatus for td in pm.full] == [FarStatus.disabled] * 12
+    assert all(td.nativeStatus == NativeStatus.unavailable for td in pm.full)
+    assert self.far_view_offs([td.farStatus for td in pm.full]) == 1  # once a drive
+
+  def test_a_stop_sweep_is_off_the_native_no_run_clock(self):
+    # a native that ran 5 s before a 35 s hold at a stop sign: the sweep's time was the side views', never the native's to
+    # miss, so it is on (not disabled, not unavailable) after the sweep, and the clock goes on from 5 s, not from zero
+    det, pm = far_detector(), FarPM()
+    native = native_slot(det, native_time=NO_ROOM_NATIVE_S)
+    det.far.disabled = True
+    native.load_t -= 100.
+    native.last_run_t, native.why = time.monotonic() - 5., FarStatus.noRoom
+    self.view_steps(det, pm, RUN_EVERY, 'stopSweep', start=0)
+    assert det.hold_t0 is not None and det.native_holds == {'sweep'}
+    det.hold_t0 -= 35.  # the hold has lasted 35 s, the native's run 5 s before it
+    native.last_run_t -= 35.
+    assert abs(det.native_idle_s(native, time.monotonic()) - 5.) < 0.5
+    assert det.far_status() == FarStatus.sweep  # 40 s since its run, 35 of them the sweep's: no farViewOff
+    self.view_steps(det, pm, 2 * RUN_EVERY, 'auto', start=4 * RUN_EVERY)
+    assert det.hold_t0 is None and not det.native_holds and abs(native.held_s - 35.) < 0.5 and native.run.calls == []
+    assert pm.full[-1].farStatus == FarStatus.noRoom and pm.full[-1].nativeStatus == NativeStatus.full
+    assert self.far_view_offs([td.farStatus for td in pm.full]) == 0
+    native.last_run_t -= NATIVE_NO_RUN_S - 4.  # 26 s more with its slot free and no run: 31 s on its clock
+    assert det.far_status() == FarStatus.disabled
+    native.ran(time.monotonic(), 0.010, False)  # a run starts the clock over, the sweep's time with it
+    assert native.held_s == 0. and det.far_status() == FarStatus.read
+
+  def test_a_slot_that_dies_in_a_sweep_says_so_after_it(self):
+    # never run, loaded 29 s before a 20 s sweep: the clock stands at 29 s through it (sweep, unavailable not yet said), and
+    # the slot is said dead on its free time after, once
+    from unittest import mock
+    from openpilot.selfdrive.turnpilot.detector import modeld_detector
+    det, pm = far_detector(), FarPM()
+    native = native_slot(det, native_time=NO_ROOM_NATIVE_S)
+    det.far.disabled = True
+    native.load_t -= NATIVE_NO_RUN_S - 1.
+    self.view_steps(det, pm, 2 * RUN_EVERY, 'stopSweep', start=0)
+    det.hold_t0 -= 20.
+    native.load_t -= 20.
+    with mock.patch.object(modeld_detector.cloudlog, 'error') as error:
+      self.view_steps(det, pm, 2 * RUN_EVERY, 'stopSweep', start=4 * RUN_EVERY)
+      assert error.call_args_list == []
+    assert all(td.farStatus == FarStatus.sweep and td.nativeStatus == NativeStatus.full for td in pm.full)
+    self.view_steps(det, pm, 2 * RUN_EVERY, 'auto', start=8 * RUN_EVERY)
+    assert pm.full[-1].farStatus == FarStatus.noRoom and pm.full[-1].nativeStatus == NativeStatus.full
+    native.load_t -= 2.  # 2 s of free slot later: 31 s
+    self.view_steps(det, pm, 2 * RUN_EVERY, 'stopSweep', start=12 * RUN_EVERY)
+    assert pm.full[-1].farStatus == FarStatus.disabled and pm.full[-1].nativeStatus == NativeStatus.unavailable
+    assert self.far_view_offs([td.farStatus for td in pm.full]) == 1
+
+  def test_the_no_run_clock_counts_only_the_slots_free_calibrated_time(self):
+    # 11-06 review: the clock ran from the load whatever kept the native from running, so a fresh install (minutes with no
+    # calibration) said nativeStatus unavailable 30 s after the load and logged 'no room', blaming the budget for the
+    # calibration. On the simulated clock at 20 Hz, the car's dead slot (far crop off for the drive, no room for the native):
+    # 40 s with no calibration, 20 s with TurnPilotFarCrop off and a 60 s gap in the steps count nothing; the slot's free,
+    # calibrated time does (and STEP_GAP_S of the gap's step: native_gap), and its 30 s say unavailable and disabled, logged
+    # once, as no room
+    from unittest import mock
+    from openpilot.selfdrive.turnpilot.detector import modeld_detector
+    from openpilot.selfdrive.turnpilot.detector.tests.test_modeld_detector import sim_clock
+    with sim_clock() as clock, mock.patch.object(modeld_detector.cloudlog, 'error') as error:
+      det, pm = far_detector(), FarPM()
+      native = native_slot(det, native_time=NO_ROOM_NATIVE_S)
+      det.far.disabled = True
+      calibrated = {'rpy': None}
+      native.calibration = det.far.calibration = lambda: calibrated['rpy']
+      k = 0
+
+      def drive(seconds):
+        nonlocal k
+        out = []
+        for _ in range(int(round(seconds / 0.05))):
+          clock.tick()
+          n = len(pm.full)
+          self.view_steps(det, pm, 1, 'auto', start=2 * k)
+          k += 1
+          if len(pm.full) > n:
+            out.append((clock.t, pm.full[-1].nativeStatus, pm.full[-1].farStatus))
+        return out
+      start = clock.t
+      uncal = drive(40.)
+      # (the first message comes before its first look: noRoom, its initial why)
+      assert native.load_t == start and all(ns == NativeStatus.full and fs == FarStatus.noCalibration for _, ns, fs in uncal[1:])
+      assert det.native_holds == {'noCalibration'}
+      calibrated['rpy'] = [0., 0., 0.]
+      det.far_on = False
+      off = drive(20.)
+      assert all(ns == NativeStatus.full and fs == FarStatus.off for _, ns, fs in off)
+      det.far_on = True
+      free = drive(10.)  # calibrated, the slot free: its clock runs (its first message before its first look, as above)
+      assert not det.native_holds and all(ns == NativeStatus.full and fs == FarStatus.noRoom for _, ns, fs in free[1:])
+      clock.tick(60.)  # nothing stepped the detector (TurnPilot off a while): the native missed nothing past STEP_GAP_S
+      after = drive(25.)
+      assert native.run.calls == []
+      dead = [t for t, ns, fs in after if ns == NativeStatus.unavailable]
+      assert dead and all(ns == NativeStatus.unavailable and fs == FarStatus.disabled for t, ns, fs in after if t >= dead[0])
+      assert all(ns == NativeStatus.full and fs == FarStatus.noRoom for t, ns, fs in after if t < dead[0])
+      # 30 s of the free slot's time: 10 s before the gap, STEP_GAP_S of it and the rest after it, two frames late for the
+      # calibration's (the gap off the clock whole would say it STEP_GAP_S later; on it whole, at once)
+      after_s = NATIVE_NO_RUN_S - 10. - STEP_GAP_S
+      assert after_s - 1e-6 <= dead[0] - after[0][0] <= after_s + 0.15
+      assert [c.args[0] for c in error.call_args_list] == [
+        "turnpilot native schedule: no room in 30 s of its free, calibrated slot beside a 37 ms model"]
+
+  def test_a_host_stepping_below_10_hz_still_says_a_dead_slot(self):
+    # 11-06 review: native_gap took every step more than STEP_GAP_S after the one before off the clock whole, so a host
+    # stepping steadily below 10 Hz (a loaded one) never ran it: 0.125 s steps for 120 s on the car's dead slot said
+    # nativeStatus full and farStatus noRoom to the end, held_s 119.875 s, though every other step offered the native the
+    # slot. Only a gap's time past STEP_GAP_S is off now, so such a host's clock runs STEP_GAP_S a step and the dead slot is
+    # said after NATIVE_NO_RUN_S / STEP_GAP_S steps (8 Hz 37.5 s, 5 Hz 60 s), on the simulated clock, logged once
+    from unittest import mock
+    from openpilot.selfdrive.turnpilot.detector import modeld_detector
+    from openpilot.selfdrive.turnpilot.detector.tests.test_modeld_detector import sim_clock
+    for dt in (0.125, 0.2):
+      with sim_clock() as clock, mock.patch.object(modeld_detector.cloudlog, 'error') as error:
+        det, pm = far_detector(), FarPM()
+        native = native_slot(det, native_time=NO_ROOM_NATIVE_S)
+        det.far.disabled = True
+        start, out = clock.t, []
+        for k in range(int(round(90. / dt))):
+          clock.tick(dt)
+          n = len(pm.full)
+          self.view_steps(det, pm, 1, 'auto', start=2 * k)
+          if len(pm.full) > n:
+            out.append((clock.t - start, pm.full[-1].nativeStatus, pm.full[-1].farStatus))
+        said_s = NATIVE_NO_RUN_S / STEP_GAP_S * dt  # 300 steps
+        assert native.run.calls == [] and out[-1][0] > said_s + 20., dt
+        dead = [t for t, ns, fs in out if ns == NativeStatus.unavailable]
+        # (the first step counts its whole time since the load, with no step before it; a message every other step)
+        assert dead and said_s - dt - 1e-6 <= dead[0] <= said_s + 2 * dt, (dt, dead[:1])
+        assert all(ns == NativeStatus.full and fs == FarStatus.noRoom for t, ns, fs in out[1:] if t < dead[0]), dt
+        assert all(ns == NativeStatus.unavailable and fs == FarStatus.disabled for t, ns, fs in out if t >= dead[0]), dt
+        assert self.far_view_offs([fs for _, _, fs in out]) == 1, dt
+        assert [c.args[0] for c in error.call_args_list] == [
+          "turnpilot native schedule: no room in 30 s of its free, calibrated slot beside a 37 ms model"], dt
+
+  def test_the_words_say_a_loaded_native_may_never_run(self):
+    # 11-06 review: diagnostics said nativeStatus unavailable meant 'not loaded', and preflight's PASS promised the strips run
+    # in the far crop's place; on the car it was loaded and never had room beside the big model. Both now say that can be
+    import tempfile
+    from pathlib import Path
+    from openpilot.selfdrive.turnpilot import preflight
+    from openpilot.selfdrive.turnpilot.diagnostics import NATIVE_WORDS
+    words = NATIVE_WORDS['unavailable']
+    assert 'not loaded' in words and 'no room beside the driving model' in words and 'far crop' in words
+    with tempfile.TemporaryDirectory() as d:
+      path = Path(d) / "big_native_detector_1344x760_1344x512_tinygrad.pkl"
+      path.write_bytes(b"\0" * 5000)
+      ok = preflight.check_native('full', path, True)
+    assert ok.status == preflight.PASS and ok.detail.startswith("full: the whole frame natively") and path.name in ok.detail
+    assert 'where it has room' in ok.detail and 'never runs' in ok.detail and 'nativeStatus unavailable' in ok.detail

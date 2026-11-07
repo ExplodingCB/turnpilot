@@ -1,5 +1,6 @@
 """Traffic light state from the detector's class-9 boxes, read on the CPU copy of the road camera's full-resolution frame
-(DESIGN phase 4 G2). Shadow only this week: what it reads is published and logged, and nothing acts on it.
+(DESIGN phase 4 G2). What it reads is published and logged; under TurnPilotCameraLights addOnly (the default since
+2026-11-06, LIGHT_MODE_DEFAULT) a governing red adds a stop at its signal (map_controls), under shadow nothing acts on it.
 
 A box is gated before any colour is read, so that tail and brake lights, red signs and glare low in the frame never
 become a red (CRITIQUE REQUIRED 8):
@@ -7,7 +8,8 @@ become a red (CRITIQUE REQUIRED 8):
   an arrow, so it is never read (a 1.07 m head at about 50 m on a comma four).
 - belowHorizon: its bottom edge is less than MIN_ELEVATION_DEG above the calibrated horizon. A signal head hangs 4-6 m
   over the road, above the camera; a car's lights are below it.
-Gated boxes are counted, never published. A box past the gates is a head, and its state is read:
+Gated boxes are counted, never published (modeld logs the counts once a minute: LightReader.take_counts). A box past the
+gates is a head, and its state is read (its reason the published Light.reason: read or one of these):
 - aspect: not a vertical head (height/width outside MIN_ASPECT-MAX_ASPECT): horizontal, a doghouse, a pedestrian signal.
   Unknown.
 - The box is split in thirds; a lamp pixel is bright (HSV value) and either saturated in a lamp hue or blown out white.
@@ -276,16 +278,33 @@ class LightHead:
 
 
 class LightReader:
-  """read_head() on each class-9 box of a road camera frame, the voter, and which heads govern the lane."""
+  """read_head() on each class-9 box of a road camera frame, the voter, and which heads govern the lane. It counts the
+  funnel since the last take_counts(), which modeld logs (modeld_detector.log_light_gates): frames read, boxes that never
+  became heads (gate_counts: small, belowHorizon, overCap) and heads by this frame's reason (head_counts) and colour
+  (colour_counts). The night tuning needs the gated ones: they are never published (Light.reason is the heads' alone)."""
   def __init__(self, lens: Lens):
     self.lens = lens
     self.voter = HeadVoter()
+    self.frames = 0
     self.gate_counts: Counter = Counter()
+    self.head_counts: Counter = Counter()
+    self.colour_counts: Counter = Counter()
+
+  def boxes_seen(self) -> bool:
+    """Whether a class-9 box has come in since the last take_counts()."""
+    return bool(self.gate_counts or self.head_counts)
+
+  def take_counts(self) -> tuple[int, Counter, Counter, Counter]:
+    """(frames, gate_counts, head_counts, colour_counts) since the last take, the counts starting over."""
+    out = (self.frames, self.gate_counts, self.head_counts, self.colour_counts)
+    self.frames, self.gate_counts, self.head_counts, self.colour_counts = 0, Counter(), Counter(), Counter()
+    return out
 
   def read(self, t: float, nv12: np.ndarray, stride: int, y_height: int, rpy_calib, cam_height: float, boxes,
            path=None) -> list[LightHead]:
     """boxes: decode_lights() rows; path: (x, y left) of the lane ahead (tracker.predicted_path), None for straight."""
     reads = []
+    self.frames += 1
     for box in boxes:
       if len(reads) >= MAX_READ_HEADS:
         self.gate_counts['overCap'] += 1
@@ -294,6 +313,9 @@ class LightReader:
       if r.gated:
         self.gate_counts[r.reason] += 1
         continue
+      self.head_counts[r.reason] += 1
+      if r.state != 'unknown':
+        self.colour_counts[r.state] += 1
       norm = (float(box[0]) / self.lens.width, float(box[1]) / self.lens.height, float(box[2]) / self.lens.width,
               float(box[3]) / self.lens.height)
       reads.append((norm, float(box[4]), r))

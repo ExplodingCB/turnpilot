@@ -17,17 +17,41 @@ guard runs), with no wrong-side fire added in any; without lane_paint's chromati
 exit. The far crop's boxes mask only its window, so the replay also read the same frames behind a full road pass's boxes
 on the frame before (which the car doesn't have in a turn): the far side's ego line read broken white (the far-side
 keep's evidence) on 304 of 4591 right-hand-traffic wide steps against 302 so, never where that read yellow.
-It has its own budget: a read slower than PAINT_BUDGET_S (median) turns the paint off for the drive, loudly, and the
-detector, which the pedestrian holds need, keeps running. A read took 7.5-8 ms on the comma four (0.79 ms on an M-series
-Mac), so the paint went off every drive and the wrong-side guard and the lane changes had none; lane_paint.sample_lines,
-vectorized to the same output (2026-11-01), takes 0.26 ms on that Mac, so about 2.6 ms on the car at the same ratio, an
-estimate until lanePaintTime is read off a drive.
+A read took 7.5-8 ms on the comma four (0.79 ms on an M-series Mac), so until 11-01 the paint went off every drive and the
+wrong-side guard and the lane changes had none; lane_paint.sample_lines, vectorized to the same output (2026-11-01), took
+3.3-3.5 ms on the car (11-06). Its time is the time budget's (estimate()): on a road run that has room for the detector
+and the lights but not the paint too, the paint is skipped (lanePaintStatus noRoom), the lights before the paint, and with
+the car under PAINT_SKIP_V near a mapped signal with the light reader reading (lights_near) it is skipped outright: the
+lane changes and the wrong-side guard read it only faster, the light reader standing (11-06: a 38-40 ms model, 10.4 ms
+pass, 3.4 ms paint and 3.1-3.9 ms of lights at a junction's heads had no room together, so the road runs went forced only,
+0.8-1.0 s apart, the 1 s camera light read aging out between them); with no reader reading there, nothing would take the
+time it frees, so the paint is read as anywhere else. A paint skipped for room PAINT_FORCE_S running is read anyway, its estimate
+starting over from that read, so a slow burst can't keep it skipped. Nothing turns it off: a median over PAINT_BUDGET_S
+is warned once a minute (the 11-06 medians peaked at 4.29-4.59 ms against 5.0, a hair from the old off-for-the-drive
+rule, against the no-features-off rule), and a failed read is retried after a backoff (lanePaintStatus retrying), logged
+each time.
 
 The traffic lights are read the same way (DESIGN phase 4 G2, detector/light_state.py): on road camera runs, from the host
 copy of the frame, on the detector's class-9 boxes (decode_lights, never in the detections), with the frame's calibration
-and modelV2 off the bus, into the message's lights (source camera, shadow unless TurnPilotCameraLights is addOnly). Its
-own budget too: a failure, or a median read slower than LIGHT_BUDGET_S, turns the lights off for the drive
-(lightStatus disabled, which turnpilotd raises once), and the detector keeps running. TurnPilotCameraLights off reads none.
+and modelV2 off the bus, into the message's lights (source camera, shadow unless TurnPilotCameraLights is addOnly), each
+head with this frame's read and its reason (the gate that stopped it: 11-06's 667 night reads gave 0 greens and no colour
+on 85% of plausible heads, and the log couldn't say why). Their time is the budget's too, a median over LIGHT_BUDGET_S
+warned once a minute (11-06: 3.58-3.74 ms against 4.0), never off for the drive; a failed read is retried after a backoff
+(lightStatus retrying), logged each time; the detector keeps running. A reader that fails LIGHT_DISABLED_FAILS reads in a
+row says lightStatus disabled on its road runs (logged once) until a read succeeds, still retried: turnpilotd keeps that
+read past its age-out and map_controls says it once (camera_lights_off), so a reader failing every retry all night is the
+driver's to know, not only the log's (11-06 review: retrying alone reached no one). The boxes that never become heads (the
+size and horizon gates, past MAX_READ_HEADS) are counted by the reader and logged with the heads' reasons at most once in
+LIGHT_GATES_LOG_S (turnpilot.light_gates), for the night tuning. TurnPilotCameraLights off reads none.
+
+Which camera (choose_camera): the wide one in a turn (desiredCurvature at or above WIDE_CURVATURE while moving) and
+WIDE_HOLD_S after it, at a standstill and a crawl but for one road run in WIDE_SLOW_ROAD_EVERY, else the road one; a turn
+desire before the car turns, and a signal mapped near (signal_near) at a crawl or in the turn with the light reader reading
+(lights_near: TurnPilotCameraLights on, out of its retry backoff), alternate them 1:1, so the light reader has road frames
+from a signalized turn's pulse to its line and through a stand at a red. 11-06: below
+MIN_LAT_CONTROL_SPEED modeld freezes desiredCurvature, at 0.011-0.014 at the stands, and with a turn desire also holding
+the wide camera, stands within 40 m of a signal had 8-17% road runs (1e 3+10 to 3+36: none in 259), a signalized right
+none from its pulse at 39 m.
 
 The far crop (DESIGN phase 4 G5, FarCrop): a FAR_CROP_SIZE window of the road camera's frame at native resolution
 (graph.Crop: twice the full pass's pixel density, a car 1.8 m wide is 9 px at 230 m), run on the model frames between the
@@ -38,8 +62,9 @@ the crop), and one compiled graph serves every aim: it takes two byte windows of
 (crop_view_offsets). Its own budget: a run only where its estimate leaves the next full pass its room (the time budget
 below); a failure, a median run over FAR_BUDGET_S, or FAR_OVERRUNS of its last TIME_WINDOW runs pushing the debt past
 DEBT_CAP_S turn it off for the drive, logged, said by every full pass message (farStatus disabled, which turnpilotd raises once), and nothing of
-the full pass's (its runs, its backoff) changes. Its class-9 boxes go to a light reader of its own, always in shadow.
-TurnPilotFarCrop off, or no far pkl, runs none (farStatus off).
+the full pass's (its runs, its backoff) changes. Its class-9 boxes go to a light reader of its own, always in shadow, its
+time and failures ruled as the full pass's lights are (never off for the drive). TurnPilotFarCrop off, or no far pkl,
+runs none (farStatus off).
 
 The native schedule (TurnPilotNativeDetect, NativeStrips; full by default, Kellen's ship call; off and nothing here differs
 from the far crop alone): Kellen's whole camera frame at native resolution, in the far crop's slot. strip runs graph.NATIVE_SIZES' 1344x384
@@ -58,6 +83,17 @@ back to the far crop for the drive, logged and said by every full pass message (
 as without it. Measured on the chestnut beside the big model on the bench (models/README.md): the step 34.86 ms median with
 strip, 35.71 ms with full, against 33.39 ms with the far crop; on the car the big model alone is 13 ms slower (the time
 budget below), so a strip (10.7-12 ms) has no room on the frame after a road run, and the far crop takes it where it fits.
+On the car it never ran (11-06, both drives: 0 native runs beside a 38.5 ms model), the far crop went off for the drive in
+its first minutes, and every message still said nativeStatus full and farStatus noRoom, so turnpilotd took the far view for
+alive and never said farViewOff. So a schedule loaded NATIVE_NO_RUN_S without a run says nativeStatus unavailable (logged
+once), and with the far crop off for the drive (or none) and no native run for NATIVE_NO_RUN_S the slot says farStatus
+disabled, which turnpilotd raises. That clock counts only the slot's free, calibrated time, where no room beside the
+driving model is the one thing that can keep the native from running (native_idle_s, native_hold): a stop sweep holds the
+slot for its side views, TurnPilotFarCrop off turns it off, a native that finds no calibration has no horizon to run on
+(a fresh install, a recalibration: the 11-06 review's probe logged 'no room' there), and a gap in the steps ran nothing
+past its first STEP_GAP_S (native_gap: a host stepping below 10 Hz still runs the clock, STEP_GAP_S a step), so their time
+is off the clock; and a dead slot says disabled through a sweep, never sweep (which turnpilotd takes for a live far view),
+so farViewOff is said once a drive, not again after every stop-sign hold.
 
 The stop sweep (STOP_SIGNS.md section 1.3, SideViews): turnpilotPlan.detectorView stopSweep (held at a stop or yield) or
 stopSweepGo (crossing, from the commit point), read through fresh_plan, shadow too. Its even steps (the full pass's, every
@@ -140,6 +176,9 @@ from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 # its debt paid back on the frame between
 RUN_EVERY = 2              # at most every 2nd model frame (10 Hz)
 CYCLE_S = 1. / 20          # modeld's cycle
+# a step more than this after the one before follows a gap (the host stepped nothing a while): it carries no debt (step), and
+# the native's no-run clock counts this much of it, the rest nobody's (native_gap)
+STEP_GAP_S = 2 * CYCLE_S
 # the rest of modeld's step (the frame's wait and upload, its messages): the car's model-only frame after a road run paid back
 # all of its 7.8 ms late start (2026-11-02), so the rest beside a 38.9 ms model is at most 3 ms
 REST_S = 0.003
@@ -148,15 +187,24 @@ STEP_BUDGET_S = CYCLE_S - REST_S  # driving model + detector past this in a step
 # 3.5 ms) carried 7.8 ms into the next (median; max 9.8) and modeld dropped no frame; the estimate projects 5.8 ms (8.0 at
 # the model's max). A host 6 ms slower (a 45 ms model) projects 12: only forced runs
 DEBT_CAP_S = 0.008
-WIDE_CURVATURE = 0.01      # 1/m (a 100 m radius): at or above this, look through the wide camera
+WIDE_CURVATURE = 0.01      # 1/m (a 100 m radius): at or above this while moving (MOVING_V), look through the wide camera
 WIDE_HOLD_S = 2.0          # and keep looking through it this long after the turn ends
+# modeld's MIN_LAT_CONTROL_SPEED: at or below it modeld freezes desiredCurvature at its last value (modeld.py
+# get_action_from_model), so the curvature says nothing about a turn there. 11-06: frozen at 0.0107-0.0161 at the stands,
+# over WIDE_CURVATURE, it held the wide camera through whole waits at red lights (1e 3+7 for 31 s, 4+9.5 for 20 s)
+MOVING_V = 0.3             # m/s
 # at a standstill and a crawl the full pass looks through the wide camera (SAT_VALIDATION rows 6 and X3: standing, the road
 # camera's pass lost a walker 2.8 m ahead, below its view, and a release lifted the car past her), but for one run in
 # WIDE_SLOW_ROAD_EVERY on the road camera, whose runs alone read the lights and the lane paint (turnpilotd ages a camera light
-# read out at CAMERA_STALE_S, 1 s: the shadow red's veto, the unsignalized release's live reader). One model, one frame size:
+# read out at CAMERA_STALE_S, 1 s: the camera red's stop, the unsignalized release's live reader); with a signal mapped near
+# (signal_near) one in 2, the wide camera keeping every other run for walkers at the corner. One model, one frame size:
 # the same run's cost, inside room(). The far crop's odd steps on the road frame are unchanged
 WIDE_SLOW_V = 3.0          # m/s
 WIDE_SLOW_ROAD_EVERY = 3
+# a turn desire before the car turns, a turn near a mapped signal and a crawl near one alternate the road and wide cameras
+# 1:1 (choose_camera): the light reader from a signalized turn's pulse to its line, the wide camera every other run for the
+# crosswalk
+ALT_EVERY = 2
 TURN_DESIRES = (log.Desire.turnLeft, log.Desire.turnRight)
 # turnpilotPlan.detectorView (DESIGN phase 4 G4, CRITIQUE REQUIRED 3): road is the road camera only, overriding a turn's wide
 # hold (an unprotected left from its go to its commit); roadAndWide the road camera with the wide one run in WIDE_EVERY (held
@@ -175,11 +223,28 @@ FORCE_RUN_S = 0.8
 RETRY_S = 1.0              # a failed run is retried after this, doubled for each failure in a row...
 RETRY_MAX_S = 60.          # ...to this
 PARAM_CHECK_S = 1.0        # TurnPilotEnabled is read this often
-# the lane paint read's median over TIME_WINDOW reads above this turns it off for the drive. On the car (2026-11-02) a read at
-# it beside the 38.9 ms model and the 10.4 ms full pass projects a 7.3 ms debt, inside DEBT_CAP_S; the read there was 3.5 ms
-# (median; p90 3.8), so it stays on with 1.5 ms spare
+# the lane paint read's median over TIME_WINDOW reads above this is warned (BUDGET_WARN_S), never off for the drive (the
+# no-features-off rule): its time is in the estimate, so the time budget skips it where it doesn't fit (noRoom). On the car
+# (2026-11-02) a read at it beside the 38.9 ms model and the 10.4 ms full pass projects a 7.3 ms debt, inside DEBT_CAP_S;
+# the read there was 3.5 ms (median; p90 3.8); 11-06 medians peaked at 4.29-4.59 ms
 PAINT_BUDGET_S = 0.005
-LIGHT_BUDGET_S = 0.004     # the light read's median over TIME_WINDOW reads above this turns the lights off for the drive
+LIGHT_BUDGET_S = 0.004     # the same for the light read (11-06: 3.1-3.9 ms a read at a junction's heads, medians to 3.74)
+BUDGET_WARN_S = 60.        # a reader's median over its budget is warned at most this often
+# a light reader with this many failed reads in a row says lightStatus disabled on its road runs (logged once) until a read
+# succeeds, still retried on backoff_s: that is 3 s of nothing but failures (1 + 2 s of backoff), where one bad frame is one
+# failure and its retry. turnpilotd keeps a disabled read past CAMERA_STALE_S and map_controls says it once
+# (camera_lights_off): the 11-06 review found retrying alone reached no one, a reader failing every retry all night silent
+LIGHT_DISABLED_FAILS = 3
+# the light readers' funnel (LightReader.take_counts: boxes stopped at the size and horizon gates or past MAX_READ_HEADS,
+# never heads, and the heads by reason and colour) is logged at most this often, for a window that saw a class-9 box
+LIGHT_GATES_LOG_S = 60.
+# a paint skipped for room (noRoom) this long running is read anyway on the next road run, its estimate starting over from
+# that read (the full pass's FORCE_RUN_S, for its own estimate): a burst of slow reads can't keep it skipped once it's gone
+PAINT_FORCE_S = 2.0
+# under this with a signal mapped near, a road run skips the paint outright (noRoom), leaving the step's time to the lights:
+# under every paint reader's floor (turnpilotd's wrong-side guard from WRONG_SIDE_MIN_SPEED 2.0 m/s, the lane planner's
+# changes from LC_SPEED_MIN 2.74 m/s), so nothing that reads the paint goes without it
+PAINT_SKIP_V = 2.0         # m/s
 # the far crop (FarCrop). Chestnut, 2026-10-28, yolo26n on the 640x384 crop alone: 6.0 ms (the full pass 5.9 ms alone, 7.9 ms
 # beside the big model); a median run over FAR_BUDGET_S is more than the frames between the full runs were measured to hold
 FAR_BUDGET_S = 0.012
@@ -191,6 +256,11 @@ FAR_CROP_DEFAULT = True    # TurnPilotFarCrop unset or unknown to this build
 # strip 12.02 ms (alone 8.29 and 9.06 ms); a median run over NATIVE_BUDGET_S sends it back to the far crop for the drive
 NATIVE_BUDGET_S = 0.015
 NATIVE_DEFAULT = 'full'    # TurnPilotNativeDetect unset, unknown to this build, or not one of NATIVE_MODES (35.7 ms step)
+# a native schedule with no run this long after its load says nativeStatus unavailable; with the far crop off for the drive
+# (or none), its slot with no native run this long says farStatus disabled, stop sweeps through too (module docstring, 11-06).
+# Only the slot's free, calibrated time counts (native_idle_s): never a stop sweep's, TurnPilotFarCrop off, no calibration
+# (native_hold) or a gap in the steps past its first STEP_GAP_S (native_gap)
+NATIVE_NO_RUN_S = 30.
 # the stop sweep (SideViews). Chestnut, 2026-10-28, yolo26n on the 768x512 side view alone: 7.0 ms (the full pass 5.9 ms alone,
 # 7.9 ms beside the big model)
 SWEEPS = ('stopSweep', 'stopSweepGo')
@@ -198,7 +268,10 @@ SIDE_VIEW_V_MAX = 2.0      # m/s (STOP_GO_V_MAX): side views only at or under th
 SIDE_BUDGET_S = 0.015      # a median side-view run over this (the odd step's room beside the driving model): off for the drive
 SIDE_OVERRUNS = 3          # of the last TIME_WINDOW side runs pushing the debt past DEBT_CAP_S: off for the drive
 SIDE_STATUS_S = 0.5        # sideViewStatus noRoom: the gate open this long with no side run
-SWEEP_SIGNAL_M = 60.       # during a sweep the light reader reads colour only with a signal mapped within this
+# a signal mapped within this, short of its line (plan_inputs' signal_near): during a sweep the light reader reads colour only
+# then; out of one, with the reader reading (lights_near), it alternates the cameras at a crawl and in a turn (choose_camera)
+# and skips the paint standing
+SWEEP_SIGNAL_M = 60.
 STOP_SIGNS_DEFAULT = 'shadow'  # TurnPilotCameraStopSigns: off, or shadow (logged, never acted on)
 SIM_DROP_PARAM = 'TurnPilotSimDropDetectionsS'  # SIM ONLY (module docstring): s of no detector, read only with SIMULATION=1
 LanePaintStatus = custom.TurnpilotDetections.LanePaintStatus
@@ -296,9 +369,73 @@ def sim_drop_seconds(params) -> float:
     return 0.
 
 
+def backoff_s(failures: int) -> float:
+  """The wait before a retry after `failures` failures in a row: RETRY_S, doubled for each, to RETRY_MAX_S (the full pass's,
+  and its readers': a failure is retried, never off for the drive)."""
+  return min(RETRY_S * 2 ** (failures - 1), RETRY_MAX_S)
+
+
+def warn_over_budget(owner, attr: str, now: float, message: str) -> None:
+  """A reader's median over its budget, warned at most once in BUDGET_WARN_S (owner.attr: when it was last, None never)."""
+  last = getattr(owner, attr)
+  if last is None or now - last >= BUDGET_WARN_S:
+    setattr(owner, attr, now)
+    cloudlog.warning(message)
+
+
+def failing_status(failures: int) -> int:
+  """lightStatus of a light reader with failures failed reads in a row, waiting out its retry: retrying, and from
+  LIGHT_DISABLED_FAILS in a row disabled (the driver's to know), until a read succeeds."""
+  return LightStatus.disabled if failures >= LIGHT_DISABLED_FAILS else LightStatus.retrying
+
+
+def light_failed(owner, what: str) -> int:
+  """A light read of owner's (owner.light_failures, light_retry_at) raised, in its except: retried after backoff_s, logged
+  each time, never off for the drive; at LIGHT_DISABLED_FAILS in a row its status turns disabled, logged once. Returns the
+  status to publish (failing_status)."""
+  owner.light_failures += 1
+  delay = backoff_s(owner.light_failures)
+  owner.light_retry_at = time.monotonic() + delay
+  cloudlog.exception(f"turnpilot {what} failed ({owner.light_failures} in a row), retrying in {delay:.0f} s")
+  if owner.light_failures == LIGHT_DISABLED_FAILS:
+    cloudlog.error(f"turnpilot {what}: {LIGHT_DISABLED_FAILS} failed reads in a row, lightStatus disabled until a read succeeds (still retried)")
+  return failing_status(owner.light_failures)
+
+
+def light_read_ok(owner, what: str) -> None:
+  """A light read of owner's succeeded: its failures in a row start over, and a reader that had said disabled says so."""
+  if owner.light_failures >= LIGHT_DISABLED_FAILS:
+    cloudlog.warning(f"turnpilot {what} read again after {owner.light_failures} failed reads in a row")
+  owner.light_failures = 0
+
+
+def log_light_gates(owner, reader, now: float, source: str, signal_near: bool) -> None:
+  """The light reader's funnel since its last log (LightReader.take_counts), at most once in LIGHT_GATES_LOG_S and only for
+  a window that saw a class-9 box: the frames read, the boxes that never became heads (small, belowHorizon: its size and
+  horizon gates; overCap: past MAX_READ_HEADS) and the heads by this frame's reason and colour. Light.reason carries the
+  heads' alone, so without it the night tuning couldn't see how many boxes die at the gates (11-06 review: 667 night reads,
+  0 greens). Replayed offline, the 11-06 drives' 673 class-9 boxes on road runs met the gates as 4 small and 6 below the
+  horizon, 663 heads (631 of them unknown): that night the colour died past the gates, and this says whether a drive's
+  does too. owner.light_gates_t: when its window started (None: no read yet); reader: a CameraLightReader."""
+  inner = getattr(reader, 'reader', None)
+  if not isinstance(inner, LightReader):
+    return  # the device isn't known yet, or a stand-in
+  start = owner.light_gates_t
+  if start is None:
+    owner.light_gates_t = now
+    return
+  if now - start < LIGHT_GATES_LOG_S or not inner.boxes_seen():
+    return
+  frames, gates, heads, colours = inner.take_counts()
+  owner.light_gates_t = now
+  cloudlog.event("turnpilot.light_gates", source=source, signal_near=signal_near, window_s=round(now - start, 1), frames=frames,
+                 boxes=sum(gates.values()) + sum(heads.values()), gates=dict(gates), heads=dict(heads), colours=dict(colours))
+
+
 def plan_inputs(plan) -> tuple[str, float, bool]:
   """What modeld takes from fresh_plan's turnpilotPlan (shadow too): the detector's view, the far crop's bearing, and whether
-  a signal is mapped within SWEEP_SIGNAL_M (a sweep's light reader reads then)."""
+  a signal is mapped within SWEEP_SIGNAL_M, short of its line (signal_near: a sweep's light reader reads then, and out of a
+  sweep choose_camera gives the light reader its road runs)."""
   if plan is None:
     return 'auto', 0., False
   mc = plan.mapControl
@@ -380,10 +517,16 @@ class FarCrop:
     self.light_times: deque[float] = deque(maxlen=TIME_WINDOW)
     self.warmup_s = 0.              # the load's warm-up runs' time, the estimate before its first run
     self.disabled = False           # failed or over budget: off for the drive
+    self.load_t = time.monotonic()  # its load (NATIVE_NO_RUN_S)
     self.last_run_t: float | None = None  # time.monotonic() of its last run
+    self.held_s = 0.                # the ended holds' time since its last run (or load), off its no-run clock (native_idle_s)
     self.why = FarStatus.noRoom     # what kept it from running last
-    self.lights: CameraLightReader | None = None  # its own (None: off, or failed)
-    self.lights_failed = False
+    self.no_run_said = False        # nativeStatus unavailable for no run in NATIVE_NO_RUN_S, logged
+    self.lights: CameraLightReader | None = None  # its own (None: off)
+    self.light_failures = 0         # its lights' failed reads in a row...
+    self.light_retry_at = 0.        # ...and the time.monotonic() their retry waits for (backoff_s)
+    self.light_warn_t: float | None = None  # its lights' median over LIGHT_BUDGET_S last warned
+    self.light_gates_t: float | None = None  # its lights' gate window's start (log_light_gates)
     self._views: dict = {}
 
   def calibration(self) -> list | None:
@@ -442,7 +585,7 @@ class FarCrop:
 
   def ran(self, now: float, dt: float, overran: bool) -> None:
     """A run of dt s at now; overran: the step's debt after it (ModeldDetector.debt_after) past DEBT_CAP_S."""
-    self.last_run_t = now
+    self.last_run_t, self.held_s = now, 0.
     self.next += 1
     self.times.append(dt)
     self.overruns.append(overran)
@@ -629,12 +772,14 @@ class SideViews:
 
 
 def fill_lights(tl, heads: list[LightHead], shadow: bool) -> None:
-  """A TurnpilotLights builder from the camera's heads."""
+  """A TurnpilotLights builder from the camera's heads: each head's vote, and this frame's read and its reason (the gate
+  that stopped it), so a night drive's rlog says which gate kills the colour (11-06: 667 reads, 0 greens, unexplained)."""
   tl.source, tl.shadow = custom.TurnpilotLights.Source.camera, shadow
   out = tl.init('lights', len(heads))
   for o, h in zip(out, heads, strict=True):
     o.state, o.distance, o.instance = h.state, float(h.distance), f"head{h.id}"
     o.conf, o.box, o.bearing, o.votes, o.governs = float(h.conf), [float(b) for b in h.box], float(h.bearing), int(h.votes), h.governs
+    o.read, o.reason = h.read, str(h.reason)
 
 
 class ModeldDetector:
@@ -642,10 +787,19 @@ class ModeldDetector:
   retry_at = 0.0                  # time.monotonic() a failed detector waits for
   last_run_t: float | None = None  # time.monotonic() of the last run (None: none yet)
   light_mode = LIGHT_MODE_DEFAULT  # TurnPilotCameraLights, set by DetectorHost
-  lights: CameraLightReader | None = None  # None: no road camera, or failed (lights_failed)
-  lights_failed = False
+  lights: CameraLightReader | None = None  # None: no road camera
+  light_failures = 0              # failed light reads in a row...
+  light_retry_at = 0.             # ...and the time.monotonic() their retry waits for (backoff_s)
+  light_warn_t: float | None = None  # the lights' median over LIGHT_BUDGET_S last warned (warn_over_budget)
+  light_gates_t: float | None = None  # the lights' gate window's start (log_light_gates)
+  paint_failures = 0             # failed paint reads in a row...
+  paint_retry_at = 0.             # ...and the time.monotonic() their retry waits for
+  paint_warn_t: float | None = None  # the paint's median over PAINT_BUDGET_S last warned
+  paint_skipped_t: float | None = None  # time.monotonic() of the first skip for room since the last paint read (PAINT_FORCE_S)
+  model_time = 0.                 # this step's driving model time (s), for the logs
   view_runs = 0                   # runs under the roadAndWide view, for its one wide run in WIDE_EVERY
   slow_runs = 0                   # runs at or under WIDE_SLOW_V in auto, for its one road run in WIDE_SLOW_ROAD_EVERY
+  alt_runs = 0                    # runs in auto's 1:1 road and wide alternation (ALT_EVERY), the wide first
   far: FarCrop | None = None      # the far crop (None: no road camera, no far pkl, or it failed to load)
   far_on = FAR_CROP_DEFAULT       # TurnPilotFarCrop, set by DetectorHost
   native: NativeStrips | None = None  # the native schedule loaded with it (None: off at load, no pkl, or it failed to load)
@@ -653,8 +807,12 @@ class ModeldDetector:
   side: SideViews | None = None   # the side views (None: no wide camera, no side pkl, or it failed to load)
   signs_mode = STOP_SIGNS_DEFAULT  # TurnPilotCameraStopSigns, set by DetectorHost
   sweep: str | None = None        # the stop sweep running (SWEEPS), or None
-  sweep_runs = 0                  # forward runs in this sweep, for the held cycle's full wide and road alternation
+  # why the native's slot isn't its own to miss now (native_hold: sweep, farOff, noCalibration), and since when (None: free)
+  native_holds: frozenset = frozenset()
+  hold_t0: float | None = None
+  sweep_runs = 0                 # forward runs in this sweep, for the held cycle's full wide and road alternation
   signal_near = False             # a signal mapped within SWEEP_SIGNAL_M (plan_inputs), this step
+  lights_near = False             # ...and the light reader reading (light_reading): the 1:1 alternation's and the paint skip's
   steps = 0                       # step() calls, for odd_paint's age
   last_cam: str | None = None     # the camera of the last full run
   odd_paint: tuple | None = None  # (paint, lanePaintStatus, its time, steps) read on the far crop's frame (read_odd_paint)
@@ -695,14 +853,27 @@ class ModeldDetector:
 
   def choose_camera(self, desired_curvature: float, desire: int, now: float, view: str = 'auto', v_ego: float | None = None,
                     peek: bool = False) -> str:
-    """The camera for this run: the wide one in a turn or on a curve and WIDE_HOLD_S after, and at or under WIDE_SLOW_V
-    (v_ego, None unknown) but for one run in WIDE_SLOW_ROAD_EVERY, else the road one; the plan's view (WIDE_EVERY, the
-    sweeps) overrides that. A device with one camera runs it. peek: the same pick, its cycles left as they were (the time
-    budget's estimate, before the run)."""
+    """The camera for this run (module docstring), by the plan's view (WIDE_EVERY, the sweeps) and in auto by this table,
+    v_ego None unknown:
+      turning (desiredCurvature at or above WIDE_CURVATURE, moving over MOVING_V or speed unknown), and WIDE_HOLD_S after:
+        the wide camera; with lights_near, the road and wide cameras 1:1 (ALT_EVERY)
+      a turn desire before the car turns: 1:1
+      at or under WIDE_SLOW_V: one road run in WIDE_SLOW_ROAD_EVERY; with lights_near, 1:1
+      else: the road camera
+    A turn desire alone no longer holds the wide camera, nor a curvature at a standstill, which modeld freezes there (11-06:
+    the stands and every signalized turn's approach were wide only, so no light was read where a red must stop the car).
+    The wide camera keeps every other run near a signal and in a turn's approach (its crosswalk), 2 of 3 at a crawl.
+    lights_near is signal_near with the light reader reading (light_reading): with TurnPilotCameraLights off or the reader
+    in its retry backoff a signal's 1:1 would take the wide camera's runs for no read (11-06 review). A device with one
+    camera runs it. peek: the same pick, its cycles left as they were (the time budget's estimate, before the run).
+    self.lights_near and self.alt_runs are read only in the rows that use them."""
     cycles = {}  # the cycles' next values, set on self unless peek
     wide_until = self.wide_until
-    if abs(desired_curvature) >= WIDE_CURVATURE or desire in TURN_DESIRES:
+    turning = abs(desired_curvature) >= WIDE_CURVATURE and (v_ego is None or v_ego > MOVING_V)
+    if turning:
       wide_until = cycles['wide_until'] = now + WIDE_HOLD_S
+    slow = alternate = False
+    want = 'road'
     if view == 'stopSweep':  # held: the full wide pass and the road camera alternating, the wide first
       want = 'wide' if self.sweep_runs % 2 == 0 else 'road'
       cycles['sweep_runs'] = self.sweep_runs + 1
@@ -714,29 +885,40 @@ class ModeldDetector:
       cycles['view_runs'] = (self.view_runs + 1) % WIDE_EVERY
       want = 'wide' if cycles['view_runs'] == 0 else 'road'
     elif now < wide_until:
-      want = 'wide'
+      want, alternate = 'wide', self.lights_near
+    elif desire in TURN_DESIRES:
+      alternate = True
     elif v_ego is not None and v_ego <= WIDE_SLOW_V:
-      want = 'road' if self.slow_runs == WIDE_SLOW_ROAD_EVERY - 1 else 'wide'
-      cycles['slow_runs'] = (self.slow_runs + 1) % WIDE_SLOW_ROAD_EVERY
+      slow = True
+      if self.lights_near:
+        alternate = True
+      else:
+        want = 'road' if self.slow_runs == WIDE_SLOW_ROAD_EVERY - 1 else 'wide'
+        cycles['slow_runs'] = (self.slow_runs + 1) % WIDE_SLOW_ROAD_EVERY
+    if alternate:
+      want = 'road' if self.alt_runs == ALT_EVERY - 1 else 'wide'
+      cycles['alt_runs'] = (self.alt_runs + 1) % ALT_EVERY
     else:
-      want = 'road'
-    if view != 'auto' or now < wide_until or v_ego is None or v_ego > WIDE_SLOW_V:
+      cycles['alt_runs'] = 0
+    if not slow:
       cycles['slow_runs'] = 0
     if not peek:
       for name, value in cycles.items():
         setattr(self, name, value)
     return want if want in self.frames else next(iter(self.frames))
 
-  def estimate(self, cam: str | None = None) -> float:
+  def estimate(self, cam: str | None = None, paint: bool = True) -> float:
     """The full pass's time estimate on camera cam (None: unknown, as the road camera): the detector's, and on the road
-    camera the lane paint read's and the lights' while they are on (a sweep reads no paint, and lights only near a mapped
-    signal). A wide run reads neither: on the car (2026-11-02) its step carried 3.5 ms into the next, a road run's 7.8."""
+    camera the lane paint read's (unless paint is False: this run skips it) and the lights' while they would read (a sweep
+    reads no paint, and lights only near a mapped signal; a reader waiting out its retry reads nothing). A wide run reads
+    neither: on the car (2026-11-02) its step carried 3.5 ms into the next, a road run's 7.8."""
     estimate = float(np.median(self.times)) if self.times else 0.
     if cam == 'wide':
       return estimate
-    if self.sweep is None and self.lane_paint is not None and self.paint_times:
+    now = time.monotonic()
+    if paint and self.sweep is None and self.lane_paint is not None and self.paint_times and now >= self.paint_retry_at:
       estimate += float(np.median(self.paint_times))
-    if self.lights_read() and self.lights is not None and self.light_mode != 'off' and self.light_times:
+    if self.light_reading(now) and self.light_times:
       estimate += float(np.median(self.light_times))
     return estimate
 
@@ -754,10 +936,15 @@ class ModeldDetector:
     full = max(0., model_execution_time + self.estimate(self.next_cam) - STEP_BUDGET_S)
     return self.debt_after(model_execution_time, more_s) + (full if full <= DEBT_CAP_S else 0.) <= DEBT_CAP_S
 
-  def room(self, model_execution_time: float, cam: str | None = None) -> bool:
-    """Whether this frame has room for a run on camera cam: the debt it would leave (debt_after, on the estimate) stays
-    within DEBT_CAP_S, or the detector has gone FORCE_RUN_FRAMES or FORCE_RUN_S without and runs to measure again."""
-    estimate = self.estimate(cam)
+  def fits(self, model_execution_time: float, cam: str | None = None, paint: bool = True) -> bool:
+    """Whether a run on camera cam (paint: with the lane paint read) leaves a debt within DEBT_CAP_S, on its estimate."""
+    return self.debt_after(model_execution_time, self.estimate(cam, paint)) <= DEBT_CAP_S
+
+  def room(self, model_execution_time: float, cam: str | None = None, paint: bool = True) -> bool:
+    """Whether this frame has room for a run on camera cam (paint: with the lane paint read): the debt it would leave
+    (debt_after, on the estimate) stays within DEBT_CAP_S, or the detector has gone FORCE_RUN_FRAMES or FORCE_RUN_S without
+    and runs to measure again."""
+    estimate = self.estimate(cam, paint)
     if self.debt_after(model_execution_time, estimate) <= DEBT_CAP_S:
       return True
     waited_s = time.monotonic() - self.last_run_t if self.last_run_t is not None else 0.
@@ -768,17 +955,45 @@ class ModeldDetector:
     self.times.clear()
     return True
 
+  def paint_skip(self, model_execution_time: float, cam: str | None, v_ego: float | None) -> int | None:
+    """Why a full run on camera cam skips the lane paint (LanePaintStatus noRoom), or None: it reads it as before (or reads
+    none anyway: the wide camera, a sweep, no reader, its retry). The lights before the paint: with the car under
+    PAINT_SKIP_V near a mapped signal and the light reader reading (lights_near) it is skipped outright (the lane changes
+    and the wrong-side guard read it only faster, the light reader standing), and where the run has room without the paint
+    and not with it, skipped for room (the estimate counts the lights only while they read); a paint skipped for room
+    PAINT_FORCE_S running is read anyway, its estimate starting over from that read (said). With TurnPilotCameraLights off
+    or the reader in its retry backoff the outright skip would free the step's time for nothing (11-06 review)."""
+    if cam == 'wide' or self.sweep is not None or self.lane_paint is None or time.monotonic() < self.paint_retry_at:
+      return None
+    if v_ego is not None and v_ego < PAINT_SKIP_V and self.lights_near:
+      return LanePaintStatus.noRoom
+    if self.fits(model_execution_time, cam) or not self.fits(model_execution_time, cam, paint=False):
+      return None  # room for it all, or for none of it: room() decides, its forced runs with the paint as before
+    now = time.monotonic()
+    if self.paint_skipped_t is None:
+      self.paint_skipped_t = now
+    skipped_s = now - self.paint_skipped_t
+    if skipped_s < PAINT_FORCE_S:
+      return LanePaintStatus.noRoom
+    paint_ms = 1e3 * float(np.median(self.paint_times))
+    cloudlog.info(f"turnpilot lane paint: no room for {skipped_s:.1f} s at {paint_ms:.1f} ms, model {1e3 * model_execution_time:.0f}; measuring again")
+    self.paint_times.clear()
+    return None
+
   def step(self, pm, model_state, model_execution_time: float, desired_curvature: float, desire: int, metas: list,
            view: str = 'auto', far_bearing: float = 0., v_ego: float | None = None, signal_near: bool = False) -> None:
     """Called once per model frame after modelV2 is sent, with the driving model this detector was loaded for.
     metas: FrameMeta of packed frames 0 and 1; view: turnpilotPlan.detectorView (choose_camera, the sweeps); far_bearing:
     turnpilotPlan.farCropBearing (FarCrop); v_ego: carState.vEgo for the side views' speed gate (None: unknown, closed);
-    signal_near: a signal mapped within SWEEP_SIGNAL_M (plan_inputs), for the light reader during a sweep. Whatever it
-    runs, the step's time past STEP_BUDGET_S is the next step's debt (the time budget)."""
+    signal_near: a signal mapped within SWEEP_SIGNAL_M (plan_inputs): the light reader during a sweep, the camera choice
+    and the paint's skip standing. Whatever it runs, the step's time past STEP_BUDGET_S is the next step's debt (the time
+    budget)."""
     now = time.monotonic()
-    if self.last_step_t is None or now - self.last_step_t > 2 * CYCLE_S:
+    if self.last_step_t is None or now - self.last_step_t > STEP_GAP_S:
       self.debt = 0.  # the first step, or after a gap (the host stepped nothing, modeld idled): nothing carried
-    self.last_step_t, self.step_t0 = now, time.perf_counter()
+      if self.last_step_t is not None:
+        self.native_gap(self.last_step_t, now)  # and the native, stepped by no one past STEP_GAP_S, missed nothing more
+    self.last_step_t, self.step_t0, self.model_time = now, time.perf_counter(), model_execution_time
     try:
       self.detect(pm, model_state, model_execution_time, desired_curvature, desire, metas, view, far_bearing, v_ego, signal_near)
     finally:
@@ -797,9 +1012,14 @@ class ModeldDetector:
       self.sweep, self.sweep_runs = sweep, 0
       if self.side is not None:
         self.side.next = 0
+    self.native_hold('sweep', sweep is not None, now)  # its odd steps are the side views'
+    self.native_hold('farOff', not self.far_on, now)    # TurnPilotFarCrop off turns the slot off
     gated = sweep is not None and v_ego is not None and v_ego <= SIDE_VIEW_V_MAX
     if self.side is not None:
       self.side.gate(gated, now)
+    # before the peek: this step's, which its pick and the paint's skip take
+    self.signal_near = signal_near
+    self.lights_near = signal_near and self.light_reading(now)
     self.next_cam = self.choose_camera(desired_curvature, desire, now, view, v_ego, peek=True)
     self.since_run += 1
     if self.since_run < RUN_EVERY:  # a frame between the full runs: the sweep's side views, else the far crop
@@ -810,9 +1030,11 @@ class ModeldDetector:
       return
     if sweep is not None and self.side is not None and not self.side.disabled:
       self.side_ready(upload=False)  # the maps' recompute starts with the sweep, above the gate too; uploaded on an odd step
-    self.signal_near = signal_near
     lights_read = self.lights_read()
-    if time.monotonic() < self.retry_at or not self.room(model_execution_time, self.next_cam):
+    if time.monotonic() < self.retry_at:
+      return
+    paint_skip = self.paint_skip(model_execution_time, self.next_cam, v_ego)
+    if not self.room(model_execution_time, self.next_cam, paint_skip is None):
       return
     try:
       cam = self.choose_camera(desired_curvature, desire, now, view, v_ego)
@@ -827,7 +1049,9 @@ class ModeldDetector:
       fill_detections(td, dets, meta.frame_id, meta.timestamp_eof, cam, dt)
       self.times.append(dt)
       odd, self.odd_paint = self.odd_paint, None
-      if cam == 'road' and sweep is None:
+      if cam == 'road' and sweep is None and paint_skip is not None:
+        td.lanePaintStatus = paint_skip  # the lights' room (paint_skip)
+      elif cam == 'road' and sweep is None:
         self.read_lane_paint(td, model_state, metas, dets)
       elif cam == 'road':
         td.lanePaintStatus = LanePaintStatus.sweep if self.lane_paint is not None else LanePaintStatus.disabled
@@ -863,6 +1087,12 @@ class ModeldDetector:
     """Whether a road run reads the lights' colour: always, but during a sweep only with a signal mapped near."""
     return self.sweep is None or self.signal_near
 
+  def light_reading(self, now: float) -> bool:
+    """Whether a road run now would read the lights: the reader on (a road camera, TurnPilotCameraLights not off), out of
+    its retry backoff (the run its retry is due on reads), and lights_read. What the estimate counts the lights' time for,
+    and with signal_near what gives them the road runs (lights_near)."""
+    return self.lights is not None and self.light_mode != 'off' and now >= self.light_retry_at and self.lights_read()
+
   def load_native(self, mode: str) -> None:
     """The native schedule for mode (TurnPilotNativeDetect at the load; DetectorHost), on the road camera; None if off."""
     self.native = load_native(self.model_state, self.lb.cam_w, self.lb.cam_h, self.cameras['road'], mode, self.bus) \
@@ -884,6 +1114,14 @@ class ModeldDetector:
       return NativeStatus.unavailable
     if native.disabled:
       return NativeStatus.fallback
+    if native.last_run_t is None and self.native_idle_s(native, time.monotonic()) > NATIVE_NO_RUN_S:
+      # 11-06: loaded and on, it never had room beside the car's 38.5 ms model, and every message said full. The clock is
+      # the slot's free, calibrated time (native_idle_s), so no room is the cause when it runs out, never calibration
+      if not native.no_run_said:
+        native.no_run_said = True
+        model_ms = 1e3 * self.model_time
+        cloudlog.error(f"turnpilot native schedule: no room in {NATIVE_NO_RUN_S:.0f} s of its free, calibrated slot beside a {model_ms:.0f} ms model")
+      return NativeStatus.unavailable
     return NativeStatus.full if native.mode == 'full' else NativeStatus.strip
 
   def far_status(self) -> int:
@@ -898,20 +1136,73 @@ class ModeldDetector:
     return self.far.status(time.monotonic())
 
   def native_far_status(self) -> int:
-    """farStatus while the native schedule holds the far crop's slot: off with TurnPilotFarCrop off, sweep in a stop sweep,
-    read when it or the far crop (on a frame it had no room for) ran within FAR_STATUS_S, else why it didn't."""
+    """farStatus while the native schedule holds the far crop's slot: off with TurnPilotFarCrop off; disabled when the far
+    crop is off for the drive (or none) and the native schedule hasn't run for NATIVE_NO_RUN_S of the slot's free,
+    calibrated time (native_idle_s; since its load, if never: the slot is dead, 11-06's noRoom for the rest of both drives),
+    in a stop sweep too; else sweep in a stop sweep, read when it or the far crop (on a frame it had no room for) ran within
+    FAR_STATUS_S, else why it didn't. The dead slot is checked before the sweep, as the far crop's own disabled outlasts one
+    (far_status): turnpilotd.watch_far raises farViewOff on every change into disabled and takes sweep for a live far view
+    (FAR_ON), so a dead slot said sweep through each stop-sign hold would chime Far View Off after every one (11-06 review)."""
     native = self.active_native()
     assert native is not None
     if not self.far_on:
       return FarStatus.off
+    now = time.monotonic()
+    far = self.far
+    far_off = far is None or far.disabled
+    if far_off and self.native_idle_s(native, now) > NATIVE_NO_RUN_S:
+      return FarStatus.disabled  # NATIVE_NO_RUN_S > FAR_STATUS_S: nor did it read lately
     if self.sweep is not None:
       return FarStatus.sweep
-    now = time.monotonic()
     status = native.status(now)
-    far = self.far
     if status != FarStatus.read and far is not None and not far.disabled and far.status(now) == FarStatus.read:
       return FarStatus.read
     return status
+
+  def native_idle_s(self, native: NativeStrips, now: float) -> float:
+    """The native schedule's time with its slot free, calibrated and no run: since its last run (its load, if none), less
+    its holds' since then (the ended ones, held_s, and the running one's from hold_t0: native_hold) and the gaps in the
+    steps past STEP_GAP_S each (native_gap). So a hold pauses the NATIVE_NO_RUN_S clock: a long wait at a stop sign, a
+    drive with TurnPilotFarCrop off, a fresh install's or a recalibration's minutes without calibration never count toward
+    nativeStatus unavailable (never run) nor the slot's farStatus disabled, and a slot already dead stays disabled through
+    one (the clock never runs back)."""
+    last = native.last_run_t if native.last_run_t is not None else native.load_t
+    held = native.held_s
+    if self.hold_t0 is not None:
+      held += max(0., now - max(self.hold_t0, last))
+    return now - last - held
+
+  def native_hold(self, reason: str, on: bool, now: float) -> None:
+    """The native's slot held for reason (on) or no longer (off), at now: while any reason holds (native_holds), its time
+    since hold_t0 is off the native's no-run clock, and when the last one ends it goes on held_s (native_idle_s). One
+    spell for every reason at once, so time held for two (a sweep without calibration) counts once. The reasons: sweep (its
+    odd steps are the side views'), farOff (TurnPilotFarCrop off: no slot), noCalibration (far_run found no calibrated
+    horizon: a fresh install, a recalibration). Until the first step that holds, the clock runs from the load."""
+    holds = self.native_holds | {reason} if on else self.native_holds - {reason}
+    if holds and not self.native_holds:
+      self.hold_t0 = now
+    elif self.native_holds and not holds:
+      native, t0 = self.native, self.hold_t0
+      if native is not None and t0 is not None:
+        last = native.last_run_t if native.last_run_t is not None else native.load_t
+        native.held_s += max(0., now - max(t0, last))
+      self.hold_t0 = None
+    self.native_holds = holds
+
+  def native_gap(self, last_step_t: float, now: float) -> None:
+    """A gap in the steps from last_step_t to now (over STEP_GAP_S: TurnPilot off a while, a host retry, a host stepping
+    below 10 Hz), its time past STEP_GAP_S off the native's no-run clock as a hold's is: the native ran nowhere then, so it
+    missed nothing more. Only the excess, so each step counts at most STEP_GAP_S, the clock continuous in the step's
+    length: the 11-06 review found the whole interval taken off, so a host stepping steadily below 10 Hz (a loaded one:
+    FORCE_RUN_S) took every interval for a gap, its clock never ran and a dead slot said nativeStatus full and farStatus
+    noRoom for good (0.125 s steps for 120 s: held_s 119.875 s), 11-06's silent far view again, though its odd steps
+    offered the native the slot. Now such a host's clock runs at STEP_GAP_S a step (8 Hz: a dead slot said
+    after 300 steps, 37.5 s), and a 60 s gap counts 0.1 s. The car isn't such a host: 11-06's rlogs had 3 of 30535 modelV2
+    intervals over 0.1 s (0.65 s in all, the longest 0.4 s), p99 61 ms. Inside a hold, the hold has it."""
+    native = self.native
+    if native is not None and not self.native_holds:
+      last = native.last_run_t if native.last_run_t is not None else native.load_t
+      native.held_s += max(0., now - max(last_step_t, last) - STEP_GAP_S)
 
   def side_status(self, gated: bool) -> int:
     """sideViewStatus for every message: off with no side views, else theirs (SideViews.status)."""
@@ -1003,6 +1294,8 @@ class ModeldDetector:
     why not (disabled when it failed, which turns it off for the drive)."""
     try:
       rpy = far.calibration()
+      if far is self.native:
+        self.native_hold('noCalibration', rpy is None, time.monotonic())  # no horizon to run on: never no room
       if rpy is None:
         far.why = FarStatus.noCalibration
         return far.why
@@ -1035,7 +1328,7 @@ class ModeldDetector:
     crop's road frame, behind the far crop's boxes, kept in odd_paint for the next full run's message, where the step has
     room for it (odd_room, with the step's time so far; with no paint time yet, as when the drive starts in a turn, a read
     is taken to cost PAINT_BUDGET_S, the most one may). Its failures and budget are the paint's own (read_lane_paint's)."""
-    if self.last_cam != 'wide' or self.lane_paint is None or 'road' not in self.cameras:
+    if self.last_cam != 'wide' or self.lane_paint is None or 'road' not in self.cameras or time.monotonic() < self.paint_retry_at:
       return
     estimate = float(np.median(self.paint_times)) if self.paint_times else PAINT_BUDGET_S
     if not self.odd_room(model_execution_time, estimate):
@@ -1045,101 +1338,121 @@ class ModeldDetector:
       i = self.cameras['road']
       paint, status = self.lane_paint.read(model_state.frames[i], metas[i], boxes)
     except Exception:
-      cloudlog.exception("turnpilot lane paint failed, off for this drive")
-      self.lane_paint = None
+      self.paint_failed()
       return
     dt = time.perf_counter() - t0
     self.odd_paint = (paint, status, dt, self.steps)
     self.paint_over_budget(dt)
 
   def read_far_lights(self, td, model_state, metas: list, raw: np.ndarray, crop: Crop, far: FarCrop | None = None) -> float:
-    """The far crop's class-9 boxes through its own reader, always shadow: td.lights, lightStatus, lightTime. A failure or
-    reads over LIGHT_BUDGET_S turn off only the far crop's lights, for the drive. Returns the time it took. far: the pass
-    that ran (the native schedule's lights are its own), default the far crop."""
+    """The far crop's class-9 boxes through its own reader, always shadow: td.lights, lightStatus, lightTime. Its time and
+    failures are ruled as the full pass's lights are (read_lights): a failure is retried after a backoff (lightStatus
+    retrying, disabled from LIGHT_DISABLED_FAILS in a row until a read succeeds), a median over LIGHT_BUDGET_S warned,
+    never off for the drive, its gates logged (log_light_gates). Returns the time it took. far: the pass that ran (the
+    native schedule's lights are its own), default the far crop."""
     far = self.far if far is None else far
     assert far is not None
-    if far.lights_failed:
-      td.lightStatus = LightStatus.disabled
-      return 0.
     if far.lights is None or self.light_mode == 'off':
       td.lightStatus = LightStatus.off
+      return 0.
+    if time.monotonic() < far.light_retry_at:
+      td.lightStatus = failing_status(far.light_failures)
       return 0.
     t0 = time.perf_counter()
     try:
       i = self.cameras['road']
       heads, status = far.lights.read(model_state.frames[i], metas[i], decode_far_lights(raw, crop))
     except Exception:
-      cloudlog.exception("turnpilot far crop lights failed, off for this drive")
-      far.lights, far.lights_failed = None, True
-      td.lightStatus = LightStatus.disabled
+      td.lightStatus = light_failed(far, "far crop lights")
       return time.perf_counter() - t0
+    light_read_ok(far, "far crop lights")
     dt = time.perf_counter() - t0
     fill_lights(td.lights, heads, True)
     td.lightStatus, td.lightTime = status, dt
     far.light_times.append(dt)
     if len(far.light_times) == TIME_WINDOW and float(np.median(far.light_times)) > LIGHT_BUDGET_S:
-      cloudlog.error(f"turnpilot far crop lights over budget ({np.median(far.light_times) * 1e3:.1f} ms), off for this drive")
-      far.lights, far.lights_failed = None, True
+      ms = 1e3 * float(np.median(far.light_times))
+      warn_over_budget(far, 'light_warn_t', time.monotonic(),
+                       f"turnpilot far crop lights over budget ({ms:.1f} ms against {LIGHT_BUDGET_S * 1e3:.1f}): read where they fit")
+    log_light_gates(far, far.lights, time.monotonic(), 'far' if far.mode == 'off' else 'native', self.signal_near)
     return dt
 
   def read_lane_paint(self, td, model_state, metas: list, boxes: np.ndarray) -> None:
     """Fill td.lanePaint, lanePaintStatus and lanePaintTime from the road camera's frame, behind this run's detections on
-    it. A failure, or reads over PAINT_BUDGET_S, turn only the paint off, for the drive; turnpilotd then plans no lane
-    change (no paint is unknown paint)."""
+    it. A failure is retried after a backoff (retrying, paint_failed), a slow read skipped where it doesn't fit
+    (paint_skip): never off for the drive. Anything but read is unknown paint to turnpilotd, which then plans no lane
+    change."""
     if self.lane_paint is None:
       td.lanePaintStatus = LanePaintStatus.disabled
+      return
+    if time.monotonic() < self.paint_retry_at:
+      td.lanePaintStatus = LanePaintStatus.retrying
       return
     t0 = time.perf_counter()
     try:
       i = self.cameras['road']
       paint, status = self.lane_paint.read(model_state.frames[i], metas[i], boxes)
     except Exception:
-      cloudlog.exception("turnpilot lane paint failed, off for this drive")
-      self.lane_paint = None
-      td.lanePaintStatus = LanePaintStatus.disabled
+      self.paint_failed()
+      td.lanePaintStatus = LanePaintStatus.retrying
       return
     dt = time.perf_counter() - t0
     fill_lane_paint(td.init('lanePaint', 4), paint)
     td.lanePaintStatus, td.lanePaintTime = status, dt
     self.paint_over_budget(dt)
 
+  def paint_failed(self) -> None:
+    """A paint read raised: retried after backoff_s, logged each time, never off for the drive (the full pass's rule)."""
+    self.paint_failures += 1
+    delay = backoff_s(self.paint_failures)
+    self.paint_retry_at = time.monotonic() + delay
+    cloudlog.exception(f"turnpilot lane paint failed ({self.paint_failures} in a row), retrying in {delay:.0f} s")
+
   def paint_over_budget(self, dt: float) -> None:
-    """Counts a paint read's time; a median over PAINT_BUDGET_S turns the paint off for the drive."""
+    """Counts a paint read's time (the estimate's: paint_skip skips a read where it doesn't fit); a median over
+    PAINT_BUDGET_S is warned at most once in BUDGET_WARN_S, never off for the drive."""
+    now = time.monotonic()
+    self.paint_failures, self.paint_skipped_t = 0, None
     self.paint_times.append(dt)
     if len(self.paint_times) == TIME_WINDOW and float(np.median(self.paint_times)) > PAINT_BUDGET_S:
-      cloudlog.error(f"turnpilot lane paint over budget ({np.median(self.paint_times) * 1e3:.1f} ms), off for this drive")
-      self.lane_paint = None
-
+      ms = 1e3 * float(np.median(self.paint_times))
+      warn_over_budget(self, 'paint_warn_t', now, f"turnpilot lane paint over budget ({ms:.1f} ms against {PAINT_BUDGET_S * 1e3:.1f}): read where it fits")
 
   def light_status(self) -> int:
-    """What a run without a read says: disabled after a failure, off with the param off or no road camera, else read."""
-    if self.lights_failed:
-      return LightStatus.disabled
+    """What a run without a read says: off with the param off or no road camera, else read."""
     return LightStatus.off if self.lights is None or self.light_mode == 'off' else LightStatus.read
 
   def read_lights(self, td, model_state, metas: list, raw: np.ndarray) -> None:
-    """Fill td.lights, lightStatus and lightTime from the road camera's frame and this run's class-9 boxes. A failure, or
-    reads over LIGHT_BUDGET_S, turn only the lights off, for the drive, said in lightStatus (disabled) and the log."""
+    """Fill td.lights, lightStatus and lightTime from the road camera's frame and this run's class-9 boxes. Never off for
+    the drive (11-06: medians to 3.74 ms against the 4.0 ms that turned them off, at the junctions where a red must stop the
+    car): its time is the estimate's, a median over LIGHT_BUDGET_S warned at most once in BUDGET_WARN_S, and a failure is
+    retried after a backoff (backoff_s), logged each time, the runs between saying retrying; from LIGHT_DISABLED_FAILS
+    failures in a row they say disabled (logged once), which turnpilotd keeps and map_controls says once, until a read
+    succeeds (light_failed). A read's gates go to log_light_gates."""
     status = self.light_status()
     if status != LightStatus.read:
       td.lightStatus = status
+      return
+    if time.monotonic() < self.light_retry_at:
+      td.lightStatus = failing_status(self.light_failures)
       return
     t0 = time.perf_counter()
     try:
       i = self.cameras['road']
       heads, status = self.lights.read(model_state.frames[i], metas[i], decode_lights(raw, self.lb))
     except Exception:
-      cloudlog.exception("turnpilot lights failed, off for this drive")
-      self.lights, self.lights_failed = None, True
-      td.lightStatus = LightStatus.disabled
+      td.lightStatus = light_failed(self, "lights")
       return
+    light_read_ok(self, "lights")
     dt = time.perf_counter() - t0
     fill_lights(td.lights, heads, self.light_mode != 'addOnly')
     td.lightStatus, td.lightTime = status, dt
     self.light_times.append(dt)
     if len(self.light_times) == TIME_WINDOW and float(np.median(self.light_times)) > LIGHT_BUDGET_S:
-      cloudlog.error(f"turnpilot lights over budget ({np.median(self.light_times) * 1e3:.1f} ms), off for this drive")
-      self.lights, self.lights_failed = None, True
+      ms = 1e3 * float(np.median(self.light_times))
+      warn_over_budget(self, 'light_warn_t', time.monotonic(),
+                       f"turnpilot lights over budget ({ms:.1f} ms against {LIGHT_BUDGET_S * 1e3:.1f}): read where they fit")
+    log_light_gates(self, self.lights, time.monotonic(), 'road', self.signal_near)
 
 
 def load_far(model_state, cam_w: int, cam_h: int, index: int, bus) -> FarCrop | None:

@@ -182,6 +182,22 @@ class TestReader(OpenpilotTestCase):
     assert reader.read(0., frame, STRIDE, Y_HEIGHT, LEVEL, 1.22, boxes) == []
     assert reader.gate_counts['belowHorizon'] == 1
 
+  def test_the_funnel_is_counted_and_taken(self):
+    # modeld logs the reader's funnel once a minute (modeld_detector.log_light_gates): the frames read, the boxes the gates
+    # stop (never heads, never published), and the heads by this frame's reason and colour; a take starts the counts over
+    reader = LightReader(LENS)
+    frame, boxes = scene([head(0, 'red'), head(2, 'red', x0=400), head(0, 'red', x0=900, w=6, h=18), head(0, 'red', x0=300, y0=500)])
+    assert not reader.boxes_seen()
+    for i in range(3):
+      reader.read(i * 0.1, frame, STRIDE, Y_HEIGHT, LEVEL, 1.22, boxes)
+    assert reader.boxes_seen()
+    frames, gates, heads, colours = reader.take_counts()
+    assert frames == 3 and gates == {'small': 3, 'belowHorizon': 3} and heads == {'read': 3, 'positionMismatch': 3}
+    assert colours == {'red': 3}
+    assert reader.take_counts() == (0, {}, {}, {}) and not reader.boxes_seen()
+    reader.read(1., frame, STRIDE, Y_HEIGHT, LEVEL, 1.22, np.zeros((0, 6), np.float32))
+    assert reader.take_counts()[0] == 1 and not reader.boxes_seen()
+
   def test_at_most_max_read_heads_a_frame(self):
     # the read's time stays bounded however many heads the junction has: the most confident first, the rest counted
     reader = LightReader(LENS)

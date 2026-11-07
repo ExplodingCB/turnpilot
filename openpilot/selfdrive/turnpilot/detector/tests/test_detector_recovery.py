@@ -140,7 +140,7 @@ class TestDetectorRecovery(OpenpilotTestCase):
     assert det.light_mode == 'addOnly'
     params.lights, host.next_check = None, 0.
     host.step(pm, model, 0.010, 0.0, log.Desire.none, METAS, True)
-    assert det.light_mode == 'shadow'
+    assert det.light_mode == 'addOnly'  # unset: light_state.LIGHT_MODE_DEFAULT, add-only since 5dcb363
 
   def test_host_passes_the_far_crop_param_and_aim(self):
     # TurnPilotFarCrop (unset: on) and turnpilotPlan.farCropBearing reach the detector
@@ -356,8 +356,9 @@ def car_detector(monkeypatch, paint_s: float, far: bool = False, far_jitter_s: f
   return det, clock
 
 
-def car_drive(det, clock, frames: int, model_s: float, desire=log.Desire.none):
-  """frames model frames at 20 Hz, each step after its frame's model (and after the last step, when that ran late).
+def car_drive(det, clock, frames: int, model_s: float, desire=log.Desire.none, curvature: float = 0.):
+  """frames model frames at 20 Hz, each step after its frame's model (and after the last step, when that ran late), at
+  desiredCurvature curvature (a turn: at or over WIDE_CURVATURE; a turn desire alone alternates the cameras since 11-06).
   Returns the messages and, per frame, whether the full pass ran and the debt it left."""
   from openpilot.selfdrive.turnpilot.detector.tests.test_far_crop import FarPM
   pm, ran, debts = FarPM(), [], []
@@ -365,7 +366,7 @@ def car_drive(det, clock, frames: int, model_s: float, desire=log.Desire.none):
   for k in range(frames):
     clock.t = max(clock.t + modeld_detector.REST_S, t0 + k * modeld_detector.CYCLE_S) + model_s
     n = len(pm.full)
-    det.step(pm, det.model_state, model_s, 0.0, desire, [Meta(2 * k), Meta(2 * k + 1)], 'auto', 0.)
+    det.step(pm, det.model_state, model_s, curvature, desire, [Meta(2 * k), Meta(2 * k + 1)], 'auto', 0.)
     ran.append(len(pm.full) > n)
     debts.append(det.debt)
   return pm, ran, debts
@@ -404,7 +405,7 @@ class TestCarTimeBudget:
     # the frames between where the debt it leaves still gives the next full pass its room; its odd paint read where that
     # fits too. The full pass never misses its frame and the debt stays bounded: a frame between with no room pays it back
     det, clock = car_detector(monkeypatch, 0.0035, far=True)
-    pm, ran, debts = car_drive(det, clock, 400, CAR_MODEL_S, log.Desire.turnLeft)
+    pm, ran, debts = car_drive(det, clock, 400, CAR_MODEL_S, log.Desire.turnLeft, 0.05)
     assert set(gaps_of(ran)) == {RUN_EVERY} and all(str(td.camera) == 'wide' for td in pm.full)
     assert len(pm.far) >= 0.6 * 200 and len(det.lane_paint.calls) >= 0.1 * 200
     assert max(debts) <= modeld_detector.DEBT_CAP_S and max(debts[200:]) <= max(debts[:200]) + 1e-9
@@ -415,7 +416,7 @@ class TestCarTimeBudget:
     # spare: one over its estimate costs the full pass a frame at most, never the far crop for the drive, since no far
     # run comes near pushing the debt past DEBT_CAP_S itself
     det, clock = car_detector(monkeypatch, 0.0035, far=True, far_jitter_s=jitter_s)
-    pm, ran, debts = car_drive(det, clock, 400, CAR_MODEL_S, log.Desire.turnLeft)
+    pm, ran, debts = car_drive(det, clock, 400, CAR_MODEL_S, log.Desire.turnLeft, 0.05)
     assert not det.far.disabled and len(pm.far) >= 0.6 * 200 and pm.full[-1].farStatus == modeld_detector.FarStatus.read
     assert set(gaps_of(ran)) <= {RUN_EVERY, RUN_EVERY + 1} and sum(ran) >= 0.95 * 200
     assert max(debts) <= modeld_detector.DEBT_CAP_S + jitter_s + 1e-9

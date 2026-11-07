@@ -1,5 +1,6 @@
 import time
 from collections import deque
+from contextlib import contextmanager
 
 import numpy as np
 import pytest
@@ -9,10 +10,10 @@ from openpilot.common.test import OpenpilotTestCase
 from openpilot.common.params import UnknownKeyName
 from openpilot.selfdrive.turnpilot.detector.decoder import PERSON, TRAFFIC_LIGHT
 from openpilot.selfdrive.turnpilot.detector.graph import letterbox
-from openpilot.selfdrive.turnpilot.detector.light_state import LightHead
-from openpilot.selfdrive.turnpilot.detector.modeld_detector import (DEBT_CAP_S, LIGHT_BUDGET_S, PAINT_BUDGET_S, RUN_EVERY, STEP_BUDGET_S,
-                                                                    TIME_WINDOW, WIDE_HOLD_S, LanePaintStatus, LightStatus, ModeldDetector,
-                                                                    camera_lights_mode)
+from openpilot.selfdrive.turnpilot.detector.light_state import LIGHT_MODE_DEFAULT, LightHead
+from openpilot.selfdrive.turnpilot.detector.modeld_detector import (BUDGET_WARN_S, CYCLE_S, DEBT_CAP_S, LIGHT_BUDGET_S, PAINT_BUDGET_S,
+                                                                    RETRY_S, RUN_EVERY, STEP_BUDGET_S, TIME_WINDOW, WIDE_HOLD_S,
+                                                                    LanePaintStatus, LightStatus, ModeldDetector, camera_lights_mode)
 from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN, LinePaint
 
 
@@ -59,9 +60,11 @@ class FakeLanePaint:
 
 
 class FakeLights:
-  """Stands in for CameraLightReader: records the frame and light boxes it got, returns one governing red head."""
-  def __init__(self):
+  """Stands in for CameraLightReader: records the frame and light boxes it got, returns one governing red head (heads: what
+  it returns instead)."""
+  def __init__(self, heads=None):
     self.calls, self.fail, self.delay = [], False, 0.
+    self.heads = heads or [LightHead(3, (0.52, 0.13, 0.53, 0.19), 0.8, 'red', 4, 'red', 'read', 1.5, 32., True)]
 
   def read(self, frame, meta, boxes):
     if self.fail:
@@ -69,8 +72,7 @@ class FakeLights:
     if self.delay:
       time.sleep(self.delay)
     self.calls.append((frame, meta.frame_id, boxes[:, 5].tolist()))
-    head = LightHead(3, (0.52, 0.13, 0.53, 0.19), 0.8, 'red', 4, 'red', 'read', 1.5, 32., True)
-    return [head], LightStatus.read
+    return list(self.heads), LightStatus.read
 
 
 class FakeModelState:
@@ -107,6 +109,46 @@ def with_lights(det, mode='shadow'):
   return det
 
 
+class SimClock:
+  """modeld_detector's time module stood in: monotonic and perf_counter both read t, which only the test moves (tick), so a
+  budget test's runs take no host time and its room is its estimates' arithmetic, whatever the host's load (11-06 review:
+  a 5 ms stall on a loaded host ate the 4 ms test_a_paint_skipped_for_room_is_measured_again left, and its run never came)."""
+  def __init__(self, t: float = 1000.):
+    self.t = t
+
+  def monotonic(self) -> float:
+    return self.t
+
+  def perf_counter(self) -> float:
+    return self.t
+
+  def tick(self, s: float = CYCLE_S) -> float:
+    self.t += s
+    return self.t
+
+
+def costed(det, clock: SimClock, det_s: float, paint_s: float | None = None) -> None:
+  """det's runs (and its lane paint reads) take det_s (paint_s) on the simulated clock, so their measured times are those."""
+  def costs(fn, s):
+    def run(*args, **kwargs):
+      clock.tick(s)
+      return fn(*args, **kwargs)
+    return run
+  det.run = costs(det.run, det_s)
+  if paint_s is not None:
+    det.lane_paint.read = costs(det.lane_paint.read, paint_s)
+
+
+@contextmanager
+def sim_clock(t: float = 1000.):
+  """A SimClock as modeld_detector's time for the block (the detectors and far crops made in it take their load times off it)."""
+  from unittest import mock
+  from openpilot.selfdrive.turnpilot.detector import modeld_detector
+  clock = SimClock(t)
+  with mock.patch.object(modeld_detector, 'time', clock):
+    yield clock
+
+
 class TestModeldDetector(OpenpilotTestCase):
   def test_camera_choice(self):
     det = make_detector()
@@ -114,7 +156,9 @@ class TestModeldDetector(OpenpilotTestCase):
     assert det.choose_camera(-0.02, log.Desire.none, 1.0) == 'wide'
     assert det.choose_camera(0.0, log.Desire.none, 1.0 + WIDE_HOLD_S - 0.1) == 'wide'  # held after the turn
     assert det.choose_camera(0.0, log.Desire.none, 1.0 + WIDE_HOLD_S + 0.1) == 'road'
-    assert det.choose_camera(0.0, log.Desire.turnRight, 10.0) == 'wide'
+    # a turn desire before the car turns alternates the cameras 1:1, the wide first: it no longer holds the wide camera (11-06,
+    # 1e 8+16: a signalized right's approach was wide only, no light read)
+    assert [det.choose_camera(0.0, log.Desire.turnRight, 10.0 + 0.1 * k) for k in range(4)] == ['wide', 'road'] * 2
     assert det.choose_camera(0.0, log.Desire.laneChangeLeft, 20.0) == 'road'
     assert make_detector({'wide': 0}).choose_camera(0.0, log.Desire.none, 0.0) == 'wide'
     assert make_detector({'road': 0}).choose_camera(0.05, log.Desire.turnLeft, 0.0) == 'road'
@@ -158,6 +202,85 @@ class TestModeldDetector(OpenpilotTestCase):
       det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(100 + k), Meta(200 + k)], v_ego=0.)
     assert [str(td.camera) for td in pm.sent] == ['wide', 'wide']
 
+  def test_a_standstill_curvature_never_holds_the_wide_camera(self):
+    # 11-06, 1e 3+10 to 3+36: standing 20 m from a signal's line, modeld's desiredCurvature frozen at 0.0117 (below
+    # MIN_LAT_CONTROL_SPEED it holds its last value), over WIDE_CURVATURE: 0 road runs against 259 wide, no light read
+    # through the wait. Below MOVING_V the curvature starts no wide hold: the slow cycle's one road run in 3
+    from openpilot.selfdrive.turnpilot.detector.modeld_detector import MOVING_V, WIDE_SLOW_ROAD_EVERY
+    assert MOVING_V == 0.3 and WIDE_SLOW_ROAD_EVERY == 3
+    det = make_detector()
+    picks = [det.choose_camera(0.0117, log.Desire.none, 0.1 * k, v_ego=0.) for k in range(9)]
+    assert picks == ['wide', 'wide', 'road'] * 3
+    # a real turn (moving) holds the wide camera; standing after it with its curvature frozen, the hold runs out at
+    # WIDE_HOLD_S and the slow cycle is back
+    det = make_detector()
+    assert [det.choose_camera(0.05, log.Desire.none, 0.1 * k, v_ego=4.) for k in range(5)] == ['wide'] * 5
+    held = [det.choose_camera(0.05, log.Desire.none, 0.5 + 0.1 * k, v_ego=0.) for k in range(int(WIDE_HOLD_S / 0.1) + 6)]
+    assert held[:int(WIDE_HOLD_S / 0.1) - 1] == ['wide'] * (int(WIDE_HOLD_S / 0.1) - 1) and 'road' in held[-6:]
+    # speed unknown: a curvature is a turn, as before
+    assert make_detector().choose_camera(0.0117, log.Desire.none, 0.) == 'wide'
+
+  def test_near_a_signal_the_light_reader_gets_every_other_run(self):
+    # the table's lights_near rows (choose_camera; a signal mapped near with the light reader reading): standing or at a
+    # crawl, and in a turn, the road and wide cameras 1:1 (the wide first), so the light reader reads 5 Hz where a red must
+    # stop the car and the wide camera keeps every other run for walkers at the corner; at speed the road camera as before
+    det = make_detector()
+    det.lights_near = True
+    assert [det.choose_camera(0.0117, log.Desire.none, 0.1 * k, v_ego=0.) for k in range(6)] == ['wide', 'road'] * 3
+    det = make_detector()
+    det.lights_near = True
+    assert [det.choose_camera(0.05, log.Desire.none, 0.1 * k, v_ego=4.) for k in range(6)] == ['wide', 'road'] * 3
+    det = make_detector()  # no signal: a turn is the wide camera's
+    assert [det.choose_camera(0.05, log.Desire.none, 0.1 * k, v_ego=4.) for k in range(6)] == ['wide'] * 6
+    det = make_detector()
+    det.lights_near = True
+    assert [det.choose_camera(0.0, log.Desire.none, 0.1 * k, v_ego=12.) for k in range(4)] == ['road'] * 4
+    # the plan's views and the sweeps still decide
+    assert det.choose_camera(0.05, log.Desire.turnLeft, 1., 'road', v_ego=4.) == 'road'
+    assert [det.choose_camera(0., log.Desire.none, 2. + 0.1 * k, 'stopSweepGo', v_ego=0.) for k in range(3)] == ['wide'] * 3
+
+  def test_a_turn_desire_before_the_turn_alternates_the_cameras(self):
+    # 1e 8+16: the turnRight desire went out at 39 m with a signal 32 m ahead, and every run to the end of the stand was
+    # wide, no light read. A turn desire alone no longer holds the wide camera: 1:1 until the car turns (its curvature,
+    # moving), then the turn's wide hold
+    det = make_detector()
+    picks = [det.choose_camera(0.002, log.Desire.turnRight, 0.1 * k, v_ego=7.) for k in range(6)]
+    assert picks == ['wide', 'road'] * 3
+    assert [det.choose_camera(0.04, log.Desire.turnRight, 1. + 0.1 * k, v_ego=5.) for k in range(4)] == ['wide'] * 4
+    det = make_detector()  # standing at the line with the desire out and the curvature frozen: 1:1 too
+    assert [det.choose_camera(0.013, log.Desire.turnLeft, 0.1 * k, v_ego=0.) for k in range(4)] == ['wide', 'road'] * 2
+
+  def test_a_peek_never_advances_the_cycles(self):
+    for v, near, curv, desire in ((0., False, 0.0117, log.Desire.none), (0., True, 0.0117, log.Desire.none),
+                                  (7., False, 0.002, log.Desire.turnRight), (4., True, 0.05, log.Desire.none)):
+      det = make_detector()
+      det.lights_near = near
+      picks = []
+      for k in range(6):
+        state = (det.slow_runs, det.alt_runs, det.wide_until, det.view_runs, det.sweep_runs)
+        peeks = {det.choose_camera(curv, desire, 0.1 * k, v_ego=v, peek=True) for _ in range(3)}
+        assert (det.slow_runs, det.alt_runs, det.wide_until, det.view_runs, det.sweep_runs) == state
+        picks.append(det.choose_camera(curv, desire, 0.1 * k, v_ego=v))
+        assert peeks == {picks[-1]}, (v, near, k)  # the peek is the pick
+
+  def test_the_peek_takes_this_steps_signal_near(self):
+    # signal_near (and lights_near with it) is set before the peek (the camera the time budget estimates for): standing on
+    # the slow cycle two runs in, the step a signal comes near takes the 1:1 alternation's wide run, and the peek says so,
+    # not the slow cycle's road run with the step before's
+    det, pm = with_lights(make_detector(), 'addOnly'), PM()
+    for k in range(2 * RUN_EVERY):
+      det.step(pm, det.model_state, 0.010, 0.0117, log.Desire.none, [Meta(2 * k), Meta(2 * k + 1)], v_ego=0.)
+    assert [str(td.camera) for td in pm.sent] == ['wide', 'wide'] and det.slow_runs == 2 and not det.lights_near
+    det.step(pm, det.model_state, 0.010, 0.0117, log.Desire.none, [Meta(50), Meta(51)], v_ego=0., signal_near=True)
+    assert det.next_cam == str(pm.sent[-1].camera) == 'wide' and det.signal_near and det.lights_near
+
+  def test_a_test_stand_in_without_the_new_cycles_still_picks_at_speed(self):
+    # test_turnpilotd's stand-in (frames, wide_until, sweep_runs, view_runs) at road speed, straight: no attribute it lacks
+    # is read on that row
+    from types import SimpleNamespace
+    det = SimpleNamespace(frames={'road': 0, 'wide': 1}, wide_until=-1., sweep_runs=0, view_runs=0)
+    assert [ModeldDetector.choose_camera(det, 0., log.Desire.none, 0.1 * k, v_ego=9.) for k in range(4)] == ['road'] * 4
+
   def test_step_takes_the_view(self):
     det, pm = make_detector(), PM()
     for k in range(3 * RUN_EVERY):
@@ -180,14 +303,18 @@ class TestModeldDetector(OpenpilotTestCase):
 
   def test_budget(self):
     # a run only where the debt it leaves (the step past STEP_BUDGET_S) stays within DEBT_CAP_S: a 10 ms detector beside a
-    # model 1 ms under the budget leaves 9 ms; 3 ms under, 7. The model alone fits, so no debt builds while it waits
-    det, pm = make_detector(det_time=0.010), PM()
-    for _ in range(10):
-      det.step(pm, det.model_state, STEP_BUDGET_S - 0.001, 0.0, log.Desire.none, [Meta(1), Meta(2)])
-    assert pm.sent == [] and det.debt < 0.001  # no room this step, every step
-    det.step(pm, det.model_state, STEP_BUDGET_S - 0.003, 0.0, log.Desire.none, [Meta(1), Meta(2)])
-    assert len(pm.sent) == 1  # the first frame with room runs, even if it's not on the N-frame grid
-    assert 0.010 - 0.003 <= DEBT_CAP_S
+    # model 1 ms under the budget leaves 9 ms; 3 ms under, 7. The model alone fits, so no debt builds while it waits. On the
+    # simulated clock (SimClock), so the host's own time never decides it
+    with sim_clock() as clock:
+      det, pm = make_detector(det_time=0.010), PM()
+      for _ in range(10):
+        clock.tick()
+        det.step(pm, det.model_state, STEP_BUDGET_S - 0.001, 0.0, log.Desire.none, [Meta(1), Meta(2)])
+      assert pm.sent == [] and det.debt == 0.  # no room this step, every step
+      clock.tick()
+      det.step(pm, det.model_state, STEP_BUDGET_S - 0.003, 0.0, log.Desire.none, [Meta(1), Meta(2)])
+      assert len(pm.sent) == 1  # the first frame with room runs, even if it's not on the N-frame grid
+    assert 0.010 - 0.003 <= DEBT_CAP_S < 0.010 - 0.001
 
   def test_failure_retries_and_a_wrong_model_raises(self):
     det, pm = make_detector(), PM()
@@ -216,40 +343,309 @@ class TestModeldDetector(OpenpilotTestCase):
     assert pm.sent[0].lanePaintStatus == LanePaintStatus.read and pm.sent[1].lanePaintStatus == LanePaintStatus.wideCamera
     assert pm.sent[0].executionTime > 0. and pm.sent[0].lanePaintTime >= 0.
 
-  def test_lane_paint_failure_leaves_the_detector_on(self):
+  def test_lane_paint_failure_is_retried_and_the_detector_keeps_going(self):
+    # never off for the drive (the no-features-off rule): a failed read is logged, the runs inside its backoff say retrying
+    # (unknown paint: turnpilotd plans no lane change on it), and after RETRY_S, doubling, it is read again
+    from unittest import mock
+    from openpilot.selfdrive.turnpilot.detector import modeld_detector
     det, pm = make_detector(), PM()
     det.lane_paint.fail = True
-    det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(1), Meta(2)])
-    assert det.lane_paint is None and len(pm.sent) == 1 and len(pm.sent[0].detections) == 1
-    assert len(pm.sent[0].lanePaint) == 0 and pm.sent[0].lanePaintStatus == LanePaintStatus.disabled  # unknown, said out loud
-    det.since_run = RUN_EVERY
-    det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(3), Meta(4)])
-    assert len(pm.sent) == 2 and pm.sent[1].lanePaintStatus == LanePaintStatus.disabled
+    with mock.patch.object(modeld_detector.cloudlog, 'exception') as logged:
+      det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(1), Meta(2)])
+      assert det.lane_paint is not None and len(pm.sent) == 1 and len(pm.sent[0].detections) == 1
+      assert len(pm.sent[0].lanePaint) == 0 and pm.sent[0].lanePaintStatus == LanePaintStatus.retrying
+      assert det.paint_failures == 1 and RETRY_S - 0.1 < det.paint_retry_at - time.monotonic() <= RETRY_S
+      det.lane_paint.fail = False
+      det.since_run = RUN_EVERY
+      det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(3), Meta(4)])
+      assert pm.sent[1].lanePaintStatus == LanePaintStatus.retrying and det.lane_paint.calls == []  # inside the backoff
+      det.paint_retry_at = 0.  # the backoff over
+      det.since_run = RUN_EVERY
+      det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(5), Meta(6)])
+      assert pm.sent[2].lanePaintStatus == LanePaintStatus.read and len(pm.sent[2].lanePaint) == 4 and det.paint_failures == 0
+      # failures in a row double the wait, each logged
+      det.lane_paint.fail = True
+      for k in range(2):
+        det.paint_retry_at, det.since_run = 0., RUN_EVERY
+        det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(7 + 2 * k), Meta(8 + 2 * k)])
+      assert det.paint_failures == 2 and det.paint_retry_at - time.monotonic() > 2 * RETRY_S - 0.1
+    assert sum('lane paint failed' in c.args[0] for c in logged.call_args_list) == 3
     # no road camera, no paint
     det, pm = make_detector({'wide': 0}), PM()
     det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(1), Meta(1)])
     assert len(pm.sent) == 1 and len(pm.sent[0].lanePaint) == 0 and pm.sent[0].lanePaintStatus == LanePaintStatus.disabled
 
-  def test_slow_lane_paint_turns_off_and_the_detector_keeps_going(self):
+  def test_slow_lane_paint_stays_on_and_is_warned_once_a_minute(self):
+    # 11-06: paint medians peaked at 4.29-4.59 ms against the 5.0 ms that turned it off for the drive. A median over
+    # PAINT_BUDGET_S is warned at most once in BUDGET_WARN_S and the paint stays on, its time in the estimate
+    from unittest import mock
+    from openpilot.selfdrive.turnpilot.detector import modeld_detector
     det, pm = make_detector(), PM()
     det.lane_paint.delay = PAINT_BUDGET_S * 1.5
-    for k in range(TIME_WINDOW):
-      det.since_run = RUN_EVERY
-      det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(2 * k), Meta(2 * k + 1)])
-    assert det.lane_paint is None and len(pm.sent) == TIME_WINDOW
-    assert all(m.lanePaintTime > PAINT_BUDGET_S for m in pm.sent)
-    det.since_run = RUN_EVERY
-    det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(100), Meta(101)])
-    assert pm.sent[-1].lanePaintStatus == LanePaintStatus.disabled and len(pm.sent[-1].detections) == 1
+    with mock.patch.object(modeld_detector.cloudlog, 'warning') as warned:
+      for k in range(TIME_WINDOW + 3):
+        det.since_run, det.debt = RUN_EVERY, 0.
+        det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(2 * k), Meta(2 * k + 1)])
+      assert sum('lane paint over budget' in c.args[0] for c in warned.call_args_list) == 1
+      det.paint_warn_t -= BUDGET_WARN_S  # a minute on: warned again
+      det.since_run, det.debt = RUN_EVERY, 0.
+      det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(100), Meta(101)])
+      assert sum('lane paint over budget' in c.args[0] for c in warned.call_args_list) == 2
+    assert det.lane_paint is not None and len(pm.sent) == TIME_WINDOW + 4
+    assert all(m.lanePaintStatus == LanePaintStatus.read and m.lanePaintTime > PAINT_BUDGET_S for m in pm.sent)
 
-  def test_paint_time_counts_toward_the_step_budget(self):
-    det, pm = make_detector(det_time=0.006), PM()
-    det.paint_times.extend([0.003] * 3)
-    det.step(pm, det.model_state, STEP_BUDGET_S, 0.0, log.Desire.none, [Meta(1), Meta(2)])
-    assert pm.sent == []  # 6 ms detector + 3 ms paint past the budget: a 9 ms debt, past DEBT_CAP_S (8 ms)
-    det.lane_paint = None  # paint off: its time no longer counts
-    det.step(pm, det.model_state, STEP_BUDGET_S, 0.0, log.Desire.none, [Meta(1), Meta(2)])
-    assert len(pm.sent) == 1
+  def test_paint_time_counts_toward_the_step_budget_and_the_lights_go_first(self):
+    # on the simulated clock (SimClock), the runs taking their stated times: the host's own time never decides a step's room
+    with sim_clock() as clock:
+      det, pm = make_detector(det_time=0.006), PM()
+      costed(det, clock, 0.006, 0.003)
+      det.paint_times.extend([0.003] * 3)
+      # 6 ms detector + 3 ms paint past the budget: a 9 ms debt, past DEBT_CAP_S (8 ms); without the paint, 6: the run goes,
+      # its paint skipped for room (noRoom), and the paint's read time stays as it was
+      clock.tick()
+      det.step(pm, det.model_state, STEP_BUDGET_S, 0.0, log.Desire.none, [Meta(1), Meta(2)])
+      assert len(pm.sent) == 1 and pm.sent[0].lanePaintStatus == LanePaintStatus.noRoom and det.lane_paint.calls == []
+      assert len(pm.sent[0].detections) == 1 and len(pm.sent[0].lanePaint) == 0 and list(det.paint_times) == [0.003] * 3
+      assert abs(det.debt - 0.006) < 1e-9  # the run's 6 ms past the budget, carried
+      # with room for both, both: the frames between paid the debt back, and 2 ms under the budget the detector and the
+      # paint leave 7 ms
+      det.since_run, det.debt = RUN_EVERY, 0.
+      clock.tick()
+      det.step(pm, det.model_state, STEP_BUDGET_S - 0.002, 0.0, log.Desire.none, [Meta(3), Meta(4)])
+      assert len(pm.sent) == 2 and pm.sent[1].lanePaintStatus == LanePaintStatus.read and len(det.lane_paint.calls) == 1
+      assert abs(det.debt - 0.007) < 1e-9
+      # a step that starts 1.5 ms late (the debt carried) has room for the run without the paint only: 8.5 ms with it
+      det.since_run, det.debt = RUN_EVERY, 0.0015
+      clock.tick()
+      det.step(pm, det.model_state, STEP_BUDGET_S - 0.002, 0.0, log.Desire.none, [Meta(5), Meta(6)])
+      assert len(pm.sent) == 3 and pm.sent[2].lanePaintStatus == LanePaintStatus.noRoom and len(det.lane_paint.calls) == 1
+      # with room for neither: no run, as before (the forced run measures again, with the paint)
+      det, pm = make_detector(det_time=0.009), PM()
+      det.paint_times.extend([0.003] * 3)
+      clock.tick()
+      det.step(pm, det.model_state, STEP_BUDGET_S, 0.0, log.Desire.none, [Meta(1), Meta(2)])
+      assert pm.sent == []
+
+  def test_a_paint_skipped_for_room_is_measured_again(self):
+    # a burst of slow reads can't keep the paint skipped: PAINT_FORCE_S skipped for room, the next road run reads it anyway,
+    # its estimate starting over from that read, which then fits. Driven at 20 Hz on the simulated clock (SimClock): a 6 ms
+    # detector beside a model 2 ms under the budget leaves 4 ms with no paint and 16 with the burst's, whatever the host's load
+    from openpilot.selfdrive.turnpilot.detector.modeld_detector import PAINT_FORCE_S
+    with sim_clock() as clock:
+      det, pm = make_detector(det_time=0.006), PM()
+      costed(det, clock, 0.006, 0.003)  # the burst is over: a read now takes 3 ms
+      det.paint_times.extend([0.012] * TIME_WINDOW)  # the burst
+      t0, k, first_skip = clock.t, 0, None
+      while not det.lane_paint.calls and clock.t - t0 < 2 * PAINT_FORCE_S:
+        det.since_run, det.debt = RUN_EVERY, 0.  # a full run every RUN_EVERY frames, the frames between paying back its debt
+        start = clock.tick(RUN_EVERY * CYCLE_S)
+        det.step(pm, det.model_state, STEP_BUDGET_S - 0.002, 0.0, log.Desire.none, [Meta(2 * k), Meta(2 * k + 1)], v_ego=10.)
+        first_skip = det.paint_skipped_t if first_skip is None else first_skip
+        k += 1
+      # every road run until then skipped it for room, its estimate kept; the read came PAINT_FORCE_S after the first skip
+      assert [td.lanePaintStatus for td in pm.sent[:-1]] == [LanePaintStatus.noRoom] * (len(pm.sent) - 1) and len(pm.sent) > 10
+      assert PAINT_FORCE_S <= start - first_skip <= PAINT_FORCE_S + RUN_EVERY * CYCLE_S + 0.006 + 1e-9
+      assert pm.sent[-1].lanePaintStatus == LanePaintStatus.read and len(det.lane_paint.calls) == 1 and len(det.paint_times) == 1
+      assert abs(det.paint_times[0] - 0.003) < 1e-9
+      assert det.paint_skipped_t is None  # read: the next skip for room starts its clock over
+      det.since_run, det.debt = RUN_EVERY, 0.
+      clock.tick(RUN_EVERY * CYCLE_S)
+      det.step(pm, det.model_state, STEP_BUDGET_S - 0.002, 0.0, log.Desire.none, [Meta(500), Meta(501)], v_ego=10.)
+      assert pm.sent[-1].lanePaintStatus == LanePaintStatus.read and len(det.lane_paint.calls) == 2  # the fast read's estimate fits
+
+
+# the car at a junction (11-06, 1e 11+1.7 to 11+9.9, standing): the big model 39 ms, the full pass 10.4 ms, the lane paint
+# 3.4 ms, the lights 3.5 ms a read at a junction's heads. Together they had no room (a 9.3 ms debt), so the road runs went
+# forced only, 0.8-1.0 s apart, and the camera's light read aged out between them (CAMERA_STALE_S, 1 s)
+JUNCTION_MODEL_S, JUNCTION_DET_S, JUNCTION_PAINT_S, JUNCTION_LIGHT_S = 0.039, 0.0104, 0.0034, 0.0035
+
+
+def junction_drive(monkeypatch, frames, v_ego, curvature, signal_near, desire=log.Desire.none):
+  """A drive on a simulated clock (modeld_detector.time) with every run taking the junction's times: the messages and, per
+  frame, the camera of a full run on it (None: none)."""
+  from types import SimpleNamespace
+  from openpilot.selfdrive.turnpilot.detector import modeld_detector
+  clock = SimpleNamespace(t=1000.)
+  monkeypatch.setattr(modeld_detector, 'time', SimpleNamespace(monotonic=lambda: clock.t, perf_counter=lambda: clock.t))
+
+  def costs(fn, s):
+    def run(*args, **kwargs):
+      clock.t += s
+      return fn(*args, **kwargs)
+    return run
+  det, pm = with_lights(make_detector(det_time=JUNCTION_DET_S), 'addOnly'), PM()
+  det.paint_times.extend([JUNCTION_PAINT_S] * TIME_WINDOW)
+  det.light_times.extend([JUNCTION_LIGHT_S] * TIME_WINDOW)
+  det.times = deque([JUNCTION_DET_S] * TIME_WINDOW, maxlen=TIME_WINDOW)
+  det.run = costs(det.run, JUNCTION_DET_S)
+  det.lane_paint.read = costs(det.lane_paint.read, JUNCTION_PAINT_S)
+  det.lights.read = costs(det.lights.read, JUNCTION_LIGHT_S)
+  cams = []
+  t0 = clock.t
+  for k in range(frames):
+    clock.t = max(clock.t + modeld_detector.REST_S, t0 + k * modeld_detector.CYCLE_S) + JUNCTION_MODEL_S
+    n = len(pm.sent)
+    det.step(pm, det.model_state, JUNCTION_MODEL_S, curvature, desire, [Meta(2 * k), Meta(2 * k + 1)], 'auto', 0., v_ego, signal_near)
+    cams.append(str(pm.sent[-1].camera) if len(pm.sent) > n else None)
+  return det, pm, cams
+
+
+def road_gaps(cams):
+  at = [k for k, c in enumerate(cams) if c == 'road']
+  return [b - a for a, b in zip(at, at[1:], strict=False)]
+
+
+def test_standing_at_a_signal_the_lights_are_read_every_other_run(monkeypatch):
+  # 1e 3+10 to 3+36 and 11+1.7 to 11+9.9: standing near a mapped signal with the curvature frozen at 0.0117. The paint is
+  # skipped outright there (noRoom: the lane changes and the wrong-side guard need it moving), so the road runs fit beside
+  # the lights: the full pass every RUN_EVERY frames, the road camera every other run (5 Hz, 0.2 s apart), each with its
+  # light read, never near the camera light's 1 s age-out
+  from openpilot.selfdrive.turnpilot.map_controls import CAMERA_STALE_S
+  det, pm, cams = junction_drive(monkeypatch, 200, 0., 0.0117, True)
+  runs = [c for c in cams if c is not None]
+  assert len(runs) == 100 and runs.count('road') == 50 and set(road_gaps(cams)) == {2 * RUN_EVERY}
+  assert 2 * RUN_EVERY * 0.05 < CAMERA_STALE_S / 4
+  road = [td for td in pm.sent if str(td.camera) == 'road']
+  assert all(td.lanePaintStatus == LanePaintStatus.noRoom and td.lightStatus == LightStatus.read for td in road)
+  assert len(det.lights.calls) == 50 and det.lane_paint.calls == [] and max(td.lightTime for td in road) > 0.
+  assert det.debt <= DEBT_CAP_S
+  # with no signal mapped near, the slow cycle's one road run in 3: the paint read where it fits (here it doesn't beside
+  # the lights: skipped for room, read anyway every PAINT_FORCE_S), the road runs never forced only
+  det, pm, cams = junction_drive(monkeypatch, 200, 0., 0.0117, False)
+  assert [c for c in cams if c is not None].count('road') >= 100 // 3 and max(road_gaps(cams)) <= 3 * RUN_EVERY
+  road = [td for td in pm.sent if str(td.camera) == 'road']
+  assert {str(td.lanePaintStatus) for td in road} == {'noRoom', 'read'}
+
+
+def test_the_paint_is_skipped_outright_only_under_its_readers_floors():
+  # standing near a signal the paint is skipped for the lights' room, but never where something reads it: the wrong-side
+  # guard (WRONG_SIDE_MIN_SPEED) and the lane planner's changes (LC_SPEED_MIN) read it from their floors up
+  from openpilot.selfdrive.turnpilot.detector.modeld_detector import PAINT_SKIP_V
+  from openpilot.selfdrive.turnpilot.lane_planner import LC_SPEED_MIN
+  from openpilot.selfdrive.turnpilot.turnpilotd import WRONG_SIDE_MIN_SPEED
+  assert PAINT_SKIP_V <= min(WRONG_SIDE_MIN_SPEED, LC_SPEED_MIN)
+  for v, near, want in ((0., True, LanePaintStatus.noRoom), (PAINT_SKIP_V - 0.1, True, LanePaintStatus.noRoom),
+                        (PAINT_SKIP_V, True, LanePaintStatus.read), (2.8, True, LanePaintStatus.read), (0., False, LanePaintStatus.read)):
+    det, pm = with_lights(make_detector(), 'addOnly'), PM()  # the light reader reading (lights_near)
+    det.slow_runs = 2  # the slow cycle's road run
+    det.alt_runs = 1   # the alternation's
+    det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(1), Meta(2)], v_ego=v, signal_near=near)
+    assert str(pm.sent[0].camera) == 'road' and pm.sent[0].lanePaintStatus == want, (v, near)
+
+
+def test_approaching_a_signal_the_paint_goes_before_the_lights(monkeypatch):
+  # moving straight toward a signal at a junction's light time: the road camera every run, at least every 3rd frame, the
+  # lights read on each, the paint skipped where it has no room beside them (noRoom) and read anyway every PAINT_FORCE_S
+  # (its estimate measured again); never a feature off for the drive
+  from openpilot.selfdrive.turnpilot.detector.modeld_detector import PAINT_FORCE_S
+  det, pm, cams = junction_drive(monkeypatch, 200, 8., 0.0, True)
+  assert all(c in (None, 'road') for c in cams) and max(road_gaps(cams)) <= 3 and len(road_gaps(cams)) >= 90
+  statuses = [td.lanePaintStatus for td in pm.sent]
+  assert statuses.count(LanePaintStatus.noRoom) >= 80 and 2 <= statuses.count(LanePaintStatus.read) <= 10 / PAINT_FORCE_S + 1
+  assert all(td.lightStatus == LightStatus.read for td in pm.sent) and det.lane_paint is not None and det.lights is not None
+  # the same frames before 11-06's fix: paint and lights together (a 9.3 ms debt) had room only on the forced runs
+  assert JUNCTION_MODEL_S + JUNCTION_DET_S + JUNCTION_PAINT_S + JUNCTION_LIGHT_S - STEP_BUDGET_S > DEBT_CAP_S
+
+
+def test_a_signalized_turn_reads_its_lights_to_the_line(monkeypatch):
+  # 1e 8+16 to 8+25: a right at a signal, its desire out from 39 m, then the turn: every run was wide. Now the approach
+  # (the desire, not yet turning) and the turn near the signal alternate 1:1, each road run with its light read
+  for curvature, v in ((0.002, 6.), (0.05, 4.)):
+    det, pm, cams = junction_drive(monkeypatch, 100, v, curvature, True, log.Desire.turnRight)
+    runs = [c for c in cams if c is not None]
+    assert len(runs) == 50 and runs.count('road') == 25, (curvature, v)
+    assert all(td.lightStatus == LightStatus.read for td in pm.sent if str(td.camera) == 'road')
+
+
+def test_the_lights_take_the_road_runs_only_while_their_reader_reads():
+  # 11-06 review: the outright paint skip and a signal's 1:1 alternation went with signal_near whatever the light reader
+  # did, so with TurnPilotCameraLights off, the reader in its retry backoff, or no road camera's reader, a stand near a
+  # signal skipped the paint and gave every other wide run to a road camera nothing read the lights on. They go with the
+  # reader reading (lights_near): without it the stand is the slow cycle's (one road run in 3, the paint read on it); the
+  # run its retry is due on alternates again, and reads
+  with sim_clock() as clock:
+    for setup in ('off', 'backoff', 'no reader'):
+      det, pm = with_lights(make_detector(), 'addOnly'), PM()
+      if setup == 'off':
+        det.light_mode = 'off'
+      elif setup == 'backoff':
+        det.light_failures, det.light_retry_at = 1, clock.t + 60.
+      else:
+        det.lights = None
+      for k in range(6 * RUN_EVERY):
+        clock.tick()
+        det.step(pm, det.model_state, 0.010, 0.0117, log.Desire.none, [Meta(2 * k), Meta(2 * k + 1)], v_ego=0., signal_near=True)
+      assert [str(td.camera) for td in pm.sent] == ['wide', 'wide', 'road'] * 2, setup
+      assert det.signal_near and not det.lights_near
+      road = [td for td in pm.sent if str(td.camera) == 'road']
+      assert all(td.lanePaintStatus == LanePaintStatus.read for td in road) and len(det.lane_paint.calls) == 2, setup
+      assert det.lights is None or det.lights.calls == []
+    # the reader reading: 1:1, the paint skipped outright, the lights read on every road run
+    det, pm = with_lights(make_detector(), 'addOnly'), PM()
+    for k in range(6 * RUN_EVERY):
+      clock.tick()
+      det.step(pm, det.model_state, 0.010, 0.0117, log.Desire.none, [Meta(2 * k), Meta(2 * k + 1)], v_ego=0., signal_near=True)
+    assert [str(td.camera) for td in pm.sent] == ['wide', 'road'] * 3 and det.lights_near
+    road = [td for td in pm.sent if str(td.camera) == 'road']
+    assert all(td.lanePaintStatus == LanePaintStatus.noRoom and td.lightStatus == LightStatus.read for td in road)
+    # in a backoff, then the step its retry is due: the slow cycle, then 1:1 again, its road run the retry's read
+    det, pm = with_lights(make_detector(), 'addOnly'), PM()
+    det.light_failures, det.light_retry_at = 1, clock.t + 0.5
+    cams = []
+    for k in range(10 * RUN_EVERY):
+      clock.tick()
+      n = len(pm.sent)
+      det.step(pm, det.model_state, 0.010, 0.0117, log.Desire.none, [Meta(2 * k), Meta(2 * k + 1)], v_ego=0., signal_near=True)
+      if len(pm.sent) > n:
+        cams.append((clock.t >= det.light_retry_at, str(pm.sent[-1].camera), pm.sent[-1].lightStatus))
+    assert [c for due, c, _ in cams if not due] == ['wide', 'wide', 'road', 'wide', 'wide']
+    assert [(c, st) for due, c, st in cams if due][:2] == [('wide', LightStatus.wideCamera), ('road', LightStatus.read)]
+    assert det.light_failures == 0 and len(det.lights.calls) >= 2
+
+
+def test_the_light_gates_are_logged_once_a_minute():
+  # 11-06 review: Light.reason carries only the heads', and the boxes the size and horizon gates stop are never heads, so
+  # the night tuning couldn't see how many class-9 boxes die there. The reader's funnel (frames, gated boxes, heads by
+  # reason and colour) is logged at most once in LIGHT_GATES_LOG_S, for a window that saw a box, the counts starting over
+  from unittest import mock
+  from openpilot.selfdrive.turnpilot.detector import modeld_detector
+  from openpilot.selfdrive.turnpilot.detector.light_state import LightReader
+  from openpilot.selfdrive.turnpilot.detector.modeld_detector import LIGHT_GATES_LOG_S
+  from openpilot.selfdrive.turnpilot.detector.tests.test_light_state import LENS, LEVEL, STRIDE, Y_HEIGHT, head, scene
+  frame, boxes = scene([head(0, 'red'), head(0, 'red', x0=900, w=6, h=18), head(0, 'red', x0=300, y0=500)])  # read, small, low
+  none = np.zeros((0, 6), np.float32)
+
+  class GateLights(FakeLights):
+    """FakeLights with CameraLightReader's real LightReader inside, reading the junction's three boxes, or none."""
+    def __init__(self):
+      super().__init__()
+      self.reader, self.boxes = LightReader(LENS), boxes
+
+    def read(self, f, meta, b):
+      self.reader.read(meta.timestamp_eof * 1e-9, frame, STRIDE, Y_HEIGHT, LEVEL, 1.22, self.boxes)
+      return super().read(f, meta, b)
+
+  assert LIGHT_GATES_LOG_S == 60.
+  with sim_clock() as clock, mock.patch.object(modeld_detector.cloudlog, 'event') as event:
+    det, pm = with_lights(make_detector(), 'addOnly'), PM()
+    det.lights = GateLights()
+    for k in range(int(130 / CYCLE_S)):  # 130 s at road speed: the road camera every full run, 10 Hz
+      clock.tick()
+      det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(2 * k), Meta(2 * k + 1)], v_ego=12.)
+    logs = [c.kwargs for c in event.call_args_list if c.args[0] == 'turnpilot.light_gates']
+    assert len(logs) == 2
+    for kw in logs:
+      n = kw['frames']
+      assert 590 <= n <= 610 and abs(kw['window_s'] - LIGHT_GATES_LOG_S) <= 0.11 and kw['source'] == 'road' and not kw['signal_near']
+      assert kw['gates'] == {'small': n, 'belowHorizon': n} and kw['heads'] == {'read': n} and kw['colours'] == {'red': n}
+      assert kw['boxes'] == 3 * n
+    # the boxes stop: the window they were in is logged once, a minute after it opened; one with none logs nothing, however long
+    det.lights.boxes = none
+    for k in range(int(130 / CYCLE_S)):
+      clock.tick()
+      det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(2 * k), Meta(2 * k + 1)], v_ego=12.)
+    logs = [c.kwargs for c in event.call_args_list if c.args[0] == 'turnpilot.light_gates']
+    assert len(logs) == 3 and 590 <= logs[2]['frames'] <= 610 and 90 <= logs[2]['heads']['read'] <= 110
 
 
 class TestCameraLights(OpenpilotTestCase):
@@ -269,6 +665,7 @@ class TestCameraLights(OpenpilotTestCase):
     (light,) = lights.lights
     assert str(light.state) == 'red' and abs(light.distance - 32.) < 1e-4 and light.votes == 4 and light.governs
     assert abs(light.conf - 0.8) < 1e-6 and abs(light.bearing - 1.5) < 1e-6 and len(light.box) == 4
+    assert str(light.read) == 'red' and light.reason == 'read'  # this frame's read and its reason
     assert pm.sent[1].lightStatus == LightStatus.wideCamera and len(pm.sent[1].lights.lights) == 0
 
   def test_add_only_mode_is_not_shadow(self):
@@ -285,37 +682,174 @@ class TestCameraLights(OpenpilotTestCase):
     det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(1), Meta(1)])
     assert pm.sent[0].lightStatus == LightStatus.off
 
-  def test_light_failure_turns_them_off_loudly_and_the_detector_keeps_going(self):
+  def test_a_reads_reason_and_its_frames_read_are_published(self):
+    # 11-06: 667 night reads, 0 greens, 85% of plausible heads with no vote, and the log couldn't say why: each head now
+    # carries this frame's read and the gate that stopped it beside its vote
+    head = LightHead(5, (0.4, 0.1, 0.41, 0.15), 0.6, 'red', 3, 'unknown', 'twoLit', -18., 17., False)
     det, pm = with_lights(make_detector()), PM()
-    det.lights.fail = True
+    det.lights = FakeLights([head])
     det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(1), Meta(2)])
-    assert det.lights is None and det.lights_failed and len(pm.sent) == 1 and len(pm.sent[0].detections) == 1
-    assert pm.sent[0].lightStatus == LightStatus.disabled and len(pm.sent[0].lights.lights) == 0
-    assert len(pm.sent[0].lanePaint) == 4  # the paint is its own
-    det.since_run = RUN_EVERY
-    det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(3), Meta(4)])
-    assert pm.sent[1].lightStatus == LightStatus.disabled  # for the drive, never back to off
+    (light,) = pm.sent[0].lights.lights
+    assert str(light.state) == 'red' and str(light.read) == 'unknown' and light.reason == 'twoLit' and not light.governs
 
-  def test_slow_lights_turn_off_and_the_detector_keeps_going(self):
+  def test_light_failure_is_retried_and_the_detector_keeps_going(self):
+    # never off for the drive: a failed read is logged, the road runs inside its backoff say retrying (no read: never an
+    # empty read that says no red), and after RETRY_S, doubling, the lights are read again. On the simulated clock
+    from unittest import mock
+    from openpilot.selfdrive.turnpilot.detector import modeld_detector
+    from openpilot.selfdrive.turnpilot.detector.modeld_detector import LIGHT_DISABLED_FAILS
+    from openpilot.selfdrive.turnpilot.map_controls import camera_light_input
+    assert LIGHT_DISABLED_FAILS == 3
+    with sim_clock() as clock, mock.patch.object(modeld_detector.cloudlog, 'exception') as logged:
+      det, pm = with_lights(make_detector()), PM()
+      det.lights.fail = True
+      clock.tick()
+      det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(1), Meta(2)])
+      assert det.lights is not None and det.light_failures == 1 and len(pm.sent) == 1 and len(pm.sent[0].detections) == 1
+      assert pm.sent[0].lightStatus == LightStatus.retrying and len(pm.sent[0].lights.lights) == 0
+      assert sum('lights failed' in c.args[0] for c in logged.call_args_list) == 1
+      assert len(pm.sent[0].lanePaint) == 4  # the paint is its own
+      assert det.light_retry_at == clock.t + RETRY_S
+      det.lights.fail = False
+      det.since_run = RUN_EVERY
+      clock.tick()
+      det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(3), Meta(4)])
+      assert pm.sent[1].lightStatus == LightStatus.retrying and det.lights.calls == []  # inside the backoff
+      det.since_run = RUN_EVERY
+      clock.tick(RETRY_S)
+      det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(5), Meta(6)])
+      assert pm.sent[2].lightStatus == LightStatus.read and len(pm.sent[2].lights.lights) == 1 and det.light_failures == 0
+      det.lights.fail = True
+      for k in range(2):
+        det.light_retry_at, det.since_run = 0., RUN_EVERY
+        clock.tick()
+        det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(7 + 2 * k), Meta(8 + 2 * k)])
+      assert det.light_failures == 2 and det.light_retry_at == clock.t + 2 * RETRY_S  # doubling
+      # two in a row are still a retry: turnpilotd's camera input takes retrying as no read at all, never a 'no red seen'
+      assert pm.sent[-1].lightStatus == LightStatus.retrying
+      assert camera_light_input(pm.sent[-1].lights, str(pm.sent[-1].lightStatus), 0., 'addOnly') is None
+
+  def test_a_reader_failing_every_retry_says_disabled_until_a_read(self):
+    # 11-06 review: since the reader stopped turning off for the drive, one failing on every retry all night said only
+    # retrying, which turnpilotd takes for no read and nothing says: the red-light rail's sensor gone and the driver not
+    # told. From LIGHT_DISABLED_FAILS failures in a row (3 s of nothing but failures) its road runs say disabled, logged once,
+    # still retried on the backoff to RETRY_MAX_S; the first read that succeeds is read again, said
+    from unittest import mock
+    from openpilot.selfdrive.turnpilot.detector import modeld_detector
+    from openpilot.selfdrive.turnpilot.detector.modeld_detector import LIGHT_DISABLED_FAILS, RETRY_MAX_S, backoff_s
+    cl = modeld_detector.cloudlog
+    with sim_clock() as clock, mock.patch.object(cl, 'exception') as failed, mock.patch.object(cl, 'error') as error, \
+         mock.patch.object(cl, 'warning') as warning:
+      det, pm = with_lights(make_detector(), 'addOnly'), PM()
+      det.lights.fail = True
+      tries, statuses, t0 = [], [], clock.t
+      for k in range(int(240 / CYCLE_S)):  # four minutes at road speed: every full run on the road camera, 10 Hz
+        clock.tick()
+        n, f = len(pm.sent), det.light_failures
+        det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(2 * k), Meta(2 * k + 1)], v_ego=12.)
+        if len(pm.sent) > n:
+          statuses.append((round(clock.t - t0, 2), str(pm.sent[-1].lightStatus)))
+        if det.light_failures > f:
+          tries.append(round(clock.t - t0, 2))
+      # retried on the full pass's backoff (1, 2, 4 ... 60 s), every try logged, and only the third one onward says disabled
+      waits = [b - a for a, b in zip(tries, tries[1:], strict=False)]  # each on the first road run its backoff allows
+      assert len(tries) >= 8 and all(backoff_s(i + 1) - 1e-6 <= w <= backoff_s(i + 1) + RUN_EVERY * CYCLE_S + 1e-6 for i, w in enumerate(waits))
+      assert backoff_s(len(tries)) == RETRY_MAX_S and failed.call_count == len(tries)
+      third = tries[LIGHT_DISABLED_FAILS - 1]
+      assert {st for t, st in statuses if t < third} == {'retrying'}
+      assert {st for t, st in statuses if t >= third} == {'disabled'}
+      assert third - tries[0] <= 3 * RETRY_S + 2 * RUN_EVERY * CYCLE_S + 1e-6  # 3 s of nothing but failures
+      assert [c.args[0] for c in error.call_args_list] == [
+        "turnpilot lights: 3 failed reads in a row, lightStatus disabled until a read succeeds (still retried)"]
+      # it reads again on the next retry, said
+      det.lights.fail = False
+      while not det.lights.calls:
+        clock.tick()
+        det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(9000), Meta(9001)], v_ego=12.)
+      assert pm.sent[-1].lightStatus == LightStatus.read and len(pm.sent[-1].lights.lights) == 1 and det.light_failures == 0
+      assert sum('read again' in c.args[0] for c in warning.call_args_list) == 1 and error.call_count == 1
+
+  def test_a_disabled_reader_reaches_the_driver_once(self):
+    # the chain past modeld: turnpilotd's camera input (TurnPilot.camera_lights) keeps a disabled read past CAMERA_STALE_S,
+    # through the wide runs and the backoff, as no read that names no red (shadow, no heads, unsignalized_why's 'camera');
+    # map_controls says it once (camera_lights_off, 'Camera light reader off')
+    from types import SimpleNamespace
+    from unittest import mock
+    from openpilot.common.realtime import DT_MDL
+    from openpilot.selfdrive.turnpilot import map_controls
+    from openpilot.selfdrive.turnpilot.detector import modeld_detector
+    from openpilot.selfdrive.turnpilot.map_controls import CAMERA_OFF_REASON, CAMERA_STALE_S, Lights
+    from openpilot.selfdrive.turnpilot.tests.test_map_controls import Car
+    from openpilot.selfdrive.turnpilot.turnpilotd import TurnPilot
+    assert DT_MDL == CYCLE_S
+
+    class SM:
+      def __init__(self):
+        self.updated, self.msg = {'turnpilotDetections': False}, None
+
+      def __getitem__(self, name):
+        return self.msg
+
+    tp, sm = SimpleNamespace(camera_age=float('inf'), camera_read=None, camera_mode='addOnly'), SM()
+    car = Car([(2000., 'signal')])
+    cl = modeld_detector.cloudlog
+    with sim_clock() as clock, mock.patch.object(cl, 'exception'), mock.patch.object(cl, 'error'), \
+         mock.patch.object(map_controls.cloudlog, 'event') as events:
+      det, pm = with_lights(make_detector(), 'addOnly'), PM()
+      det.lights.fail = True
+      cams, alerts = [], []
+      for k in range(int(30 / CYCLE_S)):
+        clock.tick()
+        n = len(pm.sent)
+        det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(2 * k), Meta(2 * k + 1)], v_ego=0.)  # standing: 1 road run in 3
+        sm.updated['turnpilotDetections'] = len(pm.sent) > n
+        sm.msg = pm.sent[-1] if pm.sent else None
+        cam = TurnPilot.camera_lights(tp, sm, {'turnpilotDetections': sm.msg})
+        cams.append(cam)
+        out, _, _ = car.step(lights=Lights(camera=cam))
+        alerts.append((out.alert, out.reason))
+    first = next(i for i, c in enumerate(cams) if c is not None and c.status == 'disabled')
+    assert first * CYCLE_S <= 3.5 and all(c is not None and c.status == 'disabled' and c.heads == [] and c.shadow for c in cams[first:])
+    assert (len(cams) - first) * CYCLE_S > 20 * CAMERA_STALE_S  # kept, never aged out
+    said = [i for i, (a, r) in enumerate(alerts) if a == 'lightSourceRejected' and r == CAMERA_OFF_REASON]
+    assert said and said[0] >= first and said == list(range(said[0], said[-1] + 1))  # one stretch: said once
+    assert sum(c.args[0] == 'turnpilot.camera_lights_off' for c in events.call_args_list) == 1
+
+  def test_slow_lights_stay_on_and_are_warned_once_a_minute(self):
+    # 11-06: light medians to 3.74 ms against the 4.0 ms that turned them off for the drive, at the junctions where a red
+    # must stop the car. Over LIGHT_BUDGET_S they stay on, warned at most once in BUDGET_WARN_S
+    from unittest import mock
+    from openpilot.selfdrive.turnpilot.detector import modeld_detector
     det, pm = with_lights(make_detector()), PM()
     det.lights.delay = LIGHT_BUDGET_S * 1.5
-    for k in range(TIME_WINDOW):
-      det.since_run = RUN_EVERY
-      det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(2 * k), Meta(2 * k + 1)])
-    assert det.lights is None and all(m.lightTime > LIGHT_BUDGET_S for m in pm.sent)
-    det.since_run = RUN_EVERY
-    det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(100), Meta(101)])
-    assert pm.sent[-1].lightStatus == LightStatus.disabled and len(pm.sent[-1].detections) == 1
+    with mock.patch.object(modeld_detector.cloudlog, 'warning') as warned:
+      for k in range(TIME_WINDOW + 3):
+        det.since_run, det.debt = RUN_EVERY, 0.
+        det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(2 * k), Meta(2 * k + 1)])
+    assert sum('lights over budget' in c.args[0] for c in warned.call_args_list) == 1
+    assert det.lights is not None and det.light_failures == 0 and all(m.lightTime > LIGHT_BUDGET_S for m in pm.sent)
+    assert all(m.lightStatus == LightStatus.read and len(m.lights.lights) == 1 for m in pm.sent)
 
   def test_light_time_counts_toward_the_step_budget(self):
-    det, pm = with_lights(make_detector(det_time=0.006)), PM()
-    det.lane_paint = None
-    det.light_times.extend([0.003] * 3)
-    det.step(pm, det.model_state, STEP_BUDGET_S, 0.0, log.Desire.none, [Meta(1), Meta(2)])
-    assert pm.sent == []
-    det.light_mode = 'off'  # off: its time no longer counts
-    det.step(pm, det.model_state, STEP_BUDGET_S, 0.0, log.Desire.none, [Meta(1), Meta(2)])
-    assert len(pm.sent) == 1
+    # 6 ms detector + 3 ms lights at the budget: 9 ms, past DEBT_CAP_S; off, 6 (on the simulated clock: SimClock)
+    with sim_clock() as clock:
+      det, pm = with_lights(make_detector(det_time=0.006)), PM()
+      det.lane_paint = None
+      det.light_times.extend([0.003] * 3)
+      clock.tick()
+      det.step(pm, det.model_state, STEP_BUDGET_S, 0.0, log.Desire.none, [Meta(1), Meta(2)])
+      assert pm.sent == []
+      det.light_mode = 'off'  # off: its time no longer counts
+      clock.tick()
+      det.step(pm, det.model_state, STEP_BUDGET_S, 0.0, log.Desire.none, [Meta(1), Meta(2)])
+      assert len(pm.sent) == 1
+      # in its retry backoff it reads nothing, so its time doesn't count either (estimate, light_reading)
+      det, pm = with_lights(make_detector(det_time=0.006)), PM()
+      det.lane_paint = None
+      det.light_times.extend([0.003] * 3)
+      det.light_retry_at = clock.tick() + 1.
+      det.step(pm, det.model_state, STEP_BUDGET_S, 0.0, log.Desire.none, [Meta(1), Meta(2)])
+      assert len(pm.sent) == 1 and pm.sent[0].lightStatus == LightStatus.retrying
 
 
 class LightParams:
@@ -330,11 +864,14 @@ class LightParams:
 
 
 def test_camera_lights_mode():
-  assert camera_lights_mode(LightParams(None)) == 'shadow'  # the default: shadow, logged, never acted on
+  # the default is add-only since 5dcb363 (camera reds stop the car); this test still said shadow
+  assert LIGHT_MODE_DEFAULT == 'addOnly'
+  assert camera_lights_mode(LightParams(None)) == LIGHT_MODE_DEFAULT
   assert camera_lights_mode(LightParams('off')) == 'off'
+  assert camera_lights_mode(LightParams('shadow')) == 'shadow'
   assert camera_lights_mode(LightParams('addOnly')) == 'addOnly'
-  assert camera_lights_mode(LightParams('loud')) == 'shadow'
-  assert camera_lights_mode(LightParams(unknown=True)) == 'shadow'  # a build whose params predate the key
+  assert camera_lights_mode(LightParams('loud')) == LIGHT_MODE_DEFAULT
+  assert camera_lights_mode(LightParams(unknown=True)) == LIGHT_MODE_DEFAULT  # a build whose params predate the key
 
 
 class TestLanePaintReader(OpenpilotTestCase):
