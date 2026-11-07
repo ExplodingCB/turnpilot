@@ -50,6 +50,14 @@ LONG_SMOOTH_SECONDS = 0.3
 MIN_LAT_CONTROL_SPEED = 0.3
 BIG_MODEL_TIMEOUT = 60
 
+# TurnPilot: the desires a finished turn's clear takes out of the model's desire queue (hooks.plan_desire's clear)
+TURN_DESIRES = [log.Desire.turnLeft, log.Desire.turnRight]
+# TurnPilot: a frame whose work (frames in hand to the detector step's end) took longer than this is logged as a
+# modeld.slow_frame event, at most one each SLOW_FRAME_LOG_S. 100 ms is two model frames: one past it drops a frame, and
+# selfdrived's modeldLagging (frameDropPerc > 1) is a few of them close together (1e seg 1, 11-06: one 419 ms frame)
+SLOW_FRAME_S = 0.1
+SLOW_FRAME_LOG_S = 1.0
+
 
 def note_big_model(params, kind, exc, took_s, retry, waited_s, wait_error) -> None:
   """TurnPilot diagnostics: one TurnPilotDiagEvents event for a big model failure, so the phone's report says why it is
@@ -75,6 +83,88 @@ def successor_heard() -> Callable[[], bool]:
   """Whether a successor modeld published modelV2 since the last call (its liveness, chestnut_recovery.STALL_S)."""
   sock = messaging.sub_sock('modelV2', conflate=True, timeout=0)
   return lambda: sock.receive(non_blocking=True) is not None
+
+
+def clear_turn_desires(model) -> tuple[float, bool]:
+  """TurnPilot: a finished turn's desires out of the model's desire queue (hooks.plan_desire's clear), timed and logged
+  with the time it took; returns (seconds, ok): those seconds and whether the desires came out (the frame's slow_frame
+  clear_ms, cleared and clear_failed). A failure is logged with its time and the pulse ages out of the queue as before.
+  The time is on the log line because the first clear of 1e (11-06) froze modeld for ~370 ms and nothing said so but the
+  modelV2 gap (ModelState.warm_desire_clear). ok is there because, through the 11-06 round, a clear that raised returned
+  its time like one that worked, and the slow frame it caused logged cleared=True: a slow clear, not a failed one."""
+  t0 = time.perf_counter()
+  try:
+    model.clear_desire_history(TURN_DESIRES)
+  except Exception:
+    took = time.perf_counter() - t0
+    cloudlog.exception(f"turnpilot: desire clear failed after {took * 1e3:.0f} ms")  # the pulse ages out of the queue as before
+    return took, False
+  took = time.perf_counter() - t0
+  cloudlog.info(f"turnpilot: turn desires cleared from the model's desire queue in {took * 1e3:.0f} ms")
+  return took, True
+
+
+class SlowFrameLog:
+  """TurnPilot: a modeld.slow_frame event for a frame whose work took over SLOW_FRAME_S, at most one each
+  SLOW_FRAME_LOG_S, so the next stall says where its time went instead of showing only as a modelV2 gap. In 1e seg 1
+  (11-06) frame 1872 published 419 ms after its EOF on a 42.1 ms model run, seven frames were dropped, frameDropPerc
+  reached 3.37 against selfdrived's > 1 and modeldLagging soft-disabled openpilot mid-left at 11 mph; only the timing of
+  the 'turn desires cleared' line tied it to the clear.
+
+  The frame's work runs from its frames in hand (the vipc receives done) to the detector step's end: the wait for
+  camerad's next frame is not modeld's own time, and a hand-over to a successor (chestnut_recovery) is not a frame.
+  Fields: ms (the work), model_ms (model.run), cleared (a turn-desire clear ran on this frame and took them out),
+  clear_failed (one ran and raised: clear_turn_desires' ok False) and clear_ms (its time either way, 0 with no clear),
+  detector_ms (DetectorHost.step, 0 when it didn't run), frame_id (the main camera's), unlogged (the slow frames the rate
+  limit held back, all in the SLOW_FRAME_LOG_S after the last event) and since_last_s (the seconds since that event, None
+  for the first): in the 1e replay the stall's event carried the 8 held back from the startup burst 40 s before, which
+  without since_last_s reads as 8 more stalls at the clear. event: cloudlog.event, injectable for the tests."""
+
+  def __init__(self, event: Callable | None = None):
+    self.event = event if event is not None else cloudlog.event
+    self.last_t: float | None = None  # time.monotonic() of the last event
+    self.unlogged = 0
+
+  def update(self, now: float, frame_s: float, model_s: float, clear: tuple[float, bool] | None, detector_s: float,
+             frame_id: int) -> bool:
+    """One frame's times in seconds, clear clear_turn_desires' (seconds, ok) (None: no clear on this frame); whether it
+    was logged."""
+    if frame_s <= SLOW_FRAME_S:
+      return False
+    if self.last_t is not None and now - self.last_t < SLOW_FRAME_LOG_S:
+      self.unlogged += 1
+      return False
+    clear_s, ok = clear if clear is not None else (0., None)
+    self.event('modeld.slow_frame', ms=round(frame_s * 1e3, 1), model_ms=round(model_s * 1e3, 1), cleared=ok is True,
+               clear_failed=ok is False, clear_ms=round(clear_s * 1e3, 1), detector_ms=round(detector_s * 1e3, 1),
+               frame_id=int(frame_id), unlogged=self.unlogged, since_last_s=None if self.last_t is None else round(now - self.last_t, 1))
+    self.last_t, self.unlogged = now, 0
+    return True
+
+
+def load_detector(params, link, cam_w: int, cam_h: int, main_wide_camera: bool, use_extra_client: bool, models: list,
+                  host_cls=None):
+  """TurnPilot: YOLO26 after modelV2, on the frames already uploaded. The host loads it now or once TurnPilotEnabled is
+  set mid-drive, for the small model too; with it unset or no pkl nothing runs, and None (an import failure) changes
+  nothing. host_cls: DetectorHost, injectable for the tests.
+
+  Then ChestnutLoading clears (modeld's own, never a successor's: its parent drives meanwhile), loaded or not: the
+  detector's ~19.5 s load (far crop, side views, native schedule) comes before the first modelV2, so selfdrived's big
+  model settling (bigModelLoading, then its 5 s warm-up) covers it. Cleared before it, as through 11-06, selfdrived saw
+  modelV2 not alive and raised commIssue for those 15 s at every start (1e seg 0: 0+34.7 to 0+50.2; 1d the same)."""
+  detector = None
+  try:
+    if host_cls is None:
+      from openpilot.selfdrive.turnpilot.detector.modeld_detector import DetectorHost as host_cls
+    host = host_cls(params, cam_w, cam_h, main_wide_camera, use_extra_client, models)
+    if host.check_enabled(time.monotonic()):
+      host.load()
+    detector = host
+  except Exception:
+    cloudlog.exception("turnpilot detector failed to load")
+  if link is None:
+    params.put_bool("ChestnutLoading", False)
+  return detector
 
 
 def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
@@ -256,15 +346,93 @@ class ModelState:
     buf.copy_from(Tensor(q, device='NPY')._buffer())
     self.prev_desire[desires] = 0
 
-  def warmup(self) -> None:
+  def warm_desire_clear(self) -> None:
+    """TurnPilot: one clear_desire_history of both turn desires at load, so the frame loop's first clear doesn't pay
+    tinygrad's first use of its read-back and copy-in (lowering and compiling them for this device) mid-drive.
+
+    1e seg 1 (11-06), the first clear since modeld started: modelV2 frame 1871 at 1+33.27, the 'turn desires cleared'
+    line at 1+33.66, frame 1872 at 1+33.67 published 419 ms after its EOF on a 42.1 ms model run, then frame 1880. Seven
+    frames dropped, frameDropPerc 3.37 against selfdrived's > 1, and modeldLagging soft-disabled openpilot ('TAKE CONTROL
+    IMMEDIATELY') mid-left at 11 mph, 12 s into the night's first engagement. The three later clears that drive cost at
+    most ~80 ms of publish latency against a p99 of ~75 ms: the cost is a first use, not the copy, so one call here takes
+    it. Each real clear makes new host buffers and only the first was slow, so what that first use builds isn't tied to
+    them: a call on the same queue and device takes it.
+
+    Called on a zeroed queue (the end of warmup(), or a model fresh from its constructor): a clear of zeros is zeros, so
+    it changes no state.
+
+    A failure on the chestnut is sorted by what the chestnut does next, not by its exception: warmup()'s dummy frame runs
+    again (frame_fault), the frame that just ran on the same inputs. If that raises too, the big model can't run its frame
+    (a fault, or state the failure left behind) and the clear's exception raises out of warmup(), so the load fails as a
+    load: load_big's 'big model load failed' and note_big_model 'failed to load' (the clear's
+    exception), then the startup ChestnutRetry onroad cycle from a freshly reset GPU; a successor's link.failed('load:
+    ...'). Swallowed, as when this warm call went in (11-06), warmup() returned, ChestnutActive went True and the fault
+    came out on the first frame as 'failed while running' instead (review, 11-06). If the frame runs, the chestnut works:
+    the failure is logged, the state zeroed again (the probe frame dirtied it, and a copy-in the failure cut short may
+    have too) and the load goes on; the first real clear pays its first use as before, and if it fails too the pulse ages
+    out. A fault the GPU came back from (AMD's on_device_hang resets it before it raises 'Device hang detected') goes on
+    the same way: the chestnut ran a frame after it, as the frame loop's first frame would.
+    The exception can't sort it. Not by the error word: on_device_hang zeroes it in that reset. Not by type: tinygrad
+    raises its own code errors as RuntimeError like its device faults (tensor.py's 'assign dtype mismatch' and "can't
+    create Tensor from", uop/ops.py's checks, device.py's 'buffer of size ... is too large', beside device.py's 'signal
+    wait timed out' and 'failed with N' and support/usb.py's libusb errors). The type rule that first fixed the swallow
+    (11-06) failed the load on any RuntimeError, MemoryError or OSError, so a deterministic code bug in the clear (a
+    tinygrad bump, a change to the desire queue) cost the big model at every start, its retry and every successor, where
+    swallowed it costs a pulse ageing out at each turn (review, 11-06 round 2). The probe runs on this failure path only:
+    one frame, or on a wedged chestnut up to AMDDevice.wait_timeout_ms (main()'s 3 s) before it raises, after the clear's
+    own 3 s; 11-06's loads took 29.1 s and 32.8 s, so ~39 s at worst against BIG_MODEL_TIMEOUT's 60.
+
+    On the small model anything is logged and swallowed, with no probe: main() calls this outside any load-failure path,
+    and comma's model stays the fallback; a real fault on comma's GPU comes out on its first frame (main()'s 'if not
+    model.chestnut: raise')."""
+    t0 = time.perf_counter()
+    try:
+      self.clear_desire_history(TURN_DESIRES)
+    except Exception as e:
+      if not self.chestnut:
+        cloudlog.exception("turnpilot: desire clear warm-up failed, the first turn's clear pays its first use")
+        return
+      if (fault := self.frame_fault()) is not None:
+        failed = f"{type(e).__name__}: {e}"
+        cloudlog.error(f"turnpilot: the chestnut faulted in the desire clear warm-up ({failed}) and a frame after it ({fault}), the big model's load fails")
+        raise
+      went_on = "but the chestnut ran a frame after it, so the load goes on; the first turn's clear pays its first use"
+      cloudlog.exception(f"turnpilot: desire clear warm-up failed on the big model ({type(e).__name__}) {went_on}")
+      self.zero_state()
+      return
+    took_ms = (time.perf_counter() - t0) * 1e3
+    cloudlog.info(f"turnpilot: desire clear warmed on the {'big' if self.chestnut else 'small'} model in {took_ms:.0f} ms")
+
+  def frame_fault(self) -> str | None:
+    """TurnPilot: warm_desire_clear's probe of the chestnut after a failure, warmup()'s dummy frame again: None when it
+    ran, else what it raised ('Type: message'). Its state is the caller's to zero."""
+    try:
+      self.run_dummy_frame()
+    except Exception as e:
+      return f"{type(e).__name__}: {e}"
+    return None
+
+  def run_dummy_frame(self) -> None:
+    """warmup()'s frame: zero frames, identity transforms, zero inputs (TurnPilot: shared with frame_fault)."""
     dummy_frames = {k: np.zeros(self.frame_copy_size, dtype=np.uint8) for k in self.vision_input_names}
     eye = np.eye(3, dtype=np.float32)
     dims = {'desire_pulse': ModelConstants.DESIRE_LEN, 'traffic_convention': 2, 'action_t': 2}
     self.run(dummy_frames, dict.fromkeys(self.vision_input_names, eye), {k: np.zeros(v, dtype=np.float32) for k, v in dims.items()})
+
+  def zero_state(self) -> None:
+    """warmup()'s reset after its frame: the packed inputs, the state queues and prev_desire (TurnPilot: shared with
+    warm_desire_clear, after frame_fault's frame)."""
     self.packed_input[:] = 0
     for key in self.state_pairs:
       self.input_queues[key].assign(0).realize()
     self.prev_desire[:] = 0
+
+  def warmup(self) -> None:
+    self.run_dummy_frame()
+    self.zero_state()
+    # TurnPilot: the turn-desire clear's first use, on the zeroed queue (warm_desire_clear); a successor's warmup too. A
+    # chestnut that fails it and then a frame raises out of here: a load failure, as the dummy run's would be
+    self.warm_desire_clear()
 
 
 def main(demo=False, successor: str | None = None):
@@ -367,24 +535,18 @@ def main(demo=False, successor: str | None = None):
       big_loaded = model is not None
 
   small_model = ModelState(vipc_client_main.width, vipc_client_main.height, False) if link is None and (model is None or CHESTNUT) else None
+  if small_model is not None:
+    # TurnPilot: the small model is never warmup()'d (comma's), so its clear's first use is taken here, on its fresh zeroed
+    # queue: the model without a chestnut, and the fallback's first turn after a big model failure
+    small_model.warm_desire_clear()
   if model is None:
     model = small_model
-  if link is None:
-    params.put_bool("ChestnutLoading", False)
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
   loaded_at = time.monotonic()
 
-  # TurnPilot: YOLO26 after modelV2, on the frames already uploaded. The host loads it now or once TurnPilotEnabled is set
-  # mid-drive, for the small model too; with it unset or no pkl nothing runs, and None (an import failure) changes nothing
-  detector = None
-  try:
-    from openpilot.selfdrive.turnpilot.detector.modeld_detector import DetectorHost
-    host = DetectorHost(params, vipc_client_main.width, vipc_client_main.height, main_wide_camera, use_extra_client, [model, small_model])
-    if host.check_enabled(time.monotonic()):
-      host.load()
-    detector = host
-  except Exception:
-    cloudlog.exception("turnpilot detector failed to load")
+  # TurnPilot: the detector, then ChestnutLoading cleared (load_detector: selfdrived's big model settling covers the load)
+  detector = load_detector(params, link, vipc_client_main.width, vipc_client_main.height, main_wide_camera, use_extra_client,
+                           [model, small_model])
 
   if link is None:  # a successor takes modeld's realtime slot only when it goes live, off its parent's core until then
     config_realtime_process(7, 54)
@@ -442,6 +604,7 @@ def main(demo=False, successor: str | None = None):
 
   DH = DesireHelper()
   desire_cleared = False
+  slow_frames = SlowFrameLog()
   if link is not None:
     link.loaded()
 
@@ -478,18 +641,14 @@ def main(demo=False, successor: str | None = None):
       buf_extra = buf_main
       meta_extra = meta_main
 
+    frame_t0 = time.perf_counter()  # TurnPilot: this frame's work starts with its frames in hand (SlowFrameLog)
     sm.update(0)
     desire = DH.desire
     # TurnPilot: nav turn desires go in while DesireHelper is idle (a nav lane change goes through DesireHelper) and
-    # openpilot is steering, and a finished turn's desire comes out of the model's desire queue
+    # openpilot is steering, and a finished turn's desire comes out of the model's desire queue, timed (clear_turn_desires)
     tp = active_plan(sm)
     tp_desire, clear = plan_desire(tp.desire, sm['carControl'].latActive) if tp is not None else (log.Desire.none, False)
-    if clear and not desire_cleared:
-      try:
-        model.clear_desire_history([log.Desire.turnLeft, log.Desire.turnRight])
-        cloudlog.info("turnpilot: turn desires cleared from the model's desire queue")
-      except Exception:
-        cloudlog.exception("turnpilot: desire clear failed")  # the pulse ages out of the queue as before
+    clear_result = clear_turn_desires(model) if clear and not desire_cleared else None  # (seconds, ok), None: no clear
     desire_cleared = clear
     if desire == log.Desire.none:
       desire = tp_desire
@@ -605,13 +764,21 @@ def main(demo=False, successor: str | None = None):
       pm.send('cameraOdometry', posenet_send)
     last_vipc_frame_id = meta_main.frame_id
 
+    detector_s = 0.
     if detector is not None and model_output is not None and publishing:
       from openpilot.selfdrive.turnpilot.detector.modeld_detector import plan_inputs
       # the camera TurnPilot asks for (DESIGN phase 4 G4, the stop sweeps), where the far crop looks (G5) and whether a signal
       # is mapped near: read in shadow too, where it steers nothing
       view, far_bearing, signal_near = plan_inputs(fresh_plan(sm))
+      detector_t0 = time.perf_counter()
       detector.step(pm, model, model_execution_time, prev_action.desiredCurvature, desire, [meta_main, meta_extra], sm['carControl'].enabled,
                     view, far_bearing, v_ego, signal_near)
+      detector_s = time.perf_counter() - detector_t0
+
+    # TurnPilot: a slow frame says where its time went (SlowFrameLog); a successor not yet live publishes nothing to lag
+    if publishing:
+      slow_frames.update(time.monotonic(), time.perf_counter() - frame_t0, model_execution_time, clear_result, detector_s,
+                         meta_main.frame_id)
 
     # TurnPilot: the big model back. With openpilot disengaged and the successor sane on these frames, this process stops
     # publishing, and waits on the successor while it publishes; when it stops, this process publishes again on the small
