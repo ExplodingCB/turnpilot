@@ -54,6 +54,42 @@ def setup_needed(params) -> bool:
 
 
 DONE_LINES_MAX = 8
+STALK_LINE = "When the comma chimes \"Signal Left\" or \"Signal Right\", tap the stalk that way."
+# under TurnPilotCarSignalsForceOn (the default since 2026-11-06) the car signals every drive with no lamp check, and the
+# comma asks for the stalk only where a lamp doesn't light: on the 11-06 drive none lit (opendbc tesla/car_signal.py: this
+# Model 3's body controller is on vehicle CAN, which the comma reaches only through a vehicle-CAN tap: xnor's Vehicle CAN
+# Addon Cable at the CAN debug port in the passenger-side A-pillar; docs/turnpilot/INSTALL.md cites the sources)
+FORCED_STALK_LINE = ("The car signals its own turns. If a lamp doesn't light, the comma chimes \"Signal Left\" or " +
+                     "\"Signal Right\": tap the stalk that way.")
+
+
+def stalk_line(params) -> str | None:
+  """The done screen's stalk line: none once the lamp check passed (TurnPilotCarSignals on); else STALK_LINE, or, while the
+  car signals with no check (setup_state.signals_forced), FORCED_STALK_LINE. Until 2026-11-06 it was STALK_LINE whatever
+  TurnPilotCarSignalsForceOn said, telling the driver to signal every turn the car was signalling."""
+  if (params.get('TurnPilotCarSignals') or 'off') == 'on':
+    return None
+  return FORCED_STALK_LINE if ss.signals_forced(params) else STALK_LINE
+
+
+def signals_sentences(params) -> list[str]:
+  """The signals step's two sentences. With TurnPilotCarSignalsForceOn on, skip leaves the car signalling: until 2026-11-06
+  the step said the comma would ask for the stalk at each turn."""
+  if ss.signals_forced(params):
+    return ["The car works its own turn signal for TurnPilot's turns, on every drive.",
+            "A check in Park shows whether its lamps light. Skip it, and the car still signals; where a lamp doesn't light, " +
+            "the comma asks you to tap the stalk."]
+  return ["TurnPilot can work the car's own turn signal, after a check in Park.",
+          "Skip it, and the comma asks you to tap the stalk at each turn."]
+
+
+def signals_failed(params) -> tuple[str, str]:
+  """The 'failed' card's (header, sentence). setup_state.signals_off sets TurnPilotCarSignals off; under
+  TurnPilotCarSignalsForceOn the car signals all the same, so "car signals are off" (the card until 2026-11-06) was false."""
+  if ss.signals_forced(params):
+    return ("check didn't pass", "The check didn't pass. The car still signals at each turn; where a lamp doesn't light, " +
+            "the comma asks you to tap the stalk.")
+  return "car signals off", "The check didn't pass, so car signals are off. The comma asks you to tap the stalk."
 
 
 def done_lines(params) -> list[str]:
@@ -67,8 +103,9 @@ def done_lines(params) -> list[str]:
            "4. Engage with the cruise stalk.",
            "5. Enter a destination on the phone.",
            f"TurnPilot starts {live}."]
-  if (params.get('TurnPilotCarSignals') or 'off') != 'on':
-    lines.append("When the comma chimes \"Signal Left\" or \"Signal Right\", tap the stalk that way.")
+  stalk = stalk_line(params)
+  if stalk:
+    lines.append(stalk)
   lines.append(ss.UPDATE_LINE)
   return lines
 
@@ -270,16 +307,14 @@ class EngineStep(SetupStep):
 
 
 class SignalsStep(SetupStep):
-  """Optional and skipped by default: the car works its own turn signal after car_signals.py's check in Park. It only
-  writes TurnPilotCarSignalsVinless and TurnPilotCarSignals; the check itself is card's, at the next ignition, and the
-  outside lamps are answered on the phone. Never offered in Drive."""
+  """Optional and skipped by default: car_signals.py's lamp check in Park. Under TurnPilotCarSignalsForceOn (the default since
+  2026-11-06) the car works its own turn signal with or without it; with that off, only after it. It only writes
+  TurnPilotCarSignalsVinless and TurnPilotCarSignals; the check itself is card's, at the next ignition, and the outside
+  lamps are answered on the phone. Never offered in Drive. Its words follow the params (signals_sentences, signals_failed)."""
   STEP = 'signals'
 
   def __init__(self, next_callback, later_callback):
-    super().__init__("car turn signals", [
-      "TurnPilot can work the car's own turn signal, after a check in Park.",
-      "Skip it, and the comma asks you to tap the stalk at each turn.",
-    ], next_callback, later_callback, next_text="skip")
+    super().__init__("car turn signals", signals_sentences(ui_state.params), next_callback, later_callback, next_text="skip")
     self._header.set_value("optional: scroll\nto continue")
     self._phase = 'choose'
     self._started_when = None
@@ -299,7 +334,7 @@ class SignalsStep(SetupStep):
     self._broken = BigPillButton("something's\nwrong")
     self._broken.set_click_callback(self._fail)
     self._cycle = GreyBigButton("", "Turn the car off and on once more. Then the car signals its own turns.")
-    self._failed = GreyBigButton("", "The check didn't pass, so car signals are off. The comma asks you to tap the stalk.")
+    self._failed = GreyBigButton("", signals_failed(ui_state.params)[1])
     self._done_next = BigPillButton("next", green=True)
     self._done_next.set_click_callback(next_callback)
     self.build()
@@ -337,11 +372,16 @@ class SignalsStep(SetupStep):
     self._scroller.scroll_panel.set_offset(0.0)
 
   HEADER = {'choose': "optional: scroll\nto continue", 'checking': "the check, in Park", 'confirm': "the lamps flashed",
-            'cycle': "car signals on", 'failed': "car signals off"}
+            'cycle': "car signals on"}  # 'failed': signals_failed, which reads TurnPilotCarSignalsForceOn
 
   def _show_phase(self):
     p = self._phase
-    self._header.set_value(self.HEADER[p])
+    params = ui_state.params
+    failed_header, failed_text = signals_failed(params)
+    self._header.set_value(failed_header if p == 'failed' else self.HEADER[p])
+    self._failed.set_value(failed_text)
+    for w, text in zip(self._sentences, signals_sentences(params), strict=True):
+      w.set_value(text)
     for w in self._sentences:
       w.set_visible(p == 'choose')
     self._next.set_visible(p == 'choose')
@@ -385,7 +425,7 @@ class DoneStep(SetupStep):
 
   def show_event(self):
     lines = done_lines(ui_state.params)
-    for i, card in enumerate(self._sentences):  # built with the most lines (car signals off); fewer with them on
+    for i, card in enumerate(self._sentences):  # built with the most lines (a stalk line); one fewer after a passed check
       card.set_visible(i < len(lines))
       if i < len(lines):
         card.set_value(lines[i])

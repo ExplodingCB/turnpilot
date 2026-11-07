@@ -213,17 +213,19 @@ def check_detector(path: Path, chestnut: bool) -> Check:
 
 def check_far_crop(path: Path, far_range_m: float, on: bool) -> Check:
   """The far crop (DESIGN phase 4 G5): its pkl, TurnPilotFarCrop and its measured range (TurnPilotLeftFarRangeM), which a
-  left past the full pass's range (45-55 mph oncoming) needs. Without them those lefts are skipped and rerouted: a warning."""
+  left past the full pass's range (45-55 mph oncoming) needs to go. Without them those lefts are still driven to their line and
+  hand back there, the car held (never skipped or rerouted since 2026-11-06): a warning."""
   name = "far crop"
   size = path.stat().st_size if path.is_file() else 0
   if size <= MIN_PKL_BYTES:
     why = "empty or a pointer" if path.is_file() else "missing"
-    return Check(name, WARN, f"{path.name} is {why}: no far crop, so no unprotected left past TurnPilotLeftRangeM",
+    return Check(name, WARN, f"{path.name} is {why}: no far crop, so unprotected lefts past TurnPilotLeftRangeM hand back at their line",
                  "update to a branch that carries it (compile_detector.py --far builds it on the Mac)")
   if not on:
-    return Check(name, WARN, "TurnPilotFarCrop is off: no unprotected left past TurnPilotLeftRangeM", "preflight --set TurnPilotFarCrop=1")
+    return Check(name, WARN, "TurnPilotFarCrop is off: unprotected lefts past TurnPilotLeftRangeM hand back at their line",
+                 "preflight --set TurnPilotFarCrop=1")
   if far_range_m <= 0.:
-    return Check(name, WARN, "TurnPilotLeftFarRangeM unmeasured (0): 45-55 mph unprotected lefts are skipped and rerouted",
+    return Check(name, WARN, "TurnPilotLeftFarRangeM unmeasured (0): 45-55 mph unprotected lefts hand back at their line",
                  "set it only from a measured recall range on this car's frames")
   return Check(name, PASS, f"{path.name} ({size / 1e6:.1f} MB), proven range {far_range_m:.0f} m")
 
@@ -242,8 +244,10 @@ def check_native(mode: str, path: Path | None, far_on: bool) -> Check:
     return Check(name, WARN, f"{mode}: {why}, so the far crop runs in its place", "update to a branch that carries it (compile_detector.py --native)")
   if not far_on:
     return Check(name, WARN, f"{mode}, but TurnPilotFarCrop is off, which turns its slot off", "preflight --set TurnPilotFarCrop=1")
-  fallback = "over its budget on this device it goes back to the far crop for the drive (nativeStatus fallback)"
-  return Check(name, PASS, f"{mode}: {what} in the far crop's place, {path.name} ({size / 1e6:.1f} MB); {fallback}")
+  # loaded is not running: on the car (11-06, both drives) it never had room beside the big model (nativeStatus unavailable)
+  fallback = ' '.join(("over its budget on this device it goes back to the far crop for the drive (nativeStatus fallback); with no",
+                       "room beside the driving model it never runs, the far crop where it fits (nativeStatus unavailable after 30 s)"))
+  return Check(name, PASS, f"{mode}: {what} in the far crop's slot where it has room, {path.name} ({size / 1e6:.1f} MB); {fallback}")
 
 
 VISION_SAYS = ' '.join(("vision: goes by itself at stop signs and yields with every cross road 25 mph or less after a 2.5 s clear",

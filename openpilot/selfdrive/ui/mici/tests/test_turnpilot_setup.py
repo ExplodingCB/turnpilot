@@ -62,7 +62,9 @@ class TestSetupWiring(OpenpilotTestCase):
     assert "15 mph" in lines[2] and "cruise stalk" in lines[3] and "destination on the phone" in lines[4]
     assert [ln[:3] for ln in lines[:5]] == ["1. ", "2. ", "3. ", "4. ", "5. "]
     assert lines[5] == "TurnPilot starts live: it drives the route."
-    assert "Signal Left" in lines[6]  # car signals off: the car asks for the stalk
+    # the car signals with no check (TurnPilotCarSignalsForceOn, default 1): the stalk only where a lamp doesn't light
+    from openpilot.selfdrive.ui.mici.layouts.turnpilot_setup import FORCED_STALK_LINE
+    assert lines[6] == FORCED_STALK_LINE and "Signal Left" in lines[6]
     params.put_bool("TurnPilotShadowMode", True)
     params.put("TurnPilotCarSignals", "on")
     lines = done_lines(params)

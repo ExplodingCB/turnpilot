@@ -48,8 +48,8 @@ SUNNYPILOT = {"branch": "staging-chestnut", "remote": "https://github.com/sunnyp
 
 GOOD_PARAMS = {
   "TurnPilotEnabled": True, "NavigationEnabled": True, "AlphaLongitudinalEnabled": True, "DisengageOnAccelerator": True,
-  "TurnPilotCarSignals": "off", "TurnPilotCameraLights": "shadow", "TurnPilotCameraStopSigns": "shadow",
-  "TurnPilotStopSignGo": "vision", "TurnPilotAvoidStops": True, "TurnPilotCurbPedCap": True, "TurnPilotLeftRangeM": 0.,
+  "TurnPilotCarSignals": "off", "TurnPilotCameraLights": "addOnly", "TurnPilotCameraStopSigns": "shadow",
+  "TurnPilotStopSignGo": "vision", "TurnPilotAvoidStops": True, "TurnPilotCurbPedCap": True, "TurnPilotLeftRangeM": 210.,
   "TurnPilotShadowMode": False, "DisableUpdates": False, "TurnPilotAutoLeft": "auto", "TurnPilotAlwaysDrive": True,
   "TurnPilotMapHost": "maps.turnpilot.test", "TurnPilotMapKey": "not-a-real-key", "TurnPilotMapCert": "not-a-real-cert",
   "IsReleaseBranch": False,
@@ -62,7 +62,7 @@ GO_LINES = ["branch", "car", "EPS", "3-bit firmware", "DAS_settings", "longitudi
             "driver's blinker", "car signals", "calibration", "road camera", "big model", "detector", "TurnPilot faults",
             "car health", *REQUIRED_KEYS, *MAP_KEYS]
 INFO_LINES = ["fingerprint source", "turn-signal frame", "X179 add-on", "VIN", "TurnPilotShadowMode", "DisableUpdates",
-              "TurnPilotLeftFarRangeM", "TurnPilotAutoLeft", "TurnPilotGoOverride", "TurnPilotNoMoveS", "TurnPilotCarSignalsVinless",
+              "TurnPilotCarSignals", "TurnPilotLeftFarRangeM", "TurnPilotAutoLeft", "TurnPilotGoOverride", "TurnPilotNoMoveS", "TurnPilotCarSignalsVinless",
               "TurnPilotAlwaysDrive",
               "panda build", "Tesla software", "outside lamps", "mount"]
 CAN_LINES = ["3-bit firmware", "panda honours long", "turn-signal frame", "driver's blinker", "X179 add-on"]
@@ -75,6 +75,8 @@ DEFAULTS = {
   "tesla_t": TESLA_T,         # None: the panda never enters tesla safety
   "panda_param": None,        # the panda's safetyParam, when it isn't carParams'
   "three_bit": True, "body_controls": True, "ui_warning": True, "refuse_before": 0, "refuse_after": 0, "src0_before": False,
+  "vehicle_can": True,        # a vehicle-CAN tap (cpf.VEHICLE_CAN_CABLE): vehicle CAN's own stock 0x3E9 on src 1 (opendbc tesla/car_signal.py)
+  "signal_failed": False,     # the port's signal failed after the tesla time (carState.carSignal failed, lampTimeout), as on 11-06
   "rx_invalid": False, "can": True, "can_keep": 1, "sendcan": True, "can_valid_drop": False,
   "big": "ok",                # ok, false (never up), failed (bigModelFailed at FAIL_T), loading (still loading at the end)
   "supply_fault": False, "calibration": "calibrated", "sensor": "os04c10", "events": (),
@@ -171,6 +173,8 @@ def drive(**kw) -> list:
       frames.append((0x3E9, STOCK_3E9, AP if tesla(t) or not c.src0_before else PARTY))
       if tesla(t):
         frames.append((0x3E9, STOCK_3E9, RETURNED))  # the panda forwarding the stock frame from bus 2 to bus 0
+    if c.vehicle_can and i % 10 == 5:
+      frames.append((0x3E9, STOCK_3E9, VEHICLE))  # vehicle CAN's own stock frame, 2 Hz, through the cable
     if tesla(t):
       frames.append((0x2B9, STOCK_2B9, AP))
     if c.sendcan and c.long and tt is not None and t >= tt - 0.2 - 1e-9:
@@ -191,7 +195,8 @@ def drive(**kw) -> list:
 
     cs = messaging.new_message('carState')
     cs.carState.canValid = t >= 1. and not (c.can_valid_drop and 8. <= t < 8.5)  # false at startup, before the tesla time
-    cs.carState.carSignal.status = 'off'
+    cs.carState.carSignal.status = 'failed' if c.signal_failed and tesla(t) else 'off'
+    cs.carState.carSignal.fault = 'lampTimeout' if c.signal_failed and tesla(t) else 'none'
     msgs.append(stamped(cs, t))
 
     if c.model:
@@ -335,6 +340,8 @@ def test_good_car_live(tmp_path):
   assert "EPS since route" not in statuses(lines)
   assert "not-a-real-key" not in cpf.render(lines) and "not-a-real-cert" not in cpf.render(lines)  # DONT_LOG: never printed
   assert "(default)" in line(lines, "TurnPilotLeftFarRangeM").detail  # unset on the device: the library's default, said
+  assert line(lines, "car signals").detail.startswith("on, TurnPilotCarSignalsForceOn 1 (default): the car signals")
+  assert "a vehicle-CAN tap (X179) is fitted" in line(lines, "X179 add-on").detail
 
 
 def test_good_car_route(tmp_path):
@@ -504,6 +511,37 @@ def test_health_needs_its_evidence(tmp_path):
 
 # ----------------------------------------------------------------------------------------------------- the turn signal
 
+def test_the_cars_signal_without_the_vehicle_can_cable_warns(tmp_path):
+  """opendbc tesla/car_signal.py (2026-11-06): this Model 3's body controller is on vehicle CAN, which the comma reaches only
+  through a vehicle-CAN tap; its party-CAN frames came back byte-correct and lit no lamp. With the car's signal on and no
+  stock 0x3E9 on src 1, the X179 add-on line WARNs, with the cable as the fix; it said before that this fork reads bus 1
+  only for the radar. The fix says the cable, its port and its listing in their sources' words (xnor's listing, Tesla's
+  CD-20-20-003, which docs/turnpilot/INSTALL.md cites): until 2026-11-07 it sent the owner to "Tesla's X179 connector,
+  behind the right A-pillar trim", a name Tesla's guide never uses, with no source in the repo."""
+  lines = run_live(tmp_path, vehicle_can=False)
+  got = line(lines, "X179 add-on")
+  assert got.status == WARN and "goes out on party CAN, where this Model 3's frames lit no lamp on 2026-11-06" in got.detail, got
+  assert "xnor's Vehicle CAN Addon Cable" in got.fix and "X179" in got.fix and "radar" not in got.detail
+  assert cpf.VEHICLE_CAN_PORT in got.fix and cpf.VEHICLE_CAN_LISTED in got.fix and "INSTALL.md cites the sources" in got.fix
+  assert "passenger-side A-pillar" in cpf.VEHICLE_CAN_PORT and "left-hand-drive" in cpf.VEHICLE_CAN_LISTED  # the listing's words
+  assert "Tesla's X179" not in got.fix and "check the car has the port first" in got.fix
+  assert cpf.exit_code(lines) == 0  # the driver is prompted where a lamp doesn't light: a WARN, never a NO-GO
+  fitted = line(run_live(tmp_path), "X179 add-on")
+  assert fitted.status == INFO and "goes out on vehicle CAN (bus 1)" in fitted.detail and "radar" not in fitted.detail
+  route = line(run_route(tmp_path, vehicle_can=False), "X179 add-on")
+  assert route.status == WARN
+
+
+def test_a_car_signal_the_port_failed_warns(tmp_path):
+  """The 11-06 drive's port: carState.carSignal failed (no lamp answered a request, the frames on party CAN), the driver
+  prompted for the rest of the drive. The car signals line said GO from the params alone; it WARNs on the port's verdict."""
+  lines = run_route(tmp_path, signal_failed=True, vehicle_can=False)
+  got = line(lines, "car signals")
+  assert got.status == WARN and "the port failed on" in got.detail and "lampTimeout" in got.detail, got
+  assert f"vehicle-CAN tap at {cpf.VEHICLE_CAN_PORT}" in got.fix and cpf.VEHICLE_CAN_CABLE in got.fix
+  assert line(run_route(tmp_path), "car signals").status == GO
+
+
 def test_no_body_controls(tmp_path):
   lines = run_live(tmp_path, body_controls=False)
   assert statuses(lines)["turn-signal frame"] == INFO and "absent" in line(lines, "turn-signal frame").detail
@@ -511,10 +549,14 @@ def test_no_body_controls(tmp_path):
 
 
 def test_zero_vin(tmp_path):
+  """A Tesla's VIN reads as zeros: under TurnPilotCarSignalsForceOn (the default) the car signals all the same; with it 0
+  no record can match it unless the owner opted in (TurnPilotCarSignalsVinless)."""
   lines = run_live(tmp_path)
   assert statuses(lines)["VIN"] == INFO and "all zeros" in line(lines, "VIN").detail
-  assert "VIN is unreadable" in line(lines, "turn-signal frame").detail
+  assert "car signals are on with no record whatever the VIN reads (TurnPilotCarSignalsForceOn 1)" in line(lines, "turn-signal frame").detail
   assert cpf.exit_code(lines) == 0
+  off = run_live(tmp_path, params={**GOOD_PARAMS, "TurnPilotCarSignalsForceOn": False})
+  assert "VIN is unreadable" in line(off, "turn-signal frame").detail
 
 
 def valid_vin(stem="5YJ3E1EA_HF000337"):
@@ -532,12 +574,21 @@ def test_valid_vin(tmp_path):
 
 
 def test_car_signals_on(tmp_path):
-  """Mode on with a verified record: record_matches' reason, on a Tesla's zero VIN "Car's VIN unreadable"."""
+  """Mode on with a verified record the zero VIN can't match: under TurnPilotCarSignalsForceOn (the default) the car signals
+  all the same, GO; with it 0 record_matches' reason, "Car's VIN unreadable", and the driver signals: a WARN whose fix is
+  ForceOn. TurnPilotCarSignals itself is INFO either way: before 2026-11-06 on was a NO-GO ("Saturday plans for off")."""
   record = {"vin": "0" * 17, "fw": [], "exteriorConfirmed": "2026-10-30T12:00:00+00:00"}
   lines = run_live(tmp_path, params={**GOOD_PARAMS, "TurnPilotCarSignals": "on", "TurnPilotCarSignalsVerified": record})
   s = statuses(lines)
-  assert s["car signals"] == WARN and "VIN unreadable" in line(lines, "car signals").detail
-  assert s["TurnPilotCarSignals"] == NO_GO
+  assert s["car signals"] == GO and "no lamp check or verified record (TurnPilotCarSignals on)" in line(lines, "car signals").detail
+  assert s["TurnPilotCarSignals"] == INFO and "whatever this says" in line(lines, "TurnPilotCarSignals").detail
+  off = run_live(tmp_path, params={**GOOD_PARAMS, "TurnPilotCarSignals": "on", "TurnPilotCarSignalsVerified": record,
+                                   "TurnPilotCarSignalsForceOn": False})
+  s = statuses(off)
+  got = line(off, "car signals")
+  assert s["car signals"] == WARN and "VIN unreadable" in got.detail and "the driver signals when prompted" in got.detail, got
+  assert got.fix == "python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotCarSignalsForceOn=1"
+  assert s["TurnPilotCarSignals"] == INFO and s["TurnPilotCarSignalsForceOn"] == NO_GO
 
 
 DONGLE = "0123456789abcdef"
@@ -559,13 +610,15 @@ def signal_record(vin="0" * 17, eps=CHASE_EPS, **kw):
 
 
 def signals_on(record, vinless=None, **extra):
-  return {**GOOD_PARAMS, "TurnPilotCarSignals": "on", "TurnPilotCarSignalsVerified": record, "DongleId": DONGLE, **extra,
-          **({} if vinless is None else {"TurnPilotCarSignalsVinless": vinless})}
+  """Mode on with TurnPilotCarSignalsForceOn 0: the record decides, as before 2026-11-06."""
+  return {**GOOD_PARAMS, "TurnPilotCarSignals": "on", "TurnPilotCarSignalsVerified": record, "DongleId": DONGLE,
+          "TurnPilotCarSignalsForceOn": False, **extra, **({} if vinless is None else {"TurnPilotCarSignalsVinless": vinless})}
 
 
 def test_car_signals_say_which_way_the_record_matched(tmp_path):
-  """Mode on: the car signals line says whether the verified record matches and which way, by VIN or without one
-  (TurnPilotCarSignalsVinless), live and from a route, and never prints the DongleId or the VIN."""
+  """Mode on, TurnPilotCarSignalsForceOn 0: the car signals line says whether the verified record matches and which way, by VIN
+  or without one (TurnPilotCarSignalsVinless), live and from a route, and never prints the DongleId or the VIN. A match is
+  GO (the car signals), none a WARN (the driver does)."""
   vin = valid_vin()
   cases = [
     (signals_on(signal_record()), {}, f"does not match: {DID} (TurnPilotCarSignalsVinless off: a record matches by VIN only)"),
@@ -583,7 +636,9 @@ def test_car_signals_say_which_way_the_record_matched(tmp_path):
     for lines in (run_live(tmp_path, params=params, **kw), run_route(tmp_path, params=params, **kw)):
       s = statuses(lines)
       detail = line(lines, "car signals").detail
-      assert s["car signals"] == WARN and detail.startswith(f"on: Saturday plans for off; the verified record {said}"), (said, detail)
+      matched = said.startswith("matches")
+      start = "on (TurnPilotCarSignalsForceOn 0): " if matched else "on (TurnPilotCarSignalsForceOn 0), but "
+      assert s["car signals"] == (GO if matched else WARN) and detail.startswith(f"{start}the verified record {said}"), (said, detail)
       out = cpf.render(lines)
       assert DONGLE not in out and "fedcba9876543210" not in out and vin not in out
 
@@ -600,9 +655,11 @@ def test_the_vinless_opt_in_line(tmp_path):
   assert s["TurnPilotCarSignalsVinless"] == WARN and "without a VIN" in line(on, "TurnPilotCarSignalsVinless").detail
   assert "TurnPilotCarSignalsVinless=0" in line(on, "TurnPilotCarSignalsVinless").fix
   assert s["VIN"] == INFO and "matches only without a VIN (TurnPilotCarSignalsVinless on)" in line(on, "VIN").detail
-  assert "VIN is unreadable" not in line(on, "turn-signal frame").detail
-  assert "only from a record made without a VIN" in line(on, "turn-signal frame").detail
   assert cpf.exit_code(on) == 0  # a WARN: read and decided, as every WARN
+  # with TurnPilotCarSignalsForceOn 0 a record decides, and the turn-signal frame line says which a zero VIN can match
+  record = run_live(tmp_path, params={**GOOD_PARAMS, "TurnPilotCarSignalsVinless": True, "TurnPilotCarSignalsForceOn": False})
+  assert "VIN is unreadable" not in line(record, "turn-signal frame").detail
+  assert "only from a record made without a VIN" in line(record, "turn-signal frame").detail
   stale = run_live(tmp_path, unknown={"TurnPilotCarSignalsVinless"})
   assert statuses(stale)["TurnPilotCarSignalsVinless"] == NO_GO
 
@@ -716,7 +773,7 @@ def test_param_wrong_or_default(tmp_path):
                           "DisableUpdates": True}
   lines = run_live(tmp_path, params=params)
   s = statuses(lines)
-  assert s["TurnPilotStopSignGo"] == NO_GO and "auto, Saturday needs vision" in line(lines, "TurnPilotStopSignGo").detail
+  assert s["TurnPilotStopSignGo"] == NO_GO and "auto, the drive needs vision" in line(lines, "TurnPilotStopSignGo").detail
   assert "TurnPilotStopSignGo=vision" in line(lines, "TurnPilotStopSignGo").fix
   assert s["TurnPilotValhallaTiles"] == NO_GO
   assert s["TurnPilotShadowMode"] == WARN and "nothing acts" in line(lines, "TurnPilotShadowMode").detail
@@ -727,19 +784,92 @@ def test_param_wrong_or_default(tmp_path):
 
 
 def test_the_saturday_values_are_the_defaults(tmp_path):
-  """A fresh install's params (params_keys.h's defaults, test_saturday_defaults.py) read as Saturday's: TurnPilotStopSignGo
-  vision and TurnPilotShadowMode 0 among them, with no NO-GO that Saturday needs off and no WARN that live is wrong."""
+  """A fresh install's params (params_keys.h's defaults, test_saturday_defaults.py) read as the drive's: TurnPilotStopSignGo
+  vision, TurnPilotShadowMode 0, TurnPilotCameraLights addOnly, TurnPilotLeftRangeM 210 and TurnPilotCarSignalsForceOn 1
+  among them, with no NO-GO and no WARN that live is wrong, and the car signals line GO: the car signals."""
   unset = dict.fromkeys(("TurnPilotEnabled", "NavigationEnabled", "AlphaLongitudinalEnabled", "DisengageOnAccelerator",
-                         "TurnPilotStopSignGo", "TurnPilotShadowMode", "DisableUpdates", "TurnPilotAlwaysDrive"))
+                         "TurnPilotStopSignGo", "TurnPilotShadowMode", "DisableUpdates", "TurnPilotAlwaysDrive",
+                         "TurnPilotCameraLights", "TurnPilotLeftRangeM", "TurnPilotCarSignals", "TurnPilotCarSignalsForceOn",
+                         "TurnPilotCameraStopSigns", "TurnPilotAvoidStops", "TurnPilotCurbPedCap", "TurnPilotAutoLeft"))
   lines = run_live(tmp_path, params=GOOD_PARAMS | unset)
   s = statuses(lines)
-  for key in ("TurnPilotEnabled", "NavigationEnabled", "AlphaLongitudinalEnabled", "DisengageOnAccelerator", "TurnPilotStopSignGo"):
+  for key in ("TurnPilotEnabled", "NavigationEnabled", "AlphaLongitudinalEnabled", "DisengageOnAccelerator", "TurnPilotStopSignGo",
+              "TurnPilotCameraLights", "TurnPilotLeftRangeM", "TurnPilotCarSignalsForceOn", "TurnPilotCameraStopSigns",
+              "TurnPilotAvoidStops", "TurnPilotCurbPedCap"):
     assert s[key] == GO and "(default)" in line(lines, key).detail, line(lines, key)
   assert line(lines, "TurnPilotStopSignGo").detail.startswith("vision")
-  for key in ("TurnPilotShadowMode", "DisableUpdates", "TurnPilotAlwaysDrive"):
+  assert line(lines, "TurnPilotCameraLights").detail == "addOnly (default)"
+  assert line(lines, "TurnPilotLeftRangeM").detail == "210 (default)"
+  for key in ("TurnPilotShadowMode", "DisableUpdates", "TurnPilotAlwaysDrive", "TurnPilotCarSignals", "TurnPilotAutoLeft"):
     assert s[key] == INFO and "(default)" in line(lines, key).detail, line(lines, key)
   assert "live" in line(lines, "TurnPilotShadowMode").detail
   assert line(lines, "DisableUpdates").detail.startswith("0 (default): updates on")
+  assert s["car signals"] == GO and "no lamp check or verified record (TurnPilotCarSignals off (default))" in line(lines, "car signals").detail
+  assert NO_GO not in s.values() and cpf.exit_code(lines) == 0
+
+
+def test_the_required_values_are_this_builds_defaults(tmp_path):
+  """Every REQUIRED value is params_keys.h's default, so preflight never asks the owner to move a param off what ships.
+  Until 2026-11-06 it required TurnPilotCameraLights shadow and TurnPilotLeftRangeM 0 (and TurnPilotCarSignals off): NO-GO on
+  every comma at its defaults (addOnly since 5dcb363, 210 since fecb4efd0), with fixes that put the camera's reds back in
+  shadow and every unprotected left at a handback."""
+  lib = Params(str(tmp_path / "defaults"))
+  for key, want, fix in cpf.REQUIRED:
+    assert lib.get_default_value(key) == want, (key, want, lib.get_default_value(key))
+    assert f"{key}=" in fix or "Settings" in fix, (key, fix)
+  fixes = " ".join(fix for _, _, fix in cpf.REQUIRED)
+  assert "TurnPilotCameraLights=shadow" not in fixes and "TurnPilotLeftRangeM=0" not in fixes and "TurnPilotCarSignals=off" not in fixes
+  assert cpf.REQUIRED[3][0] == "DisengageOnAccelerator"  # check_faults' fix
+
+
+@pytest.mark.parametrize("key, value, status, said, fix", [
+  # the old Saturday values, which the tool once required
+  ("TurnPilotCameraLights", "shadow", NO_GO, "shadow, the drive needs addOnly: a red the camera reads stops nothing",
+   "TurnPilotCameraLights=addOnly"),
+  ("TurnPilotCameraLights", "off", NO_GO, "off, the drive needs addOnly", "TurnPilotCameraLights=addOnly"),
+  ("TurnPilotLeftRangeM", 0., NO_GO, "0, the drive needs 210: no unprotected left goes", "TurnPilotLeftRangeM=210"),
+  ("TurnPilotCarSignalsForceOn", False, NO_GO, "0, the drive needs 1: the car signals only from a verified lamp check",
+   "TurnPilotCarSignalsForceOn=1"),
+  # a range set by hand or measured (left_range.py): the owner's call, a WARN; 150, an earlier build's default, said so
+  ("TurnPilotLeftRangeM", 180., WARN, "180 m, not this build's 210: a left whose R_req at its line is past it is driven to its line",
+   "TurnPilotLeftRangeM=210"),
+  ("TurnPilotLeftRangeM", 150., WARN, "150 m, not this build's 210 (an earlier build's default: turnpilot_web writes 210 over it",
+   "TurnPilotLeftRangeM=210"),
+])
+def test_a_param_off_the_shipped_default_says_what_it_costs(tmp_path, key, value, status, said, fix):
+  lines = run_live(tmp_path, params={**GOOD_PARAMS, key: value})
+  got = line(lines, key)
+  assert got.status == status and got.detail.startswith(said) and fix in got.fix, got
+  assert cpf.exit_code(lines) == (1 if status == NO_GO else 0)
+
+
+def test_the_unprotected_left_mode_says_each_left_is_driven_to_its_line(tmp_path):
+  """TurnPilotAutoLeft (unprotected_left.py): auto, the default, drives every unprotected left to its line, where it goes or
+  hands back; until 2026-11-06 this line said every left was skipped and rerouted under a range of 0."""
+  lines = run_live(tmp_path)
+  got = line(lines, "TurnPilotAutoLeft")
+  assert got.status == INFO and "every unprotected left is driven to its line" in got.detail and "hands back there" in got.detail
+  assert "skipped" not in got.detail and "rerouted" not in got.detail
+  for mode, words in (("off", "every unprotected left hands back at its line"), ("announce", "debugging only")):
+    got = line(run_live(tmp_path, params={**GOOD_PARAMS, "TurnPilotAutoLeft": mode}), "TurnPilotAutoLeft")
+    assert got.status == WARN and words in got.detail and "TurnPilotAutoLeft=auto" in got.fix, got
+
+
+def test_a_queued_lamp_check_warns_and_says_what_follows_it(tmp_path):
+  forced = line(run_live(tmp_path, params={**GOOD_PARAMS, "TurnPilotCarSignals": "check"}), "car signals")
+  assert forced.status == WARN and "the ignition after it signals with no check (TurnPilotCarSignalsForceOn 1)" in forced.detail
+  assert forced.fix.endswith("TurnPilotCarSignals=off to skip the check")
+  record = line(run_live(tmp_path, params={**GOOD_PARAMS, "TurnPilotCarSignals": "check", "TurnPilotCarSignalsForceOn": False}),
+                "car signals")
+  assert "signals only from a record that matches (TurnPilotCarSignalsForceOn 0)" in record.detail
+
+
+def test_car_signals_off_with_force_on_0_is_the_driver_signalling(tmp_path):
+  lines = run_live(tmp_path, params={**GOOD_PARAMS, "TurnPilotCarSignalsForceOn": False})
+  got = line(lines, "car signals")
+  assert got.status == WARN and got.detail.startswith("off (TurnPilotCarSignalsForceOn 0): the car doesn't signal"), got
+  assert "TurnPilotCarSignalsForceOn=1" in got.fix
+  assert statuses(lines)["X179 add-on"] == INFO  # no car signal, so no lamp path to judge
 
 
 def test_stop_sign_go_off_is_saturdays_fallback_warned(tmp_path):
@@ -900,7 +1030,7 @@ def test_runs_on_the_device_python():
 def test_constants_follow_their_sources():
   from openpilot.selfdrive.turnpilot import car_signals, turnpilotd
   assert cpf.DETECTOR_DEADLINE_S == turnpilotd.DETECTOR_DEADLINE_S
-  assert cpf.VINLESS == car_signals.VINLESS_KEY
+  assert cpf.VINLESS == car_signals.VINLESS_KEY and cpf.FORCE_ON == car_signals.FORCE_ON_KEY
   # the detector's bands come from its real rate: the model's 20 Hz over RUN_EVERY (10 Hz), never the 20 Hz of a stop sweep
   assert cpf.MODEL_HZ == ModelConstants.MODEL_RUN_FREQ and cpf.DETECTOR_RUN_EVERY == RUN_EVERY
   nominal = ModelConstants.MODEL_RUN_FREQ / RUN_EVERY

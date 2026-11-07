@@ -129,18 +129,20 @@ def test_detector(tmp_path):
 
 
 def test_far_crop(tmp_path):
-  # DESIGN phase 4 G5: the far crop (and its measured range) are what a 45-55 mph left needs; without either the car drives,
-  # those lefts skipped and rerouted, so a warning, never a failure
+  # DESIGN phase 4 G5: the far crop (and its measured range) are what a 45-55 mph left needs to go; without either the car
+  # drives, those lefts driven to their line and handed back there (never skipped or rerouted since 2026-11-06), so a warning,
+  # never a failure, and said so
   path = tmp_path / "big_far_detector_1344x760_tinygrad.pkl"
   missing = preflight.check_far_crop(path, 300., True)
-  assert missing.status == WARN and "missing" in missing.detail
+  assert missing.status == WARN and "missing" in missing.detail and "hand back at their line" in missing.detail
   path.write_bytes(b"version https://git-lfs.github.com/spec/v1\n")
   assert preflight.check_far_crop(path, 300., True).status == WARN
   path.write_bytes(b"\0" * 5000)
   unmeasured = preflight.check_far_crop(path, 0., True)
-  assert unmeasured.status == WARN and "TurnPilotLeftFarRangeM" in unmeasured.detail
+  assert unmeasured.status == WARN and "TurnPilotLeftFarRangeM" in unmeasured.detail and "hand back at their line" in unmeasured.detail
   off = preflight.check_far_crop(path, 300., False)
-  assert off.status == WARN and "TurnPilotFarCrop" in off.detail
+  assert off.status == WARN and "TurnPilotFarCrop" in off.detail and "hand back at their line" in off.detail
+  assert not any(w in c.detail for c in (missing, unmeasured, off) for w in ('skipped', 'rerouted'))
   ok = preflight.check_far_crop(path, 300., True)
   assert ok.status == PASS and "300 m" in ok.detail
 

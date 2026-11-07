@@ -6,7 +6,8 @@ Plain params in, words out, so the comma screen (ui/mici/layouts/turnpilot_setup
 The steps, in order: intro, phone (the phone opened the TurnPilot page with the pairing token: TurnPilotPhoneSeen,
 written by the web server), key (the map server answered the saved key: TurnPilotMapCoverageStatus ok), engine (the
 map engine, pyvalhalla, is installed: navd routes each drive's corridor with it, so driving needs it), signals (the
-car's own turn signal, optional and skipped by default: car_signals.py's check mode, run in Park), done.
+car's own turn signal's lamp check, optional and skipped by default: car_signals.py's check mode, run in Park; under
+TurnPilotCarSignalsForceOn, 1 by default since 2026-11-06, the car signals with or without it), done.
 """
 from dataclasses import dataclass
 
@@ -153,8 +154,39 @@ def start_signal_check(params):
   params.put('TurnPilotCarSignals', 'check', block=True)
 
 
+def signals_forced(params) -> bool:
+  """TurnPilotCarSignalsForceOn as card's resolver reads it (car_signals.forced_on): on, the default, the car signals
+  TurnPilot's turns and lane changes on every drive with no lamp check or verified record, whatever TurnPilotCarSignals says
+  but check (Kellen, 2026-11-06: "never disable turn signals for now they should always be enabled for this test"). Imported
+  here, not at the top: the screens' state stays plain params in, words out."""
+  from openpilot.selfdrive.turnpilot.car_signals import forced_on
+  return forced_on(params)
+
+
+def car_signal_state(params) -> tuple[str, str]:
+  """What the car's own turn signal does from the next start, as card's resolver (car_signals.resolver) picks it from the
+  params, for the phone (after "Car signal "): ('check', why) the lamp check runs, ('on', why) the car signals, or ('off', why)
+  the driver does, prompted. Mode on with TurnPilotCarSignalsForceOn 0 says on only with a verified record: the resolver
+  still matches it to the car's VIN and firmware at the start. Until 2026-11-06 the phone showed TurnPilotCarSignals alone,
+  which read off on every comma at its defaults while the car signalled."""
+  from openpilot.selfdrive.turnpilot.car_signals import read_mode
+  mode, forced = read_mode(params), signals_forced(params)
+  if mode == 'check':
+    then = "then on for every drive, with no check" if forced else "then on once you confirm the lamps flashed"
+    return 'check', f"checked at the next start: the lamp check runs in Park, {then}"
+  if forced:
+    return 'on', "on for every drive, with no lamp check"
+  if mode == 'on':
+    if params.get('TurnPilotCarSignalsVerified'):
+      return 'on', "on, from the lamp check you confirmed"
+    return 'off', "off until a lamp check passes: you signal when TurnPilot asks"
+  return 'off', "off: you signal when TurnPilot asks"
+
+
 def signals_off(params):
-  """Any failure: both back to off, and the car asks for the stalk at each turn."""
+  """Any failure: both back to off. With TurnPilotCarSignalsForceOn 0 the comma then asks for the stalk at each turn; under it
+  (the default) the car signals all the same, with no record (signals_forced), and the comma asks only where a lamp doesn't
+  light."""
   params.put('TurnPilotCarSignals', 'off', block=True)
   params.put_bool('TurnPilotCarSignalsVinless', False, block=True)
 

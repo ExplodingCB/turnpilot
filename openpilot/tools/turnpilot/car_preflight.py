@@ -22,10 +22,22 @@ messages sit on turnpilotPlan's, turnpilotDetections' and turnpilotFarDetections
 carState.carSignal; its events are numbered differently, so their names are listed, not judged; fingerprintSource fixed is
 its vehicle selector, and the EPS line decides whether this fork would match the car.
 
-With TurnPilotCarSignals on, the car signals line says whether the verified record matches as card's resolver matches it
+The car signals line says what card's resolver (car_signals.resolver) gives this car's next drive: on with no lamp check or
+verified record under TurnPilotCarSignalsForceOn (1, the default since 2026-11-06), whatever TurnPilotCarSignals says but
+check; with it 0, TurnPilotCarSignals decides, and on, whether the verified record matches as the resolver matches it
 (car_signals.match_record) and which way: by VIN and firmware, or, with the owner's TurnPilotCarSignalsVinless on and the
 VIN unreadable, without a VIN on this comma's DongleId, the firmware's exact fingerprint and the exact carFw list. It reads
-DongleId and never prints it.
+DongleId and never prints it. The X179 add-on line says whether a vehicle-CAN tap is fitted (a stock DAS_bodyControls on
+src 1), the only way the comma reaches this Model 3's body controller (opendbc tesla/car_signal.py: on 2026-11-06 its
+frames on party CAN came back byte-correct and lit no lamp): WARN while the car signals without it, its fix the cable
+(VEHICLE_CAN_FIT). X179 is this tool's name for the port, not Tesla's: docs/turnpilot/INSTALL.md cites the cable's
+listing and Tesla's guide to the port.
+
+The params it requires are this build's defaults (params_keys.h), which the 11-06 drive needs: TurnPilotCameraLights addOnly
+(a camera red stops the car, since 5dcb363), TurnPilotLeftRangeM 210 (maps/defaults.CAR_LEFT_RANGE_M, since fecb4efd0; every
+unprotected left is driven to its line and goes from there or hands back, never skipped or rerouted for its range) and
+TurnPilotCarSignalsForceOn 1 (since 7c37f664a). A range other than 210 above 0 is a WARN (set by hand, or measured by
+left_range.py: the owner's call), 0 a NO-GO (no left would ever go).
 
 Exit 0 when every line is GO, WARN or INFO; 1 on any NO-GO; 2 on any UNKNOWN without a NO-GO. A route can't show the map key
 and certificate (DONT_LOG), so a route never exits 0.
@@ -48,6 +60,7 @@ from opendbc.car.structs import CarParams
 from opendbc.car.tesla.fingerprints import FW_VERSIONS
 from opendbc.car.tesla.values import CAR, TeslaFlags
 from openpilot.common.version import RELEASE_BRANCHES
+from openpilot.selfdrive.turnpilot.maps.defaults import CAR_LEFT_RANGE_M, EARLIER_CAR_RANGES_M
 
 GO, NO_GO, WARN, UNKNOWN, INFO = "GO", "NO-GO", "WARN", "UNKNOWN", "INFO"
 
@@ -67,6 +80,18 @@ DAS_CONTROL = 0x2B9
 DAS_BODY_CONTROLS = 0x3E9
 UI_WARNING = 0x311
 X179 = {0x249: "SCCM_leftStalk", 0x3F5: "VCFRONT_lighting", 0x3DF: "UI_status2"}
+# The vehicle-CAN tap, in its sources' words (docs/turnpilot/INSTALL.md, "Let the car signal its own turns", cites both;
+# the docs say the same three phrases, kept equal by a test). xnor's listing: "Vehicle CAN Addon Cable", the "CAN debug
+# port in the passenger-side A-pillar", "Built after 2021", left-hand drive only, "verify your vehicle has this port
+# before ordering". Tesla's Model 3 EDR guide for cars built after 10/04/2020 (CD-20-20-003) reaches a CAN connector
+# there: the passenger footwell, the right lower A-pillar trim off and the carpet folded back; it doesn't name it X179,
+# and cars built through that date have their own guide. Until 2026-11-07 this said "Tesla's X179 connector, behind the
+# right A-pillar trim", a name Tesla's guide never uses
+VEHICLE_CAN_CABLE = "xnor's Vehicle CAN Addon Cable"
+VEHICLE_CAN_PORT = "the CAN debug port in the passenger-side A-pillar, behind the right lower A-pillar trim"
+VEHICLE_CAN_LISTED = "listed for left-hand-drive Model 3/Y built after 2021"
+VEHICLE_CAN_FIT = (f"fit {VEHICLE_CAN_CABLE} at {VEHICLE_CAN_PORT} (X179 in this tool; {VEHICLE_CAN_LISTED}: check the car has " +
+                   "the port first, INSTALL.md cites the sources): the car's own turn signal then goes out on vehicle CAN (bus 1)")
 WATCH = {DI_SPEED, DAS_REDUNDANT_BRAKING, DI_AUTONOMY_HEALTH, DAS_SETTINGS, DAS_CONTROL, DAS_BODY_CONTROLS, UI_WARNING, *X179}
 SENT = {DAS_CONTROL, DAS_BODY_CONTROLS}
 
@@ -91,22 +116,35 @@ DETECTOR_EVENTS = ("turnpilotNoDetector", "turnpilotDetectorStopped")
 NOT_APPLICABLE = "not applicable: a sunnypilot log, whose own messages share TurnPilot's slots"
 
 PREFLIGHT_SET = "python3 -m openpilot.selfdrive.turnpilot.preflight --set"
-REQUIRED = (  # (key, the value Saturday needs, None for unset, how to set it)
+FORCE_ON = "TurnPilotCarSignalsForceOn"  # car_signals.FORCE_ON_KEY, kept equal by a test
+# (key, the value the drive needs, None for unset, how to set it): each is this build's default (params_keys.h, kept equal by
+# a test), so a fresh install reads GO. Until 2026-11-06 this asked for TurnPilotCameraLights shadow, TurnPilotLeftRangeM 0 and
+# TurnPilotCarSignals off, Saturday's (10-31) values, and told the owner to set them: NO-GO on every comma at its defaults,
+# and its fixes would have put the camera's reds back in shadow (the 11-06 right on red) and every unprotected left at a
+# handback. TurnPilotCarSignals is NOTED: under TurnPilotCarSignalsForceOn its off and on read the same (the car signals line)
+REQUIRED = (
   ("TurnPilotEnabled", True, f"{PREFLIGHT_SET} TurnPilotEnabled=1, then turn the car off and on"),
   ("NavigationEnabled", True, "Settings > Developer > navigation (alpha)"),
   ("AlphaLongitudinalEnabled", True, "Settings > Developer > openpilot longitudinal control (alpha), then turn the car off and on"),
   ("DisengageOnAccelerator", True, f"Settings > Toggles > Disengage on accelerator pedal, or {PREFLIGHT_SET} DisengageOnAccelerator=1"),
-  ("TurnPilotCarSignals", "off", f"{PREFLIGHT_SET} TurnPilotCarSignals=off"),
-  ("TurnPilotCameraLights", "shadow", f"{PREFLIGHT_SET} TurnPilotCameraLights=shadow"),
+  (FORCE_ON, True, f"{PREFLIGHT_SET} {FORCE_ON}=1, then turn the car off and on"),
+  ("TurnPilotCameraLights", "addOnly", f"{PREFLIGHT_SET} TurnPilotCameraLights=addOnly"),
   ("TurnPilotCameraStopSigns", "shadow", f"{PREFLIGHT_SET} TurnPilotCameraStopSigns=shadow"),
   ("TurnPilotStopSignGo", "vision", f"{PREFLIGHT_SET} TurnPilotStopSignGo=vision"),
   ("TurnPilotAvoidStops", True, f"{PREFLIGHT_SET} TurnPilotAvoidStops=1"),
   ("TurnPilotCurbPedCap", True, f"{PREFLIGHT_SET} TurnPilotCurbPedCap=1"),
-  ("TurnPilotLeftRangeM", 0., f"{PREFLIGHT_SET} TurnPilotLeftRangeM=0"),
+  ("TurnPilotLeftRangeM", CAR_LEFT_RANGE_M, f"{PREFLIGHT_SET} TurnPilotLeftRangeM={CAR_LEFT_RANGE_M:g}"),
   ("TurnPilotValhallaTiles", None, f"{PREFLIGHT_SET} TurnPilotValhallaTiles= (empty clears it)"),
 )
-NOTED = ("TurnPilotShadowMode", "DisableUpdates", "TurnPilotLeftFarRangeM", "TurnPilotAutoLeft", "TurnPilotGoOverride", "TurnPilotNoMoveS",
-         "TurnPilotCarSignalsVinless", "TurnPilotAlwaysDrive")
+# what a REQUIRED key off its value means, said with the NO-GO
+OFF_VALUE = {
+  FORCE_ON: "the car signals only from a verified lamp check (the car signals line)",
+  "TurnPilotCameraLights": "a red the camera reads stops nothing, as when the car rolled a right on red its reader had read in " +
+                           "shadow (2026-11-06)",
+  "TurnPilotLeftRangeM": "no unprotected left goes: each is driven to its line and hands back there",
+}
+NOTED = ("TurnPilotShadowMode", "DisableUpdates", "TurnPilotCarSignals", "TurnPilotLeftFarRangeM", "TurnPilotAutoLeft",
+         "TurnPilotGoOverride", "TurnPilotNoMoveS", "TurnPilotCarSignalsVinless", "TurnPilotAlwaysDrive")
 MAP_PARAMS = ("TurnPilotMapHost", "TurnPilotMapKey", "TurnPilotMapCert")
 DONT_LOG = ("TurnPilotMapKey", "TurnPilotMapCert")  # params_keys.h: loggerd logs them with no value; kept equal by a test
 OTHER_PARAMS = ("IsReleaseBranch", "TurnPilotCarSignalsVerified", "ChestnutLoading", "DongleId")  # DongleId: read, never printed
@@ -356,6 +394,25 @@ def vinless_on(pv: ParamView) -> bool:
   """TurnPilotCarSignalsVinless, the owner's opt-in to match a car-signal record without a VIN; off for a library without it."""
   p = pv.get(VINLESS)
   return p.state != "unknown" and bool(p.value)
+
+
+def forced_on(pv: ParamView) -> bool:
+  """TurnPilotCarSignalsForceOn as card's resolver reads it (car_signals.forced_on): its default, 1, when unset; off for a
+  library without it (the REQUIRED line says that NO-GO)."""
+  p = pv.get(FORCE_ON)
+  return p.state != "unknown" and bool(p.value)
+
+
+def signals_resolved(pv: ParamView) -> str:
+  """What card's resolver (car_signals.resolver) starts the next drive's car signal in, from the params alone: 'check' (the
+  lamp check runs), 'forced' (on with no lamp check or record, TurnPilotCarSignalsForceOn), 'on' (TurnPilotCarSignals on:
+  on only if the verified record matches) or 'off'."""
+  mode = pv.get("TurnPilotCarSignals").value
+  if mode == "check":
+    return "check"
+  if forced_on(pv):
+    return "forced"
+  return "on" if mode == "on" else "off"
 
 
 class ParamValues:
@@ -651,7 +708,9 @@ def check_turn_signal_frame(f: Facts, pv: ParamView) -> Line:
     text = (f"present on src 2 at {hz:.1f} Hz ({len(src2)} frames, dlc {dlc}); {len(src128)} forwarded on src 128{equal}; " +
             f"openpilot sent {len(f.sent[DAS_BODY_CONTROLS])}; HAS_BODY_CONTROLS {'set' if body else 'clear'}" +
             (" (sunnypilot's port never sets it)" if f.sunnypilot else "") + ": a lamp check can run")
-    if not vin_ok and vinless_on(pv):
+    if not f.sunnypilot and signals_resolved(pv) == "forced":
+      text += f", and car signals are on with no record whatever the VIN reads ({FORCE_ON} 1)"
+    elif not vin_ok and vinless_on(pv):
       text += f", and with the VIN unreadable car signals turn on only from a record made without a VIN ({VINLESS} on)"
     elif not vin_ok:
       text += ", but car signals can't turn on while the VIN is unreadable"
@@ -660,7 +719,7 @@ def check_turn_signal_frame(f: Facts, pv: ParamView) -> Line:
   return Line(name, WARN if warns else INFO, "; ".join(warns + [text]))
 
 
-def check_stalk(f: Facts) -> list[Line]:
+def check_stalk(f: Facts, pv: ParamView) -> list[Line]:
   tt, why = can_window(f)
   if tt is None:
     return [Line("driver's blinker", UNKNOWN, why), Line("X179 add-on", UNKNOWN, why)]
@@ -675,16 +734,36 @@ def check_stalk(f: Facts) -> list[Line]:
   by_src = {name: Counter(s for _, s, _ in after(f, address, tt)) for address, name in X179.items()}
   on_bus1 = [name for name, srcs in by_src.items() if srcs[VEHICLE]]
   elsewhere = {name: dict(srcs) for name, srcs in by_src.items() if srcs and not srcs[VEHICLE]}
-  if on_bus1:
-    x179 = Line("X179 add-on", INFO, f"{', '.join(on_bus1)} on src 1: an X179 vehicle-CAN add-on is fitted; this fork reads bus 1 only for the radar's 0x410")
-  elif elsewhere:
-    x179 = Line("X179 add-on", INFO, f"none on src 1, so no X179 add-on; seen by src: {elsewhere}")
+  # opendbc tesla/car_signal.py (2026-11-06): a stock DAS_bodyControls on src 1 says a vehicle-CAN tap (VEHICLE_CAN_CABLE at
+  # VEHICLE_CAN_PORT) is fitted, and the car's own turn signal then goes out on bus 1, VCFRONT_lighting's lamps read with it. Without it the frames
+  # go on party CAN, where this Model 3's came back byte-correct and lit no lamp in P or D: its body controller is on vehicle
+  # CAN. Until then this said the fork read bus 1 only for the radar's 0x410
+  body = after(f, DAS_BODY_CONTROLS, tt, VEHICLE)
+  name = "X179 add-on"
+  if body:
+    x179 = Line(name, INFO, f"DAS_bodyControls 0x3E9 on src 1 ({len(body)} frames): a vehicle-CAN tap (X179) is fitted, " +
+                            "so the car's own turn signal goes out on vehicle CAN (bus 1)" +
+                            (f"; also on src 1: {', '.join(on_bus1)}" if on_bus1 else ""))
   else:
-    x179 = Line("X179 add-on", INFO, "no 0x249, 0x3F5 or 0x3DF on any bus: no X179 add-on")
+    seen = f"{', '.join(on_bus1)} on src 1, but no DAS_bodyControls 0x3E9 there" if on_bus1 else \
+           f"none on src 1, so no vehicle-CAN add-on; seen by src: {elsewhere}" if elsewhere else \
+           "no 0x249, 0x3F5, 0x3DF or 0x3E9 on src 1: no vehicle-CAN add-on"
+    how = "off" if f.sunnypilot else signals_resolved(pv)
+    if how == "forced" or (how == "on" and record_match(f, pv)[0]):  # the car's own turn signal goes out this drive
+      x179 = Line(name, WARN, seen + ": the car's own turn signal goes out on party CAN, where this Model 3's frames lit no " +
+                  "lamp on 2026-11-06 (its body controller is on vehicle CAN), so a signal no lamp answers is said and the driver " +
+                  "prompted", VEHICLE_CAN_FIT)
+    else:
+      x179 = Line(name, INFO, seen)
   return [blinker, x179]
 
 
 def check_car_signals(f: Facts, pv: ParamView) -> Line:
+  """What card's resolver gives the next drive (signals_resolved): GO while the car signals, by TurnPilotCarSignalsForceOn
+  (the default since 2026-11-06, Kellen: "never disable turn signals for now they should always be enabled for this test")
+  or by a verified record that matches; WARN while the driver signals instead, a lamp check is queued, the port failed
+  (carState.carSignal failed, as on the 11-06 drive) or the panda refused our frames. Until 2026-11-06 off was GO and on a
+  WARN ("Saturday plans for off"), which read the car's signal as off on every comma at its defaults, where it was on."""
   name = "car signals"
   if f.sunnypilot:
     return Line(name, INFO, NOT_APPLICABLE)
@@ -700,38 +779,58 @@ def check_car_signals(f: Facts, pv: ParamView) -> Line:
   if f.signal_rejected:
     seen.append(f"the panda refused {f.signal_rejected} of our turn-signal frames")
   tail = f"; {'; '.join(seen)}" if seen else ""
-  if mode == "off":
-    status = WARN if f.signal_rejected else GO
-    default = " (default)" if p.state == "default" else ""
-    return Line(name, status, f'off{default}: the driver signals when prompted ("Signal Left", "Signal Right"){tail}')
-  fix = f"{PREFLIGHT_SET} TurnPilotCarSignals=off"
-  if mode == "check":
+  forced_fix = f"{PREFLIGHT_SET} {FORCE_ON}=1"
+  # the port's own verdict (carState.carSignal: a fault latches failed for the drive, opendbc car_signal.py): the 11-06 drive's
+  # was failed on 3699 of 5992 carState of 1e seg 1, every request answered by no lamp, with the frames on party CAN
+  failed = f.signal_status.get("failed", 0)
+  faults = {k: v for k, v in f.signal_fault.items() if k != "none"}
+  port_failed = (f": the port failed on {failed} carState ({faults or 'no fault named'}), so the car's signal was off for the " +
+                 "rest of that drive and the driver signalled, prompted") if failed else ""
+  port_fix = ("read the X179 add-on line: the comma reaches this Model 3's body controller only through a vehicle-CAN tap at " +
+              f"{VEHICLE_CAN_PORT} ({VEHICLE_CAN_CABLE})")
+  how = signals_resolved(pv)
+  if how == "check":
     record = ""
     if f.cp is not None and not vin_valid(f.cp.carVin):
       vin = "zero VIN" if set(f.cp.carVin) <= {"0"} else "unreadable VIN"
       record = f"; its record keeps this comma's DongleId and the firmware's fingerprint ({VINLESS} on)" if vinless_on(pv) else \
                f"; its record can't match this car's {vin} ({VINLESS} off)"
-    return Line(name, WARN, f"check: this ignition runs the lamp check; Saturday plans for off{record}{tail}", fix)
-  if mode == "on":
-    return Line(name, WARN, f"on: Saturday plans for off; the verified record {record_said(f, pv)}{tail}", fix)
-  return Line(name, WARN, f"{mode!r} isn't off, check or on: read as off{tail}", fix)
+    after_check = f"the ignition after it signals with no check ({FORCE_ON} 1)" if forced_on(pv) else \
+                  f"the ignition after it signals only from a record that matches ({FORCE_ON} 0)"
+    return Line(name, WARN, f"check: this ignition runs the lamp check in P, and {after_check}{record}{tail}",
+                f"{PREFLIGHT_SET} TurnPilotCarSignals=off to skip the check")
+  if how == "forced":
+    status = WARN if f.signal_rejected or failed else GO
+    return Line(name, status, f"on, {FORCE_ON} {shown(pv.get(FORCE_ON))}: the car signals TurnPilot's turns and lane changes with " +
+                              f"no lamp check or verified record (TurnPilotCarSignals {shown(p)}){port_failed}{tail}",
+                port_fix if failed else "the panda refused them: check the panda build" if f.signal_rejected else "")
+  driver = 'the car doesn\'t signal, the driver signals when prompted ("Signal Left", "Signal Right")'
+  if how == "on":
+    ok, said = record_match(f, pv)
+    if ok:
+      return Line(name, WARN if f.signal_rejected or failed else GO, f"on ({FORCE_ON} 0): the verified record {said}{port_failed}{tail}",
+                  port_fix if failed else "the panda refused them: check the panda build" if f.signal_rejected else "")
+    return Line(name, WARN, f"on ({FORCE_ON} 0), but the verified record {said}: {driver}{tail}", forced_fix)
+  if mode not in ("off", "on", "check"):
+    return Line(name, WARN, f"{mode!r} isn't off, check or on: read as off ({FORCE_ON} 0): {driver}{tail}", forced_fix)
+  return Line(name, WARN, f"{shown(p)} ({FORCE_ON} 0): {driver}{tail}", forced_fix)
 
 
-def record_said(f: Facts, pv: ParamView) -> str:
+def record_match(f: Facts, pv: ParamView) -> tuple[bool, str]:
   """Whether the verified record matches this car as card's resolver matches it (car_signals.match_record), and which way:
   by VIN and firmware, or without a VIN on the opt-in's identity; why not when it doesn't. Never the DongleId or VIN."""
   from openpilot.selfdrive.turnpilot.car_signals import match_record
   if f.cp is None:
-    return "does not match: no carParams"
+    return False, "does not match: no carParams"
   identity = signal_identity(f, pv)
   ok, why, how = match_record(pv.get("TurnPilotCarSignalsVerified").value, f.cp.carVin, f.cp.carFw, identity=identity)
   if ok and how == "vinless":
-    return f"matches without a VIN ({VINLESS}): this comma's DongleId, {identity.car_fingerprint} by its firmware and the exact carFw list"
+    return True, f"matches without a VIN ({VINLESS}): this comma's DongleId, {identity.car_fingerprint} by its firmware and the exact carFw list"
   if ok:
-    return "matches by VIN and firmware" if how == "vin" else "matches as a simulator record"
+    return True, "matches by VIN and firmware" if how == "vin" else "matches as a simulator record"
   if identity is None and why == "Car's VIN unreadable: can't match the record":
-    return f"does not match: {why} ({VINLESS} off: a record matches by VIN only)"
-  return f"does not match: {why}"
+    return False, f"does not match: {why} ({VINLESS} off: a record matches by VIN only)"
+  return False, f"does not match: {why}"
 
 
 def check_vin(f: Facts, pv: ParamView) -> Line:
@@ -937,7 +1036,7 @@ def check_health(f: Facts) -> Line:
   return Line(name, GO, f"{valid}, none of {', '.join(HEALTH_EVENTS)} in {read} onroadEvents after it; " + ", ".join(bits))
 
 
-def noted(p: Param) -> Line:
+def noted(p: Param, pv: ParamView) -> Line:
   key, v, text = p.key, p.value, shown(p)
   if key == "TurnPilotShadowMode":  # Saturday runs live from the first drive: 0, the default
     return Line(key, INFO, f"{text}: TurnPilot is live, it takes turns, changes lanes and brakes") if not v else \
@@ -948,9 +1047,19 @@ def noted(p: Param) -> Line:
   if key == "TurnPilotLeftFarRangeM":
     return Line(key, INFO, f"{text}: the far crop adds no reach") if not v else \
       Line(key, WARN, f"{text} m: it must come from a measurement on this car", f"{PREFLIGHT_SET} TurnPilotLeftFarRangeM=0 until it is measured")
-  if key == "TurnPilotAutoLeft":
-    return Line(key, INFO, f"{text}: with TurnPilotLeftRangeM 0 every unprotected left is skipped and rerouted") if v == "auto" else \
-      Line(key, WARN, f"{text}: off turns the skip into a handback at the line", f"{PREFLIGHT_SET} TurnPilotAutoLeft=auto")
+  if key == "TurnPilotAutoLeft":  # unprotected_left.py; until 2026-11-06 lefts past TurnPilotLeftRangeM were skipped and rerouted
+    if v == "auto":
+      return Line(key, INFO, f"{text}: every unprotected left is driven to its line and goes from there on a gap the camera " +
+                             "certifies within TurnPilotLeftRangeM, else hands back there with the car held")
+    what = "the car stops at each unprotected left's line, says whether it would go, and hands back (debugging only)" \
+      if v == "announce" else "every unprotected left hands back at its line (G1), none goes"
+    return Line(key, WARN, f"{text}: {what}", f"{PREFLIGHT_SET} TurnPilotAutoLeft=auto")
+  if key == "TurnPilotCarSignals":  # read with TurnPilotCarSignalsForceOn: the car signals line says what the drive gets
+    if v == "check":
+      return Line(key, INFO, f"{text}: the lamp check runs at the next ignition (the car signals line)")
+    if forced_on(pv):
+      return Line(key, INFO, f"{text}: {FORCE_ON} 1 puts the car's signal on whatever this says, check aside (the car signals line)")
+    return Line(key, INFO, f"{text}: with {FORCE_ON} 0 this and the verified record decide (the car signals line)")
   if key == "TurnPilotGoOverride":
     return Line(key, INFO, f"{text}: TurnPilot's certified go from a standstill (plannerd's bounded lift)")
   if key == "TurnPilotAlwaysDrive":  # ALWAYS_DRIVE.md section 1: off is today's behaviour, never NO-GO
@@ -982,12 +1091,19 @@ def check_params(f: Facts, pv: ParamView) -> list[Line]:
     elif key == "TurnPilotStopSignGo" and p.value == "off":  # Saturday's fallback when preflight's stop-sign go line WARNs
       lines.append(Line(key, WARN, f"{shown(p)}: every stop sign and yield hands back after 1 s; Saturday runs vision unless " +
                         "preflight's stop-sign go line WARNs", fix))
+    elif key == "TurnPilotLeftRangeM" and isinstance(p.value, float) and p.value > 0.:
+      # a range set by hand or measured (left_range.py prints the --set, the owner's call): read and decided, so a WARN. 150,
+      # an earlier build's default, becomes 210 at turnpilot_web's next start (maps/defaults.ensure_left_range)
+      earlier = " (an earlier build's default: turnpilot_web writes 210 over it at its next start)" if p.value in EARLIER_CAR_RANGES_M else ""
+      lines.append(Line(key, WARN, f"{shown(p)} m, not this build's {want:g}{earlier}: a left whose R_req at its line is past it is " +
+                        "driven to its line and hands back there; keep it only if left_range.py measured it on this car", fix))
     else:
       need = "unset" if want is None else shown(Param(key, "set", want))
-      lines.append(Line(key, NO_GO, f"{shown(p)}, Saturday needs {need}", fix))
+      what = f": {OFF_VALUE[key]}" if key in OFF_VALUE else ""
+      lines.append(Line(key, NO_GO, f"{shown(p)}, the drive needs {need}{what}", fix))
   for key in NOTED:
     p = pv.get(key)
-    lines.append(unknown_param(key, f.live) if p.state == "unknown" else noted(p))
+    lines.append(unknown_param(key, f.live) if p.state == "unknown" else noted(p, pv))
   for key in MAP_PARAMS:
     p = pv.get(key)
     if p.state == "unknown":
@@ -1004,7 +1120,7 @@ def check_params(f: Facts, pv: ParamView) -> list[Line]:
 
 def evaluate(f: Facts, pv: ParamView) -> list[Line]:
   lines = [check_branch(f, pv), check_car(f), *check_eps(f), check_source(f), check_three_bit(f), check_das_settings(f),
-           check_longitudinal(f, pv), check_panda(f), *check_panda_long(f), check_turn_signal_frame(f, pv), *check_stalk(f),
+           check_longitudinal(f, pv), check_panda(f), *check_panda_long(f), check_turn_signal_frame(f, pv), *check_stalk(f, pv),
            check_car_signals(f, pv), check_vin(f, pv), check_calibration(f), check_camera(f), check_big_model(f),
            check_detector(f, pv), check_faults(f), check_health(f), *check_params(f, pv)]
   return lines + [Line(name, INFO, how) for name, how in BY_HAND]
