@@ -92,6 +92,19 @@ def trusted(fix: Fix | None) -> bool:
   return fix is not None and all(math.isfinite(x) for x in fix.position) and fix.accuracy <= GPS_ACCURACY_MAX_M
 
 
+def course_good(fix: Fix | None, motion: Motion | None) -> bool:
+  """Whether fix's bearing is a GPS course the heading navd routes with is taken from (module docstring): a trusted fix, the
+  car moving HEADING_MIN_V or faster (carState's vEgo, else the fix's own speed without a live carState), a finite bearing
+  and a bearing accuracy within HEADING_ACCURACY_MAX_DEG (0 is none reported). PositionHold's heading becomes the fix's bearing
+  exactly when this says so, and navd's HeadingBasis (parked onroad, COURSE_TURN_MAX_DEG) starts a course on it: one test,
+  so the two can't drift apart (review of 11-06: navd had mirrored it as course_taken, kept in step by a test alone)."""
+  if not trusted(fix):
+    return False
+  assert fix is not None
+  v = motion.v if motion is not None else fix.speed
+  return v >= HEADING_MIN_V and math.isfinite(fix.bearing) and 0. < fix.bearing_accuracy <= HEADING_ACCURACY_MAX_DEG
+
+
 def car_motion(sm) -> Motion | None:
   """The car's speed and heading from navd's SubMaster, None without a live, valid carState."""
   if 'carState' not in sm.data or not sm.alive['carState'] or not sm.valid['carState']:
@@ -205,7 +218,7 @@ class PositionHold:
       self._v = self._yaw = None
       self.standing = False
     ok = trusted(fix)
-    self._update_heading(fix, ok, motion, ds, yaw_step)
+    self._update_heading(fix, motion, ds, yaw_step)
 
     if self.position is None:
       if fix is not None:  # the first position, from whatever there is: navd routes from nothing else
@@ -228,10 +241,10 @@ class PositionHold:
       self.reacquire = 0
     self._carry(ds, dt, yaw_step, geometry, step_idx, missed)
 
-  def _update_heading(self, fix: Fix | None, ok: bool, motion: Motion | None, ds: float, yaw_step: float | None) -> None:
-    """heading (module docstring): a good fix's bearing, else the last good one turned with the car, or none."""
-    v = motion.v if motion is not None else fix.speed if fix is not None else 0.
-    if ok and v >= HEADING_MIN_V and math.isfinite(fix.bearing) and 0. < fix.bearing_accuracy <= HEADING_ACCURACY_MAX_DEG:
+  def _update_heading(self, fix: Fix | None, motion: Motion | None, ds: float, yaw_step: float | None) -> None:
+    """heading (module docstring): a good fix's bearing (course_good), else the last good one turned with the car, or none."""
+    if course_good(fix, motion):
+      assert fix is not None
       self.heading, self._heading_m = fix.bearing % 360., 0.
     elif self.heading is not None and yaw_step is not None:
       self.heading = (self.heading + yaw_step) % 360.

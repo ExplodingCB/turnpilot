@@ -13,6 +13,27 @@ from openpilot.selfdrive.navigation.pmtiles import HEADER_LENGTH
 
 CACHE_LIMIT = 64 * 1024 * 1024
 MERGE_GAP = 256 * 1024  # tiles this close together in the archive are fetched in one range request
+METADATA_STEP = 'nav/tiles'  # TurnPilot: comma's v1/<dongle>/nav/tiles call, which answers with the archive's signed URL
+RANGE_STEP = 'range'  # TurnPilot: the byte-range read of the archive at that signed URL
+
+
+class TileFetchError(OSError):
+  """TurnPilot: a failed tile fetch that says which call failed and, when there was one, its HTTP status, never the URL.
+
+  2026-11-06, both drives (0000001d and 0000001e): mapsd.render_failed every 10 s whenever a route existed (1e: from seg0
+  t=36 s to the end, 6 a segment), every one a bare 'Unable to fetch map tiles' from RemoteTiles' first header read, with
+  the uploader and athena reaching comma's servers in the same minutes. The old except turned every requests
+  error into that, so the logs couldn't say whether comma's nav/tiles call refused this device (PrimeType 0, no prime, is
+  the leading cause) or something else failed, and the comma's map panel stayed black all drive. The message now carries
+  '(nav/tiles HTTP 403)' or '(range HTTP 412)'. Without a status (a dropped connection, a body that isn't the expected
+  JSON) it stays 'Unable to fetch map tiles', and a note on the exception (shown in the logged traceback, not in str())
+  names the call and the error's type. step and status are attributes too, so mapsd can stop retrying a refusal."""
+
+  def __init__(self, step: str, status: int | None = None, cause: str = ''):
+    super().__init__('Unable to fetch map tiles' + (f' ({step} HTTP {status})' if status is not None else ''))
+    self.step, self.status = step, status
+    if status is None and cause:
+      self.add_note(f'{step}: {cause}')  # the error's type only: requests' own messages hold the signed URL
 
 
 class RemoteTiles:
@@ -38,18 +59,20 @@ class RemoteTiles:
       raise
 
   def _fetch(self, offset: int, length: int) -> bytes:
+    step = METADATA_STEP
     try:
       if time.time() >= self.expires - 60:  # noqa: TID251 - SAS expiry is a Unix timestamp
         response = self.api.get(f'v1/{self.api.dongle_id}/nav/tiles', access_token=self.api.get_token(), timeout=10)
         response.raise_for_status()
         metadata = response.json()
         self.url, self.expires = metadata['url'], metadata['expires']
+      step = RANGE_STEP
       headers = {'Range': f'bytes={offset}-{offset + length - 1}', 'Accept-Encoding': 'identity'}
       if self.etag is not None:
         headers['If-Match'] = self.etag
       with self.session.get(self.url, headers=headers, timeout=10, stream=True) as response:
         if response.status_code != 206:
-          raise OSError(f'Map tile range request failed ({response.status_code})')
+          raise TileFetchError(RANGE_STEP, response.status_code)  # 'Unable to fetch map tiles (range HTTP 412)'
         match = re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)', response.headers.get('Content-Range', ''))
         if match is None or tuple(map(int, match.groups()[:2])) != (offset, offset + length - 1):
           raise OSError('Invalid map tile range response')
@@ -66,9 +89,12 @@ class RemoteTiles:
           raise OSError('Truncated map tile range response')
         self.size, self.etag = size, etag
         return bytes(data)
-    except (requests.RequestException, ValueError, KeyError, TypeError, RuntimeError):
+    except requests.HTTPError as e:  # raise_for_status: the call answered, with an error status. Before RequestException, its base
+      status = e.response.status_code if e.response is not None else None
+      raise TileFetchError(step, status, type(e).__name__) from None
+    except (requests.RequestException, ValueError, KeyError, TypeError, RuntimeError) as e:
       # requests exceptions contain the signed URL; keep it out of logs.
-      raise OSError('Unable to fetch map tiles') from None
+      raise TileFetchError(step, cause=type(e).__name__) from None
 
   def _store(self, offset: int, data: bytes):
     (self.cache / f'{offset}-{len(data)}').write_bytes(data)

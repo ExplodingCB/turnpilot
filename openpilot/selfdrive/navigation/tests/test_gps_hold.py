@@ -175,9 +175,12 @@ def test_without_car_state_fixes_are_taken_as_before_but_never_a_poor_one():
   place stays. A fix past GPS_ACCURACY_MAX_M is never taken but as the very first place (navd routes from nothing else)."""
   loop = NavdLoop(motion=False, yaw=False)
   ni, valid = loop.tick(0., 0., fix=(0., 0., 60.))  # the first place: poor, but all there is
-  assert valid and loop.engine.last_position == place(0.)
-  loop.tick(30., 0., fix='true')
+  # routed from it with no heading (none moving, no bearing accuracy): nothing goes out until the car's direction is checked
+  # (navd heading_due), here by its travel along the route, since these fixes never give a heading
+  assert not valid and loop.engine.last_position == place(0.) and loop.engine.heading_unverified
+  ni, valid = loop.tick(30., 0., fix='true')
   assert loop.engine.last_position == place(30.)
+  assert valid and not loop.engine.heading_unverified  # 30 m on along the route: it goes the car's way
   loop.tick(60., 0., fix=(0., 0., 60.))
   assert loop.engine.last_position == place(30.) and str(loop.engine.hold.source) == 'deadReckoned'
 

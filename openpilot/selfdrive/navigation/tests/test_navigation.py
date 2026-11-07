@@ -18,10 +18,12 @@ import openpilot.cereal.messaging as messaging
 from openpilot.common.prefix import OpenpilotPrefix
 from openpilot.selfdrive.navigation.mapsd import MapsD
 from openpilot.selfdrive.turnpilot.routing import certify
-from openpilot.selfdrive.navigation.navd import RECOMPUTE_HOLD, REROUTE_COUNTER_MIN, ROUTE_RESEND_PERIOD, RouteEngine, set_banner
+from openpilot.selfdrive.navigation.navd import (RECOMPUTE_HOLD, REROUTE_COUNTER_MIN, ROUTE_RESEND_PERIOD, RouteEngine,
+                                                 chord_bearing, set_banner, step_place)
 from openpilot.selfdrive.navigation.pmtiles import PMTiles, decode_directory, tile_id
 from openpilot.selfdrive.navigation.renderer import MAJOR, MEDIUM, MINOR, SIZE, STREET, TRACK, MapRenderer, draw_segments, mercator, project, stroke_widths
-from openpilot.selfdrive.navigation.route import METERS_PER_DEGREE, ROUTE_TURNS_AHEAD_M, ROUTE_TURNS_BEHIND_M, ROUTE_TURNS_STEP_M, RouteTracker, route_turns
+from openpilot.selfdrive.navigation.route import (METERS_PER_DEGREE, ROUTE_TURNS_AHEAD_M, ROUTE_TURNS_BEHIND_M, ROUTE_TURNS_STEP_M, RouteTracker,
+                                                  along_path, cumulative_distance, route_turns)
 from openpilot.selfdrive.navigation.tiles import RemoteTiles
 from openpilot.selfdrive.navigation.vector_tile import decode_lines, decode_roads
 from openpilot.selfdrive.turnpilot.maps.client import MapError
@@ -336,7 +338,9 @@ class TestRouteEngine(unittest.TestCase):
     self.sm.valid = dict.fromkeys(('gpsLocation', 'gpsLocationExternal'), True)
     self.sm.logMonoTime = dict.fromkeys(self.sm.valid, time.monotonic_ns())
     self.sm.recv_time = dict.fromkeys(self.sm.valid, time.monotonic())
-    self.sm.__getitem__.return_value = SimpleNamespace(hasFix=True, latitude=0, longitude=0, bearingDeg=90)
+    # TurnPilot: a car driving east with a good heading of motion (speed and bearing accuracy: hold.py), so a route made from
+    # its fix has a start heading and isn't held back for a check of the car's direction (navd heading_due)
+    self.sm.__getitem__.return_value = SimpleNamespace(hasFix=True, latitude=0, longitude=0, bearingDeg=90, speed=10., bearingAccuracyDeg=2.)
     self.engine = route_engine(self.sm, self.pm, self.values)
     self.engine.last_position, self.engine.last_bearing = (0, 0), 90
     self.response = self.steps()
@@ -798,13 +802,16 @@ class TestRouteEngine(unittest.TestCase):
     self.engine.job = MagicMock()  # rerouting for the same destination
     self.engine.send_instruction()
     self.engine.job = None
-    self.load_route()  # the new route
     self.engine.last_position = (0, 0)
+    self.load_route()  # the new route, from where the car is (navd routed_across: one the car stands 33 m off is checked)
     self.engine.send_instruction()
     self.assertEqual(counts(), [(True, 1), (False, 1), (False, 1), (True, 2)])
 
   def test_maneuvers_and_rerouting(self):
     self.load_route()
+    # driving (setUp's fixes: 10 m/s), so the reroute that lands with the car off its start is a road's and kept as before
+    # (navd routed_across: VERIFY_STREET_V)
+    self.engine.v_ego = 10.
     self.engine.last_position = (0, 0.001)  # 111 m off route: reroute after a few consecutive misses
     for _ in range(REROUTE_COUNTER_MIN):
       self.assertFalse(self.engine.should_recompute())
@@ -890,7 +897,7 @@ class TestBackgroundRouting(unittest.TestCase):
     self.sm.logMonoTime = dict.fromkeys(self.sm.valid, time.monotonic_ns())
     self.sm.recv_time = dict.fromkeys(self.sm.valid, time.monotonic())
     self.sm.frame = 1
-    self.fix = SimpleNamespace(hasFix=True, latitude=0, longitude=0, bearingDeg=90)
+    self.fix = SimpleNamespace(hasFix=True, latitude=0, longitude=0, bearingDeg=90, speed=10., bearingAccuracyDeg=2.)  # heading east
     self.sm.__getitem__.side_effect = lambda service: self.fix
     params = MagicMock()
     params.get.side_effect = self.values.get
@@ -988,21 +995,21 @@ class TestBackgroundRouting(unittest.TestCase):
              for i in range(6)]
     self.values['NavDestination'] = {'latitude': 0, 'longitude': 6 * d}
     self.router.steps = steps
-    self.fix = SimpleNamespace(hasFix=True, latitude=0, longitude=0.001, bearingDeg=90)
+    self.fix = SimpleNamespace(hasFix=True, latitude=0, longitude=0.001, bearingDeg=90, speed=30., bearingAccuracyDeg=2.)
     self.tick()
     self.finish()
     self.assertTrue(self.tick().valid)
     self.router.gate = threading.Event()  # the next route call is the new corridor's download: minutes
     calls = len(self.router.calls)
     for t in range(1, 120):  # the car leaves the route northward at 30 m/s
-      self.fix = SimpleNamespace(hasFix=True, latitude=t * 30 / 111319.5, longitude=0.001, bearingDeg=0)
+      self.fix = SimpleNamespace(hasFix=True, latitude=t * 30 / 111319.5, longitude=0.001, bearingDeg=0, speed=30., bearingAccuracyDeg=2.)
       msg = self.tick()
       self.assertIn('NavDestination', self.values, f"navd deleted the destination at {t} s")
       if len(self.router.calls) > calls:
         self.assertFalse(msg.valid, f"guidance on the old route at {t} s: {msg.navInstruction.maneuverDistance} m")
         self.assertEqual(self.engine.step_idx, 0)
     self.assertGreater(len(self.router.calls), calls, "navd never rerouted")
-    self.fix = SimpleNamespace(hasFix=True, latitude=0, longitude=0.001, bearingDeg=90)
+    self.fix = SimpleNamespace(hasFix=True, latitude=0, longitude=0.001, bearingDeg=90, speed=30., bearingAccuracyDeg=2.)
     self.finish()
     self.assertFalse(self.tick().valid)  # one invalid instruction between two routes, so no turn desire carries over
     self.assertTrue(self.tick().valid)
@@ -1017,6 +1024,900 @@ class TestBackgroundRouting(unittest.TestCase):
     job.join(2)
     self.assertFalse(job.is_alive())
     self.assertIsNone(self.engine.route)
+
+
+DEG = 1 / METERS_PER_DEGREE  # degrees per m at the equator, in navd's own frame (route.local_meters)
+
+
+def ll(east: float, north: float) -> tuple:
+  """(longitude, latitude) east and north m of (0, 0): synthetic positions, never a drive's."""
+  return east * DEG, north * DEG
+
+
+def heading_to(bearing: float, m: float, origin=(0., 0.)) -> tuple:
+  """(east, north) m bearing deg and m from origin (east, north)."""
+  return origin[0] + m * np.sin(np.radians(bearing)), origin[1] + m * np.cos(np.radians(bearing))
+
+
+def road_step(points, text='', mtype='', modifier=''):
+  """A route step (Mapbox's shape) along points [(east, north) m], its banner the maneuver at its end (none for the arrival)."""
+  coords = [list(ll(*p)) for p in points]
+  distance = float(cumulative_distance(np.array(coords))[-1])
+  banners = [{'distanceAlongGeometry': min(distance, 200.), 'primary': {'text': text, 'type': mtype, 'modifier': modifier}}] if text else []
+  return {'geometry': {'coordinates': coords}, 'distance': distance, 'duration': distance / 10., 'bannerInstructions': banners}
+
+
+def arrival(point):
+  return road_step([point, point])
+
+
+class TestRouteStartAndReroutes(unittest.TestCase):
+  """TurnPilot, the 2026-11-06 drives (1d: 0000001d, 1e: 0000001e), replayed in synthetic geometry around (0, 0): a route
+  planned parked with no heading (1e's first left out of the parking spot, the wrong way), a reroute that lands with its first
+  turn already behind the car (1e 9:43.4), a right navd couldn't tell was made (1e 8:35.4) or was missed (1e 5:55.4). navd
+  steps at 1 Hz with fixes as each tick gives them (no carState: every trusted fix is taken, hold.py)."""
+
+  def setUp(self):
+    self.pm = MagicMock()
+    self.values = {'NavDestination': {'latitude': 0., 'longitude': 0.01}, 'LanguageSetting': 'main_en'}
+    self.sm = MagicMock()
+    self.sm.valid = dict.fromkeys(('gpsLocation', 'gpsLocationExternal'), True)
+    self.sm.frame = 1
+    self.fix = None
+    self.sm.__getitem__.side_effect = lambda service: self.fix
+    params = MagicMock()
+    params.get.side_effect = self.values.get
+    params.remove.side_effect = lambda key: self.values.pop(key, None)
+    self.router = StubRouter()
+    self.engine = RouteEngine(self.sm, self.pm, params=params, router=self.router, background=False)
+
+  def tick(self, place, bearing=90., speed=0., bearing_accuracy=0.):
+    """One navd update with a fix at place (east, north m) heading bearing at speed, reporting bearing_accuracy (0: none, so
+    no heading: hold.py), received just now. The navInstruction message navd sent."""
+    lon, lat = ll(*place)
+    self.fix = SimpleNamespace(hasFix=True, longitude=lon, latitude=lat, bearingDeg=bearing, speed=speed, bearingAccuracyDeg=bearing_accuracy)
+    self.sm.logMonoTime = dict.fromkeys(self.sm.valid, time.monotonic_ns())
+    self.sm.recv_time = dict.fromkeys(self.sm.valid, time.monotonic())
+    self.engine.update()
+    return next(c.args[1] for c in reversed(self.pm.send.call_args_list) if c.args[0] == 'navInstruction')
+
+  # --- the route's start direction (navd heading_due) ---
+
+  def parking_lot_start(self):
+    """1e 0:32.4: the route's first edge heads 122 deg with an 'end of road left' 44 m on; the car is parked 8 m off that
+    street, facing about 29 deg, and needs a RIGHT to join it. Returns the car's parked place (east, north m)."""
+    start, corner = (0., 0.), heading_to(122., 44.)
+    end = heading_to(32., 200., corner)
+    self.router.steps = [road_step([start, heading_to(122., 22.), corner], 'End of road left', 'end of road', 'left'),
+                         road_step([corner, end], 'Arrive', 'arrive', ''), arrival(end)]
+    return heading_to(32., 8.)
+
+  def test_a_route_made_parked_with_no_heading_sends_nothing_until_the_cars_direction_is_checked(self):
+    parked = self.parking_lot_start()
+    # parked: the u-blox's standstill bearing (295 deg, 45 deg accuracy) is no heading, so the route goes without one
+    sent = [self.tick(parked, bearing=295., bearing_accuracy=45.) for _ in range(5)]
+    self.assertEqual([c[2] for c in self.router.calls], [None])
+    self.assertTrue(self.engine.heading_unverified)
+    # invalid, so no 'end of road left' maneuver and no turn desire 40 m out at a crawl (1e: turnLeft at 0.34 m/s)
+    self.assertTrue(all(not m.valid for m in sent))
+    # creeping out of the spot under HEADING_MIN_V (3 m/s): still no heading, still nothing
+    self.assertFalse(self.tick(heading_to(29., 1., parked), bearing=29., speed=1.5, bearing_accuracy=12.).valid)
+    # pulling out onto the street the route's way (121 deg against its 122): verified, guidance from here on, no reroute
+    sent = [self.tick(heading_to(122., 4. * i, (2., 1.)), bearing=121., speed=4., bearing_accuracy=5.) for i in range(1, 4)]
+    self.assertTrue(all(m.valid for m in sent))
+    self.assertEqual(str(sent[0].navInstruction.maneuverModifier), 'left')
+    self.assertEqual(len(self.router.calls), 1)
+    self.assertFalse(self.engine.heading_unverified)
+
+  def test_route_heading_unverified_is_said_on_every_message_while_the_start_waits(self):
+    """routeHeadingUnverified (2026-11-06): while the route's start direction waits on its check (heading_unverified), every
+    message says so, the invalid ones it withholds guidance on and the separator before a reroute made for the heading, so
+    turnpilotd can say 'the route starts once moving' instead of off the route; a verified route, and no route, say false."""
+    parked = self.parking_lot_start()
+    sent = [self.tick(parked, bearing=295., bearing_accuracy=45.) for _ in range(3)]
+    self.assertTrue(all(not m.valid and m.navInstruction.routeHeadingUnverified for m in sent))
+    # the reroute for a heading against the route on the street: its separator says the new route is unverified too
+    sent = self.tick(heading_to(122., 10.), bearing=349., speed=3., bearing_accuracy=5.6)
+    self.assertEqual([c[2] for c in self.router.calls], [None, 349.])
+    self.assertFalse(sent.valid)
+    self.assertTrue(sent.navInstruction.routeHeadingUnverified and self.engine.heading_unverified)
+    # the same route back (Valhalla ignoring the heading): driving it the route's way verifies it, false from then on
+    sent = [self.tick(heading_to(122., 10. + 4. * i), bearing=121., speed=4., bearing_accuracy=5.) for i in range(1, 4)]
+    self.assertTrue(all(m.valid and not m.navInstruction.routeHeadingUnverified for m in sent))
+    # a route made with the car's own course on the street is never unverified, nor is there anything to wait on without one
+    self.setUp()
+    self.parking_lot_start()
+    sent = [self.tick(heading_to(122., 10. + 10. * i), bearing=122., speed=10., bearing_accuracy=2.) for i in range(3)]
+    self.assertEqual([c[2] for c in self.router.calls], [122.])
+    self.assertTrue(all(m.valid and not m.navInstruction.routeHeadingUnverified for m in sent))
+    self.values.pop('NavDestination')
+    sent = self.tick(heading_to(122., 40.), bearing=122., speed=10., bearing_accuracy=2.)
+    self.assertFalse(sent.valid or sent.navInstruction.routeHeadingUnverified)
+
+  def test_a_lot_heading_across_the_street_decides_nothing_and_never_reroutes(self):
+    """Review of 11-06: a heading near-perpendicular to the street says nothing about its direction, and a reroute with it
+    let Valhalla (HEADING_TOLERANCE 90) take either again, trusted at once: 'Turn left 30.6 m' went out with the car still
+    in the lot. 1e 1:30: out of the spot 107 deg off the route's 122, 13 m off the street: nothing decided, nothing sent."""
+    parked = self.parking_lot_start()
+    for _ in range(3):
+      self.tick(parked, bearing=295., bearing_accuracy=45.)
+    off = (122. - 107.) % 360.
+    sent = [self.tick(heading_to(off, 5. + 2. * i, parked), bearing=off, speed=3.1, bearing_accuracy=5.4) for i in range(3)]
+    self.assertEqual([c[2] for c in self.router.calls], [None])
+    self.assertTrue(all(not m.valid for m in sent))
+    self.assertTrue(self.engine.heading_unverified)
+
+  def test_a_car_crossing_a_lot_to_an_east_street_waits_then_its_heading_on_the_street_verifies(self):
+    """The reviewer's probe: an east street with a left 40 m on, the car 10 m north of it heading 180 (toward it) at 3.2 m/s
+    with a good bearing accuracy: no reroute with 180, nothing sent; on the street heading east, verified, the left goes out."""
+    start, corner, end = (0., 0.), (40., 0.), (40., 300.)
+    self.router.steps = [road_step([start, (20., 0.), corner], 'Turn left', 'turn', 'left'),
+                         road_step([corner, end], 'Arrive', 'arrive', ''), arrival(end)]
+    for _ in range(3):
+      self.tick((5., 14.), bearing=180., bearing_accuracy=45.)
+    sent = [self.tick((5., north), bearing=180., speed=3.2, bearing_accuracy=6.) for north in (10., 8., 6.)]
+    self.assertTrue(all(not m.valid for m in sent))
+    self.assertEqual(len(self.router.calls), 1)
+    sent = self.tick((9., 1.), bearing=92., speed=4., bearing_accuracy=4.)  # turned onto the street, the route's way
+    self.assertTrue(sent.valid)
+    self.assertEqual(str(sent.navInstruction.maneuverModifier), 'left')
+    self.assertEqual(len(self.router.calls), 1)
+    self.assertFalse(self.engine.heading_unverified)
+
+  def against_on_the_street(self, heading=349., speed=3.0):
+    """The parking-lot start, then the car on the street 10 m along it heading `heading` (1e 1:31.4: 349, bacc 5.6, 3.0 m/s,
+    133 deg off the route's 122). The message navd sent."""
+    parked = self.parking_lot_start()
+    for _ in range(3):
+      self.tick(parked, bearing=295., bearing_accuracy=45.)
+    return self.tick(heading_to(122., 10.), bearing=heading, speed=speed, bearing_accuracy=5.6)
+
+  def test_a_heading_against_the_route_on_the_street_reroutes_once_with_it_and_checks_the_new_route(self):
+    """1e 1:31.4: 133 deg off the route on the street: a reroute at once with that heading. The new route is checked too
+    (a reroute for the heading may come back the same way): here Valhalla took the car's way, so the update after the
+    separator verifies it and guidance goes out, with no third route."""
+    route, car = self.router.route, heading_to(122., 10.)
+
+    def the_cars_way(start, destination, bearing, language, position=None, cancelled=None):
+      if bearing is not None:  # routed with the car's heading: its road, its way
+        corner = heading_to(349., 60., car)
+        self.router.steps = [road_step([car, heading_to(349., 30., car), corner], 'Turn right', 'turn', 'right'),
+                             road_step([corner, heading_to(79., 300., corner)], 'Arrive', 'arrive', ''), arrival(heading_to(79., 300., corner))]
+      return route(start, destination, bearing, language, position=position, cancelled=cancelled)
+    self.router.route = the_cars_way
+    sent = self.against_on_the_street()
+    self.assertEqual([c[2] for c in self.router.calls], [None, 349.])
+    self.assertFalse(sent.valid)  # the separator between the two routes
+    self.assertTrue(self.engine.heading_unverified and self.engine.route_heading_retry)
+    sent = [self.tick(heading_to(349., 3. * i, car), bearing=349., speed=3.5, bearing_accuracy=5.) for i in range(1, 4)]
+    self.assertTrue(all(m.valid for m in sent))
+    self.assertEqual(str(sent[0].navInstruction.maneuverModifier), 'right')
+    self.assertFalse(self.engine.heading_unverified)
+    self.assertEqual(len(self.router.calls), 2)
+
+  def test_a_heading_reroute_that_comes_back_the_same_way_is_tried_again_only_once_per_recompute_hold(self):
+    """Valhalla ignoring the heading (or a one-way the car heads against) brings back the same route: still unverified,
+    nothing sent, and the next reroute for it after RECOMPUTE_HOLD, never one every update."""
+    self.against_on_the_street(heading=302., speed=3.5)  # driving back down the street, 180 deg off
+    self.assertEqual([c[2] for c in self.router.calls], [None, 302.])
+    sent = [self.tick(heading_to(122., 9. - 0.5 * i), bearing=302., speed=3.5, bearing_accuracy=5.) for i in range(1, RECOMPUTE_HOLD)]
+    self.assertTrue(all(not m.valid for m in sent))
+    self.assertEqual(len(self.router.calls), 2)
+    self.assertTrue(self.engine.heading_unverified)
+    self.tick(heading_to(122., 4.), bearing=302., speed=3.5, bearing_accuracy=5.)
+    self.assertEqual(len(self.router.calls), 3)
+
+  def test_a_heading_against_the_route_anywhere_within_off_route_distance_reroutes(self):
+    """Reversed is informative however far into OFF_ROUTE_DISTANCE: 15 m off the street (a wide road's far side), 180 deg off
+    the route's way, a reroute with it; VERIFY_LATERAL_M bounds only verification."""
+    parked = self.parking_lot_start()
+    for _ in range(3):
+      self.tick(parked, bearing=295., bearing_accuracy=45.)
+    self.tick(heading_to(32., 15., heading_to(122., 20.)), bearing=302., speed=3.5, bearing_accuracy=5.)
+    self.assertEqual([c[2] for c in self.router.calls], [None, 302.])
+
+  def test_a_reroute_made_while_the_route_is_unverified_is_unverified_too(self):
+    """A car driving round a lot more than REROUTE_DISTANCE off the route is rerouted (should_recompute) with its lot heading:
+    that route is checked like the one it replaced, never trusted for having a heading (the reviewer's probe, by another
+    road). On the street the route's way, it is verified."""
+    parked = self.parking_lot_start()
+    self.tick(parked, bearing=295., bearing_accuracy=45.)
+    for i in range(RECOMPUTE_HOLD + REROUTE_COUNTER_MIN):
+      self.tick(heading_to(32., 30. + i), bearing=32., speed=3.5, bearing_accuracy=5.)
+    self.assertEqual([c[2] for c in self.router.calls], [None, 32.])
+    self.assertTrue(self.engine.heading_unverified)
+    self.assertFalse(self.engine.route_heading_retry)
+    self.assertFalse(self.tick(heading_to(32., 20.), bearing=212., speed=3.5, bearing_accuracy=5.).valid)  # back across the lot
+    self.assertTrue(self.tick(heading_to(122., 6.), bearing=120., speed=4., bearing_accuracy=5.).valid)
+    self.assertEqual(len(self.router.calls), 2)
+
+  def test_a_wide_roads_far_lane_verifies_at_speed_and_waits_at_a_crawl(self):
+    """14 m off the step's mapped centre line, heading its way: at a crawl that is a parking row's place too, so it waits; at
+    VERIFY_STREET_V it is the street. (carState given here: vEgo is the car's speed.)"""
+    from openpilot.selfdrive.navigation.hold import Motion
+    self.router.steps = [road_step([(0., 0.), (100., 0.), (300., 0.)], 'Turn right', 'turn', 'right'),
+                         road_step([(300., 0.), (300., -300.)], 'Arrive', 'arrive', ''), arrival((300., -300.))]
+    speed = {'v': 0.}
+    with patch('openpilot.selfdrive.navigation.navd.car_motion', lambda sm: Motion(speed['v'], None)):
+      self.tick((0., 14.), bearing=295., bearing_accuracy=45.)
+      self.assertTrue(self.engine.heading_unverified)
+      speed['v'] = 4.
+      self.assertFalse(self.tick((4., 14.), bearing=90., speed=4., bearing_accuracy=4.).valid)
+      self.assertTrue(self.engine.heading_unverified)
+      speed['v'] = 9.  # 20 mph (VERIFY_STREET_V 8)
+      self.assertTrue(self.tick((12., 14.), bearing=90., speed=9., bearing_accuracy=3.).valid)
+    self.assertEqual(len(self.router.calls), 1)
+
+  def test_standing_a_heading_only_verifies(self):
+    """Standing, the hold's heading is the car's own, turned with its yaw (hold.py): pointing the route's way on the street it
+    verifies; nose-in in a space, 90 deg off, decides nothing; reversed, nothing either (a car standing never reroutes for
+    its heading: it may yet reverse out)."""
+    from openpilot.selfdrive.navigation.hold import Motion
+    with patch('openpilot.selfdrive.navigation.navd.car_motion', lambda sm: Motion(0., None)):
+      for place, heading, verified in (('parked', 32., False), (heading_to(122., 10.), 302., False), (heading_to(122., 10.), 121., True)):
+        with self.subTest(heading=heading):
+          self.setUp()
+          parked = self.parking_lot_start()
+          place = parked if place == 'parked' else place
+          for _ in range(2):
+            self.tick(place, bearing=heading, bearing_accuracy=45.)
+          self.engine.hold.heading = heading  # as an earlier drive's moving fixes and the car's yaw since left it
+          self.assertTrue(self.engine.hold.standing)
+          self.assertEqual(self.tick(place, bearing=heading, bearing_accuracy=45.).valid, verified)
+          self.assertEqual(self.engine.heading_unverified, not verified)
+          self.assertEqual(len(self.router.calls), 1)
+
+  def test_a_heading_within_the_tolerance_keeps_the_route_and_a_wrong_one_far_off_it_waits(self):
+    parked = self.parking_lot_start()
+    self.tick(parked, bearing=295., bearing_accuracy=45.)
+    # 30 m off the street (a car park beside it): its heading says nothing about the street's direction, so nothing is decided
+    self.tick(heading_to(32., 30.), bearing=300., speed=4., bearing_accuracy=5.)
+    self.assertTrue(self.engine.heading_unverified)
+    self.assertEqual(len(self.router.calls), 1)
+    # on the street, 1 deg off the route's bearing: kept
+    self.assertTrue(self.tick(heading_to(122., 10.), bearing=123., speed=4., bearing_accuracy=5.).valid)
+    self.assertEqual(len(self.router.calls), 1)
+
+  def test_with_no_heading_ever_travel_along_the_route_verifies_it_and_travel_against_it_never(self):
+    """A receiver that reports no bearing accuracy gives no heading at all: VERIFY_TRAVEL_M along the step on it verifies the
+    route, so guidance isn't withheld for the drive; driving back down the step the wrong way never does."""
+    self.router.steps = [road_step([(0., 0.), (100., 0.), (200., 0.)], 'Turn right', 'turn', 'right'),
+                         road_step([(200., 0.), (200., -300.)], 'Arrive', 'arrive', ''), arrival((200., -300.))]
+    sent = [self.tick((60. - 5. * i, 2.), bearing=270., speed=5.) for i in range(6)]  # 25 m back toward the route's start
+    self.assertTrue(all(not m.valid for m in sent) and self.engine.heading_unverified)
+    sent = [self.tick((35. + 5. * i, 2.), bearing=90., speed=5.) for i in range(1, 5)]  # then 20 m the route's way
+    self.assertEqual([m.valid for m in sent], [False, False, True, True])  # valid from 15 m on
+    self.assertEqual(len(self.router.calls), 1)
+
+  def test_a_route_made_with_a_heading_is_never_held_back(self):
+    self.router.steps = [road_step([(0., 0.), (200., 0.)], 'Turn right', 'turn', 'right'), arrival((200., 0.))]
+    self.assertTrue(self.tick((0., 1.), bearing=90., speed=10., bearing_accuracy=3.).valid)
+    self.assertFalse(self.engine.heading_unverified)
+
+  def test_a_download_that_routes_from_a_later_moving_fix_routes_with_its_heading(self):
+    # the router routes from position() after a download (sources.py: route_server); that bearing is the route's heading
+    job_steps = [road_step([(0., 0.), (200., 0.)], 'Turn right', 'turn', 'right'), arrival((200., 0.))]
+    self.router.steps = job_steps
+    route = self.router.route
+
+    def downloading(start, destination, bearing, language, position=None, cancelled=None):
+      self.assertIsNone(bearing)  # the job started with the car standing
+      self.tick_fix((10., 1.), bearing=91., speed=8., bearing_accuracy=3.)  # meanwhile it drove off east
+      return route(start, destination, bearing, language, position=position, cancelled=cancelled)
+    self.router.route = downloading
+    self.tick_fix((0., 1.), bearing=200., bearing_accuracy=40.)
+    self.engine.update()
+    self.assertFalse(self.engine.heading_unverified)
+
+  def tick_fix(self, place, bearing=90., speed=0., bearing_accuracy=0.):
+    """The fix tick() would give, and the hold (and what its heading rests on, navd's note_basis) updated with it, without the
+    rest of navd's update."""
+    from openpilot.selfdrive.navigation.hold import car_motion, gps_fix
+    lon, lat = ll(*place)
+    self.fix = SimpleNamespace(hasFix=True, longitude=lon, latitude=lat, bearingDeg=bearing, speed=speed, bearingAccuracyDeg=bearing_accuracy)
+    self.sm.logMonoTime = dict.fromkeys(self.sm.valid, time.monotonic_ns())
+    self.sm.recv_time = dict.fromkeys(self.sm.valid, time.monotonic())
+    fix, motion, now = gps_fix(self.sm), car_motion(self.sm), time.monotonic()
+    self.engine.hold.update(fix, motion, now)
+    self.engine.note_basis(fix, motion, now)
+    self.engine.last_position = self.engine.hold.position
+
+  # --- a reroute that lands stale (navd collect_route, stale_start) ---
+
+  def stale_route(self, first_turn_m, text='Turn right', mtype='turn', modifier='right'):
+    """A route east from (0, 0) to a turn first_turn_m on, then south to the end."""
+    corner = (first_turn_m, 0.)
+    self.router.steps = [road_step([(0., 0.), (first_turn_m / 2., 0.), corner], text, mtype, modifier),
+                         road_step([corner, (first_turn_m, -300.)], 'Arrive', 'arrive', ''), arrival((first_turn_m, -300.))]
+
+  def route_while_driving(self, travelled, v_ego=11.):
+    """navd routes from (0, 0) at v_ego; while each route job runs the car drives on: to travelled[i] m east by the time the
+    i-th route comes back (1e: 4-7 s, 37-101 m, from 'Calculating route' to the first instruction)."""
+    self.engine.last_position, self.engine.last_bearing, self.engine.v_ego = ll(0., 0.), 90., v_ego
+    route, places = self.router.route, list(travelled)
+
+    def driving(*args, **kwargs):
+      if places:
+        self.engine.last_position = ll(places.pop(0), 0.)
+      return route(*args, **kwargs)
+    self.router.route = driving
+    self.engine.calculate_route((0.01, 0.))
+
+  def test_a_reroute_whose_first_right_is_already_behind_the_car_is_routed_again_once_then_installed(self):
+    """1e 9:39.4-9:43.4: the reroute's job started 38 m back; it landed with its first right 4.8 m behind the car, skipped
+    tooLate and rerouted again a second later. navd routes it again at once from where the car is, and the second result
+    goes in as it is (here the stub's same route, its right still behind: never a third)."""
+    self.stale_route(30.)
+    self.route_while_driving([34.8, 78.8])
+    self.assertEqual(len(self.router.calls), 2)
+    self.assertEqual(self.router.calls[0][0], ll(0., 0.))
+    self.assertEqual(self.router.calls[1][0], ll(34.8, 0.))  # the retry from the live position
+    self.assertIsNone(self.engine.job)
+    self.assertEqual((self.engine.route_count, self.engine.step_idx), (2, 0))
+
+  def test_a_first_turn_too_close_at_speed_is_stale_and_one_far_enough_or_a_keep_or_standing_is_not(self):
+    """1e rc=13 (11:19.4): its first right 37 m on at 12 m/s, too close to make. Stale under max(25 m, 3 s at the car's
+    speed) when its first instruction goes out, a second after the route lands (the separator's update); a keep (no junction
+    turn), a car that didn't move while it routed (the same route would come back) and a car standing (a route made at a red
+    light: the turn is near, not stale) are installed as they are."""
+    # (first turn m from the route's start, m the car drove while it routed, v_ego, banner, standing, routed again)
+    for name, first, travelled, v_ego, banner, standing, again in (
+        ('20 m ahead at 11 m/s', 58., 38., 11., ('Turn right', 'turn', 'right'), False, True),
+        ('40 m ahead at 11 m/s: 29 m, under 3 s, a second on', 78., 38., 11., ('Turn left', 'turn', 'left'), False, True),
+        ('50 m ahead at 11 m/s: 39 m a second on', 88., 38., 11., ('Turn right', 'turn', 'right'), False, False),
+        ('30 m ahead at 4 m/s: 26 m a second on', 68., 38., 4., ('Turn right', 'turn', 'right'), False, False),
+        ('20 m ahead at 5 m/s, a slight-right keep', 58., 38., 5., ('Keep right', 'fork', 'slight right'), False, False),
+        ('20 m ahead, not having moved while it routed', 20., 0., 11., ('Turn right', 'turn', 'right'), False, False),
+        ('standing at a red 20 m short', 58., 38., 0., ('Turn right', 'turn', 'right'), True, False)):
+      with self.subTest(name):
+        self.setUp()
+        self.stale_route(first, *banner)
+        self.engine.hold.standing = standing
+        self.route_while_driving([travelled, travelled], v_ego=v_ego)
+        self.assertEqual(len(self.router.calls), 2 if again else 1)
+        self.assertEqual(self.engine.route_count, 2 if again else 1)
+
+  # --- the step's end: a turn made or missed, by the car's heading (navd turned_onto_next, went_straight_past) ---
+
+  def wide_right(self):
+    """1e 8:16-8:36: a right from a wide road's curb lane. The step runs east to the junction at (0, 0), its last segment
+    13.3 m, and the next one south. At the 1e moment the car is 20.7 m off the step at -8.5 m along and 6.4 m off the next
+    step's line (its right lane), heading the exit road."""
+    self.router.steps = [road_step([(-200., 0.), (-13.33, 0.), (0., 0.)], 'Turn right', 'turn', 'right'),
+                         road_step([(0., 0.), (0., -400.)], 'Arrive', 'arrive', ''), arrival((0., -400.))]
+    self.assertTrue(self.tick((-100., -3.), bearing=90., speed=8., bearing_accuracy=2.).valid)
+    return (-6.4, -20.7)
+
+  def test_a_right_made_on_a_wide_road_moves_navd_on_by_the_cars_heading(self):
+    after_turn = self.wide_right()
+    g0, g1 = self.engine.route_geometry[:2]
+    # the 1e geometry: past OFF_ROUTE_DISTANCE off the step at -8.5 m along, and past NEXT_STEP_NEAR off the next one
+    self.assertAlmostEqual(along_path(g0, ll(*after_turn))[1], 20.7, delta=0.05)
+    self.assertAlmostEqual(self.engine.route[0]['distance'] - along_path(g0, ll(*after_turn))[0], -8.5, delta=0.1)
+    self.assertAlmostEqual(along_path(g1, ll(*after_turn))[1], 6.4, delta=0.05)
+    sent = [self.tick((-20., -4.), bearing=95., speed=5., bearing_accuracy=2.),
+            self.tick((-9., -8.), bearing=125., speed=4., bearing_accuracy=2.),    # turning, not onto the exit road yet
+            self.tick(after_turn, bearing=181., speed=3.8, bearing_accuracy=2.1)]  # on it (1e: 15 deg against its 16)
+    self.assertEqual([m.valid for m in sent], [True, True, True])  # never the invalid blip turnpilotd dropped the turn on
+    self.assertEqual([self.engine.step_idx, str(sent[1].navInstruction.maneuverModifier)], [1, 'right'])
+    self.assertEqual(str(sent[-1].navInstruction.maneuverType), 'arrive')
+    self.assertEqual(len(self.router.calls), 1)
+
+  def test_without_a_heading_the_wide_right_goes_invalid_as_before(self):
+    after_turn = self.wide_right()
+    self.tick((-20., -4.), bearing=95., speed=5., bearing_accuracy=2.)
+    self.engine.hold.heading = None  # no heading (a dropout ended it), and these fixes report no bearing accuracy
+    self.assertFalse(self.tick(after_turn, bearing=181., speed=3.8).valid)  # navd can only go by the geometry
+    self.assertEqual(self.engine.step_idx, 0)
+
+  def test_straight_through_a_right_is_a_missed_turn_rerouted_at_once_never_the_next_step(self):
+    """1e 5:49-5:56: the car went straight through the right (GPS 127-129, the step 128, the next road 201); navd moved on
+    at -10.4 m to the next step's left 80 m on a road the car wasn't on, and turnpilotd armed an unprotected left for 1 s."""
+    self.wide_right()
+    self.tick((-5., -3.), bearing=90., speed=9., bearing_accuracy=2.)
+    sent = self.tick((10.4, -3.), bearing=89., speed=9., bearing_accuracy=2.)  # just past the junction, straight on
+    self.assertLess(sent.navInstruction.maneuverDistance, -10.)
+    self.assertEqual(self.engine.step_idx, 0)  # not moved on
+    self.assertTrue(self.engine.missed)
+    self.assertEqual(len(self.router.calls), 1)
+    self.tick((19.4, -3.), bearing=90., speed=9., bearing_accuracy=2.)  # the next update: rerouted from where the car is
+    self.assertEqual(len(self.router.calls), 2)
+    self.assertEqual(self.router.calls[1][0], ll(19.4, -3.))
+    self.assertFalse(self.engine.missed)
+
+  def test_without_a_heading_past_the_end_navd_moves_on_as_before(self):
+    self.wide_right()
+    self.tick((-5., -3.), bearing=90., speed=9., bearing_accuracy=2.)
+    self.engine.hold.heading = None
+    self.tick((10.4, -3.), bearing=90., speed=9.)  # no bearing accuracy: no heading
+    self.assertEqual(self.engine.step_idx, 1)
+    self.assertFalse(self.engine.missed)
+
+  def test_a_slight_turn_is_never_moved_on_before_its_junction(self):
+    # a slight right (20 deg): the car still on the approach heads within 30 deg of the next road, but hasn't left its own
+    corner = (0., 0.)
+    self.router.steps = [road_step([(-200., 0.), corner], 'Turn slight right', 'turn', 'slight right'),
+                         road_step([corner, heading_to(110., 300.)], 'Arrive', 'arrive', ''), arrival(heading_to(110., 300.))]
+    self.tick((-100., 0.), bearing=90., speed=8., bearing_accuracy=2.)
+    sent = self.tick((-6., 0.5), bearing=95., speed=8., bearing_accuracy=2.)
+    self.assertEqual(self.engine.step_idx, 0)
+    self.assertAlmostEqual(sent.navInstruction.maneuverDistance, 6., delta=0.5)
+
+  def test_chord_bearings_of_a_step(self):
+    g = np.array([ll(0., 0.), ll(1., 1.), ll(1., 30.)])  # a 1.4 m stub north-east, then north
+    self.assertAlmostEqual(chord_bearing(g, from_end=False), np.degrees(np.arctan2(1., 1. + 20. - np.hypot(1., 1.))), delta=1e-6)
+    self.assertAlmostEqual(chord_bearing(g, from_end=True), 0., delta=1e-6)
+    self.assertIsNone(chord_bearing(np.array([ll(5., 5.), ll(5., 5.)]), from_end=True))
+    along, lateral, bearing = step_place(g, ll(3., 10.))
+    self.assertAlmostEqual(lateral, 2., delta=0.01)
+    self.assertAlmostEqual(bearing, 0., delta=1e-6)
+    self.assertAlmostEqual(along, np.hypot(1., 1.) + 9., delta=0.01)
+
+
+class TestSlightLeftAcrossTheOpposingRoad(unittest.TestCase):
+  """The rights review (2026-11-06): navd's maneuverOpposing present is any other road within 45 deg of straight on, so a main
+  road bending 28 deg left past a lone side road 40 deg to the right read present, and route_follower's slight_far_turn made
+  the slight left a TURN: an autonomous unprotected left held at a line on a through road, handed back. A cone on the
+  opposing road's leg off straight on was to tell the two apart, which navd never sent. navd now sends it
+  (maneuverOpposingRelBearing, and each allManeuvers entry's opposingRelBearing: routing/guidance.py), and RouteFollower reads
+  it off navd's own message beside that road's mapped speed (maneuverOpposingSpeed, opposingSpeed) and the approach's
+  (speedLimit). By its bearing alone the road off the far side was more often the approach's own road going on, whose
+  oncoming traffic the left does cross (review of 11-06: 5 of the 6 keeps the bare cone made on the local tiles around the
+  11-06 drives, every one at the approach's own mapped speed; routing/guidance.py docstring), so the cone is gone
+  (2026-11-07): the slight left across the road straight ahead, one on its own side (1e seg 5, 1d seg 9: 29 and 38 deg lefts
+  with an oncoming approach) or one off the far side at the approach's speed is a TURN, on navd's message and on the look
+  ahead. navd on a route of synthetic geometry around (0, 0), the car on the street east of the junction with a good course
+  (routed with it: valid)."""
+
+  setUp = TestRouteStartAndReroutes.setUp
+  tick = TestRouteStartAndReroutes.tick
+
+  def route(self, other: float, bend_first: bool = False):
+    """East 150 m to a slight left onto 62 deg (28 deg left) at a junction with one other road leaving at `other` deg, then the
+    arrival; bend_first: a 'continue straight' at 60 m first (no other road: NONE), so the slight left is allManeuvers[1], the
+    maneuver RouteFollower looks ahead to past it."""
+    corner, end = (150., 0.), heading_to(62., 200., (150., 0.))
+    junction = {'type': 'turn', 'modifier': 'slight left', 'bearing_before': 90., 'bearing_after': 62.}
+    steps = [road_step([(0., 0.), (75., 0.), corner], 'Bear left', 'turn', 'slight left'), road_step([corner, end], 'Arrive', 'arrive', ''),
+             arrival(end)]
+    steps[1].update(maneuver=junction, intersections=[{'location': list(ll(*corner)), 'bearings': [62., 270., other],
+                                                       'entry': [True, False, True], 'in': 1, 'out': 0}])
+    if bend_first:
+      first, rest = road_step([(0., 0.), (60., 0.)], 'Continue', 'continue', 'straight'), road_step([(60., 0.), (105., 0.), corner],
+                                                                                                    'Bear left', 'turn', 'slight left')
+      rest.update(maneuver={'type': 'continue', 'modifier': 'straight', 'bearing_before': 90., 'bearing_after': 90.},
+                  intersections=[{'location': list(ll(60., 0.)), 'bearings': [90., 270.], 'entry': [True, False], 'in': 1, 'out': 0}])
+      steps = [first, rest] + steps[1:]
+    self.router.steps = steps
+
+  def follow(self):
+    """navd's messages for the car driving east 10 m/s on a good course from 20 m to 50 m, each into a RouteFollower as
+    turnpilotd gives them: the follower and the last message."""
+    from openpilot.selfdrive.turnpilot.route_follower import RouteFollower
+    rf = RouteFollower()
+    for east in (20., 30., 40., 50.):
+      sent = self.tick((east, 0.), bearing=90., speed=10., bearing_accuracy=2.)
+      rf.update(sent.navInstruction, True, sent.valid, 10., 1.)
+    self.assertTrue(sent.valid)
+    return rf, sent.navInstruction
+
+  def test_the_opposing_roads_bearing_and_speed_reach_the_follower(self):
+    import math
+    from openpilot.selfdrive.turnpilot.route_follower import LEFT, NONE, TURN, make_maneuver
+    limit = 13.41  # m/s, 30 mph: the approach's and the opposing road's alike, a through road's
+    # off the far side 40 deg (the approach's own road going on at its speed: the class docstring), ahead, the turn's side
+    for other, rel, kind in ((130., 40., TURN), (95., 5., TURN), (75., -15., TURN), (45., -45., TURN)):
+      with self.subTest(other=other):
+        self.setUp()
+        self.route(other)
+        self.router.opposing_result, self.router.limits_result = {0: (limit, 2)}, [(1000., limit)]
+        rf, ni = self.follow()
+        self.assertEqual(str(ni.maneuverOpposing), 'present')
+        self.assertAlmostEqual(ni.maneuverOpposingRelBearing, rel, places=3)
+        self.assertAlmostEqual(ni.allManeuvers[0].opposingRelBearing, rel, places=3)
+        self.assertAlmostEqual(ni.maneuverOpposingSpeed, limit, places=3)  # the road's speed and the approach's, on one message
+        self.assertAlmostEqual(ni.speedLimit, limit, places=3)
+        m = rf.upcoming
+        self.assertEqual((m.side, m.type, m.modifier), (LEFT, 'turn', 'slight left'))
+        self.assertEqual(m.kind, kind)
+        self.assertAlmostEqual(m.angle_deg, 28.)
+        self.assertAlmostEqual(m.opposing_rel_deg, rel, places=3)
+        self.assertAlmostEqual(m.opposing_speed, limit, places=3)
+        # past a 'continue straight' first, the slight left is RouteFollower's look ahead (allManeuvers[1]): the same reading
+        self.setUp()
+        self.route(other, bend_first=True)
+        self.router.opposing_result, self.router.limits_result = {1: (limit, 2)}, [(1000., limit)]
+        rf, ni = self.follow()
+        self.assertEqual(rf.upcoming.kind, NONE)
+        self.assertAlmostEqual(ni.allManeuvers[1].opposingRelBearing, rel, places=3)
+        self.assertAlmostEqual(ni.allManeuvers[1].opposingSpeed, limit, places=3)
+        self.assertEqual(rf.ahead.side, LEFT)
+        self.assertEqual(rf.ahead.kind, kind)
+        self.assertAlmostEqual(rf.ahead.opposing_rel_deg, rel, places=3)
+        self.assertAlmostEqual(rf.ahead.opposing_speed, limit, places=3)
+    # what the car did before: no bearing (a navd before the field: NaN, not known), present alone decides, a TURN past the road off the far side
+    self.assertEqual(make_maneuver('turn', 'slight left', (), True, 90., 62., 1, 'present', True, None).kind, TURN)
+    # an invalid message (the separator, a route not yet verified) carries none: NaN, never a road dead ahead
+    self.setUp()
+    self.route(130.)
+    sent = self.tick((20., 0.), bearing=295., bearing_accuracy=45.)  # standing with no course: routed with none, unverified
+    self.assertFalse(sent.valid)
+    self.assertTrue(math.isnan(sent.navInstruction.maneuverOpposingRelBearing))
+
+
+class TestParkedOnroadHeading(unittest.TestCase):
+  """Review of 11-06, the residual of the route-start fix: the occupied Tesla can park nose-in and stay onroad, so carState and
+  deviceMotion stay live and the hold's heading, turned with the car's yaw through the manoeuvre, is its orientation in the
+  space: perpendicular to the street. A destination set then was routed with it as a known heading and never checked (1d
+  ended standing 80 s at 82 deg from its last GPS course). navd routes with the hold's heading only while it rests on a GPS
+  course the car has turned less than COURSE_TURN_MAX_DEG from since (navd HeadingBasis), so a red light after driving
+  straight keeps its heading (the 11-06 stands: at most 11.9 deg). navd itself on navd_loop's synthetic route (east 300 m to a
+  left) with carState and deviceMotion, no deviceState: onroad throughout, as the occupied car is."""
+
+  def loop(self):
+    from openpilot.selfdrive.turnpilot.tests.navd_loop import NavdLoop
+    return NavdLoop()
+
+  @staticmethod
+  def into_a_space(loop, s=100.):
+    """Driven east at 10 m/s on good GPS to s, then a right at 2 m/s (under HEADING_MIN_V, so no GPS course) on a 5 m radius
+    into a space beside the street, nose-in 8 m south of it, heading 180, and standing there: the last tick's instruction."""
+    from openpilot.selfdrive.navigation.hold import HEADING_MIN_V
+    for i in range(int(s / 10.)):
+      loop.tick(10. * i, 10.)
+    assert 2. < HEADING_MIN_V
+    for turned in (20., 40., 60., 80., 90.):
+      a = np.radians(turned)
+      loop.tick(s, 2., fix=(5. * np.sin(a), -5. + 5. * np.cos(a), 3.), car_heading=90. + turned)
+    loop.tick(s, 2., fix=(5., -8., 3.), car_heading=180.)
+    out = None
+    for _ in range(5):
+      out = loop.tick(s, 0., fix=(5., -8., 3.), car_heading=180.)
+    return out
+
+  def test_the_course_test_is_the_holds_own(self):
+    """hold.py's course_good is the one course test (review of 11-06: navd had mirrored it as course_taken, kept in step by
+    this test alone): the hold's heading becomes the fix's bearing exactly when it says so, and navd's HeadingBasis starts a
+    course (its turn since reset, routable again) on the very same updates, at each edge (HEADING_MIN_V,
+    HEADING_ACCURACY_MAX_DEG, none reported, no carState, a NaN bearing, a poor fix, no fix)."""
+    from openpilot.selfdrive.navigation import navd
+    from openpilot.selfdrive.navigation.hold import (GPS_ACCURACY_MAX_M, HEADING_ACCURACY_MAX_DEG, HEADING_MIN_V, Fix, Motion, PositionHold,
+                                                     course_good)
+    from openpilot.selfdrive.navigation.navd import HeadingBasis
+    self.assertFalse(hasattr(navd, 'course_taken'))  # no copy to drift from it
+    cases = [(Fix((0., 0.), 200., 3., 0., 5.), Motion(HEADING_MIN_V, None)),
+             (Fix((0., 0.), 200., 3., 10., 5.), Motion(HEADING_MIN_V - 0.01, None)),
+             (Fix((0., 0.), 200., 3., 10., HEADING_ACCURACY_MAX_DEG), Motion(10., None)),
+             (Fix((0., 0.), 200., 3., 10., HEADING_ACCURACY_MAX_DEG + 0.01), Motion(10., None)),
+             (Fix((0., 0.), 200., 3., 10., 0.), Motion(10., None)),
+             (Fix((0., 0.), 560., 3., HEADING_MIN_V, 5.), None),
+             (Fix((0., 0.), 200., 3., HEADING_MIN_V - 0.01, 5.), None),
+             (Fix((0., 0.), float('nan'), 3., 10., 5.), Motion(10., None)),
+             (Fix((0., 0.), 200., GPS_ACCURACY_MAX_M + 1., 10., 5.), Motion(10., None)),
+             (Fix((0., 0.), 200., 0., 10., 5.), Motion(10., None)),
+             (None, Motion(10., None))]
+    taken = []
+    for fix, motion in cases:
+      hold = PositionHold()
+      hold.update(Fix((0., 0.), 10., 3., 10., 5.), Motion(10., None), 0.)
+      self.assertEqual(hold.heading, 10.)
+      hold.update(fix, motion, 1.)
+      self.assertEqual(hold.heading != 10., course_good(fix, motion), (fix, motion))
+      # HeadingBasis on a course the car then turned 40 deg from at a crawl (not routable), given this update's fix and motion
+      # and the heading the hold left: a course again (routable) exactly when the hold took the fix's bearing
+      basis = HeadingBasis()
+      basis.update(10., Fix((0., 0.), 10., 3., 10., 5.), Motion(10., None), 0.)
+      basis.update(50., None, Motion(1., None), 1.)
+      self.assertFalse(basis.routable)
+      basis.update(hold.heading, fix, motion, 2.)
+      self.assertEqual(basis.routable, course_good(fix, motion), (fix, motion))
+      taken.append(course_good(fix, motion))
+    self.assertEqual(taken, [True, False, True, False, False, True, False, False, False, True, False])
+
+  def test_the_heading_rests_on_a_course_barely_turned_from_since(self):
+    """HeadingBasis: the furthest it turned from its course, not the net (a turn in and back out), a new course starts over,
+    no heading (stale, or dropped parked) ends it, and COURSE_UNTRACKED_M driven with no yaw does too."""
+    from openpilot.selfdrive.navigation.hold import Fix, Motion
+    from openpilot.selfdrive.navigation.navd import COURSE_TURN_MAX_DEG, COURSE_UNTRACKED_M, HeadingBasis
+    course, crawl = Fix((0., 0.), 90., 3., 10., 5.), Fix((0., 0.), 90., 3., 1., 0.)
+    basis, t = HeadingBasis(), 0.
+    self.assertFalse(basis.routable)
+    self.assertEqual(basis.why_not(), 'noCourse')
+
+    def step(heading, fix=crawl, v=1., yaw=0.):
+      nonlocal t
+      t += 1.
+      basis.update(heading, fix, Motion(v, yaw), t)
+      return basis.routable
+    self.assertTrue(step(90., course, 10.))
+    self.assertTrue(step(90. + COURSE_TURN_MAX_DEG - 1.))
+    self.assertFalse(step(90. + COURSE_TURN_MAX_DEG + 1.))
+    self.assertEqual(basis.why_not(), 'turned')
+    self.assertFalse(step(90.))  # turned back: still turned at its furthest
+    self.assertAlmostEqual(basis.turn, 0.)
+    self.assertTrue(step(95., course, 10.))  # a new course
+    self.assertTrue(step(85. + 360.))  # wraps: -10 deg net
+    self.assertAlmostEqual(basis.turn, -10.)
+    self.assertFalse(step(None))
+    self.assertFalse(step(95.))  # not a course's: what turned it is unknown
+    self.assertTrue(step(95., course, 10.))
+    for _ in range(int(COURSE_UNTRACKED_M / 0.5) - 1):
+      self.assertTrue(step(95., v=0.5, yaw=None))  # crawling with no deviceMotion: nothing turns the heading
+    self.assertFalse(step(95., v=0.5, yaw=None))
+    self.assertEqual(basis.why_not(), 'untracked')
+
+  def test_parked_nose_in_onroad_a_destination_is_routed_with_no_heading_and_waits_for_the_cars_direction(self):
+    loop = self.loop()
+    looked, controls_ahead = [], loop.router.controls_ahead
+    loop.router.controls_ahead = lambda position, bearing: looked.append(bearing) or controls_ahead(position, bearing)
+    self.into_a_space(loop)
+    engine = loop.engine
+    self.assertEqual(len(loop.router.calls), 1)  # the drive's route, made moving with its heading
+    self.assertAlmostEqual(loop.router.calls[0][1], 90.)
+    self.assertTrue(engine.onroad() and engine.hold.standing)
+    self.assertAlmostEqual(engine.own_heading(), 180., delta=0.5)  # the car's orientation in the space
+    self.assertGreaterEqual(engine.basis.peak, 89.)
+    self.assertIsNone(engine.route_heading())
+    self.assertEqual(engine.heading_dropped(), 'turned')
+    # a new destination set on the phone in the space: routed with no heading (the earlier code routed with 180, trusted it,
+    # and sent valid guidance at once), and nothing goes out standing there
+    loop.values['NavDestination'] = {'latitude': 0.003, 'longitude': 0.004}
+    loop.tick(100., 0., fix=(5., -8., 3.), car_heading=180.)
+    self.assertEqual(len(loop.router.calls), 2)
+    self.assertIsNone(loop.router.calls[1][1])
+    self.assertTrue(engine.heading_unverified)
+    self.assertTrue(all(not loop.tick(100., 0., fix=(5., -8., 3.), car_heading=180.)[1] for _ in range(5)))
+    self.assertAlmostEqual(looked[-1], 180., delta=0.5)  # the road ahead of the car's nose is still looked up with its own
+    # out of the space at a crawl, turning onto the street the route's way: 75 deg off it decides nothing; 40 deg off, 3 m off
+    # its line, the car's own heading verifies it (no GPS course yet, so navd would still route with none)
+    self.assertFalse(loop.tick(100., 1.5, fix=(6., -6., 3.), car_heading=165.)[1])
+    self.assertTrue(engine.heading_unverified)
+    self.assertTrue(loop.tick(100., 1.5, fix=(8., -3., 3.), car_heading=130.)[1])
+    self.assertFalse(engine.heading_unverified)
+    self.assertIsNone(engine.route_heading())
+    ni, valid = loop.tick(112., 3.5, car_heading=95.)  # away on the street: a course again
+    self.assertTrue(valid)
+    self.assertAlmostEqual(engine.route_heading(), 95.)
+    self.assertEqual(len(loop.router.calls), 2)
+
+  def test_out_of_the_space_against_the_route_waits_for_a_course_and_then_reroutes_with_it(self):
+    """Leaving west, against the route: at a crawl the car's heading the space turned decides nothing (navd would route with
+    none); its first GPS course on the street reroutes with it."""
+    loop = self.loop()
+    self.into_a_space(loop)
+    engine = loop.engine
+    loop.values['NavDestination'] = {'latitude': 0.003, 'longitude': 0.004}
+    loop.tick(100., 0., fix=(5., -8., 3.), car_heading=180.)
+    self.assertTrue(engine.heading_unverified)
+    for turned in (30., 60., 90.):  # a right out of the space onto the street, heading west under HEADING_MIN_V
+      a = np.radians(turned)
+      loop.tick(100., 2., fix=(5. - 5. * np.sin(a), -8. + 5. * (1. - np.cos(a)) + 3. * turned / 90., 3.), car_heading=180. + turned)
+    self.assertFalse(loop.tick(97., 2., car_heading=270.)[1])  # on the street, 180 deg off the route: no course yet
+    self.assertEqual(len(loop.router.calls), 2)
+    self.assertIsNone(engine.route_heading())
+    loop.tick(92., 4., car_heading=270.)  # 4 m/s with a good bearing accuracy: a course, against the route
+    self.assertEqual(len(loop.router.calls), 3)
+    self.assertAlmostEqual(loop.router.calls[2][1], 270.)
+
+  def test_a_red_light_stand_after_driving_straight_keeps_its_heading_for_a_reroute(self):
+    """Standing 60 s at a red after driving east (deviceMotion's yaw jittering a few tenths, as at the 11-06 stands): the heading
+    is still the course's, so a reroute there (a new destination, the stop-sign avoidance re-run for an ETA that left its
+    window) is made with it and trusted, as before: valid guidance the update after the separator."""
+    from openpilot.selfdrive.navigation.tests.test_gps_hold import STOP_M, approach
+    for why in ('destination', 'avoidRerun'):
+      with self.subTest(why=why):
+        loop = self.loop()
+        approach(loop, STOP_M)
+        for i in range(60):
+          loop.tick(STOP_M, 0., car_heading=90. + 0.3 * float(np.sin(i)))
+        engine = loop.engine
+        self.assertTrue(engine.hold.standing and engine.basis.routable)
+        self.assertLess(engine.basis.peak, 1.)
+        if why == 'destination':
+          loop.values['NavDestination'] = {'latitude': 0.003, 'longitude': 0.004}
+        else:
+          engine.avoid_rerun = True
+        ni, valid = loop.tick(STOP_M, 0., car_heading=90.)
+        self.assertEqual(len(loop.router.calls), 2)
+        self.assertAlmostEqual(loop.router.calls[1][1], 90., delta=0.5)
+        self.assertFalse(engine.heading_unverified)
+        self.assertFalse(valid)  # the separator between the two routes
+        self.assertTrue(loop.tick(STOP_M, 0., car_heading=90.)[1])
+
+  def test_a_route_made_mid_turn_at_a_crawl_is_checked_by_the_cars_own_heading_the_update_after(self):
+    """A turn from a stop at 2 m/s, under HEADING_MIN_V (here navd_loop's left; on 11-06 three rights from a stop, a second each
+    at 2.3-2.9 m/s and 36-40 deg): a route made in that second goes with no heading, unverified, and the car's own heading, on
+    the road the route takes, verifies it the update after the separator: no guidance lost but the separator's."""
+    from openpilot.selfdrive.navigation.tests.test_gps_hold import STOP_M, approach
+    from openpilot.selfdrive.turnpilot.tests.navd_loop import JUNCTION_M
+    loop = self.loop()
+    approach(loop, STOP_M)
+    for s in (STOP_M + 2., STOP_M + 4., STOP_M + 6., STOP_M + 8.):
+      loop.tick(s, 2.)
+    engine = loop.engine
+    self.assertFalse(engine.basis.routable)
+    self.assertGreaterEqual(engine.basis.peak, 30.)
+    loop.values['NavDestination'] = {'latitude': 0.003, 'longitude': 0.004}
+    self.assertFalse(loop.tick(JUNCTION_M + 2., 2.)[1])
+    self.assertIsNone(loop.router.calls[-1][1])
+    self.assertTrue(engine.heading_unverified)
+    self.assertTrue(loop.tick(JUNCTION_M + 4., 2.)[1])
+    self.assertFalse(engine.heading_unverified)
+    self.assertEqual(len(loop.router.calls), 2)
+
+
+class TestStraightAtTheStreet(unittest.TestCase):
+  """Review of 11-06, the residual of the parked-onroad gate: a GPS course the car hasn't turned from can itself point across
+  the street, taken driving straight at it across a lot or down a driveway at HEADING_MIN_V or faster, or into a pull-through
+  space. Standing at the exit, nose perpendicular to the street, a destination was routed with it as a known heading and
+  trusted: valid guidance (and a turn desire) at once, the 11-06 wrong-way-out-of-the-spot class by another road (Valhalla's
+  HEADING_TOLERANCE 90 takes the street's direction nearer the nose, which says nothing about the way the driver will turn
+  out). navd checks a route made with a heading against that heading where the car is (navd routed_across), and one more
+  than HEADING_MISMATCH_DEG across it, or with the car under VERIFY_STREET_V further than OFF_ROUTE_DISTANCE off it, goes
+  unverified as a headingless one does (heading_due decides). navd itself on navd_loop's synthetic route (east along y=0 to
+  a left at 300 m: StepsRouter answers every route so, whatever the heading) with carState and deviceMotion, onroad, and
+  fixes placed where each tick says with the bearing accuracy it says (NavdLoop.tick's fixes off the route report none)."""
+
+  def loop(self):
+    from openpilot.selfdrive.turnpilot.tests.navd_loop import NavdLoop  # lazily, as TestParkedOnroadHeading does
+
+    class Loop(NavdLoop):
+      def at(self, east, north, v, heading, bacc=0.):
+        """One navd update with a trusted fix (3 m accuracy) at (east, north) m moving v heading `heading` (the fix's bearing and
+        deviceMotion's yaw) and reporting bearing accuracy bacc (0: none), carState's vEgo v: (instruction, valid)."""
+        self.t += 1.
+        self.sm.updated = dict.fromkeys(self.sm.data, False)
+        msg = messaging.new_message('gpsLocationExternal')
+        gps = msg.gpsLocationExternal
+        gps.hasFix, gps.horizontalAccuracy, gps.speed, gps.bearingDeg, gps.bearingAccuracyDeg = True, 3., float(v), heading, bacc
+        gps.longitude, gps.latitude = east / METERS_PER_DEGREE, north / METERS_PER_DEGREE
+        self.sm.put('gpsLocationExternal', msg.as_reader().gpsLocationExternal)
+        cs = messaging.new_message('carState')
+        cs.carState.vEgo = float(v)
+        self.sm.put('carState', cs.as_reader().carState)
+        dm = messaging.new_message('deviceMotion')
+        dm.deviceMotion.orientationNED.z, dm.deviceMotion.orientationNED.valid = float(np.radians(heading)), True
+        self.sm.put('deviceMotion', dm.as_reader().deviceMotion)
+        self.engine.update()
+        sent = next(c.args[1] for c in reversed(self.pm.send.call_args_list) if c.args[0] == 'navInstruction')
+        return sent.as_reader().navInstruction, sent.valid
+    return Loop()
+
+  def routed_standing(self, loop, place, heading):
+    """A new destination set on the phone with the car standing at place heading `heading`: (navd.route_heading_unverified
+    events, the separator's validity)."""
+    from openpilot.selfdrive.navigation import navd
+    loop.values['NavDestination'] = {'latitude': 0.003, 'longitude': 0.004}
+    with patch.object(navd.cloudlog, 'event') as said:
+      _, valid = loop.at(*place, 0., heading)
+    return [c.kwargs for c in said.call_args_list if c.args[0] == 'navd.route_heading_unverified'], valid
+
+  def straight_at_the_street(self, loop):
+    """The probe: driven east on the street at 10 m/s (the drive's route, made with its heading), a left at 2 m/s into a lot
+    north of it, north across the lot at 4 m/s, a U-turn at its top at a crawl (within REROUTE_DISTANCE of the street, so
+    the drive's route stays), then straight south at the street at 4 m/s with a good bearing accuracy (a GPS course, 180),
+    slowing to stand at the lot's exit 6 m north of the street's centre line, nose perpendicular to it. Returns the place
+    it stands."""
+    for i in range(6):
+      loop.at(10. * i, 0., 10., 90., bacc=2.)
+    for east, north, heading in ((52., 2., 60.), (54., 5., 30.), (55., 8., 0.)):
+      loop.at(east, north, 2., heading)
+    for north in (11., 14., 17.):
+      loop.at(55., north, 4., 0., bacc=3.)
+    for east, north, heading in ((57., 20., 45.), (60., 21., 90.), (63., 20., 135.), (64., 18., 180.)):
+      loop.at(east, north, 2., heading)
+    for north in (15., 12., 9.):
+      loop.at(64., north, 4., 180., bacc=3.)
+    loop.at(64., 7., 1., 180.)
+    for _ in range(4):
+      loop.at(64., 6., 0., 180.)
+    assert len(loop.router.calls) == 1 and not loop.engine.heading_unverified
+    return 64., 6.
+
+  def test_standing_at_the_exit_a_route_made_with_the_course_across_the_street_waits_for_the_cars_direction(self):
+    loop = self.loop()
+    place = self.straight_at_the_street(loop)
+    engine = loop.engine
+    self.assertTrue(engine.hold.standing and engine.basis.routable)  # a course, not turned from: navd routes with it
+    self.assertAlmostEqual(engine.route_heading(), 180., delta=0.5)
+    said, valid = self.routed_standing(loop, place, 180.)
+    self.assertAlmostEqual(loop.router.calls[-1][1], 180., delta=0.5)  # routed with it, as before
+    self.assertFalse(valid)  # the separator
+    # ...and the route came back along the street, 90 deg across it: checked, as a route with no heading is (the earlier code
+    # trusted it and sent 'left 239.7' the update after)
+    self.assertTrue(engine.heading_unverified)
+    self.assertFalse(engine.route_heading_retry)
+    self.assertEqual([(s['why'], s['dropped']) for s in said], [('headingAcross', None)])
+    self.assertAlmostEqual(abs(said[0]['diff']), 90., delta=1.)
+    self.assertAlmostEqual(said[0]['lateral'], 6., delta=1.)
+    self.assertTrue(all(not loop.at(*place, 0., 180.)[1] for _ in range(5)))
+    self.assertEqual(len(loop.router.calls), 2)
+
+  def test_pulling_out_the_routes_way_verifies_it_with_no_reroute(self):
+    loop = self.loop()
+    place = self.straight_at_the_street(loop)
+    self.routed_standing(loop, place, 180.)
+    engine = loop.engine
+    self.assertFalse(loop.at(64., 5., 1.5, 160.)[1])  # turning out, 70 deg off the route's way: nothing decided
+    self.assertTrue(engine.heading_unverified)
+    ni, valid = loop.at(66., 3., 1.5, 125.)  # 35 deg off it, 3 m off its line: the car's own heading verifies it
+    self.assertTrue(valid)
+    self.assertEqual(str(ni.maneuverModifier), 'left')
+    self.assertFalse(engine.heading_unverified)
+    self.assertEqual(len(loop.router.calls), 2)
+
+  def test_pulling_out_against_the_route_waits_for_a_course_and_then_reroutes_with_it(self):
+    loop = self.loop()
+    place = self.straight_at_the_street(loop)
+    self.routed_standing(loop, place, 180.)
+    engine = loop.engine
+    for east, north, heading in ((63., 4., 210.), (61., 2., 240.), (58., 1., 265.)):  # a right out at a crawl, west
+      self.assertFalse(loop.at(east, north, 2., heading)[1])
+    self.assertIsNone(engine.route_heading())  # turned 85 deg from its course at a crawl: nothing navd routes with
+    self.assertEqual(len(loop.router.calls), 2)
+    loop.at(54., 0.5, 4., 270., bacc=3.)  # a course on the street, 180 deg off the route: rerouted with it, and checked
+    self.assertEqual(len(loop.router.calls), 3)
+    self.assertAlmostEqual(loop.router.calls[2][1], 270., delta=0.5)
+    self.assertTrue(engine.heading_unverified and engine.route_heading_retry)
+
+  def test_a_course_up_a_lot_row_further_than_off_route_distance_from_the_route_is_checked_and_a_road_at_speed_is_not(self):
+    """A course along a lot row 23 m north of the street (the street's own direction, so not across it; within
+    REROUTE_DISTANCE, so the drive's route stays) says nothing about the street the route starts on: under VERIFY_STREET_V
+    further than OFF_ROUTE_DISTANCE off it, the route is checked. At VERIFY_STREET_V or faster the car is on a road, and a
+    route made with its heading is kept as before however it lies (here a parallel road 23 m off and a crossing one, 90 deg
+    across: the stub routes along y=0 whatever the car's place; in a drive, a reroute that lands past its first turn, 1e
+    13:23.3 and 13:29.3 at 11.5 and 9.8 m/s carState 30-41 m off, which stale_start and the missed-turn reroutes handle)."""
+    with self.subTest('a lot row'):
+      loop = self.loop()
+      for i in range(6):
+        loop.at(10. * i, 0., 10., 90., bacc=2.)
+      for east, north, heading in ((52., 3., 30.), (54., 8., 0.), (55., 13., 0.), (56., 18., 0.), (58., 21., 30.), (61., 23., 60.)):
+        loop.at(east, north, 2., heading)
+      for east in (65., 69., 73.):
+        loop.at(east, 23., 4., 90., bacc=3.)
+      loop.at(75., 23., 1., 90.)
+      for _ in range(3):
+        loop.at(76., 23., 0., 90.)
+      self.assertEqual(len(loop.router.calls), 1)
+      self.assertTrue(loop.engine.basis.routable)
+      said, _ = self.routed_standing(loop, (76., 23.), 90.)
+      self.assertAlmostEqual(loop.router.calls[-1][1], 90., delta=0.5)
+      self.assertTrue(loop.engine.heading_unverified)
+      self.assertEqual([(s['why'], s['diff'], s['lateral']) for s in said], [('headingAcross', None, None)])
+      self.assertFalse(loop.at(78., 18., 2., 150.)[1])  # crossing the lot to the street
+      self.assertTrue(loop.at(84., 2., 4., 95., bacc=3.)[1])  # on it, the route's way: verified
+      self.assertEqual(len(loop.router.calls), 2)
+    for name, places, heading in (('a parallel road at speed', [(10. * i, 23.) for i in range(7)], 90.),
+                                  ('a crossing road at speed', [(150., -60. + 10. * i) for i in range(7)], 0.)):
+      with self.subTest(name):
+        loop = self.loop()
+        for place in places[:-1]:
+          loop.at(*place, 10., heading, bacc=2.)
+        self.assertFalse(loop.engine.heading_unverified)
+        loop.values['NavDestination'] = {'latitude': 0.003, 'longitude': 0.004}
+        loop.at(*places[-1], 10., heading, bacc=2.)
+        self.assertEqual(len(loop.router.calls), 2)
+        self.assertAlmostEqual(loop.router.calls[1][1], heading, delta=0.5)
+        self.assertFalse(loop.engine.heading_unverified)
+
+  def test_a_red_light_in_a_wide_roads_far_lane_keeps_a_reroutes_heading(self):
+    """14 m off the mapped centre line (a wide road's far lane), standing at a red after driving its way: the reroute's route
+    goes the heading's way there, so it is trusted and guidance goes out the update after the separator. The check is on the
+    angle only: heading_due wouldn't verify that place standing (VERIFY_LATERAL_M), and a reroute at every such red would
+    withhold guidance until 18 mph."""
+    loop = self.loop()
+    for i in range(10):
+      loop.at(10. * i, 14., 10., 90., bacc=2.)
+    self.assertFalse(loop.engine.heading_unverified)
+    for _ in range(5):
+      loop.at(95., 14., 0., 90.)
+    said, valid = self.routed_standing(loop, (95., 14.), 90.)
+    self.assertEqual(len(loop.router.calls), 2)
+    self.assertAlmostEqual(loop.router.calls[1][1], 90., delta=0.5)
+    self.assertEqual(said, [])
+    self.assertFalse(loop.engine.heading_unverified)
+    self.assertFalse(valid)  # the separator
+    self.assertTrue(loop.at(95., 14., 0., 90.)[1])
 
 
 class TestTiles(unittest.TestCase):
@@ -1202,6 +2103,22 @@ class TestStopAvoidance(unittest.TestCase):
   def instruction(self):
     self.engine.send_instruction()
     return next(call.args[1] for call in reversed(self.pm.send.call_args_list) if call.args[0] == 'navInstruction').navInstruction
+
+  def test_an_avoidance_reroute_made_with_no_heading_leaves_the_route_unverified(self):
+    """TurnPilot (route start): the avoidance loop reroutes from the car's position and heading then (engine.position); a
+    reroute with none may be the route kept, so the route waits for the car's direction to be checked however it began."""
+    engine, certify = self.engine, self.engine.certifier
+
+    def heading_gone(control, eta, runtime):
+      engine.last_bearing = None  # the heading went while the job ran
+      return certify(control, eta, runtime)
+    engine.certifier = heading_gone
+    router = self.start([self.stop(1, 60.)], reroutes=[[]])
+    self.assertEqual(router.calls[0][2], 90)  # the route itself had one
+    self.assertEqual([c[2] for c in router.reroute_calls], [None])
+    self.assertTrue(engine.heading_unverified)
+    self.instruction()
+    self.assertFalse(next(c.args[1] for c in reversed(self.pm.send.call_args_list) if c.args[0] == 'navInstruction').valid)
 
   def test_C2_noTable_floor_every_stop_and_yield_is_routed_around(self):
     """No camera measurements yet: the real certifier says noTable for every stop and yield, so the route avoids all of
