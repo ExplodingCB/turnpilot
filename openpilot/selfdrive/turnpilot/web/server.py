@@ -31,7 +31,7 @@ from openpilot.selfdrive.turnpilot.maps.defaults import ensure_camera_lights, en
 from openpilot.selfdrive.turnpilot.maps.paths import wall_time
 from openpilot.selfdrive.turnpilot.maps.status import for_destination, read_status
 from openpilot.selfdrive.turnpilot.routing.sources import local_override
-from openpilot.selfdrive.turnpilot.setup_state import PHONE_SEEN
+from openpilot.selfdrive.turnpilot.setup_state import PHONE_SEEN, car_signal_state, signals_forced
 from openpilot.selfdrive.turnpilot.valhalla_install import SetupThread
 from openpilot.selfdrive.turnpilot.web import places
 from openpilot.selfdrive.turnpilot.web.pairing import PORT, icon_png, pairing_url, qr_svg
@@ -46,6 +46,16 @@ LOOPBACK = ("127.0.0.1", "::1")
 MAX_CONNECTIONS = 32  # sockets handled at once; past this a new one is closed unanswered. A page opens several at once
 BIND_RETRY_S = 5.  # s between tries to listen: the manager doesn't restart a dead process, and a dead one soft-disables openpilot
 PHONE_SEEN_WRITE_S = 10.  # s between writes of TurnPilotPhoneSeen: the page polls every 2 s
+CAR_SERVICES = ["carState", "driverMonitoringState"]  # what the phone's Restart checks (CarReader)
+CAR_READ_S = 0.5  # s a Restart waits for them: card sends carState at 100 Hz and dmonitoringd its state at 20 Hz
+# s an offroad Restart waits for them, which offroad never come: a running card or dmonitoringd is still caught (deviceState
+# silent past status.SERVICE_TIMEOUT reads as offroad). A cold reader had both in 0.046-0.061 s (Mac, dmonitoringd's 20 Hz; 11-06)
+CAR_READ_OFFROAD_S = 0.2
+CAR_FRESH_S = 1.  # s since a message was sent before it counts as the car now; offroad the queue keeps the last one forever
+CAR_POLL_MS = 20  # ms each of CarReader's reads waits for a message: card sends one every 10 ms onroad
+CAR_RETRY_S = 5.  # s before CarReader tries again after its SubMaster failed (logged once)
+LOCKOUT_MESSAGE = "Driver monitoring lockout: wait it out"  # as the car says it (selfdrived's tooDistracted)
+COMEBACK = "the comma takes about 2 minutes to come back"  # 1e: AGNOS boot plus the model load, CarParams at seg0 t=56 s
 
 
 class ApiError(Exception):
@@ -65,12 +75,111 @@ def number(value):
     return None
 
 
+class CarReader(threading.Thread):
+  """The car as the phone's Restart needs it: carState's gear and standstill and driverMonitoringState's lockout, or None
+  for each that isn't being sent now (offroad, card or dmonitoringd not running).
+
+  One SubMaster for the server's life, made on this thread (started at the first Restart) at that Restart's read: every
+  Restart reads, offroad only for CAR_READ_OFFROAD_S (restart). Never one per request:
+  each subscriber takes one of msgq's reader slots until the publisher restarts, and past the last one msgq evicts every
+  reader of the queue, selfdrived's, controlsd's and turnpilotd's carState among them. Its sockets conflate, so offroad
+  they still hold the last carState from before (in Park, say): a message counts only if it was sent in the last
+  CAR_FRESH_S, by its logMonoTime, the sender's monotonic clock and this one's.
+
+  Only this thread touches the SubMaster (2026-11-06 review). On Linux msgq stamps a reader's slot with the gettid() of
+  the thread that makes the socket (msgq.cc:40, ipc.cc:73) and tkill()s that tid with SIGUSR2 on every publish
+  (msgq.cc:180 and 311; card's at 100 Hz, dmonitoringd's at 20). A publisher's restart clears the slots, and the next
+  read re-stamps them with the reading thread's tid (msgq.cc:326, 355). The first version made and read the SubMaster
+  on the request's thread, which exits with the request: after a refused Restart (in Drive, now the common 409) card
+  signalled a dead tid until card next restarted, and Linux recycles tids, so SIGUSR2 could land on a thread of a
+  process that never installed msgq's handler (an nmcli, a git), whose default action is to terminate. This thread lives
+  as long as the process, as StatusReader's does, and reads only while a Restart waits: between Restarts it sleeps on
+  the condition, so the web process doesn't parse card's 100 Hz carState all drive for a button pressed now and then."""
+
+  def __init__(self):
+    super().__init__(name="car", daemon=True)
+    self.cond = threading.Condition()
+    self.launched = False  # start() at the first Restart (Thread.start runs once)
+    self.stopped = False
+    self.waiting = 0  # Restarts waiting on a read: this thread reads only while there is one
+    self.cars: dict[str, dict] = {}  # service: what the Restart reads, "at" (monotonic s its read began), "mono" (logMonoTime)
+    self.sm = None  # this thread's alone
+
+  def stop(self):
+    with self.cond:
+      self.stopped = True
+      self.cond.notify_all()
+
+  def run(self):
+    logged = False
+    while True:
+      with self.cond:
+        self.cond.wait_for(lambda: self.stopped or self.waiting > 0)  # idle between Restarts
+        if self.stopped:
+          return
+      began = time.monotonic()
+      try:
+        if self.sm is None:
+          from openpilot.cereal import messaging  # as status.py: a missing messaging build leaves the rest of the page working
+          self.sm = messaging.SubMaster(CAR_SERVICES)
+        self.sm.update(CAR_POLL_MS)  # the newest of each (conflated); a new subscriber's first read only syncs to the queue
+        got = {s: car_fields(s, self.sm[s]) | {"at": began, "mono": self.sm.logMonoTime[s]}
+               for s in CAR_SERVICES if self.sm.updated[s]}
+      except Exception:
+        if not logged:
+          cloudlog.exception("turnpilot_web.car_failed")
+          logged = True
+        with self.cond:  # a failed SubMaster is tried again after CAR_RETRY_S, never in a loop that takes reader slots
+          self.cond.wait_for(lambda: self.stopped, timeout=CAR_RETRY_S)
+        continue
+      with self.cond:
+        self.cars.update(got)
+        self.cond.notify_all()
+
+  def fresh(self, service, asked=None) -> dict | None:
+    """The service's last read while its message is fresh, and with asked, only one read after that moment."""
+    got = self.cars.get(service)
+    if got is None or time.monotonic_ns() - got["mono"] >= CAR_FRESH_S * 1e9 or (asked is not None and got["at"] < asked):
+      return None
+    return got
+
+  def __call__(self, timeout: float | None = None) -> dict:
+    """What the car says now. This thread reads, and the call waits up to timeout (CAR_READ_S if None) for a fresh
+    message of each service read after the call began, so a carState kept from a Restart a moment ago (fresh, but in
+    Drive) isn't taken for now. Past the timeout a service not being sent (card or dmonitoringd not running, as offroad)
+    is None. There is no answer without a read: one version answered offroad at once from the last read, and the
+    2026-11-06 review's probe had card in Drive while deviceState was silent, which reads as offroad (restart)."""
+    with self.cond:
+      if not self.launched:
+        self.launched = True
+        self.start()
+      asked = time.monotonic()
+      self.waiting += 1
+      self.cond.notify_all()
+      try:
+        self.cond.wait_for(lambda: all(self.fresh(s, asked) for s in CAR_SERVICES),
+                           timeout=CAR_READ_S if timeout is None else timeout)
+      finally:
+        self.waiting -= 1
+      car, dm = self.fresh("carState"), self.fresh("driverMonitoringState")
+    return {"gear": car["gear"] if car else None, "standstill": car["standstill"] if car else None,
+            "lockout": dm["lockout"] if dm else None}
+
+
+def car_fields(service, msg) -> dict:
+  """What the phone's Restart reads of each CAR_SERVICES message, copied out of the capnp reader the SubMaster replaces."""
+  if service == "carState":
+    return {"gear": str(msg.gearShifter), "standstill": bool(msg.standstill)}
+  return {"lockout": bool(msg.lockout)}
+
+
 class App:
-  """What the handlers share. search, resolve and preflight can be swapped for tests."""
+  """What the handlers share. search, resolve, preflight and car (CarReader) can be swapped for tests."""
   def __init__(self, params, reader=None, search=places.search, resolve=places.resolve_apple_maps, maps_dir=None, refresh=None,
-               preflight=None):
+               preflight=None, car=None):
     self.store = Store(params)
     self.reader = reader
+    self.car = car if car is not None else CarReader()
     self.preflight = preflight or diagnostics.Preflight()
     self.search = search
     self.resolve = resolve
@@ -230,26 +339,68 @@ class App:
 
   def car_signals(self) -> dict:
     """TurnPilot's turn signal settings for the page (car_signals.py, DESIGN phase4/blinker 7.8): the mode, the last
-    lamp check (step, result, why, its id and whether the outside lamps were confirmed), and the verified record's VIN."""
+    lamp check (step, result, why, its id and whether the outside lamps were confirmed), and the verified record's VIN.
+    And what the next drive gets (setup_state.car_signal_state: state, state_why) with TurnPilotCarSignalsForceOn
+    (forced_on): until 2026-11-06 the page showed the mode alone, "Mode: off" on every comma at its defaults while the car
+    signalled under ForceOn."""
     with self.store.lock:
       params = self.store.params
       mode = read_mode(params)
       check = params.get("TurnPilotCarSignalsCheck")
       record = params.get("TurnPilotCarSignalsVerified")
+      forced = signals_forced(params)
+      state, why = car_signal_state(params)
     last = None
     if check:
       last = {k: check.get(k) for k in ("pass", "step", "why", "checkId", "exterior", "when")}
       last["gear"] = (check.get("record") or {}).get("gear")
-    return {"mode": mode, "check": last, "verified": bool(record), "verified_vin": (record or {}).get("vin")}
+    return {"mode": mode, "check": last, "verified": bool(record), "verified_vin": (record or {}).get("vin"),
+            "forced_on": forced, "state": state, "state_why": why}
+
+  def onroad(self) -> bool | None:
+    """deviceState.started from the status reader's snapshot, None without a fresh one (no reader, or it is stuck)."""
+    snap = self.reader.get() if self.reader else None
+    return bool(snap["onroad"]) if snap and time.monotonic() - snap["at"] < STALE_AFTER else None
 
   def restart(self) -> dict:
     """Reboot the comma from the phone (DoReboot, as Settings > Device > Reboot). A Tesla stays awake while anyone is in it,
     so the comma never sees the car turn off: what applies at the next start (the car signal check and mode, an update
-    downloaded, a fresh big model load) needed getting out and back in (Kellen, 2026-11-06). Refused while openpilot is
-    engaged: the driver disengages first, and the car is the driver's for the minute the comma takes to come back."""
-    if self.store.params.get_bool("IsEngaged"):
-      raise ApiError(409, "Disengage openpilot first: the comma takes about a minute to come back")
-    self.store.params.put_bool("DoReboot", True, block=True)
+    downloaded, a fresh big model load) needed getting out and back in (Kellen, 2026-11-06). It takes about 2 minutes
+    (1e: AGNOS boot, then modeld had CarParams at seg0 t=56 s and the models loaded in 33 s), not the minute this said.
+
+    Refused (409), in this order:
+    - while openpilot is engaged: the driver disengages first;
+    - during comma's driver monitoring lockout, DriverTooDistracted set or driverMonitoringState.lockout live (the cabin
+      camera view removes the param while dmonitoringd's lockout runs on). manager_init clears DriverTooDistracted and
+      DriverLockoutCount (CLEAR_ON_MANAGER_START), so a reboot ends the lockout and resets its escalating length: the phone
+      would be a way around comma's DM from the passenger seat, which TurnPilot never weakens. Wait it out, as in the car;
+    - unless the car is in Park at a standstill, while card sends carState: the car is the driver's for those 2 minutes,
+      and a parked one is where that is safe. Onroad without a fresh carState (card not running, or not answering in
+      CAR_READ_S) it is refused too, as the gear can't be checked. Offroad there is no carState and no car to guard: only
+      the lockout applies. The car is still read offroad, for CAR_READ_OFFROAD_S, not skipped: offroad here is the status
+      snapshot's deviceState.started, which also reads False when deviceState hasn't been heard for status.SERVICE_TIMEOUT (a
+      hardwared stall, or its restart by manager) while manager keeps the last started and card runs on. A version that
+      skipped the read offroad rebooted the comma in Drive, rolling, that way (2026-11-06 review's probe); the short read
+      refuses it on the gear and on driverMonitoringState's live lockout, and an offroad press still answers in 0.2 s.
+    alwaysOnLockout and the DriverLockoutCount reset are left as stock's own reboot button leaves them (mici device_layout.py
+    reboot_callback has no gate at all; alwaysOnLockout clears as awareness recovers, policy.py:409; 2026-11-06 review)."""
+    params = self.store.params
+    if params.get_bool("IsEngaged"):
+      raise ApiError(409, f"Disengage openpilot first: {COMEBACK}")
+    if params.get_bool("DriverTooDistracted"):
+      raise ApiError(409, LOCKOUT_MESSAGE)
+    onroad = self.onroad()
+    # None (no fresh status) waits in full: the car may be onroad. Offroad the read is short, never skipped
+    car = self.car(timeout=CAR_READ_OFFROAD_S if onroad is False else CAR_READ_S)
+    if car["lockout"]:
+      raise ApiError(409, LOCKOUT_MESSAGE)
+    if car["gear"] is None:
+      if onroad:
+        raise ApiError(409, "Can't read the car's gear right now: try again in a moment")
+    elif car["gear"] != "park" or not car["standstill"]:
+      raise ApiError(409, f"Stop and shift into Park first: {COMEBACK}")
+    params.put_bool("DoReboot", True, block=True)
+    cloudlog.event("turnpilot_web.restart", gear=car["gear"])
     return {"restarting": True}
 
   def set_car_signals(self, body) -> dict:
@@ -499,7 +650,9 @@ def main():
   ensure_token(params)
   ensure_map_defaults(params)  # the shipped map server's address and certificate: the phone only adds the key
   ensure_signal_check(params)  # the lamp check queued for the next ignition, once, so the car can signal itself
-  ensure_left_range(params)  # an unmeasured left range (0) becomes the provisional 150 m, once (maps/defaults.py)
+  # an unmeasured left range (0) becomes the provisional 210 m (maps/defaults.CAR_LEFT_RANGE_M), once per comma, and a 150
+  # an earlier build wrote as its default becomes 210 at every start (maps/defaults.ensure_left_range)
+  ensure_left_range(params)
   ensure_camera_lights(params)  # a comma on the camera lights' old shadow default takes addOnly, once (maps/defaults.py)
   if not PC:  # the map engine installs itself on the comma; a PC has its own (or the sim's local tiles)
     SetupThread(params).start()

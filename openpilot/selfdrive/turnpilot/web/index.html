@@ -124,15 +124,16 @@ code { display: block; word-break: break-all; margin: 4px 0 12px; padding: 8px; 
 <details id="restartcomma">
   <summary>Restart the comma</summary>
   <div class="note">A Tesla stays on while you're in it, so the comma never restarts by itself. Restart it here to apply an
-    update, a turn signal check or a setting that waits for the next start. Disengage first; it takes about a minute.</div>
+    update, a turn signal check or a setting that waits for the next start. Stop in Park and disengage first; it takes about
+    2 minutes. Not during a driver monitoring lockout: that has to run out, as in the car.</div>
   <button class="go" type="button" id="restartbtn">Restart now</button>
 </details>
 
 <details id="carsignals">
   <summary>Car turn signal</summary>
-  <div class="note">On a verified Tesla the car works its own turn signal for TurnPilot's turns and lane changes. Off, you signal,
-    and TurnPilot asks you at each turn. The check blinks the lamps in Park (or, with Start in Drive, stopped with the brake held):
-    watch the front, side and rear lamps from outside, or film them.</div>
+  <div class="note"><span id="csnote">The car works its own turn signal for TurnPilot's turns and lane changes, on every drive,
+    with no check needed.</span> Where a lamp doesn't light, TurnPilot asks you to signal. The check blinks the lamps in Park
+    (or, with Start in Drive, stopped with the brake held): watch the front, side and rear lamps from outside, or film them.</div>
   <div id="csstate"></div>
   <div class="row" id="csmodes"></div>
   <button class="go" type="button" id="csdrive" hidden>Start check in Drive</button>
@@ -468,7 +469,13 @@ $("mapsave").onclick = function () {
 
 async function loadCarSignals() {
   var d = await api("/api/car-signals");
-  var lines = ["Mode: " + d.mode];
+  // what the next drive gets first (setup_state.car_signal_state), then the mode: under TurnPilotCarSignalsForceOn (the default
+  // since 2026-11-06) the car signals whatever the mode says, and "Mode: off" alone read off while the car signalled
+  var lines = ["Car signal " + d.state_why];
+  $("csnote").textContent = d.forced_on ? "The car works its own turn signal for TurnPilot's turns and lane changes, on every " +
+    "drive, with no check needed." : "On a verified Tesla the car works its own turn signal for TurnPilot's turns and lane " +
+    "changes. Off, you signal.";
+  lines.push("Mode: " + d.mode + (d.forced_on && d.mode !== "check" ? " (the car signals anyway: it is on for every drive)" : ""));
   lines.push(d.verified ? "Verified for " + d.verified_vin : "Not verified");
   if (d.check) {
     lines.push("Last check: " + (d.check.pass ? "passed" : "failed") + (d.check.step ? " (" + d.check.step + ")" : "") +

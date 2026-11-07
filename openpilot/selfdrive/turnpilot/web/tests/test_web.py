@@ -1027,12 +1027,32 @@ class TestCarSignals(WebTestCase):
     return check
 
   def test_get(self):
-    assert self.call("GET", "/api/car-signals")[1] == {"mode": "off", "check": None, "verified": False, "verified_vin": None}
+    # a fresh install: mode off, and the car signals all the same (TurnPilotCarSignalsForceOn, 1 by default since 2026-11-06)
+    assert self.call("GET", "/api/car-signals")[1] == {"mode": "off", "check": None, "verified": False, "verified_vin": None,
+                                                       "forced_on": True, "state": "on",
+                                                       "state_why": "on for every drive, with no lamp check"}
     self.pending_check()
     self.params.put("TurnPilotCarSignalsVerified", {"vin": "5YJ3E1EA8KF000001"}, block=True)
     body = self.call("GET", "/api/car-signals")[1]
     assert body["check"]["checkId"] == "ab12cd34" and body["check"]["exterior"] == "pending" and body["check"]["gear"] == "P"
     assert body["verified"] and body["verified_vin"] == "5YJ3E1EA8KF000001"
+
+  def test_the_state_is_what_the_next_drive_gets(self):
+    """state and state_why say what card's resolver gives the next start (setup_state.car_signal_state): under ForceOn the
+    car signals in off and on alike; with it 0 the mode and the record decide. Until 2026-11-06 the page had the mode alone,
+    off while the car signalled."""
+    for mode, state in (("off", "on"), ("on", "on"), ("check", "check")):
+      self.params.put("TurnPilotCarSignals", mode, block=True)
+      body = self.call("GET", "/api/car-signals")[1]
+      assert body["mode"] == mode and body["forced_on"] and body["state"] == state, body
+    self.params.put_bool("TurnPilotCarSignalsForceOn", False, block=True)
+    for mode, state, why in (("off", "off", "off: you signal when TurnPilot asks"),
+                             ("on", "off", "off until a lamp check passes: you signal when TurnPilot asks")):
+      self.params.put("TurnPilotCarSignals", mode, block=True)
+      body = self.call("GET", "/api/car-signals")[1]
+      assert not body["forced_on"] and (body["state"], body["state_why"]) == (state, why), body
+    self.params.put("TurnPilotCarSignalsVerified", {"vin": "5YJ3E1EA8KF000001"}, block=True)
+    assert self.call("GET", "/api/car-signals")[1]["state"] == "on"
 
   def test_mode(self):
     for mode in ("check", "on", "off"):
@@ -1112,15 +1132,258 @@ class TestMapDefaultsOnTheWeb(WebTestCase):
     assert "Key works." in script and "Not saved: " in script
 
 
+class FakeCar:
+  """Stands in for server.CarReader: what carState and driverMonitoringState say now, None for one not being sent."""
+  def __init__(self, gear="park", standstill=True, lockout=False):
+    self.gear, self.standstill, self.lockout, self.calls, self.timeouts = gear, standstill, lockout, 0, []
+
+  def __call__(self, timeout=None):
+    self.calls += 1
+    self.timeouts.append(timeout)
+    return {"gear": self.gear, "standstill": self.standstill, "lockout": self.lockout}
+
+
+class CarPublisher:
+  """card and dmonitoringd as the phone's Restart hears them: carState every 10 ms and driverMonitoringState every
+  dm_every-th of those (5 is dmonitoringd's own 20 Hz), until stop() (or while on is False: offroad, where the conflated
+  sockets keep their last messages)."""
+  def __init__(self, gear="drive", standstill=True, lockout=False, dm_every=1):
+    self.gear, self.standstill, self.lockout, self.on, self.dm_every = gear, standstill, lockout, True, dm_every
+    self.pm = messaging.PubMaster(server.CAR_SERVICES)
+    self.stopped = threading.Event()
+    self.thread = threading.Thread(target=self.run, daemon=True)
+    self.thread.start()
+
+  def run(self):
+    sent = 0
+    while not self.stopped.is_set():
+      if self.on:
+        cs = messaging.new_message("carState", valid=True)
+        cs.carState.gearShifter, cs.carState.standstill = self.gear, self.standstill
+        self.pm.send("carState", cs)
+        if sent % self.dm_every == 0:
+          dm = messaging.new_message("driverMonitoringState", valid=True)
+          dm.driverMonitoringState.lockout = self.lockout
+          self.pm.send("driverMonitoringState", dm)
+        sent += 1
+      time.sleep(0.01)
+
+  def stop(self):
+    self.stopped.set()
+    self.thread.join()
+
+
+class FakeReader:
+  """Stands in for status.StatusReader: a fresh snapshot, onroad or not."""
+  def __init__(self, onroad):
+    self.onroad = onroad
+
+  def get(self):
+    return {"at": time.monotonic(), "onroad": self.onroad, "route": None, "plan": None, "gps": None}
+
+
 class TestRestart(WebTestCase):
+  """2026-11-06: the phone's Restart (DoReboot) clears DriverTooDistracted and DriverLockoutCount at manager_init, so it was a
+  way around comma's driver monitoring lockout from the passenger seat. It is refused during one, and out of Park."""
+
+  def restart(self, car=None, reader=None):
+    self.params.remove("DoReboot")
+    if car is not None:
+      self.app.car = car
+    self.app.reader = reader
+    code, body, _ = self.call("POST", "/api/restart", {})
+    assert self.params.get_bool("DoReboot") == (code == 200), (code, body)
+    return code, body
+
   def test_restart_reboots_the_comma_unless_engaged(self):
     self.params.put_bool("IsEngaged", True, block=True)
-    assert self.call("POST", "/api/restart", {})[0] == 409
-    assert not self.params.get_bool("DoReboot")
+    code, body = self.restart(FakeCar())
+    assert code == 409 and body["error"] == "Disengage openpilot first: the comma takes about 2 minutes to come back"
     self.params.put_bool("IsEngaged", False, block=True)
-    code, body, _ = self.call("POST", "/api/restart", {})
-    assert code == 200 and body["restarting"] and self.params.get_bool("DoReboot")
+    code, body = self.restart(FakeCar())
+    assert code == 200 and body["restarting"]
     assert '$("restartbtn")' in server.INDEX.read_text()
+
+  def test_refused_during_a_driver_monitoring_lockout(self):
+    self.params.put_bool("DriverTooDistracted", True, block=True)  # selfdrived's, at driverMonitoringState.lockout's onset
+    self.params.put("DriverLockoutCount", 2, block=True)
+    car = FakeCar()
+    for reader in (None, FakeReader(onroad=True), FakeReader(onroad=False)):  # parked, onroad or not: the lockout runs out first
+      code, body = self.restart(car, reader)
+      assert code == 409 and body["error"] == "Driver monitoring lockout: wait it out"
+    assert car.calls == 0  # refused on the param alone, without waiting on the car
+    assert self.params.get_bool("DriverTooDistracted") and self.params.get("DriverLockoutCount") == 2
+    # the cabin camera view removes the param while dmonitoringd's lockout runs on: the live state refuses it too
+    self.params.remove("DriverTooDistracted")
+    code, body = self.restart(FakeCar(lockout=True), FakeReader(onroad=True))
+    assert code == 409 and body["error"] == "Driver monitoring lockout: wait it out"
+    code, body = self.restart(FakeCar(lockout=False), FakeReader(onroad=True))  # over: Park, disengaged, no lockout
+    assert code == 200 and body["restarting"]
+
+  def test_refused_out_of_park_while_carstate_is_sent(self):
+    # 1e: the car stood in Drive at lights (standstill, 952 qlog samples), rolled, and backed in Reverse; Park is always
+    # a standstill (717). Only that last one restarts. 'unknown' is card's first carState before DI_gear is read.
+    for gear, standstill in (("drive", True), ("drive", False), ("reverse", True), ("neutral", True), ("unknown", False),
+                             ("park", False)):
+      code, body = self.restart(FakeCar(gear, standstill), FakeReader(onroad=True))
+      assert code == 409 and body["error"] == "Stop and shift into Park first: the comma takes about 2 minutes to come back", gear
+    code, body = self.restart(FakeCar("park", True), FakeReader(onroad=True))
+    assert code == 200 and body["restarting"]
+
+  def test_without_carstate_only_the_lockout_applies_offroad(self):
+    for reader, timeout in ((FakeReader(onroad=False), server.CAR_READ_OFFROAD_S), (None, server.CAR_READ_S)):
+      car = FakeCar(None, None, None)  # offroad (card isn't running), or no status reader to say
+      code, body = self.restart(car, reader)
+      assert code == 200 and body["restarting"], reader
+      # offroad the car is read briefly, never skipped (deviceState silent reads as offroad); without a status, in full
+      assert car.timeouts == [timeout], reader
+    # onroad, card sends carState: without one the gear can't be checked, so it isn't restarted blind
+    code, body = self.restart(FakeCar(None, None, None), FakeReader(onroad=True))
+    assert code == 409 and "Can't read the car's gear" in body["error"]
+    stale = FakeReader(onroad=True)
+    stale.get = lambda: {"at": time.monotonic() - status.STALE_AFTER - 1, "onroad": True}  # a stuck reader says nothing
+    assert self.restart(FakeCar(None, None, None), stale)[0] == 200
+
+  def car_reader(self):
+    reader = server.CarReader()
+    self.app.car = reader
+
+    def stop():
+      reader.stop()
+      if reader.launched:
+        reader.join(5)
+    self.addCleanup(stop)
+    return reader
+
+  def publish(self, **state) -> CarPublisher:
+    publisher = CarPublisher(**state)
+    self.addCleanup(publisher.stop)
+    return publisher
+
+  def test_the_car_reader_reads_the_live_services(self):
+    """The real CarReader against published carState and driverMonitoringState: one subscriber for the server's life,
+    a message counts only while it is fresh, and a lockout or Drive refuses."""
+    reader = self.car_reader()
+    car = self.publish(gear="drive")
+    onroad = FakeReader(onroad=True)
+    code, body = self.restart(reader, onroad)
+    assert code == 409 and "shift into Park" in body["error"]
+    sm = reader.sm
+    car.gear, car.lockout = "park", True
+    time.sleep(0.05)  # a few carStates in Park: the read takes one sent since the Restart, not the Drive one of a moment ago
+    code, body = self.restart(reader, onroad)
+    assert code == 409 and body["error"] == "Driver monitoring lockout: wait it out"
+    car.lockout = False
+    time.sleep(0.05)
+    assert self.restart(reader, onroad)[0] == 200
+    assert reader.sm is sm  # one SubMaster, made at the first Restart: msgq's reader slots are never given back
+    car.on = False  # offroad: card and dmonitoringd stop, and the conflated sockets keep their last messages
+    with mock.patch.object(server, "CAR_FRESH_S", 0.2):
+      time.sleep(0.3)
+      assert reader() == {"gear": None, "standstill": None, "lockout": None}
+      assert self.restart(reader, FakeReader(onroad=False))[0] == 200
+      assert self.restart(reader, onroad)[0] == 409  # still onroad by deviceState: refused, never the stale Park
+
+  def test_the_car_reader_reads_on_one_long_lived_thread(self):
+    """2026-11-06 review: on Linux msgq SIGUSR2s, on every publish (card's at 100 Hz), the tid of the thread that made a
+    reader or last re-synced it after a publisher's restart. A request's thread exits with the request, and its tid is
+    recycled, so every SubMaster call runs on CarReader's own thread: across two Restarts and card restarting (a new
+    publisher, which clears every reader slot, and the next read re-stamps it)."""
+    calls = []
+    init, update = messaging.SubMaster.__init__, messaging.SubMaster.update
+
+    def spy(name, original):
+      def call(sm, *args, **kwargs):
+        calls.append((name, id(sm), threading.current_thread()))
+        return original(sm, *args, **kwargs)
+      return call
+    self.enterContext(mock.patch.object(messaging.SubMaster, "__init__", spy("init", init)))
+    self.enterContext(mock.patch.object(messaging.SubMaster, "update", spy("update", update)))
+    reader = self.car_reader()
+    card = self.publish(gear="drive")
+    onroad = FakeReader(onroad=True)
+    code, body = self.restart(reader, onroad)
+    assert code == 409 and "shift into Park" in body["error"]
+    card.stop()  # card restarts: a new publisher on carState and driverMonitoringState, now in Park
+    before = len(calls)
+    self.publish(gear="park")
+    assert self.restart(reader, onroad)[0] == 200  # read through the re-synced reader: Park, sent since this Restart
+    assert len(calls) > before  # the re-sync after the new publisher ran on that thread too
+    assert [name for name, _, _ in calls].count("init") == 1
+    assert {i for _, i, _ in calls} == {id(reader.sm)}  # one SubMaster
+    assert all(thread is reader for _, _, thread in calls), {thread.name for _, _, thread in calls}
+    assert reader.name == "car" and reader.daemon and reader.is_alive()  # not a request's thread, and alive after both
+    assert reader is not threading.main_thread() and "process_request" not in reader.name
+    time.sleep(0.05)
+    idle = len(calls)
+    time.sleep(0.2)  # card still sends at 100 Hz: between Restarts the thread doesn't read (or parse) it
+    assert len(calls) == idle
+
+  def test_a_failed_car_reader_refuses_onroad_and_logs_once(self):
+    """A SubMaster that can't be made (a broken messaging build) is tried again after CAR_RETRY_S, never in a loop: each
+    try can take a reader slot. Onroad the gear can't be checked, so the Restart is refused."""
+    made = []
+
+    def broken(services):
+      made.append(services)
+      raise RuntimeError("no msgq")
+    self.enterContext(mock.patch.object(messaging, "SubMaster", broken))
+    log = self.enterContext(mock.patch.object(server, "cloudlog"))
+    reader = self.car_reader()
+    for _ in range(2):
+      code, body = self.restart(reader, FakeReader(onroad=True))
+      assert code == 409 and "Can't read the car's gear" in body["error"]
+    assert made == [server.CAR_SERVICES]  # once: the next try is CAR_RETRY_S on
+    assert [c.args for c in log.exception.call_args_list] == [("turnpilot_web.car_failed",)]
+    assert self.restart(reader, FakeReader(onroad=False))[0] == 200  # offroad only the lockout applies, as before
+
+  def test_offroad_the_car_is_read_only_briefly(self):
+    """The first version always waited CAR_READ_S for card's carState, which offroad never comes (0.504 s a press). The
+    next skipped the read offroad (0.001 s), which let a running card in Drive through (the test below). Offroad it now
+    waits CAR_READ_OFFROAD_S, for messages that offroad never come."""
+    reader = self.car_reader()
+    with mock.patch.object(server, "CAR_READ_S", 5.):
+      start = time.monotonic()
+      assert self.restart(reader, FakeReader(onroad=False))[0] == 200
+      took = time.monotonic() - start
+    assert server.CAR_READ_OFFROAD_S <= took < 2., took  # read for the short bound, not the 5 s a full wait would take
+    assert server.CAR_READ_OFFROAD_S <= 0.25  # an offroad press answers at once to a person (round 1: 0.504 s)
+    assert reader(timeout=0.05) == {"gear": None, "standstill": None, "lockout": None}
+
+  def test_offroad_a_running_card_still_refuses(self):
+    """2026-11-06 review: offroad is the status snapshot's deviceState.started, which reads False also when deviceState
+    hasn't been heard for status.SERVICE_TIMEOUT (hardwared stalled, or being restarted by manager) while manager keeps the
+    last started and card runs on. A version that skipped the car read offroad rebooted the comma then, rolling in Drive.
+    The short offroad read still catches card's gear and dmonitoringd's live lockout, at their own rates (driverMonitoring-
+    State at 20 Hz) and on a cold reader: each case is its reader's first Restart, so the SubMaster is made within it."""
+    silent = status.StatusReader()  # the real reader, with nothing publishing deviceState: hardwared silent
+    silent.start()
+    self.addCleanup(silent.stop)
+    deadline = time.monotonic() + 5
+    while silent.get() is None and time.monotonic() < deadline:
+      time.sleep(0.02)
+    park = "Stop and shift into Park first: the comma takes about 2 minutes to come back"
+    for state, error in (({"gear": "drive", "standstill": False}, park), ({"gear": "drive", "standstill": True}, park),
+                         ({"gear": "reverse", "standstill": False}, park),
+                         ({"gear": "park", "standstill": True, "lockout": True}, server.LOCKOUT_MESSAGE)):
+      reader = self.car_reader()
+      card = self.publish(dm_every=5, **state)
+      time.sleep(0.05)  # card has been sending a while: the queue holds messages from before this reader
+      self.app.reader = silent
+      assert self.app.onroad() is False, silent.get()  # the snapshot is fresh and says offroad
+      code, body = self.restart(reader, silent)
+      assert code == 409 and body["error"] == error, (state, code, body)
+      card.on = False  # card and dmonitoringd stop: really offroad, and the conflated sockets keep the last messages
+      with mock.patch.object(server, "CAR_FRESH_S", 0.2):
+        time.sleep(0.3)
+        assert self.restart(reader, silent)[0] == 200, state  # the stale Drive or lockout no longer refuses
+      card.stop()
+
+  def test_the_page_says_park_two_minutes_and_the_lockout(self):
+    box = server.INDEX.read_text().split('<details id="restartcomma">')[1].split("</details>")[0]
+    text = " ".join(box.split())
+    assert "Stop in Park and disengage first" in text and "about 2 minutes" in text and "about a minute" not in text
+    assert "driver monitoring lockout" in text
 
 
 class TestCarSignalsPage(WebTestCase):
@@ -1129,6 +1392,19 @@ class TestCarSignalsPage(WebTestCase):
     # 2026-11-06: a Model 3 lit no lamp for the check in Park, so the check in Drive is offered without ?dev=1
     assert '$("csdrive").hidden = !(d.check === null || d.mode !== "on");' in script
     assert '$("carsignals").open = true' in script and "loadCarSignals().catch" in script
+
+  def test_the_card_shows_what_the_next_drive_gets_before_the_mode(self):
+    """Under TurnPilotCarSignalsForceOn the mode alone ("Mode: off") read off while the car signalled: the card leads with
+    the server's state_why and says the mode doesn't turn it off, and its note no longer says off means you signal."""
+    page = server.INDEX.read_text()
+    script = page.split("<script>")[1]
+    assert 'var lines = ["Car signal " + d.state_why];' in script
+    assert 'd.forced_on && d.mode !== "check" ? " (the car signals anyway: it is on for every drive)"' in script
+    box = " ".join(page.split('<details id="carsignals">')[1].split("</details>")[0].split())
+    assert "on every drive, with no check needed" in box and "Where a lamp doesn't light, TurnPilot asks you to signal" in box
+    assert "Off, you signal" not in box and "On a verified Tesla" not in box
+    # with TurnPilotCarSignalsForceOn 0 the note says the verified check decides
+    assert '$("csnote").textContent = d.forced_on ?' in script and '"changes. Off, you signal."' in script
 
 
 class TestDiagnostics(WebTestCase):
