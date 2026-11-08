@@ -837,6 +837,7 @@ class MapControlPolicy:
     # [maneuver id, s of steady green] of a red or yellow read at the unprotected left's own junction with no signal mapped
     # there: the left's light until a steady green (_left_red_latch, HR-1)
     self._left_red: list | None = None
+    self._left_red_read = False         # ...a red or yellow read for it on the last update (turn_light_read)
     self._latch_run: int | None = None  # ...the camera read it last looked at (CameraLights.run)...
     self._latch_run_m = 0.              # ...and m driven since it was made: a carried read's heads dead-reckoned
     self.driven: Driven | None = None  # a line crossed with no go, its take-control up until through (DRIVEN_THROUGH_M)
@@ -935,6 +936,16 @@ class MapControlPolicy:
       return 'unknown' if self.tracker.route and self.tracker.status not in ('ok', 'none') else 'none'
     return 'green' if 'green' in states else 'none'
 
+  def turn_light_read(self, maneuver_id: int, distance: float) -> bool:
+    """Whether turn_light's red or yellow for the unprotected turn maneuver_id, distance m ahead, is read now: a red or yellow
+    from any source around the junction (turn_light's first test), or one its latch read on the last update
+    (_left_red_latch). False with turn_light 'red' is a stop of TurnPilot's in force there, or the latch, with nothing read
+    now (review 2026-11-07, AL-2: the left says it as a through signal says its light unseen). The last update's lights."""
+    accepted, camera = self.junction_lights(distance)
+    if (accepted | camera) & {'red', 'yellow'}:
+      return True
+    return self._left_red_read and self._left_red is not None and self._left_red[0] == maneuver_id
+
   def _left_red_latch(self, turn, controls, lights: Lights, v: float, dt: float) -> None:
     """The unprotected left's own junction's red, kept once no longer read (turn_light), where no signal is mapped there
     (one mapped keeps its own stop in force: signal_stopping). Review 2026-11-07 (HR-1): there the camera's signal is never
@@ -951,6 +962,7 @@ class MapControlPolicy:
     turnpilotd carries between road runs (up to CAMERA_STALE_S) dead-reckoned by the metres driven since its run. turn:
     update()'s (maneuver id, m to its junction, side) of the unprotected turn the car is taking, or None (the latch kept for
     its maneuver)."""
+    self._left_red_read = False
     cam = lights.camera
     if cam is not None and cam.run != self._latch_run:
       self._latch_run, self._latch_run_m = cam.run, 0.
@@ -975,6 +987,7 @@ class MapControlPolicy:
         cloudlog.event("turnpilot.left_red_latched", maneuver_id=mid, states=sorted(states), distance=round(dist, 1))
       self._left_red = [mid, 0.]
       self._signal_turn_id = mid
+      self._left_red_read = True
     elif self._left_red is not None:
       self._left_red[1] = self._left_red[1] + dt if 'green' in states else 0.
       if self._left_red[1] >= CAMERA_GREEN_STEADY_S - 1e-9:

@@ -532,7 +532,7 @@ def test_closed_loop_a_model_that_never_takes_over_is_nudged_2_25_m_at_most():
 def test_closed_loop_the_lift_ends_on_the_models_takeover():
   """A model that goes once the car rolls: the lift ends TAKEOVER_S after its plan says go, well inside the window, and the
   model drives on past 3 m/s by itself. With an actuator lag of up to 0.3 s the car is past 0.3 m/s inside the unprotected
-  left's LEFT_NO_MOVE_S (1.0 s, CRITIQUE REQUIRED 4)."""
+  left's LEFT_NO_MOVE_S (CRITIQUE REQUIRED 4; 2 s, this car's own launch, since 2026-11-07 L4)."""
   from openpilot.selfdrive.turnpilot.turnpilotd import LEFT_NO_MOVE_S, STANDSTILL_SPEED
   for lag in (0.15, 0.3):
     rows, lp = closed_loop(model_that_takes_over, lag_s=lag)

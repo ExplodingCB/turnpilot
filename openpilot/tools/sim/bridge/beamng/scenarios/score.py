@@ -159,12 +159,14 @@ HELD_SLACK_M = 1.0
 MOVING_HANDBACKS = ('turnAbandonedTakeControl', 'wrongSideTakeControl')
 FULL_STOP_HANDBACKS = ('stopSignTakeControl',)
 SHORT_OF_LANES = ('cantStartTakeControl',)
-# ...and comes soon after the left's go (S02 'handback within 3.5 s of the go, 1.5 s with the lift off'): LIFT_HANDBACK_S
+# ...and comes soon after the left's go (S02 'handback within 3.5 s of the go, 2.5 s with the lift off'): LIFT_HANDBACK_S
 # from it with plannerd's lift certified for it (go_override.GO_WINDOW_S, 3 s, then withdrawn), NO_LIFT_HANDBACK_S without
-# (turnpilotd's LEFT_NO_MOVE_S, 1 s, standing); rows from before go_cert are held to the former, the most either allows
+# (turnpilotd's LEFT_NO_MOVE_S and NO_MOVE_S, 2 s, standing: since 2026-11-07 L4 the left's from this car's own launch, and
+# LS-2's unlifted go with the model planning motion; 1 s and 1.5 s before); rows from before go_cert are held to the former,
+# the most either allows
 GO_TIMED = ('cantStartTakeControl',)
 LIFT_HANDBACK_S = 3.5
-NO_LIFT_HANDBACK_S = 1.5
+NO_LIFT_HANDBACK_S = 2.5
 # a row or two: the plan's message and the car's each land in the 50 ms rows up to a row late
 ROW_TOL_S = 0.1
 # the stall's handback (S03 'handback 3 s after the stand') comes STALL_PROMPT_S (turnpilotd's) into the car's stand with

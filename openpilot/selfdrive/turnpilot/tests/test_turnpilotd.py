@@ -82,6 +82,7 @@ class Sim:
     self.lights = None  # turnpilotLights to send each frame, a function of the sim
     self.paint, self.paint_rule, self.inputs_valid = paint, paint_rule, True
     self.s, self.v, self.cruise, self.t = 0., cruise, cruise, 0.
+    self.heading_deg = 0.  # the car's heading off the road's, left positive: the yaw_rate stepped (the road boxes' frame)
     self.model_lanes, self.shadow, self.driver_signals, self.long_control = model_lanes, shadow, driver_signals, long_control
     self.disengage_on_accel = disengage_on_accel
     self.big = False
@@ -159,6 +160,7 @@ class Sim:
     self.v = max(self.v + max(a, -3.5) * DT_MDL, 0.)
     self.s += self.v * DT_MDL
     self.t += DT_MDL
+    self.heading_deg += math.degrees(yaw_rate * DT_MDL)
     self.trace.append((self.s, self.v, plan))
     return plan
 
@@ -3574,13 +3576,17 @@ def test_a_go_ended_by_a_lead_nothing_in_the_scene_shows_hands_back_at_the_no_mo
 
 
 def test_an_unprotected_turns_go_is_withdrawn_after_a_shorter_no_move():
-  """CRITIQUE REQUIRED 4: a go across the oncoming road with no movement is withdrawn at LEFT_NO_MOVE_S (1.0 s), not 2.0:
-  the gap it was certified for runs out while the car stands. Any other turn waits NO_MOVE_S (2.0 s)."""
+  """CRITIQUE REQUIRED 4: a go across the oncoming road with no movement is withdrawn at LEFT_NO_MOVE_S: the gap it was
+  certified for runs out while the car stands, so never later than the launch its gap was certified for (GO_LATENCY_S, the
+  left re-checking its band on every road run until the first motion) and, since 2026-11-07 (L4: at 1.0 s a lifted go on a
+  car whose accel lags its plan 0.7-1.0 s was handed back as the car began to roll), never sooner than this car's own launch
+  (0.92-1.6 s to STANDSTILL_SPEED on 11-06). Any other turn waits NO_MOVE_S (2.0 s)."""
+  from openpilot.selfdrive.turnpilot.unprotected_left import GO_LATENCY_S
   left = Maneuver(*classify("turn", "left"), "turn", "left", 90., geometry=True, opposing='present')
   t_left = Maneuver(*classify("turn", "left"), "turn", "left", 90., geometry=True, opposing='none')
   tp = TurnPilot()
   tp.start_post_go(left, 9., 0., True)
-  assert tp.no_move_limit == LEFT_NO_MOVE_S == 1.0
+  assert tp.no_move_limit == LEFT_NO_MOVE_S and 1.6 < GO_LATENCY_S <= LEFT_NO_MOVE_S <= NO_MOVE_S
   tp.start_post_go(t_left, 9., 0., True)
   assert tp.no_move_limit == NO_MOVE_S == 2.0
   tp.left_go_profile = 'graduated'  # the limit goes with the turn, not the profile

@@ -122,7 +122,7 @@ class TestWithdrawnGoShortOfTheOncomingLanes:
 
 
 class TestWithdrawnGoTimed:
-  """S02 'handback within 3.5 s of the go (1.5 s with the lift off)' (B2b): the cantStartTakeControl handback comes within
+  """S02 'handback within 3.5 s of the go (2.5 s with the lift off)' (B2b): the cantStartTakeControl handback comes within
   score.LIFT_HANDBACK_S of the left's go (left_state into go) when plannerd's lift was certified for it (the rows' go_cert,
   turnpilotPlan.goCertified.cause unprotectedLeft), within NO_LIFT_HANDBACK_S when it wasn't, and within the former in rows
   from before go_cert."""
@@ -130,9 +130,9 @@ class TestWithdrawnGoTimed:
 
   def test_the_bounds_hold_turnpilots_timers(self):
     from openpilot.selfdrive.turnpilot.go_override import GO_WINDOW_S
-    from openpilot.selfdrive.turnpilot.turnpilotd import LEFT_NO_MOVE_S
-    assert (score.LIFT_HANDBACK_S, score.NO_LIFT_HANDBACK_S) == (3.5, 1.5)
-    assert GO_WINDOW_S < score.LIFT_HANDBACK_S and LEFT_NO_MOVE_S < score.NO_LIFT_HANDBACK_S
+    from openpilot.selfdrive.turnpilot.turnpilotd import LEFT_NO_MOVE_S, NO_MOVE_S
+    assert (score.LIFT_HANDBACK_S, score.NO_LIFT_HANDBACK_S) == (3.5, 2.5)
+    assert GO_WINDOW_S < score.LIFT_HANDBACK_S and max(LEFT_NO_MOVE_S, NO_MOVE_S) < score.NO_LIFT_HANDBACK_S
 
   def test_a_handback_12_s_after_the_go_fails(self):
     # the skeptic's B2b: the go, the car standing 12 s, then cantStartTakeControl, held, the driver's brake
@@ -153,12 +153,12 @@ class TestWithdrawnGoTimed:
     assert res['passed'], res['failures']
     assert res['expect_facts']['go_before']['cantStartTakeControl'] == {'go_t': 3.0, 'after_s': 3.0, 'lift': True, 'bound_s': 3.5}
 
-  def test_without_the_lift_the_handback_comes_within_1_5_s(self):
-    rows, _ = withdrawn_go(0.2, 1.5, 14., go_s=2.5, extra={'go_cert': 'none'})
+  def test_without_the_lift_the_handback_comes_within_2_5_s(self):
+    rows, _ = withdrawn_go(0.2, 1.5, 14., go_s=3.0, extra={'go_cert': 'none'})
     res = score.summarize('unprotected_left_visible', rows, 'taken over', expect=self.EXPECT)
-    assert "handed back cantStartTakeControl 2.5 s after the left's go at t=3.0 s, over 1.5 s (without the lift: no goCertified)" in \
+    assert "handed back cantStartTakeControl 3.0 s after the left's go at t=3.0 s, over 2.5 s (without the lift: no goCertified)" in \
       res['failures'], res['failures']
-    rows, _ = withdrawn_go(0.2, 1.5, 14., go_s=1.2, extra={'go_cert': 'none'})
+    rows, _ = withdrawn_go(0.2, 1.5, 14., go_s=2.0, extra={'go_cert': 'none'})
     res = score.summarize('unprotected_left_visible', rows, 'taken over', expect=self.EXPECT)
     assert res['passed'], res['failures']
 

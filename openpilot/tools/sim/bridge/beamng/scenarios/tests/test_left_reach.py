@@ -17,12 +17,17 @@ from openpilot.tools.sim.bridge.beamng.scenarios.tests.test_occluded import left
 pytestmark = pytest.mark.skipif(not os.path.exists(GRAPH_JSON), reason="needs piston's road-graph export")
 
 
-@pytest.mark.parametrize("name,r_line,slack", [('unprotected_left_visible', 133.9, 3.7), ('unprotected_left_occluded', 141.1, 2.05)])
+# at GO_LATENCY_S 1.7 s (this car's own launch, 2026-11-07 L4; 133.9 m and 3.7 m, 141.1 m and 2.05 m at 1 s): S08's R_req at
+# its line is past the shots' 150 m already (slack -1), judged on the band the camera covers there (no handback since 11-07)
+@pytest.mark.parametrize("name,r_line,slack", [('unprotected_left_visible', 144.1, 1.35), ('unprotected_left_occluded', 151.3, -1.)])
 def test_each_left_says_how_much_setback_it_tolerates_at_the_provisional_range(name, r_line, slack):
   reach = catalog.build(name).notes['left_reach']
   assert reach['range_m'] == ul.PROVISIONAL_RANGE_M == 150.
   assert reach['r_req_at_line_m'] == pytest.approx(r_line, abs=0.2)
   assert reach['slack_m'] == pytest.approx(slack, abs=0.1)
+  if reach['slack_m'] < 0.:
+    assert reach['r_req_at_line_m'] > ul.PROVISIONAL_RANGE_M  # past it at the line already
+    return
   # R_req standing slack_m past LINE_D is the range: the live check's, with the car there or the junction read that far out
   v, lanes = reach['v_limit'], reach['lanes']
   d = ul.LINE_D + reach['slack_m']

@@ -441,6 +441,45 @@ def test_a_car_coming_up_the_lane_a_wrong_lane_left_crosses_withdraws_its_go():
   assert sim.s > JUNCTION + 5.  # gone again once it has passed and cleared the junction
 
 
+def two_lanes_off_left():
+  """THREE_LANES_LEFT_TURN with the car in the right lane (model_lanes (2, 0)): the plan wants two changes left (the map's
+  lane list), the left blind spot occupied the whole way, so LC-03 leaves the car two lanes off the left's lane."""
+  sim = left_on(V_25, full_pass=TEST_RANGE_M, sim_cls=Sim, nav_lanes={0: THREE_LANES_LEFT_TURN}, model_lanes=(2, 0),
+                paint=BROKEN_WHITE_LEFT)
+  sim.blindspot = lambda s: (True, False)
+  return sim
+
+
+def test_a_left_two_lanes_off_holds_for_a_car_in_the_further_lane_it_crosses_and_goes_once_it_has_gone():
+  """Review 2026-11-07 (LEFTS-2): LS-1's crossed lane was one lane wide (1.5-5.4 m to the turn side), but a left LC-03 leaves
+  two lanes off (laneChangeWant 2 on the map's lane list) crosses two lanes of ours, the further the left's own turn lane
+  where left-turners queue. A car standing there 3 m ahead of ours (67 deg off the camera axis: the wide camera's view, where
+  a track can be) was in no zone, and the go came at 31.75 s as on an empty road. Now the crossed band is as wide as the
+  lanes LC-03 left unmade: held, said in plain words, and gone on a fresh window once that car has left."""
+  from openpilot.selfdrive.turnpilot.unprotected_left import BESIDE_REASON, CLEAR_WINDOW_S
+  stop_s = JUNCTION - HOLD_LINE_M - 1.25  # where the car stands at its line
+  leave_t = 60.
+  sim, plans = lane_left_with(lambda sim: [(stop_s + 3., 7.2, 0., 77)] if sim.t < leave_t else [], 90., sim=two_lanes_off_left())
+  assert sim.tp.left_lane_id is not None and any(p.laneChangeWant == 2 for p in plans)
+  held = next(i for i, p in enumerate(plans) if p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap')
+  wait = plans[held:round(leave_t / DT_MDL)]
+  assert wait and all(p.shouldStop and p.reason == BESIDE_REASON[1] for p in wait[5:]), {p.reason for p in wait}
+  assert not any(p.desire == log.Desire.turnLeft for p in plans[:round(leave_t / DT_MDL)])
+  go = next(i for i, p in enumerate(plans) if p.desire == log.Desire.turnLeft)
+  assert go * DT_MDL >= leave_t + CLEAR_WINDOW_S - 0.2 and sim.s > JUNCTION + 5.
+
+
+def test_the_crossed_band_is_as_wide_as_the_lanes_the_left_crosses():
+  # LEFTS-2: a lane of 3.6 m per change LC-03 left unmade, from ONCOMING_Y_NEAR_M; one lane (no lane list: LC-03 wants one
+  # change at a time) as LS-1 shipped it, so oncoming cars passing beside the car never hold it
+  from openpilot.selfdrive.turnpilot.unprotected_left import CROSSED_LANE_Y_FAR_M, in_crossed_lane
+  for y in (3.4, 5.0):
+    assert in_crossed_lane(y) and in_crossed_lane(y, 2)
+  for y in (5.6, 7.2, 8.9):
+    assert not in_crossed_lane(y) and in_crossed_lane(y, 2), y
+  assert not in_crossed_lane(CROSSED_LANE_Y_FAR_M + 3.7, 2) and not in_crossed_lane(1.0, 2)
+
+
 def test_a_standing_car_ahead_in_the_lane_a_wrong_lane_left_crosses_is_no_view_to_creep_past():
   # LS-1 (its skeptic): a velocity-trusted car standing 4.5 m ahead of ours in the lane the left crosses was an occluder to
   # creep past ("Creeping for a view"), and with the camera losing it the left went with that car beside it. From a lane it

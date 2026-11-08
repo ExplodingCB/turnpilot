@@ -345,8 +345,10 @@ approach of R_req or more.
 
 That 150 m leaves little room. The live check at the line computes R_req from where the car stands and the furthest of
 navd's readings, about 4.4 m more R_req for every metre past the 9 m line at 25 mph, so a left's plan says how far past it
-the car may stand, or its junction be read, before the left is undecided there (`notes.left_reach.slack_m`): 3.7 m at
-(-650.1, 481.7), one lane across, and 2.0 m at S08's wpTown_5, two lanes across. The round-2 smoke's S08 and the diag's S02
+the car may stand, or its junction be read, before the left is undecided there (`notes.left_reach.slack_m`): 1.35 m at
+(-650.1, 481.7), one lane across, and S08's wpTown_5, two lanes across, already past it at its line (R_req 151.3 m: slack -1;
+3.7 m and 2.0 m before 2026-11-07, when GO_LATENCY_S was 1 s rather than this car's measured launch; since that day such a
+left is judged on the band the camera covers, never handed back for its reach). The round-2 smoke's S08 and the diag's S02
 went undecided at R_req 204 and 172.9 m because TurnPilot's junction ran 13 m and 6.5 m short of navd's on the wheels'
 over-read speed (now the ground speed, above); an undecided left's result says where the car stood, navd's junction and
 TurnPilot's (`left.undecided_at`). No left is skipped at route time for its range (Kellen, 2026-11-06: "never route around
@@ -414,15 +416,20 @@ junction (why `unprotected`, `junction`): nothing the lift checks sees the lanes
 
 A go the model never takes over is withdrawn at its 3 s and handed back (`cantStartTakeControl`, the car stopped at 1.5
 m/s^2 and held): with a model that holds, the car ends about 3.0 m past its line. A go the car doesn't move on within 2.0 s
-(1.0 s for the left) is withdrawn as before. With an actuator lag over about 0.4 s the lift doesn't reach 0.3 m/s inside
-the left's 1.0 s, so the left's go is withdrawn and handed back; measure the lag (`carState.aEgo` behind
-`carControl.actuators.accel`) before relying on it. That is the total from turnpilotd's go to the wheels: the plan's hop to
+(the left's too since 2026-11-07, L4: this car's own launches reach 0.3 m/s 0.92-1.6 s after the plan's go) is withdrawn as
+before. With an actuator lag over about 1.4 s the lift doesn't reach 0.3 m/s inside it, so the go is withdrawn and handed
+back; measure the lag (`carState.aEgo` behind `carControl.actuators.accel`) before relying on it. That is the total from turnpilotd's go to the wheels: the plan's hop to
 plannerd and controlsd and the CAN frame add about 0.1-0.15 s on the car to the actuator's own lag.
 
 The left's go is lifted only from its line (4.5 m or more short of the oncoming lanes: the nudge, its stop and 1.5 m), never
 from a creep, and it is followed into the oncoming lanes only by a launch: a car under 2.0 m/s with 1.5 m left to stop short
-of them is withdrawn and handed back (`turnpilot.left_not_launched`). A model that only keeps the speed the lift gave it
-satisfies the takeover predicate, and would otherwise coast across at under 1 m/s.
+of where its next go is judged is judged again for the launch it shows (`turnpilot.left_not_launched`), as the go is, on
+the band the camera covers out to that launch's R_req: kept driving where nothing is seen there, withdrawn to the left's own
+wait short of the lanes where a car is, its next go's gap for that launch (since 2026-11-07, L3: withdrawn and handed back
+before; 2026-11-08: an R_req past the camera's reach no longer withdraws it). A model that only keeps the speed the lift gave
+it satisfies the takeover predicate, and with nothing seen in that band it now coasts across at under 1 m/s. A car standing
+there yawed past the band's edge in the road camera (about 28 deg) is judged on what the camera frames and says so once
+(`turnpilot.left_yaw_view`), never the `yaw` handback.
 
 | param | values | default |
 | --- | --- | --- |

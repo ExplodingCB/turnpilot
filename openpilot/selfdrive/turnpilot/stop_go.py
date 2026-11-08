@@ -70,8 +70,8 @@ an override, the side views on for the drive, the light at the line: certify._as
 (stop_rules.reach_needed_vision on the walk's raw reach, PV1's optimistic row, no mask needed). After dark it runs as by day
 (Kellen, 2026-11-07: "why the hell do we care about dark?"): the light at the line is glare alone, and night, dusk and no clock
 walk the day table (stop_rules.walk_row), the side views' live sectors zeroing any bearing that reads washed, frozen or
-degraded (by day blocked too; a dark sector, or a blocked one after dark, never: every side view reads so at a night stand,
-review 2026-11-07 LS-3, visibility.LiveVisibility.lanes); until then the gate failed every stop after dark ("Stop sign:
+degraded (a dark or blocked sector never, at any lighting row: every side view reads so at a night stand, and a dim still
+one by day, review 2026-11-07 LS-3 and LS-3-R1, visibility.LiveVisibility.lanes); until then the gate failed every stop after dark ("Stop sign:
 night at ETA +0 min: take control", H9) and the walk on the 'night' row, which has no table, read every lane's reach 0
 (the note above stop_rules.DARK_ROWS). Every lane is judged as
 possibly not stopping (the tracked test for every track, no on-site downgrade), a car at its line on an approach the map says
@@ -1916,9 +1916,9 @@ class StopGo:
     row, low = self._lighting(f)
     stamp = ce.pick_stamp(self.entry, row, self.junction.heading_in) if self.entry is not None and not self.vision else None
     rot = sr.angle_bound(self.edges.nominal is not None, max(abs(f.yaw20_deg), sr.ROUTE_YAW_DEG))
-    # under vision the side views' dark sectors judged by the walk's other rules, a blocked (static and dark) one too after
-    # dark or with no clock (visibility.LiveVisibility.lanes, LS-3)
-    kw = {'vision': True, 'dark': row in sr.DARK_ROWS or row == 'unknown'} if self.vision else {}
+    # under vision the side views' dark and blocked (static and dark) sectors judged by the walk's other rules, at every
+    # lighting row (visibility.LiveVisibility.lanes, LS-3, LS-3-R1)
+    kw = {'vision': True} if self.vision else {}
     # under vision a dark row (and no clock) walks the day table, the side views' live sectors judging what the camera sees
     # (stop_rules.walk_row, the note above DARK_ROWS); until 2026-11-07 every row but day and sunAhead was 'night', which has no
     # table, so after dark every lane read reach 0 and a gate that passed would have waited, crept and handed back (H3)

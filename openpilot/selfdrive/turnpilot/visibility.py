@@ -199,8 +199,7 @@ class LiveVisibility:
 
   def lanes(self, lanes_at_stop: list, d_stop: float, vis, *, rot_deg: float, edges: sr.Edges, lighting: str = 'day',
             low_sun_sides=(), entry: dict | None = None, stamp: dict | None = None, tracks=(), evidence: dict | None = None,
-            cam_height: float | None = None, a_launch: float = sr.A_LAUNCH_PLAN, ahead_m: float = 0., vision: bool = False,
-            dark: bool = False) -> Report:
+            cam_height: float | None = None, a_launch: float = sr.A_LAUNCH_PLAN, ahead_m: float = 0., vision: bool = False) -> Report:
     """Each lane's reach now (module docstring). lanes_at_stop: the held control's conflicting lanes seen from its stop
     point (stop_evidence.junction_lanes); d_stop: m our car stands short of the stop point; vis: visibility_table's
     Visibility; lighting: day, sunAhead, dusk or night at the line; low_sun_sides: the sides with low sun along an approach;
@@ -213,13 +212,15 @@ class LiveVisibility:
     file's mask where it has one (none on the shipped file: the side views' sector quality is the live stand-in, a dark or
     static bearing zeroed), its frame edge (DEFAULT_EDGE_DEG without a lens fit) and every live rule (the sun, low sun, the
     sectors, freshness, occluders); need_m stays the two-way need, which blockers() reads. Under vision a sector that reads
-    dark is judged by what the walk's other rules see, never zeroed for its darkness alone, nor one that reads blocked (static
-    and dark) after dark (dark: the lighting row night or dusk, or no clock): review 2026-11-07 (LS-3), the wide camera's own
-    exposure median read 31-33 raw DN at night (1d, 1e: 17-22 full-range DN, against the 45 the sectors' dark and blocked
-    tests read), so every side bearing was zeroed at every night stop and the car waited 15 s and handed back (H3), unwarned,
-    the night gate gone from certify and the walk (Kellen, 2026-11-07: "why the hell do we care about dark?"). A washed,
-    frozen or degraded sector still zeroes its bearing, by day a blocked one too; raw boxes, tracks and the launch's withdraw
-    rail judge the rest."""
+    dark or blocked (static and dark) is judged by what the walk's other rules see, never zeroed for its darkness alone, at
+    every lighting row: review 2026-11-07 (LS-3), the wide camera's own exposure median read 31-33 raw DN at night (1d, 1e:
+    17-22 full-range DN, against the 45 the sectors' dark and blocked tests read), so every side bearing was zeroed at every
+    night stop and the car waited 15 s and handed back (H3), unwarned, the night gate gone from certify and the walk (Kellen,
+    2026-11-07: "why the hell do we care about dark?"); and LS-3-R1, a blocked sector still zeroed by day (the lighting row
+    deciding what the same camera read meant), so a dim still band at a stand (an overcast morning: the wide camera's AE
+    median on route 0f p50 38 full-range DN) waited and handed back H3 where the same read at 23:00 went. A washed, frozen or
+    degraded sector still zeroes its bearing; raw boxes, tracks and the launch's withdraw rail judge the rest. The trade: a
+    dark van beside the camera the detector never boxes no longer holds the go, as a light one reading ok never did."""
     height = cam_height if cam_height is not None else (vis.height if vis.height is not None else 1.3)
     lns = [replace(ln, s_min=ln.s_min + d_stop, s_max=ln.s_max + d_stop) for ln in lanes_at_stop]
     edges_now = sr.Edges(edges.d_min + d_stop, edges.d_max + d_stop, None if edges.nominal is None else edges.nominal + d_stop)
@@ -228,7 +229,7 @@ class LiveVisibility:
     veil_ok = vis.veil in sr.VEIL_OK
     rows = vis.views(lighting, bound='optimistic' if vision else 'conservative', use='allWay') if lighting in ('day', 'sunAhead') else {}
 
-    accept = (('ok', 'dark') + (('blocked',) if dark else ())) if vision else ('ok',)
+    accept = ('ok', 'dark', 'blocked') if vision else ('ok',)
 
     def zero(side: str, bearing: float):
       if lighting == 'sunAhead' and not veil_ok and sr.sun_ahead_zero(side, bearing):

@@ -41,7 +41,8 @@ FULL_S, PAINT_S, LIGHT_S = 0.0102, 0.0034, 0.0007   # the full pass's run, its p
 FAR_S, FAR_LIGHT_S = 0.0105, 0.0007                # the far crop's run and its lights'
 # each step's time past them: a wide run's, a road run's (and its paint read's on top), a far run's
 WIDE_EXTRA_S, ROAD_EXTRA_S, PAINT_EXTRA_S, FAR_EXTRA_S = 0.0013, 0.0016, 0.0006, 0.0024
-ROAD_FRESH_FRAMES = 6  # unprotected_left's ROAD_FRESH_S and FAR_FRESH_S, 0.3 s: a stream's gap past this starts its window over
+ROAD_FRESH_FRAMES = 6  # far first's cadence: a stream's due run a frame late (ROAD_DUE_S + CYCLE_S, 0.3 s; unprotected_left's
+                       # ROAD_FRESH_S and FAR_FRESH_S were this until 2026-11-07, L2, 0.5 s since)
 
 
 def model_times(n: int, seed: int = 0, shift: float = 0.) -> np.ndarray:
@@ -257,11 +258,11 @@ def test_a_warm_chestnut_spaces_the_far_runs_and_never_drops_a_frame(monkeypatch
 
 
 def within_cap(late) -> bool:
-  """Every step's debt within DEBT_CAP_S, but a road run due (modeld_detector.road_due: its gap at ROAD_DUE_S) judged as auto
-  judges it, without its step's extra (review 2026-11-07, R1): such a step past the cap by the extra at most
-  (FULL_STEP_OVERHEAD_S), on 1% of steps at most. Never near a dropped frame (a whole CYCLE_S)."""
-  from openpilot.selfdrive.turnpilot.detector.modeld_detector import FULL_STEP_OVERHEAD_S
-  return late.max() <= DEBT_CAP_S + FULL_STEP_OVERHEAD_S + 1e-9 and (late > DEBT_CAP_S + 1e-9).mean() <= 0.01
+  """Every step's lateness (the debt it leaves the next) under half a frame, never near a dropped frame (a whole CYCLE_S): the
+  car itself dropped none at lateness up to 26.8 ms (1d) and 47.9 ms (1e) (module docstring). DEBT_CAP_S is the room rule's,
+  passed by a road run due judged as auto judges it, without its step's extra (R1), and by one a frame past due run whatever
+  its debt (CS-1, review 2026-11-07: up to 19% of steps at a heavy signalized left's line, the latest 17.9 ms)."""
+  return late.max() < CYCLE_S / 2
 
 
 # the light read's cost on the car by the heads in a run (11-06 rlogs, HEAD's reader: 0, 1, 2, 3, 4 heads), ms
@@ -291,6 +292,27 @@ def test_at_a_signalized_lefts_line_the_light_reads_never_starve_the_road_camera
   assert what.count('road') / s > 3.8 and what.count('far') / s > 3.8
   assert pm.far and all(str(fd.run.lightStatus) == 'off' for fd in pm.far)  # far first: no far light read
   assert late.max() < CYCLE_S / 3  # never near a dropped frame
+
+
+@pytest.mark.parametrize("heads,factor,shift_ms", [(3, 1.55, 0.), (3, 1.4, 0.7)])
+def test_a_road_run_past_due_at_a_heavy_signalized_lefts_line_runs_whatever_its_debt(monkeypatch, heads, factor, shift_ms):
+  """Review 2026-11-07 (CS-1): R1 kept the road camera fed at a signalized left's line only inside its test's conditions (1-2
+  road heads at 11-06's model). A due road run whose own step would leave 8-10 ms of debt (DEBT_CAP_S) was refused even
+  from a paid-back step, and left_pick gave its frame to no far run while it was due, so those frames ran nothing: one step
+  past the tested conditions (3 heads at the 1.55x per head measured on this tree's reader, or 3 at 1.4x with the model
+  0.7 ms slower, the warmest segment on disk) the road camera fell to 3.1-3.4 runs a second, a fifth to a third of its gaps
+  past ROAD_FRESH_S, and the real left's empty-road wait went p50 6-10 s, p90 17-21 s. Now under far first a road run a frame
+  past due runs whatever its debt (room): the window fills as at the tested conditions, the far crop still reading, and no
+  step near a dropped frame."""
+  from openpilot.selfdrive.turnpilot import unprotected_left as ul
+  monkeypatch.setattr(ul.cloudlog, 'event', lambda *a, **kw: None)
+  monkeypatch.setattr(sys.modules[__name__], 'LIGHT_S', light_cost(heads, factor))
+  _, _, what, late = car_drive(monkeypatch, 6000, 'roadAndWide', 0., far_first=True, shift=shift_ms * 1e-3, noise=True)
+  w = np.array(real_left_waits(what))
+  s = len(what) * CYCLE_S
+  assert np.median(w) <= 2.6 and np.percentile(w, 90) <= 6. and (w >= 60.).sum() == 0, (np.median(w), np.percentile(w, 90))
+  assert what.count('far') / s > 3.  # the far crop still reading: the go is no far_behind giving up its reach
+  assert max(gaps(what, 'road')) <= 8 and within_cap(late)  # the overdue road run's 6 frames, two of jitter
 
 
 def real_left_waits(what, starts: int = 100, horizon_s: float = 60.) -> list[float]:

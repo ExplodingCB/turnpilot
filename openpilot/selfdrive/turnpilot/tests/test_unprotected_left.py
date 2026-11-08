@@ -11,9 +11,10 @@ from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.route_follower import LEFT
 from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M, VEL_TRUST_HITS
 from openpilot.selfdrive.turnpilot.tests.synthetic import scene
-from openpilot.selfdrive.turnpilot.unprotected_left import (BLOCKED_UNDECIDED_S, CLEAR_WINDOW_S, CREEP_MAX_M, CREEP_SHORT_M, CREEP_STALL_S, HELD_MIN_M,
+from openpilot.selfdrive.turnpilot.unprotected_left import (BLOCKED_UNDECIDED_S, CLEAR_WINDOW_S, CREEP_MAX_M, CREEP_SHORT_M, CREEP_STALL_S, GO_LATENCY_S,
+                                                           HELD_MIN_M,
                                                            LIGHT_RED_MAX_S, LIGHT_UNKNOWN_S, LONG_WAIT_REASON, PET_S, RAW_CONF,
-                                                           ROAD_FRESH_S, SPEED_MARGIN, STALE_UNDECIDED_S, STAND_UNDECIDED_S, LeftInput, RawBox,
+                                                           FAR_FRESH_S, ROAD_FRESH_S, SPEED_MARGIN, STALE_UNDECIDED_S, STAND_UNDECIDED_S, LeftInput, RawBox,
                                                            RawFrame, UnprotectedLeft, WIDTH_FLOOR_M, band_blockers, nearest_range, r_req,
                                                            t_clear, t_req)
 
@@ -59,17 +60,19 @@ def ped(x, y, **fields):
 
 
 def test_t_req_and_r_req():
-  # the left's post-go profile (1.5 m/s^2 to 4.3 m/s) over the path from the hold line through the oncoming lanes, a second
-  # from go to moving (LEFT_NO_MOVE_S withdraws a go not moving by then) and a 2 s post-encroachment margin
+  # the left's post-go profile (1.5 m/s^2 to 4.3 m/s) over the path from the hold line through the oncoming lanes, this car's
+  # own launch from go to moving (GO_LATENCY_S: 0.92-1.6 s on 11-06, review 2026-11-07 L4; turnpilotd's LEFT_NO_MOVE_S
+  # withdraws a go not moving by then) and a 2 s post-encroachment margin
   assert 5.0 < t_clear(HOLD_D + 8.) < 5.8
+  assert 1.6 <= GO_LATENCY_S < 2.
   t1, t2 = t_req(HOLD_D, 1), t_req(HOLD_D, 2)
-  assert 8.0 < t1 < 9.0 and abs(t2 - t1 - 0.5) < 1e-6
+  assert 8.7 < t1 < 9.7 and abs(t2 - t1 - 0.5) < 1e-6
   assert abs(t_req(HOLD_D, None) - t2) < 1e-6  # unknown opposing lanes: two
-  assert abs(t_req(HOLD_D, 1, latency=False) - (t1 - 1.)) < 1e-6
+  assert abs(t_req(HOLD_D, 1, latency=False) - (t1 - GO_LATENCY_S)) < 1e-6
   # the range to see clear is the mapped limit's 1.3 x over it, from the conflict point
   assert SPEED_MARGIN >= 1.3 and PET_S >= 2.
   r = r_req(V_25, t1, HOLD_D)
-  assert abs(r - (V_25 * SPEED_MARGIN * t1 + HOLD_D + 3.)) < 1e-6 and 125. < r < 145.
+  assert abs(r - (V_25 * SPEED_MARGIN * t1 + HOLD_D + 3.)) < 1e-6 and 130. < r < 150.
   assert r_req(20.1, t1, HOLD_D) > 220.  # 45 mph: beyond the road camera's provisional range
 
 
@@ -153,6 +156,34 @@ class Junction:
     for _ in range(round(seconds / DT_MDL)):
       d = self.step(**kw)
     return d
+
+
+def runs_every(j, frames, seconds, far=False):
+  """j's runs every frames frames for seconds (a far crop run on the road run's frame with far)."""
+  for _ in range(round(seconds / (frames * DT_MDL))):
+    j.step(far=[] if far else None, far_range_m=300., far_live=far)
+    for _ in range(frames - 1):
+      j.step(raw_new=False, far_range_m=300., far_live=far)
+
+
+def test_the_streams_freshness_is_what_the_gap_rule_can_spare_never_the_schedules_edge():
+  """Review 2026-11-07 (L2): ROAD_FRESH_S and FAR_FRESH_S were 0.3 s, where far first's deadlines sit one frame inside them
+  (ROAD_DUE_S 0.25): a run a frame late started the window over, so with the chestnut's model 2 ms slower an empty road's
+  35 mph left at a signalized line waited p50 28-35 s, 20-26 of 100 holds a minute or more (test_far_first's real left, 2
+  road heads at 1.4x, without CS-1's overdue run). The gap rule's margin is what a gap between runs may spend: a car at
+  SPEED_MARGIN x the limit just past R_req on the last run is inside it by that travel at the go, out of PET_S. So the
+  freshness is a quarter of PET_S (half a second): runs 0.35 s apart now fill the window, 0.55 s apart still start it over."""
+  assert ROAD_FRESH_S == FAR_FRESH_S == PET_S / 4.
+  j = Junction()
+  runs_every(j, 7, CLEAR_WINDOW_S + 1.)  # 0.35 s apart
+  assert any(x.go for x in j.decisions)
+  j = Junction()
+  runs_every(j, 11, CLEAR_WINDOW_S + 3.)  # 0.55 s apart
+  assert not any(x.go for x in j.decisions)
+  # the far crop's runs (a 45 mph left, far needed) the same
+  j = Junction(v_limit=V_45)
+  runs_every(j, 7, CLEAR_WINDOW_S + 1., far=True)
+  assert any(x.go and x.far_needed for x in j.decisions)
 
 
 def test_goes_only_after_the_band_is_clear_on_road_frames_for_the_window():
@@ -780,11 +811,11 @@ def test_route_times_reach_is_taken_where_the_car_may_stand():
 
 
 def test_45_and_55_mph_reach_needs_the_far_crop_and_its_measured_range():
-  # DESIGN phase 4 G5, the owner's "support both": R_req from the line is ~231-244 m at 45 mph and ~280-296 m at 55 mph,
+  # DESIGN phase 4 G5, the owner's "support both": R_req from the line is ~249-263 m at 45 mph and ~303-319 m at 55 mph,
   # past the full pass's range; the far crop's runs judge the band out there, but only under a measured far range
   # (TurnPilotLeftFarRangeM), with the far crop reading
   from openpilot.selfdrive.turnpilot.unprotected_left import reach_at_line
-  assert 225. < reach_at_line(V_45, 1) < reach_at_line(V_45, 2) < 250. and 275. < reach_at_line(V_55, 1) < reach_at_line(V_55, 2) < 300.
+  assert 240. < reach_at_line(V_45, 1) < reach_at_line(V_45, 2) < 270. and 295. < reach_at_line(V_55, 1) < reach_at_line(V_55, 2) < 325.
   for v, lanes in ((V_45, 1), (V_45, 2), (V_55, 1), (V_55, 2)):
     j = Junction(v_limit=v, lanes=lanes)
     d = far_wait(j, CLEAR_WINDOW_S + 1., far_range_m=300., far_live=True)
@@ -845,7 +876,7 @@ def test_needed_far_runs_must_be_fresh_and_cover_the_band():
   # only past one far gap over STALE_UNDECIDED_S), where one that didn't run went on the full pass's band. Once that band has
   # been clear a whole window with the far slot's age alone holding it, the left is judged on it (far_behind) and goes; a far
   # box in the band within FAR_BLOCK_RECENT_S still holds it
-  for every in (math.ceil(FAR_FRESH_S / DT_MDL) + 2, 30, 38):  # 2.25, 0.67 and 0.53 far runs a second, gaps under 2 s
+  for every in (math.ceil(FAR_FRESH_S / DT_MDL) + 2, 30, 38):  # 1.67, 0.67 and 0.53 far runs a second, gaps under 2 s
     j = Junction(v_limit=V_45)
     d = far_wait(j, CLEAR_WINDOW_S - 0.2, every=every, far_range_m=300., far_live=True)
     assert not any(x.go for x in j.decisions), every
@@ -857,7 +888,7 @@ def test_needed_far_runs_must_be_fresh_and_cover_the_band():
   # ...and once its runs hold FAR_FRESH_S a window again it is needed again (disengaged here: the rule read with no go taken)
   from openpilot.selfdrive.turnpilot.unprotected_left import FAR_BEHIND_CLEAR_S
   j = Junction(v_limit=V_45)
-  far_wait(j, CLEAR_WINDOW_S + 0.5, every=10, far_range_m=300., far_live=True, enabled=False)
+  far_wait(j, CLEAR_WINDOW_S + 0.5, every=math.ceil(FAR_FRESH_S / DT_MDL) + 2, far_range_m=300., far_live=True, enabled=False)
   assert j.left.far_behind and not j.decisions[-1].far_needed
   far_wait(j, FAR_BEHIND_CLEAR_S + 0.2, every=2, far_range_m=300., far_live=True, enabled=False)
   assert not j.left.far_behind and j.decisions[-1].far_needed
@@ -1003,6 +1034,55 @@ def withdrawn(j, v):
   d = j.step([raw(110., 3.6)], v=v, distance=j.distance - v * DT_MDL)
   assert d.state == 'waitGap' and d.stops and j.left.hold_here and not d.crossed
   return d
+
+
+def car_seen(x, y, heading_deg):
+  """raw() of a vehicle at road-frame (x along the approach, y toward the turn) from a car yawed heading_deg toward the turn."""
+  a = math.radians(heading_deg)
+  return raw(x * math.cos(a) + y * math.sin(a), -x * math.sin(a) + y * math.cos(a))
+
+
+@pytest.mark.parametrize('heading_deg', [20., 35., 50.])
+def test_a_stand_yawed_into_the_turn_is_judged_at_its_heading_never_handed_back(log_events, heading_deg):
+  """Review 2026-11-08 (L3, round 2): standing on its own hold after a withdrawn go yawed past 15 deg (YAW_UNDECIDED_DEG)
+  was the 'yaw' handback (leftUndecidedTakeControl, the car held). A go withdrawn short of the oncoming lanes stands yawed
+  into the turn (the Sim 25-29 deg; this car's own lefts from a stand 0-39 deg 4 m from first motion). Now judged at its
+  measured heading: a car in the band seen from there holds it, and on an empty band it goes. Past YAW_VIEW_DEG (the band's
+  far edge out of the road camera's frame) it is judged on what the camera frames, said once with a chime, its line saying
+  so; never a handback."""
+  from openpilot.selfdrive.turnpilot.unprotected_left import ROAD_HALF_FOV_DEG, YAW_VIEW_DEG, yaw_view_m
+  j = Junction()
+  withdrawn(j, 1.)
+  roll(j, 1.5, lambda k: max(1. - 0.67 * k * DT_MDL, 0.))
+  seen = [j.step([car_seen(100., 3.6, heading_deg)], v=0., heading_deg=heading_deg) for _ in range(round((CLEAR_WINDOW_S + 1.) / DT_MDL))]
+  assert not any(d.go or d.state == 'undecided' or d.prompt in TAKE_CONTROL_PROMPTS for d in seen)
+  assert all(d.blockers for d in seen[::2])  # the car seen from the car's heading is in the band
+  ds = [j.step(v=0., heading_deg=heading_deg) for _ in range(round((CLEAR_WINDOW_S + 1.) / DT_MDL))]
+  assert any(d.go for d in ds) and not any(d.state == 'undecided' or d.prompt in TAKE_CONTROL_PROMPTS for d in seen + ds)
+  views = [kw for name, kw in log_events if name == 'turnpilot.left_yaw_view']
+  past = heading_deg > YAW_VIEW_DEG
+  assert len(views) == (1 if past else 0), views
+  if past:
+    assert any(d.chime for d in seen) and any(d.reason == LONG_WAIT_REASON['yaw'] for d in ds)
+    assert abs(views[0]['view_m'] - min(yaw_view_m(heading_deg), 999.)) < 0.1 and views[0]['hold']
+  assert not any(name == 'turnpilot.left_undecided' for name, _ in log_events)
+  assert 30. < ROAD_HALF_FOV_DEG < 31. and abs(YAW_VIEW_DEG - (ROAD_HALF_FOV_DEG - ul.BAND_TOL_DEG)) < 1e-9
+  assert yaw_view_m(30.) == math.inf and 50. < yaw_view_m(32.) < 60. and yaw_view_m(40.) < 10.
+
+
+def test_a_fault_on_the_lefts_own_hold_says_the_faults_words_on_its_stop():
+  """A fault raised on the left's own hold after a withdrawn go ('stale': no road run since) held the car with the
+  withdrawal's words on its stop ("Oncoming, holding"), and turnpilotd's line is the stop's reason first: under
+  leftUndecidedTakeControl the driver read the withdrawal (the 'yaw' handback read 'Car started too slowly, holding' until
+  2026-11-08). The stop says the fault's words."""
+  from openpilot.selfdrive.turnpilot.unprotected_left import UNDECIDED_REASON, WITHDRAWN_REASON
+  j = Junction()
+  withdrawn(j, 1.)
+  roll(j, 1.5, lambda k: max(1. - 0.67 * k * DT_MDL, 0.))
+  assert j.decisions[-1].stops[0].reason == WITHDRAWN_REASON['band']
+  d = j.wait(STALE_UNDECIDED_S + 0.5, raw_new=False, v=0.)
+  assert d.state == 'undecided' and d.why == 'stale' and d.prompt == 'leftUndecidedTakeControl'
+  assert d.reason == UNDECIDED_REASON['stale'] and d.stops and all(s.reason == UNDECIDED_REASON['stale'] for s in d.stops)
 
 
 def test_the_lefts_own_hold_is_let_go_only_past_it_by_the_drivers_own_metres():
@@ -1336,9 +1416,10 @@ def test_route_range_refuses_no_left_and_still_says_its_reach_and_bend():
         assert rc.unprotected and not rc.out_of_range, (maneuver, reach_m, setback)
         assert rc.reach == pytest.approx(reach) and rc.margin == margin
         assert rc.bent == (reach > LINE_D + margin + maneuver.opposing_straight_m)
-  # the 11-06 lefts' route-time numbers (scratchpad reach.py): 1e L1 267.8 m and L3 198.4 m bent, 1e L4/L5 (all unknown) bent
-  assert route_range(left(opposing_speed=15.6, opposing_straight_m=400.), None, 210.).reach == pytest.approx(267.8, abs=0.5)
+  # the 11-06 lefts' route-time numbers (scratchpad reach.py): 1e L1 267.8 m and L3 198.4 m bent at GO_LATENCY_S 1 s, 282.0
+  # and 208.5 at this car's measured launch (L4), 1e L4/L5 (all unknown) bent
+  assert route_range(left(opposing_speed=15.6, opposing_straight_m=400.), None, 210.).reach == pytest.approx(282.0, abs=0.5)
   rc = route_range(left(opposing_speed=11.1, opposing_straight_m=125.), None, 210.)
-  assert rc.reach == pytest.approx(198.4, abs=0.5) and rc.bent and not rc.out_of_range
+  assert rc.reach == pytest.approx(208.5, abs=0.5) and rc.bent and not rc.out_of_range
   rc = route_range(left(opposing_speed=0., opposing_lanes=0, opposing_straight_m=0.), None, 210.)
   assert rc.bent and not rc.out_of_range

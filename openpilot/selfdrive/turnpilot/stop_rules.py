@@ -135,14 +135,16 @@ VEIL_OK = ('none', 'withCover')
 # here ('night at ETA -5 min', 18 of 20; the other 2 skew): so every stop was routed around where the budget allowed, the rest
 # said "Stop sign ahead needs you" (6 times on 1e), and each would have handed back 1 s after its full stop (H9, the line's own
 # light check; none was reached engaged). A dark row walks on the day table (DARK_WALK_ROW: the file has no night table, none
-# measured), and what the cameras see at the line judges the rest, as by day: a side-view bearing whose horizon band reads dark
-# (sideview.DARK_LUMA_DN), washed, frozen or blocked is zeroed (visibility.LiveVisibility's sector quality), a raw box blocks
+# measured), and what the cameras see at the line judges the rest, as by day: a side-view bearing whose horizon band reads
+# washed, frozen or degraded is zeroed (visibility.LiveVisibility's sector quality; dark or blocked, under sideview.DARK_LUMA_DN,
+# not, below), a raw box blocks
 # its lane, a track holds it, and a car coming at our path withdraws the go. What the night logs do show: the detector found
 # vehicles on 43-50% of the road camera's runs (boxes p50 87-104 px tall, conf p50 0.58-0.61) and the full pass's raw boxes
 # reached 50-78 m (darkness.py); what they don't: no side-view sweep ran after dark (no stop was reached), so the side views'
 # night reach and their sectors' dark verdict at a lit junction are unmeasured. The wide camera's own exposure median at night
 # (1d, 1e: 31-33 raw DN, 17-22 full range) is under the sectors' 45 DN dark and blocked tests, so under vision neither zeroes
-# a bearing after dark (review 2026-11-07, LS-3: every night stop waited and handed back H3). Low sun and the sun ahead stay
+# a bearing, after dark or by day (review 2026-11-07, LS-3: every night stop waited and handed back H3; LS-3-R1: a dim still
+# band by day read blocked and did the same). Low sun and the sun ahead stay
 # (glare, by day)
 DARK_ROWS = ('night', 'dusk')
 DARK_WALK_ROW = 'day'

@@ -23,9 +23,10 @@ from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, 
                                                                  walker_stops_the_car)
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import (JUNCTION, LEFT_25, TEST_RANGE_M, V_25, drive, left_sim, road_runs,
                                                                       run_objects, signal_sim)
-from openpilot.selfdrive.turnpilot.turnpilotd import (GO_OVERRIDE_DEFAULT, LEFT_NO_MOVE_S, LEFT_LAUNCH_SPEED, LEFT_LIFT_ROOM_M, NO_MOVE_REASON, NO_MOVE_S,
+from openpilot.selfdrive.turnpilot.turnpilotd import (GO_OVERRIDE_DEFAULT, LEFT_NO_MOVE_S, LEFT_LIFT_ROOM_M, NO_MOVE_REASON, NO_MOVE_S,
                                                        RELEASE_UNSIGNALIZED, STALL_PROMPT_S, go_override_for)
-from openpilot.selfdrive.turnpilot.unprotected_left import LINE_D, MODEL_HOLD_REASON
+from openpilot.selfdrive.turnpilot.unprotected_left import (LEFT_LAUNCH_SPEED, LINE_D, LONG_WAIT_REASON, MODEL_HOLD_REASON, WITHDRAWN_REASON,
+                                                             YAW_VIEW_DEG, r_req, t_req)
 
 Desire = messaging.log.Desire
 
@@ -296,7 +297,7 @@ def test_a_go_whose_lift_ended_early_stands_again_and_is_handed_back():
 
 def test_the_unprotected_lefts_lifted_go_never_reaches_the_oncoming_lanes_unfollowed():
   """The autonomous left's go from its 9 m line, the model holding: the lift has the car past 0.3 m/s inside LEFT_NO_MOVE_S
-  (1.0 s) at a 0.3 s lag, so its no-move withdrawal doesn't come; the model never takes over, and the window's end withdraws
+  at a 0.3 s lag, so its no-move withdrawal doesn't come; the model never takes over, and the window's end withdraws
   it: the car stops short of the oncoming lanes (ONCOMING_ENTRY_M before the maneuver point) and is handed back."""
   sim = left_sim()
   while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
@@ -355,23 +356,258 @@ def left_go_with(model_fn):
   return sim
 
 
-def test_the_lefts_go_is_followed_into_the_oncoming_lanes_only_by_a_launch():
+@pytest.mark.parametrize('lag_s', [0.3, 0.7, 1.0])
+def test_a_lifted_lefts_go_launched_at_the_cars_own_pace_is_never_withdrawn_for_not_moving(lag_s):
+  """Review 2026-11-07 (L4): LEFT_NO_MOVE_S and GO_LATENCY_S were 1 s, where this car's own launches from a stand reach
+  STANDSTILL_SPEED 0.92-1.6 s after the plan's go (11-06, 1d and 1e: five engaged launches, four past 1 s). A lifted left's go
+  (an unsignalized left: plannerd's +0.5 m/s^2) on a car whose accel lags its plan 0.7-1.0 s stood past 1 s and was
+  withdrawn and handed back (cantStartTakeControl) as the car began to roll. Now both are set from that launch: a go the car
+  launches on at its own pace turns the car; one it never moves on is still the no-move fault (the next test)."""
+  sim = left_go_with_lag(launching, lag_s)
+  after = drive(sim, 10.)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in after), lag_s
+  assert any(str(p.unprotectedLeft.state) == 'committed' for p in after) and sim.s > JUNCTION, lag_s
+
+
+def test_a_lifted_lefts_go_the_car_never_moves_on_is_still_the_no_move_fault():
+  sim = left_go_with_lag(launching, 0.3)
+  plans = []
+  for _ in range(round((LEFT_NO_MOVE_S + 1.) / DT_MDL)):
+    sim.v = 0.  # an actuator that doesn't answer
+    plans += drive(sim, DT_MDL)
+  handed = next(i for i, p in enumerate(plans) if str(p.controlPrompt) == 'cantStartTakeControl')
+  assert abs(handed * DT_MDL - LEFT_NO_MOVE_S) <= 0.15 and plans[-1].shouldStop
+
+
+def left_go_with_lag(model_fn, lag_s):
+  """left_go_with at plannerd's lag lag_s: the unsignalized left (its go lifted) from its stand to its go's frame."""
+  sim = left_sim()
+  while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
+    drive(sim, DT_MDL)
+    assert sim.t < 60.
+  attach_planner(sim, model_fn, lag_s)
+  plans = []
+  while not any(p.desire == Desire.turnLeft for p in plans[-1:]):
+    plans += drive(sim, DT_MDL)
+    assert sim.t < 90.
+  assert go(plans[-1])[0] == 'unprotectedLeft'
+  return sim
+
+
+def coast_with(cars=lambda sim: (), seconds=25.):
+  """left_go_with(coasting) with road_runs' oncoming cars, driven seconds with the Sim's yaw: (sim, plans, the left's events)."""
+  from unittest import mock
+  from openpilot.selfdrive.turnpilot import unprotected_left as ul
+  with mock.patch.object(ul.cloudlog, 'event') as event:
+    sim = left_sim(cars)
+    while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
+      drive(sim, DT_MDL)
+      assert sim.t < 60.
+    attach_planner(sim, coasting)
+    plans = drive(sim, seconds)
+  return sim, plans, [(c.args[0], c.kwargs) for c in event.call_args_list if c.args]
+
+
+def test_a_coast_on_the_lifts_speed_is_judged_on_the_band_its_launch_needs_and_withdrawn_only_for_a_car_seen_there():
   """Skeptic probe (advisor, G5): the lift has the car rolling at 0.78 m/s, the model's plan keeps that speed (the takeover
   predicate holds, the lift ends) and it coasts through the oncoming lanes at 0.78 m/s, 10 s across them, nothing said; the
   left's clear time assumed its 1.5 m/s^2 launch. So the left's go is followed into the oncoming lanes only at
-  LEFT_LAUNCH_SPEED or more: short of it, while the car can still stop LEFT_LAUNCH_ROOM_M short of them, it is withdrawn and
-  handed back. A model launching as the left assumes goes through."""
-  sim = left_go_with(coasting)
-  after = drive(sim, 15.)
-  assert sim.tp.go_cert.end == 'takeover'
-  handed = [p for p in after if p.controlPrompt == 'cantStartTakeControl']
-  assert handed and not any(str(p.unprotectedLeft.state) == 'committed' for p in after)
-  assert sim.v < 0.05 and JUNCTION - sim.s > ONCOMING_ENTRY_M and after[-1].shouldStop
+  LEFT_LAUNCH_SPEED or more: short of it, while the car can still stop LEFT_LAUNCH_ROOM_M short of them, it is judged again
+  for the launch the car shows. Review 2026-11-07 (L3): handed back there until then (cantStartTakeControl, a give-up).
+  Round 2 (2026-11-08): judged as the go is, on the band the camera covers out to that launch's R_req (a coast's ~280 m,
+  past the camera's reach): nothing seen there, the car keeps driving and turns; a car seen there (250 m up, outside the
+  A_GO launch's band, inside the coast's) withdraws it to the left's own wait short of the oncoming lanes, standing about
+  25 deg into the turn (the Sim's yaw), never a handback; this model never pulls away from a stand (the model holding: no
+  go over it), so the car waits there, its line the withdrawal's. A model launching as the left assumes goes through, never
+  judged."""
+  sim, plans, said = coast_with()
+  slow = [kw for name, kw in said if name == 'turnpilot.left_not_launched']
+  assert len(slow) == 1 and slow[0]['on'] and slow[0]['launch_a'] < 0.2 and slow[0]['r_req'] > slow[0]['range_m'], slow
+  assert not any(name == 'turnpilot.left_go_withdrawn' for name, _ in said)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  assert any(str(p.unprotectedLeft.state) == 'committed' for p in plans) and sim.s > JUNCTION
+
+  st = {'t': None}
+
+  def cars(sim):
+    left = sim.tp.left_now
+    if st['t'] is None and left is not None and left.state == 'go' and sim.v > 0.5:
+      st['t'] = sim.t
+    if st['t'] is None:
+      return ()
+    return ((sim.s + 250. - V_25 * (sim.t - st['t']), 3.6),) if sim.t - st['t'] < 6. else ()
+  sim, plans, said = coast_with(cars, 30.)
+  slow = [kw for name, kw in said if name == 'turnpilot.left_not_launched']
+  assert len(slow) == 1 and not slow[0]['on'] and slow[0]['seen'], slow
+  assert any(p.reason == WITHDRAWN_REASON['launch'] for p in plans)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  assert not any(str(p.unprotectedLeft.state) == 'committed' for p in plans)
+  assert 15. < sim.heading_deg < YAW_VIEW_DEG, sim.heading_deg  # past the 'yaw' handback's old 15 deg
+  assert sim.v < 0.05 and JUNCTION - sim.s > ONCOMING_ENTRY_M and plans[-1].shouldStop
+  assert str(plans[-1].unprotectedLeft.state) == 'waitGap' and plans[-1].reason == WITHDRAWN_REASON['launch']
   sim = left_go_with(launching)
   after = drive(sim, 8.)
   assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in after)
   assert any(str(p.unprotectedLeft.state) == 'committed' for p in after) and sim.s > JUNCTION
   assert LEFT_LAUNCH_SPEED == 2.0
+
+
+def gentle(sim):
+  """A model that pulls away from a stand by itself, gently: motion planned from rest at 0.6 m/s^2 (the car short of
+  LEFT_LAUNCH_SPEED with LEFT_LAUNCH_ROOM_M left to stop short of the oncoming lanes; 0.4-0.7 handed back 3-4 s after the go
+  until 2026-11-07, 0.8 got there)."""
+  return model_v2(*sim.model_lanes, accel=0.6, **sim.model_kw)
+
+
+def left_events(cars, seconds=30., yaw=True):
+  """left_go_with(gentle) on LEFT_25's band with cars(sim) (road_runs' oncoming cars), driven seconds: (sim, plans, the
+  left's cloudlog events)."""
+  from unittest import mock
+  from openpilot.selfdrive.turnpilot import unprotected_left as ul
+  with mock.patch.object(ul.cloudlog, 'event') as event:
+    sim = left_sim(cars)
+    while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
+      drive(sim, DT_MDL)
+      assert sim.t < 60.
+    attach_planner(sim, gentle)
+    plans = drive(sim, seconds, yaw=yaw)
+  return sim, plans, [(c.args[0], c.kwargs) for c in event.call_args_list if c.args]
+
+
+def test_a_lefts_go_the_car_launches_on_gently_keeps_driving_where_the_band_that_launch_needs_is_clear():
+  """Review 2026-11-07 (L3): left_launch handed back a model that launches gently (0.4-0.7 m/s^2) from the left's line, a
+  give-up handback with the car held short of the oncoming lanes on an empty road. Now the go is judged again for the
+  launch the car shows (its R_req at 0.6 m/s^2, ~140 m, within the camera's reach and clear): the car keeps driving and
+  turns, never a handback."""
+  sim, plans, said = left_events(lambda sim: ())
+  slow = [kw for name, kw in said if name == 'turnpilot.left_not_launched']
+  assert len(slow) == 1 and slow[0]['on'] and slow[0]['launch_a'] < 0.9 and slow[0]['r_req'] <= slow[0]['range_m'], slow
+  assert not any(name == 'turnpilot.left_go_withdrawn' for name, _ in said)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  assert any(str(p.unprotectedLeft.state) == 'committed' for p in plans) and sim.s > JUNCTION
+
+
+def test_a_lefts_go_the_car_launches_on_gently_with_a_car_in_the_band_that_launch_needs_waits_and_goes_on_a_bigger_gap():
+  """L3, the other side: an oncoming car 145-150 m up the band when the slow launch is judged (outside the A_GO launch's
+  ~105 m from there, inside the 0.6 m/s^2 one's ~140 m): withdrawn to the left's own wait, the car stopped short of the
+  oncoming lanes, never a handback; its next go's clear time is the launch the car showed (a bigger R_req), and the car
+  turns on it. Driven with the Sim's yaw (the car stands about 29 deg into the turn, past YAW_VIEW_DEG: judged on what the
+  road camera frames, said once, never the 'yaw' handback of 2026-11-07); road_runs' boxes seen from the car's heading."""
+  st = {'t': None}
+
+  def cars(sim):
+    left = sim.tp.left_now
+    if st['t'] is None and left is not None and left.state == 'go' and sim.v > 1.5:
+      st['t'] = sim.t
+    if st['t'] is None or sim.t - st['t'] > 2.:
+      return ()
+    return ((sim.s + 150. - V_25 * (sim.t - st['t']), 3.6),)
+  sim, plans, said = left_events(cars, 40.)
+  slow = [kw for name, kw in said if name == 'turnpilot.left_not_launched']
+  gos = [kw for name, kw in said if name == 'turnpilot.left_go']
+  assert len(slow) == 1 and not slow[0]['on'] and slow[0]['seen'], slow
+  assert any(p.reason == WITHDRAWN_REASON['launch'] for p in plans)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  stood = [s for s, v, _ in sim.trace if v < 0.05]
+  assert max(stood) < JUNCTION - ONCOMING_ENTRY_M  # every stand short of the oncoming lanes
+  assert len(gos) == 2 and gos[1]['r_req'] > r_req(V_25, t_req(gos[1]['distance'], 1), gos[1]['distance']) + 10., gos
+  assert any(str(p.unprotectedLeft.state) == 'committed' for p in plans) and sim.s > JUNCTION
+
+
+def slow_launch(a, lifted, cars=lambda sim: (), seconds=40., radius_m=8.):
+  """A left's go launched by the model at a m/s^2 from rest, on the car's own full pass (FULL_PASS_RANGE_M, the far crop
+  off: both 11-06 drives) and the Sim's yaw (the car turning at radius_m from its line): lifted, the unsignalized LEFT_25
+  (plannerd's lift); else a mapped signal with no light source (the model pulls away by itself). cars: road_runs' oncoming
+  cars, seen from the car's heading. Returns (sim, plans from the stand at the line, the left's cloudlog events)."""
+  from unittest import mock
+  from openpilot.selfdrive.turnpilot import unprotected_left as ul
+  from openpilot.selfdrive.turnpilot.unprotected_left import FULL_PASS_RANGE_M
+  with mock.patch.object(ul.cloudlog, 'event') as event:
+    sim = left_sim(cars) if lifted else signal_sim(oracle=False)
+    if not lifted:
+      sim.raw = road_runs(cars)
+    sim.tp.full_pass_range_m = FULL_PASS_RANGE_M
+    while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
+      drive(sim, DT_MDL)
+      assert sim.t < 60.
+    attach_planner(sim, lambda sim: model_v2(*sim.model_lanes, accel=a, **sim.model_kw))
+    plans = []
+    for _ in range(int(round(seconds / DT_MDL))):
+      turning = sim.tp.desires.started and abs(JUNCTION - sim.s) < 12. and sim.v > 0.3
+      plans.append(sim.step(engaged=True, yaw_rate=sim.v / radius_m if turning else 0.))
+  return sim, plans, [(c.args[0], c.kwargs) for c in event.call_args_list if c.args]
+
+
+@pytest.mark.parametrize('a,lifted', [(0.6, True), (0.8, False)])
+def test_a_slow_launch_at_the_cars_own_range_and_yaw_keeps_driving_on_the_band_the_camera_covers(a, lifted):
+  """Review 2026-11-08 (L3, round 2): the slow launch was kept on only where the R_req that launch needs was within the
+  camera's reach (rreq <= range_eff), stricter than the go's own rule, which judges an R_req past the reach on the band the
+  camera covers. On the car's 98 m full pass (the far crop off, as both 11-06 drives ran) every judged launch at 25 mph or
+  faster was withdrawn, and standing yawed in the Sim (8 m radius from the line) the 'yaw' fault handed it back: a lifted
+  0.6 m/s^2 launch (cantStartTakeControl at HEAD, leftUndecidedTakeControl then) and an unlifted 0.8 m/s^2 one HEAD turned
+  (701 take-control frames). Now judged as the go is: kept driving where nothing is seen in the band it needs, and the car
+  turns, never a handback."""
+  sim, plans, said = slow_launch(a, lifted)
+  slow = [kw for name, kw in said if name == 'turnpilot.left_not_launched']
+  assert len(slow) == 1 and slow[0]['on'] and slow[0]['r_req'] > slow[0]['range_m'], slow  # past the reach, judged on its band
+  assert not any(name == 'turnpilot.left_go_withdrawn' for name, _ in said)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  assert any(str(p.unprotectedLeft.state) == 'committed' for p in plans) and sim.s > JUNCTION
+  assert any(l for _, _, l in sim.planned) == lifted
+
+
+def test_a_slow_launch_with_a_car_seen_in_the_band_it_needs_at_the_cars_range_and_yaw_waits_and_turns_after_it():
+  """L3's rail on the car's own range and the Sim's yaw: an oncoming car about 140 m up the band when the 0.6 m/s^2 launch
+  is judged (outside the A_GO launch's band from there, inside this one's) withdraws the go to the left's own wait short of
+  the oncoming lanes. The car stands there yawed about 29 deg, past where the band's far edge leaves the road camera's frame
+  (YAW_VIEW_DEG; the 'yaw' handback past 15 deg until 2026-11-08): judged from where it stands at its measured heading on
+  what the camera frames, said once, and it turns once the car has gone."""
+  st = {'t': None}
+
+  def cars(sim):
+    left = sim.tp.left_now
+    if st['t'] is None and left is not None and left.state == 'go' and sim.v > 1.5:
+      st['t'] = sim.t
+    if st['t'] is None or sim.t - st['t'] > 2.:
+      return ()
+    return ((sim.s + 150. - V_25 * (sim.t - st['t']), 3.6),)
+  sim, plans, said = slow_launch(0.6, True, cars)
+  slow = [kw for name, kw in said if name == 'turnpilot.left_not_launched']
+  assert len(slow) == 1 and not slow[0]['on'] and slow[0]['seen'], slow
+  assert any(p.reason == WITHDRAWN_REASON['launch'] for p in plans)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  stood = [(s, i) for i, (s, v, _) in enumerate(sim.trace) if v < 0.05 and s > JUNCTION - LINE_D + 0.5]
+  assert stood and max(s for s, _ in stood) < JUNCTION - ONCOMING_ENTRY_M  # stood short of the oncoming lanes, past its line
+  views = [kw for name, kw in said if name == 'turnpilot.left_yaw_view']
+  assert len(views) == 1 and views[0]['heading_deg'] > YAW_VIEW_DEG, views
+  assert not any(name == 'turnpilot.left_undecided' for name, _ in said)
+  assert any(str(p.unprotectedLeft.state) == 'committed' for p in plans) and sim.s > JUNCTION
+
+
+def test_a_stand_yawed_past_what_the_road_camera_frames_is_judged_on_what_it_frames_said_once_and_heard():
+  """A go withdrawn for a car seen in the slow launch's band, the car turning at a 4 m radius from its line: it stands
+  short of the oncoming lanes yawed past YAW_VIEW_DEG, the band's far edge out of the road camera's frame. Until
+  2026-11-08 the 'yaw' handback (leftUndecidedTakeControl, under the withdrawal's words 'Car started too slowly, holding').
+  Now judged at its measured heading on what the camera frames, said once with a chime (turnpilot.left_yaw_view), its line
+  saying so while it waits; it goes on a gap and turns, never a handback."""
+  st = {'t': None}
+
+  def cars(sim):
+    left = sim.tp.left_now
+    if st['t'] is None and left is not None and left.state == 'go' and sim.v > 1.5:
+      st['t'] = sim.t
+    if st['t'] is None or sim.t - st['t'] > 2.:
+      return ()
+    return ((sim.s + 150. - V_25 * (sim.t - st['t']), 3.6),)
+  sim, plans, said = slow_launch(0.6, True, cars, radius_m=4.)
+  stood = [p for p, (s, v, _) in zip(plans, sim.trace[-len(plans):], strict=True) if v < 0.05 and s > JUNCTION - LINE_D + 0.5]
+  assert any(p.reason == WITHDRAWN_REASON['launch'] for p in plans) and stood
+  views = [kw for name, kw in said if name == 'turnpilot.left_yaw_view']
+  assert len(views) == 1 and views[0]['heading_deg'] > YAW_VIEW_DEG and views[0]['hold'], views
+  assert any(p.reason == LONG_WAIT_REASON['yaw'] for p in stood) and any(p.unprotectedLeft.chime for p in stood)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  assert not any(name == 'turnpilot.left_undecided' for name, _ in said)
+  assert any(str(p.unprotectedLeft.state) == 'committed' for p in plans) and sim.s > JUNCTION
 
 
 def test_a_left_go_nearer_the_oncoming_lanes_than_the_lifts_nudge_is_never_lifted():
@@ -758,6 +994,176 @@ def test_a_signalized_lefts_go_the_model_stops_following_goes_back_to_its_wait_n
   assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
   assert all(p.desire != Desire.turnLeft for p in plans[back + 1:round((st['go_t'] + 15. - t0) / DT_MDL)])
   assert sim.s > JUNCTION + 5.  # gone again once the model's plan moves
+
+
+def moving_from_rest(sim):
+  """The model at a green it sees, nothing ahead: motion planned from rest (shouldStop false), 1.5 m/s^2."""
+  return model_v2(*sim.model_lanes, accel=1.5, **sim.model_kw)
+
+
+def left_withdrawn_before_motion(model_fn, lag_s, car_for_s, seconds=40.):
+  """signal_sim on the car's light config (no accepted source: every signalized left's go unlifted), plannerd attached at the
+  stand with model_fn; from the left's go an oncoming car 90 m up the band at 25 mph for car_for_s, so the left withdraws its
+  own go ('Oncoming, holding') before the car has moved. Returns (sim, plans, the go's time, the gos sent: turnLeft edges)."""
+  st = {'go_t': None}
+
+  def cars(sim):
+    if st['go_t'] is None or sim.t - st['go_t'] > car_for_s:
+      return []
+    return [(sim.s + 90. - V_25 * (sim.t - st['go_t']), 3.6)]
+  sim = signal_sim(oracle=False)
+  sim.raw = road_runs(cars)
+  while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
+    run_objects(sim, DT_MDL)
+    assert sim.t < 60.
+  attach_planner(sim, lambda s: model_fn(s, st), lag_s)
+  plans = []
+  for _ in range(round(seconds / DT_MDL)):
+    plans += run_objects(sim, DT_MDL)
+    if st['go_t'] is None and plans[-1].desire == Desire.turnLeft:
+      st['go_t'] = sim.t
+  edges = sum(1 for a, b in zip(plans, plans[1:], strict=False) if b.desire == Desire.turnLeft and a.desire != Desire.turnLeft)
+  return sim, plans, st['go_t'], edges
+
+
+@pytest.mark.parametrize('lag_s,car_for_s', [(0.3, 1.5), (1.0, 1.5), (1.0, 6.)])
+def test_an_unlifted_lefts_go_it_withdraws_itself_before_the_car_moves_is_never_handed_back(lag_s, car_for_s):
+  """Review 2026-11-07 (LEFTS-1): LS-2's launch clock for an unlifted left's go (the model planning motion, go_launch_s) ran
+  on the takeover predicate alone, under the left's own hold, and go_wait_s outlived the left's withdrawal of its own go: an
+  oncoming car into the band 0.1 s after the go, 'Oncoming, holding' at the line, and cantStartTakeControl 2.0 s after the
+  go (NO_MOVE_S), latched to a disengage, 714 frames, the car 9.2 m short with the left ready to go again (its retry needs
+  CLEAR_WINDOW_S of clear band, the stale clock NO_MOVE_S). Now that clock runs only while the left's go is out and nothing
+  holds the car, and a go the left withdrew has no clock: it waits, then goes on its next window."""
+  sim, plans, go_t, edges = left_withdrawn_before_motion(lambda s, st: moving_from_rest(s), lag_s, car_for_s)
+  assert go_t is not None
+  assert any(p.reason == 'Oncoming, holding' for p in plans)  # the left withdrew its own go, standing
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  assert edges >= 2 and sim.s > JUNCTION + 5.  # its retry went, and the car turned
+
+
+def test_an_unlifted_lefts_go_the_model_yields_on_then_moves_again_is_never_handed_back():
+  """LEFTS-1's second case: the model holds (shouldStop) while the oncoming car is in the band, then plans motion once it has
+  passed. The stale launch clock ran again on the model's motion and handed back at 38.6 s, under the left's own retry go at
+  39.15 s. Now it waits, and its retry turns the car."""
+  def model(sim, st):
+    if st['go_t'] is not None and sim.t - st['go_t'] <= 4.5:
+      return holding(sim)  # the model yields to the oncoming car it sees
+    return moving_from_rest(sim)
+  sim, plans, go_t, edges = left_withdrawn_before_motion(model, 0.3, 4.)
+  assert go_t is not None and any(p.reason == 'Oncoming, holding' for p in plans)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  assert edges >= 2 and sim.s > JUNCTION + 5.
+
+
+def test_an_unlifted_lefts_go_the_car_doesnt_answer_is_still_the_no_move_fault():
+  """What LEFTS-1's gate keeps: the left's go out, the model planning motion, nothing holding the car, and the car standing
+  (an actuator that doesn't answer): NO_MOVE_S of it is the no-move fault, said, the car held."""
+  sim = signal_sim(oracle=False)
+  while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
+    run_objects(sim, DT_MDL)
+    assert sim.t < 60.
+  attach_planner(sim, moving_from_rest)
+  sim.accel = lambda sim, plan: 0.  # the car never answers
+  plans, go_i = [], None
+  for _ in range(round(15. / DT_MDL)):
+    plans += run_objects(sim, DT_MDL)
+    sim.v = 0.
+    if go_i is None and plans[-1].desire == Desire.turnLeft:
+      go_i = len(plans) - 1
+  assert go_i is not None
+  handed = next(i for i, p in enumerate(plans) if str(p.controlPrompt) == 'cantStartTakeControl')
+  assert abs((handed - go_i) * DT_MDL - NO_MOVE_S) <= 0.15 and plans[-1].shouldStop
+
+
+def held_at_the_signal_with(model_fn, seconds):
+  """signal_sim on the car's light config held at its line, then plannerd attached with model_fn for seconds. Returns (sim,
+  the plans before plannerd, the plans after)."""
+  sim = signal_sim(oracle=False)
+  while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
+    run_objects(sim, DT_MDL)
+    assert sim.t < 60.
+  pre = [q for _, _, q in sim.trace]
+  attach_planner(sim, model_fn)
+  return sim, pre, run_objects(sim, seconds)
+
+
+def test_a_lefts_go_the_model_wont_follow_is_heard_once_a_hold_and_never_says_turning_with_the_car_standing():
+  """Review 2026-11-07 (AL-1): an unlifted left's go the model doesn't follow goes back to a wait (LS-2) and the left goes
+  again once the model's plan moves; every go said "Turning / Turning across oncoming traffic" with a chime. A model that
+  plans motion with no turn desire and holds once the turnLeft pulse is out (yielding to a car past TurnPilot's band, a turn
+  it won't make from a stand) had 15 gos in 60 s, a chime every 3.85 s, "Turning" on a car that never moved. Now the retries
+  after a go the model didn't follow are silent and say what holds the car until it moves; the retry itself goes on (no
+  bound on it). A retry the model does follow is said and heard as the car moves (the next test)."""
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import heard_spells, selfdrived_alerts
+
+  def model(sim):
+    left = sim.tp.left_now
+    return holding(sim) if left is not None and left.state == 'go' else moving_from_rest(sim)
+  sim, pre, plans = held_at_the_signal_with(model, 60.)
+  states = [str(p.unprotectedLeft.state) for p in plans]
+  gos = [i for i in range(1, len(plans)) if states[i] == 'go' and states[i - 1] != 'go']
+  assert len(gos) >= 5  # it keeps trying
+  shown = selfdrived_alerts(pre + plans)
+  spells = heard_spells(shown, len(pre))
+  assert len(spells) == 1 and spells[0][0] - len(pre) <= gos[0] + 1, spells  # the first go, heard
+  back = next(i for i in range(gos[0], len(plans)) if states[i] == 'waitGap')  # its first go not followed
+  assert not any(f[1] == "Turning" for f in shown if f[0] >= len(pre) + back)
+  assert not any(p.reason == "Turning" for p in plans[back:])
+  assert sim.v < 0.05 and not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+
+
+def test_a_retry_the_model_does_follow_is_said_and_heard_as_the_car_moves():
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import heard_spells, selfdrived_alerts
+  st = {'gos': 0, 'was': ''}
+
+  def model(sim):
+    left = sim.tp.left_now
+    state = left.state if left is not None else ''
+    if state == 'go' and st['was'] != 'go':
+      st['gos'] += 1
+    st['was'] = state
+    return holding(sim) if state == 'go' and st['gos'] < 3 else moving_from_rest(sim)  # follows its third go
+  sim, pre, plans = held_at_the_signal_with(model, 40.)
+  assert st['gos'] == 3 and sim.s > JUNCTION + 5.
+  shown = selfdrived_alerts(pre + plans)
+  spells = heard_spells(shown, len(pre))
+  assert len(spells) == 2, spells  # the first go, and the followed retry as the car moved
+  moved = next(i for i, (_, v, _) in enumerate(sim.trace[len(pre):]) if v >= 0.3)
+  assert abs(spells[1][0] - len(pre) - moved) <= 2, (spells, moved)
+  assert any(f[1] == "Turning" for f in shown if f[0] >= len(pre) + moved)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+
+
+def test_a_left_refused_its_lift_only_for_a_head_boxed_on_the_approach_never_says_waiting_at_the_light():
+  """Review 2026-11-07 (LEFTS-4): HR-2 refuses the left's lift for a head of any colour or bearing boxed in the last
+  HEAD_CLEAR_M driven (a streetlight boxed as one, the previous block's signal), and its go then goes with the model; with
+  the model holding a standstill there, the left's line said "Waiting at the light" at a junction with no light mapped or
+  boxed at it, for as long as the model held. The refusal stays (lifting there would put the car over the model's own hold
+  at a signal OSM doesn't have, the 11-06 red); its words are what is known: the car waits for the model to pull away."""
+  from openpilot.selfdrive.turnpilot.detector.light_state import LIGHT_MODE_DEFAULT
+  from openpilot.selfdrive.turnpilot.tests.test_camera_lights import detections as light_detections
+  sim = Sim(LEFT_25)
+  sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps = 'auto', TEST_RANGE_M, False
+  sim.answers_prompt, sim.tp.oracle_ok, sim.tp.camera_mode = True, False, LIGHT_MODE_DEFAULT
+  none = messaging.new_message('turnpilotLights').as_reader().turnpilotLights
+
+  def lights(sim):
+    # a non-governing head (a streetlight boxed as one, off to the side) read while the car is 30-45 m from the junction
+    if 30. < JUNCTION - sim.s < 45. and int(round(sim.t / DT_MDL)) % 2 == 0:
+      sim.sm.put('turnpilotDetections', light_detections('unknown', 6., shadow=False, governs=False))
+    return none
+  sim.lights = lights
+  sim.raw = road_runs()
+  while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
+    run_objects(sim, DT_MDL)
+    assert sim.t < 60.
+  attach_planner(sim, holding)
+  plans = run_objects(sim, 30.)
+  assert sim.tp.left_lift_refused(sim.tp.follower.distance) != ''  # the refusal stands (HR-2)
+  assert not any(p.desire == Desire.turnLeft for p in plans) and not any(lifted for _, _, lifted in sim.planned)
+  assert not any(p.reason == MODEL_HOLD_REASON['light'] for p in plans), {p.reason for p in plans}
+  assert all(p.reason == MODEL_HOLD_REASON[''] for p in plans[round(1. / DT_MDL):]), {p.reason for p in plans}
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
 
 
 def test_a_head_first_boxed_mid_lift_at_an_unsignalized_left_never_ends_its_lift():

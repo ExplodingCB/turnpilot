@@ -44,9 +44,10 @@ ROAD_25 = {0: (25 * MPH, 1, 400.)}  # the opposing road: 25 mph mapped, one lane
 
 def test_a_quiet_four_way_left_passes_with_its_margin():
   """25 mph and one lane mapped: route time's R_req, at LINE_D plus ROUTE_REACH_MARGIN_M (no mapped stop line), is about
-  200 m, so it passes under 210 m (and not under DESIGN's 134-141 m, which were at LINE_D alone)."""
+  210 m (200 m at GO_LATENCY_S 1 s; 1.7 s since 2026-11-07, L4: this car's own launch), so it passes under 210 m (and not
+  under DESIGN's 134-141 m, which were at LINE_D alone)."""
   reach = reach_at_line(25 * MPH, 1, ROUTE_REACH_MARGIN_M)
-  assert 195. < reach < 205.
+  assert 205. < reach < 210.
   v = ls.judge(turn_steps(), ROAD_25, [], 'ok', 210.)
   assert v.ok and v.reasons == [] and v.reach == pytest.approx(reach)
   assert v.margin == pytest.approx(min(210. - reach, LINE_D + ROUTE_REACH_MARGIN_M + 400. - reach))

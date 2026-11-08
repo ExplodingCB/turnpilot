@@ -77,10 +77,11 @@ VIEW_FROM_M to its commit, whose R_req is past the full pass's range: the band p
 slow only (under FAR_FIRST_V: at its line, its roll-up and creep, the go's first second). Each frame goes to the pass due
 first that fits on its own step cost (left_pick): the far crop's next run FAR_DUE_S after its last, the full pass's
 ROAD_DUE_S after its last road run (a wide run's WIDE_DUE_S after its last, or the road's sooner: the next road run waits on
-it), each one frame inside unprotected_left's 0.3 s ROAD_FRESH_S and FAR_FRESH_S, past which a stream's gap starts the
-left's clear window over. So the far crop takes a full pass's frame when it is due sooner, the full pass then running on the
-next frame it fits, and between the full runs it takes a frame where its run leaves the next full pass its room. Both judged
-on what their steps cost (the full pass's measured past its run, paint and lights: full_extra_s). The paint is skipped
+it), 4 runs a second each, under unprotected_left's ROAD_FRESH_S and FAR_FRESH_S (0.5 s since 2026-11-07, L2: a quarter of
+PET_S), past which a stream's gap starts the left's clear window over. So the far crop takes a full pass's frame when it is
+due sooner, the full pass then running on the next frame it fits, and between the full runs it takes a frame where its run
+leaves the next full pass its room. Both judged on what their steps cost (the full pass's measured past its run, paint and
+lights: full_extra_s). The paint is skipped
 outright (noRoom; read_odd_paint too), the car standing or creeping freeing the step's time: nothing reads the paint there.
 The slot is the far crop's, the native's only without one (left_far): a native strip's 15.4 ms beside the car's model needs
 a paid-back step and another after it. Moving it is auto's schedule (the 11-06 review, 2026-11-07: far first there halved
@@ -96,8 +97,9 @@ road camera's 2,490 gaps past it, 8-9 of the far crop's 2,480; at a model 1 ms s
 window (test_far_first.left_waits) with every timing spread as on 11-06, an empty road certifies at once on most holds (the
 wait's p90 2.5 s at 11-06's model, 4.3 s at one 1 ms slower, at most 7.2 s); at a model 2 ms slower the far crop reads 3.1 a
 second and a third of its gaps pass 0.3 s, so the left waits (a median of 15-19 s, some over a minute), never shorter, and
-no far gap passes STALE_UNDECIDED_S (FAR_FORCE_S), so none goes blind past ~98 m. unprotected_left's ROAD_FRESH_S and
-FAR_FRESH_S at 0.4 s would give that a median of 3 s (p90 7-8). A left's road camera runs 4 a second at its line
+no far gap passes STALE_UNDECIDED_S (FAR_FORCE_S), so none goes blind past ~98 m (that replica, without unprotected_left's
+far_behind; the real left there waits p50 2.5 s, test_far_first.real_left_waits). unprotected_left's ROAD_FRESH_S and
+FAR_FRESH_S are 0.5 s since 2026-11-07 (L2: a quarter of PET_S, what the gap rule can spare between runs). A left's road camera runs 4 a second at its line
 (LEFT_ROAD_RUNS_HZ, left_range.py's). Its boxes hold the left as the full pass's do, a car going the car's own way too:
 unprotected_left's band widens by BAND_TOL_DEG with range, so the car's own lane is in it from 18 m out and the lane beside
 from 121 m, and a far box blocks at any range where the left needs the far slot. So a car going straight on from ahead of
@@ -108,10 +110,14 @@ rule's (the 11-06 review, 2026-11-07), unchanged here: the far crop's boxes stay
 At a signalized left (review 2026-11-07, R1) the light reads cost 2-4.6 ms with 1-4 heads (11-06's rlogs; this tree's reader
 ~1.4x on a Mac): with the far crop's shadow reads on top of its step and the full pass judged with its step's extra, neither
 stream fit and an empty road's window waited p50 8-19 s, or never filled. Far first now reads no far lights (nothing acts
-on them at a left), and a road run due (road_due) is judged as auto judges it, its frame never the far crop's:
-replayed with the 11-06 spread, an empty road's wait p50 2.5 s up to 3 road and 2 far heads at the car's cost, 3.4-3.9 s at
-3 heads at 1.4x; 4 road heads at 1.4x (never seen at a stand) still waits (p50 31-40 s), steps past DEBT_CAP_S 3-16%, by a
-step's extra at most, none near a dropped frame.
+on them at a left), a road run due (road_due) is judged as auto judges it, its frame never the far crop's, and one a frame
+past due (road_overdue, review 2026-11-07 CS-1) runs whatever its debt: at 3 road heads at the 1.55x per head measured on
+this tree's reader, or 3 at 1.4x with the model 0.7 ms slower, a due road run's own step left 8-10 ms of debt and was
+refused until the forced run, and the real left's empty-road wait went p50 6-10 s, p90 17-21 s. Replayed with the 11-06
+spread through the real UnprotectedLeft (test_far_first.real_left_waits, both seeds), an empty road's wait is p50 2.5 s, p90
+2.5 s from 1 to 4 road heads at 1.0-1.55x and the model up to 0.7 ms slower (p90 2.9-3.8 s at 2 heads 1.55x and 1.5 ms,
+4.1-5.2 s at 2 ms), the road camera 3.4-4.3 runs a second (its longest gap 8 frames), the far crop 2.7-4.3; up to 19% of
+steps pass DEBT_CAP_S, the latest 17.9 ms, under half a frame (the car dropped no frame at 47.9 ms on 1e).
 
 The native schedule (TurnPilotNativeDetect, NativeStrips; full by default, Kellen's ship call; off and nothing here differs
 from the far crop alone): Kellen's whole camera frame at native resolution, in the far crop's slot. strip runs graph.NATIVE_SIZES' 1344x384
@@ -336,8 +342,9 @@ NATIVE_NO_RUN_S = 30.
 # far first (plan_inputs' far_first: an unprotected left in hand whose R_req is past the full pass's range, from VIEW_FROM_M
 # to its commit; module docstring). Each frame goes to whichever of the full pass and the far crop is due first that fits
 # on its own step cost, so the far crop takes a full pass's frame when its own is due sooner: each stream's next run due
-# this long after its last, one frame inside unprotected_left's ROAD_FRESH_S and FAR_FRESH_S (0.3 s, past which a stream's
-# gap starts the clear window over), the wide camera's (roadAndWide: the exit crosswalk) twice that
+# this long after its last, under unprotected_left's ROAD_FRESH_S and FAR_FRESH_S (0.5 s, past which a stream's gap starts
+# the clear window over; 0.3 s, one frame past these, until 2026-11-07 L2), the wide camera's (roadAndWide: the exit
+# crosswalk) twice that
 ROAD_DUE_S = 0.25
 FAR_DUE_S = 0.25
 WIDE_DUE_S = 0.5
@@ -1097,8 +1104,8 @@ class ModeldDetector:
     past them too (full_extra_s), as the far crop's estimate is its step's (FarCrop.estimate)."""
     estimate = float(np.median(self.times)) if self.times else 0.
     if self.far_first and not self.road_due(time.monotonic()):
-      # judged on its step's cost against the far crop's (left_pick), but a road run due (ROAD_DUE_S: one frame more and its
-      # gap passes unprotected_left's ROAD_FRESH_S) is judged as auto judges it. Review 2026-11-07 (R1): at a signalized
+      # judged on its step's cost against the far crop's (left_pick), but a road run due (ROAD_DUE_S) is judged as auto
+      # judges it. Review 2026-11-07 (R1): at a signalized
       # left's line the light reads (2-4.6 ms with 1-4 heads on 11-06's rlogs, this tree's reader ~1.4x on a Mac) left no
       # step a road run fit on with the extra: road runs fell to the 0.8 s forced ones, 1.2-1.6 a second, and an empty
       # road's window never filled (3 heads: 200 of 200 holds over 60 s)
@@ -1149,12 +1156,25 @@ class ModeldDetector:
     """Whether a run on camera cam (paint: with the lane paint read) leaves a debt within DEBT_CAP_S, on its estimate."""
     return self.debt_after(model_execution_time, self.estimate(cam, paint)) <= DEBT_CAP_S
 
+  def road_overdue(self, now: float) -> bool:
+    """Far first, the full pass's road run a frame past due (road_due's ROAD_DUE_S, and a CYCLE_S more: 0.3 s since its
+    last), so the road camera's band, the one the left falls back on (unprotected_left far_behind), keeps its 3.3 runs a
+    second or more whatever the step costs, its gaps well inside unprotected_left's ROAD_FRESH_S."""
+    return (self.run_t or {}).get('road', -math.inf) + ROAD_DUE_S + CYCLE_S <= now + CYCLE_S / 2
+
   def room(self, model_execution_time: float, cam: str | None = None, paint: bool = True) -> bool:
     """Whether this frame has room for a run on camera cam (paint: with the lane paint read): the debt it would leave
     (debt_after, on the estimate) stays within DEBT_CAP_S, or the detector has gone FORCE_RUN_FRAMES or FORCE_RUN_S without
-    and runs to measure again."""
+    and runs to measure again. Far first, a road run a frame past due runs whatever its debt (road_overdue): review
+    2026-11-07 (CS-1), at a signalized left's line with 3 road heads (this tree's reader 1.55x per head) or the model 0.7 ms
+    slower, a road run's own step left 8-10 ms of debt from a paid-back step and was refused, left_pick gave its frame to
+    no far run, and the road camera fell to the forced runs: the left's window kept starting over (p50 6-10 s, p90 17-21 s
+    on an empty road). Run, its step's lateness stays under a third of a frame (test_far_first.within_cap; the car dropped no
+    frame at lateness up to 47.9 ms on 1e)."""
     estimate = self.estimate(cam, paint)
     if self.debt_after(model_execution_time, estimate) <= DEBT_CAP_S:
+      return True
+    if self.far_first and cam != 'wide' and self.road_overdue(time.monotonic()):
       return True
     waited_s = time.monotonic() - self.last_run_t if self.last_run_t is not None else 0.
     if self.since_run < FORCE_RUN_FRAMES and waited_s < FORCE_RUN_S:
