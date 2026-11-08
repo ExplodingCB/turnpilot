@@ -164,8 +164,9 @@ class LiveVisibility:
   def fresh(self, view: str, side: str) -> bool:
     return self.fresh_key(SIDE_VIEW[side] if view == 'side' else VIEW_KEY.get(view, view))
 
-  def sector_ok(self, side: str, bearing: float) -> bool:
-    """Every run of side's view in the CLEAR_S window listed an ok sector covering bearing (deg, unsigned), and one did."""
+  def sector_ok(self, side: str, bearing: float, accept=('ok',)) -> bool:
+    """Every run of side's view in the CLEAR_S window listed a sector covering bearing (deg, unsigned) of a quality in
+    accept (ok, by default), and one did."""
     if self.newest_t is None:
       return False
     frames = [rows for t, rows in self.sectors[side] if t >= self.newest_t - sr.CLEAR_S - 1e-9]
@@ -173,7 +174,7 @@ class LiveVisibility:
       return False
     for rows in frames:
       cover = [q for lo, hi, q in rows if lo - 1e-9 <= bearing <= hi + 1e-9]
-      if not cover or any(q != 'ok' for q in cover):
+      if not cover or any(q not in accept for q in cover):
         return False
     return True
 
@@ -198,7 +199,8 @@ class LiveVisibility:
 
   def lanes(self, lanes_at_stop: list, d_stop: float, vis, *, rot_deg: float, edges: sr.Edges, lighting: str = 'day',
             low_sun_sides=(), entry: dict | None = None, stamp: dict | None = None, tracks=(), evidence: dict | None = None,
-            cam_height: float | None = None, a_launch: float = sr.A_LAUNCH_PLAN, ahead_m: float = 0., vision: bool = False) -> Report:
+            cam_height: float | None = None, a_launch: float = sr.A_LAUNCH_PLAN, ahead_m: float = 0., vision: bool = False,
+            dark: bool = False) -> Report:
     """Each lane's reach now (module docstring). lanes_at_stop: the held control's conflicting lanes seen from its stop
     point (stop_evidence.junction_lanes); d_stop: m our car stands short of the stop point; vis: visibility_table's
     Visibility; lighting: day, sunAhead, dusk or night at the line; low_sun_sides: the sides with low sun along an approach;
@@ -210,7 +212,14 @@ class LiveVisibility:
     (TurnPilotStopSignGo=vision): the PV1 optimistic row, and no mask, survey, stamp or rule 5 needed: the walk runs with the
     file's mask where it has one (none on the shipped file: the side views' sector quality is the live stand-in, a dark or
     static bearing zeroed), its frame edge (DEFAULT_EDGE_DEG without a lens fit) and every live rule (the sun, low sun, the
-    sectors, freshness, occluders); need_m stays the two-way need, which blockers() reads."""
+    sectors, freshness, occluders); need_m stays the two-way need, which blockers() reads. Under vision a sector that reads
+    dark is judged by what the walk's other rules see, never zeroed for its darkness alone, nor one that reads blocked (static
+    and dark) after dark (dark: the lighting row night or dusk, or no clock): review 2026-11-07 (LS-3), the wide camera's own
+    exposure median read 31-33 raw DN at night (1d, 1e: 17-22 full-range DN, against the 45 the sectors' dark and blocked
+    tests read), so every side bearing was zeroed at every night stop and the car waited 15 s and handed back (H3), unwarned,
+    the night gate gone from certify and the walk (Kellen, 2026-11-07: "why the hell do we care about dark?"). A washed,
+    frozen or degraded sector still zeroes its bearing, by day a blocked one too; raw boxes, tracks and the launch's withdraw
+    rail judge the rest."""
     height = cam_height if cam_height is not None else (vis.height if vis.height is not None else 1.3)
     lns = [replace(ln, s_min=ln.s_min + d_stop, s_max=ln.s_max + d_stop) for ln in lanes_at_stop]
     edges_now = sr.Edges(edges.d_min + d_stop, edges.d_max + d_stop, None if edges.nominal is None else edges.nominal + d_stop)
@@ -219,6 +228,8 @@ class LiveVisibility:
     veil_ok = vis.veil in sr.VEIL_OK
     rows = vis.views(lighting, bound='optimistic' if vision else 'conservative', use='allWay') if lighting in ('day', 'sunAhead') else {}
 
+    accept = (('ok', 'dark') + (('blocked',) if dark else ())) if vision else ('ok',)
+
     def zero(side: str, bearing: float):
       if lighting == 'sunAhead' and not veil_ok and sr.sun_ahead_zero(side, bearing):
         return 'sunAhead'
@@ -226,7 +237,7 @@ class LiveVisibility:
         return 'lowSun'
       if bearing >= sr.INNER_BAND_LO_DEG and self.fresh('side', side):  # a stale side view covers nothing anyway (noView)
         for b in (bearing, bearing - rot_deg):
-          if not self.sector_ok(side, max(b, sr.INNER_BAND_HI_DEG + 0.1)):
+          if not self.sector_ok(side, max(b, sr.INNER_BAND_HI_DEG + 0.1), accept):
             return 'sector'
       return False
 

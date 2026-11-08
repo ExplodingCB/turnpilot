@@ -19,7 +19,7 @@ certify(junction, maneuver, visibility, surveys, eta, runtime) returns (certific
    8 override      an approach in TurnPilotJunctionOverrides (a downgrade or a signal seen)
    9 light         night, dusk, low sun along a conflicting approach, or the sun ahead with the veil present or unmeasured, at
                    any time from ETA - ETA_EARLY_S to ETA + ETA_LATE_S (runtime.window; at the line (0, 0)); or no ETA
-                   (the clock isn't valid yet)
+                   (the clock isn't valid yet). Under vision only the glare (below)
   10 notValidated  no passing validation stamp for our approach for every lighting row the window needs, or one whose
                    maxDropoutS exceeds CLEAR_S / 3 on a binding lane
   11 reach         a conflicting lane's reach short of its requirement: the stamp's minFirstTrackM bounding the distance along
@@ -29,8 +29,13 @@ certify(junction, maneuver, visibility, surveys, eta, runtime) returns (certific
 
 Under TurnPilotStopSignGo=vision (_assess_vision) only checks 4-6, 8, 9 and 11 run, with sideViews (the side views off for the
 drive) after 6: no survey, stamp, camera field or launch stamp is read, every lane is judged as possibly not stopping, and
-check 11's reach is the walk on the PV1 optimistic row against stop_rules.reach_needed_vision. A conflicting approach over
-25 mph or of unknown speed doesn't fail: it is the longer look (Verdict.long_look), its floor judged at 25 mph.
+check 11's reach is the walk on the PV1 optimistic row against stop_rules.reach_needed_vision, one lane per physical lane as
+the line walks them (vision_lanes: since 2026-11-07 a right's swing zone isn't walked beside its far lane's cross movement
+under UNION_YAW_DEG of yaw, which the line doesn't do either). A conflicting approach over
+25 mph or of unknown speed doesn't fail: it is the longer look (Verdict.long_look), its floor judged at 25 mph. Check 9 under
+vision is glare alone (low sun, the sun ahead): night and dusk walk the day table and no clock leaves the glare unchecked
+(Kellen, 2026-11-07, "why the hell do we care about dark?"; the note above stop_rules.DARK_ROWS has the 11-06 evidence: this
+check was the route certificate that failed every night stop and handed each back at its line).
 
 A validation stamp (written by junction_validate.py, SG3b) is {lighting, date, passes, approachBearingDeg (required: the
 heading toward the junction of the approach it was measured from; a stamp without it validates no approach), cars: {left,
@@ -193,9 +198,27 @@ def vision_lane(ln: sr.Lane) -> sr.Lane:
 
 
 def vision_lanes(j: sr.Junction, maneuver: str, setback: float, yaw_deg: float = 0.) -> list[sr.Lane]:
-  """The conflicting lanes as vision judges them (vision_lane), placed on the unsurveyed edge band."""
+  """The conflicting lanes as vision judges them (vision_lane), placed on the unsurveyed edge band, one per physical lane: the
+  lanes the line itself walks (stop_evidence.junction_lanes, which stop_go.junction_lanes makes vision lanes; vision reads no
+  survey, so no laneEdgeM), each the first of its movements in conflict_lanes' order. Under UNION_YAW_DEG of yaw a right's
+  far lane is so walked as its cross movement, never its swing zone; past it (the turn's set alone) as the swing.
+
+  Since 2026-11-07. Until then this walked every movement, a right's swing lane as well as the far lane's cross, so the
+  route-time reach check disagreed with the line: a 1/1 right at a 20-30 mph stop (swing 23.8 m of 26.7-37.6 m) failed
+  'reach' at route time and went 2.5-6.4 s after its full stop at the line. Across 144 shapes in the closed loop (15-30 mph,
+  1-3 lanes a side, straight, left and right, stop points 8 and 13 m back), this walk predicted the line every time: the 12
+  that certify go, and the 132 still failing 'reach' are short at the line too and hand back there, none rescued by the
+  creep for a view (V9): 123 with H3 15 s after the full stop, the 9 at 15 mph whose near lane is 0.4 m short with H5 ("Can't
+  start") 2.5 s after it. So vision's 'reach' is the line's own: navd routes round such a stop and, when it
+  can't, says it needs the driver, as for any stop it can't certify (review of the 11-06 repairs; the per-movement walk had
+  let navd keep every 'reach' stop unannounced, the 2/2 cross road's H3 then unwarned)."""
   edges = sr.edge_band(j.stop_point_distance, cross_lanes(j), None)
-  return [vision_lane(ln) for ln in sr.conflict_lanes(j, maneuver, edges, setback, yaw_deg)]
+  out, seen = [], set()
+  for ln in sr.conflict_lanes(j, maneuver, edges, setback, yaw_deg):
+    if (ln.role, ln.index) not in seen:
+      seen.add((ln.role, ln.index))
+      out.append(vision_lane(ln))
+  return out
 
 
 def long_look(j: sr.Junction, maneuver: str, yaw_deg: float = 0.) -> list[tuple[str, float]]:
@@ -210,11 +233,13 @@ def long_look(j: sr.Junction, maneuver: str, yaw_deg: float = 0.) -> list[tuple[
 
 def _assess_vision(j: sr.Junction, maneuver: str, visibility, eta: float | None, runtime: Runtime) -> Verdict:
   """TurnPilotStopSignGo=vision's checks, in order: geometry, skew and unknown legs (4-6, as every mode), side views off for
-  the drive (sideViews), an override (8), the light over runtime.window (9: night, dusk, low sun, the sun ahead with the veil
-  unmeasured, no clock), and at route time the reach each lane's walk predicts on the optimistic row against the vision floor
-  (11; the decider ignores 'reach' and walks live). No survey, validation stamp, camera field or launch stamp is read. A
-  conflicting approach over 25 mph or of unknown speed is no failure: the longer look (Verdict.long_look), its floor judged at
-  25 mph."""
+  the drive (sideViews), an override (8), the light over runtime.window (9: low sun, the sun ahead with the veil unmeasured;
+  since 2026-11-07 never night or dusk, which walk the day table, nor no clock, which leaves the glare unchecked, said in the
+  detail: the note above stop_rules.DARK_ROWS), and at route time the reach each lane's walk predicts on the optimistic row
+  against the vision floor (11, on the lanes the line walks: vision_lanes; the decider ignores 'reach' and walks live, and a
+  stop navd finds short is one the line would wait at, creep and hand back, so navd routes round it like any other). No
+  survey, validation stamp, camera field or launch stamp is read. A conflicting approach over 25 mph or of unknown speed is no
+  failure: the longer look (Verdict.long_look), its floor judged at 25 mph."""
   moves = sr.conflict_movements(j, maneuver, runtime.yaw_deg)
   bad = _geometry(j, maneuver, moves)
   if bad is not None:
@@ -225,10 +250,17 @@ def _assess_vision(j: sr.Junction, maneuver: str, visibility, eta: float | None,
   look = '; '.join(f"the {r} approach is {lim / sr.MPH:.0f} mph" if lim > 0. else f"the {r} approach's speed not known" for r, lim in slow)
   if any(a.overridden for a in j.approaches):
     return _fail('override', 'an approach is in TurnPilotJunctionOverrides')
-  if eta is None:
-    return _fail('light', "the clock isn't set (no GPS time yet): the sun can't be placed")
   looks = sorted({m.approach.bearing for m in moves})
-  rows, why = sr.light_window(j.lat, j.lon, eta, j.heading_in, visibility.veil, looks, *runtime.window)
+  notes = [f"long look: {look}"] if look else []
+  if eta is None:
+    # no clock (no GPS time yet): the sun can't be placed, so its glare checks (low sun, the sun ahead) can't run. Dark is no
+    # reason under vision (the note above stop_rules.DARK_ROWS), so this is no failure either (2026-11-07: before, every stop
+    # handed back 1 s after its full stop until GPS time came): the day table, and at the line the side views' live sectors
+    # (washed, dark, frozen) judge what the camera can see
+    rows, why = {sr.DARK_WALK_ROW}, ''
+    notes.append("the sun not placed (no clock): low sun and the sun ahead unchecked")
+  else:
+    rows, why = sr.light_window(j.lat, j.lon, eta, j.heading_in, visibility.veil, looks, *runtime.window, dark_ok=True)
   if why:
     return _fail('light', why)
   setback = visibility.setback if visibility.setback is not None else 1.9
@@ -245,7 +277,7 @@ def _assess_vision(j: sr.Junction, maneuver: str, visibility, eta: float | None,
   roles = [r for r, _ in slow]
   if short:
     return _fail('reach', '; '.join(short), lanes=out, rows=rows, long_look=roles)
-  return Verdict('certifiable', 'none', f"long look: {look}" if look else '', out, rows, False, roles)
+  return Verdict('certifiable', 'none', '; '.join(notes), out, rows, False, roles)
 
 
 def assess(junction: sr.Junction, maneuver: str, visibility, surveys, eta: float | None, runtime: Runtime) -> Verdict:

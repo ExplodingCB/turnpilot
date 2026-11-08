@@ -274,13 +274,15 @@ class SectorQuality:
   def _quality(self, vals: np.ndarray, ratio: float, ref_p5: float, hist: deque, still_s: float) -> str:
     if float((vals >= SAT_DN).mean()) >= WASHED_SAT:
       return 'washed'
+    # frozen before blocked (review 2026-11-07, LS-3): under vision a blocked sector after dark is judged by the walk's other
+    # rules (static and dark is every side view at a night stand), so a stuck feed, static too, must still read frozen
+    if still_s >= FROZEN_S:
+      return 'frozen'
     if len(hist) >= MIN_STATIC_SAMPLES:
       stack = np.stack([h[1] for h in hist])
       static = (stack.std(axis=0) < STATIC_STD_DN) & (stack.mean(axis=0) < STATIC_MEAN_DN)
       if float(static.mean()) >= STATIC_FRAC:
         return 'blocked'
-    if still_s >= FROZEN_S:
-      return 'frozen'
     if float(np.median(vals)) < self.dark_dn:
       return 'dark'
     if float(np.percentile(vals, 5)) - ref_p5 >= WASHED_LIFT_DN and ratio < WASHED_RATIO:

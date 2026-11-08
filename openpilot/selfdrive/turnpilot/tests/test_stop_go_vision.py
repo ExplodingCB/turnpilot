@@ -12,7 +12,7 @@ from openpilot.selfdrive.turnpilot import stop_go as sg
 from openpilot.selfdrive.turnpilot import stop_rules as sr
 from openpilot.selfdrive.turnpilot import visibility_table as vt
 from openpilot.selfdrive.turnpilot.routing import certify as ce
-from openpilot.selfdrive.turnpilot.routing.tests.test_certify import ETA, two_way_junction, utc, vision_junction, visibility
+from openpilot.selfdrive.turnpilot.routing.tests.test_certify import two_way_junction, utc, vision_junction, visibility
 from openpilot.selfdrive.turnpilot.stop_evidence import CAR_HALF_LEN_M, DEFAULT_LINE_M, junction_lanes
 from openpilot.selfdrive.turnpilot.tests.test_stop_evidence import track as ev_track
 from openpilot.selfdrive.turnpilot.tests.test_stop_go import Drive, World, arrived_at, first_go, raw_box, rolling
@@ -259,10 +259,10 @@ def test_vision_side_views_off_for_the_drive_is_the_1_s_handback_saying_so(tmp_p
 
 
 @pytest.mark.parametrize('wall_t, heading, words', [
-  (ETA + 8 * 3600., 0., 'night at ETA +0 min'), (utc(2026, 10, 28, 23, 0), 0., 'dusk at ETA +0 min'),
   (utc(2026, 10, 28, 22, 0), 0., 'low sun along an approach at ETA +0 min'),
-  (utc(2026, 10, 28, 17, 0), 180., 'sun ahead at ETA +0 min (veil unmeasured)'), (None, 0., "the clock isn't set")])
-def test_vision_night_dusk_low_sun_the_sun_ahead_and_no_clock_hand_back_saying_which(tmp_path, wall_t, heading, words):
+  (utc(2026, 10, 28, 17, 0), 180., 'sun ahead at ETA +0 min (veil unmeasured)')])
+def test_vision_low_sun_and_the_sun_ahead_hand_back_saying_which(tmp_path, wall_t, heading, words):
+  # glare, by day; night, dusk and no clock go as by day since 2026-11-07 (tests/test_stop_go_night.py)
   w = vworld(tmp_path, j=vision_junction(heading_in=heading), wall_t=wall_t)
   out = w.run(4.)
   d = gate_fault(out)

@@ -25,6 +25,11 @@ The loop (run), with route(exclude) the router's status-neutral reroute, which n
     of the plain route, at least AVOID_ADD_MIN_S (a short trip may still go round a block) and at most AVOID_ADD_MAX_S;
   - otherwise it ends 'clean' (nothing uncertifiable left) or 'unavoidable' (only unavoidable controls left).
 Whatever ends it, every stop and yield still uncertifiable on the kept route becomes unavoidable: the driver needs to know.
+Under TurnPilotStopSignGo=vision what the certifier fails is what the line would refuse: since 2026-11-07 no stop for dark or
+a missing clock (certify._assess_vision), and its reach is the line's own walk (certify.vision_lanes), so a stop it finds
+short is one the line would wait at, creep for a view and hand back: in the closed loop a 25 mph stop on a cross road of 2
+lanes each way (route-time 'reach' on its cross lanes) hands back 15 s after its full stop, day or night. So every
+uncertifiable stop is routed round alike, and said ahead when it can't be: the driver is never handed one unwarned.
 
 The maneuvers the car refuses (routing/lefts.py: a Left, since 2026-11-06 only the route's U-turns, which the driving model
 can't drive) go round the same loop, excluded by their exit edge (that module says why not the approach), in the same set,

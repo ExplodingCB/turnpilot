@@ -12,7 +12,13 @@ stands disengaged: never a reroute while driving, however long it was off the ro
   decision D5: the demo starts on a through street). The first one's street isn't on the bus, so it isn't said.
 Then, on any route, AHEAD_M before each stop or yield navd marks unavoidable (junctionInfo.certification), or at once where it
 is first seen closer: "Stop sign ahead needs you" (stopAheadNeedsYou, a chime), once per junction. At the line the decider
-hands it back right after the full stop (stop_go.py: 7.1).
+hands it back right after the full stop (stop_go.py: 7.1); under vision one its gate refuses (geometry, skew, an unknown leg,
+the side views off, an override, low sun or the sun ahead) 1 s after it (H9), and one short of reach on the line's own walk
+(routing/certify.vision_lanes) after its wait and creep for a view (in the closed loop H3 15 s after it, or H5). Since 2026-11-07
+a dark stop certifies under vision, so it is never said: on the 11-06 night drive (1e) this said "Stop sign ahead needs you"
+6 times, each stop's logged failure the light check (the first that fails); re-certified now, 2 of the 7 stops those routes kept certify
+and 5 are short of reach at their line (a far or third cross lane 0.7-7.7 m short): routed round where the budget allows,
+said where it can't.
 
 Each is said only where the plan's alert slot is free (turnpilotd: nothing that outranks it is up), and used up only on the
 frames it is said: held back behind another alert, it and its remaining time wait for the slot, never lost. A stop-ahead

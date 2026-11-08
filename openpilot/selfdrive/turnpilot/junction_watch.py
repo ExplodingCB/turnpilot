@@ -101,7 +101,9 @@ def watch_lanes(j: sr.Junction, setback: float, lane_edge_m: float | None = None
 
 def lighting_at(j: sr.Junction, wall_t: float | None, veil: str | None) -> tuple[str, tuple]:
   """(row, low-sun sides) at the junction now: night, dusk, sunAhead (the sun within 90 deg of our heading), day, or
-  unknown without a valid clock; and the sides whose approach the low sun lies along (section 1.6)."""
+  unknown without a valid clock; and the sides whose approach the low sun lies along (section 1.6). The row is the light as
+  it is, for step S3's evidence and the logs; it gates nothing under vision, whose walk reads the day table for a dark row or
+  no clock (stop_rules.walk_row, since 2026-11-07)."""
   if wall_t is None:
     return 'unknown', ()
   el, az = sr.sun_position(j.lat, j.lon, wall_t)

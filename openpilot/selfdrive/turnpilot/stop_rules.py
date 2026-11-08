@@ -129,6 +129,23 @@ SUN_AZ_TOL = 25.          # ...within this of a conflicting approach's look bear
 ETA_EARLY_S, ETA_LATE_S = 300., 1200.  # s, the window the light check passes over
 ETA_STEP_S = 60.
 VEIL_OK = ('none', 'withCover')
+# Under TurnPilotStopSignGo=vision dark is no failure and no gate (Kellen, 2026-11-07: "why the hell do we care about dark? its
+# been driving at night in all our past tests... and it performed great the streets are very lit up, its issues with out nav
+# system not openpilot"). On the 11-06 night drives (1d, 1e: sun -10 to -17 deg) every stop verdict navd logged failed check 9
+# here ('night at ETA -5 min', 18 of 20; the other 2 skew): so every stop was routed around where the budget allowed, the rest
+# said "Stop sign ahead needs you" (6 times on 1e), and each would have handed back 1 s after its full stop (H9, the line's own
+# light check; none was reached engaged). A dark row walks on the day table (DARK_WALK_ROW: the file has no night table, none
+# measured), and what the cameras see at the line judges the rest, as by day: a side-view bearing whose horizon band reads dark
+# (sideview.DARK_LUMA_DN), washed, frozen or blocked is zeroed (visibility.LiveVisibility's sector quality), a raw box blocks
+# its lane, a track holds it, and a car coming at our path withdraws the go. What the night logs do show: the detector found
+# vehicles on 43-50% of the road camera's runs (boxes p50 87-104 px tall, conf p50 0.58-0.61) and the full pass's raw boxes
+# reached 50-78 m (darkness.py); what they don't: no side-view sweep ran after dark (no stop was reached), so the side views'
+# night reach and their sectors' dark verdict at a lit junction are unmeasured. The wide camera's own exposure median at night
+# (1d, 1e: 31-33 raw DN, 17-22 full range) is under the sectors' 45 DN dark and blocked tests, so under vision neither zeroes
+# a bearing after dark (review 2026-11-07, LS-3: every night stop waited and handed back H3). Low sun and the sun ahead stay
+# (glare, by day)
+DARK_ROWS = ('night', 'dusk')
+DARK_WALK_ROW = 'day'
 
 # route-time avoidance (3.3)
 MAX_AVOID_ITER = 8
@@ -916,17 +933,27 @@ def lighting(lat: float, lon: float, t: float, heading: float, look_bearings=())
   return 'day'
 
 
+def walk_row(row: str, vision: bool) -> str:
+  """The table row the reach walk reads for a lighting row: under vision a dark row (or 'unknown', no clock: the sun not
+  placed) the day table's (DARK_WALK_ROW, the note above DARK_ROWS); any other row, and every row of the other modes, itself."""
+  return DARK_WALK_ROW if vision and (row in DARK_ROWS or row == 'unknown') else row
+
+
 def light_window(lat: float, lon: float, eta: float, heading: float, veil: str | None, look_bearings=(),
-                 early_s: float = ETA_EARLY_S, late_s: float = ETA_LATE_S) -> tuple[set[str], str]:
+                 early_s: float = ETA_EARLY_S, late_s: float = ETA_LATE_S, dark_ok: bool = False) -> tuple[set[str], str]:
   """(the lighting rows the window needs, why it fails or ''): the light check (3.2 check 9) at every ETA_STEP_S from eta
   - early_s to eta + late_s (and both ends). Night, dusk and low sun fail; sun ahead fails unless the veil is none or
-  withCover, when its row is 'sunAhead'."""
+  withCover, when its row is 'sunAhead'. dark_ok (vision): night and dusk are no failure, their row the day table's
+  (DARK_WALK_ROW); low sun and the sun ahead fail as ever."""
   rows, n = set(), max(int(math.ceil((early_s + late_s) / ETA_STEP_S)), 1)
   for k in range(n + 1):
     t = eta - early_s + (early_s + late_s) * k / n
     row = lighting(lat, lon, t, heading, look_bearings)
     when = f"{(t - eta) / 60.:+.0f} min"
-    if row in ('night', 'dusk'):
+    if row in DARK_ROWS and dark_ok:
+      rows.add(DARK_WALK_ROW)
+      continue
+    if row in DARK_ROWS:
       return rows, f"{row} at ETA {when}"
     if row == 'lowSun':
       return rows, f"low sun along an approach at ETA {when}"
