@@ -9,15 +9,18 @@ band_blockers): every full-pass run's vehicle boxes at RAW_CONF or more in the o
 (RawBox.near_m, the box bottom NEAR_PX lower) is within R_req break the clear window, and CLEAR_WINDOW_S of runs with none is
 the go. Every left is driven to its line (2026-11-06: never skipped or rerouted for its range), and goes from there only
 where R_req, judged where the car stands, fits under TurnPilotLeftRangeM, or past it under TurnPilotLeftFarRangeM while the
-far crop reads, whose boxes in the band block at any range; else it hands back at the line (unprotected_left.reach_fault).
+far crop reads (unmeasured, its provisional FAR_CROP_LEFT_RANGE_M), whose boxes in the band block at any range; past that
+reach it goes on the band the camera covers, a car seen there holding it, never handed back (2026-11-07).
 So the range is safe only if an oncoming car inside it is boxed on the road runs, with no stretch of them long enough for
 the window to fill: CRITIQUE REQUIRED 2 sets the window at least 3x the longest dropout at R_req, so a car is confirmed from the
 farthest near_m from which it never went MAX_DROPOUT_S (CLEAR_WINDOW_S / 3) without a box at the left. The drive is not the
-left: its full pass is on the road camera every run and the car closes at the oncoming car's speed plus its own, while held
-at the line the left's road runs are 2 in WIDE_EVERY (roadAndWide) and the car closes at its own speed alone. So a gap on
-the drive counts as the longer of the two it would be there (left_gap_s): the same missed runs LEFT_SCHEDULE x as long, the
-same stretch of road at the car's speed. The far crop's runs aren't thinned at the left, but its chain takes the same
-(the safe side). R_req's own margins (the opposing road's limit x SPEED_MARGIN 1.3, PET_S, the lanes) are route time's,
+left: its full pass is on the road camera every run, every RUN_EVERY frames, and the car closes at the oncoming car's
+speed plus its own, while held at the line the left's road runs come about LEFT_ROAD_RUNS_HZ a second (modeld_detector's
+far-first schedule on the car's budget, 2026-11-07: the far crop takes its share of the frames, the wide camera one run in
+WIDE_EVERY; 2 in 3 at 10 Hz before) and the car closes at its own speed alone. So a gap on the drive counts as the longer of
+the two it would be there (left_gap_s): the same missed runs LEFT_SCHEDULE x as long, the same stretch of road at the
+car's speed. The far crop's runs at the left come about as often as its road runs, but its chain takes the same (the safe
+side). R_req's own margins (the opposing road's limit x SPEED_MARGIN 1.3, PET_S, the lanes) are route time's,
 and this measures only the eyes.
 
 How. Every oncoming car the drive saw near is a sample: a turnpilotScene vehicle track (car, truck, bus, motorcycle) on the
@@ -63,7 +66,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from openpilot.selfdrive.turnpilot.detector.modeld_detector import WIDE_EVERY
+from openpilot.selfdrive.turnpilot.detector.modeld_detector import CYCLE_S, LEFT_ROAD_RUNS_HZ, RUN_EVERY
 from openpilot.selfdrive.turnpilot.maps.defaults import CAR_LEFT_RANGE_M
 from openpilot.selfdrive.turnpilot.route_follower import LEFT
 from openpilot.selfdrive.turnpilot.scene.tracker import GROUND_GATE_FRAC, GROUND_GATE_M, NEAR_PX, iou, is_calibrated
@@ -71,7 +74,9 @@ from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_Y_FAR_M, ONCOMIN
 from openpilot.selfdrive.turnpilot.unprotected_left import CLEAR_WINDOW_S, LEFT_RANGE_MAX_M, ROUTE_REACH_MARGIN_M, band_blockers, reach_at_line
 
 MAX_DROPOUT_S = CLEAR_WINDOW_S / 3.  # CRITIQUE REQUIRED 2: the window at least 3x the longest dropout, at the left
-LEFT_SCHEDULE = WIDE_EVERY / (WIDE_EVERY - 1)  # held at its line (roadAndWide) the full pass is on the road camera 2 runs in 3
+# a drive's road runs every RUN_EVERY frames (10 Hz), a left's LEFT_ROAD_RUNS_HZ held at its line (far first): the same missed
+# runs take 2.5x as long there (until 2026-11-07 the 1.5 of roadAndWide's 2 road runs in 3 at 10 Hz; the far crop had none)
+LEFT_SCHEDULE = 1. / (RUN_EVERY * CYCLE_S) / LEFT_ROAD_RUNS_HZ
 COVERAGE, CONFIDENCE = 0.95, 0.95    # DESIGN section 6: the range where recall is 95%; at 95% confidence
 MIN_VEHICLES = 59                    # the fewest for which the shortest is that bound (1 - 0.95^n >= 0.95)
 ROUND_M = 10.                        # recommended ranges round down to this
@@ -312,8 +317,8 @@ class Ego:
 
 def left_gap_s(back: float, ego_m: float, speed: float) -> float:
   """How long a gap of back s with no box of the car on the drive would be at the left, held at its line: the longer of the
-  same missed road runs at its schedule (roadAndWide: the full pass on the road camera WIDE_EVERY - 1 runs in WIDE_EVERY, so
-  LEFT_SCHEDULE x as long; the drive's are all on it) and the same stretch of road at the car's own speed (the drive closed
+  same missed road runs at its schedule (far first: LEFT_ROAD_RUNS_HZ road runs a second, so LEFT_SCHEDULE x as long as
+  the drive's every RUN_EVERY frames) and the same stretch of road at the car's own speed (the drive closed
   it at speed and the car's own, ego_m more; the car waiting at its line doesn't move)."""
   return max(back * LEFT_SCHEDULE, (speed * back + max(ego_m, 0.)) / speed)
 

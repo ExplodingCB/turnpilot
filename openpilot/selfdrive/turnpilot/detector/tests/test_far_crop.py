@@ -134,39 +134,88 @@ class TestFarCrop(OpenpilotTestCase):
     steps(det, pm, 4)
     assert pm.far == [] and det.far.run.calls == [] and pm.full[-1].farStatus == FarStatus.off
 
-  def test_failure_turns_only_the_far_crop_off_for_the_drive(self):
+  def test_a_failure_is_retried_and_never_turns_the_far_crop_off_for_the_drive(self):
+    # 2026-11-07 (no features off): a failed run is retried after a backoff, logged, the full pass's own backoff untouched;
+    # FAR_DISABLED_FAILS in a row say farStatus disabled (turnpilotd's farViewOff) until a run succeeds, which reads again.
+    # Until then one failure was the far crop off for the drive
+    from openpilot.selfdrive.turnpilot.detector.modeld_detector import FAR_DISABLED_FAILS
     det, pm = far_detector(), FarPM()
     det.far.run.fail = True
     steps(det, pm, 2 * RUN_EVERY)
-    assert det.far.disabled and pm.far == [] and len(pm.full) == 2
+    assert not det.far.disabled and det.far.failures == 1 and pm.far == [] and len(pm.full) == 2
     assert det.failures == 0 and det.retry_at == 0.  # the full pass's backoff is its own
-    assert pm.full[-1].farStatus == FarStatus.disabled
-    det.far.run.fail = False
-    steps(det, pm, 2 * RUN_EVERY, start=100)
-    assert pm.far == [] and pm.full[-1].farStatus == FarStatus.disabled  # for the drive, never back
+    assert RETRY_S - 0.5 < det.far.retry_at - time.monotonic() <= RETRY_S
+    assert pm.full[-1].farStatus == FarStatus.noRoom  # one failure, waiting out its retry: not yet said off
+    for k in range(FAR_DISABLED_FAILS - 1):
+      det.far.retry_at = 0.
+      steps(det, pm, RUN_EVERY, start=100 + 10 * k)
+    steps(det, pm, RUN_EVERY, start=150)  # the next full run's message, the retry not yet due
+    assert det.far.failures == FAR_DISABLED_FAILS and pm.full[-1].farStatus == FarStatus.disabled and pm.far == []
+    det.far.run.fail, det.far.retry_at = False, 0.
+    steps(det, pm, RUN_EVERY + 1, start=200)
+    assert len(pm.far) == 1 and det.far.failures == 0 and pm.full[-1].farStatus == FarStatus.read  # back, never off
 
-  def test_slow_far_crop_turns_off_and_the_full_pass_keeps_going(self):
+  def test_a_slow_far_crop_is_warned_and_runs_where_it_fits(self):
+    # a median run over FAR_BUDGET_S: warned once, never off for the drive (11-06: the far crop's rules turned it off in
+    # minutes on both drives); its runs go where its estimate, its measured step cost, fits
+    from unittest import mock
+    from openpilot.selfdrive.turnpilot.detector import modeld_detector
     det, pm = far_detector(far_time=0.001), FarPM()
     det.far.run.delay = FAR_BUDGET_S * 1.3
-    steps(det, pm, 2 * TIME_WINDOW + 4, model_time=0.002)
-    assert det.far.disabled and len(pm.far) == TIME_WINDOW and all(fd.run.executionTime > FAR_BUDGET_S for fd in pm.far)
-    assert len(pm.full) == TIME_WINDOW + 2 and pm.full[-1].farStatus == FarStatus.disabled
+    with mock.patch.object(modeld_detector.cloudlog, 'warning') as warning:
+      steps(det, pm, 2 * TIME_WINDOW + 4, model_time=0.002)
+    assert not det.far.disabled and len(pm.far) == TIME_WINDOW + 2 and all(fd.run.executionTime > FAR_BUDGET_S for fd in pm.far)
+    assert len(pm.full) == TIME_WINDOW + 2 and pm.full[-1].farStatus == FarStatus.read
+    said = [c.args[0] for c in warning.call_args_list if 'over budget' in c.args[0]]
+    assert len(said) == 1 and said[0].startswith("turnpilot far crop over budget")
+    assert det.far.estimate(False) >= FAR_BUDGET_S * 1.3  # its step's cost, the run's time in it
 
-  def test_step_overruns_turn_it_off(self):
+  def test_step_overruns_are_warned_never_off(self):
     # runs that fit their estimate but, with the model's time, push the debt past DEBT_CAP_S (the estimate low, the model
-    # slow): FAR_OVERRUNS of the last TIME_WINDOW and it is off for the drive
-    from openpilot.selfdrive.turnpilot.detector.modeld_detector import FAR_OVERRUNS
-    det, pm = far_detector(far_time=0.001), FarPM()
+    # slow): FAR_OVERRUNS of the last TIME_WINDOW are warned, never the far crop off for the drive (11-06: three of five did
+    # it 79.5 s into 1d's log and 190.6 s into 1e's); each run's step cost is its estimate after it, so it fits only where it does
+    from unittest import mock
+    from openpilot.selfdrive.turnpilot.detector import modeld_detector
+    det, pm = far_detector(far_time=0.001, det_time=0.001), FarPM()
     det.far.run.delay = 0.009
-    for k in range(2 * TIME_WINDOW):
-      det.far.times.clear()  # each run fits the (low) estimate from a paid-back cycle, but beside a model 1 ms over the
-      det.debt = 0.          # budget it leaves 10 ms of debt
-      steps(det, pm, 1, model_time=STEP_BUDGET_S + 0.001, start=10 * k)
-    assert det.far.disabled and len(pm.far) == FAR_OVERRUNS and pm.full[-1].farStatus == FarStatus.disabled
-    det, pm = far_detector(far_time=0.001), FarPM()
-    det.far.run.delay = 0.007
-    steps(det, pm, 2 * TIME_WINDOW, model_time=0.010)
-    assert not det.far.disabled and len(pm.far) == TIME_WINDOW
+    with mock.patch.object(modeld_detector.cloudlog, 'warning') as warning:
+      for k in range(2 * TIME_WINDOW):
+        det.far.costs.clear()  # each run fits the (low) warm-up estimate from a paid-back cycle, but beside a model 1 ms over
+        det.debt = 0.          # the budget it leaves 10 ms of debt
+        steps(det, pm, 1, model_time=STEP_BUDGET_S + 0.001, start=10 * k)
+    assert not det.far.disabled and len(pm.far) == TIME_WINDOW and all(det.far.overruns)
+    assert pm.full[-1].farStatus == FarStatus.read
+    assert len([c for c in warning.call_args_list if 'pushed the debt' in c.args[0]]) == 1  # once in BUDGET_WARN_S
+    # its measured cost kept: beside that model it has no room again (noRoom), never off
+    det.debt = 0.
+    steps(det, pm, 2, model_time=STEP_BUDGET_S + 0.001, start=500)
+    assert len(pm.far) == TIME_WINDOW and det.far.why == FarStatus.noRoom and not det.far.disabled
+
+  def test_a_far_run_is_judged_on_its_steps_cost(self):
+    # 11-06: the room check took the far run's own 10.5 ms, the step around it (decode, the message, the send) cost 2.4 ms
+    # more, and runs it fit left 6.5-7.1 ms of debt. Its estimate is now the step's: before a run the warm-up's plus
+    # FAR_STEP_OVERHEAD_S, after, the measured costs' median (its lights apart), its executionTime still the run's alone
+    from openpilot.selfdrive.turnpilot.detector.modeld_detector import FAR_STEP_OVERHEAD_S
+    det = far_detector(far_time=0.0105)
+    assert abs(det.far.estimate(False) - (0.0105 + FAR_STEP_OVERHEAD_S)) < 1e-9
+    det.far.ran(time.monotonic(), 0.0105, 0.0129, False)
+    det.far.light_times.append(0.0007)
+    det.far.lights = FakeLights()
+    assert abs(det.far.estimate(False) - 0.0129) < 1e-9 and abs(det.far.estimate(True) - 0.0136) < 1e-9
+    assert list(det.far.times) == [0.0105]
+
+  def test_a_far_crop_without_room_measures_again(self):
+    # a slow burst's median can't keep it from ever running: FAR_FORCE_S wanting a frame with none and its measured costs
+    # are dropped, the estimate back to the warm-up's, so a frame with room for that measures it again
+    from openpilot.selfdrive.turnpilot.detector.modeld_detector import FAR_FORCE_S, FAR_STEP_OVERHEAD_S
+    det = far_detector(far_time=0.010)
+    det.far.costs.extend([0.030] * TIME_WINDOW)  # the burst
+    t = time.monotonic()
+    det.far.no_room(t)
+    det.far.no_room(t + FAR_FORCE_S - 0.1)
+    assert len(det.far.costs) == TIME_WINDOW
+    det.far.no_room(t + FAR_FORCE_S)
+    assert not det.far.costs and abs(det.far.estimate(False) - (0.010 + FAR_STEP_OVERHEAD_S)) < 1e-9
 
   def test_far_lights_have_a_reader_of_their_own_always_in_shadow(self):
     det, pm = far_detector(), FarPM()
@@ -317,7 +366,7 @@ NO_ROOM_NATIVE_S = 0.030  # a native estimate that never fits beside view_steps'
 
 class TestTruthfulFarView(OpenpilotTestCase):
   """11-06, both drives: the native schedule never ran beside the car's 38.5 ms model and the far crop went off for the drive
-  in its first minutes (1d 1+18.5, 1e 3+8.8), yet every message said nativeStatus full and farStatus noRoom, so turnpilotd
+  in its first minutes (79.5 s into 1d's log, 190.6 s into 1e's), yet every message said nativeStatus full and farStatus noRoom, so turnpilotd
   took the far view for alive (FAR_ON) and never said farViewOff."""
 
   def test_a_dead_slot_says_disabled(self):
@@ -429,7 +478,7 @@ class TestTruthfulFarView(OpenpilotTestCase):
     assert self.far_view_offs([td.farStatus for td in pm.full]) == 0
     native.last_run_t -= NATIVE_NO_RUN_S - 4.  # 26 s more with its slot free and no run: 31 s on its clock
     assert det.far_status() == FarStatus.disabled
-    native.ran(time.monotonic(), 0.010, False)  # a run starts the clock over, the sweep's time with it
+    native.ran(time.monotonic(), 0.010, 0.012, False)  # a run starts the clock over, the sweep's time with it
     assert native.held_s == 0. and det.far_status() == FarStatus.read
 
   def test_a_slot_that_dies_in_a_sweep_says_so_after_it(self):

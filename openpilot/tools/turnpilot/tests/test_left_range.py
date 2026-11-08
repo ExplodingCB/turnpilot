@@ -301,14 +301,18 @@ def drop_runs(c, at_m, n):
 
 
 @pytest.mark.parametrize("ego_v, speed, missed, bridged", (
-  (0., 15., 6, False),   # 0.7 s: at the left's 2 road runs in 3 the same 6 misses take 1.05 s
+  (0., 15., 6, False),   # 0.7 s: at the left's LEFT_ROAD_RUNS_HZ the same 6 misses take 1.75 s
   (15., 10., 4, False),  # 0.5 s: at the left the car closes at 10 m/s, not 25: that stretch takes 1.25 s
-  (10., 15., 3, True),   # 0.4 s: 0.6 s at the left's schedule, 0.67 s at its closing: under CLEAR_WINDOW_S / 3
-), ids=("stopped, 6 runs missed", "faster than it, 4 missed", "3 missed"))
+  (10., 15., 3, False),  # 0.4 s: 1.0 s at the left's far-first schedule (0.6 s at 2 road runs in 3 before 2026-11-07)
+  (10., 15., 2, True),   # 0.3 s: 0.75 s at the left's schedule, 0.5 s at its closing: under CLEAR_WINDOW_S / 3
+), ids=("stopped, 6 runs missed", "faster than it, 4 missed", "3 missed", "2 missed"))
 def test_a_dropout_counts_as_long_as_it_would_be_at_the_left(monkeypatch, ego_v, speed, missed, bridged):
-  """The drive's runs are on the road camera every time, held at the line the left's are 2 in WIDE_EVERY (roadAndWide), and
-  an oncoming car closes on the moving car at its own speed and ours, on the waiting one at its own: a gap of boxes on the
-  drive counts as the longer of what the same missed runs, and the same stretch of road, would be at the left."""
+  """The drive's runs are on the road camera every RUN_EVERY frames, held at the line the left's come LEFT_ROAD_RUNS_HZ a
+  second (modeld_detector's far-first schedule on the car's budget, the far crop taking its share), and an oncoming car
+  closes on the moving car at its own speed and ours, on the waiting one at its own: a gap of boxes on the drive counts as
+  the longer of what the same missed runs, and the same stretch of road, would be at the left."""
+  from openpilot.tools.turnpilot.left_range import LEFT_SCHEDULE
+  assert LEFT_SCHEDULE == pytest.approx(2.5)
   monkeypatch.setattr(sys.modules[__name__], 'EGO_V', ego_v)
   cars = stream(60, far_from=0., speed=speed)
   c = cars[30]

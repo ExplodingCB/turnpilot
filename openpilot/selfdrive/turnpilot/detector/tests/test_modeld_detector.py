@@ -685,12 +685,18 @@ class TestCameraLights(OpenpilotTestCase):
   def test_a_reads_reason_and_its_frames_read_are_published(self):
     # 11-06: 667 night reads, 0 greens, 85% of plausible heads with no vote, and the log couldn't say why: each head now
     # carries this frame's read and the gate that stopped it beside its vote
-    head = LightHead(5, (0.4, 0.1, 0.41, 0.15), 0.6, 'red', 3, 'unknown', 'twoLit', -18., 17., False)
+    head = LightHead(5, (0.4, 0.1, 0.41, 0.15), 0.6, 'red', 3, 'unknown', 'twoLit', -18., 17., False, 'h40 fr0.43/0.47/0.10')
     det, pm = with_lights(make_detector()), PM()
     det.lights = FakeLights([head])
     det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(1), Meta(2)])
     (light,) = pm.sent[0].lights.lights
     assert str(light.state) == 'red' and str(light.read) == 'unknown' and light.reason == 'twoLit' and not light.governs
+    assert light.instance == 'head5 h40 fr0.43/0.47/0.10'  # the read's detail on every run (2026-11-07), not only the samples
+    from openpilot.cereal import messaging
+    from openpilot.selfdrive.turnpilot.detector.modeld_detector import fill_lights
+    td = messaging.new_message('turnpilotDetections').turnpilotDetections
+    fill_lights(td.lights, [LightHead(6, (0.4, 0.1, 0.41, 0.15), 0.6, 'red', 3, 'red', 'read', 1., 30., True)], False)
+    assert td.lights.lights[0].instance == 'head6'  # no detail: the id alone, as before
 
   def test_light_failure_is_retried_and_the_detector_keeps_going(self):
     # never off for the drive: a failed read is logged, the road runs inside its backoff say retrying (no read: never an
@@ -1108,12 +1114,35 @@ class TestStopSweep(OpenpilotTestCase):
 
       def __getitem__(self, s):
         return msg.as_reader().turnpilotPlan
-    assert plan_inputs(fresh_plan(SM())) == ('stopSweep', 3., True)
+    assert plan_inputs(fresh_plan(SM())) == ('stopSweep', 3., True, False)
     p.mapControl.distance = SWEEP_SIGNAL_M + 1.
-    assert plan_inputs(fresh_plan(SM())) == ('stopSweep', 3., False)
+    assert plan_inputs(fresh_plan(SM())) == ('stopSweep', 3., False, False)
     p.mapControl.kind, p.mapControl.distance = 'stop', 10.
     assert plan_inputs(fresh_plan(SM()))[2] is False
-    assert plan_inputs(None) == ('auto', 0., False)
+    assert plan_inputs(None) == ('auto', 0., False, False)
+
+  def test_far_first_is_an_unprotected_lefts_view_with_its_band_past_the_full_pass(self):
+    # plan_inputs' far_first (left_pick): the left's views (road from VIEW_FROM_M, roadAndWide at its line) with R_req past
+    # the full pass's range (rangeM), from those two alone: farNeeded goes false while the far slot is stale, and a stale
+    # far view would then never get the frames to read again
+    from openpilot.cereal import messaging
+    from openpilot.selfdrive.turnpilot.detector.modeld_detector import plan_inputs
+    from openpilot.selfdrive.turnpilot.hooks import fresh_plan
+    msg = messaging.new_message('turnpilotPlan')
+    p = msg.turnpilotPlan
+    p.unprotectedLeft.rReq, p.unprotectedLeft.rangeM, p.unprotectedLeft.farNeeded = 134., 98., False
+
+    class SM:
+      recv_time, valid = {'turnpilotPlan': time.monotonic()}, {'turnpilotPlan': True}
+
+      def __getitem__(self, s):
+        return msg.as_reader().turnpilotPlan
+    for view, want in (('road', True), ('roadAndWide', True), ('auto', False), ('stopSweep', False), ('stopSweepGo', False)):
+      p.detectorView = view
+      assert plan_inputs(fresh_plan(SM()))[3] is want, view
+    p.detectorView = 'roadAndWide'
+    p.unprotectedLeft.rReq = 85.  # a 15 mph road's: inside the full pass's reach, nothing for the far slot
+    assert plan_inputs(fresh_plan(SM()))[3] is False
 
   def test_a_sweep_suspends_the_far_crop_lane_paint_and_unmapped_lights(self):
     # G6's far crop never runs during a sweep (the odd steps are the side views'), and says so; lane paint is off; the

@@ -768,12 +768,13 @@ def main(demo=False, successor: str | None = None):
     detector_s = 0.
     if detector is not None and model_output is not None and publishing:
       from openpilot.selfdrive.turnpilot.detector.modeld_detector import plan_inputs
-      # the camera TurnPilot asks for (DESIGN phase 4 G4, the stop sweeps), where the far crop looks (G5) and whether a signal
-      # is mapped near: read in shadow too, where it steers nothing
-      view, far_bearing, signal_near = plan_inputs(fresh_plan(sm))
+      # the camera TurnPilot asks for (DESIGN phase 4 G4, the stop sweeps), where the far crop looks (G5), whether a signal is
+      # mapped near, and whether an unprotected left's band past the full pass's range wants the far crop's frames (far
+      # first): read in shadow too, where it steers nothing
+      view, far_bearing, signal_near, far_first = plan_inputs(fresh_plan(sm))
       detector_t0 = time.perf_counter()
       detector.step(pm, model, model_execution_time, prev_action.desiredCurvature, desire, [meta_main, meta_extra], sm['carControl'].enabled,
-                    view, far_bearing, v_ego, signal_near)
+                    view, far_bearing, v_ego, signal_near, far_first)
       detector_s = time.perf_counter() - detector_t0
 
     # TurnPilot: a slow frame says where its time went (SlowFrameLog); a successor not yet live publishes nothing to lag

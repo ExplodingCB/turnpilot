@@ -43,12 +43,25 @@ LEFT_RANGE_PARAM, LEFT_RANGE_MARK = 'TurnPilotLeftRangeM', 'TurnPilotLeftRangePr
 # The full pass that always runs is the frame letterboxed into 640x384, where that car is ~10 px at 98 m
 # (unprotected_left.FULL_PASS_RANGE_M), and turnpilotd never certifies a band past that on its runs alone, whatever this
 # says. On the car the native schedule never ran (11-06, both drives: no room beside the 38.5 ms driving model) and the far
-# crop (TurnPilotLeftFarRangeM unmeasured) went off in minutes, so by day too a left past ~98 m (every road of about 18 mph
-# or more) is driven to its line and hands back there ("Can't see oncoming far enough: take control"), the car held, never
-# rerouted, until the native schedule or a measured far crop reads (review 2026-11-07, LN-2). Past 210 m (40-45 mph, and
-# roads with no mapped limit, taken as 45) it hands back so with them too
+# crop (TurnPilotLeftFarRangeM unmeasured) went off in minutes, so a left past ~98 m (every road of about 18 mph or more)
+# was judged on the full pass's band alone (since 2026-11-07, no handbacks: it goes on the band it can see, a car seen there
+# holding it). Past 210 m (40-45 mph, and roads with no mapped limit, taken as 45) the band reaches 210 m, the rest unseen
 CAR_LEFT_RANGE_M = 210.
 EARLIER_CAR_RANGES_M = (150.,)  # the defaults earlier builds wrote: a comma still on one of them takes the current one
+# The far crop's provisional range (2026-11-07, bleeding edge, Kellen: "bleeding edge, not maximal caution"), what turnpilotd's
+# left_ranges takes while TurnPilotLeftFarRangeM is unmeasured (0) and the far crop is on: the same pixel arithmetic as the
+# 210 m above. The far crop is a 640x384 window of the road frame at native resolution (detector/graph.Crop), the native
+# strips' pixel density, so a car 1.8 m wide at f 1141.5 px is 1.8 x 1141.5 / R px in it as in them: 10 px, about the
+# smallest the detector boxes (FULL_PASS_RANGE_M's floor at the letterbox's 640/1344 of it), at 205.5 m, and 9.8 px at 210 m,
+# Kellen's rounding, taken here too so the far slot's reach is one number whichever of the two fills it. Never a measured
+# recall: a car at 210 m in the far crop is as small as one at 98 m in the full pass, whose per-frame recall was 0.27 at
+# 75-100 m by day. Replaced by tools/turnpilot/left_range.py's measurement (TurnPilotLeftFarRangeM, from shadow-drive rlogs
+# of oncoming cars followed through the far crop's runs, LEFT_RANGE.md): any value set wins over it. By night unmeasured
+# too: the full pass boxed nothing past 78 m on 11-06's night drive (p99 50 m), the far crop's night reach was never seen.
+# It only adds holds, a car going the car's own way among them: the band takes the car's own lane from 18 m out and the lane
+# beside from 121 m, so a car going straight on ahead holds the left until it is past the far crop's reach (the 11-06 review,
+# 2026-11-07: 15 s after the hold at a 35 mph left, against 7.8 s on the full pass's band; detector/modeld_detector's far first)
+FAR_CROP_LEFT_RANGE_M = CAR_LEFT_RANGE_M
 
 
 def ensure_left_range(params) -> bool:
