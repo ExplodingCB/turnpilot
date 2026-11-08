@@ -31,18 +31,27 @@ that marks the turn's lanes itself, never on a guess for one that marks none (fa
 
 Whether the next change may go (change_blocker), on every path, map lanes or not: only into a valid travel lane, which
 means all of
-- the ego line that way reads broken white at BROKEN_WHITE_CONF_MIN or better: solid, yellow, no line, unknown, or no
-  paint read at all (no detector, the wide camera, a stale scene) is no change. A yellow read keeps vetoing for
-  YELLOW_HOLD_S and YELLOW_HOLD_M after the last one, so a worn stretch doesn't open a gap; the hold moves with the lines
-  in a lane change, and covers all four lines when the direction of one is unknown. After it a white read keeps its colour
-  across reads of unknown colour for WHITE_HOLD_S or WHITE_HOLD_M, whichever ends first (WhiteHold: a dashed line's colour
-  drops out before its kind does); never over solid, yellow or no line. A frame valid by that hold alone keeps an offer's
-  confirm count and keeps an offer up, but nothing is offered, requested or placed for LC-03 on it (LanePlanner._held_only);
+- the ego line that way reads broken white at BROKEN_WHITE_CONF_MIN or better, or the reader read it but couldn't make it
+  out and the rest agrees a lane of ours is beyond it (lane_agreed: the model sees the line and counts a painted lane beyond
+  it, and the line read white, the line beyond read yellow, or the map's lane list has a lane of ours there, toward the far
+  side only over a line its reads have cleared; only on a frame whose paint was read, and only while the ego line has read
+  neither yellow nor solid since the car's last lane change, unless WHITE_CLEAR_FRAMES white reads of it or the yellow
+  moving out came after, LineMarks). Solid, yellow, no line, or no paint read at all (no detector, the wide camera, a stale
+  scene) is no change. A yellow read keeps vetoing for YELLOW_HOLD_S and YELLOW_HOLD_M after the last one, so a worn stretch
+  doesn't open a gap, unless the yellow moves out a lane (the ego line read white and the line beyond yellow,
+  YELLOW_OUT_FRAMES frames of the two since its last yellow or solid read: a turn bay opening, YellowHold); the
+  hold moves with the lines in a lane change, and covers all four lines when the direction of one is unknown. After it a
+  white read keeps its colour across reads of unknown colour for WHITE_HOLD_S or WHITE_HOLD_M, whichever ends first
+  (WhiteHold: a dashed line's colour drops out before its kind does); never over solid, yellow or no line. A frame valid by
+  that hold alone keeps an offer's confirm count and keeps an offer up, but nothing is offered, requested or placed for
+  LC-03 on it (LanePlanner._held_only);
 - the model sees a lane that way, its next line out at least LANE_MIN lane widths beyond the ego line (an 8 ft parking
   strip beside an 11 ft lane is 0.73, a 6 ft bike lane beside a 10 ft one 0.61), not beyond a yellow line; or, with that
   line unseen (at night the usual case), the ego line read broken white and a trusted road edge LANE_MIN lane widths beyond
-  it: one lane (lanes_toward), never more, so never one beyond the next line out;
-- nothing stopped in that lane ahead (parked cars: a parking strip);
+  it: one lane (lanes_toward), never more, so never one beyond the next line out. The lane width there is the ego lines'
+  own spacing when one of them is sure (model_lanes: at night the curb-side line rarely is);
+- nothing stopped in that lane ahead (parked cars: a parking strip), and nothing coming toward the car in it (an oncoming
+  lane, whatever its line reads: oncoming_in_lane);
 - under US markings (MUTCD) only: in left-hand traffic the center line is broken white, so nothing goes away from the curb
   there, and nothing tells right-hand Europe (white center lines too) from the US.
 Before the paint, a change toward the curb before a junction turn put the car in a parking strip (BeamNG, 2026-10-27).
@@ -55,9 +64,11 @@ countdown ends. The request is the lane change itself: DesireHelper takes it wit
 the driver's 20 mph floor, only a moving car (NAV_LANE_CHANGE_SPEED_MIN), and still waits for the car's own blind spot
 signal (Tesla DAS_status). Until DesireHelper starts the change, every frame checks it
 again, and any failure aborts it, with laneChangeAbort saying why for ABORT_HOLD_S (selfdrived raises
-turnpilotLaneChangeAborted): the line read solid, yellow (held included) or none, or no paint read at all, or the lane no
-longer valid (a line read short of broken white with nothing contrary, its kind or colour unknown, or broken white by the
-white hold alone, waits instead, nothing requested on that frame, for LC_UNSURE_MAX_S at most: _follow_up), the blind spot
+turnpilotLaneChangeAborted): the line read solid, yellow (held included) or none, or the lane no longer valid (a line read
+short of broken white with nothing contrary, its kind or colour unknown, or broken white by the white hold alone, a frame
+with no paint read at all, or no lane by the model's count alone with the count unknown, waits instead, nothing requested
+on that frame, for LC_UNSURE_MAX_S at most: soft_block, _follow_up; before the offer the same frames keep its confirm
+count), the blind spot
 occupied, a car in
 the target lane, no signal in time (or the blinker off before the change started), the route changed, the change no
 longer needed, the car too slow or too close to the maneuver, DesireHelper waiting too long. Once the change has started
@@ -91,9 +102,9 @@ or no line, on no frame of the window solid or yellow, the model's next line out
 edge, the lane not parked, no car in it and the blind spot clear, the countdown said first as for any change. Only on a
 frame whose paint the reader read: turnpilotd hands over none unless the detector's lanePaintStatus is read (plan_paint),
 and the planner looks before the yellow hold, which gives a frame with none read four lines, the held one yellow and the
-rest unknown (YellowHold.apply). An offer of it aborts lineNotBroken on the first frame with none, and on one read short of
-it with nothing contrary waits, nothing requested (_follow_up), so it goes only on paint read. Toward the far side the
-paint rule stands, and so does a far-side keep's (keep_blocker).
+rest unknown (YellowHold.apply). An offer of it waits on a frame with none read, and on one read short of it with nothing
+contrary, nothing requested (_follow_up), so it goes only on paint read. Toward the far side the paint rule stands
+(lane_agreed's included), and so does a far-side keep's (keep_blocker).
 
 A map stop between the car and the maneuver (stop_d: MapControlPolicy.stop_ahead) inside the window (BeamNG lane_change on
 the signal tiles, 2026-10-28: a signal 164 m before the turn, and braking for it kept the car under DesireHelper's speed
@@ -116,7 +127,10 @@ the first frame at or past lane_change_window's end with nothing offered or unde
 lane list (every lane the car may be in is one the maneuver doesn't leave from, lane_unconfirmed false); without one, by a
 frame of the window on which the model read both ego lines and change_blocker found a travel lane that way (since the car's
 last lane change: the lane it changed from was no evidence about the one it is in). A window that only ever read the line
-solid or the lane parked doesn't place it: a bike lane behind solid white, a parking strip. The one exception is noLane at the
+solid or the lane parked doesn't place it: a bike lane behind solid white, a parking strip; and a lane found by the room
+beyond the line alone (no line seen beyond it) places nothing once a stopped car is seen in it on any frame of the window,
+the room between parked cars a parking strip's (2026-11-07: 1e 722-737 s, replayed through the planner before it, that
+right skipped). The one exception is noLane at the
 window's end (the model sees no lane that way, or one only beyond a yellow line): the lane list may be wrong, or the car is
 at the edge already, and the turn goes as before. The bay rule's turn wants none there (desired_changes), so is never blocked
 for a bay that hasn't opened. That makes the bay's latch (BayLatch) the permissive answer: one shut by a lane divider misread
@@ -129,7 +143,28 @@ waits lineNotBroken 777 frames, noLane 314, pastWindow 3293. The model's next li
 (_follow_up). The yellow rail is as it was: the yellow hold is applied before the white, an ego line read or held yellow is
 never crossed (and aborts an offer at once), the room beyond broken white counts one lane, never one past the next line, and
 a request, an offer or LC-03's placement goes only on a frame whose own read is broken white, never on the white hold's.
-"""
+
+Night, the second pass (2026-11-07, Kellen: "we wanna get over to the right before a right turn and the left before a
+left"; no give-ups for lack of a read; a safety driver signals every change, the car's lamps beyond it). The working tree's
+TurnPilot.plan replayed open loop over 1d and 1e, the lane planner's inputs recorded and run through 2bd8bc25c's planner and
+this one, a driver answering each prompt 1 s on: 2bd8bc25c's offered 4 changes, none on an engaged frame (1e segs 12-13 and 1d seg 4,
+driven by hand), and none for the turns the driver changed lanes for himself; this offers 3 on engaged frames, each at a
+left's turn bay as it opened: 1d seg 9's at 96.8 m (requested at 84.3 m, the driver's own blinker on from 106 m and his
+change at 81 m), 1e seg 5's at 226.6 m (requested from 215.6 m, then held by a car stopped in the bay), 1d seg 8's at 63 m
+(3.2 m/s in a queue, aborted tooSlow). What held them: the lane width the next line out was measured against
+(model_lanes), the centre line's yellow hold across the bay opening (YellowHold's yellow moving out), the bay's line read
+but not made out (lane_agreed), and every frame short of a pass starting the confirm count over (soft_block). Where nothing
+changed: the curb-side rights, the car at the curb on all of them (the right edge 0.1-0.9 m beyond a line the model is
+unsure of: no lane); a sharp left's lane beyond a line read solid with its traffic oncoming (1e 364-367 s, held by the rail,
+the driver crossing it himself); a left whose line read yellow on 115 of 314 frames (1e 589-614 s, the yellow rail).
+
+Its review (2026-11-07) found three ways that pass agreed a lane over a centre line: a frame nobody read, padded to four
+lines by the yellow hold, agreed by a held yellow beyond or the list (lane_agreed now only on paint read); the far side's
+list over a line never read white (now only over one cleared, LineMarks); and one white read clearing a mark and, with one
+yellow read beyond, ending the hold (1e 243.35-244.85 s; now YELLOW_OUT_FRAMES and WHITE_CLEAR_FRAMES frames). The replays
+of 1d and 1e offer and request the same changes at the same distances as before them; 5 frames a change left may go by
+the frame's own read are gone from the two drives (the four of 1e 244.38-244.79 s, and 1d 576.25 s, the bay's yellow beyond
+read once, a frame before its tenth frame of evidence)."""
 import math
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
@@ -189,6 +224,15 @@ LC_LANE_MARGIN_M = 0.5
 # the bay rule's latch (BayLatch): the far-side ego line read yellow at this confidence (for LC-03 yellow is the permissive
 # answer there, so a higher bar than YELLOW_CONF_MIN's) this many times, none of them this long after a white read of it
 BAY_YELLOW_CONF_MIN, BAY_YELLOW_READS, BAY_CONTEST_S = 0.5, LC_CONFIRM_FRAMES, 10.
+# frames of reads, not one, for the yellow moving out a lane (YellowHold: the ego line read white and the line beyond it read
+# yellow, the two together, since the ego line's last yellow or solid read) and for a line's mark to clear (LineMarks: white
+# reads since it). One of each did both before (2026-11-07 review): 1e 243.35-244.85 s, an ego left line read yellow 3.3 s
+# earlier, then unknown kind white 0.61 on 2 frames and the far-left line yellow on 3, crossable on 4 frames until it read
+# solid. The logged bays: 1d 575.5-576.3 s, 8 white frames then the yellow beyond (the tenth frame at 576.30 s); 1e
+# 306.82 s, 1 white frame with the yellow beyond read on 33 frames since the ego line's last yellow. Between two marks of an
+# ego line on 1d and 1e, moving, its white frames were 10 or more on 16 stretches, and 1-9 on three: those two bays and
+# 1e 601.2 s (7, the 589-614 s left whose line read yellow on 115 of 314 frames)
+YELLOW_OUT_FRAMES = WHITE_CLEAR_FRAMES = LC_CONFIRM_FRAMES
 # a map stop in the window (module docstring)
 LC_SPEED_MIN = NAV_LANE_CHANGE_SPEED_MIN + LC_SPEED_MARGIN  # m/s: the change's speed
 STOP_CURVE_DECEL = 1.5      # m/s^2: map_controls.MAP_STOP_DECEL, the braking curve to a map stop...
@@ -244,13 +288,18 @@ class ModelLanes:
   # itself (room alone counts shoulders and parking strips), only with the ego line read broken white (lanes_toward)
   left_open: bool = field(default=False, compare=False)
   right_open: bool = field(default=False, compare=False)
+  # the model sees the ego line that way, its prob over LINE_PROB_MIN: lane_agreed's "the model's lines"
+  left_seen: bool = field(default=False, compare=False)
+  right_seen: bool = field(default=False, compare=False)
 
 
-def _side(ego_y, ego_prob, outer_y, outer_prob, edge_y, edge_std, sign, width):
+def _side(ego_y, ego_prob, outer_y, outer_prob, edge_y, edge_std, sign, width, spacing=None):
   """(lanes counted on one side, keep ok that way, the count known, open: ModelLanes); sign is +1 for the right, -1 for the
-  left (modelV2 y is right)."""
+  left (modelV2 y is right). spacing: the ego lines' own spacing the next line out is measured against (model_lanes),
+  width when None."""
   room = sign * (edge_y - ego_y)
-  painted = outer_prob > LINE_PROB_MIN and LANE_MIN * width <= sign * (outer_y - ego_y) <= 1.5 * width
+  near = LANE_MIN * min(width, width if spacing is None else spacing)
+  painted = outer_prob > LINE_PROB_MIN and near <= sign * (outer_y - ego_y) <= 1.5 * width
   edge_ok = edge_std < EDGE_STD_MAX
   if not painted or (edge_ok and room < SHOULDER_LANES * width):
     lanes = 0
@@ -263,16 +312,32 @@ def _side(ego_y, ego_prob, outer_y, outer_prob, edge_y, edge_std, sign, width):
 
 
 def model_lanes(line_ys, line_probs, edge_ys, edge_stds) -> ModelLanes:
-  """From modelV2 laneLines [far left, left, right, far right] and roadEdges [left, right] at one distance ahead."""
+  """From modelV2 laneLines [far left, left, right, far right] and roadEdges [left, right] at one distance ahead.
+
+  The next line out counts a lane (painted) from LANE_MIN of the ego lane's width beyond the ego line, the width there the
+  model's two ego lines' spacing whenever one of them is sure and the spacing is a lane's (2.5-4.8 m), if that is narrower
+  than ModelLanes.width (which stays LANE_WIDTH unless both are sure, for the shoulder, the room and the lane bands: a
+  narrower width there would make a 2.5 m strip to the edge no shoulder, and count more lanes in the same room; the BeamNG
+  crossing, test_lane_planner's XING, the curb lane then unplaced). The model places a line it is unsure of where the lane's
+  edge is all the same: drives 1d and 1e (2026-11-06, after dark), moving, the spacing with one ego line unsure had a median
+  of 3.23 and 3.27 m (10th-90th 2.9-3.6, 2.9-4.3), with both sure 3.09 and 3.27 m, and it lay in 2.5-4.8 m on 99% and 92% of
+  the frames. Before, both had to be sure, and at night the curb side's ego line is unsure on most frames (its prob a median
+  0.08 moving, 1e: the car at the curb, no line painted there), so the bar was LANE_WIDTH's 3.6 m, wider than nine in ten of
+  the lanes measured, and a lane beside the car needed its next line out 3.06 m away: a city lane the model put 2.6-2.8 m out
+  was no lane. 1d 575.9-577.4 s, a left's bay opened (the far-left line read yellow at 0.39-1.0, 2.6-2.8 m beyond the ego
+  line read broken white, the lane 2.7-3.0 m wide), counted none (noLane), and the driver signalled and changed lanes
+  himself 104 m out; 1e 364-367 s, the far-left line 2.8 m out at p 0.5-0.72 the same."""
   measured = line_ys[2] - line_ys[1]
-  width = measured if min(line_probs[1], line_probs[2]) > LINE_PROB_MIN and 2.5 <= measured <= 4.8 else LANE_WIDTH
+  lane = 2.5 <= measured <= 4.8
+  width = measured if min(line_probs[1], line_probs[2]) > LINE_PROB_MIN and lane else LANE_WIDTH
+  spacing = measured if max(line_probs[1], line_probs[2]) > LINE_PROB_MIN and lane else LANE_WIDTH
   left, keep_left, left_known, left_open = _side(line_ys[1], line_probs[1], line_ys[0], line_probs[0], edge_ys[0], edge_stds[0], -1.,
-                                                 width)
+                                                 width, spacing)
   right, keep_right, right_known, right_open = _side(line_ys[2], line_probs[2], line_ys[3], line_probs[3], edge_ys[1], edge_stds[1],
-                                                     1., width)
+                                                     1., width, spacing)
   measured = min(line_probs[1], line_probs[2]) > LINE_PROB_MIN
   return ModelLanes(left, right, keep_left, keep_right, width, measured, left_known, right_known, float(line_ys[1]), float(line_ys[2]),
-                    left_open, right_open)
+                    left_open, right_open, line_probs[1] > LINE_PROB_MIN, line_probs[2] > LINE_PROB_MIN)
 
 
 def model_lanes_from_msg(model) -> ModelLanes:
@@ -486,6 +551,59 @@ def lanes_toward(direction: int, lanes: ModelLanes, paint=()) -> int:
   return int(lanes.left_open if direction == LEFT else lanes.right_open)
 
 
+def lane_agreed(direction: int, lanes: ModelLanes, paint, nav_room: int | None = None, right_hand_traffic: bool = True,
+                cleared: bool = False) -> bool:
+  """A lane change toward direction (LEFT or RIGHT) across an ego line the reader read but couldn't make out (its kind unknown,
+  or broken white under BROKEN_WHITE_CONF_MIN; its colour white or unknown), where the rest agrees a lane of ours is beyond it
+  (Kellen, 2026-11-07: "a line the reader can't read is not a reason to stay put when the model's lane lines, road edges and
+  the map's lane count agree a lane is there"). Paint as for change_blocker (the yellow hold applied), four lines read; never
+  across a contrary read (line_contrary: solid, yellow at any confidence read or held, no line). All of:
+  - the model sees the ego line that way (ModelLanes.left_seen, right_seen) and counts a painted lane beyond it: its next line
+    out LANE_MIN to 1.5 lane widths on, a trusted road edge (the count known), after paint_lanes takes out every lane beyond a
+    yellow line. Never by room to the edge alone (left_open, right_open): beside a divided road's yellow left edge misread,
+    the room beyond is the median, and room is what a shoulder or a parking strip leaves too;
+  - and one sign the lane goes our way: the ego line read white at BROKEN_WHITE_CONF_MIN on this frame's own read (white is no
+    centre line; kind unknown is a dash's gaps unresolved, the usual night read); or, toward the far side, the next line out
+    read or held yellow (the centre line beyond the lane, as a turn bay opens: paint_lanes counts one lane before it); or the
+    map's lane list has a lane of ours that way from wherever the car may be in it (nav_room >= 1, None without a list),
+    toward the far side only over an ego line cleared (cleared: LineMarks, read white WHITE_CLEAR_FRAMES times since its last
+    yellow or solid read, or the yellow moved out a lane from it). Toward the far side the model counts the oncoming lane
+    beyond a centre line as readily as a lane of ours, and on a far_bay approach the list is the junction's (desired_changes'
+    bay rule), so there the list alone is no sign over a line whose colour was never read white.
+  The planner asks this only with that way's ego line unmarked (LineMarks, LanePlanner._unread_ok: no yellow or solid read
+  of it since the car's last lane change, unless WHITE_CLEAR_FRAMES white reads of it or the yellow moving out came after),
+  so a centre line read yellow once is never crossed on unread frames after the yellow hold runs out; and only on a frame
+  whose paint the reader read (turnpilotd's plan_paint hands over none unless it did, and the planner asks on four lines as
+  they came in, before the yellow hold pads a frame nobody read to four: 2026-11-07 review, a far-left line read yellow once
+  and every frame after it unread was agreed by its hold, offered and requested), so a frame nobody read is no agreement.
+
+  Drive 1d (2026-11-06, after dark) 575.5-577.7 s: a left's bay opened 127 m out, its lane list [left, straight] placing the
+  car one lane right of it; the ego left line read white 0.58-0.71 (kind unknown, 3 frames broken), then broken of unknown
+  colour, then unknown at 0 from 576.4 s, the far-left line read yellow 0.39-1.0 2.6-2.8 m out, and the driver signalled at
+  577.7 s and changed lanes himself, the planner waiting lineNotBroken and noLane throughout. On both drives the ego lines
+  read kind unknown on 41% (left, 1e) and 90% (right) of moving frames."""
+  if len(paint) != 4 or direction not in (LEFT, RIGHT) or line_contrary(paint, direction) or (nav_room is not None and nav_room <= 0):
+    return False  # (the list with no lane of ours that way: no agreement, whatever else reads)
+  ego, outer = (paint[1], paint[0]) if direction == LEFT else (paint[2], paint[3])
+  counted = paint_lanes(lanes, paint)
+  seen, n, known = (lanes.left_seen, counted.left, lanes.left_known) if direction == LEFT else \
+    (lanes.right_seen, counted.right, lanes.right_known)
+  if not (seen and n >= 1 and known):
+    return False
+  far = direction == (LEFT if right_hand_traffic else RIGHT)
+  return (ego.color == 'white' and ego.confidence >= BROKEN_WHITE_CONF_MIN) or (far and _yellow(outer)) or \
+    (nav_room is not None and nav_room >= 1 and (cleared or not far))
+
+
+def oncoming_in_lane(objects, direction: int, width: float = LANE_WIDTH) -> bool:
+  """Something coming toward the car, faster than STOPPED_V over ground, up to STOPPED_X_M ahead in the lane one over toward
+  direction (LEFT or RIGHT): that lane is an oncoming one, whatever its line reads. objects: as for stopped_in_lane. Drive 1e
+  (2026-11-06) 364.2-367.4 s, a sharp left's approach: cars at 2.7-3.1 m left closing at 3-6 m/s over ground, 7-25 m ahead,
+  beyond an ego line read solid of unknown colour; target_lane_blocked counts only one within LC_CLOSING_T_S of the car."""
+  return any(0. < obj.x < STOPPED_X_M and obj.vx < -STOPPED_V and 0.5 * width < obj.y * direction < 1.5 * width + LC_LANE_MARGIN_M
+             for obj in objects)
+
+
 def far_bay(maneuver, right_hand_traffic: bool = True) -> bool:
   """A turn toward the far side (left where traffic keeps right) whose lane list has the lanes it leaves from all on the far
   side of the others ([left (active), straight, straight]). The list describes the junction, its turn bay open; on the
@@ -566,24 +684,51 @@ def desired_changes(maneuver, lanes: ModelLanes, right_hand_traffic: bool = True
 
 
 def change_blocker(direction: int, lanes: ModelLanes, paint=(), objects=(), right_hand_traffic: bool = True,
-                   nav_room: int | None = None, unpainted_curb: bool = False) -> str:
+                   nav_room: int | None = None, unpainted_curb: bool = False, unread_ok: bool = False,
+                   line_cleared: bool = False) -> str:
   """'' when one lane change toward direction (LEFT or RIGHT) is into a valid travel lane, else the abort reason why not
   (a TurnpilotPlan.LaneChangeAbort name). paint: as for paint_lanes, held yellow included; objects: as for stopped_in_lane;
   nav_room: as nav_room() returns it, None without the map's lane list; unpainted_curb: a curb-side change may go on less
-  than paint (curb_lane_unpainted; LanePlanner, under TurnPilotAlwaysDrive)."""
+  than paint (curb_lane_unpainted; LanePlanner, under TurnPilotAlwaysDrive); unread_ok: a line the reader couldn't make out
+  may be crossed where the rest agrees a lane is there (lane_agreed; LanePlanner, that way's line unmarked and this frame's
+  paint read); line_cleared: that way's ego line cleared (lane_agreed's cleared, LineMarks). Anything coming toward the car
+  in that lane makes it no lane of ours (oncoming_in_lane: noLane), on every path."""
   if direction not in (LEFT, RIGHT):
     return 'noLane'
   if not right_hand_traffic and direction == RIGHT:
     return 'noLane'  # away from the curb in left-hand traffic: the center line is broken white there
-  if not broken_white_toward(paint, direction) and not (unpainted_curb and curb_lane_unpainted(direction, lanes, paint, right_hand_traffic)):
+  if not broken_white_toward(paint, direction) and not (unpainted_curb and curb_lane_unpainted(direction, lanes, paint, right_hand_traffic)) \
+     and not (unread_ok and lane_agreed(direction, lanes, paint, nav_room, right_hand_traffic, line_cleared)):
     return 'lineNotBroken'
   if lanes_toward(direction, lanes, paint) == 0:
     return 'noLane'  # the model sees no lane that way, nor room for one beyond broken white, or only beyond a yellow line
   if nav_room is not None and nav_room <= 0:
     return 'noLane'  # the map's lane list has no lane that way: the model's are oncoming, or not where it can place the car
+  if oncoming_in_lane(objects, direction, lanes.width):
+    return 'noLane'  # an oncoming lane, whatever its line reads
   if stopped_in_lane(objects, direction, lanes.width):
     return 'laneParked'
   return ''
+
+
+def soft_block(direction: int, blocker: str, lanes: ModelLanes, paint, objects=(), nav_room: int | None = None,
+               right_hand_traffic: bool = True) -> bool:
+  """change_blocker's blocker toward direction is the want of a read or of the model's count, nothing read against the lane:
+  lineNotBroken with no contrary read of the ego line that way (line_contrary: solid, yellow read or held, no line), a frame
+  nobody read included; or noLane by the model's count alone with the count not known (its next line out under
+  LINE_PROB_MIN this frame with room beyond, the edge's std over EDGE_STD_MAX: ModelLanes.left_known, right_known), never a
+  road edge the model is sure lies beside the line, the lane list's, an oncoming car's or the far side's in left-hand
+  traffic. Such a frame keeps an offer's confirm count and an offer up, for LC_UNSURE_MAX_S past the last frame that passed,
+  and nothing is offered or requested on it (LanePlanner.update, _follow_up). Before 2026-11-07 every one reset the count, and at night
+  nothing reached LC_CONFIRM_FRAMES in a row: 1d 576.4-577.4 s, the far-left line's prob 0.15-0.74 around LINE_PROB_MIN,
+  the lane counted on at most eight frames running, then not; 1e seg 8-9, the left edge's std over EDGE_STD_MAX once."""
+  if direction not in (LEFT, RIGHT) or line_contrary(paint, direction):
+    return False
+  if blocker == 'lineNotBroken':
+    return True
+  known = lanes.left_known if direction == LEFT else lanes.right_known
+  return blocker == 'noLane' and not known and (right_hand_traffic or direction == LEFT) and \
+    not (nav_room is not None and nav_room <= 0) and not oncoming_in_lane(objects, direction, lanes.width)
 
 
 def curb_lane_unpainted(direction: int, lanes: ModelLanes, paint, right_hand_traffic: bool = True) -> bool:
@@ -680,16 +825,51 @@ def target_lane_blocked(objects, direction: int, v_ego: float, width: float = LA
 
 class YellowHold:
   """Per modelV2 lane line, how long and how far since it was last read yellow; it reads yellow until both pass
-  YELLOW_HOLD_S and YELLOW_HOLD_M. Lane changes move the holds with the lines."""
+  YELLOW_HOLD_S and YELLOW_HOLD_M. Lane changes move the holds with the lines.
+
+  The yellow moving out a lane ends an ego line's hold: since the ego line's last yellow (any confidence) or solid read, it
+  read white at BROKEN_WHITE_CONF_MIN (any kind but none) and the next line out that way read yellow, YELLOW_OUT_FRAMES
+  frames of the two together with at least one of each, the line beyond read yellow this frame and the ego line's last white
+  read at most WHITE_HOLD_S and WHITE_HOLD_M before (moved_out, which clears the line's mark: LineMarks). That is a turn bay
+  opening beside the centre line, or a lane added on the far side: the centre line now lies beyond the lane, a white line
+  where it was. The hold is there so a worn stretch of a centre line opens no gap, and a worn stretch reads no white with a
+  yellow line a lane further out. One frame of each did it before (2026-11-07 review), and 1e 243.35-244.30 s had them: a
+  centre line read white 0.61 on 2 frames, the line beyond yellow on 1, released, the lane beyond the centre line crossable on
+  4 frames. A pair of frames can be two misreads; ten are the two lines' reads agreeing. Drive 1d (2026-11-06, after dark), a left
+  with the lane list [left, straight]: the ego left line read solid and unknown yellow to 574.0 s, white 0.67-0.71 over
+  575.5-576.0 s (kind unknown, then broken), and from 576.25 s the far-left line read yellow 0.39-1.0 2.6-2.8 m beyond it;
+  held to 582.5 s (100 m at 11.7 m/s), past the window's end, the bay was no lane all its length, and the driver signalled
+  at 577.7 s and changed lanes himself 104 m out. 1e 305-314 s (a left, [left (active), straight, straight]) the same: the
+  far-left line yellow 0.75-1.0 2.5-3.3 m out from 305 s, the ego line broken white 0.64-0.75 at 310.2-311.4 s."""
   def __init__(self):
     self.since = [(math.inf, math.inf)] * 4
+    self.white = [(math.inf, math.inf)] * 4  # how long and how far since each line's last white read (_white): moved out
+    self.whites = [0] * 4                    # ...frames each line read white since its last yellow or solid read
+    self.outs = [0] * 4                      # ...frames the line beyond an ego line read yellow since then
+    self.moved_out = [False] * 4             # this frame, the yellow moved out a lane from that ego line (LineMarks)
 
   def update(self, paint, v_ego: float, dt: float, frozen: bool) -> tuple:
     """paint as for paint_lanes; frozen: a lane change is under way, so the lines may be renumbering. Returns the paint with
     every held line read yellow (four entries whenever anything is held)."""
     self.since = [(t + dt, d + v_ego * dt) for t, d in self.since]
+    self.white = [(t + dt, d + v_ego * dt) for t, d in self.white]
+    self.moved_out = [False] * 4
     if len(paint) == 4 and not frozen:
       self.since = [(0., 0.) if _yellow(p) else hold for p, hold in zip(paint, self.since, strict=True)]
+      self.white = [(0., 0.) if _white(p) else w for p, w in zip(paint, self.white, strict=True)]
+      for i, p in enumerate(paint):
+        if p.color == 'yellow' or p.kind == 'solid':  # (as LineMarks marks a line) the evidence starts over
+          self.whites[i] = self.outs[i] = 0
+        elif _white(p):
+          self.whites[i] += 1
+      for ego, outer in ((1, 0), (2, 3)):  # the yellow moved out a lane: the ego line's hold ends
+        p = paint[ego]
+        if not _yellow(paint[outer]) or p.color == 'yellow' or p.kind == 'solid':
+          continue
+        self.outs[ego] += 1
+        wt, wd = self.white[ego]
+        if self.whites[ego] and self.whites[ego] + self.outs[ego] >= YELLOW_OUT_FRAMES and wt < WHITE_HOLD_S and wd < WHITE_HOLD_M:
+          self.since[ego], self.moved_out[ego] = (math.inf, math.inf), True
     return self.apply(paint)
 
   def apply(self, paint) -> tuple:
@@ -703,15 +883,17 @@ class YellowHold:
 
   def shift(self, direction: int) -> None:
     """The car moved one lane toward direction (LEFT or RIGHT): each line is now one index further the other way. With the
-    direction unknown, any hold covers all four lines, since it could be any of them now."""
+    direction unknown, any hold covers all four lines, since it could be any of them now. A line's white reads move with it;
+    the yellow beyond an ego line is counted afresh (the line beyond the new one wasn't watched)."""
     none = (math.inf, math.inf)
+    self.outs = [0] * 4
     if direction == LEFT:
-      self.since = [none] + self.since[:3]
+      self.since, self.white, self.whites = [none] + self.since[:3], [none] + self.white[:3], [0] + self.whites[:3]
     elif direction == RIGHT:
-      self.since = self.since[1:] + [none]
+      self.since, self.white, self.whites = self.since[1:] + [none], self.white[1:] + [none], self.whites[1:] + [0]
     else:
       latest = min(self.since)
-      self.since = [latest] * 4
+      self.since, self.white, self.whites = [latest] * 4, [none] * 4, [0] * 4  # white is the permissive answer: none assumed
 
 
 class WhiteHold:
@@ -763,6 +945,66 @@ class WhiteHold:
       self.since, self.confidence = self.since[1:] + [none], self.confidence[1:] + [0.]
     else:
       self.since, self.confidence = [none] * 4, [0.] * 4
+
+
+class LineMarks:
+  """Per modelV2 lane line, what its own reads have said of its colour, three ways: marked, read yellow (any confidence) or
+  solid; cleared, read white (at BROKEN_WHITE_CONF_MIN, any kind but none) on WHITE_CLEAR_FRAMES frames since its last mark,
+  or the yellow moved out a lane from it since (YellowHold.moved_out: a turn bay opening); or neither, as every line is from
+  the start. lane_agreed crosses a line the reader couldn't make out only while it is unmarked (LanePlanner._unread_ok), and
+  toward the far side takes the map's lane list as a sign only once it is cleared (LanePlanner._cleared).
+
+  Marked: the yellow hold keeps a yellow read for YELLOW_HOLD_S and YELLOW_HOLD_M; a centre line can go unread longer than
+  that at night (1d and 1e, 2026-11-06: three of the thirty unsure stretches of an ego line between two reads of it 3.6-7.3
+  s), and on an undivided road the model counts the oncoming lane beyond it (its edge line painted a lane out), so with the
+  hold run out the agreement would be the oncoming lane's. One white read cleared it before (2026-11-07 review): 1e 243.35
+  s, a centre line read yellow 3.3 s earlier read unknown kind white 0.61 on 2 frames, and lane_agreed crossed it on 4
+  frames 1.0-1.4 s on until it read solid; 1e 601.2 s, a line that read yellow on 115 of 314 frames read white on 7 between
+  two of them. A bay opening beside the centre line puts a white line where the yellow was and the yellow a lane out, and
+  clears it as it ends the hold (1d 575.5-576.3 s; 1e 306.82 s).
+
+  Cleared, for the far side's map-list sign: there the model's count can't tell our lane from the oncoming one beyond a
+  centre line, and on a far_bay approach the list is the junction's, placing the car a lane or two short of its bay
+  (desired_changes' bay rule); so the list says a lane of ours is there only over a line read white. Before (2026-11-07
+  review), a centre line never read yellow or white (worn, or its colour unknown at night) on a [left (active), straight]
+  approach, the oncoming lane counted beyond it, was offered left at the window's start, 293 m out.
+
+  Lane changes move the reads with the lines; one of unknown direction marks every line any was and clears none (the
+  cautious answer)."""
+  def __init__(self):
+    self.marked = [False] * 4
+    self.cleared = [False] * 4
+    self.whites = [0] * 4  # frames each line read white since its last mark (or the start)
+
+  def update(self, paint, frozen: bool, moved_out=(False,) * 4) -> None:
+    """paint: this frame's reads as handed in, before either hold; empty when not read. frozen: a lane change under way.
+    moved_out: YellowHold.moved_out, this frame's."""
+    if len(paint) != 4 or frozen:
+      return
+    for i, p in enumerate(paint):
+      if p.kind == 'solid' or p.color == 'yellow':
+        self.marked[i], self.cleared[i], self.whites[i] = True, False, 0
+      elif _white(p):
+        self.whites[i] += 1
+      if moved_out[i] or self.whites[i] >= WHITE_CLEAR_FRAMES:
+        self.marked[i], self.cleared[i] = False, True
+
+  def new_maneuver(self) -> None:
+    """A new maneuver: no line is cleared for it yet (marked kept, the cautious side). Review 2026-11-07 (LC-1): cleared never
+    aged nor reset, so a clear earned by one road's line (1d 370.75 s: the junction's own paint read unknown-kind white 10 m
+    out, 1 of the 8 turns of 1d and 1e) carried through the turn onto the next road's centre line, and the far side's list
+    alone agreed a change over a line the reader never made out, into the oncoming lane (offered at 293 m in the probe). Its
+    white reads count afresh: a real lane line clears again in WHITE_CLEAR_FRAMES (0.5 s). Never aged on its own: a line read
+    white, then unknown at night, is still the one read white (test_lane_planner_night)."""
+    self.cleared, self.whites = [False] * 4, [0] * 4
+
+  def shift(self, direction: int) -> None:
+    if direction == LEFT:
+      self.marked, self.cleared, self.whites = [False] + self.marked[:3], [False] + self.cleared[:3], [0] + self.whites[:3]
+    elif direction == RIGHT:
+      self.marked, self.cleared, self.whites = self.marked[1:] + [False], self.cleared[1:] + [False], self.whites[1:] + [0]
+    else:
+      self.marked, self.cleared, self.whites = [any(self.marked)] * 4, [False] * 4, [0] * 4
 
 
 class BayLatch:
@@ -908,6 +1150,10 @@ class LanePlanner:
     self.yellow = YellowHold()
     self.white = WhiteHold()          # applied after the yellow hold; never in keeps (turnpilotd's keep gate: yellow.apply)
     self.bay = BayLatch()             # the bay rule's latch (desired_changes), on each frame's own reads
+    self.marks = LineMarks()          # lines read yellow or solid: never crossed on less than a read (lane_agreed)
+    self._parked = False              # something stopped in the lane that way on a frame of the window, since the car's last
+                                      # lane change: the room beyond the line places nothing for LC-03
+    self._lane_painted = False        # ...LC-03 placed by a painted lane counted that way (not the room beyond the line)
     self.lines = LineWatch()          # the car crossing a line, by the model's lines: a change is counted only on that
     self._before: ModelLanes | None = None  # the model's lanes the frame before the change under way started
     self._last_lanes: ModelLanes | None = None
@@ -920,9 +1166,13 @@ class LanePlanner:
     self._wait_t = 0.
     self._pre_t = 0.
     self._unsure_t = 0.               # s an offer has waited on the line read short of broken white since its last frame read it
+    self._soft_t = 0.                 # s the change being confirmed has waited on soft_block frames since its last that passed
     self._pending = ''                # an abort in REQUEST, said once DesireHelper is seen not to have started
     self._pending_t = 0.
     self._wait, self._want, self._unreachable = 'none', 0, False  # this frame's LaneDecision.wait, want, unreachable
+    # this frame a soft one inside a live confirm count (soft_block or the white hold alone, the count kept): the change still
+    # pending, whatever its wait says (turnpilotd's lane_pending, LC-4)
+    self.confirm_live = False
     self._unreachable_logged = None   # the maneuver whose unreachable lane was logged
     self._offer_driver = True         # who signals this offer, latched at its warning (module docstring)
     self._lane_seen = False           # a travel lane read the way wanted on a frame of the window, since the car's last lane
@@ -973,15 +1223,17 @@ class LanePlanner:
     has been lit for the offer's side (car_signals.py), lead_m the legal lead, car_block the port holding off (the
     driver's other side, hazards), signals_failed the car's signal failed mid-offer: the driver's path takes over."""
     self._wait, self._want, self._unreachable = 'none', 0, False
+    self.confirm_live = False
     if self._abort_t > 0.:
       self._abort_t -= dt
       if self._abort_t <= 0.:
         self.abort = 'none'
     if maneuver_id != self._done_id:  # a new maneuver: its changes are counted from here
       self._done_id, self.done, self._start = maneuver_id, 0, None
-      self._lane_seen = self._curb_marked = False
+      self._lane_seen = self._curb_marked = self._parked = self._lane_painted = False
       self._room_seen = 0
       self.bay.reset()
+      self.marks.new_maneuver()
       self._carry = LaneChange.none
     if maneuver_id != self._judged_id:
       self._blocked = False
@@ -1005,10 +1257,13 @@ class LanePlanner:
       self.yellow.shift(self._lc_dir if made else 0)
       self.white.shift(self._lc_dir if made else 0)
       self.bay.shift(self._lc_dir if made else 0)  # read from the lane the car left: open
+      self.marks.shift(self._lc_dir if made else 0)
     # the yellow hold first, then the white: a line held yellow is never made white. own: this frame's own reads, the yellow
     # hold applied but not the white, for what the white hold may not do (a request, LC-03's placement: held_only below)
     raw, own = paint, self.yellow.update(paint, v_ego, dt, changing)
     paint = self.white.update(own, v_ego, dt, changing, read)
+    # this frame's yellow or solid marks its line, its white reads or the yellow moving out a lane clear it, before any check
+    self.marks.update(raw, changing, self.yellow.moved_out)
     # the bay rule's latch (BayLatch), on this frame's reads as handed in. The lane it counts that way only on paint read: with
     # none (and no hold to pad it) paint_lanes gives the model's raw count, the oncoming lane beyond the centre line
     far = LEFT if right_hand_traffic else RIGHT
@@ -1036,12 +1291,12 @@ class LanePlanner:
       self._lc_dir = None
       self.lines.reset()
       self._cooldown = max(self._cooldown, LC_COOLDOWN_S)
-      self._lane_seen = self._curb_marked = False  # read from the lane the car left
+      self._lane_seen = self._curb_marked = self._parked = self._lane_painted = False  # read from the lane the car left
       self._room_seen = 0
     elif crossed:
       self.done, self._start = None, None
       self.lines.reset()
-      self._lane_seen = self._curb_marked = False
+      self._lane_seen = self._curb_marked = self._parked = self._lane_painted = False
       self._room_seen = 0
     if self.ours:  # DesireHelper is done with it, whether or not a held blinker keeps it in preLaneChange
       self.ours = False
@@ -1088,17 +1343,34 @@ class LanePlanner:
       idle_reason = idle_reason or (AFTER_STOP_REASON if stop_wait == 'afterStop' else UNREACHABLE_REASON)
     wanted_dir = LEFT if wanted > 0 else RIGHT if wanted < 0 else 0
     wanted_room = nav_room(maneuver, lanes, wanted_dir, right_hand_traffic, paint, self.done, self._start) if wanted_dir else None
-    blocker = change_blocker(wanted_dir, lanes, paint, objects, right_hand_traffic, wanted_room, unpainted) if wanted_dir else ''
-    held_only = self._held_only(wanted_dir, blocker, lanes, own, objects, right_hand_traffic, wanted_room, unpainted)
-    if wanted_dir and end < distance < start and lanes.measured and not blocker and not held_only:
+    # lane_agreed only on paint read this frame, as curb_lane_unpainted: the yellow hold pads a frame nobody read to four lines,
+    # the held one yellow and the rest unknown, and a held far-left yellow (its sign) or the list agreed every such frame
+    unread_ok, cleared = self._unread_ok(wanted_dir, right_hand_traffic) and read, self._cleared(wanted_dir)
+    blocker = change_blocker(wanted_dir, lanes, paint, objects, right_hand_traffic, wanted_room, unpainted, unread_ok, cleared) \
+      if wanted_dir else ''
+    held_only = self._held_only(wanted_dir, blocker, lanes, own, objects, right_hand_traffic, wanted_room, unpainted, unread_ok, cleared)
+    # a frame nobody read (no paint, and no hold padding it: a wide camera run, a stop sweep) is no evidence either way: it
+    # keeps an offer's confirm count and LC-03's streak, as a frame valid by the white hold alone does, and nothing is offered,
+    # requested or placed on it (Kellen, 2026-11-07: no give-ups for lack of a read). 1e and 1d (2026-11-06) moving, the wide
+    # camera's runs read no paint on 18% and 26% of frames, 13 and 13 of their stretches over 3 s, and one unread frame reset
+    # a confirm count of nine
+    unread = bool(wanted_dir) and not read and not paint and blocker == 'lineNotBroken'
+    soft = bool(wanted_dir) and bool(blocker) and soft_block(wanted_dir, blocker, lanes, paint, objects, wanted_room, right_hand_traffic)
+    keep = held_only or unread  # LC-03's room streak: a frame valid by the white hold alone, or one nobody read
+    in_window = end < distance < start
+    if wanted_dir and in_window and stopped_in_lane(objects, wanted_dir, lanes.width):
+      self._parked = True  # something stopped in that lane on a frame of the window: the room beyond the line is a parking strip
+    if wanted_dir and in_window and lanes.measured and not blocker and not held_only:
       # a travel lane that way, offered or not (LC-03): on one frame by the model's painted count, as ever; by the room beyond
       # broken white only on LC_CONFIRM_FRAMES in a row, the bar an offer needs. With no line seen beyond, one frame of broken
       # white is weak evidence for a skip: the whole-drive replay of 1e with a right every 40 s placed one by a single frame.
-      # Never on a frame valid by the white hold alone (held_only): that keeps the streak, as it keeps an offer's confirm count
+      # Never on a frame valid by the white hold alone (held_only): that keeps the streak, as it keeps an offer's confirm count.
+      # A room placement is undone by a stopped car seen in that lane on any frame of the window (_parked, _judge_end)
       painted = (paint_lanes(lanes, paint).left if wanted_dir == LEFT else paint_lanes(lanes, paint).right) > 0
+      self._lane_painted = self._lane_painted or painted
       self._room_seen = 0 if painted else self._room_seen + 1
       self._lane_seen = self._lane_seen or painted or self._room_seen >= LC_CONFIRM_FRAMES
-    elif not (held_only and end < distance < start and lanes.measured):
+    elif not (keep and in_window and lanes.measured):
       self._room_seen = 0
     if self._judged_id != maneuver_id and maneuver is not None and 0. < distance <= end and self.phase == Phase.IDLE and \
        not self._pending:
@@ -1147,17 +1419,27 @@ class LanePlanner:
         self._carry_t = 0.
     if not self.paint_rule or not inputs_valid or stop_wait or not (win_end < distance < win_start):
       want_dir = 0
-    if want_dir and blocker:
+    if want_dir and blocker and not soft:
       want_dir = 0
     direction = _toward(want_dir)
-    # a frame valid by the white hold alone (held_only) keeps the confirm count, neither counted nor a break in it, and is
-    # never the one an offer is made on: the same need LC_CONFIRM_FRAMES frames read broken white by their own read
-    held_only = held_only and direction != LaneChange.none
+    # a frame valid by the white hold alone (held_only), or one whose blocker is the want of a read or of the model's count
+    # (soft_block: a frame nobody read included), keeps the confirm count, neither counted nor a break in it, for
+    # LC_UNSURE_MAX_S past the last frame that passed, and is never the one an offer is made on: the same need
+    # LC_CONFIRM_FRAMES frames that pass by their own read, nothing read against it between them
+    held_only = (held_only or soft) and direction != LaneChange.none
     if not held_only:
       self._confirm = self._confirm + 1 if direction == self._candidate else 1
-    elif direction != self._candidate:
-      self._confirm = 0
+      self._soft_t = 0.
+    else:
+      self._soft_t += dt
+      if direction != self._candidate or self._soft_t >= LC_UNSURE_MAX_S - 1e-6:
+        self._confirm = 0
     self._candidate = direction
+    # review 2026-11-07 (LC-4): such a frame's wait is its blocker (lineNotBroken, noLane), not one turnpilotd counts as a
+    # change pending, so the wait alternated with 'confirming' frame to frame and the turn's prompt to signal flickered (1d
+    # 576.65-577.45 s, a left 119-110 m out: every 50-400 ms), its chime cut to a blip, and a lamp lit for it was taken as the
+    # change's go-ahead at the offer's first frame (WARN's rule, D15's case). The count live, the change is pending
+    self.confirm_live = held_only and self._confirm > 0
     if direction == LaneChange.none or self._confirm < LC_CONFIRM_FRAMES:
       return self._decision(idle_reason)
     if left_blindspot if want_dir == LEFT else right_blindspot:
@@ -1180,15 +1462,36 @@ class LanePlanner:
     desired_changes': a car never offered one for its speed counts), the car is placed, the planner is on and the model sees a
     lane that way (blocker isn't noLane)."""
     self._judged_id = maneuver_id
-    placed = not lane_unconfirmed(maneuver, lanes, right_hand_traffic, paint, self.done, self._start) if nav else self._lane_seen
+    # without a list: a painted lane counted that way places the car; the room beyond the line only with nothing seen stopped
+    # in that lane all window (drive 1e 722-737 s: a right, the room 3.2-4.6 m beyond the right ego line, parked cars 4.4-4.7 m
+    # right 7-33 m ahead, placed by the room between them, and the right skipped "Can't Reach Turn Lane" for a parking strip)
+    placed = not lane_unconfirmed(maneuver, lanes, right_hand_traffic, paint, self.done, self._start) if nav else \
+      self._lane_painted or (self._lane_seen and not self._parked)
     self._blocked = bool(wanted) and placed and self.paint_rule and blocker != 'noLane'
     if wanted:
       cloudlog.event("turnpilot.lane_blocked" if self._blocked else "turnpilot.lane_not_blocked", error=self._blocked, want=wanted,
                      distance=round(distance, 1), v_ego=round(v_ego, 2), lane_list=bool(nav), placed=placed, blocker=blocker,
                      abort=self.abort, wait=self._last_wait)
 
+  def _unread_ok(self, direction: int, right_hand_traffic: bool = True) -> bool:
+    """A line the reader couldn't make out may be crossed toward direction (lane_agreed): the ego line that way unmarked, and
+    toward the curb side never read solid white or yellow on a frame of the window (4.10's latch, _curb_marked, as
+    curb_lane_unpainted has it). Review 2026-11-07 (LC-2): the latch gated only the 4.10 change, so a curb-side line read
+    solid, then unknown-kind white on WHITE_CLEAR_FRAMES frames (a solid line part-lit, worn or in dappled shade: lane_paint
+    gives kind unknown at 0.5-0.8 coverage), was crossed on lane_agreed's white sign, the switch on or off; HEAD offered
+    nothing there. The caller adds that this frame's paint was read."""
+    if direction not in (LEFT, RIGHT) or self.marks.marked[1 if direction == LEFT else 2]:
+      return False
+    curb = RIGHT if right_hand_traffic else LEFT
+    return not (direction == curb and self._curb_marked)
+
+  def _cleared(self, direction: int) -> bool:
+    """The ego line toward direction cleared by its white reads or the yellow moving out (LineMarks): lane_agreed's far side."""
+    return direction in (LEFT, RIGHT) and self.marks.cleared[1 if direction == LEFT else 2]
+
   @staticmethod
-  def _held_only(direction, blocker, lanes, own, objects, right_hand_traffic, room, unpainted) -> bool:
+  def _held_only(direction, blocker, lanes, own, objects, right_hand_traffic, room, unpainted, unread_ok=False,
+                 cleared=False) -> bool:
     """A change toward direction valid (blocker '', change_blocker's on the white hold's paint) by the white hold alone: on
     own, this frame's reads with the yellow hold but not the white, change_blocker says no (the ego line broken of unknown
     colour, so not broken white; lanes_toward's room beyond it uncounted). Such a frame keeps an offer's confirm count and
@@ -1199,7 +1502,7 @@ class LanePlanner:
     edge and on half of them no lane the model counted), broken yellow 0.40-0.57 from 322.67 s; 23 of the 26 frames the hold
     made broken white on that line in all of 1d lay within 5 s of a yellow read of it (1e: 10 of 67)."""
     return bool(direction) and not blocker and \
-      change_blocker(direction, lanes, own, objects, right_hand_traffic, room, unpainted) != ''
+      change_blocker(direction, lanes, own, objects, right_hand_traffic, room, unpainted, unread_ok, cleared) != ''
 
   def _follow_up(self, maneuver, maneuver_id, distance, end, want_dir, fast, lanes, paint, objects, lc_state, v_ego,
                  left_blinker, right_blinker, left_blindspot, right_blindspot, driver_signals, right_hand_traffic, dt,
@@ -1209,14 +1512,16 @@ class LanePlanner:
     this frame's paint was read (update's); own: this frame's reads before the white hold (update's; paint when None).
 
     The line that way short of broken white aborts the offer (lineNotBroken) only on a contrary read (line_contrary: solid,
-    yellow read or held, no line) or on a frame with no paint read at all (nothing looked at the line: a wide camera run, a
-    stop sweep, a stale scene). Read but unsure (its kind unknown, broken of unknown colour, broken white short of
-    BROKEN_WHITE_CONF_MIN; or valid by the white hold alone, _held_only) the offer waits: up, its countdown and timeouts
-    running, but nothing requested on such a frame, so DesireHelper starts the change only on one that reads broken white
-    by its own read. The rest of change_blocker (the lane list's room, a parked lane) is checked on it as on any frame; the
-    model's lane count isn't, lanes_toward counting one beyond broken white only. Drive 1e seg 8-9 (2026-11-06): the left ego
-    line's reads flicked between broken white and unknown kind (white) every few tenths of a second, and an offer replayed
-    there died on its first unsure frame.
+    yellow read or held, no line). Read but unsure (its kind unknown, broken of unknown colour, broken white short of
+    BROKEN_WHITE_CONF_MIN, with nothing agreeing a lane is there, lane_agreed; or valid by the white hold alone, _held_only),
+    or a frame with no paint read at all (nothing looked at the line: a wide camera run, a stop sweep, a stale scene; it
+    aborted the offer before 2026-11-07, Kellen: no give-ups for lack of a read; 1e 776.8-782.5 s, a right's offer out on
+    broken white read and requested, died on the wide camera's first unread frames at 4 m/s), the offer waits: up, its
+    countdown and timeouts running, but nothing requested on such a frame, so DesireHelper starts the change only on one that
+    passes by its own read (broken white, or lane_agreed). The rest of change_blocker (the lane list's room, a parked lane)
+    is checked on it as on any frame; the model's lane count isn't, lanes_toward counting one beyond broken white only. Drive
+    1e seg 8-9 (2026-11-06): the left ego line's reads flicked between broken white and unknown kind (white) every few tenths
+    of a second, and an offer replayed there died on its first unsure frame.
 
     The wait lasts LC_UNSURE_MAX_S from the last frame read broken white, then aborts lineNotBroken, the lamp out and the
     abort said; its clock stops while the blind spot reads occupied (the car beside hides the line; LC-01's hold goes on). A
@@ -1227,7 +1532,7 @@ class LanePlanner:
     2 s (a dash's colour or kind dropping out, the longest 1.95 s: 1e 525.5-527.4 s, broken of unknown colour); the three
     longer, 3.6-7.3 s, read nothing of the line (kind and colour unknown at 0 confidence) on 86-90% of their frames. Nothing
     goes on an unsure frame, so the model's lane count isn't asked on it (the edge's std flickering over EDGE_STD_MAX at night
-    would abort the offer on noLane there too); the request frame asks it, broken white by its own read."""
+    would abort the offer on noLane there too); the request frame asks it, passing by its own read."""
     d = _direction(self.offer)
     if not self.paint_rule:
       return self._abort('turnedOff')
@@ -1241,15 +1546,23 @@ class LanePlanner:
       return self._abort('tooLate')
     occupied = left_blindspot if d == LEFT else right_blindspot
     room = nav_room(maneuver, lanes, d, right_hand_traffic, paint, self.done, self._start)
-    reason = change_blocker(d, lanes, paint, objects, right_hand_traffic, room, unpainted)
-    held_only = self._held_only(d, reason, lanes, paint if own is None else own, objects, right_hand_traffic, room, unpainted)
-    unsure = (reason == 'lineNotBroken' or held_only) and read and not line_contrary(paint, d)
+    unread_ok, cleared = self._unread_ok(d, right_hand_traffic) and read, self._cleared(d)  # (agreement only on paint read: update's)
+    reason = change_blocker(d, lanes, paint, objects, right_hand_traffic, room, unpainted, unread_ok, cleared)
+    held_only = self._held_only(d, reason, lanes, paint if own is None else own, objects, right_hand_traffic, room, unpainted,
+                                unread_ok, cleared)
+    # read but unsure, nobody read this frame, or no lane by the model's count alone (soft_block): waits, nothing requested
+    unsure = held_only or (bool(reason) and soft_block(d, reason, lanes, paint, objects, room, right_hand_traffic))
     if unsure:
-      reason = 'noLane' if room is not None and room <= 0 else 'laneParked' if stopped_in_lane(objects, d, lanes.width) else ''
+      waited = reason or 'lineNotBroken'
+      # no lane by what is read for sure: the list's none, an oncoming car, or a road edge the model is sure lies beside the
+      # line (the count known, none: the lane ended), aborted at once as on any frame
+      edge = lanes.left == 0 and lanes.left_known if d == LEFT else lanes.right == 0 and lanes.right_known
+      reason = 'noLane' if (room is not None and room <= 0) or oncoming_in_lane(objects, d, lanes.width) or edge else \
+        'laneParked' if stopped_in_lane(objects, d, lanes.width) else ''
       if not occupied:  # a car in the blind spot hides the line beside it: the clock stops while it holds the change (LC-02)
         self._unsure_t += dt
       if not reason and self._unsure_t >= LC_UNSURE_MAX_S - 1e-6:
-        reason = 'lineNotBroken'  # no frame has read the line for LC_UNSURE_MAX_S: the lamp goes out, said
+        reason = waited  # no frame has passed for LC_UNSURE_MAX_S: the lamp goes out, said
     elif not reason:
       self._unsure_t = 0.
     if reason:
@@ -1351,6 +1664,7 @@ class LanePlanner:
   def _reset(self) -> None:
     self.phase, self.offer, self.countdown, self._carry, self._carry_t = Phase.IDLE, LaneChange.none, 0., LaneChange.none, 0.
     self._confirm, self._candidate, self._wait_t, self._pre_t, self._unsure_t = 0, LaneChange.none, 0., 0., 0.
+    self._soft_t = 0.
     self._pending, self._pending_t = '', 0.
     self._hold, self._clear_t = 'none', 0.
 

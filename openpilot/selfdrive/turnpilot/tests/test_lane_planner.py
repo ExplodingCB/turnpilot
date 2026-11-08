@@ -362,9 +362,15 @@ def test_left_turn_on_three_lane_road_warns_then_changes_twice():
   assert not drive.aborts and distance < 100.
 
 
-def test_never_without_broken_white():
+CONTRARY = (SW, SY, BY, NO_LINE)
+UNREADABLE = (UNKNOWN, UNSURE_BW, COLORLESS, LinePaint('unknown', 'white', 0.9, 0.3))
+
+
+def test_never_across_a_contrary_read_nor_on_paint_nobody_read():
+  """Solid, yellow or no line read: never, the map's lane list and the model's lanes notwithstanding. Paint nobody read: never
+  either (lane_agreed needs a read; the lines unreadable, test_an_unreadable_line_goes_where_the_map_and_the_model_agree)."""
   m = maneuver("turn", "left", THREE_LANES_LEFT_TURN)
-  for p in NOT_BW:
+  for p in CONTRARY:
     drive = Drive(lanes_left=2, lanes_right=0, paint=lambda left, right, p=p: paint(left=p, right=SW))
     drive.run(m, 500., 40.)
     assert not drive.offers and not drive.requests, p
@@ -446,12 +452,16 @@ def test_aborts_before_the_change_starts():
     assert drive.lp.phase == Phase.WARN
     return drive, distance
 
-  # the line turns solid, yellow or none, or stops being read; read unknown it waits (test_an_offer_waits_out_an_unsure_line)
-  for p in (SW, SY, BY, NO_LINE, LinePaint('solid', 'unknown', 0.3, 0.9), LinePaint('unknown', 'yellow', 0.2, 0.), None):
+  # the line turns solid, yellow or none; read unknown, or not read at all, it waits (test_an_offer_waits_out_an_unsure_line)
+  for p in (SW, SY, BY, NO_LINE, LinePaint('solid', 'unknown', 0.3, 0.9), LinePaint('unknown', 'yellow', 0.2, 0.)):
     drive, distance = offered()
-    drive.paint = (lambda left, right, p=p: paint(right=p)) if p is not None else None
+    drive.paint = lambda left, right, p=p: paint(right=p)
     drive.run(m, distance, 1.)
     assert [a for a, _ in drive.aborts] == ['lineNotBroken'] and not drive.requests, p
+  drive, distance = offered()
+  drive.paint = None  # no paint read (the wide camera): no give-up for lack of a read, nothing requested
+  drive.run(m, distance, 1.)
+  assert not drive.aborts and not drive.requests and drive.lp.phase != Phase.IDLE
   # the model stops seeing a lane that way
   drive, distance = offered()
   drive.lanes_right = 0
@@ -794,6 +804,18 @@ def test_the_planner_changes_toward_the_curb_on_less_than_paint_only_under_the_s
     drive = always(Drive(0, 1, paint=once))
     drive.run(m, 290., 9.)
     assert not drive.offers and drive.decisions[-1].wait == 'lineNotBroken', marked
+    # review 2026-11-07 (LC-2): the same line read white of unknown kind after the solid or yellow frames (a solid line in
+    # dappled shade reads so) cleared its mark, and lane_agreed's white sign crossed it, the switch on or off: offered at 274
+    # m and changed. The latch is the window's for every less-than-paint change toward the curb
+    for on in (False, True):
+      frames = {'n': 0}
+      def then_white(left, right, marked=marked, frames=frames):
+        frames['n'] += 1
+        return paint(left=SW, right=marked if frames['n'] <= 3 else LinePaint('unknown', 'white', 0.9, 0.6))
+      drive = Drive(0, 1, paint=then_white)
+      drive.lp.always_drive = on
+      drive.run(m, 290., 9.)
+      assert not drive.offers and not drive.requests and drive.lp.changes == 0, (marked, on)
   drive = always(Drive(0, 1, paint=unread))
   distance = drive.run(m, 290., 3., blindspot=LaneChange.right)
   drive.run(m, distance, 2., objects=scene([{'cls': 'car', 'x': -3., 'y': -3.6, 'vx': 15.}]).objects)
@@ -832,12 +854,13 @@ def test_a_curb_side_change_on_less_than_paint_needs_this_frames_paint_read():
   drive = always(Drive(0, 1, paint=lambda left, right: paint(left=SY, right=UNKNOWN)))
   assert drive.run(m, start + 30., 17., blindspot=LaneChange.right) < end
   assert not drive.offers and drive.decisions[-1].blocked
-  # an offer on less than paint under way: the first frame with nothing read aborts it, never requested
+  # an offer on less than paint under way, then nothing read: it waits, never requested on a frame nobody read (before
+  # 2026-11-07 the first such frame aborted it), and aborts once LC_UNSURE_MAX_S have passed with nothing read
   drive = always(Drive(0, 1))
   drive.paint = lambda left, right: paint(left=SY, right=UNKNOWN) if not drive.offers else ()
-  drive.run(m, start - 10., 2.)
+  drive.run(m, start - 10., LC_UNSURE_MAX_S + 1.)
   assert len(drive.offers) == 1 and [a for a, _ in drive.aborts] == ['lineNotBroken'] and not drive.requests
-  assert drive.aborts[0][1] - drive.offers[0][2] == pytest.approx(DT_MDL, abs=0.5 * DT_MDL)
+  assert drive.aborts[0][1] - drive.offers[0][2] == pytest.approx(LC_UNSURE_MAX_S, abs=2.5 * DT_MDL)
 
 
 def test_driver_lane_change_gets_a_cooldown_too():
@@ -1367,6 +1390,7 @@ def test_the_lamp_carried_between_two_changes_goes_out_on_a_line_unread():
   change_blocker that way by its own read puts it out, silently (nothing was offered, so nothing aborts: the wait says why):
   on a line whose kind reads unknown (no hold reaches it), and on broken of unknown colour valid by the white hold alone."""
   drive, m, distance = first_of_two_lefts()
+  drive.night = True  # the line beyond the next lane unseen: nothing agrees a lane is there (lane_agreed)
   drive.paint = lambda left, right: paint(left=UNKNOWN, right=BW)
   distance, sides = lamp_run(drive, m, distance, LC_COOLDOWN_S + 2 * LC_UNSURE_MAX_S)
   lit = sides.index(LaneChange.none)
@@ -1378,6 +1402,7 @@ def test_the_lamp_carried_between_two_changes_goes_out_on_a_line_unread():
   # broken of unknown colour after broken white read through the cooldown: valid by the white hold alone (wait confirming,
   # nothing confirmed on it), which no more keeps the lamp lit than the unread line
   drive, m, distance = first_of_two_lefts()
+  drive.night = True
   while drive.decisions[-1].wait == 'cooldown':
     drive.step(m, distance)
     distance -= drive.v * DT_MDL
@@ -1402,6 +1427,7 @@ def test_the_carried_lamp_waits_out_a_short_dropout_and_a_car_beside():
   for stretches in ((unread, LC_UNSURE_MAX_S - 0.2),), \
                    ((unread, 2.), (read, (LC_CONFIRM_FRAMES - 3) * DT_MDL), (unread, 2.)):
     drive, m, distance = first_of_two_lefts()
+    drive.night = True  # nothing agreeing a lane beyond the unread line (lane_agreed); broken white still counts the room
     drive.paint = unread
     sides = []
     while drive.decisions[-1].wait == 'cooldown':
@@ -1424,6 +1450,7 @@ def test_the_carried_lamp_waits_out_a_short_dropout_and_a_car_beside():
     assert drive.lp.changes == 2 and (drive.lanes_left, drive.lanes_right) == (0, 2), stretches
   # held by the blind spot: the clock stops while the car beside is there, and runs once it clears
   drive, m, distance = first_of_two_lefts()
+  drive.night = True
   drive.paint = lambda left, right: paint(left=UNKNOWN, right=BW)
   distance, beside = lamp_run(drive, m, distance, LC_COOLDOWN_S + 1.5 * LC_UNSURE_MAX_S, blindspot=LaneChange.left)
   assert set(beside) == {LaneChange.left} and len(drive.offers) == 1 and not drive.aborts
@@ -1717,11 +1744,15 @@ def test_an_offer_waits_out_an_unsure_line_and_aborts_only_on_a_contrary_read():
     drive.paint = lambda left, right, p=contrary: paint(left=p, right=SW)
     drive.run(m, distance, DT_MDL)
     assert [a for a, _ in drive.aborts] == ['lineNotBroken'] and not drive.requests, contrary
-  # and so does a frame with no paint read at all: nothing looked at the line (the wide camera, a sweep, a stale scene)
+  # a frame with no paint read at all (the wide camera, a sweep, a stale scene) waits as an unsure one does: before
+  # 2026-11-07 it aborted the offer (1e 782.5 s), Kellen: no give-ups for lack of a read. Never requested on it
   drive, m, distance = offered_left()
   drive.paint = None
-  drive.run(m, distance, DT_MDL)
-  assert [a for a, _ in drive.aborts] == ['lineNotBroken']
+  distance = drive.run(m, distance, LC_UNSURE_MAX_S - 0.2)
+  assert not drive.aborts and not drive.requests and drive.decisions[-1].offer == LaneChange.left
+  drive.paint = striped
+  drive.run(m, distance, 6.)
+  assert [r for r, _, _ in drive.requests] == [LaneChange.left] and drive.lp.changes == 1 and not drive.aborts
   # unsure, the rest of the lane's checks still run: a parked lane aborts
   drive, m, distance = offered_left()
   drive.paint = lambda left, right: paint(left=UNKNOWN, right=SW)
@@ -2117,8 +2148,9 @@ def test_a_white_read_every_few_seconds_never_makes_a_change():
 
 def test_the_white_hold_keeps_the_confirm_count_and_the_offer_goes_on_a_read():
   """A frame valid by the white hold alone neither counts toward LC_CONFIRM_FRAMES nor breaks it, and is never the frame an
-  offer is made on, even with the count made and a blind spot clearing on it; a frame read short of broken white the hold
-  doesn't cover (the kind unknown) still starts the count over."""
+  offer is made on, even with the count made and a blind spot clearing on it. A frame read short of broken white the hold
+  doesn't cover (the kind unknown) keeps it too since 2026-11-07 (soft_block: the want of a read, nothing against the
+  lane); a contrary read (solid) still starts the count over."""
   def offer_frame(reads, blindspots=()):
     lp = LanePlanner()
     it = iter(reads)
@@ -2130,7 +2162,8 @@ def test_the_white_hold_keeps_the_confirm_count_and_the_offer_goes_on_a_read():
     return None
   assert offer_frame([BW] * 20) == LC_CONFIRM_FRAMES - 1
   assert offer_frame([BW] * 5 + [COLORLESS] * 3 + [BW] * 20) == LC_CONFIRM_FRAMES + 2
-  assert offer_frame([BW] * 5 + [LinePaint('unknown', 'white', 0.9, 0.3)] + [BW] * 20) == 5 + LC_CONFIRM_FRAMES
+  assert offer_frame([BW] * 5 + [LinePaint('unknown', 'white', 0.9, 0.3)] + [BW] * 20) == LC_CONFIRM_FRAMES
+  assert offer_frame([BW] * 5 + [SW] + [BW] * 20) == 5 + LC_CONFIRM_FRAMES
   assert offer_frame([BW] * 15 + [COLORLESS] * 3 + [BW] * 5, blindspots=range(15)) == 18
 
 
