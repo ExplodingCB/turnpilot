@@ -12,10 +12,35 @@ Gated boxes are counted, never published (modeld logs the counts once a minute: 
 gates is a head, and its state is read (its reason the published Light.reason: read or one of these):
 - aspect: not a vertical head (height/width outside MIN_ASPECT-MAX_ASPECT): horizontal, a doghouse, a pedestrian signal.
   Unknown.
-- The box is split in thirds; a lamp pixel is bright (HSV value) and either saturated in a lamp hue or blown out white.
-  The lit third holds the most; none past LIT_FRAC_MIN is dark, two is twoLit. Unknown either way.
-- noColor: the lit lamp's saturated pixels don't agree on red, yellow or green. Unknown.
-- positionMismatch: the colour isn't the one its lamp shows (red top, yellow middle, green bottom). Unknown.
+- A lamp pixel is bright (HSV value) and either saturated in a lamp hue or blown out white. dark: no third of the box
+  holds LIT_FRAC_MIN of them. Unknown.
+- The lit lamp is a run of lit rows (lamp_runs: rows holding ROW_REL of the fullest row's lamp pixels, gaps of GAP_REL
+  closed), the run with the most; its third is the one its core's centre (its pixels at CORE_REL of its brightest) lies in,
+  its colour and shape read on its rows grown through the rows next to them that hold any lamp pixel. twoLit: a second,
+  separate run with SECOND_LIT_REL of its pixels (and LIT_FRAC_MIN of a third's). streak: the run's core (first to last
+  row) is taller than STREAK_MAX of the run's widest row, or the run than RUN_MAX_REL of the box: a lit pole, a sign filling
+  the box, glare, never a lamp (a lamp's glow trailing below its face is the lamp's: STREAK_MAX). Unknown either way.
+  Until 2026-11-07 the lit third was the third holding the most lamp pixels and any other third with half its share was
+  twoLit, and a lamp's glow made it two. On the 11-06 night drives 667 head reads gave no green and no
+  colour on any head governing the car's lane (heads 36-86 px tall: not small; 32 reds, all on side heads 15-30 deg off
+  the lane, off the lamps' beam and so dimmer, it seems: there are no frames). The one governing head a frame shows (1d
+  4:05, standing 31 m from it, box 24x46 px, no colour in 84 reads over 48 s; the qlog thumbnail, a quarter the size):
+  the red lamp's face blown pink-white (S 0.15-0.29, no hue) with a saturated red glow (V 150-200, S 0.5-0.9) spreading
+  below it under the visor, so the lamp straddles the top and middle thirds and the old read said twoLit (0.43 and 0.47
+  of the thirds lit, the thumbnail upscaled); its core's centre is at 0.28 of the box: red. Read through its glow (the
+  run), one lamp is one lamp. On the comma demo route's 878 daylight head reads (2026-11-07 replay) it
+  changed no colour read and read 45 more, every one the colour its crop shows (green and yellow balls the sky had made
+  arrows or two lamps, greens on a third's edge); voted (the lane taken straight), 36 more road runs had a governing green
+  and 1 a yellow, the reds the same 371.
+- noColor: the lit lamp's saturated pixels don't agree on red, yellow or green. Unknown. HUES green ends at 195 deg: on the
+  demo route the green lamps' pixels lie at 166-181 (1-99%) and the sky's at 195-216, which up to 210 counted as a green
+  lamp (a box over a head with sky in its bottom third read green; sky beside a green ball called it an arrow). The night
+  green lamp's glow (1d 5:05 thumbnail) is 159-168.
+- positionMismatch: the colour isn't the one its lamp shows (red top, yellow middle, green bottom). Unknown. The thirds stay
+  strict: a box drawn round a glow, its housing unseen, can put a lamp in the middle third, and then it is unknown, never
+  a guess (1d 4:06, the same head, standing: the box's bottom moved 14 px lower and its top held, the lamp changing it
+  seems, and no colour was read until the car left at 4:24; a green may have sat in its middle third. No frame shows it:
+  the samples below will).
 - arrow: the lit lamp's pixels aren't mirror-symmetric left to right about their own centre, as a ball is and a turn
   arrow is not. A green arrow is unknown: it is never a permission. A yellow arrow is unknown too: a flashing yellow
   arrow is a permissive left, and blocking on it would stall the autonomous left in the phase it is built for. A red
@@ -24,14 +49,23 @@ gates is a head, and its state is read (its reason the published Light.reason: r
   green. Under add-only (the default) a camera red adds a stop at its signal, so a red arrow alone over the car's lane
   stops it there too, as a red: a stop and a loud handback, never a run. This is a proxy at these
   sizes: on the comma demo route it caught 24-78% of two red left arrows' reads, and called 10 reads of a red ball, 30
-  of a yellow ball and 25 of a green ball arrows, so a red arrow must never turn unknown on it alone.
+  of a yellow ball and 25 of a green ball arrows, so a red arrow must never turn unknown on it alone (the sky in the
+  lamp's third made most of the green and yellow balls' arrows: since 2026-11-07 15 of the green and 2 of the yellow
+  reads there read their colour).
 A head's state is its vote: VOTE_N of its last VOTE_M reads (a frame it wasn't seen in counts as unknown), which also
 rides out LED flicker. A head governs the car's lane when its bearing lies within GOVERN_BEARING_DEG of the lane's (the
 driving model's path at the head's distance), and the governing state is what all governing heads with a state agree
 on, else unknown.
 
 Distance is to the head, from its elevation and an assumed height: the stop line is not known from the camera.
+
+What tunes it next (2026-11-07): each read carries a detail (HeadRead.detail: the thirds' lamp shares, the lit run, its
+core's centre and rows, its pixels and widest row, its peak value, the saturated pixels per colour), published with the head
+(LightHead.detail), and every SAMPLE_S the reader logs a sample (turnpilot.light_sample, debug level, so the rlog alone):
+up to SAMPLE_HEADS heads, the governing first, each with its detail and its box's NV12 crop at full resolution (rows over
+SAMPLE_MAX_PX subsampled). The 11-06 drives left no frames: the next night's rlog has the lamps themselves.
 """
+import base64
 import math
 from collections import Counter, deque
 from dataclasses import dataclass, field
@@ -50,10 +84,26 @@ LIT_V = 150                 # HSV value (0-255) of a lamp pixel...
 LIT_S = 0.35                # ...with this saturation in a lamp hue...
 BLOWN_V = 235               # ...or blown out this bright
 LIT_FRAC_MIN = 0.08         # share of a third's pixels that are lamp pixels for it to be lit
-SECOND_LIT_REL = 0.5        # another third with this share of the lit one's (and LIT_FRAC_MIN) is a second lit lamp
+SECOND_LIT_REL = 0.5        # another run with this share of the lit one's pixels (and LIT_FRAC_MIN of a third's) is a second lamp
+ROW_REL = 0.25              # a row is lit with this share of the fullest row's lamp pixels
+GAP_REL = 1 / 24            # lit rows this close (a share of the box's height, at least a row) are one lamp's
+CORE_REL = 0.9              # a lamp's core: its pixels this bright of its brightest (a blown face at night, the lens by day)
+# the lit run's core's rows over the run's widest row's lamp pixels (across the whole box), and the whole run's rows over the
+# box's height: past either is a streak, never a lamp. Demo route daylight colour reads: at most 1.64 and 0.35; the 1d 4:05
+# night red with its glow 0.35 (its whole run 1.1-1.3) and 0.39-0.43; a pole lit by a streetlight in a class-9 box (1e 7:05,
+# read twoLit before) 4.2 (its core 25 of its 29 rows) and 0.66; the demo route's yellow warning sign filling its box 0.93 of
+# its height. The core, not the whole run, since the 2026-11-07 review: a small or far lamp's glow trailing below its face
+# made the whole run a streak, and of 1500 synthetic night lamps, 14 reds, 17 yellows and 3 greens that the read before
+# 2026-11-07 read went unknown on the whole run (0, 2 and 0 on the core). Its cost: a strip lit brighter at one end, a pole
+# under a streetlight, has a core shorter than its run, and of 980 synthetic lit strips 430 read yellow (240 on the whole
+# run, 392 on the read before 2026-11-07). The real pole and red above read the same either way; the night samples (below)
+# are the real test of both
+STREAK_MAX = 2.5
+RUN_MAX_REL = 0.6
 MIN_COLOR_PX = 3            # saturated pixels in the lit lamp to read a colour from
 COLOR_SHARE = 0.6           # of them, this share in one hue range
-HUES = {'red': ((330., 360.), (0., 18.)), 'yellow': ((18., 65.),), 'green': ((120., 210.),)}
+# green to 195, not 210: the sky is 195-216 and green lamps 166-181 (module docstring, noColor)
+HUES = {'red': ((330., 360.), (0., 18.)), 'yellow': ((18., 65.),), 'green': ((120., 195.),)}
 LAMP = {'red': 0, 'yellow': 1, 'green': 2}  # top, middle, bottom of a vertical head
 ARROW_MIN_PX = 10           # lamp pixels needed to judge the lamp's shape; fewer is unknown (tooFewLampPx)
 SYMMETRY_MIN = 0.6          # the lamp's mask against its mirror image about its own centre (IoU): a ball, not an arrow
@@ -62,8 +112,16 @@ MAX_RANGE = 150.            # m, the farthest distance it says
 VOTE_M, VOTE_N = 5, 4       # a state takes VOTE_N of a head's last VOTE_M reads
 MATCH_HEIGHTS = 1.5         # a read is the same head when its box centre is within this many box heights
 HEAD_DROP_S = 0.6           # a head not seen this long is forgotten
-GOVERN_BEARING_DEG = 10.    # a head within this of the lane's bearing governs it
+# a head within this of the lane's bearing governs it. Kept at 10 after the 11-06 night, though every red it read was a side
+# head 15-30 deg off: at 1e 4:45-4:48 three right-side heads 16-25 deg off read red, 4-5 votes, as the car went through at
+# 10.5 m/s, its driver not braking (not the car's lights), so a wider gate would have braked it hard on a through road; at
+# 1e 11:04-11:06 a head 17 deg off read red until the car went and nothing after, likely the car's own. Wider needs frames
+# to tell the two apart
+GOVERN_BEARING_DEG = 10.
 MAX_READ_HEADS = 8          # heads read a frame, the most confident first (decode_lights' order): the read's time stays bounded
+SAMPLE_S = 2.0              # s between a reader's logged samples (turnpilot.light_sample, module docstring)
+SAMPLE_HEADS = 2            # heads a sample carries at most: the governing first, then the unread, then the largest
+SAMPLE_MAX_PX = 96          # a sample's crop rows at most: a taller crop is subsampled by 2, 4 or 8
 STATES = ('red', 'yellow', 'green')
 LIGHT_MODES = ('off', 'shadow', 'addOnly')  # TurnPilotCameraLights
 # a camera red adds a stop, never removes one (map_controls: add-only). Shadow until 2026-11-06, when the real car rolled a right
@@ -90,10 +148,14 @@ class HeadRead:
   gated: bool = False         # stopped at a gate: not a head, never published
   bearing: float = 0.         # deg left of the calibrated forward axis
   distance: float = MAX_RANGE  # m to the head
+  # what the read saw, for the logs (module docstring): h box rows, fr the thirds' lamp shares, run the lit run's rows, lamp
+  # them grown, c its core's centre over the box's height, cr its core's rows, n its lamp pixels, wd its widest row's, runs
+  # how many, pk its peak value, hue its saturated pixels per colour; empty for a gated box or a bad aspect
+  detail: str = ''
 
 
 def lamp_pixels(nv12: np.ndarray, stride: int, y_height: int, x0: int, y0: int, x1: int, y1: int):
-  """(lamp mask, saturated hue or nan) per pixel of the box, from NV12 (BT.601 full range)."""
+  """(lamp mask, saturated hue or nan, HSV value 0-255) per pixel of the box, from NV12 (BT.601 full range)."""
   rows = np.arange(y0, y1)
   cols = np.arange(x0, x1)
   y = nv12.reshape(-1, stride)[rows[:, None], cols[None, :]].astype(np.float32)
@@ -114,16 +176,48 @@ def lamp_pixels(nv12: np.ndarray, stride: int, y_height: int, x0: int, y0: int, 
     for lo, hi in ranges:
       in_lamp_hue |= (h >= lo) & (h < hi)
   lamp = (colored & in_lamp_hue) | (mx >= BLOWN_V)
-  return lamp, hue
+  return lamp, hue, mx
+
+
+def lamp_runs(lamp: np.ndarray, value: np.ndarray) -> list[tuple[int, int, int, float, int]]:
+  """The box's lit lamps, top to bottom (module docstring): (first row, last row, lamp pixels, centre row, core rows) of
+  each run of lit rows, its centre the mean row of its core and its core rows the core's first to last row. lamp, value:
+  the box's inner columns (lamp_pixels). A lamp's glow joins its run, so a lamp is one run wherever the thirds' edges fall;
+  two lit lamps are two runs, the dark housing between them."""
+  prof = lamp.sum(axis=1)
+  lit = np.nonzero(prof >= max(1., ROW_REL * float(prof.max())))[0]
+  if not len(lit):
+    return []
+  gap = max(1, int(round(lamp.shape[0] * GAP_REL)))
+  bounds, start = [], int(lit[0])
+  for a, b in zip(lit[:-1], lit[1:], strict=True):
+    if b - a - 1 > gap:
+      bounds.append((start, int(a)))
+      start = int(b)
+  bounds.append((start, int(lit[-1])))
+  out = []
+  for r0, r1 in bounds:
+    v = np.where(lamp[r0:r1 + 1], value[r0:r1 + 1], 0.)
+    # its brightest: the 90th percentile of its lamp pixels, not one pixel (a blown glint on a visor by day would be the core)
+    core = (v >= CORE_REL * float(np.percentile(v[v > 0], 90))).sum(axis=1)
+    centre = float((np.arange(r0, r1 + 1) + 0.5) @ core / max(int(core.sum()), 1))
+    cr = np.nonzero(core)[0]
+    out.append((r0, r1, int(prof[r0:r1 + 1].sum()), centre, int(cr[-1] - cr[0] + 1) if len(cr) else r1 - r0 + 1))
+  return out
+
+
+def hue_counts(hues: np.ndarray) -> dict[str, int]:
+  """The saturated pixels (finite hues) in each lamp colour's hue range."""
+  hues = hues[np.isfinite(hues)]
+  return {name: sum(int(((hues >= lo) & (hues < hi)).sum()) for lo, hi in ranges) for name, ranges in HUES.items()}
 
 
 def hue_color(hues: np.ndarray) -> str | None:
-  hues = hues[np.isfinite(hues)]
-  if len(hues) < MIN_COLOR_PX:
+  n = int(np.isfinite(hues).sum())
+  if n < MIN_COLOR_PX:
     return None
-  for name, ranges in HUES.items():
-    n = sum(int(((hues >= lo) & (hues < hi)).sum()) for lo, hi in ranges)
-    if n >= COLOR_SHARE * len(hues):
+  for name, k in hue_counts(hues).items():
+    if k >= COLOR_SHARE * n:
       return name
   return None
 
@@ -165,20 +259,41 @@ def read_head(nv12: np.ndarray, stride: int, y_height: int, lens: Lens, rpy_cali
     return out
   ix0, iy0 = int(math.floor(x0)), int(math.floor(y0))
   ix1, iy1 = min(int(math.ceil(x1)), lens.width), min(int(math.ceil(y1)), lens.height)
-  lamp, hue = lamp_pixels(nv12, stride, y_height, ix0, iy0, ix1, iy1)
+  lamp, hue, value = lamp_pixels(nv12, stride, y_height, ix0, iy0, ix1, iy1)
   h, w = lamp.shape
   edges = np.rint(np.linspace(0, h, 4)).astype(int)
   inner = slice(int(round(w * INNER_X)), max(int(round(w * (1 - INNER_X))), int(round(w * INNER_X)) + 1))
   fracs = np.array([lamp[edges[k]:edges[k + 1], inner].mean() if edges[k + 1] > edges[k] else 0. for k in range(3)])
-  lit = int(np.argmax(fracs))
-  if fracs[lit] < LIT_FRAC_MIN:
+  out.detail = f"h{h} fr{fracs[0]:.2f}/{fracs[1]:.2f}/{fracs[2]:.2f}"
+  if fracs.max() < LIT_FRAC_MIN:
     out.reason = 'dark'
     return out
-  others = np.delete(fracs, lit)
-  if (others >= max(LIT_FRAC_MIN, SECOND_LIT_REL * fracs[lit])).any():
+  runs = lamp_runs(lamp[:, inner], value[:, inner])
+  r0, r1, n, centre, core_rows = max(runs, key=lambda r: r[2])
+  lit = min(int(3 * centre / h), 2)
+  # the lamp's colour and shape are read on its run grown through the rows next to it that hold any lamp pixel, never into
+  # another run: an arrow's thin head and its glow's thin edge are under ROW_REL, and are the lamp's
+  prof = lamp[:, inner].sum(axis=1)
+  e0, e1 = r0, r1
+  lo, hi = max((r[1] + 1 for r in runs if r[1] < r0), default=0), min((r[0] - 1 for r in runs if r[0] > r1), default=h - 1)
+  while e0 > lo and prof[e0 - 1] > 0:
+    e0 -= 1
+  while e1 < hi and prof[e1 + 1] > 0:
+    e1 += 1
+  rows = slice(e0, e1 + 1)
+  peak = int(value[rows, inner][lamp[rows, inner]].max())
+  widest = int(lamp[r0:r1 + 1].sum(axis=1).max())  # across the whole box: a narrow box's inner columns clip a glow
+  out.detail += f" run{r0}-{r1} lamp{e0}-{e1} c{centre / h:.2f} cr{core_rows} n{n} wd{widest} runs{len(runs)} pk{peak}"
+  third_px = h / 3 * lamp[:, inner].shape[1]
+  if any(r[2] >= max(LIT_FRAC_MIN * third_px, SECOND_LIT_REL * n) for r in runs if r[0] != r0):
     out.reason = 'twoLit'
     return out
-  rows = slice(edges[lit], edges[lit + 1])
+  # the whole run against the box (a glow's tail is the lamp's, and never past RUN_MAX_REL of a head), its core against its
+  # widest row (a lamp's face is round however far its glow trails; a lit pole is its core end to end): STREAK_MAX, above
+  if r1 - r0 + 1 > RUN_MAX_REL * h or core_rows > STREAK_MAX * widest:
+    out.reason = 'streak'
+    return out
+  out.detail += " hue " + " ".join(f"{k[0]}{v}" for k, v in hue_counts(hue[rows, inner]).items())
   color = hue_color(hue[rows, inner])
   if color is None:
     out.reason = 'noColor'
@@ -275,13 +390,36 @@ class LightHead:
   bearing: float
   distance: float
   governs: bool
+  detail: str = ''    # this frame's read's (HeadRead.detail)
+
+
+def nv12_crop(nv12: np.ndarray, stride: int, y_height: int, width: int, height: int, box) -> dict:
+  """A box's NV12 for a sample (module docstring): the box with a sixth of its height around it, on even rows and columns
+  (the chroma's 2x2), its rows subsampled by step (1, 2, 4 or 8) past SAMPLE_MAX_PX. x y w h: the crop in full-frame px. y:
+  base64 of the luma, ceil(h/step) rows of ceil(w/step); uv: of the chroma, ceil(h/2/uvStep) rows of ceil(w/2/uvStep) u,v
+  pairs (BT.601 full range, as lamp_pixels reads it)."""
+  x0, y0, x1, y1 = (float(b) for b in box[:4])
+  m = max(2, int(round((y1 - y0) / 6)))
+  cx0, cy0 = max(0, (int(x0) - m) // 2 * 2), max(0, (int(y0) - m) // 2 * 2)
+  cx1, cy1 = min(width, (int(math.ceil(x1)) + m + 1) // 2 * 2), min(height, (int(math.ceil(y1)) + m + 1) // 2 * 2)
+  step = 1
+  while (cy1 - cy0) / step > SAMPLE_MAX_PX and step < 8:
+    step *= 2
+  uv_step = max(1, step // 2)
+  img = nv12.reshape(-1, stride)
+  luma = img[cy0:cy1:step, cx0:cx1:step]
+  chroma = img[y_height + cy0 // 2:y_height + cy1 // 2, cx0:cx1].reshape(-1, (cx1 - cx0) // 2, 2)[::uv_step, ::uv_step]
+  return {'x': cx0, 'y': cy0, 'w': cx1 - cx0, 'h': cy1 - cy0, 'step': step, 'uvStep': uv_step,
+          'yb64': base64.b64encode(np.ascontiguousarray(luma).tobytes()).decode(),
+          'uvb64': base64.b64encode(np.ascontiguousarray(chroma).tobytes()).decode()}
 
 
 class LightReader:
   """read_head() on each class-9 box of a road camera frame, the voter, and which heads govern the lane. It counts the
   funnel since the last take_counts(), which modeld logs (modeld_detector.log_light_gates): frames read, boxes that never
   became heads (gate_counts: small, belowHorizon, overCap) and heads by this frame's reason (head_counts) and colour
-  (colour_counts). The night tuning needs the gated ones: they are never published (Light.reason is the heads' alone)."""
+  (colour_counts). The night tuning needs the gated ones: they are never published (Light.reason is the heads' alone).
+  Every SAMPLE_S with a head in view it logs a sample of them, crops and all (module docstring; sample())."""
   def __init__(self, lens: Lens):
     self.lens = lens
     self.voter = HeadVoter()
@@ -289,6 +427,7 @@ class LightReader:
     self.gate_counts: Counter = Counter()
     self.head_counts: Counter = Counter()
     self.colour_counts: Counter = Counter()
+    self.sample_t: float | None = None  # the last sample's frame time (None: none yet)
 
   def boxes_seen(self) -> bool:
     """Whether a class-9 box has come in since the last take_counts()."""
@@ -327,8 +466,29 @@ class LightReader:
         xs, ys = path
         lane = math.degrees(math.atan2(float(np.interp(r.distance, xs, ys)), r.distance))
       out.append(LightHead(hd.id, norm, conf, hd.state, hd.votes, r.state, r.reason, r.bearing, r.distance,
-                           abs(r.bearing - lane) <= GOVERN_BEARING_DEG))
+                           abs(r.bearing - lane) <= GOVERN_BEARING_DEG, r.detail))
+    if out and (self.sample_t is None or not 0. <= t - self.sample_t < SAMPLE_S):
+      self.sample_t = t
+      self.sample(t, nv12, stride, y_height, out)
     return out
+
+  def sample(self, t: float, nv12: np.ndarray, stride: int, y_height: int, heads: list[LightHead]) -> None:
+    """Log up to SAMPLE_HEADS of this frame's heads, the governing first, then the unread, then the tallest: each one's read,
+    vote and detail, and its box's NV12 (nv12_crop), so a drive's rlog shows the lamps each read saw (turnpilot.light_sample,
+    debug: the rlog, not the swaglog files). A failure here is logged and never fails the read."""
+    try:
+      W, H = self.lens.width, self.lens.height
+      chosen = sorted(heads, key=lambda h: (not h.governs, h.read != 'unknown', -(h.box[3] - h.box[1])))[:SAMPLE_HEADS]
+      out = []
+      for h in chosen:
+        box = (h.box[0] * W, h.box[1] * H, h.box[2] * W, h.box[3] * H)
+        out.append({'id': h.id, 'governs': h.governs, 'state': h.state, 'votes': h.votes, 'read': h.read, 'reason': h.reason,
+                    'detail': h.detail, 'bearing': round(h.bearing, 1), 'distance': round(h.distance, 1),
+                    'conf': round(h.conf, 2), 'box': [round(b, 1) for b in box],
+                    'crop': nv12_crop(nv12, stride, y_height, W, H, box)})
+      cloudlog.event("turnpilot.light_sample", debug=True, t=round(t, 3), heads=out)
+    except Exception:
+      cloudlog.exception("turnpilot light sample failed")
 
   @staticmethod
   def governing_state(heads: list[LightHead]) -> str:
