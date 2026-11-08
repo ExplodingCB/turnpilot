@@ -17,6 +17,7 @@ from pathlib import Path
 
 from openpilot.common.hardware.usb import CHESTNUT_USB_PRODUCT, is_chestnut_usb_id
 from openpilot.common.version import RELEASE_BRANCHES
+from openpilot.selfdrive.turnpilot.maps.defaults import FAR_CROP_LEFT_RANGE_M
 
 PASS, FAIL, WARN, INFO = "PASS", "FAIL", "WARN", "INFO"
 CAR_CAMERA = (1344, 760)  # the comma four's road and wide cameras, so the detector pkl to look for
@@ -213,19 +214,23 @@ def check_detector(path: Path, chestnut: bool) -> Check:
 
 def check_far_crop(path: Path, far_range_m: float, on: bool) -> Check:
   """The far crop (DESIGN phase 4 G5): its pkl, TurnPilotFarCrop and its measured range (TurnPilotLeftFarRangeM), which a
-  left past the full pass's range (45-55 mph oncoming) needs to go. Without them those lefts are still driven to their line and
-  hand back there, the car held (never skipped or rerouted since 2026-11-06): a warning."""
+  left past the full pass's range (45-55 mph oncoming) reads its band out to. Without the far crop those lefts are still
+  driven to their line and go from it on the band the full pass covers, a car seen there holding them (never skipped or
+  rerouted since 2026-11-06, never handed back since 2026-11-07); with its range unmeasured (0) and the far crop on, the
+  provisional FAR_CROP_LEFT_RANGE_M (210 m, pixel arithmetic, not a measured recall: turnpilotd.left_ranges) applies. Each
+  a warning."""
   name = "far crop"
   size = path.stat().st_size if path.is_file() else 0
   if size <= MIN_PKL_BYTES:
     why = "empty or a pointer" if path.is_file() else "missing"
-    return Check(name, WARN, f"{path.name} is {why}: no far crop, so unprotected lefts past TurnPilotLeftRangeM hand back at their line",
+    return Check(name, WARN, f"{path.name} is {why}: no far crop, so unprotected lefts past TurnPilotLeftRangeM go on the band the full pass covers",
                  "update to a branch that carries it (compile_detector.py --far builds it on the Mac)")
   if not on:
-    return Check(name, WARN, "TurnPilotFarCrop is off: unprotected lefts past TurnPilotLeftRangeM hand back at their line",
+    return Check(name, WARN, "TurnPilotFarCrop is off: unprotected lefts past TurnPilotLeftRangeM go on the band the full pass covers",
                  "preflight --set TurnPilotFarCrop=1")
   if far_range_m <= 0.:
-    return Check(name, WARN, "TurnPilotLeftFarRangeM unmeasured (0): 45-55 mph unprotected lefts hand back at their line",
+    provisional = f"the far crop's provisional {FAR_CROP_LEFT_RANGE_M:.0f} m applies, not a measured recall"
+    return Check(name, WARN, f"TurnPilotLeftFarRangeM unmeasured (0): {provisional}",
                  "set it only from a measured recall range on this car's frames")
   return Check(name, PASS, f"{path.name} ({size / 1e6:.1f} MB), proven range {far_range_m:.0f} m")
 

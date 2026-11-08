@@ -74,11 +74,18 @@ def test_a_right_at_a_mapped_signal_on_a_camera_red_holds_without_a_handback_whi
   for _ in range(int(60. / DT_MDL)):
     out, dec, _ = car.step(lights=cam('red'))
     assert held(out, dec) and out.prompt == 'none'
-  # the red lost (night, the reader blind): the red's stand, SIGNAL_UNSEEN_S, then its handback
+  # the red lost (night, the reader blind): the red's stand, SIGNAL_UNSEEN_S, then said and still held for a green (until
+  # 2026-11-07 its handback, signalUnseenTakeControl), however long: a turn desire out is never let go on a red nobody saw end
   out, dec, _ = car.run(SIGNAL_UNSEEN_S - 0.5, lights=cam('unknown'))
   assert held(out, dec) and out.prompt == 'none'
   out, dec, _ = car.run(1., lights=cam('unknown'))
-  assert held(out, dec) and out.prompt == 'signalUnseenTakeControl' and out.stops[0].reason == SIGNAL_UNSEEN_REASON
+  assert held(out, dec) and out.prompt == 'none' and out.stops[0].reason == SIGNAL_UNSEEN_REASON
+  for _ in range(int(90. / DT_MDL)):
+    out, dec, _ = car.step(lights=cam('unknown'))
+    assert held(out, dec) and out.prompt == 'none' and out.stops[0].reason == SIGNAL_UNSEEN_REASON
+  # the camera's steady green read at last: TurnPilot's own stop let go (the model's own hold, if any, its own)
+  out, dec, _ = car.run(CAMERA_GREEN_STEADY_S + 0.2, lights=cam('green'))
+  assert not held(out, dec)
 
 
 def test_a_steady_camera_green_before_the_stopping_point_means_no_stop():
@@ -103,15 +110,15 @@ def test_a_steady_camera_green_before_the_stopping_point_means_no_stop():
 
 
 
-def test_a_camera_green_that_cant_release_the_stop_puts_off_no_handback():
+def test_a_camera_green_that_cant_release_the_stop_puts_off_nothing():
   # an accepted source's red made the stop (only an accepted green ends it): a camera green read after the red is lost
-  # changes nothing, and the stand's handback comes at SIGNAL_UNSEEN_S as before
+  # changes nothing, and the stand's unseen line comes at SIGNAL_UNSEEN_S as before, held (never a handback since 2026-11-07)
   car = right_at_a_signal()
   held_at(car, LINE, lights=lambda car: lights('red', LINE - car.s))
   out, dec, _ = car.run(SIGNAL_UNSEEN_S - 0.3, lights=cam('green', oracle_state='unknown'))
-  assert held(out, dec) and out.prompt == 'none'
+  assert held(out, dec) and out.prompt == 'none' and out.stops[0].reason != SIGNAL_UNSEEN_REASON
   out, dec, _ = car.run(0.6, lights=cam('green', oracle_state='unknown'))
-  assert held(out, dec) and out.prompt == 'signalUnseenTakeControl'
+  assert held(out, dec) and out.prompt == 'none' and out.stops[0].reason == SIGNAL_UNSEEN_REASON
 
 
 

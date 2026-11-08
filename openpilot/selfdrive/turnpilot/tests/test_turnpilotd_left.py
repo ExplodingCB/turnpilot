@@ -6,15 +6,20 @@ import pytest
 
 from openpilot.cereal import log, messaging
 from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.turnpilot.detector.light_state import LIGHT_MODE_DEFAULT
 from openpilot.selfdrive.turnpilot.hooks import CLEAR_DESIRE, TAKE_CONTROL_PROMPTS
+from openpilot.selfdrive.turnpilot.map_controls import CAMERA_GREEN_STEADY_S
+from openpilot.selfdrive.turnpilot.maps.defaults import FAR_CROP_LEFT_RANGE_M
 from openpilot.selfdrive.turnpilot.scene.tracker import RawBox, RawFrame
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, ONCOMING_ENTRY_M
 from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of, nav_instruction
+from openpilot.selfdrive.turnpilot.tests.test_camera_lights import detections as light_detections
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Sim
 from openpilot.selfdrive.turnpilot.turn_speed import POST_GO_PROFILES
-from openpilot.selfdrive.turnpilot.turnpilotd import GO_LINE_M, LEFT_NO_MOVE_S, TurnPilot, auto_left_for, left_range_for
-from openpilot.selfdrive.turnpilot.unprotected_left import (CLEAR_WINDOW_S, CREEP_STALL_S, HELD_MIN_M, ROAD_RANGE_M,
-                                                           STALE_UNDECIDED_S, STAND_UNDECIDED_S,
+from openpilot.selfdrive.turnpilot.turnpilotd import GO_LINE_M, LEFT_NO_MOVE_S, NO_MOVE_S, TurnPilot, auto_left_for, left_range_for
+from openpilot.selfdrive.turnpilot import unprotected_left as ul_mod
+from openpilot.selfdrive.turnpilot.unprotected_left import (CLEAR_WINDOW_S, CREEP_STALL_S, HELD_MIN_M, LIGHT_RED_MAX_S, LIGHT_WAIT_REASON,
+                                                           LONG_WAIT_REASON, ROAD_RANGE_M, STALE_UNDECIDED_S, STAND_UNDECIDED_S,
                                                            r_req, t_req)
 
 Desire = log.Desire
@@ -136,10 +141,10 @@ def test_it_waits_through_an_oncoming_stream_silently_and_goes_after_it():
   assert sim.trace[go - 1][1] < 0.3 and t_go[0] <= LINE + 0.1 and sim.s > JUNCTION + 30.
 
 
-def standing_run(raw_at, track_at, seconds, vx=0., stream=()):
+def standing_run(raw_at, track_at, seconds, vx=0., stream=(), leaves_t=math.inf):
   """LEFT_25 at its line with a car standing at (m past the junction, m left) raw_at (a road run box every other frame,
-  None: none) and track_at (a velocity-trusted track at vx, None: none), and oncoming stream cars (absolute s, moving at
-  V_25, a box and a track each). (sim, plans)"""
+  None: none) and track_at (a velocity-trusted track at vx, None: none) until leaves_t s into the run, and oncoming stream
+  cars (absolute s, moving at V_25, a box and a track each). (sim, plans)"""
   frame = [0]
 
   def movers(sim):
@@ -149,7 +154,7 @@ def standing_run(raw_at, track_at, seconds, vx=0., stream=()):
     frame[0] += 1
     if frame[0] % 2:
       return None
-    boxes = [raw_box(JUNCTION + raw_at[0] - sim.s, raw_at[1])] if raw_at is not None else []
+    boxes = [raw_box(JUNCTION + raw_at[0] - sim.s, raw_at[1])] if raw_at is not None and sim.t < leaves_t else []
     boxes += [raw_box(s - sim.s, y) for s, y in movers(sim)]
     return RawFrame([b for b in boxes if b.xy[0] > 0.], 'road', sim.t)
   sim = left_sim()
@@ -158,29 +163,34 @@ def standing_run(raw_at, track_at, seconds, vx=0., stream=()):
   for _ in range(int(seconds / DT_MDL)):
     turning = sim.tp.desires.started and abs(JUNCTION - sim.s) < 12. and sim.v > 0.3
     objs = [{'cls': 'car', 'x': JUNCTION + track_at[0] - sim.s, 'y': track_at[1], 'vx': vx, 'vy': 0., 'age': 60, 'trackId': 40,
-             'conf': 0.8, 'camera': 'road'}] if track_at is not None else []
+             'conf': 0.8, 'camera': 'road'}] if track_at is not None and sim.t < leaves_t else []
     objs += [{'cls': 'car', 'x': s - sim.s, 'y': y, 'vx': -V_25, 'vy': 0., 'age': 60, 'trackId': 50 + k, 'conf': 0.8, 'camera': 'road'}
              for k, (s, y) in enumerate(movers(sim))]
     plans.append(sim.step(tuple(objs), engaged=True, yaw_rate=sim.v / 8. if turning else 0.))
   return sim, plans
 
 
-def test_a_car_standing_in_the_way_is_a_loud_handback_never_an_endless_silent_wait():
+def test_a_car_standing_in_the_way_is_said_and_waited_on_never_handed_back():
   """Skeptic g4c (still open after SIMFIX; the same on 49359b2 and be3c0ed): the left had no bound on its wait. A car parked
   50 m up the oncoming curb (in the band: a box and a track) or at the curb 6 m past the junction, 5 m right (in the junction
-  box: a track) held the car at its line the whole 240 s run with only 'waitingForGap' (shown, never heard): no chime, no
-  handback, and stopped_unheld can't fire with TurnPilot holding the car. The owner's 'loud alert if undecided': waiting
-  STAND_UNDECIDED_S on what the tracker says stands is the 'standing' fault, the car held, said."""
+  box: a track) held the car at its line the whole 240 s run with only 'waitingForGap' (shown, never heard). Until
+  2026-11-07 waiting STAND_UNDECIDED_S on what the tracker says stands was the 'standing' handback. Kellen, 2026-11-07: "no,
+  no handbacks". Past STAND_UNDECIDED_S its line says what holds it, in plain words, the car held at its line, no
+  take-control however long; the car gone, the left goes on its gap."""
   for raw_at, track_at in (((50., 7.5), (50., 7.5)), (None, (6., -5.))):
-    sim, plans = standing_run(raw_at, track_at, 90.)
+    sim, plans = standing_run(raw_at, track_at, 150.)
     held = next(i for i, p in enumerate(plans) if p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap')
-    first = next((i for i, p in enumerate(plans) if str(p.controlPrompt) in TAKE_CONTROL_PROMPTS), None)
-    assert first is not None, f"stood at the line behind a car parked at {raw_at or track_at}, no chime, no handback"
-    assert str(plans[first].controlPrompt) == 'leftUndecidedTakeControl' and plans[first].unprotectedLeft.why == 'standing'
-    assert plans[first].reason == "Blocked by something standing: take control"
-    assert abs((first - held) * DT_MDL - STAND_UNDECIDED_S) < 1., (first - held) * DT_MDL
-    assert all(str(p.controlPrompt) == 'leftUndecidedTakeControl' and p.shouldStop for p in plans[first:])
+    assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans), raw_at or track_at
+    said = next((i for i, p in enumerate(plans) if p.reason == LONG_WAIT_REASON['standing']), None)
+    assert said is not None and abs((said - held) * DT_MDL - STAND_UNDECIDED_S) < 1., raw_at or track_at
+    assert all(str(p.controlPrompt) == 'waitingForGap' and p.shouldStop and p.reason == LONG_WAIT_REASON['standing']
+               for p in plans[said:]), raw_at or track_at
     assert not any(p.desire == Desire.turnLeft for p in plans) and sim.s < LINE + 1.
+  # the parked car pulls away 100 s into the run: the left goes from its line, never having handed back
+  sim, plans = standing_run((50., 7.5), (50., 7.5), 140., leaves_t=100.)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  go = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
+  assert go * DT_MDL > 100. and sim.s > JUNCTION + 10.
 
 
 def test_moving_traffic_with_no_gap_is_never_called_standing_and_a_wait_under_45_s_is_silent():
@@ -193,25 +203,25 @@ def test_moving_traffic_with_no_gap_is_never_called_standing_and_a_wait_under_45
   assert 30. < waited < STAND_UNDECIDED_S and any(p.desire == Desire.turnLeft for p in plans) and sim.s > JUNCTION + 10.
 
 
-def test_a_wait_at_the_line_with_no_gap_is_a_loud_handback_at_45_s_whatever_the_tracker_says():
+def test_a_wait_at_the_line_with_no_gap_is_said_at_45_s_and_waited_through_whatever_the_tracker_says():
   """Owner decision (ii), 2026-10-30, Kellen's delegate (DESIGN's UNDECIDED row: no gap in 45 s): 154bdaa bounded the wait
   at the line only on what the tracker says stands, so a car parked in the band seen only as raw boxes (never tracked: a
   box nothing tracks can't be told standing from coming) held the car at its line silently with no limit, and an oncoming
-  stream with no gap, or a car moving in the junction box, was waited through however long. Every wait at the line for a
-  gap now ends at STAND_UNDECIDED_S in the loud handback (leftUndecidedTakeControl, "No gap in oncoming traffic: take
-  control"; 'standing' where the tracker says so), the car held, never let go, never a go."""
-  stream = [JUNCTION + 60. + V_25 * 25. + k * 3. * V_25 for k in range(24)]
+  stream with no gap, or a car moving in the junction box, was waited through however long. Until 2026-11-07 every wait at
+  the line for a gap ended at STAND_UNDECIDED_S in the loud handback ("No gap in oncoming traffic: take control"). Kellen,
+  2026-11-07: "no, no handbacks". It is now logged once there (turnpilot.left_no_gap) and waited through, the car held at its
+  line, waitingForGap and its line throughout, never a go into the traffic it sees, never a take-control."""
+  from unittest import mock
+  stream = [JUNCTION + 60. + V_25 * 25. + k * 3. * V_25 for k in range(40)]
   for raw_at, track_at, vx, movers in (((50., 7.5), None, 0., ()), (None, None, 0., stream), (None, (6., -5.), 3., ())):
-    sim, plans = standing_run(raw_at, track_at, 110., vx=vx, stream=movers)
+    with mock.patch.object(ul_mod.cloudlog, 'event') as event:
+      sim, plans = standing_run(raw_at, track_at, 140., vx=vx, stream=movers)
     case = (raw_at, track_at, vx, len(movers))
     held = next(i for i, p in enumerate(plans) if p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap')
-    first = next((i for i, p in enumerate(plans) if str(p.controlPrompt) in TAKE_CONTROL_PROMPTS), None)
-    assert first is not None, f"{case}: waited at the line {(len(plans) - held) * DT_MDL:.0f} s with no gap, silently"
-    assert abs((first - held) * DT_MDL - STAND_UNDECIDED_S) < 1., (case, (first - held) * DT_MDL)
-    assert str(plans[first].controlPrompt) == 'leftUndecidedTakeControl' and plans[first].unprotectedLeft.why == 'noGap', case
-    assert plans[first].reason == "No gap in oncoming traffic: take control", case
-    assert all(str(p.controlPrompt) == 'waitingForGap' for p in plans[held + 5:first]), case
-    assert all(str(p.controlPrompt) == 'leftUndecidedTakeControl' and p.shouldStop for p in plans[first:]), case
+    assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans), case
+    assert all(str(p.controlPrompt) == 'waitingForGap' and p.shouldStop for p in plans[held + 5:]), case
+    said = [c.kwargs for c in event.call_args_list if c.args and c.args[0] == 'turnpilot.left_no_gap']
+    assert len(said) == 1 and abs(said[0]['wait_s'] - STAND_UNDECIDED_S) < 0.1, (case, said)
     assert not any(p.desire == Desire.turnLeft for p in plans) and sim.s < LINE + 1. and sim.v < 0.05, case
 
 
@@ -457,9 +467,11 @@ class HeldSim(Sim):
     return plan
 
 
-def test_a_creep_for_a_view_the_car_never_makes_is_never_silent():
+def test_a_creep_for_a_view_the_car_never_makes_is_never_silent_nor_handed_back():
   # skeptic G4 (blocker 4): a standing opposing left-turner blocks the view, the car is asked to creep and never moves (the
-  # model holding it): 270 s in 'creep' with only the visual creepingForView. Now a loud handback, the car held
+  # model holding it): 270 s in 'creep' with only the visual creepingForView. Until 2026-11-07 a loud handback (creepStall,
+  # "Can't creep for a view: take control"); Kellen, 2026-11-07: "no, no handbacks". Now its line says it waits for the view
+  # from CREEP_STALL_S, the car held at its line, no take-control however long, never a go on the hidden lanes
   sim = HeldSim(LEFT_25)
   sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps = 'auto', TEST_RANGE_M, False
   sim.answers_prompt = True
@@ -473,20 +485,24 @@ def test_a_creep_for_a_view_the_car_never_makes_is_never_silent():
     frame[0] += 1
     return None if frame[0] % 2 else RawFrame([raw_box(JUNCTION + 6. - sim.s, 3.6)], 'road', sim.t)
   sim.raw = raw
-  plans = [sim.step(objects(sim), engaged=True) for _ in range(int(60. / DT_MDL))]
+  plans = [sim.step(objects(sim), engaged=True) for _ in range(int(120. / DT_MDL))]
   creep = next(i for i, p in enumerate(plans) if str(p.unprotectedLeft.state) == 'creep')
-  first = next((i for i, p in enumerate(plans) if str(p.controlPrompt) in TAKE_CONTROL_PROMPTS), None)
-  assert first is not None, "stood creeping for a view it never got, silently"
-  assert str(plans[first].controlPrompt) == 'leftUndecidedTakeControl' and plans[first].reason == "Can't creep for a view: take control"
-  assert (first - creep) * DT_MDL <= CREEP_STALL_S + 1. and plans[first].shouldStop
-  assert not any(p.desire == Desire.turnLeft for p in plans)
+  said = next((i for i, p in enumerate(plans) if p.reason == LONG_WAIT_REASON['view']), None)
+  assert said is not None, "stood creeping for a view it never got, silently"
+  assert (said - creep) * DT_MDL <= CREEP_STALL_S + 1.
+  # the creep stays asked (the latch's stop point on, shouldStop off: the model may yet take it), its line the wait
+  assert all(p.reason == LONG_WAIT_REASON['view'] and str(p.controlPrompt) == 'waitingForGap' for p in plans[said:])
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  assert not any(p.desire == Desire.turnLeft for p in plans) and sim.s < LINE + 1.
 
 
-def test_a_creep_for_a_view_the_car_makes_then_undecided_keeps_the_car_held_and_said():
+def test_a_creep_for_a_view_the_car_makes_then_waits_keeps_the_car_held_and_said():
   # skeptic residual-check-1 (058df13): the same blocked view with the car moving as asked (the plain Sim, where HeldSim's
   # moved_m stays 0): it crept 3.8 m past its line, stayed blocked and went undecided 'blocked', and the latch was let go
   # on the first handback frame as the driver's with no driver input (shouldStop on 0 of 384 frames, the take-control
-  # gone after 104 frames, the car 164 m past the junction at 13 m/s). Held short of the oncoming lanes, said throughout
+  # gone after 104 frames, the car 164 m past the junction at 13 m/s). Held short of the oncoming lanes, said throughout.
+  # Since 2026-11-07 (Kellen: no handbacks) the view still blocked BLOCKED_UNDECIDED_S after the full creep is a wait where
+  # it crept to, its line saying so, never a take-control: the latch never let go on it either
   sim = Sim(LEFT_25)
   sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps = 'auto', TEST_RANGE_M, False
   sim.answers_prompt = True  # the driver signals the left when prompted: it goes only with a lamp lit (LEFT_GO_NEEDS_SIGNAL, tp/blinker)
@@ -502,10 +518,11 @@ def test_a_creep_for_a_view_the_car_makes_then_undecided_keeps_the_car_held_and_
   sim.raw = raw
   plans = [sim.step(objects(sim), engaged=True) for _ in range(int(70. / DT_MDL))]
   states = [str(p.unprotectedLeft.state) for p in plans]
-  und = states.index('undecided')
+  assert 'undecided' not in states and not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  und = next(i for i, p in enumerate(plans) if p.reason == LONG_WAIT_REASON['view'])
   assert 'creep' in states[:und] and sim.trace[und][0] - LINE > 2.  # it crept past the latch's reach first
   after = plans[und:]
-  assert all(str(p.controlPrompt) == 'leftUndecidedTakeControl' and p.shouldStop for p in after)
+  assert all(str(p.controlPrompt) == 'waitingForGap' and p.reason == LONG_WAIT_REASON['view'] and p.shouldStop for p in after)
   assert max(s for s, _, _ in sim.trace[und:]) < JUNCTION - ONCOMING_ENTRY_M and sim.v < 0.3
   assert not any(p.desire == Desire.turnLeft for p in plans)
 
@@ -811,14 +828,16 @@ class GoHeldSim(Sim):
 
 def test_a_go_after_a_nearer_reading_is_still_withdrawn_when_the_car_doesnt_move():
   # the left goes only standing held at its line: after a nearer reading (the follower's distance under GO_LINE_M) its go is
-  # still a go from the line, withdrawn and handed back when the model holds the car (LEFT_NO_MOVE_S), never taken for a go
-  # in the junction left to the stall's handback
+  # still a go from the line, withdrawn and handed back when the car doesn't move, never taken for a go in the junction left
+  # to the stall's handback. Unlifted there (too near the oncoming lanes for the lift's nudge), with the model planning
+  # motion (the Sim's drives on) and the car standing: a fault, said at NO_MOVE_S (review 2026-11-07, LS-2: the model's launch
+  # from a stand takes 0.9-1.6 s on this car, so LEFT_NO_MOVE_S is no bound for it)
   sim, plans, last = jump_run(4., 70., sim_cls=GoHeldSim)
   go = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
   assert sim.distance() < GO_LINE_M and not sim.tp.go_in_junction
   after = plans[go:]
   withdrawn = next(i for i, p in enumerate(after) if str(p.controlPrompt) == 'cantStartTakeControl')
-  assert withdrawn * DT_MDL <= LEFT_NO_MOVE_S + 0.2 and after[-1].shouldStop and sim.s < LINE + 1.
+  assert withdrawn * DT_MDL <= NO_MOVE_S + 0.2 and after[-1].shouldStop and sim.s < LINE + 1.
 
 
 def signal_sim(red_until=None, oracle=True, line=JUNCTION - 8.5):
@@ -931,6 +950,394 @@ def test_a_signal_whose_light_nothing_reads_is_gone_on_the_clear_band():
   plans = run_objects(sim, 50.)
   assert any(p.desire == Desire.turnLeft for p in plans)
   assert not any(str(p.controlPrompt) == 'leftUndecidedTakeControl' or str(p.unprotectedLeft.state) == 'undecided' for p in plans)
+
+
+def camera_signal_sim(read):
+  """LEFT_25 at a signal mapped at its hold line, lit as on the car: no accepted light source (the oracle off), the camera's
+  reader in its default add-only mode (LIGHT_MODE_DEFAULT) reading the head 15 m past the junction as read(t) on every
+  other frame (None: nothing read), and an oncoming car every 3 s at 25 mph until 50 s, the band empty after."""
+  sim = Sim(LEFT_25, controls=[(JUNCTION - 8.5, 'signal')])
+  sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps = 'auto', TEST_RANGE_M, False
+  sim.answers_prompt, sim.tp.oracle_ok, sim.tp.camera_mode = True, False, LIGHT_MODE_DEFAULT
+  none = messaging.new_message('turnpilotLights').as_reader().turnpilotLights
+
+  def lights(sim):
+    state = read(sim.t)
+    if state is not None and int(round(sim.t / DT_MDL)) % 2 == 0:
+      sim.sm.put('turnpilotDetections', light_detections(state, JUNCTION + 15. - sim.s, shadow=False))
+    return none
+  sim.lights = lights
+  sim.raw = road_runs(lambda sim: ((JUNCTION + 60. + V_25 * (3. * (int(sim.t / 3.) + 1) - sim.t), 3.6),) if sim.t < 50. else ())
+  return sim
+
+
+@pytest.mark.parametrize('green_first', [True, False])
+def test_a_camera_red_lost_at_the_line_is_waited_for_as_the_lights_said_once_and_gone_on_the_next_green(green_first, monkeypatch):
+  # review 2026-11-07 (handbacks-rest): on the car (camera add-only, no accepted source) a camera red read at the left's line
+  # raises map_controls' own signal stop there, and the read's loss keeps it (a light gone unread keeps a stop) until a
+  # steady green releases it; but turn_light gave 'none' once the red was no longer read, so the left, held by that stop
+  # (other_hold), said "Waiting for a gap" at an empty band for as long as it stood (150 s in the review's Sim run), never
+  # logged the wait, and was never going on the gap its line promised. At HEAD green, then red, then lost handed back
+  # (lightChange) at once; arrive on red, then lost, was the same silent "Waiting for a gap" wait. Now the stop in force is
+  # the left's light: its line the light's wait throughout, the change from the green said once, the wait said once as
+  # LIGHT_RED_MAX_S passes, never a go nor a handback, and it goes on its gap once a camera green releases the stop
+  red_at, lost_at, green_at = 45. if green_first else 0., 55., 230.
+
+  def read(t):
+    return 'green' if t < red_at or t >= green_at else 'red' if t < lost_at else None
+  sim = camera_signal_sim(read)
+  said = []
+  monkeypatch.setattr(ul_mod.cloudlog, 'event', lambda name, *a, **kw: said.append((round(sim.t, 1), name)))
+  plans = run_objects(sim, green_at)
+  at_line = next(i for i, p in enumerate(plans) if str(p.unprotectedLeft.state) == 'waitGap')
+  held = plans[max(at_line, int(round((red_at + 1.) / DT_MDL))):]
+  assert held and all(p.reason == LIGHT_WAIT_REASON['red'] and p.shouldStop for p in held), \
+    {p.reason for p in held}  # never "Waiting for a gap" while the stop for the red holds the car
+  assert sim.s < LINE + 1. and str(plans[-1].unprotectedLeft.state) == 'waitGap'
+  assert not any(p.desire == Desire.turnLeft or str(p.controlPrompt) == 'leftGo' for p in plans)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS or str(p.unprotectedLeft.state) == 'undecided' for p in plans)
+  waits = [(t, name) for t, name in said if name in ('turnpilot.left_light_wait', 'turnpilot.left_light_changed',
+                                                     'turnpilot.left_no_gap', 'turnpilot.left_far_wait')]
+  light_from = red_at if green_first else at_line * DT_MDL  # counted at its line
+  assert [name for _, name in waits] == (['turnpilot.left_light_changed'] if green_first else []) + ['turnpilot.left_light_wait']
+  assert abs(waits[-1][0] - (light_from + LIGHT_RED_MAX_S)) < 1.
+  # the camera's steady green releases TurnPilot's own stop (CAMERA_GREEN_STEADY_S), then a fresh window on the empty band
+  plans = run_objects(sim, 15.)
+  go = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
+  assert CAMERA_GREEN_STEADY_S + CLEAR_WINDOW_S - 0.2 < go * DT_MDL < CAMERA_GREEN_STEADY_S + CLEAR_WINDOW_S + 2.
+  assert sim.s > JUNCTION + 10. and not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+
+
+def unmapped_camera_sim(read, status=lambda t: 'read'):
+  """LEFT_25 at a junction the map has no signal for (OSM missing one: 11-06 had one), lit as on the car: no accepted light
+  source, the camera's reader add-only (LIGHT_MODE_DEFAULT) reading the governing head 15 m past the junction as read(t) on
+  every other frame (None: nothing read), its lightStatus status(t); an empty band (the oncoming road at its own red)."""
+  sim = Sim(LEFT_25)
+  sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps = 'auto', TEST_RANGE_M, False
+  sim.answers_prompt, sim.tp.oracle_ok, sim.tp.camera_mode = True, False, LIGHT_MODE_DEFAULT
+  none = messaging.new_message('turnpilotLights').as_reader().turnpilotLights
+
+  def lights(sim):
+    state, st = read(sim.t), status(sim.t)
+    if (state is not None or st != 'read') and int(round(sim.t / DT_MDL)) % 2 == 0:
+      sim.sm.put('turnpilotDetections', light_detections(state or 'unknown', JUNCTION + 15. - sim.s, shadow=False, status=st))
+    return none
+  sim.lights = lights
+  sim.raw = road_runs()
+  return sim
+
+
+@pytest.mark.parametrize('after', ['lost', 'unknown', 'disabled'])
+def test_a_camera_red_at_a_junction_with_no_mapped_signal_holds_the_left_until_a_steady_green(after):
+  # review 2026-11-07 (HR-1): at a junction the map has no signal for, the camera's own signal is never made at the left's own
+  # junction (its own_turn gate), so a red the camera read there (add-only, the car's only source) was forgotten the moment it
+  # went unread: nothing read (a truck in front of the head), read 'unknown' (the 11-06 night's usual read), or the reader
+  # gone disabled. The left then went 2.6-3.5 s later on the oncoming band, empty at its own red, its go certified for
+  # plannerd's lift over the model's own red hold. Now the red stays the left's light until a steady camera green
+  lost_at, green_at = 40., 190.
+
+  def read(t):
+    return 'red' if t < lost_at else 'green' if t >= green_at else None if after != 'unknown' else 'unknown'
+  sim = unmapped_camera_sim(read, lambda t: 'disabled' if after == 'disabled' and lost_at <= t < green_at else 'read')
+  plans = run_objects(sim, green_at)
+  at_line = next(i for i, p in enumerate(plans) if str(p.unprotectedLeft.state) == 'waitGap' and p.shouldStop)
+  assert at_line * DT_MDL < lost_at
+  held = plans[at_line:]
+  from openpilot.selfdrive.turnpilot.map_controls import CAMERA_OFF_REASON  # the reader failing: its onset's own words (SF-2)
+  assert all(p.reason in (LIGHT_WAIT_REASON['red'], CAMERA_OFF_REASON) and p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap'
+             for p in held), sorted({(p.reason, str(p.unprotectedLeft.state)) for p in held})
+  assert sum(p.reason == LIGHT_WAIT_REASON['red'] for p in held) > 0.95 * len(held)
+  assert not any(p.desire == Desire.turnLeft or str(p.goCertified.cause) == 'unprotectedLeft' for p in plans)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans) and sim.s < LINE + 1.
+  # a steady camera green lets it go on its gap: a fresh window from the release, never lifted (no accepted green there)
+  plans = run_objects(sim, 15.)
+  go = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
+  assert CAMERA_GREEN_STEADY_S + CLEAR_WINDOW_S - 0.2 < go * DT_MDL < CAMERA_GREEN_STEADY_S + CLEAR_WINDOW_S + 2.
+  assert not any(str(p.goCertified.cause) == 'unprotectedLeft' for p in plans)
+  assert sim.s > JUNCTION + 10. and not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+
+
+def test_a_red_far_short_of_the_lefts_junction_is_no_light_of_its_own():
+  # the latch takes only heads the junction's own line (the junction less 10 m) would: a red read 25 m short of the junction
+  # (the previous signal, a mid-block crossing) holds the left only while it is read, never once the car is past it
+  sim = Sim(LEFT_25)
+  sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps = 'auto', TEST_RANGE_M, False
+  sim.answers_prompt, sim.tp.oracle_ok, sim.tp.camera_mode = True, False, LIGHT_MODE_DEFAULT
+  none = messaging.new_message('turnpilotLights').as_reader().turnpilotLights
+
+  def lights(sim):
+    if JUNCTION - 25. - sim.s > 0. and int(round(sim.t / DT_MDL)) % 2 == 0:
+      sim.sm.put('turnpilotDetections', light_detections('red', JUNCTION - 25. - sim.s, shadow=False))
+    return none
+  sim.lights = lights
+  sim.raw = road_runs()
+  plans = run_objects(sim, 60.)
+  assert any(p.desire == Desire.turnLeft for p in plans) and sim.s > JUNCTION + 10.
+
+
+@pytest.mark.parametrize('dark', [False, True])
+def test_a_left_at_a_junction_the_camera_boxes_a_light_at_is_never_lifted_and_goes_with_the_model(dark):
+  # review 2026-11-07 (HR-2): no signal mapped, the governing head boxed on every road run with no colour read (the 11-06
+  # night's every governing head, 667 reads): the left's go was certified for plannerd's lift at 31.75 s exactly as on an
+  # empty road, by day and after dark, while unsignalized_why's camera clause kept turnRelease and the unstick off. Now the
+  # lift is refused there; the left goes unlifted, with the model (the Sim's drives on)
+  from openpilot.selfdrive.turnpilot.darkness import DarkFilter
+  sim = unmapped_camera_sim(lambda t: 'unknown')
+  sim.tp.dark_filter = DarkFilter(dark=dark)
+  plans = run_objects(sim, 60.)
+  assert any(p.desire == Desire.turnLeft for p in plans) and sim.s > JUNCTION + 10.
+  assert not any(str(p.goCertified.cause) == 'unprotectedLeft' for p in plans)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  # no head read at all: an unsignalized left is lifted as before (its companion: test_turnpilotd_go's lift test)
+  sim = left_sim()
+  plans = run_objects(sim, 60.)
+  assert any(str(p.goCertified.cause) == 'unprotectedLeft' for p in plans) and sim.s > JUNCTION + 10.
+
+
+class Selfdrived:
+  """selfdrived's alerts for turnpilotd's plans, its own way, one plan at a time (selfdrived.py: hooks.plan_events, then
+  hooks.CarSignalEvents for the turn signal, into Events and AlertManager at its 100 Hz over turnpilotd's 20 Hz; the car's
+  signal not fitted, so the driver signals; the plan's SubMaster passed to the alert callbacks, as selfdrived's): step(plan)
+  gives the (alertText1, alertText2, audibleAlert name) of each of its five frames."""
+  def __init__(self):
+    import types
+
+    from openpilot.selfdrive.selfdrived.alertmanager import AlertManager
+    from openpilot.selfdrive.turnpilot import hooks
+    self.ev, self.current, self.am, self.frame = hooks.CarSignalEvents(), {'plan': None}, AlertManager(), 0
+    self.port = types.SimpleNamespace(status='off', fault='none', check='idle', checkWhy='', stillOn=False, rejected=0, left=False,
+                                      right=False, hazard=False, block='none')
+
+  def step(self, p):
+    import time
+
+    import openpilot.selfdrive.selfdrived.events as events_mod
+    from openpilot.common.realtime import DT_CTRL
+    from openpilot.selfdrive.selfdrived.events import ET, Events
+    from openpilot.selfdrive.turnpilot import hooks
+    EventName = log.OnroadEvent.EventName
+    AudibleAlert = log.SelfdriveState.AudibleAlert
+    sound_name = {v: k for k, v in AudibleAlert.schema.enumerants.items()}
+
+    class PlanSM(dict):
+      def __init__(self, plan):
+        super().__init__({'turnpilotPlan': plan})
+        self.recv_time, self.valid = {'turnpilotPlan': time.monotonic()}, {'turnpilotPlan': True}
+    self.current['plan'] = p
+    psm, out = PlanSM(p), []
+    saved = events_mod.CAR_SIGNAL_EVENTS, events_mod.shown_plan
+    events_mod.CAR_SIGNAL_EVENTS, events_mod.shown_plan = self.ev, lambda sm, now=None: self.current['plan']
+    try:
+      for _ in range(5):
+        events = Events()
+        for name in hooks.plan_events(psm) + list(self.ev.update(p, self.port, 0, DT_CTRL)):
+          events.add(getattr(EventName, name))
+        self.am.add_many(self.frame, events.create_alerts([ET.PERMANENT, ET.WARNING], [None, None, psm, False, 0, None]))
+        self.am.process_alerts(self.frame, set())
+        a = self.am.current_alert
+        out.append((a.alert_text_1, a.alert_text_2, sound_name.get(int(a.audible_alert), str(a.audible_alert))))
+        self.frame += 1
+    finally:
+      events_mod.CAR_SIGNAL_EVENTS, events_mod.shown_plan = saved
+    return out
+
+
+def selfdrived_alerts(plans):
+  """What selfdrived shows and plays for these plans (Selfdrived): (plan index, alertText1, alertText2, audibleAlert name)
+  per selfdrived frame."""
+  sd = Selfdrived()
+  return [(i, *a) for i, p in enumerate(plans) for a in sd.step(p)]
+
+
+def drive_answering_what_is_shown(sim, seconds, react_s, step=None):
+  """sim driven seconds (step(sim): one plan, drive's by default) with a driver who lights the lamp the prompt asks for once
+  "Signal LEFT Now" has been on selfdrived's screen react_s in all (None: never), not on the plan's field the screen may not
+  show (Sim.answers_prompt). Returns (plans, shown): shown per plan, its five selfdrived frames."""
+  from openpilot.common.realtime import DT_CTRL
+  sim.answers_prompt = False
+  sd, plans, shown, seen = Selfdrived(), [], [], 0.
+  for _ in range(int(round(seconds / DT_MDL))):
+    p = step(sim) if step is not None else drive(sim, DT_MDL)[0]
+    frames = sd.step(p)
+    plans.append(p)
+    shown.append(frames)
+    seen += sum(f[0] == "Signal LEFT Now" for f in frames) * DT_CTRL
+    if react_s is not None and seen >= react_s - 1e-9:
+      sim._signal = 'left'
+  return plans, shown
+
+
+def test_the_light_readers_failing_at_a_signalized_lefts_line_is_heard_before_the_left_goes():
+  """Review 2026-11-07 (SF-2): the camera's light reader failing (lightStatus disabled) 5 s after the car is held at a
+  signalized left's line. Its chimed onset ran down where map_controls' own prompt was none, but the shown prompt there is
+  the left's silent waitingForGap (turnpilotd.fill_left adds it, and overwrote the plan's reason), which plan_events raises
+  first: 18 s of a silent "Waiting for a gap", then the left went through the signal no camera could read, and "Lights
+  Unknown" came only after the go, silent. Now the onset is raised over the left's wait in its own words, with its chime,
+  before the go, then the wait's line again."""
+  from openpilot.common.realtime import DT_CTRL
+  from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S
+  from openpilot.selfdrive.turnpilot.map_controls import CAMERA_OFF_REASON
+  sim = camera_signal_sim(lambda t: None)
+  held_t = [None]
+  none = messaging.new_message('turnpilotLights').as_reader().turnpilotLights
+
+  def lights(s):
+    if held_t[0] is None and s.trace and s.trace[-1][2].shouldStop and s.v < 0.1 and str(s.trace[-1][2].unprotectedLeft.state) == 'waitGap':
+      held_t[0] = s.t
+    failing = held_t[0] is not None and s.t >= held_t[0] + 5.
+    if int(round(s.t / DT_MDL)) % 2 == 0:
+      s.sm.put('turnpilotDetections', light_detections('green', JUNCTION + 15. - s.s, shadow=False,
+                                                       status='disabled' if failing else 'read', governs=False))
+    return none
+  sim.lights = lights
+  plans = run_objects(sim, 75.)
+  go = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
+  fail_i = int(round((held_t[0] + 5.) / DT_MDL))
+  assert fail_i < go
+  shown = selfdrived_alerts(plans)
+  onset = [f for f in shown if fail_i <= f[0] < go and f[1] == 'Lights Unknown' and f[2] == CAMERA_OFF_REASON]
+  assert onset and all(f[3] == 'prompt' for f in onset[:5])
+  assert abs(len(onset) * DT_CTRL - ABORT_HOLD_S) < 0.2, len(onset) * DT_CTRL
+  assert any(f[1] == 'Waiting for a gap' or f[1] == LIGHT_WAIT_REASON['red'] for f in shown if onset[-1][0] < f[0] < go)
+
+
+def heard_spells(shown, start):
+  """The audible spells in selfdrived's frames shown from plan index start: [(first plan index, its sound)] of each run of
+  frames with a sound."""
+  spells, prev = [], 'none'
+  for i, _, _, sound in shown:
+    if i >= start and sound != 'none' and prev == 'none':
+      spells.append((i, sound))
+    prev = sound if i >= start else 'none'
+  return spells
+
+
+def test_a_long_wait_at_the_line_that_wont_end_on_its_own_is_heard_once_never_a_handback():
+  """Review 2026-11-07 (SF-4): every wait that ended in a handback's chime until that day (STAND_UNDECIDED_S on something
+  standing, the light waits, the view and creep waits, farBlocked) was visual only: a car parked 50 m up the oncoming curb
+  had 0 audible frames after the hold ('none' on 12,075 selfdrived frames) under "Waiting: something stopped is in the way"
+  for 75.8 s; the camera's red lost at the line, 'Waiting for the light' 190.8 s, never heard. The state skeptic g4c rejected,
+  with other words. Now each is heard once, as its old bound passes, a chime and no take-control; the plain wait for a gap
+  in a moving stream stays silent (the busy road's ordinary wait)."""
+  sim, plans = standing_run((50., 7.5), (50., 7.5), 150.)
+  held = next(i for i, p in enumerate(plans) if p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap')
+  spells = heard_spells(selfdrived_alerts(plans), held)
+  assert len(spells) == 1 and spells[0][1] == 'prompt', spells
+  assert abs((spells[0][0] - held) * DT_MDL - STAND_UNDECIDED_S) < 1.
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  # the camera's red lost at the line: the light's wait, heard once at its old bound (LIGHT_RED_MAX_S)
+  sim = camera_signal_sim(lambda t: 'red' if t < 55. else None)
+  plans = run_objects(sim, 230.)
+  held = next(i for i, p in enumerate(plans) if p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap')
+  spells = heard_spells(selfdrived_alerts(plans), held)
+  assert len(spells) == 1 and abs((spells[0][0] - held) * DT_MDL - LIGHT_RED_MAX_S) < 1., spells
+  # an oncoming stream with no gap for 140 s: waited through, never heard
+  stream = [JUNCTION + 60. + V_25 * 25. + k * 3. * V_25 for k in range(40)]
+  sim, plans = standing_run(None, None, 140., stream=stream)
+  held = next(i for i, p in enumerate(plans) if p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap')
+  assert heard_spells(selfdrived_alerts(plans), held) == []
+
+
+def test_a_light_changing_with_the_car_crept_into_the_junction_is_said_and_heard_and_the_car_held():
+  """Review 2026-11-07 (LS-4): a signalized left on a green with an opposing left-turner standing in the junction: the car
+  crept 4 m for a view, the nose about 3.3 m from the junction's centre; the light went yellow, then red, and it was held
+  there for the whole red (the read red's rail), "Waiting for a Gap / Waiting for the light", never heard: on a cross road of
+  two lanes or more each way that is in the near cross lanes through their green. The hold is kept (going on the band as
+  a driver clearing the junction would is Kellen's call): said in plain words, heard once, never a handback; the next green
+  and the gap, it goes."""
+  from openpilot.selfdrive.turnpilot.unprotected_left import LIGHT_CHANGED_REASON
+  yellow_at, red_at, green_at, occ_leaves = 50., 54., 130., 57.
+
+  def light_at(t):
+    return 'green' if t < yellow_at or t >= green_at else 'yellow' if t < red_at else 'red'
+  sim = camera_signal_sim(light_at)
+  sim.raw = None
+  frame = [0]
+
+  def raw(sim):
+    frame[0] += 1
+    if frame[0] % 2:
+      return None
+    return RawFrame([raw_box(JUNCTION + 6. - sim.s, 3.6)] if sim.t < occ_leaves else [], 'road', sim.t)
+  sim.raw = raw
+
+  def occluder(sim):
+    return ({'cls': 'car', 'x': JUNCTION + 6. - sim.s, 'y': 3.6, 'vx': 0., 'vy': 0., 'age': 40, 'trackId': 7, 'conf': 0.8,
+             'camera': 'road'},) if sim.t < occ_leaves else ()
+  plans = run_objects(sim, green_at, occluder)
+  i_red = round((red_at + 1.) / DT_MDL)
+  assert sim.s > LINE + 2.  # crept for the view on the green
+  held = plans[round((yellow_at + 0.5) / DT_MDL):]
+  assert all(p.shouldStop and p.reason == LIGHT_CHANGED_REASON for p in held[10:]), sorted({p.reason for p in held})
+  assert all(v < 0.05 for _, v, _ in sim.trace[i_red:])  # held where it stands, never on into the oncoming lanes
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS or p.desire == Desire.turnLeft for p in plans)
+  spells = heard_spells(selfdrived_alerts(plans), round(yellow_at / DT_MDL))
+  assert len(spells) == 1 and spells[0][0] * DT_MDL < yellow_at + 1.5, spells
+  plans = run_objects(sim, 15.)
+  assert any(p.desire == Desire.turnLeft for p in plans) and sim.s > JUNCTION + 5.
+
+
+def test_a_signal_held_with_its_light_unseen_is_heard_once_and_still_held():
+  """Review 2026-11-07 (SF-4): a through signal on the car's light config (no accepted source, the camera add-only), its red
+  read at the stand and then never read again (no green read: 0 greens in 667 reads on 11-06): held at the green it never
+  read, "Light not seen: waiting for green" on TurnPilot's status line only, selfdrived silent and blank on every frame of a
+  200 s run. Now its onset at SIGNAL_UNSEEN_S is heard once (signalUnseen), the car still held for a green, never handed
+  back; a green read releases it."""
+  from openpilot.selfdrive.turnpilot.map_controls import SIGNAL_UNSEEN_REASON, SIGNAL_UNSEEN_S
+  sim = Sim([(1000., "turn", "right"), (2000., "turn", "left")], controls=[(300., 'signal')])
+  sim.go_taps, sim.tp.oracle_ok, sim.tp.camera_mode = False, False, LIGHT_MODE_DEFAULT
+  none = messaging.new_message('turnpilotLights').as_reader().turnpilotLights
+  read = {'state': 'red'}
+
+  def lights(sim):
+    if read['state'] is not None and int(round(sim.t / DT_MDL)) % 2 == 0:
+      sim.sm.put('turnpilotDetections', light_detections(read['state'], 315. - sim.s, shadow=False))
+    return none
+  sim.lights = lights
+  plans = []
+  while not (plans and plans[-1].shouldStop and sim.v < 0.05):
+    plans.append(sim.step(engaged=True))
+    assert sim.t < 60.
+  stood = len(plans)
+  read['state'] = None
+  plans += [sim.step(engaged=True) for _ in range(int(60. / DT_MDL))]
+  assert all(p.shouldStop for p in plans[stood:]) and not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  shown = selfdrived_alerts(plans)
+  spells = heard_spells(shown, stood)
+  assert len(spells) == 1, spells
+  onset = next(f for f in shown if f[0] >= stood and f[3] != 'none')
+  assert onset[2] == SIGNAL_UNSEEN_REASON and (onset[0] - stood) * DT_MDL < SIGNAL_UNSEEN_S + 2.
+  read['state'] = 'green'
+  plans = [sim.step(engaged=True) for _ in range(int(5. / DT_MDL))]
+  assert not plans[-1].shouldStop and sim.v > 1.
+
+
+def test_a_left_the_driver_hasnt_signalled_waits_at_its_line_prompting_the_side_on_repeat_and_goes_once_lit():
+  """IC 9-21-8-25 and LEFT_GO_NEEDS_SIGNAL: the left goes only with its side lit, and on this car (no vehicle-CAN tap) only
+  the driver can light it. Until 2026-11-07 it handed back after LEFT_SIGNAL_WAIT_S dark at its line ('unsignalled', "No turn
+  signal at the line: take control"), and from the line on selfdrived showed the left's own silent waitingForGap prompt over
+  "Signal LEFT Now", so the side's chime stopped as the car stood. Now (Kellen: no give-up handbacks; the driver prompted per
+  side with a repeating chime at any speed) the car waits at its line for as long as it is dark, "Signal LEFT Now" and its
+  own chime up the whole wait, never a take-control and never a go unsignalled; lit at last, it goes on its gap."""
+  sim = left_sim()
+  sim.answers_prompt = False  # the driver never signals
+  plans = []
+  while sim.t < 120.:
+    plans += drive(sim, DT_MDL)
+  held = next(i for i, p in enumerate(plans) if p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap')
+  wait = plans[held:]
+  assert len(wait) * DT_MDL > 80. and all(p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap' for p in wait)
+  assert all(str(p.turnSignal.prompt) == 'left' and p.reason == "Unprotected left: waiting for the turn signal" for p in wait)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS or p.desire == Desire.turnLeft for p in plans)
+  shown = [s for s in selfdrived_alerts(plans) if s[0] >= held]
+  assert all(s[1] == "Signal LEFT Now" and s[3] == 'tpSignalLeft' for s in shown), sorted({s[1:] for s in shown})
+  # the driver lights it: the window from the lamp, then the go
+  sim.answers_prompt = True
+  after = []
+  while sim.s < JUNCTION + 10. and sim.t < 180.:
+    after += drive(sim, DT_MDL)
+  assert any(p.desire == Desire.turnLeft for p in after) and sim.s > JUNCTION + 10.
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in after)
 
 
 def route_time_left(range_m, controls=()):
@@ -1077,12 +1484,14 @@ def test_a_car_far_up_the_oncoming_road_seen_only_by_the_far_crop_holds_it():
 def test_without_the_far_crop_a_45_mph_left_goes_on_the_band_it_covers_and_its_loss_there_is_loud():
   # the far crop off (no pkl, the param, off for the drive) or its range unmeasured: driven to its line (never skipped at route
   # time and rerouted since 2026-11-06) and, since 2026-11-07 (Kellen: no handbacks), gone from it on the band the full pass
-  # covers, never handed back for what it can't see
+  # covers, never handed back for what it can't see. Its range unmeasured with the far crop reading is its provisional
+  # FAR_CROP_LEFT_RANGE_M since 2026-11-07 (turnpilotd.left_ranges), and the left still goes on an empty road
   for status, far_range in (('off', FAR_RANGE_M), ('disabled', FAR_RANGE_M), ('read', 0.)):
     sim = far_sim(status=status, far_range=far_range)
     plans = drive(sim, 3.)
     assert not plans[-1].tooFastToTurn and str(plans[-1].unprotectedLeft.state) == 'approach', status
-    assert plans[-1].unprotectedLeft.farRangeM == (far_range if status == 'read' else 0.) and not plans[-1].unprotectedLeft.farNeeded
+    want = 0. if status != 'read' else (far_range or FAR_CROP_LEFT_RANGE_M)
+    assert plans[-1].unprotectedLeft.farRangeM == want and not plans[-1].unprotectedLeft.farNeeded
     while sim.s < JUNCTION + 30. and sim.t < 120.:
       plans += drive(sim, DT_MDL)
     assert any(p.desire == Desire.turnLeft for p in plans), status
@@ -1112,6 +1521,13 @@ def test_without_the_far_crop_a_45_mph_left_goes_on_the_band_it_covers_and_its_l
   after = [p for p, (_, _, _) in zip(plans, sim.trace, strict=True) if p is not None][-int(round((sim.t - off_at[0]) / DT_MDL)):]
   assert any(str(p.controlAlert) == 'farViewOff' for p in after[:3])
   assert sum(str(p.controlAlert) == 'farViewOff' for p in plans) * DT_MDL <= 2.1  # said once
+  # ...and shown: selfdrived raises it over the left's silent waitingForGap for its whole time, with its chime (review
+  # 2026-11-07, SF-3: its time ran down under that prompt and 'Far View Off' was never shown at the line)
+  from openpilot.common.realtime import DT_CTRL
+  from openpilot.selfdrive.turnpilot.turnpilotd import FAR_OFF_ALERT_S
+  shown = [f for f in selfdrived_alerts(plans) if f[1] == 'Far View Off']
+  assert abs(len(shown) * DT_CTRL - FAR_OFF_ALERT_S) < 0.2 and shown[0][3] == 'prompt', len(shown) * DT_CTRL
+  assert all(str(plans[f[0]].controlPrompt) == 'waitingForGap' for f in shown)
   # the far crop's cars held it at the line while it read them; never handed back, never skipped and rerouted from it
   before = plans[:len(plans) - len(after)]
   assert not any(p.desire == Desire.turnLeft for p in before) and any(p.unprotectedLeft.farBlockers for p in before)
@@ -1167,25 +1583,25 @@ def test_main_reads_the_far_range():
   assert left_far_range_for(Params({}, unknown=True)) == 0.
 
 
-def test_a_car_standing_far_up_the_road_is_a_loud_handback_never_an_endless_wait():
+def test_a_car_standing_far_up_the_road_is_said_and_holds_the_left_never_an_endless_silent_wait():
   # skeptic G6: a car parked on the oncoming side 280 m up the road, in the band, found only by the far crop (which blocks
-  # at any range): the 45 mph left stood at its line for good, silently (waitingForGap). Now, waiting on the far crop's boxes
-  # alone FAR_BLOCKED_UNDECIDED_S, it is undecided out loud (farBlocked, the take-control prompt), held at its line within
-  # -2.0, never a go
+  # at any range): the 45 mph left stood at its line for good, silently (waitingForGap). Until 2026-11-07, waiting on the far
+  # crop's boxes alone FAR_BLOCKED_UNDECIDED_S was the farBlocked handback; now (Kellen: "no, no handbacks") the car the
+  # detector sees holds the left and the line says what it waits for from there, held at its line within -2.0, never a go,
+  # never a take-control
   from openpilot.selfdrive.turnpilot.unprotected_left import FAR_BLOCKED_UNDECIDED_S
   sim = far_sim()
   sim.raw, sim.raw_far = road_runs(), far_runs(lambda sim: [(JUNCTION + 280., 5.4)])
   plans = []
-  while sim.t < 40. + FAR_BLOCKED_UNDECIDED_S:  # ~29 s to stand at the line
+  while sim.t < 70. + FAR_BLOCKED_UNDECIDED_S:  # ~29 s to stand at the line
     plans += drive(sim, DT_MDL)
   states = [str(p.unprotectedLeft.state) for p in plans]
   stand = states.index('waitGap')
-  first_und = states.index('undecided')
-  assert FAR_BLOCKED_UNDECIDED_S - 0.1 <= (first_und - stand) * DT_MDL <= FAR_BLOCKED_UNDECIDED_S + 0.5
-  assert all(p.controlPrompt == 'waitingForGap' for p in plans[stand:first_und])
-  und = plans[first_und:]
-  assert all(str(p.unprotectedLeft.state) == 'undecided' and p.unprotectedLeft.why == 'farBlocked' for p in und)
-  assert all(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS and p.shouldStop for p in und)
+  said = next(i for i, p in enumerate(plans) if p.reason == LONG_WAIT_REASON['farBlocked'])
+  assert FAR_BLOCKED_UNDECIDED_S - 0.1 <= (said - stand) * DT_MDL <= FAR_BLOCKED_UNDECIDED_S + 0.5
+  assert all(p.controlPrompt == 'waitingForGap' and p.shouldStop for p in plans[stand + 5:])
+  assert all(p.reason == LONG_WAIT_REASON['farBlocked'] for p in plans[said:])
+  assert 'undecided' not in states and not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
   assert not any(p.desire == Desire.turnLeft for p in plans) and sim.s <= LINE + 0.1 and sim.v < 0.1
   assert min(p.accelCap for p in plans) >= -2.0 - 1e-6
 

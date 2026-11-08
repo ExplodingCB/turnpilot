@@ -70,7 +70,8 @@ SILENT_PROMPTS = ('none', 'yieldAhead', 'waitingForGap', 'creepingForView', 'wai
 RETIRED_PROMPTS = ('stopSignGo', 'signalGo', 'unprotectedTurnGo', 'carStoppedGo')
 RETIRED_ALERTS = ('goingOnRed',)
 CONTROL_ALERT_EVENTS = ('stopOverrun', 'proceedingOnYellow', 'junctionUncertain', 'carStoppedNote',  # below the prompt, above a lane change
-                        'lightGreenNotMoving', 'unstickLift', 'pedestrianWaiting', 'turnpilotResumed', 'lightNotRead')
+                        'lightGreenNotMoving', 'unstickLift', 'pedestrianWaiting', 'turnpilotResumed', 'lightNotRead',
+                        'signalUnseen')
 CONTROL_STATUS_ALERTS = ('mapControlsUnavailable', 'lightSourceRejected', 'farViewOff', 'sideCamerasOff',  # last of all, a status line
                          'mapControlsUnavailableSilent')
 SILENT_STATUS_ALERTS = ('mapControlsUnavailableSilent',)  # ...that line with no sound (MC-03)
@@ -109,11 +110,15 @@ def plan_events(sm, now: float | None = None) -> list[str]:
      or wait for the reroute), or an unprotected left's go withdrawn for oncoming traffic (oncomingHolding);
   4. too fast to turn, or a turn from a standstill missed (turnpilotTooFastToTurn, turnMissed), or navd's reroute past a keep
      the model drove under TurnPilotAlwaysDrive (KEEP_REROUTED);
+  4b. over a wait's silent prompt (WAIT_PROMPTS: the left waiting or creeping, the decider waiting for cross traffic, a yield),
+     a said-once line in its onset (ONSET_OVER_WAITS: the light reader failing, the far crop or the side views lost), its
+     chime with it: those waits last as long as the car stands (review 2026-11-07, SF-2, SF-3);
   5. a map control's other prompt (turnpilotControlPrompt: yield ahead, an unprotected left waiting for a gap or creeping for
      a view, visual only; its go, a short chime);
   6. a map control's other alerts (turnpilotControlAlert: a stop line overrun, going on a yellow, an unprotected turn's
      junction uncertain, the car stopped with nothing holding it: the stopped note's chime);
   7. a planned lane change, offered or just aborted (turnpilotLaneChangeLeft/Right/Aborted, LaneChangeEvents);
+  7b. the prompt to signal the turn (turnSignal.prompt: CarSignalEvents raises its line): nothing below while it is up (SF-1);
   8. the wrong lane for the turn ahead (turnpilotWrongLane), then the lights unknown (turnpilotControlAlert,
      LIGHTS_UNKNOWN_ALERTS: the camera's light reader failing, up for its whole spell), then a lane it can't confirm
      (turnpilotWrongLane);
@@ -132,7 +137,20 @@ def plan_events(sm, now: float | None = None) -> list[str]:
   if not getattr(sm, 'recv_time', {}).get('turnpilotPlan'):
     return []
   plan = fresh_plan(sm, now)
-  if plan is None or plan.handback != custom.TurnpilotPlan.Handback.none:
+  return plan_event_names(plan) if plan is not None else []
+
+
+# a status line said once, raised over a silent prompt of the left's or the stop-sign decider's while it is up (they are
+# visual only and up for as long as the car waits: review 2026-11-07, SF-2 and SF-3): the camera's light reader failing (its
+# chimed onset, map_controls CAMERA_OFF_REASON), the far crop or the side views lost (turnpilotd's farViewOff, sideCamerasOff)
+ONSET_OVER_WAITS = ('lightSourceRejected', 'farViewOff', 'sideCamerasOff')
+WAIT_PROMPTS = tuple(p for p in SILENT_PROMPTS if p != 'none')
+
+
+def plan_event_names(plan) -> list[str]:
+  """plan_events' names for a fresh, valid turnpilotPlan (plan_events' order). turnpilotd reads it of its own plan to run a
+  said-once line's time down only on frames it is shown (shows_alert)."""
+  if plan.handback != custom.TurnpilotPlan.Handback.none:
     return []
   if plan.fault != custom.TurnpilotPlan.Fault.none:
     return ['turnpilotUnavailable']
@@ -149,12 +167,21 @@ def plan_events(sm, now: float | None = None) -> list[str]:
     return ['turnpilotRouteNotice']
   if skip_said(plan):
     return ['turnpilotTooFastToTurn']
+  if alert in ONSET_OVER_WAITS and str(plan.controlPrompt) in WAIT_PROMPTS and onset_live(plan):
+    return ['turnpilotControlAlert']  # said once over a wait's silent prompt, which stays up as long as the car waits
   if str(plan.controlPrompt) != 'none':
     return ['turnpilotControlPrompt']
   if alert in CONTROL_ALERT_EVENTS:
     return ['turnpilotControlAlert']
   if lane_change_events(plan):
     return []  # the lane change outranks the wrong lane
+  if str(plan.turnSignal.prompt) != 'none':
+    # the driver's prompt to signal (CarSignalEvents' "Signal LEFT Now", the side's chime on repeat) outranks every line
+    # below: it is the only thing that unblocks a left waiting dark at its line (LEFT_GO_NEEDS_SIGNAL). Review 2026-11-07
+    # (SF-1): the left's prompt stands aside for it, so plan_events fell through to "Wrong Lane" (wrongLaneForTurn from 60 m,
+    # the left LC-03 drives from the lane it is in) or "Can't Confirm Lane", the same Priority.LOW and newer, and the left
+    # waited at its line with nothing on screen or heard asking for the lamp
+    return []
   Mismatch = custom.TurnpilotPlan.LaneMismatch
   if plan.laneMismatch in (Mismatch.turnOnlyGoingStraight, Mismatch.wrongLaneForTurn):
     return ['turnpilotWrongLane']
@@ -167,6 +194,23 @@ def plan_events(sm, now: float | None = None) -> list[str]:
   if alert in CONTROL_STATUS_ALERTS:
     return ['turnpilotControlAlert']
   return []
+
+
+def onset_live(plan) -> bool:
+  """The plan's status alert is a said-once line still in its onset: the light reader's chimed onset (its words, map_controls
+  CAMERA_OFF_REASON), or the far crop's or the side views' loss (on the plan only while turnpilotd's time for it runs)."""
+  alert = str(plan.controlAlert)
+  if alert == 'lightSourceRejected':
+    from openpilot.selfdrive.turnpilot.map_controls import CAMERA_OFF_REASON
+    return str(plan.reason) == CAMERA_OFF_REASON
+  return alert in ('farViewOff', 'sideCamerasOff')
+
+
+def shows_alert(plan, alert: str) -> bool:
+  """plan's controlAlert is alert and selfdrived raises it (plan_event_names: turnpilotControlAlert, no prompt to signal
+  over it). turnpilotd runs a said-once line's time down only on such frames (review 2026-11-07, SF-2, SF-3: the far crop's,
+  the side views' and the light reader's onset ran down hidden under the left's silent prompt and were never shown)."""
+  return str(plan.controlAlert) == alert and plan_event_names(plan) == ['turnpilotControlAlert']
 
 
 def skip_said(plan) -> bool:
@@ -190,7 +234,7 @@ CONTROL_PROMPT_TEXT = {
   'leftUndecidedTakeControl': 'TurnPilot can\'t judge oncoming traffic',
   'waitingForCross': 'Waiting for cross traffic',
   'stopGo': 'Going from the stop sign',
-  'signalUnseenTakeControl': 'TurnPilot can\'t see the light',
+  'signalUnseenTakeControl': 'TurnPilot can\'t see the light',  # never sent since 2026-11-07 (map_controls SIGNAL_UNSEEN_S: said, held)
   'turnAbandonedTakeControl': 'The car is steering out of the turn',
   'wrongSideTakeControl': 'Yellow line on the right: the car is left of the centre line',
   'pedestrianWaitingTakeControl': 'A pedestrian has stood at the crosswalk 45 s',
@@ -210,7 +254,7 @@ CONTROL_ALERT_TEXT = {
   'hardBrake': 'Braking hard',
   'carCrossing': 'Car crossing: stopping short of it',
   'oncomingHolding': 'Oncoming traffic: holding short of its lanes',
-  'farViewOff': 'Far view off for this drive: no lefts across fast oncoming traffic',
+  'farViewOff': 'Far view lost: oncoming traffic judged closer in',  # lefts go on the band the full pass sees (2026-11-07)
   'sideCamerasOff': 'Side cameras off for this drive: stop signs see less cross traffic',
   'crossTrafficAfterCommit': 'Cross traffic: carrying on through the junction',
   'cameraPaused': 'Cross-traffic camera paused: holding',
@@ -231,6 +275,7 @@ CONTROL_ALERT_TEXT = {
   'pedestrianWaiting': 'Waiting for pedestrian',  # the crosswalk hold's standoff (SC-02), once a hold at PED_NOTE_S
   'turnpilotResumed': 'Big model back: TurnPilot drives the route again',  # at the engagement after a fallback's pause
   'lightNotRead': 'No red seen: check the light',  # a stand at a mapped signal with no red read (turnpilotd.py LIGHT_UNREAD_S)
+  'signalUnseen': 'Light not seen: waiting for green',  # held at a signal with no light read (map_controls SIGNAL_UNSEEN_S)
 }
 
 
@@ -304,10 +349,14 @@ def hides_stock_lane_change(names, direction) -> bool:
   return any(name in side and direction == side[name] for name in names)
 
 
-def lane_change_text(plan, side: str) -> str:
+def lane_change_text(plan, side: str, lit: bool = False) -> str:
   """The coming lane change's alert line: the countdown, then the prompt to signal, then waiting for the blind spot. Under
   TurnPilotAlwaysDrive a change held for the blind spot says so (selfdrived gives it no sound), and its release says it is clear,
-  with its countdown (LC-01, laneChangeHold)."""
+  with its countdown (LC-01, laneChangeHold). lit: the driver's lamp that way is lit (carState): with the countdown spent and
+  TurnPilot's request withheld this frame (the lane planner's REQUEST on a line read unsure or not read, LINE_UNSURE_REASON,
+  or a soft frame), the change is being checked, never a prompt to signal what the driver has signalled. Review 2026-11-07
+  (LC-3): such frames said "Signal LEFT to Change Lanes" with the side's chime on repeat for 1.2-1.65 s on 2 of the 4
+  driver-signalled requests of the 11-06 replays, and a driver who cycles the stalk on it aborts the change (noSignal)."""
   if plan is None:
     return f'Lane Change {side.capitalize()}'
   hold = str(plan.laneChangeHold)
@@ -319,6 +368,8 @@ def lane_change_text(plan, side: str) -> str:
     return f'Lane Change {side.capitalize()} in {math.ceil(plan.laneChangeCountdown)}'
   if str(plan.laneChange) == side:
     return f'Changing Lanes {side.capitalize()} Once Clear'
+  if lit:
+    return f'Changing Lanes {side.capitalize()}: Checking the Lane'
   return f'Signal {side.upper()} to Change Lanes'
 
 
@@ -382,7 +433,7 @@ CAR_SIGNAL_FAULT_TEXT = {
 CAR_SIGNAL_FAULT_S = 4.
 CAR_SIGNAL_ONCE_S = 6.
 CAR_SIGNAL_NOTICE_S = 3.
-PROMPT_QUIET_S = 10.  # a prompt gone this long is a new one: chimed again
+PROMPT_QUIET_S = 10.  # the prompt's quiet time before the first; since 2026-11-07 every return chimes again (LC-4)
 # a chime goes ahead of the lines without one until it has been on air this long: longer than any of its sounds (0.75 s),
 # so the next chime never cuts it off, and many of soundd's 20 Hz reads of selfdriveState
 CHIME_S = 1.
@@ -532,7 +583,10 @@ class CarSignalEvents:
     prompt = str(ts.prompt) if ts is not None else 'none'
     prompt_line = None
     if prompt != 'none':
-      if prompt != self._prompt_side or self._prompt_quiet >= PROMPT_QUIET_S:
+      # every return of the prompt, its lamp still dark, chimes again (review 2026-11-07, LC-4: a dropout under PROMPT_QUIET_S,
+      # a lane planner frame or the driver's tap going out, ended() the chime and the prompt came back silent for the rest of
+      # its life). One put aside under another line while it stayed up, once heard, stays heard (Chime)
+      if prompt != self._prompt_side or self._prompt_quiet > 0.:
         self._prompt_chime.ended()
         # repeating until the driver's lamp is lit (car_signals drops the prompt then): one soft chime was missed on 11-06
         # (Kellen, 2026-11-07: make it more obvious, and very clear left from right: the side's own chime, the side in capitals)

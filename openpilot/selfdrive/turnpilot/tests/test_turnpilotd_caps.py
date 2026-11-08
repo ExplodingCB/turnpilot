@@ -14,7 +14,7 @@ from openpilot.selfdrive.turnpilot.hooks import CLEAR_DESIRE, KEEP_FOLLOW
 from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Sim
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_keep import KEEP_J, follow_sim, keep_sim, run_keep
-from openpilot.selfdrive.turnpilot.turn_speed import CORNER_M, NO_SPEED_CAP, V_CORNER, turn_done_deg, turn_speed_cap
+from openpilot.selfdrive.turnpilot.turn_speed import CORNER_M, NO_SPEED_CAP, V_CORNER, V_CORNER_CURB, turn_done_deg, turn_speed_cap
 
 Desire = log.Desire
 JUNCTION = 300.
@@ -71,7 +71,7 @@ def through_a_turn(maneuvers, side, cancel_at_start=False, yaw=True):
 
 
 def test_a_turn_turned_to_its_angle_lets_its_cap_go_before_its_pass():
-  for maneuvers, side, floor in ((RIGHT, 1, 3.0), (T_LEFT, -1, V_CORNER)):
+  for maneuvers, side, floor in ((RIGHT, 1, V_CORNER_CURB), (T_LEFT, -1, V_CORNER)):  # a right's corner speed: 2.97, derived (2026-11-07)
     sim, out = through_a_turn(maneuvers, side)
     done = [(dist, plan, v, up) for dist, is_done, turned, plan, v, up in out if is_done and turned >= turn_done_deg(90.) - 1e-6 and
             str(plan.maneuverType) == 'turn' and dist < 0.]

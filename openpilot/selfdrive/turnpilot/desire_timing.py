@@ -10,9 +10,10 @@ Where the lead is depends on the side the turn goes to (turn_lead; 2026-11-06, d
   crawl from 20 m lands the repeat about 20 m out) and the 10 m entry pulse each started the right 11-25 m before the
   junction on a 12-15 m radius, cutting the inside curb (the driver took over twice, one curb clip), where the human turned
   in about 6.7 m out on an 8 m radius. Gate 1's "not from 10-20 m" was the far side's wider arc at 6.9 m/s; the curb
-  side's cap has the car at 3 m/s by 20 m (turn_speed.py), and one pulse at 8 m, 6.6 s long, covers the turn at that
-  speed through about 12 m past the junction. Being inside ENTRY_M it is the entry pulse, so no repeat or entry follows it
-  (the standstill re-arm, a hold's go, a re-engage still do). A hold's go standing further out than 8 m (a stop line, a red,
+  side's cap has the car at its corner speed (2.97 m/s at a right angle; 3 m/s by 20 m before 2026-11-07) by 15 m
+  (turn_speed.py), and one pulse at 8 m, 6.6 s long, covers the turn at that speed through about 12 m past the junction.
+  Being inside ENTRY_M it is the entry pulse, so no repeat or entry follows it (the standstill re-arm, a hold's go, a
+  re-engage still do). A hold's go standing further out than 8 m (a stop line, a red,
   the stop-sign decider's go) waits with no desire until the car is inside 8 m; turn_skip's tooLate deadline for it is
   5 m (CURB_FIRST_PULSE_M, turn_skip's). The junction's own hold line is 8 m out too (scene_policy.HOLD_LINE_M: a walker on
   the turn's crosswalk), and the car stands a little short of it (8.26 m in test_turnpilotd's ped_crosswalk_right): a go
@@ -169,9 +170,9 @@ The angle is the junction's real one from Valhalla's bearings (route_follower.py
 Short of CLEAR_MIN_DEG it waits: in H2's single-pulse runs, with the pulse gone at 5-16 degrees the model gave up
 3 turns of 3, and at 25-42 degrees it finished 9 of 10 on its own (the one it gave up was at 32).
 No turn pulse starts while the car is too fast to make the turn (turn_skip.py, may_start false): the turn speed cap
-has the car at 6.9 m/s by a far-side turn's 40 m lead and 3 m/s by 20 m before a curb-side one, and faster than the check
-allows something else holds the speed (the driver's foot), so the model would turn from road speed. Too fast for long,
-the turn is skipped and no pulse goes at all. A pulse
+has the car at 6.9 m/s by a far-side turn's 40 m lead and at its corner speed (2.97 m/s at a right angle) by 15 m before a
+curb-side one, and faster than the check allows something else holds the speed (the driver's foot), so the model would
+turn from road speed. Too fast for long, the turn is skipped and no pulse goes at all. A pulse
 already out is held and never cancelled, since dropping it and sending it again would be a new rising edge, and a turn
 under way is finished. A keep goes at any speed.
 Nor does any desire go out while openpilot isn't steering (carControl.latActive): modeld would not feed it to the

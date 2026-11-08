@@ -11,6 +11,7 @@ from pathlib import Path
 
 from openpilot.selfdrive.turnpilot.map_controls import CAMERA_OFF_REASON, TURN_LIGHT_REASON, TURN_UNSEEN_S
 from openpilot.selfdrive.turnpilot.preflight import INFO, WARN, check_shadow
+from openpilot.selfdrive.turnpilot.unprotected_left import LIGHT_WAIT_REASON, LONG_WAIT_REASON, UNDECIDED_FAULTS, UNDECIDED_REASON
 
 HEADER = Path(__file__).parents[3] / 'common' / 'params_keys.h'
 DOCS = Path(__file__).parents[4] / 'docs' / 'turnpilot'
@@ -68,12 +69,26 @@ def test_a_preflight_warn_on_shadow_mode_means_shadow_mode_is_on():
 def test_the_checklists_lights_are_the_codes():
   sec = section('SHADOW_CHECKLIST.md', 'Traffic lights')
   assert f"(`TurnPilotCameraLights`, `{defaults()['TurnPilotCameraLights']}` by default)" in sec
-  assert f"With no colour read for {TURN_UNSEEN_S:.0f} seconds at the line, the comma says `{TURN_LIGHT_REASON}`" in sec
-  # the 11-06 night: 667 reads over both drives, no green, nothing governing the car's lane read: every turn at a light
+  # since 2026-11-07 a route turn's signal is a through signal's (map_controls): no stop for want of a green, so no
+  # TURN_UNSEEN_S handback and its words (TURN_LIGHT_REASON) are never said; the page says what the turn now does
+  assert TURN_LIGHT_REASON not in sec and f"{TURN_UNSEEN_S:.0f} seconds at the line" not in sec
+  assert 'A route turn at a signal is driven as a through signal is' in sec and 'With no colour read the turn goes with the driving model' in sec
+  # the 11-06 night: 667 reads over both drives, no green, nothing governing the car's lane read
   assert 'At one turn' not in sec and 'at some turns at a light' not in sec
-  assert 'no green in 667 light reads' in sec and 'expect every turn at a light on the map to stop at its line' in sec
+  assert 'no green in 667 light reads' in sec and 'expect every turn at a light on the map to stop at its line' not in sec
   # the reader failing (2026-11-06): its line as the comma says it, once per failing spell, at most once a minute; and the
   # red map_controls refused past a line gone through on a go, an error the log check triages against the rider's notes
   assert f'reading "{CAMERA_OFF_REASON}"' in sec and 'Camera light reader off for this drive' not in sec, sec
   assert 'once per failing spell' in sec and 'no more than once a minute' in sec
   assert '`turnpilot.camera_red_refused`' in sec
+
+
+def test_the_checklists_unprotected_lefts_are_the_codes():
+  """SHADOW_CHECKLIST.md's unprotected lefts against unprotected_left (2026-11-07, Kellen: "no, no handbacks"): the page
+  had the driver expect a take-control at every left past the camera's reach and at every left after dark, which the build
+  no longer says. It names each wait's line as the car says it, the handbacks still raised (UNDECIDED_FAULTS) and no other."""
+  sec = section('SHADOW_CHECKLIST.md', 'What to watch in shadow mode')
+  for words in list(LONG_WAIT_REASON.values()) + [LIGHT_WAIT_REASON['red'], 'Signal LEFT Now']:
+    assert f'`{words}`' in sec, words
+  for why, words in UNDECIDED_REASON.items():
+    assert (f'`{words}`' in sec) == (why in UNDECIDED_FAULTS), (why, words)

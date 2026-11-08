@@ -845,10 +845,12 @@ def test_a_param_off_the_shipped_default_says_what_it_costs(tmp_path, key, value
 
 def test_the_unprotected_left_mode_says_each_left_is_driven_to_its_line(tmp_path):
   """TurnPilotAutoLeft (unprotected_left.py): auto, the default, drives every unprotected left to its line, where it goes or
-  hands back; until 2026-11-06 this line said every left was skipped and rerouted under a range of 0."""
+  waits saying for what (never a handback since 2026-11-07; it said "hands back there" before); until 2026-11-06 this line
+  said every left was skipped and rerouted under a range of 0."""
   lines = run_live(tmp_path)
   got = line(lines, "TurnPilotAutoLeft")
-  assert got.status == INFO and "every unprotected left is driven to its line" in got.detail and "hands back there" in got.detail
+  assert got.status == INFO and "every unprotected left is driven to its line" in got.detail and "waits there saying for what" in got.detail
+  assert "hands back" not in got.detail
   assert "skipped" not in got.detail and "rerouted" not in got.detail
   for mode, words in (("off", "every unprotected left hands back at its line"), ("announce", "debugging only")):
     got = line(run_live(tmp_path, params={**GOOD_PARAMS, "TurnPilotAutoLeft": mode}), "TurnPilotAutoLeft")

@@ -129,20 +129,20 @@ def test_detector(tmp_path):
 
 
 def test_far_crop(tmp_path):
-  # DESIGN phase 4 G5: the far crop (and its measured range) are what a 45-55 mph left needs to go; without either the car
-  # drives, those lefts driven to their line and handed back there (never skipped or rerouted since 2026-11-06), so a warning,
-  # never a failure, and said so
+  # DESIGN phase 4 G5: the far crop (and its measured range) are what a 45-55 mph left reads its band to; without the far crop
+  # the car drives, those lefts driven to their line and gone from it on the full pass's band (never skipped or rerouted since
+  # 2026-11-06, never handed back since 2026-11-07), and unmeasured, the provisional 210 m: a warning, never a failure, said so
   path = tmp_path / "big_far_detector_1344x760_tinygrad.pkl"
   missing = preflight.check_far_crop(path, 300., True)
-  assert missing.status == WARN and "missing" in missing.detail and "hand back at their line" in missing.detail
+  assert missing.status == WARN and "missing" in missing.detail and "go on the band the full pass covers" in missing.detail
   path.write_bytes(b"version https://git-lfs.github.com/spec/v1\n")
   assert preflight.check_far_crop(path, 300., True).status == WARN
   path.write_bytes(b"\0" * 5000)
   unmeasured = preflight.check_far_crop(path, 0., True)
-  assert unmeasured.status == WARN and "TurnPilotLeftFarRangeM" in unmeasured.detail and "hand back at their line" in unmeasured.detail
+  assert unmeasured.status == WARN and "TurnPilotLeftFarRangeM" in unmeasured.detail and "provisional 210 m" in unmeasured.detail
   off = preflight.check_far_crop(path, 300., False)
-  assert off.status == WARN and "TurnPilotFarCrop" in off.detail and "hand back at their line" in off.detail
-  assert not any(w in c.detail for c in (missing, unmeasured, off) for w in ('skipped', 'rerouted'))
+  assert off.status == WARN and "TurnPilotFarCrop" in off.detail and "go on the band the full pass covers" in off.detail
+  assert not any(w in c.detail for c in (missing, unmeasured, off) for w in ('skipped', 'rerouted', 'hand back'))
   ok = preflight.check_far_crop(path, 300., True)
   assert ok.status == PASS and "300 m" in ok.detail
 

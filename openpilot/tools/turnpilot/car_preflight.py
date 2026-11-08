@@ -60,7 +60,7 @@ from opendbc.car.structs import CarParams
 from opendbc.car.tesla.fingerprints import FW_VERSIONS
 from opendbc.car.tesla.values import CAR, TeslaFlags
 from openpilot.common.version import RELEASE_BRANCHES
-from openpilot.selfdrive.turnpilot.maps.defaults import CAR_LEFT_RANGE_M, EARLIER_CAR_RANGES_M
+from openpilot.selfdrive.turnpilot.maps.defaults import CAR_LEFT_RANGE_M, EARLIER_CAR_RANGES_M, FAR_CROP_LEFT_RANGE_M
 
 GO, NO_GO, WARN, UNKNOWN, INFO = "GO", "NO-GO", "WARN", "UNKNOWN", "INFO"
 
@@ -1044,13 +1044,14 @@ def noted(p: Param, pv: ParamView) -> Line:
   if key == "DisableUpdates":  # updates on, the default: a fix pushed to the turnpilot branch reaches the car (11:50)
     return Line(key, INFO, f"{text}: updates on, a fix pushed to the turnpilot branch reaches the car through Settings > Software") \
       if not v else Line(key, WARN, f"{text}: no fix pushed to the turnpilot branch can reach the car", f"{PREFLIGHT_SET} DisableUpdates=0")
-  if key == "TurnPilotLeftFarRangeM":
-    return Line(key, INFO, f"{text}: the far crop adds no reach") if not v else \
-      Line(key, WARN, f"{text} m: it must come from a measurement on this car", f"{PREFLIGHT_SET} TurnPilotLeftFarRangeM=0 until it is measured")
+  if key == "TurnPilotLeftFarRangeM":  # unmeasured: turnpilotd.left_ranges takes the far crop's provisional range while it is on
+    return Line(key, INFO, f"{text}: unmeasured, the far crop's provisional {FAR_CROP_LEFT_RANGE_M:.0f} m while it is on") if not v else \
+      Line(key, WARN, f"{text} m: it must come from a measurement on this car",
+           f"{PREFLIGHT_SET} TurnPilotLeftFarRangeM=0 (the provisional {FAR_CROP_LEFT_RANGE_M:.0f} m) until it is measured")
   if key == "TurnPilotAutoLeft":  # unprotected_left.py; until 2026-11-06 lefts past TurnPilotLeftRangeM were skipped and rerouted
     if v == "auto":
       return Line(key, INFO, f"{text}: every unprotected left is driven to its line and goes from there on a gap the camera " +
-                             "certifies within TurnPilotLeftRangeM, else hands back there with the car held")
+                             "certifies on the band it covers, else waits there saying for what, never handed back (2026-11-07)")
     what = "the car stops at each unprotected left's line, says whether it would go, and hands back (debugging only)" \
       if v == "announce" else "every unprotected left hands back at its line (G1), none goes"
     return Line(key, WARN, f"{text}: {what}", f"{PREFLIGHT_SET} TurnPilotAutoLeft=auto")

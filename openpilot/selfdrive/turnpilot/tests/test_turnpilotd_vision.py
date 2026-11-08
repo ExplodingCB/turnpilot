@@ -132,14 +132,19 @@ def test_vision_side_views_off_or_disabled_hands_back_at_1_s_saying_so(tmp_path,
   assert p.stopGo.fault == 'H9' and str(p.stopGo.mode) == 'vision'
 
 
-@pytest.mark.parametrize('dt_h, words', [(8., 'night at ETA +0 min'), (None, "the clock isn't set")])
-def test_vision_night_and_no_clock_hand_back_at_1_s_saying_which(tmp_path, dt_h, words):
+@pytest.mark.parametrize('dt_h', [8., None], ids=['night', 'noClock'])
+def test_vision_night_and_no_clock_go_after_the_window_as_by_day(tmp_path, dt_h):
+  """Before 2026-11-07 vision handed back at night and with no clock at 1 s (H9, "night at ETA +0 min", "the clock isn't
+  set"). Kellen, 2026-11-07: no night-only gating, the streets are lit. Now the stop is judged on the day table's reach and
+  goes after VISION_CLEAR_S, never handed back (test_turnpilotd_stop_night covers dusk and a car seen holding the go)."""
   sim = vsim(tmp_path)
   sim.tp.wall_clock = (lambda: None) if dt_h is None else (lambda: ETA + dt_h * 3600. + sim.t)
   run_to_line(sim)
-  sim.run(3.)
-  p = sim.plans()[-1]
-  assert p.controlPrompt == 'stopSignTakeControl' and words in p.reason and p.reason.startswith('Stop sign: ') and go_frame(sim) is None
+  sim.run(14.)
+  plans = sim.plans()
+  k, a = go_frame(sim), arrived(plans)
+  assert k is not None and (k - a) * DT_MDL == pytest.approx(sr.VISION_CLEAR_S, abs=0.11)
+  assert not any(p.controlPrompt == 'stopSignTakeControl' for p in plans) and caps_ok(plans)
 
 
 def test_vision_without_the_sidecar_hands_back_h8(tmp_path):

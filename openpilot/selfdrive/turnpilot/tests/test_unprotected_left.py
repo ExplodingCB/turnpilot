@@ -6,11 +6,13 @@ import math
 import pytest
 
 from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.turnpilot import unprotected_left as ul
+from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.route_follower import LEFT
 from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M, VEL_TRUST_HITS
 from openpilot.selfdrive.turnpilot.tests.synthetic import scene
 from openpilot.selfdrive.turnpilot.unprotected_left import (BLOCKED_UNDECIDED_S, CLEAR_WINDOW_S, CREEP_MAX_M, CREEP_SHORT_M, CREEP_STALL_S, HELD_MIN_M,
-                                                           LIGHT_RED_MAX_S, LIGHT_UNKNOWN_S, PET_S, RAW_CONF,
+                                                           LIGHT_RED_MAX_S, LIGHT_UNKNOWN_S, LONG_WAIT_REASON, PET_S, RAW_CONF,
                                                            ROAD_FRESH_S, SPEED_MARGIN, STALE_UNDECIDED_S, STAND_UNDECIDED_S, LeftInput, RawBox,
                                                            RawFrame, UnprotectedLeft, WIDTH_FLOOR_M, band_blockers, nearest_range, r_req,
                                                            t_clear, t_req)
@@ -18,6 +20,14 @@ from openpilot.selfdrive.turnpilot.unprotected_left import (BLOCKED_UNDECIDED_S,
 HOLD_D = 9.     # m from the hold line (map_controls: HOLD_LINE_M + MAP_MARGIN_M) to the maneuver point
 V_25 = 11.18    # m/s, 25 mph
 RANGE = 150.
+
+
+@pytest.fixture
+def log_events(monkeypatch):
+  """The left's cloudlog events, (name, fields), in order: a converted wait is said once, never a frame's log."""
+  out = []
+  monkeypatch.setattr(ul.cloudlog, 'event', lambda name, *a, **kw: out.append((name, kw)))
+  return out
 
 
 def raw(x, y, cls='car', conf=0.6, camera='road', near=None, ranged=True, width=1.8):
@@ -259,12 +269,18 @@ def test_an_occluder_is_no_traffic_but_blocks_the_view_and_the_car_creeps():
   j.wait(0.5, boxes=[box], objects=[turner])
   d = j.wait(0.2, boxes=[box, raw(90., 6.)], objects=[turner], v=0.7, distance=HOLD_D - 0.3)
   assert d.state == 'waitGap' and not d.go and d.creep_m <= 0.3 + 0.7 * 0.2 + 1e-6
-  # the view still blocked BLOCKED_UNDECIDED_S after the full creep: can't judge, said and handed back
+  # the view still blocked BLOCKED_UNDECIDED_S after the full creep: said once, and waited through where it crept to (until
+  # 2026-11-07 the 'blocked' handback; Kellen: "no, no handbacks"), never a go on the hidden lanes
   j = Junction()
   j.wait(0.5, boxes=[box], objects=[turner])
   j.wait(BLOCKED_UNDECIDED_S - 0.5, boxes=[box], objects=[turner], v=0., distance=HOLD_D - CREEP_MAX_M)
-  d = j.wait(1., boxes=[box], objects=[turner], v=0., distance=HOLD_D - CREEP_MAX_M)
-  assert d.state == 'undecided' and d.prompt == 'leftUndecidedTakeControl' and not any(x.go for x in j.decisions)
+  assert j.decisions[-1].prompt == 'creepingForView'
+  d = j.wait(60., boxes=[box], objects=[turner], v=0., distance=HOLD_D - CREEP_MAX_M)
+  assert d.state == 'creep' and d.prompt == 'waitingForGap' and d.reason == LONG_WAIT_REASON['view'] == "Waiting for the view to clear"
+  assert d.creep_m == CREEP_MAX_M and not any(x.go or x.state == 'undecided' for x in j.decisions)
+  # ...and the turner gone, the car goes from where it crept to on the band it now sees
+  d = j.wait(CLEAR_WINDOW_S + 0.3, v=0., distance=HOLD_D - CREEP_MAX_M)
+  assert any(x.go for x in j.decisions[-round((CLEAR_WINDOW_S + 0.3) / DT_MDL):])
   # the turner goes: the view clears, the band is clear, and the car goes from where it crept to
   j = Junction()
   j.wait(0.5, boxes=[box], objects=[turner])
@@ -417,19 +433,25 @@ def test_only_an_occluders_own_box_is_exempt():
   assert matches(same, scene([turner]).objects[0])
 
 
-def test_a_creep_the_car_never_makes_is_handed_back():
+def test_a_creep_the_car_never_makes_is_said_and_waited_through_never_handed_back(log_events):
   # skeptic G4 (blocker 4): the view blocked, the band clear, the creep asked for, and the car never moves (the model holding
   # a standstill: G0's tapless stand). The full-creep timer never started (blocked_s counts only once crept), so it stood in
-  # 'creep' for minutes with only the visual creepingForView. Standing CREEP_STALL_S in a creep it hasn't made: handed back
+  # 'creep' for minutes with only the visual creepingForView. Standing CREEP_STALL_S in a creep it hasn't made was the
+  # creepStall handback until 2026-11-07 (Kellen: "no, no handbacks"): now its line says the wait, it is logged once, the
+  # creep stays asked (the model may yet take it), and the view clearing lets the car go from where it stands
   turner = oncoming(HOLD_D + 12., 3.6, vx=0., trackId=7, box=[0.5, 0.4, 0.6, 0.5], camera='road')
   box = raw(HOLD_D + 12., 3.6)
   box = RawBox(box.camera, box.cls, box.conf, box.bearing_deg, box.span_deg, box.xy, box.near_m, (0.5, 0.4, 0.6, 0.5))
   j = Junction()
   d = j.wait(CREEP_STALL_S - 0.5, boxes=[box], objects=[turner], v=0.)
   assert d.state == 'creep' and d.prompt == 'creepingForView'
-  d = j.wait(1., boxes=[box], objects=[turner], v=0.)
-  assert d.state == 'undecided' and d.prompt == 'leftUndecidedTakeControl' and d.why == 'creepStall'
-  assert d.reason == "Can't creep for a view: take control" and not any(x.go for x in j.decisions)
+  d = j.wait(120., boxes=[box], objects=[turner], v=0.)
+  assert d.state == 'creep' and d.prompt == 'waitingForGap' and d.reason == LONG_WAIT_REASON['view'] and d.creep_m == CREEP_MAX_M
+  assert not any(x.go or x.state == 'undecided' or x.prompt in TAKE_CONTROL_PROMPTS for x in j.decisions)
+  said = [kw for name, kw in log_events if name == 'turnpilot.left_view_wait']
+  assert len(said) == 1 and said[0]['why'] == 'creepStall', said
+  j.wait(CLEAR_WINDOW_S + 0.3, v=0.)  # the turner gone: the view open from where the car stands
+  assert any(x.go for x in j.decisions[-round((CLEAR_WINDOW_S + 0.3) / DT_MDL):])
   # a creep that moves isn't stalled; nor one held by something else (a walker crossing in front)
   j = Junction()
   d = j.wait(CREEP_STALL_S + 2., boxes=[box], objects=[turner], v=0.5, distance=HOLD_D - 1.)
@@ -562,23 +584,61 @@ def test_never_a_go_while_anything_else_holds_the_car_or_its_light_isnt_green():
   assert d.state == 'waitGap' and d.creep_m == 0.
 
 
-def test_a_light_it_cant_read_or_that_changes_while_it_waits_is_handed_back():
-  # no read of the junction's light for LIGHT_UNKNOWN_S: it can't tell red from green, out loud
+def test_a_light_it_cant_read_or_that_changes_while_it_waits_is_waited_through_never_handed_back(log_events):
+  """Until 2026-11-07 these handed back, the car held: no read ('unknown': navd's controls failing, whether a signal is there
+  not known) for LIGHT_UNKNOWN_S, a red past LIGHT_RED_MAX_S ('light'), and the light going red or yellow while it waited on
+  a green (lightChange). Kellen: "no, no handbacks". Each is now a wait at its line saying so, logged once, never a go under
+  the red or yellow read (the hard rail): gone on the next green, or on the gap once turn_light gives no red or yellow. This
+  harness feeds turn_light's value as given; in the closed loop a red that raised TurnPilot's own stop stays 'red' while the
+  stop is in force, read or not (test_turnpilotd_left: a camera red lost at the line), so 'none' after a red is only the
+  camera's shadow red, which raised none."""
+  def no_handback(j):
+    return not any(x.go or x.state == 'undecided' or x.prompt in TAKE_CONTROL_PROMPTS for x in j.decisions)
+  # whether there is a light isn't known (SIGNAL_NEEDS_GREEN): waited on, said once, its line plain
   j = Junction()
-  d = j.wait(LIGHT_UNKNOWN_S + 0.2, light='unknown')
-  assert d.state == 'undecided' and d.why == 'light' and d.prompt == 'leftUndecidedTakeControl'
-  # a red is waited through (no gap is taken under it) up to LIGHT_RED_MAX_S
+  d = j.wait(LIGHT_UNKNOWN_S + 60., light='unknown')
+  assert d.state == 'waitGap' and d.prompt == 'waitingForGap' and d.reason == "Waiting: can't tell if there's a light" and no_handback(j)
+  assert [kw['light'] for name, kw in log_events if name == 'turnpilot.left_light_wait'] == ['unknown']
+  j.wait(CLEAR_WINDOW_S + 0.2, light='green')
+  assert any(x.go for x in j.decisions)
+  # a red is waited through, a red read that never ends too (past LIGHT_RED_MAX_S: said once more, never a handback)
+  log_events.clear()
   j = Junction()
-  d = j.wait(LIGHT_RED_MAX_S - 1., light='red')
-  assert d.state == 'waitGap'
-  d = j.wait(1.5, light='red')
-  assert d.state == 'undecided' and d.why == 'light'
-  # waiting at the line on a green, the light goes yellow: the car is in the junction as the light changes, which it can't
-  # finish the turn on (no cross-traffic check): handed back at once
+  d = j.wait(LIGHT_RED_MAX_S + 30., light='red')
+  assert d.state == 'waitGap' and d.reason == "Waiting for the light" and no_handback(j)
+  assert [kw['light'] for name, kw in log_events if name == 'turnpilot.left_light_wait'] == ['red']
+  # waiting at the line on a green, the light goes yellow then red: held where it stands, short of the oncoming lanes, said
+  # once for the change; the next green is a fresh window, and it goes on its gap
+  log_events.clear()
   j = Junction()
   j.wait(1., boxes=[raw(90., 3.6)], light='green')
   d = j.step(boxes=[raw(90., 3.6)], light='yellow')
-  assert d.state == 'undecided' and d.why == 'lightChange' and not any(x.go for x in j.decisions)
+  assert d.state == 'waitGap' and d.reason == "Waiting for the light" and not d.stops and d.creep_m == 0.
+  d = j.wait(40., light='red')
+  assert d.state == 'waitGap' and no_handback(j)
+  assert [kw['light'] for name, kw in log_events if name == 'turnpilot.left_light_changed'] == ['yellow']
+  n = len(j.decisions)
+  j.wait(CLEAR_WINDOW_S - 0.3, light='green')
+  assert not any(x.go for x in j.decisions[n:])  # a fresh window from the green: never a window counted under the red
+  d = j.wait(0.5, light='green')
+  assert any(x.go for x in j.decisions[n:])
+  # ...or, the red no longer read and no stop of TurnPilot's in force for it (turn_light's 'none': the camera's shadow red,
+  # which raised none; an unread light is no reason to wait), on the gap, a fresh window
+  j = Junction()
+  j.wait(1., light='green')
+  j.wait(5., light='red')
+  n = len(j.decisions)
+  j.wait(CLEAR_WINDOW_S - 0.3, light='none')
+  assert not any(x.go for x in j.decisions[n:])
+  j.wait(0.5, light='none')
+  assert any(x.go for x in j.decisions[n:])
+  # another change on the same hold is another event: the next green then red is said again, once
+  log_events.clear()
+  j = Junction()
+  for _ in range(3):
+    j.wait(1., boxes=[raw(90., 3.6)], light='green')
+    j.wait(5., boxes=[raw(90., 3.6)], light='red')
+  assert len([1 for name, _ in log_events if name == 'turnpilot.left_light_changed']) == 3
 
 
 def test_a_go_never_outlives_another_hold_or_a_change_before_its_commit():
@@ -628,20 +688,50 @@ def test_held_short_of_its_line_under_a_red_it_waits_where_it_is():
 
 # ------------------------------------------------------------------- the turn signal (car_signals.py, DESIGN phase4/blinker 6.7)
 
-def test_no_go_and_no_creep_without_the_signal():
+def test_no_go_and_no_creep_without_the_signal_and_it_waits_for_it_never_handed_back(log_events):
+  """The left goes only with its side lit (LEFT_GO_NEEDS_SIGNAL: IC 9-21-8-25, and a car standing dark in a left-turn position
+  invites a pass into its path). On this car only the driver can light it, prompted per side on repeat (car_signals.py).
+  Until 2026-11-07 the left handed back after LEFT_SIGNAL_WAIT_S dark ('unsignalled'); now it waits at its line saying so,
+  logged once, never gone unsignalled however long, and goes on a gap once lit."""
   from openpilot.selfdrive.turnpilot.unprotected_left import LEFT_SIGNAL_WAIT_S, NO_SIGNAL_REASON
   j = Junction()
   d = j.wait(CLEAR_WINDOW_S + 1., signal_lit=False)
   assert not any(x.go for x in j.decisions) and d.state == 'waitGap' and d.reason == NO_SIGNAL_REASON and d.creep_m == 0.
-  d = j.wait(LEFT_SIGNAL_WAIT_S - CLEAR_WINDOW_S - 1.5, signal_lit=False)
-  assert d.state == 'waitGap'
-  d = j.wait(1., signal_lit=False)
-  assert d.state == 'undecided' and d.why == 'unsignalled' and d.prompt == 'leftUndecidedTakeControl'
+  d = j.wait(LEFT_SIGNAL_WAIT_S + 120., signal_lit=False)
+  # its own prompt stands aside for car_signals' "Signal LEFT Now" and its chime (the module's no_signal comment)
+  assert d.state == 'waitGap' and d.prompt == 'none' and d.reason == NO_SIGNAL_REASON
+  assert not any(x.go or x.state == 'undecided' or x.prompt in TAKE_CONTROL_PROMPTS for x in j.decisions)
+  said = [kw for name, kw in log_events if name == 'turnpilot.left_unsignalled']
+  assert len(said) == 1 and abs(said[0]['unsignalled_s'] - LEFT_SIGNAL_WAIT_S) < 0.1, said
+  # lit at last: the window counts from the lamp, then it goes
+  n = len(j.decisions)
+  j.wait(CLEAR_WINDOW_S - 0.3, signal_lit=True)
+  assert not any(x.go for x in j.decisions[n:])
+  j.wait(0.5, signal_lit=True)
+  assert any(x.go for x in j.decisions[n:])
   # lit: the window counts from the lamp, then it goes
   j = Junction()
   j.wait(2., signal_lit=False)
   j.wait(CLEAR_WINDOW_S + 0.2, signal_lit=True)
   assert any(x.go for x in j.decisions)
+
+
+def test_each_long_wait_is_logged_once_per_spell_never_per_frame(log_events):
+  # a converted wait is said once as its old bound passes, and again only once what held it let go and it came round again:
+  # the lamp lit then dark again, a red after a green, the creep left and stalled again
+  from openpilot.selfdrive.turnpilot.unprotected_left import LEFT_SIGNAL_WAIT_S
+  j = Junction()
+  car = [raw(90., 3.6)]  # a car in the band: no go meanwhile
+  j.wait(LEFT_SIGNAL_WAIT_S + 20., boxes=car, signal_lit=False)
+  j.wait(1., boxes=car, signal_lit=True)
+  j.wait(LEFT_SIGNAL_WAIT_S + 20., boxes=car, signal_lit=False)
+  assert len([1 for name, _ in log_events if name == 'turnpilot.left_unsignalled']) == 2
+  log_events.clear()
+  for _ in range(2):
+    j.wait(LIGHT_RED_MAX_S + 5., boxes=car, light='red')
+    j.wait(1., boxes=car, light='green')
+  assert len([1 for name, _ in log_events if name == 'turnpilot.left_light_wait']) == 2
+  assert not any(x.go or x.state == 'undecided' for x in j.decisions)
 
 
 def test_signal_gate_off_is_todays_rule(monkeypatch):
@@ -750,11 +840,27 @@ def test_needed_far_runs_must_be_fresh_and_cover_the_band():
   assert not any(x.go for x in j.decisions)
   d = j.wait(CLEAR_WINDOW_S + 1., far_range_m=300., far_live=True)
   assert any(x.go for x in j.decisions) and not any(x.state == 'undecided' for x in j.decisions)
-  # far runs further apart than FAR_FRESH_S
+  # far runs further apart than FAR_FRESH_S: no go on them while the full pass's band hasn't been clear a whole window. Review
+  # 2026-11-07 (R2): that held an empty road's left forever while the far crop ran 1-3 times a second (far_needed dropped
+  # only past one far gap over STALE_UNDECIDED_S), where one that didn't run went on the full pass's band. Once that band has
+  # been clear a whole window with the far slot's age alone holding it, the left is judged on it (far_behind) and goes; a far
+  # box in the band within FAR_BLOCK_RECENT_S still holds it
+  for every in (math.ceil(FAR_FRESH_S / DT_MDL) + 2, 30, 38):  # 2.25, 0.67 and 0.53 far runs a second, gaps under 2 s
+    j = Junction(v_limit=V_45)
+    d = far_wait(j, CLEAR_WINDOW_S - 0.2, every=every, far_range_m=300., far_live=True)
+    assert not any(x.go for x in j.decisions), every
+    d = far_wait(j, 1., every=every, far_range_m=300., far_live=True)
+    assert d.go and not d.far_needed and not any(x.state == 'undecided' for x in j.decisions), every
+    j = Junction(v_limit=V_45)
+    d = far_wait(j, 20., far=[raw(250., 3.6)], every=every, far_range_m=300., far_live=True)
+    assert not any(x.go for x in j.decisions), every  # the far crop's car holds it, however slow its runs
+  # ...and once its runs hold FAR_FRESH_S a window again it is needed again (disengaged here: the rule read with no go taken)
+  from openpilot.selfdrive.turnpilot.unprotected_left import FAR_BEHIND_CLEAR_S
   j = Junction(v_limit=V_45)
-  every = math.ceil(FAR_FRESH_S / DT_MDL) + 2
-  d = far_wait(j, CLEAR_WINDOW_S + 1., every=every, far_range_m=300., far_live=True)
-  assert not any(x.go for x in j.decisions)
+  far_wait(j, CLEAR_WINDOW_S + 0.5, every=10, far_range_m=300., far_live=True, enabled=False)
+  assert j.left.far_behind and not j.decisions[-1].far_needed
+  far_wait(j, FAR_BEHIND_CLEAR_S + 0.2, every=2, far_range_m=300., far_live=True, enabled=False)
+  assert not j.left.far_behind and j.decisions[-1].far_needed
   # far runs that don't cover the band's bearings past the full pass's range (aimed off, clamped at the frame's edge, the
   # horizon out of the crop): seen nothing there, judged on the full pass's band once stale and gone when clear
   for cover in ((-20., 3.), (5., 30.), None):
@@ -814,26 +920,27 @@ def far_blocked_wait(j, seconds, x, y, seen_every=1, light='none', **kw):
   return d
 
 
-def test_a_far_car_standing_in_the_band_is_undecided_out_loud_never_an_endless_wait():
+def test_a_far_car_standing_in_the_band_is_said_and_holds_the_left_never_an_endless_silent_wait(log_events):
   # skeptic G6: any far box in the band blocks at any range (math.inf: its range can't clear it), so a car standing far up
   # the road in the band (parked on the oncoming side, queued at the next light in the car's own lanes, or just far up
   # them) held a 45-55 mph left at its line for good, silently (waitingForGap). Moving traffic reaches the full pass's range
-  # within FAR_BLOCKED_UNDECIDED_S; waiting on far boxes alone for that long, the car can't tell standing from coming: out
-  # loud (leftUndecidedTakeControl, the handback chime, the car held), never a go
-  from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
+  # within FAR_BLOCKED_UNDECIDED_S; waiting on far boxes alone for that long, the car can't tell standing from coming. Until
+  # 2026-11-07 that was the farBlocked handback; now (Kellen: "no, no handbacks") the car the detector sees still holds the
+  # left, and its line says what it waits for from FAR_BLOCKED_UNDECIDED_S, logged once: never a go, never silent
   from openpilot.selfdrive.turnpilot.unprotected_left import FAR_BLOCKED_UNDECIDED_S
   assert 30. <= FAR_BLOCKED_UNDECIDED_S <= 45.  # DESIGN's no gap in 45 s, scoped to the far crop's boxes alone
   for v in (V_45, V_55):
     for x, y in ((280., 5.4), (300., 0.), (400., 0.)):
       for seen_every in (1, 2, 10):  # every far run, half of them (the far recall G6 is built for), one a second
+        log_events.clear()
         j = Junction(v_limit=v)
-        d = far_blocked_wait(j, FAR_BLOCKED_UNDECIDED_S + 5., x, y, seen_every)
+        d = far_blocked_wait(j, FAR_BLOCKED_UNDECIDED_S + 30., x, y, seen_every)
         case = (v, x, y, seen_every, d.state, d.why, round(j.t, 1))
-        assert not any(x.go for x in j.decisions), case
-        assert d.state == 'undecided' and d.why == 'farBlocked' and d.prompt in TAKE_CONTROL_PROMPTS, case
-        assert FAR_BLOCKED_UNDECIDED_S - 0.1 <= j.t <= FAR_BLOCKED_UNDECIDED_S + 2 * seen_every * DT_MDL + 0.1, case  # from its first sighting
-        assert all(x.state == 'waitGap' and x.prompt == 'waitingForGap' for x in j.decisions[:-1]), case
-        assert d.reason and d.reason != "Waiting for a gap", case
+        assert not any(x.go or x.state == 'undecided' or x.prompt in TAKE_CONTROL_PROMPTS for x in j.decisions), case
+        assert all(x.state == 'waitGap' and x.prompt == 'waitingForGap' for x in j.decisions), case
+        said = [k for k, x in enumerate(j.decisions) if x.reason == LONG_WAIT_REASON['farBlocked']]
+        assert said and FAR_BLOCKED_UNDECIDED_S - 0.1 <= said[0] * DT_MDL <= FAR_BLOCKED_UNDECIDED_S + 2 * seen_every * DT_MDL + 0.1, case
+        assert len([1 for name, _ in log_events if name == 'turnpilot.left_far_wait']) == 1, case
 
 
 def test_moving_traffic_and_other_holds_never_make_a_far_car_a_fault():
@@ -856,12 +963,11 @@ def test_moving_traffic_and_other_holds_never_make_a_far_car_a_fault():
       if d.go:
         break
     return j
-  # a 45 mph stream at an 8 s headway (no gap of T_req): waited through, never the farBlocked fault (traffic reaches the full
-  # pass's range); no gap in STAND_UNDECIDED_S, the noGap handback (owner decision (ii))
+  # a 45 mph stream at an 8 s headway (no gap of T_req): waited through, never the far wait's line (traffic reaches the full
+  # pass's range); no gap in STAND_UNDECIDED_S, said (owner decision (ii)'s bound) and waited through (2026-11-07: no handback)
   j = stream(V_45, 8., 400., 3. * FAR_BLOCKED_UNDECIDED_S)
-  und = [k for k, x in enumerate(j.decisions) if x.state == 'undecided']
-  assert und and j.decisions[und[0]].why == 'noGap' and abs(und[0] * DT_MDL - STAND_UNDECIDED_S) < 0.2
-  assert not any(x.go for x in j.decisions)
+  assert not any(x.state == 'undecided' or x.reason == LONG_WAIT_REASON['farBlocked'] for x in j.decisions)
+  assert all(x.state == 'waitGap' for x in j.decisions) and not any(x.go for x in j.decisions)
   # one slow car (8 m/s) from 300 m: in the full pass's range within FAR_BLOCKED_UNDECIDED_S, then past: no fault, and a go
   # once it has passed, inside STAND_UNDECIDED_S (from 400 m, 56 s: noGap)
   j = stream(8., 1000., 300., (300. + 20.) / 8. + CLEAR_WINDOW_S + 1.)
@@ -870,10 +976,11 @@ def test_moving_traffic_and_other_holds_never_make_a_far_car_a_fault():
   # it; at the green the wait on the far car alone starts from there
   j = Junction(v_limit=V_45)
   d = far_blocked_wait(j, 2. * FAR_BLOCKED_UNDECIDED_S, 280., 5.4, light='red')
-  assert d.state == 'waitGap' and not any(x.state == 'undecided' for x in j.decisions)
-  t_green = j.t
+  assert d.state == 'waitGap' and d.reason == "Waiting for the light" and not any(x.state == 'undecided' for x in j.decisions)
+  n = len(j.decisions)
   d = far_blocked_wait(j, FAR_BLOCKED_UNDECIDED_S + 5., 280., 5.4, light='green')
-  assert d.state == 'undecided' and d.why == 'farBlocked' and j.t - t_green >= FAR_BLOCKED_UNDECIDED_S - 0.1
+  said = [k for k, x in enumerate(j.decisions[n:]) if x.reason == LONG_WAIT_REASON['farBlocked']]
+  assert d.state == 'waitGap' and said and said[0] * DT_MDL >= FAR_BLOCKED_UNDECIDED_S - 0.1
   # the far crop not needed (25 mph): a far box blocks only within R_req, as the full pass's do; beyond it, a go
   j = Junction()
   d = far_blocked_wait(j, CLEAR_WINDOW_S + 1., 280., 5.4)
@@ -973,40 +1080,57 @@ def test_the_lefts_own_hold_short_of_the_oncoming_lanes_is_never_held_in_them_on
   assert all(d.stops and not d.crossed for d in ds) and ds[-1].state == 'undecided' and ds[-1].why == 'position'
 
 
-def test_every_wait_at_the_line_for_a_gap_ends_in_the_loud_handback_at_45_s_never_a_go():
+def test_every_wait_at_the_line_for_a_gap_is_said_at_45_s_and_waited_through_never_a_go_nor_a_handback(log_events):
   """Owner decision (ii), 2026-10-30, Kellen's delegate (DESIGN's UNDECIDED row: no gap in 45 s): a car parked in the band
   seen only as raw boxes, and a stream with no gap, each waited on silently with no limit (154bdaa bounded only what the
-  tracker says stands). Every wait at its line for a gap is now the noGap fault at STAND_UNDECIDED_S ('standing' where the
-  tracker says so), the car held, said. Another hold keeps the car where it is (a red, no lamp lit): that is no wait for a
-  gap, so the count pauses (their own bounds hold: LIGHT_RED_MAX_S, LEFT_SIGNAL_WAIT_S), and a go starts it over."""
-  from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
+  tracker says stands). Until 2026-11-07 every wait at its line for a gap ended in the noGap handback at STAND_UNDECIDED_S
+  ('standing' where the tracker says so). Kellen, 2026-11-07: "no, no handbacks". It is now said there, once a hold (the
+  log; its line 'standing' where the tracker says so), and waited through, the car held, a car it sees holding it, never a
+  go. Another hold keeps the car where it is (a red, no lamp lit): that is no wait for a gap, so the count pauses, and a
+  go starts it over."""
   for boxes in (lambda t: [raw(50., 7.5)], lambda t: [raw(x, 3.6) for x in (120. - 11. * (t % 3.), 150. - 11. * (t % 3.))]):
+    log_events.clear()
     j = Junction()
-    for k in range(round((STAND_UNDECIDED_S + 5.) / DT_MDL)):
+    for k in range(round((STAND_UNDECIDED_S + 120.) / DT_MDL)):
       d = j.step(boxes(k * DT_MDL))
-      if d.state == 'undecided':
-        break
-    assert d.state == 'undecided' and d.why == 'noGap' and d.prompt in TAKE_CONTROL_PROMPTS and not d.stops
-    assert d.reason == "No gap in oncoming traffic: take control"
-    assert abs(j.t - STAND_UNDECIDED_S) < 0.1 and not any(x.go for x in j.decisions)
-    assert all(x.state == 'waitGap' for x in j.decisions[:-1])
-  # under a red for 60 s, then 40 s on the green with the band blocked: no wait for a gap under the red, so no fault
+    assert d.state == 'waitGap' and d.prompt == 'waitingForGap' and d.reason == "Waiting for a gap" and not d.stops
+    assert not any(x.go or x.state == 'undecided' or x.prompt in TAKE_CONTROL_PROMPTS for x in j.decisions)
+    said = [kw for name, kw in log_events if name == 'turnpilot.left_no_gap']
+    assert len(said) == 1 and said[0]['why'] == 'noGap' and abs(said[0]['wait_s'] - STAND_UNDECIDED_S) < 0.1, said
+  # under a red for 60 s, then 40 s on the green with the band blocked: no wait for a gap under the red, so nothing said
+  log_events.clear()
   j = Junction()
   j.wait(60., boxes=[raw(50., 7.5)], light='red')
   d = j.wait(STAND_UNDECIDED_S - 5., boxes=[raw(50., 7.5)], light='green')
-  assert d.state == 'waitGap' and not any(x.state == 'undecided' for x in j.decisions)
+  assert d.state == 'waitGap' and not any(name == 'turnpilot.left_no_gap' for name, _ in log_events)
   d = j.wait(6., boxes=[raw(50., 7.5)], light='green')
-  assert d.state == 'undecided' and d.why == 'noGap'
-  # a go after 40 s, withdrawn at its first motion: the wait on its own hold is counted afresh from there
+  assert d.state == 'waitGap' and [name for name, _ in log_events if name == 'turnpilot.left_no_gap'] == ['turnpilot.left_no_gap']
+  # a go after 40 s, withdrawn at its first motion: the wait on its own hold is counted afresh from there, and said afresh
+  log_events.clear()
   j = Junction()
   j.wait(40., boxes=[raw(50., 7.5)])
   go(j)
   d = j.step([raw(110., 3.6)], v=0.5, distance=HOLD_D - 0.05)
   assert d.state == 'waitGap' and j.left.hold_here
   d = j.wait(STAND_UNDECIDED_S - 5., boxes=[raw(100., 3.6)], v=0.)
-  assert d.state == 'waitGap' and d.stops
-  d = j.wait(6., boxes=[raw(100., 3.6)], v=0.)
-  assert d.state == 'undecided' and d.why == 'noGap' and d.stops  # held, its own hold
+  assert d.state == 'waitGap' and d.stops and not any(name == 'turnpilot.left_no_gap' for name, _ in log_events)
+  d = j.wait(60., boxes=[raw(100., 3.6)], v=0.)
+  assert d.state == 'waitGap' and d.stops and d.stops[0].should_stop  # held, its own hold
+  assert [kw['hold'] for name, kw in log_events if name == 'turnpilot.left_no_gap'] == [True]
+
+
+def test_a_car_standing_in_the_way_is_said_for_what_it_is_and_waited_on(log_events):
+  # the tracker says the band's car stands (a velocity-trusted track under STAND_SPEED matched to its box): past
+  # STAND_UNDECIDED_S the line says so, in plain words (until 2026-11-07: 'standing', "Blocked by something standing: take
+  # control"), the car held, and it goes once the car has gone
+  parked = oncoming(50., 7.5, vx=0., trackId=3, box=[0.5, 0.4, 0.6, 0.5], camera='road')
+  j = Junction()
+  d = j.wait(STAND_UNDECIDED_S + 30., boxes=[raw(50., 7.5)], objects=[parked])
+  assert d.state == 'waitGap' and d.reason == LONG_WAIT_REASON['standing'] == "Waiting: something stopped is in the way"
+  assert not any(x.go or x.state == 'undecided' or x.prompt in TAKE_CONTROL_PROMPTS for x in j.decisions)
+  assert [kw['why'] for name, kw in log_events if name == 'turnpilot.left_no_gap'] == ['standing']
+  d = j.wait(CLEAR_WINDOW_S + 0.3)
+  assert any(x.go for x in j.decisions[-round((CLEAR_WINDOW_S + 0.3) / DT_MDL):])
 
 
 def under_the_hold(j, seconds):

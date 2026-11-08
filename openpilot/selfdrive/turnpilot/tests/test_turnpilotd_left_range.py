@@ -21,12 +21,13 @@ import pytest
 from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot import turnpilotd
-from openpilot.selfdrive.turnpilot.maps.defaults import CAR_LEFT_RANGE_M
+from openpilot.selfdrive.turnpilot.maps.defaults import CAR_LEFT_RANGE_M, FAR_CROP_LEFT_RANGE_M
 from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M
 from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import BROKEN_WHITE_LEFT, THREE_LANES_LEFT_TURN, Sim
-from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import (JUNCTION, LINE, STRAIGHT_M, TEST_RANGE_M, V_25, drive, far_runs,
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import (JUNCTION, LINE, STRAIGHT_M, TEST_RANGE_M, V_25, drive,
+                                                                      drive_answering_what_is_shown, far_runs,
                                                                      road_runs)
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_night import NIGHT_EV, NightSim
 from openpilot.selfdrive.turnpilot.turnpilotd import TurnPilot
@@ -89,6 +90,27 @@ def test_the_full_pass_range_is_what_the_letterboxed_pass_can_box():
   assert tp.left_ranges() == (FULL_PASS_RANGE_M, 0.)
   tp.left_range_m = 60.  # a range measured under the cap is the range
   assert tp.left_ranges()[0] == 60.
+
+
+def test_a_live_far_crop_extends_the_band_to_its_provisional_range():
+  # 2026-11-07 (bleeding edge): TurnPilotLeftFarRangeM unmeasured (0) and the far crop on, the far slot's range is
+  # FAR_CROP_LEFT_RANGE_M, the native strips' pixel arithmetic at the same density (maps/defaults): 1.8 m at f 1141.5 px is
+  # ~10 px at 205.5 m, 9.8 at 210. Until then a live far crop extended nothing, and the band was the full pass's ~98 m
+  assert abs(1.8 * 1141.5 / FAR_CROP_LEFT_RANGE_M - 9.8) < 0.05 and FAR_CROP_LEFT_RANGE_M == CAR_LEFT_RANGE_M
+  tp = TurnPilot()
+  tp.left_range_m = CAR_LEFT_RANGE_M
+  for status in ('read', 'noRoom', 'noCalibration', 'sweep'):  # on: reading, or waiting for room (far_live, route time's)
+    tp.far_status, tp.far_status_age = status, 0.
+    assert tp.left_ranges() == (FULL_PASS_RANGE_M, FAR_CROP_LEFT_RANGE_M), status
+  for status in ('disabled', 'off', 'unset'):  # off, failing, or a log from before the field: nothing past the full pass
+    tp.far_status = status
+    assert tp.left_ranges() == (FULL_PASS_RANGE_M, 0.), status
+  tp.far_status, tp.far_status_age = 'read', 2.  # its status stale: not known to read
+  assert tp.left_ranges() == (FULL_PASS_RANGE_M, 0.)
+  tp.far_status_age, tp.left_far_range_m = 0., 150.  # a measured range wins over the provisional one
+  assert tp.left_ranges() == (FULL_PASS_RANGE_M, 150.)
+  tp.far_status = 'disabled'  # ...and is kept as before, the far slot's liveness the left's own input (far_live)
+  assert tp.left_ranges() == (FULL_PASS_RANGE_M, 150.)
 
 
 def assert_went(sim, plans):
@@ -179,13 +201,119 @@ def test_the_native_schedule_said_on_with_no_runs_at_the_line_goes_on_the_full_p
   sim = left_on(V_25)
   native_reading(sim, far='noRoom')
   assert_went(sim, through(sim))
-  # never run in its first NATIVE_NO_RUN_S (nativeStatus unavailable): the far crop's slot, its range unmeasured: the same
+  # never run in its first NATIVE_NO_RUN_S (nativeStatus unavailable): the far crop's slot, its provisional range
+  # (FAR_CROP_LEFT_RANGE_M, TurnPilotLeftFarRangeM unmeasured): gone on its runs over an empty band
   sim = left_on(V_25)
   native_reading(sim, status='unavailable')
   sim.raw_far = far_runs(cover=NATIVE_COVER)
   plans = through(sim)
   go = assert_went(sim, plans)
-  assert plans[go].unprotectedLeft.farRangeM == 0.
+  assert plans[go].unprotectedLeft.farRangeM == FAR_CROP_LEFT_RANGE_M and plans[go].unprotectedLeft.farNeeded
+
+
+# ---------------------------------------------------------------------------------------------------- the far crop at a left
+
+FAR_CROP_COVER = (-15.6, 15.6)  # the far crop's 640 px at the horizon, at f 1141.5 px (aimed straight here: far_runs')
+
+
+def car_cadence(monkeypatch, frames=1200):
+  """The detector's frames at a left's line on the car's budget, far first (detector/tests/test_far_first.car_drive: the
+  11-06 timings replayed through modeld_detector on a simulated clock): per frame 'road', 'wide', 'far' or None."""
+  from openpilot.selfdrive.turnpilot.detector.tests.test_far_first import car_drive
+  _, _, what, _ = car_drive(monkeypatch, frames, 'roadAndWide', 0., far_first=True)
+  return what
+
+
+def cadenced(what, cars, kind, cover=FAR_CROP_COVER):
+  """A raw (kind 'road') or raw_far ('far') of the Sim's on the cadence what (cycled): road_runs' and far_runs' boxes, on
+  the frames the schedule ran that pass."""
+  import dataclasses
+  from openpilot.selfdrive.turnpilot.scene.tracker import RawFrame
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import raw_box
+  frame = [0]
+
+  def raw(sim):
+    k, frame[0] = frame[0] % len(what), frame[0] + 1
+    if what[k] != kind:
+      return None
+    if kind == 'road':
+      return RawFrame([raw_box(s - sim.s, y) for s, y in cars(sim) if -5. < s - sim.s < FULL_PASS_RANGE_M], 'road', sim.t)
+    boxes = [dataclasses.replace(raw_box(s - sim.s, y), view='far') for s, y in cars(sim) if -5. < s - sim.s < 800.]
+    return RawFrame(boxes, 'road', sim.t, 'far', cover)
+  return raw
+
+
+def oncoming_at_line(distance_m, v):
+  """An oncoming car distance_m up the road from the junction when the car is first held at its line, closing at v from
+  then (standing out there before, where nothing judges it yet): cars(sim), and its clock (s0[0], the hold's time)."""
+  s0 = [None]
+
+  def cars(sim):
+    if s0[0] is None and sim.s > LINE - 2. and sim.v < 0.3:
+      s0[0] = sim.t
+    dt = sim.t - s0[0] if s0[0] is not None else 0.
+    return [(JUNCTION + distance_m - v * dt, 3.6)]
+  return cars, s0
+
+
+def test_a_car_only_the_far_crop_sees_at_150_m_holds_the_left_until_it_passes(monkeypatch):
+  """The car's far reading at a left (2026-11-07): a 35 mph left (R_req 183 m at its line), the far crop reading on the
+  far-first schedule's cadence on the car's budget (car_cadence: road and far runs about 4 a second each), its range the
+  provisional one, an oncoming car at the limit 150 m up the road when the car is held at its line: past the ~98 m the
+  full pass boxes, so only the far crop's runs see it. Held while it comes, gone once it has passed, never handed back."""
+  what = car_cadence(monkeypatch)
+  cars, s0 = oncoming_at_line(150., V_35)
+  sim = left_on(V_35)
+  sim.far_status = lambda s: 'read'
+  sim.raw, sim.raw_far = cadenced(what, cars, 'road'), cadenced(what, cars, 'far')
+  plans = through(sim, 150.)
+  go = assert_went(sim, plans)
+  passed_t = s0[0] + (150. + HOLD_LINE_M) / V_35  # the car past the junction's conflict point
+  assert go * DT_MDL > passed_t and any(p.unprotectedLeft.farBlockers for p in plans[:go])
+  held = [p for i, p in enumerate(plans[:go]) if s0[0] + 1. < i * DT_MDL < passed_t]
+  assert held and all(p.unprotectedLeft.farNeeded and p.unprotectedLeft.farRangeM == FAR_CROP_LEFT_RANGE_M for p in held)
+  assert all(str(p.unprotectedLeft.state) != 'go' for p in held)
+  # what the far reading catches: the same left with 11-06's far slot (no far run; its range unmeasured then, so nothing
+  # waited for one: here the far crop off) goes with that car still coming inside its R_req, before it is in the ~98 m the
+  # full pass boxes
+  cars, s0 = oncoming_at_line(150., V_35)
+  sim = left_on(V_35)
+  sim.far_status = lambda s: 'off'
+  sim.raw = cadenced(what, cars, 'road')
+  plans = through(sim, 150.)
+  # its first go (on the car's cadence since review 2026-11-07, R1, the road runs come on their due frame, so the go can
+  # come late enough that the band's re-check in its launch, that car now inside the full pass's ~98 m, withdraws it:
+  # either way it was gone blind to it)
+  go = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
+  assert go * DT_MDL < s0[0] + (150. + JUNCTION - LINE - FULL_PASS_RANGE_M) / V_35
+  assert plans[go].unprotectedLeft.rReq > 150. + JUNCTION - LINE - V_35 * (go * DT_MDL - s0[0])  # inside its R_req
+  assert not any(p.tooFastToTurn for p in plans)
+
+
+def test_a_far_crop_that_stops_reading_at_the_line_never_hands_back(monkeypatch):
+  # the far crop reads on the car's cadence as the car comes to its line, then stops (a stall, a failure's backoff: farStatus
+  # noRoom, then disabled): judged on the band the full pass covers after STALE_UNDECIDED_S without a far run over the band
+  # (unprotected_left: far_needed off), or at once with the far slot off; gone on an empty band, never undecided
+  from openpilot.selfdrive.turnpilot.unprotected_left import STALE_UNDECIDED_S
+  what = car_cadence(monkeypatch)
+  for after in ('noRoom', 'disabled'):
+    held = [None]
+
+    def status(s, after=after, held=held):
+      if held[0] is None and s.s > LINE - 2. and s.v < 0.3:
+        held[0] = s.t
+      return 'read' if held[0] is None or s.t < held[0] + 0.5 else after
+    far = cadenced(what, lambda s: (), 'far')
+
+    def raw_far(s, far=far, held=held):
+      return far(s) if held[0] is None or s.t < held[0] + 0.5 else None
+    sim = left_on(V_25)
+    sim.far_status = status
+    sim.raw, sim.raw_far = cadenced(what, lambda s: (), 'road'), raw_far
+    plans = through(sim)
+    go = assert_went(sim, plans)
+    assert go * DT_MDL > held[0] + 0.5 + (STALE_UNDECIDED_S if after == 'noRoom' else 0.), after
+    assert not plans[go].unprotectedLeft.farNeeded, after
 
 
 # ---------------------------------------------------------------------------------------------------- LN-5: the lane
@@ -237,6 +365,91 @@ def test_a_night_left_whose_paint_is_never_read_is_taken_from_its_lane_not_skipp
   plans, _ = through_reasons(sim)
   assert sim.tp.dark and any(str(p.laneChangeWait) == 'lineNotBroken' for p in plans)
   assert_wrong_lane_go(sim, plans)
+
+
+@pytest.mark.parametrize("night", [False, True])
+def test_a_wrong_lane_left_waiting_dark_at_its_line_shows_the_prompt_to_signal_and_goes_once_lit(night):
+  """Review 2026-11-07 (SF-1): the left LC-03 now drives from the lane it is in waits at its line for the driver's lamp, its
+  own prompt standing aside for "Signal LEFT Now"; but plan_events fell through to the wrong lane (wrongLaneForTurn from
+  60 m out, the same Priority.LOW and newer), so selfdrived showed "Wrong Lane", silent, for the whole wait, and the left
+  never went: "Signal LEFT Now" was up 1.0 s by day and 6.4 s at night before it. Now the prompt to signal outranks the lane
+  lines: shown with the side's chime the whole wait at the line, and a driver who answers what the screen shows lights the
+  lamp and the left goes."""
+  sim = lane_left(NightSim, paint=(UNKNOWN, UNKNOWN, UNKNOWN, UNKNOWN), blind_left=False, ev=lambda s: NIGHT_EV) if night else lane_left()
+  plans, shown = drive_answering_what_is_shown(sim, 90., None, step=lambda sim: drive(sim, DT_MDL, yaw=False)[0])
+  held = next(i for i, p in enumerate(plans) if p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap')
+  assert all(str(p.turnSignal.prompt) == 'left' for p in plans[held:])
+  at_line = [f for frames in shown[held:] for f in frames]
+  assert all(f[0] == "Signal LEFT Now" and f[2] == 'tpSignalLeft' for f in at_line), sorted(set(at_line))
+  # the driver who signals once the screen asks (1.5 s of it) is asked, and the left goes
+  sim = lane_left(NightSim, paint=(UNKNOWN, UNKNOWN, UNKNOWN, UNKNOWN), blind_left=False, ev=lambda s: NIGHT_EV) if night else lane_left()
+  plans, _ = drive_answering_what_is_shown(sim, 90., 1.5, step=lambda sim: drive(sim, DT_MDL, yaw=False)[0])
+  assert any(p.desire == log.Desire.turnLeft for p in plans) and sim.s > JUNCTION + 10.
+
+
+def lane_left_with(cars, seconds, sim=None):
+  """lane_left (the change into the left's lane held by the blind spot: the left taken from the middle lane) driven seconds
+  with vehicle tracks cars(sim) -> [(absolute s, m left, vx, trackId)] (velocity trusted: age 60), in the car's frame."""
+  sim = sim or lane_left()
+  plans = []
+  for _ in range(int(round(seconds / DT_MDL))):
+    objs = tuple({'cls': 'car', 'x': s - sim.s, 'y': y, 'vx': vx, 'vy': 0., 'age': 60, 'trackId': tid, 'conf': 0.8,
+                  'camera': 'wide'} for s, y, vx, tid in cars(sim))
+    plans.append(sim.step(objs, engaged=True))
+  return sim, plans
+
+
+def test_a_wrong_lane_left_holds_for_a_car_beside_in_the_lane_it_crosses_and_goes_once_it_has_gone():
+  """Review 2026-11-07 (LS-1): the left LC-03 drives from the middle lane crosses the left lane before the junction, where
+  nothing of the go looked (the junction box and the occluder zone start about 4.25 m ahead of the car at its line): a car
+  standing level with ours there (the bay's first left-turner) and the go came at 31.8 s as on an empty road, and the model
+  swept left across its lane. Now a car the detector tracks in that lane, from 10 m behind the car to the junction box,
+  holds the left at its line, said in plain words; gone, the left goes on a fresh window."""
+  from openpilot.selfdrive.turnpilot.unprotected_left import BESIDE_REASON, CLEAR_WINDOW_S
+  stop_s = JUNCTION - HOLD_LINE_M - 1.25  # where the car stands at its line
+  leave_t = 60.
+  sim, plans = lane_left_with(lambda sim: [(stop_s + 0.5, 3.4, 0., 77)] if sim.t < leave_t else [], 90.)
+  held = next(i for i, p in enumerate(plans) if p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap')
+  wait = plans[held:round(leave_t / DT_MDL)]
+  assert wait and all(p.shouldStop and p.reason == BESIDE_REASON[1] for p in wait[5:]), {p.reason for p in wait}
+  assert not any(p.desire == log.Desire.turnLeft for p in plans[:round(leave_t / DT_MDL)])
+  go = next(i for i, p in enumerate(plans) if p.desire == log.Desire.turnLeft)
+  assert go * DT_MDL >= leave_t + CLEAR_WINDOW_S - 0.2 and sim.s > JUNCTION + 5.
+
+
+def test_a_car_coming_up_the_lane_a_wrong_lane_left_crosses_withdraws_its_go():
+  # LS-1: a car coming up the lane the left crosses from behind as the left goes (seen by the wide camera 9 m back): the go is
+  # withdrawn while the car can still stop short of the oncoming lanes, and the left goes again once it has passed
+  from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M
+  st = {'go': None}
+
+  def cars(sim):
+    left = sim.tp.left_now
+    if st['go'] is None and left is not None and left.state == 'go':
+      st['go'] = (sim.t, sim.s)
+    if st['go'] is None:
+      return []
+    t0, s0 = st['go']
+    return [(s0 - 9. + 6. * (sim.t - t0), 3.4, 6., 78)]
+  with mock.patch.object(turnpilotd.cloudlog, 'event') as event:
+    sim, plans = lane_left_with(cars, 70.)
+  assert st['go'] is not None
+  withdrawn = [c.kwargs for c in event.call_args_list if c.args[0] == 'turnpilot.left_go_withdrawn']
+  assert withdrawn and withdrawn[0]['why'] == 'beside', withdrawn
+  i0 = round(st['go'][0] / DT_MDL)
+  assert all(JUNCTION - s > ONCOMING_ENTRY_M for s, _, _ in sim.trace[i0:i0 + round(3. / DT_MDL)])
+  assert sim.s > JUNCTION + 5.  # gone again once it has passed and cleared the junction
+
+
+def test_a_standing_car_ahead_in_the_lane_a_wrong_lane_left_crosses_is_no_view_to_creep_past():
+  # LS-1 (its skeptic): a velocity-trusted car standing 4.5 m ahead of ours in the lane the left crosses was an occluder to
+  # creep past ("Creeping for a view"), and with the camera losing it the left went with that car beside it. From a lane it
+  # doesn't leave from, a car there is in its path: held for, never crept past
+  stop_s = JUNCTION - HOLD_LINE_M - 1.25
+  sim, plans = lane_left_with(lambda sim: [(stop_s + 4.5, 3.4, 0., 79)], 70.)
+  held = next(i for i, p in enumerate(plans) if p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap')
+  assert not any(str(p.controlPrompt) == 'creepingForView' or p.unprotectedLeft.creepM > 0. for p in plans[held:])
+  assert not any(p.desire == log.Desire.turnLeft for p in plans) and sim.s < LINE + 1.
 
 
 def test_a_far_side_left_is_never_skipped_for_its_lane_even_with_the_mode_off():

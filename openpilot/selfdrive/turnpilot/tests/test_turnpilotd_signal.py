@@ -837,7 +837,9 @@ def test_a_veto_in_a_crawling_queue_still_finishes_the_turn(turn):
   t = turn_of(turn)
   sim, state = signal_veto_sim(t)
   if turn == 'right':
-    while sim.distance() > 20.:
+    # from 30 m: since 2026-11-07 a right reaches its corner speed by 15 m (turn_speed CORNER_CURB_M), at about 4.5 m/s at
+    # 20 m, so the queue's crawl starts earlier to be under 1.6 m/s by the 8 m pulse, as from 20 m before
+    while sim.distance() > 30.:
       sim.step(engaged=True)
     sim.cruise = 1.5
   else:

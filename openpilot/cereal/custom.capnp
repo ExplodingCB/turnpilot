@@ -184,7 +184,8 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     stopGo @16;                     # going from the stop sign: a short chime
     # BUILD_FINDINGS (demo round 2, 2026-10-30): the stands and exits nothing else said
     signalUnseenTakeControl @17;    # held at a signal with no accepted light read for SIGNAL_UNSEEN_S (map_controls.py): held,
-                                    # take control; never released by the timeout
+                                    # take control; never released by the timeout. Never sent since 2026-11-07: said
+                                    # (SIGNAL_UNSEEN_REASON) and held for a green
     turnAbandonedTakeControl @18;   # the model steering away from the route's turn in the junction, under half of it turned
                                     # (turnpilotd.py: turn_abandoned): take control; no hold, the turn's caps stay
     wrongSideTakeControl @19;       # right-hand traffic, moving: the first painted line to the car's right read yellow
@@ -269,6 +270,10 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     # car and no red or yellow read there by any source: "No red seen: car not moving", a chime, once a stand; never a lift, the
     # NEAR_CONTROL_STAND_S handback unchanged
     lightNotRead @32;
+    # map_controls SIGNAL_UNSEEN_S: held at a signal for want of a green with no light read for it that long (a red read, then
+    # lost): "Light not seen: waiting for green", a chime, once as it starts; still held for a green, never a handback (SF-4,
+    # review 2026-11-07: the status line alone said it)
+    signalUnseen @33;
   }
   mapControl @24 :MapControlStatus;
   controlPrompt @25 :ControlPrompt;
@@ -340,6 +345,8 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
     farRangeM @11 :Float32;    # the far crop's proven range (TurnPilotLeftFarRangeM), 0 when unmeasured or the crop is off
     farNeeded @12 :Bool;       # rReq is past rangeM: the band out to rReq is judged on the far crop's runs too
     farBlockers @13 :UInt8;    # raw boxes in the band on the last far crop run
+    chime @14 :Bool;           # a long wait's chime is due (with waitingForGap or creepingForView): once a wait as its old
+                               # bound passes (unprotected_left._said; review 2026-11-07, SF-4)
   }
   unprotectedLeft @31 :UnprotectedLeftStatus;
   # TurnPilot's certified go (selfdrive/turnpilot/go_override.py; DESIGN phase 4 decision 1, G5): asserted on every frame of
@@ -469,8 +476,8 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
   }
   turnSignal @36 :TurnSignal;   # tp/blinker's, after tp/integrate's routeNotice @35
   skipReason @37 :Text;         # while tooFastToTurn: why the maneuver ahead is skipped (turn_skip.py's reason: tooFast, tooLate,
-                                # keepNoLine, signalStop, ...; unprotectedRange before 2026-11-06), for selfdrived's line; empty
-                                # otherwise
+                                # keepNoLine, ...; unprotectedRange before 2026-11-06, signalStop never sent since 2026-11-07), for
+                                # selfdrived's line; empty otherwise
   # LC-01 (ALWAYS_DRIVE.md step S4, TurnPilotAlwaysDrive): an offered lane change held while the car's blind spot that way reads
   # occupied, its request withdrawn (blindspot: selfdrived's line has no sound), then released once it has read clear 0.5 s:
   # said again with the lane change chime and laneChangeCountdown's 1.5 s before the request (clear). none otherwise, and
@@ -531,7 +538,8 @@ struct TurnpilotDetections @0xaedffd8f31e7b55d {
     sweep @5;        # a stop sweep runs (turnpilotPlan.detectorView): no paint read
     noRoom @6;       # not read on this road run, to leave the light reader the step's time: the time budget had room for the
                      # run without the paint and not with it, or the car stands near a mapped signal with the light reader
-                     # reading (modeld_detector.py)
+                     # reading, or far first standing or slow (an unprotected left's band past the full pass, under
+                     # FAR_FIRST_V 2 m/s) (modeld_detector.py)
     retrying @7;     # the paint read failed (logged each time) and waits out its retry backoff: not read
   }
   lanePaintStatus @6 :LanePaintStatus;
@@ -570,9 +578,10 @@ struct TurnpilotDetections @0xaedffd8f31e7b55d {
     unset @0;          # a log from before the field
     read @1;           # the far crop ran within FAR_STATUS_S
     off @2;            # TurnPilotFarCrop off, no far pkl for this device, or no road camera
-    disabled @3;       # it failed, or ran over its budget or the step's: off for the drive (logged, said once); with the native
-                       # schedule in its slot, the far crop off for the drive (or none) and no native run for NATIVE_NO_RUN_S
-                       # of its slot's free, calibrated time
+    disabled @3;       # FAR_DISABLED_FAILS (3) failed runs in a row, still retried, until one succeeds (since 2026-11-07 never
+                       # off for the drive for its budget or overruns, only warned); with the native schedule in its slot, the
+                       # far crop off for the drive, none or failing and no native run for NATIVE_NO_RUN_S of its slot's free,
+                       # calibrated time
     noCalibration @4;  # no calibrated horizon to aim it by yet
     noRoom @5;         # on, but no frame between the full runs had room for it within FAR_STATUS_S
     sweep @6;          # on, suspended while a stop sweep runs (its frames are the side views')
@@ -699,8 +708,10 @@ struct TurnpilotLights @0xda96579883444c35 {
     governs @7 :Bool;      # its bearing lies over the car's lane (within GOVERN_BEARING_DEG)
     # this frame's read of the head (light_state.read_head), so a night drive's rlog says which gate kills the colour
     reason @8 :Text;       # 'read', or the gate that stopped it: aspect, dark, twoLit, noColor, positionMismatch, tooFewLampPx,
-                           # arrow (a red arrow keeps its colour). Boxes stopped before they are heads (small, belowHorizon,
-                           # overCap) are never published: lightBoxes has them, and modeld's turnpilot.light_gates log counts
+                           # arrow (a red arrow keeps its colour), streak (since 2026-11-07: the lit pixels form a shape no lamp
+                           # has: a lit pole, a sign filling the box, glare). Boxes stopped before they are heads (small,
+                           # belowHorizon, overCap) are never published: lightBoxes has them, and modeld's turnpilot.light_gates
+                           # log counts
     read @9 :State;        # this frame's state (state is the vote over the last VOTE_M reads)
   }
   source @0 :Source;

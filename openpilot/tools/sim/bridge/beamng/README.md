@@ -290,8 +290,9 @@ on a gap the camera clears, or hands back there with the car held.
 Going straight through, a signal adds nothing unless a light source reads red or yellow for it. The camera's reader is
 one, on the car and in the sim alike (`TurnPilotCameraLights` `addOnly`, the default since 2026-11-06): its red, or a
 yellow the car can still stop for gently, stops the car at a mapped signal and at a route turn's junction with none
-mapped, and it may only ever add a stop. A route turn at a mapped signal stops at its line for want of a steady green,
-and held there with no light read for 5 s it hands back ("Turn at a light: take control"), still held. A green only an accepted source
+mapped, and it may only ever add a stop. A route turn at a mapped signal is a through signal's since 2026-11-07: a red,
+or a yellow still stoppable, read stops it, and with no colour read it goes with the model, never handed back for the
+light it can't read ("Turn at a light: take control" is never said). A green only an accepted source
 reads lifts the model's own hold (plannerd's lift, `map_controls.release_light`); the camera's green lets go of
 TurnPilot's own latch and nothing more. The sim's light oracle is that accepted source: it gives turnpilotd the game's
 light states, SIM ONLY:
@@ -350,13 +351,17 @@ went undecided at R_req 204 and 172.9 m because TurnPilot's junction ran 13 m an
 over-read speed (now the ground speed, above); an undecided left's result says where the car stood, navd's junction and
 TurnPilot's (`left.undecided_at`). No left is skipped at route time for its range (Kellen, 2026-11-06: "never route around
 or skip a left for range"): route time's margin (BeamNG build findings D4) only goes in the logs, and a left whose R_req
-at the line is past the range rolls up to its line and hands back there (undecided, `range`: "Can't see oncoming far
-enough: take control"), the car held.
+at the line is past the range rolls up to its line and, since 2026-11-07 (Kellen: "no, no handbacks"), goes from there on
+the band the camera covers, a car seen there holding it (it handed back there before: undecided, `range`, "Can't see
+oncoming far enough: take control").
 
-The junction is signalized and mapped, so the left goes only on a read green (`unprotected_left.SIGNAL_NEEDS_GREEN`: it
-doesn't check the cross traffic). Run it with the light oracle (`TURNPILOT_LIGHT_ORACLE=1` on the launch, `--light-oracle`
-on the bridge; without `--signals` the game's lights are held green, so it reads green), or the left waits at its line and
-hands back on the light it can't read ("Can't read the light: take control").
+The junction is signalized and mapped. A red or yellow read holds the left at its line ("Waiting for the light") until
+the green that ends that stop; with no colour read it goes on the oncoming band, the model's own red-light hold kept
+(plannerd lifts it only on an accepted green; `unprotected_left.SIGNAL_NEEDS_GREEN` holds only a light navd can't say is
+there, 'unknown'). Run it with the light oracle (`TURNPILOT_LIGHT_ORACLE=1` on the launch, `--light-oracle` on the bridge;
+without `--signals` the game's lights are held green, so it reads green), so the left's go is lifted on the oracle's green.
+Since 2026-11-07 that 'unknown' light is waited through, said ("Waiting: can't tell if there's a light"), never handed
+back ("Can't read the light: take control" is never said).
 
 ```sh
 python -c "from openpilot.common.params import Params; Params().put('TurnPilotLeftRangeM', 150.0)"  # after the stack is up: see above

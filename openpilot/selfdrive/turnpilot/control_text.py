@@ -42,7 +42,7 @@ def _ledger_title(reason: str) -> str:
   r = reason.lower()
   if 'signal at junction' in r:
     return 'Signal at junction'
-  if 'sunahead' in r or 'lowsun' in r or 'glare' in r:
+  if 'sunahead' in r or 'lowsun' in r or 'glare' in r or 'low sun' in r:
     return 'Sun glare'
   if "can't see far enough" in r or 'view blocked' in r:
     return 'View blocked'

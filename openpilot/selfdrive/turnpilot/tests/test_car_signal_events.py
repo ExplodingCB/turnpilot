@@ -35,14 +35,17 @@ def run(ev, n, p, cs, flags=RECHECKED):
   return lines
 
 
-def test_prompt_chimes_once_and_holds():
+def test_prompt_chimes_and_holds_and_chimes_again_on_every_return():
   ev = CarSignalEvents()
   lines = run(ev, 50, plan(prompt='left'), port())
-  # the chime stays on the line for as long as it shows: soundd plays a one-shot sound once however long it is held
+  # the chime stays on the line for as long as it shows: its side's sound, on repeat in soundd, until the lamp is lit
   assert all(line == ("Signal LEFT Now", "Turn LEFT ahead: put your left signal on", 'tpSignalLeft') for line in lines)
   assert run(ev, 1, plan(), port()) == [None]
-  # back within the quiet time: no new chime; a new prompt after it: chimed again
-  assert all(line[2] == 'none' for line in run(ev, 50, plan(prompt='left'), port()))
+  # review 2026-11-07 (LC-4): back within PROMPT_QUIET_S it came back silent for the rest of its life (a one-frame gap of the
+  # lane planner's wait, the driver's 3-flash tap going out); every return of the prompt, its lamp still dark, chimes again
+  assert all(line[2] == 'tpSignalLeft' for line in run(ev, 50, plan(prompt='left'), port()))
+  run(ev, int(2. / DT), plan(), port())  # a 2 s gap (a lamp lit, then out)
+  assert all(line[2] == 'tpSignalLeft' for line in run(ev, 50, plan(prompt='left'), port()))
   run(ev, int(11. / DT), plan(), port())
   assert run(ev, 1, plan(prompt='left'), port())[0][2] == 'tpSignalLeft'
   assert run(CarSignalEvents(), 1, plan(prompt='right'), port())[0][2] == 'tpSignalRight'

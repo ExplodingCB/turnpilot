@@ -282,7 +282,7 @@ In the BeamNG sim the car signals by default: `launch_openpilot.sh` and `run_bri
 
 ## Let the car go by itself at stop signs
 
-By default (`vision`) the car goes by itself from what the cameras see live. (`auto` acts only on a camera fit and a junction survey, neither of which exists for this car yet, so under `auto` every stop sign and yield hands back after a 1 s full stop.) Under `vision` the car stops fully at the line, looks for 2.5 s with every view fresh and nothing in a conflicting lane, chimes "Going", and goes. Where a cross road is over 25 mph, or its speed isn't known, it looks for 4 s and says "Look both ways" first, so check both ways yourself. If you brake or press the gas at the line and then re-engage, it still says "Going" (or "Look both ways") for 1 s before it goes, never going the moment you re-engage. It hands back after 1 s, saying why, at night, at dusk, in low sun, with the sun ahead, with the side cameras off, without the stop-sign map data, and at a divided road, a roundabout or a rail crossing.
+By default (`vision`) the car goes by itself from what the cameras see live. (`auto` acts only on a camera fit and a junction survey, neither of which exists for this car yet, so under `auto` every stop sign and yield hands back after a 1 s full stop.) Under `vision` the car stops fully at the line, looks for 2.5 s with every view fresh and nothing in a conflicting lane, chimes "Going", and goes. Where a cross road is over 25 mph, or its speed isn't known, it looks for 4 s and says "Look both ways" first, so check both ways yourself. If you brake or press the gas at the line and then re-engage, it still says "Going" (or "Look both ways") for 1 s before it goes, never going the moment you re-engage. It hands back after 1 s, saying why, in low sun, with the sun ahead, with the side cameras off, without the stop-sign map data, and at a divided road, a roundabout or a rail crossing. Since 2026-11-07 night and dusk stops go as by day, on what the cameras see.
 
 To have every stop sign and yield hand back instead (Saturday's fallback when preflight's `stop-sign go` line warns):
 
@@ -350,7 +350,7 @@ python3 -m openpilot.selfdrive.turnpilot.preflight --set TurnPilotAlwaysDrive=0 
 | Param | Value | What it does |
 | --- | --- | --- |
 | `TurnPilotAlwaysDrive` | 1 | 1: always drive (above). turnpilotd reads it every second, and navd reads it each time it routes. |
-| `TurnPilotNoMoveS` | 20 | Seconds a turn TurnPilot let go of at a standstill waits for the car to pull away before "Can't start the turn: take control", 2 to 20. An unprotected left's 1 s is fixed. Read every second. |
+| `TurnPilotNoMoveS` | 20 | Seconds a turn TurnPilot let go of at a standstill waits for the car to pull away before "Can't start the turn: take control", 2 to 20. An unprotected left's 1 s is fixed; since 2026-11-07 a left whose go isn't lifted (at a signal) goes back to waiting at its line instead, and waits for the driving model to start pulling away. Read every second. |
 
 The switch doesn't set or change `TurnPilotStopSignGo`. The car goes by itself at stop signs and yields only with `TurnPilotStopSignGo=vision`, which you set on its own (see "Let the car go by itself at stop signs"). With the switch on, every stop-sign mode, `vision` included, stops, waits, goes and hands back exactly as it does with the switch off, and navd keeps and avoids the same stops.
 

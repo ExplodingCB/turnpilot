@@ -11,7 +11,7 @@ from openpilot.cereal import log, messaging
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot import turnpilotd
 from openpilot.selfdrive.turnpilot.desire_timing import CURB_GO_SLACK_M, CURB_TURN_PULSE_M, DesireTiming
-from openpilot.selfdrive.turnpilot.hooks import CLEAR_DESIRE
+from openpilot.selfdrive.turnpilot.hooks import CLEAR_DESIRE, TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.route_follower import RouteFollower
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M
 from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of
@@ -213,24 +213,20 @@ def right_at_a_signal_taken_up(s_line, back_s, green=False, cruise=10., known_fr
   return sim, [p for _, _, p in sim.trace[back:]], event
 
 
-def test_a_turn_taken_up_at_a_signal_it_can_no_longer_stop_for_is_skipped_out_loud():
+def test_a_turn_taken_up_at_a_signal_too_close_to_stop_for_with_no_colour_read_is_taken_never_skipped():
   """A right taken up after a handback at a signal 25 m short of its junction, its line 22 m ahead at 10 m/s (a stop there
-  needs -2.3), the signal first known in the handback already too close to stop for at -2.0 (map_controls refuses to mark it:
-  signal_turn_late), and the right makeable (47 m at 10 m/s): it was turned through a light nobody read with nothing said. Now
-  it is skipped out loud (signalStop, "Can't Stop for the Light", navd reroutes), as an unprotected left too close for its line is
-  (unprotectedStop): no turn desire, the car on through the junction on the model. A signal known all along keeps its stop
-  through the handback (update()'s junction: a handback doesn't take the turn from TurnPilot), so its take-up loses none."""
-  sim, after, event = right_at_a_signal_taken_up(JUNCTION - 25., JUNCTION - 47., known_from=JUNCTION - 49.)
-  assert events(event, 'turnpilot.signal_turn_late'), "first known too close: never the turn's stop"
-  late, = events(event, 'turnpilot.signal_turn_taken_up_late')
-  assert late['needed'] < -2.0 and late['d'] == pytest.approx(22., abs=1.5) and not late['started'] and late['v'] > 9.5
-  assert [e['reason'] for e in events(event, 'turnpilot_turn_skipped')] == ['signalStop']
-  assert after[1].tooFastToTurn and after[1].skipReason == 'signalStop'
-  assert not any(p.desire == Desire.turnRight for p in after), "never turned through the unread light"
-  # its light read green (an accepted source): nothing to stop for, the right taken as before
-  sim, after, event = right_at_a_signal_taken_up(JUNCTION - 25., JUNCTION - 47., green=True, known_from=JUNCTION - 49.)
-  assert not events(event, 'turnpilot.signal_turn_taken_up_late') and sim.tp.skip.reason == ''
-  assert any(p.desire == Desire.turnRight for p in after)
+  needs -2.3), the signal first known in the handback already too close to stop for at -2.0, and the right makeable (47 m
+  at 10 m/s). Until 2026-11-07 the take-up skipped it out loud (signalStop, "Can't Stop for the Light", navd rerouting:
+  signal_stop_lost), its premise the turn's stop for want of a green. That stop is gone (Kellen, 2026-11-07: an unread light
+  is no reason to wait; a turn at a light is a through signal's), so the take-up skips nothing for a light nobody read red:
+  the right is taken with the model, as one known all along is. A green read is the same."""
+  for green in (False, True):
+    sim, after, event = right_at_a_signal_taken_up(JUNCTION - 25., JUNCTION - 47., green=green, known_from=JUNCTION - 49.)
+    assert not events(event, 'turnpilot.signal_turn_taken_up_late'), green
+    assert not any(e['reason'] == 'signalStop' for e in events(event, 'turnpilot_turn_skipped')), green
+    assert not any(p.tooFastToTurn and str(p.skipReason) == 'signalStop' for p in after) and sim.tp.skip.reason == '', green
+    assert any(p.desire == Desire.turnRight for p in after), green
+    assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in after), green
 
 
 class LeftHandSim(Sim):

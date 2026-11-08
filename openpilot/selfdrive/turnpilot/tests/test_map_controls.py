@@ -5,8 +5,8 @@ import pytest
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, SPEED_CAP_ACCEL_MIN, plan_accel
-from openpilot.selfdrive.turnpilot.map_controls import (COMMIT_SPEED, DRIVEN_THROUGH_M, STOP_SIGN_HANDBACK_S, GREEN_STEADY_S, LIGHT_STALE_S,
-                                                         MAP_DECEL_MAX, NO_LIGHTS,
+from openpilot.selfdrive.turnpilot.map_controls import (CAMERA_GREEN_STEADY_S, COMMIT_SPEED, DRIVEN_THROUGH_M, STOP_SIGN_HANDBACK_S,
+                                                         GREEN_STEADY_S, LIGHT_STALE_S, MAP_DECEL_MAX, NO_LIGHTS,
                                                          OFF_ROUTE_DRIVE_REASON, OFF_ROUTE_DRIVE_SPEED,
                                                          OFF_ROUTE_REASON, OFF_ROUTE_SPEED, T_LAT, UNPROTECTED, YIELD_SPEED, CameraLights,
                                                          Lights, MapControlPolicy, StopCommand, engage_distance, light_input, unprotected_turn)
@@ -383,36 +383,44 @@ def test_a_red_whose_light_is_lost_stays_stopped_until_a_steady_green():
   assert not dec.should_stop
 
 
-def test_a_held_signal_whose_light_goes_unseen_hands_back_loudly_and_stays_held():
+def test_a_held_signal_whose_light_goes_unseen_is_said_and_stays_held_for_a_green_never_handed_back(monkeypatch):
   """BeamNG S14 (diag s14_red_right_frames, BUILD_FINDINGS N3): held at a red, the car 1.3 m past the mapped line, the sim's
   light oracle stopped listing the light, and the hold waited 108.6 s on "Stopped at signal: waiting for green" with no
-  prompt. A held signal with no accepted light read for SIGNAL_UNSEEN_S hands back loudly (signalUnseenTakeControl,
-  "Signal not seen: take control"), the car held: never released by the timeout. A red read meanwhile, however long, is the
-  light seen; a light read again takes the handback down, and a steady green still releases."""
+  prompt. Until 2026-11-07 a held signal with no light read for SIGNAL_UNSEEN_S handed back (signalUnseenTakeControl,
+  "Signal not seen: take control"). Kellen, 2026-11-07: "no, no handbacks". Now its line says so ("Light not seen: waiting
+  for green"), logged once as it starts, the car still held for a green: never released by the timeout (a release would run
+  turnpilotd's no-move clock into its own handback at a red the model holds for: SIGNAL_UNSEEN_S's comment), never a
+  take-control. A red read meanwhile, however long, is the light seen; a light read again is the light's line, and a
+  steady green still releases."""
+  from openpilot.selfdrive.turnpilot import map_controls as mcm
+  from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
   from openpilot.selfdrive.turnpilot.map_controls import SIGNAL_UNSEEN_REASON, SIGNAL_UNSEEN_S
+  events = []
+  monkeypatch.setattr(mcm.cloudlog, 'event', lambda name, *a, **kw: events.append((name, kw)))
   car = Car([(150., 'signal')])
   car.run_until(held, lights=oracle('red'))
-  for _ in range(int(60. / DT_MDL)):  # a long red, read all along: no handback
+  for _ in range(int(60. / DT_MDL)):  # a long red, read all along: nothing said
     out, dec, _ = car.step(lights=oracle('red'))
     assert held(out, dec) and out.prompt == 'none'
   for _ in range(int((SIGNAL_UNSEEN_S - 0.2) / DT_MDL)):  # the light gone unknown: still waiting
     out, dec, _ = car.step(lights=NO_LIGHTS)
-    assert held(out, dec) and out.prompt == 'none', car.t
+    assert held(out, dec) and out.prompt == 'none' and dec.reason != SIGNAL_UNSEEN_REASON, car.t
   out, dec, _ = car.run(0.4, lights=NO_LIGHTS)
-  assert held(out, dec) and out.prompt == 'signalUnseenTakeControl' and dec.reason == SIGNAL_UNSEEN_REASON == \
-    "Signal not seen: take control"
-  for _ in range(int(60. / DT_MDL)):  # handed back, held: the timeout never lets go
+  assert held(out, dec) and out.prompt == 'none' and dec.reason == SIGNAL_UNSEEN_REASON == "Light not seen: waiting for green"
+  for _ in range(int(120. / DT_MDL)):  # said, held: the timeout never lets go, never a take-control
     out, dec, _ = car.step(lights=NO_LIGHTS)
-    assert held(out, dec) and out.prompt == 'signalUnseenTakeControl' and not out.released_stopped
-  out, dec, _ = car.run(0.2, lights=oracle('red'))  # read again: TurnPilot's hold to release once more
-  assert held(out, dec) and out.prompt == 'none'
+    assert held(out, dec) and out.prompt not in TAKE_CONTROL_PROMPTS and dec.reason == SIGNAL_UNSEEN_REASON
+    assert not out.released_stopped
+  assert len([1 for name, _ in events if name == 'turnpilot.signal_unseen']) == 1
+  out, dec, _ = car.run(0.2, lights=oracle('red'))  # read again: the red's line, TurnPilot's hold to release once more
+  assert held(out, dec) and out.prompt == 'none' and dec.reason != SIGNAL_UNSEEN_REASON
   out, dec, _ = car.run(GREEN_STEADY_S + 0.1, lights=oracle('green'))
   assert not dec.should_stop
-  # handed back, the driver takes over and drives off: theirs (driverWent), never a stop again in the junction
+  # said, the driver takes over and drives off: theirs, never a stop again in the junction
   car = Car([(150., 'signal')])
   car.run_until(held, lights=oracle('red'))
   out, dec, _ = car.run(SIGNAL_UNSEEN_S + 0.2, lights=NO_LIGHTS)
-  assert out.prompt == 'signalUnseenTakeControl'
+  assert dec.reason == SIGNAL_UNSEEN_REASON and out.prompt == 'none'
   drive_off(car)
   out, dec, _ = car.run(3., lights=NO_LIGHTS)
   assert not dec.should_stop and not out.stops and car.s > 160.
@@ -1367,10 +1375,19 @@ def test_the_turn_light_is_the_signal_at_the_lefts_junction_from_any_source():
   car = left_car([(250. - 11., 'signal')])
   car.run(1., lights=lambda car: lights('green', 239. - car.s))
   assert car.policy.turn_light(7, 250. - car.s) == 'green'
+  car.run(0.1)
+  assert car.policy.turn_light(7, 250. - car.s) == 'none'  # unread, no stop for it: no reason to wait (Kellen, 2026-11-07)
   car.run(0.1, lights=lambda car: lights('red', 239. - car.s))
   assert car.policy.turn_light(7, 250. - car.s) == 'red'
+  # the red's stop is in force with nothing read now (a light gone unread keeps a stop: stop_ahead, the left's other hold):
+  # the left's light is the red's until a steady green releases that stop. Review 2026-11-07: 'none' here had the left,
+  # held by the stop, say "Waiting for a gap" at an empty band for as long as it stood, logging nothing
+  car.run(5.)
+  assert car.policy.stop_ahead() is not None and car.policy.turn_light(7, 250. - car.s) == 'red'
+  car.run(GREEN_STEADY_S + 0.1, lights=lambda car: lights('green', 239. - car.s))
+  assert car.policy.stop_ahead() is None and car.policy.turn_light(7, 250. - car.s) == 'green'
   car.run(0.1)
-  assert car.policy.turn_light(7, 250. - car.s) == 'none'  # unread: no reason to wait (Kellen, 2026-11-07)
+  assert car.policy.turn_light(7, 250. - car.s) == 'none'  # released, unread: no reason to wait again
   shadow = Lights(None, 'none', camera=CameraLights([('red', 250. + 20. - car.s)], shadow=True))
   car.run(0.1, lights=shadow)
   assert car.policy.turn_light(7, 250. - car.s) == 'red'
@@ -1382,6 +1399,11 @@ def test_the_turn_light_is_the_signal_at_the_lefts_junction_from_any_source():
   assert car.policy.turn_light(7, 250. - car.s) == 'none'
   # another maneuver's junction isn't this one's
   assert car.policy.turn_light(8, 400.) == 'none'
+  # a yellow that decided a stop, its read then lost: the yellow's stop is in force, red by now, so the left's light is red
+  car = left_car([(250. - 11., 'signal')])
+  car.run(0.5, lights=lambda car: lights('yellow', 239. - car.s))
+  car.run(3.)
+  assert car.policy.stop_ahead() is not None and car.policy.turn_light(7, 250. - car.s) == 'red'
   # navd's controls failing (no junction data is never clear): whether there is a signal isn't known, so its light isn't
   car = left_car()
   car.status = 'failed'
@@ -1406,7 +1428,15 @@ def test_a_red_or_yellow_at_a_junction_with_no_mapped_signal_is_read_for_the_lef
     assert car.policy.turn_light(7, d) == state and car.policy.release_light(d) == state
   car.run(0.1, lights=Lights(None, 'none', camera=CameraLights([('green', 250. - 10. - car.s)], shadow=True)))
   d = 250. - car.s
-  assert car.policy.turn_light(7, d) == 'none' and car.policy.release_light(d) == 'none'
+  # review 2026-11-07 (HR-1): the accepted red read there stays the left's light, read no more, until a steady green there
+  # (a shadow green releases nothing: it adds nothing); release_light reads what is read now
+  assert car.policy.turn_light(7, d) == 'red' and car.policy.release_light(d) == 'none'
+  car.run(CAMERA_GREEN_STEADY_S + 0.1, lights=lambda car: lights('green', 250. + 15. - car.s))
+  d = 250. - car.s
+  assert car.policy.turn_light(7, d) == 'green' and car.policy.release_light(d) == 'none'
+  car.run(0.1, lights=Lights(None, 'none', camera=CameraLights([('green', 250. - 10. - car.s)], shadow=True)))
+  d = 250. - car.s
+  assert car.policy.turn_light(7, d) == 'green' and car.policy.release_light(d) == 'none'
   # outside the junction's window (the next junction's light): not this junction's
   car.run(0.1, lights=Lights(None, 'none', camera=CameraLights([('red', 250. + 60. - car.s)], shadow=True)))
   d = 250. - car.s

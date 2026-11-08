@@ -10,7 +10,7 @@ import openpilot.cereal.messaging as messaging
 from openpilot.cereal import custom, log
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, CLEAR_DESIRE, SPEED_CAP_ACCEL_MIN, TAKE_CONTROL_PROMPTS, lane_change_events, plan_accel
-from openpilot.selfdrive.turnpilot.lane_planner import LANE_UNKNOWN_REASON, LC_WARN_S, lane_change_window, slow_zone
+from openpilot.selfdrive.turnpilot.lane_planner import LANE_UNKNOWN_REASON, LC_UNSURE_MAX_S, LC_WARN_S, lane_change_window, slow_zone
 from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN, LinePaint, fill_lane_paint
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, NO_ACCEL_CAP, ONCOMING_TTA_S, PED_STOP_GAP_M
 from openpilot.selfdrive.turnpilot.tests.synthetic import FakeNavd, car_control, car_state, junction_of, model_v2, nav_instruction, scene
@@ -377,12 +377,20 @@ def test_no_paint_no_lane_change_and_aborts_reach_the_plan():
   sim = Sim([(500., "turn", "left"), (2000., "turn", "right")], cruise=15., nav_lanes={0: THREE_LANES_LEFT_TURN}, model_lanes=(2, 0))
   sim.run(25.)
   assert all(plan.laneChange == LaneChange.none and plan.laneChangeOffer == LaneChange.none for _, _, plan in sim.trace)
-  # paint lost under an offer: the plan says why, for selfdrived's alert
+  # paint lost under an offer (the wide camera): it waits, nothing requested, then LC_UNSURE_MAX_S on it aborts and the plan
+  # says why, for selfdrived's alert (lane_planner, 2026-11-07: no give-up for lack of a read)
   sim = Sim([(500., "turn", "left"), (2000., "turn", "right")], cruise=15., model_lanes=(1, 0), paint=BROKEN_WHITE_LEFT)
   while not sim.trace or sim.trace[-1][2].laneChangeOffer == LaneChange.none:
     sim.step()
   sim.paint = ()
-  plan = sim.step()
+  waited = []
+  for _ in range(int((LC_UNSURE_MAX_S + 1.) / DT_MDL)):
+    plan = sim.step()
+    if plan.laneChangeAbort != 'none':
+      break
+    waited.append(plan)
+  assert all(p.laneChangeOffer == LaneChange.left and p.laneChange == LaneChange.none for p in waited)
+  assert len(waited) * DT_MDL >= LC_UNSURE_MAX_S - 0.1
   assert plan.laneChangeAbort == 'lineNotBroken' and plan.laneChangeOffer == LaneChange.none and plan.laneChange == LaneChange.none
   # inputs failing their checks abort too
   sim = Sim([(500., "turn", "left"), (2000., "turn", "right")], cruise=15., model_lanes=(1, 0), paint=BROKEN_WHITE_LEFT)
@@ -617,7 +625,8 @@ def test_handback_in_the_turn_holds_its_desire_to_the_clear():
     while sim.distance() > 5.:
       sim.step()
     for _ in range(int(10. / DT_MDL)):
-      sim.step(available=not stop_detector, yaw_rate=0.3)  # 17 deg/s
+      # 29 deg/s: at the 4.65 m/s left corner (2026-11-07) the turn still clears by its angle before navd's 15 m pass
+      sim.step(available=not stop_detector, yaw_rate=0.5)
     return sim
   kept, handed = drive(False), drive(True)
   assert handed.trace[-1][2].handback == Handback.detectorStopped
@@ -1881,8 +1890,8 @@ def test_one_true_reading_inside_a_lasting_long_bias_never_has_a_right_pulsed_pa
   the truth. Judged by the second-nearest (JunctionSpan.firm, the 2026-11-06 round before its review; removed), the true
   reading was dropped as one reading alone: the pulse went by the furthest at its 8 m, 0.3 m past the junction under an 8 m
   bias and 2.3 m past under 10 m, nothing said, a turn started past the corner. By the nearest no first pulse goes past the
-  junction and the right is skipped tooLate out loud as the nearest crosses it, its corner cap kept: the car held to 3 m/s
-  through it, rerouted. (The same readings are one outlier 8-10 m short: test_gps_outlier's skip band.)"""
+  junction and the right is skipped tooLate out loud as the nearest crosses it, its corner cap kept: the car held to its
+  corner speed (2.97 m/s) through it, rerouted. (The same readings are one outlier 8-10 m short: test_gps_outlier's skip band.)"""
   J = 400.
   mans = [(J, "turn", "right", junction_of("right")), (J + 1200., "turn", "left", junction_of("left", 2))]
   sim = Sim(mans)
@@ -1906,7 +1915,12 @@ def test_one_true_reading_inside_a_lasting_long_bias_never_has_a_right_pulsed_pa
   onsets = [(s, str(p.skipReason)) for (s, _, p), (_, _, q) in zip(sim.trace[1:], sim.trace, strict=False) if p.tooFastToTurn and not q.tooFastToTurn]
   assert len(onsets) == 1 and onsets[0][1] == 'tooLate' and abs(J - onsets[0][0]) < 1., (case, onsets)
   assert all(p.speedCap < NO_SPEED_CAP for s, _, p in sim.trace if J - 30. < s < J), case
-  assert max(v for s, v, _ in sim.trace if J - 10. < s < J + 2.) < 3.5, case  # held to its cap through the junction
+  # held to its cap through the junction. Since 2026-11-07 the curb side reaches its corner speed by 15 m (turn_speed
+  # CORNER_CURB_M), so on readings 8-10 m long the car is still braking 10 m before the true junction (4.0-4.5 m/s there,
+  # 3.0-3.5 before): the margin against a long bias went from about 20 m to about 15 m, and the junction itself is unchanged
+  approach = [v for s, v, _ in sim.trace if J - 10. < s < J]
+  assert max(approach) < 4.6 and all(b <= a + 1e-6 for a, b in zip(approach, approach[1:], strict=False)), case  # braking all the way
+  assert max(v for s, v, _ in sim.trace if J - 3. < s < J + 2.) < 3.5, case
 
 
 def test_a_fault_with_a_right_in_hand_keeps_it():
@@ -2701,22 +2715,27 @@ def test_the_stopped_notes_chime_is_silent_near_a_mapped_signal(always_drive):
   status line alone, with no chime; the handback at NEAR_CONTROL_STAND_S comes as before, with its own sound. A signal past
   STOPPED_CONTROL_M, or a stop sign near, chimes once a stand as before. Under TurnPilotAlwaysDrive the note at the signal
   reads LIGHT_WAIT_NOTE (step S2: the model owns the light). With no red read there by LIGHT_UNREAD_S the stand is said once,
-  with its own chime (lightNotRead: the confirm round's C8), and is the silent status line again after it."""
+  with its own chime (lightNotRead: the confirm round's C8), and is the silent status line again after it. Since 2026-11-07
+  (no handbacks) the stand at the signal under the switch is LIGHT_WAIT_NOTE however long, never carStoppedTakeControl; with
+  the switch off it hands back at NEAR_CONTROL_STAND_S as before."""
   hold = int(round(ABORT_HOLD_S / DT_MDL))
   sim = Sim([(2000., 'turn', 'left', T_LEFT)], controls=[(20., 'signal')])
   sim.tp.always_drive = always_drive
   sim.run(0.2)
-  plans = stand(sim, NEAR_CONTROL_STAND_S + 0.2)
+  plans = stand(sim, NEAR_CONTROL_STAND_S + (10. if always_drive else 0.2))
   text = LIGHT_WAIT_NOTE if always_drive else STOPPED_NOTE
   note = next(i for i, p in enumerate(plans) if p.reason == text)
-  back = next(i for i, p in enumerate(plans) if p.controlPrompt != 'none')
+  back = next((i for i, p in enumerate(plans) if p.controlPrompt != 'none'), len(plans))
   unread = [i for i, p in enumerate(plans) if str(p.controlAlert) == 'lightNotRead']
   assert not note_chimes(plans)
   assert (note + 1) * DT_MDL == pytest.approx(STOPPED_NOTE_S, abs=1.5 * DT_MDL)
   assert unread and (unread[0] + 1) * DT_MDL == pytest.approx(LIGHT_UNREAD_S, abs=1.5 * DT_MDL) and len(unread) == hold
   assert all(p.reason == text and p.controlAlert == 'none' for i, p in enumerate(plans[note:back], note) if i not in unread)  # silent
-  assert plans[back].controlPrompt == 'carStoppedTakeControl' and plans[back].reason == SIGNAL_STOPPED_REASON
-  assert (back - note) * DT_MDL == pytest.approx(NEAR_CONTROL_STAND_S - STOPPED_NOTE_S, abs=1.5 * DT_MDL)
+  if always_drive:
+    assert back == len(plans)  # never handed back: the model's wait for the light, said, NEAR_CONTROL_STAND_S + 10 s on
+  else:
+    assert plans[back].controlPrompt == 'carStoppedTakeControl' and plans[back].reason == SIGNAL_STOPPED_REASON
+    assert (back - note) * DT_MDL == pytest.approx(NEAR_CONTROL_STAND_S - STOPPED_NOTE_S, abs=1.5 * DT_MDL)
   sim = Sim([(2000., 'turn', 'left', T_LEFT)], controls=[(STOPPED_CONTROL_M + 8., 'signal')])  # 35 m on: not near it
   sim.tp.always_drive = always_drive
   sim.run(0.2)
@@ -3276,11 +3295,12 @@ def oracle_lights(state, s_signal):
   return make
 
 
-def test_held_at_a_red_the_oracle_stops_listing_hands_back_and_stays_held():
+def test_held_at_a_red_the_oracle_stops_listing_is_said_and_stays_held_for_a_green():
   """BeamNG S14 (diag s14_red_right_frames, BUILD_FINDINGS N3): held at a red 1.3 m past the mapped line, the light oracle
   stopped listing the light and the hold waited for a green no source could give, 108.6 s with controlPrompt none. With no
-  accepted light read SIGNAL_UNSEEN_S, the plan hands back (signalUnseenTakeControl, "Signal not seen: take control") with
-  the car held throughout, and the stopped handbacks (which skip a held car) never stand in for it."""
+  accepted light read SIGNAL_UNSEEN_S, the plan says so (SIGNAL_UNSEEN_REASON, "Light not seen: waiting for green") and the
+  car stays held for a green; since 2026-11-07 (no handbacks, map_controls) it is never a take-control, and the stopped
+  handbacks (which skip a held car) never stand in for it."""
   from openpilot.selfdrive.turnpilot.map_controls import SIGNAL_UNSEEN_REASON, SIGNAL_UNSEEN_S
   sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')])
   sim.go_taps = False
@@ -3296,10 +3316,10 @@ def test_held_at_a_red_the_oracle_stops_listing_hands_back_and_stays_held():
   assert all(p.shouldStop and p.controlPrompt == 'none' for _, _, p in sim.trace[-5:])
   sim.run(0.6)
   p = sim.trace[-1][2]
-  assert p.shouldStop and p.controlPrompt == 'signalUnseenTakeControl' and p.reason == SIGNAL_UNSEEN_REASON
+  assert p.shouldStop and p.controlPrompt == 'none' and p.reason == SIGNAL_UNSEEN_REASON
   i0 = len(sim.trace)
   sim.run(60.)
-  assert all(p.shouldStop and p.controlPrompt == 'signalUnseenTakeControl' for _, _, p in sim.trace[i0:])
+  assert all(p.shouldStop and p.controlPrompt == 'none' and p.reason == SIGNAL_UNSEEN_REASON for _, _, p in sim.trace[i0:])
   assert sim.v == 0.
 
 
@@ -3762,15 +3782,41 @@ def test_the_no_move_limit_is_a_param_for_the_sweep():
 def test_side_cameras_going_off_is_said_once():
   # STOP_SIGNS.md row E9: modeld turns the side views off for the drive when they overrun (sideViewStatus disabled): said
   # once (controlAlert sideCamerasOff, a status line, about ABORT_HOLD_S) and logged, never again for the drive
+  # its time runs only on frames selfdrived shows it (turnpilotd.count_shown, review 2026-11-07 SF-3: openpilot engaged, a
+  # WARNING): carried while disengaged, said in full once engaged
   sim = Sim([(3000., "turn", "right")])
   sim.side_status = lambda sim: 'disabled' if sim.t >= 2. else 'running'
   with mock.patch('openpilot.selfdrive.turnpilot.turnpilotd.cloudlog.event') as event:
-    sim.run(8.)
+    sim.run(4.)
+    for _ in range(int(4. / DT_MDL)):
+      sim.step(engaged=True)
   plans = [p for _, _, p in sim.trace]
   said = [i for i, p in enumerate(plans) if str(p.controlAlert) == 'sideCamerasOff']
   assert said and abs(said[0] * DT_MDL - 2.) < 0.1 and said == list(range(said[0], said[0] + len(said)))
-  assert abs(len(said) * DT_MDL - ABORT_HOLD_S) < 0.11
+  engaged_said = [i for i in said if i >= int(4. / DT_MDL)]
+  assert abs(len(engaged_said) * DT_MDL - ABORT_HOLD_S) < 0.11
   assert [c.args[0] for c in event.call_args_list].count('turnpilot.side_cameras_off') == 1
+
+
+def test_a_far_view_lost_and_back_while_disengaged_is_not_said_late():
+  # review 2026-11-07 (SF-3's carry): the far crop off (farStatus disabled, a run failing) and back (a run succeeding) while
+  # openpilot is disengaged: its line, carried for a shown frame, is dropped on the way back, never chimed at the next
+  # engagement about a far view that reads. Lost again, it is said again (and logged each time)
+  sim = Sim([(3000., "turn", "right")])
+  sim.far_status = lambda sim: 'disabled' if 2. <= sim.t < 3. or sim.t >= 8. else 'read'
+  with mock.patch('openpilot.selfdrive.turnpilot.turnpilotd.cloudlog.event') as event:
+    sim.run(4.)
+    assert sim.tp.far_off_t == 0.
+    for _ in range(int(3. / DT_MDL)):
+      sim.step(engaged=True)
+    plans = [p for _, _, p in sim.trace]
+    assert not any(str(p.controlAlert) == 'farViewOff' for p in plans[int(3.5 / DT_MDL):])
+    for _ in range(int(3. / DT_MDL)):
+      sim.step(engaged=True)
+  plans = [p for _, _, p in sim.trace]
+  said = [i for i, p in enumerate(plans) if str(p.controlAlert) == 'farViewOff' and i >= int(7. / DT_MDL)]
+  assert said and abs(said[0] * DT_MDL - 8.) < 0.1
+  assert [c.args[0] for c in event.call_args_list].count('turnpilot.far_view_off') == 2
 
 
 def test_a_far_crop_suspended_for_a_stop_sweep_is_on_at_route_time_but_not_reading():

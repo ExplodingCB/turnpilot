@@ -13,6 +13,7 @@ import pytest
 from openpilot.cereal import log, messaging
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
+from openpilot.selfdrive.turnpilot import turnpilotd as tpd_mod
 from openpilot.selfdrive.turnpilot.desire_timing import CURB_TURN_PULSE_M
 from openpilot.selfdrive.turnpilot.go_override import GO_CLEAR_M, GO_END_SPEED, TAKEOVER_S
 from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
@@ -602,22 +603,28 @@ def at_a_signal(on: bool, camera=None):
   return sim
 
 
-def test_a_stand_at_a_signal_is_waiting_at_the_light_and_a_camera_red_holds_its_handback_to_150_s():
+def test_a_stand_at_a_signal_under_the_switch_is_waiting_at_the_light_however_long_never_handed_back():
   """ALWAYS_DRIVE.md ST-07 (stops): under the switch within STOPPED_CONTROL_M of a mapped signal the 5 s note reads 'Waiting at
-  the light' (no chime, as it already is); while the camera's shadow reader reads red there the NEAR_CONTROL_STAND_S handback
-  waits, never past LIGHT_RED_MAX_S from the stand's start; with no red read it comes at NEAR_CONTROL_STAND_S. It never brakes
-  for the read. Switch off: the note and the 90 s handback as today, red or not."""
-  sim = at_a_signal(True, camera=lambda sim: 'red')
-  plans = stand(sim, LIGHT_RED_MAX_S + 1.)
+  the light' (no chime, as it already is): the model owns the light. Until 2026-11-07 the stand handed back ("Stopped at the
+  signal: take control") at NEAR_CONTROL_STAND_S, at LIGHT_RED_MAX_S while the camera's shadow reader read red there: a long
+  red's or a left phase's ordinary stand among them. Kellen, 2026-11-07: "no, no handbacks". Now the note stays however long,
+  logged once at those bounds, never a take-control, never a brake for the read. Switch off: the note and the 90 s handback
+  as before, red or not."""
+  with mock.patch.object(tpd_mod.cloudlog, 'event') as event:
+    sim = at_a_signal(True, camera=lambda sim: 'red')
+    plans = stand(sim, LIGHT_RED_MAX_S + 60.)
   assert plans[round((STOPPED_NOTE_S + 0.5) / DT_MDL)].reason == LIGHT_WAIT_NOTE
+  assert all(q.reason == LIGHT_WAIT_NOTE for q in plans[round((STOPPED_NOTE_S + 0.5) / DT_MDL):])
   assert not any(str(q.controlAlert) == 'carStoppedNote' for q in plans)
-  first = next(i for i, q in enumerate(plans) if q.controlPrompt == 'carStoppedTakeControl')
-  assert abs(first * DT_MDL - LIGHT_RED_MAX_S) < 0.2, first * DT_MDL
-  assert not any(q.shouldStop for q in plans)
-  sim = at_a_signal(True)
-  plans = stand(sim, NEAR_CONTROL_STAND_S + 1.)
-  first = next(i for i, q in enumerate(plans) if q.controlPrompt == 'carStoppedTakeControl')
-  assert abs(first * DT_MDL - NEAR_CONTROL_STAND_S) < 0.2
+  assert not any(str(q.controlPrompt) in TAKE_CONTROL_PROMPTS for q in plans) and not any(q.shouldStop for q in plans)
+  said = [c.kwargs for c in event.call_args_list if c.args and c.args[0] == 'turnpilot.stopped_unheld']
+  assert len(said) == 1 and said[0]['waiting'] and abs(said[0]['stood_s'] - LIGHT_RED_MAX_S) < 0.2, said
+  with mock.patch.object(tpd_mod.cloudlog, 'event') as event:
+    sim = at_a_signal(True)
+    plans = stand(sim, NEAR_CONTROL_STAND_S + 60.)
+  assert not any(str(q.controlPrompt) in TAKE_CONTROL_PROMPTS for q in plans) and plans[-1].reason == LIGHT_WAIT_NOTE
+  said = [c.kwargs for c in event.call_args_list if c.args and c.args[0] == 'turnpilot.stopped_unheld']
+  assert len(said) == 1 and abs(said[0]['stood_s'] - NEAR_CONTROL_STAND_S) < 0.2, said
   sim = at_a_signal(False, camera=lambda sim: 'red')
   plans = stand(sim, NEAR_CONTROL_STAND_S + 1.)
   assert plans[round((STOPPED_NOTE_S + 0.5) / DT_MDL)].reason == STOPPED_NOTE
@@ -648,8 +655,8 @@ def test_a_stand_at_a_signal_with_no_red_read_is_said_loudly_long_before_its_han
   """The confirm round's C8 (route_demo): the model stood 85 s at a mapped signal's green, 7 m short of a rerouted U-turn,
   nothing in its path, and no light source read anything there: 'Waiting at the light' on the status line alone until the
   90 s handback. A stand at a mapped signal with no red or yellow read for LIGHT_UNREAD_S is said with a chime, once a stand
-  (lightNotRead, LIGHT_UNREAD_REASON); never a lift, and the handback still at NEAR_CONTROL_STAND_S. A camera red there
-  explains the stand: nothing said. Switch on or off."""
+  (lightNotRead, LIGHT_UNREAD_REASON); never a lift. Switch off, the handback still at NEAR_CONTROL_STAND_S; on, none since
+  2026-11-07 (the model's wait for the light, LIGHT_WAIT_NOTE). A camera red there explains the stand: nothing said."""
   for on in (True, False):
     sim = at_a_signal(on)
     plans = stand(sim, NEAR_CONTROL_STAND_S + 1.)
@@ -658,8 +665,11 @@ def test_a_stand_at_a_signal_with_no_red_read_is_said_loudly_long_before_its_han
     assert said == list(range(said[0], said[0] + len(said))) and len(said) * DT_MDL <= 3.1  # one chime, held a moment
     assert plans[said[0]].reason == LIGHT_UNREAD_REASON and plans[said[0]].controlPrompt == 'none'
     assert LIGHT_UNREAD_S <= NEAR_CONTROL_STAND_S / 3.
-    first = next(i for i, q in enumerate(plans) if q.controlPrompt == 'carStoppedTakeControl')
-    assert abs(first * DT_MDL - NEAR_CONTROL_STAND_S) < 0.2, on
+    first = next((i for i, q in enumerate(plans) if q.controlPrompt == 'carStoppedTakeControl'), None)
+    if on:
+      assert first is None and plans[-1].reason == LIGHT_WAIT_NOTE, on
+    else:
+      assert abs(first * DT_MDL - NEAR_CONTROL_STAND_S) < 0.2, on
     assert all(str(q.goCertified.cause) == 'none' for q in plans) and not any(q.shouldStop for q in plans)
     sim = at_a_signal(on, camera=lambda sim: 'red')
     assert not any(str(q.controlAlert) == 'lightNotRead' for q in stand(sim, LIGHT_UNREAD_S + 5.)), on

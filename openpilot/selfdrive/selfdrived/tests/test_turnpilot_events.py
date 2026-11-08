@@ -46,6 +46,26 @@ def test_lane_change_warning_left_and_right():
     assert a.alert_type == f'turnpilotLaneChange{side.capitalize()}/warning'  # separate names: a chime per side later
 
 
+def test_a_request_withheld_with_the_drivers_lamp_lit_never_asks_for_the_signal():
+  """Review 2026-11-07 (LC-3): the driver lit his lamp on the prompt and the request went out; the lane planner then withheld
+  it on frames whose paint read unsure or not at all (REQUEST: LINE_UNSURE_REASON, laneChange none, the countdown spent), and
+  lane_change_text fell through to "Signal LEFT to Change Lanes" with tpSignalLeft on repeat over his lit lamp (1.2-1.65 s on
+  2 of the 4 driver-signalled requests of the 11-06 replays). With the lamp lit it says the change is being checked, silent;
+  dark, the prompt and its chime as before."""
+  from openpilot.selfdrive.turnpilot.lane_planner import LINE_UNSURE_REASON
+  for name, side in ((EventName.turnpilotLaneChangeLeft, 'left'), (EventName.turnpilotLaneChangeRight, 'right')):
+    withheld = FakeSM(plan(laneChangeOffer=side, reason=LINE_UNSURE_REASON))
+    cs = car.CarState.new_message(leftBlinker=side == 'left', rightBlinker=side == 'right')
+    events = Events()
+    events.add(name)
+    a, = events.create_alerts([ET.WARNING], [car.CarParams.new_message(), cs, withheld, False, 0, 0])
+    assert a.alert_text_1 == f'Changing Lanes {side.capitalize()}: Checking the Lane' and a.audible_alert == AudibleAlert.none
+    assert not a.alert_text_1.startswith('Signal ')
+    a, = alerts(name, withheld)  # the lamp dark: asked, the side's chime
+    assert a.alert_text_1 == f'Signal {side.upper()} to Change Lanes'
+    assert a.audible_alert == (AudibleAlert.tpSignalLeft if side == 'left' else AudibleAlert.tpSignalRight)
+
+
 def test_a_change_held_for_the_blind_spot_is_silent_and_its_release_chimes_and_counts_down():
   """LC-01 (ALWAYS_DRIVE.md S4, TurnPilotAlwaysDrive): an offered change held while the blind spot reads occupied
   (laneChangeHold blindspot) stays up with no sound, so its release (laneChangeHold clear) sounds the lane change chime again,

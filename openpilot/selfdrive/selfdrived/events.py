@@ -285,10 +285,13 @@ def turnpilot_lane_change_alert(side: str) -> AlertCallbackType:
     # held for the blind spot (LC-01): no sound, so its release ('clear') chimes again (soundd plays a sound it changes to)
     held = plan is not None and str(plan.laneChangeHold) == 'blindspot'
     sound = AudibleAlert.none if held else AudibleAlert.tpLaneChangeLeft if side == 'left' else AudibleAlert.tpLaneChangeRight
-    text = lane_change_text(plan, side)
+    lit = CS is not None and bool(CS.leftBlinker if side == 'left' else CS.rightBlinker)
+    text = lane_change_text(plan, side, lit)
     if not held and text.startswith('Signal '):
       # waiting on the driver's lamp: the side's chime on repeat until it is lit (Kellen, 2026-11-07: very clear left vs right)
       sound = AudibleAlert.tpSignalLeft if side == 'left' else AudibleAlert.tpSignalRight
+    elif text.endswith('Checking the Lane'):
+      sound = AudibleAlert.none  # the driver's lamp lit, the request withheld a frame or two: nothing to ask, nothing to chime (LC-3)
     return Alert(text, "Car in blind spot" if held else "TurnPilot, for the route",
                  AlertStatus.userPrompt, AlertSize.mid,
                  Priority.LOW, VisualAlert.none, sound, .1)
@@ -320,9 +323,10 @@ def turnpilot_too_fast_to_turn_alert(CP: car.CarParams, CS: car.CarState, sm: me
   """The turn ahead is skipped and navd reroutes (turnpilotPlan.tooFastToTurn): too fast to make it, or a map stop left no
   room to get into its lane (laneChangeWait unreachable, lane_planner.py) or the change into it never went by the lane change
   window's end (skipReason laneBlocked: LC-03), or a keep the model can't be sent (skipReason
-  keepNoLine: no lane line that way; keepFarSide: no lane of ours beyond it toward the far side, turnpilotd.keep_unsent), or a
-  turn at a signal taken up after a handback too close to stop at its line for want of a green read (skipReason signalStop,
-  turnpilotd.signal_stop_lost: "Can't Stop for the Light", never turned through a light nobody read). Or a turn the car pulled
+  keepNoLine: no lane line that way; keepFarSide: no lane of ours beyond it toward the far side, turnpilotd.keep_unsent). A
+  turn at a signal too close to stop at its line for want of a green read (skipReason signalStop: "Can't Stop for the
+  Light") is skipped no more since 2026-11-07 (Kellen: an unread light is no reason to wait; turnpilotd's signal_stop_lost
+  and signal_turn_late are gone): the title stays for older logs. Or a turn the car pulled
   away into from a standstill went straight past its junction (turnpilotPlan.turnMissed, turnpilotd.py): missed, and navd
   reroutes."""
   plan = shown_plan(sm)
@@ -334,8 +338,9 @@ def turnpilot_too_fast_to_turn_alert(CP: car.CarParams, CS: car.CarState, sm: me
   rerouted = plan is not None and str(plan.skipReason) == KEEP_REROUTED
   # a map stop leaving no room to get into the turn's lane, or a change it needed that never went (LC-03, skipReason laneBlocked)
   lane = plan is not None and (str(plan.laneChangeWait) == 'unreachable' or str(plan.skipReason) == 'laneBlocked')
-  # a turn at a signal whose stop at its line can't be made now with no green read for it (turnpilotd: skipReason signalStop):
-  # until 2026-11-06 it fell through to "Too Fast to Turn", which says nothing of the light the car couldn't stop for
+  # a turn at a signal whose stop at its line couldn't be made with no green read for it (skipReason signalStop): never sent
+  # since 2026-11-07 (no stop for want of a green, so no skip for an unread light); the title stays for older logs. Until
+  # 2026-11-06 it fell through to "Too Fast to Turn", which says nothing of the light the car couldn't stop for
   light = plan is not None and str(plan.skipReason) == 'signalStop'
   missed = plan is not None and plan.turnMissed
   # an unprotected left skipped at route time for the detector's range: turnpilotd sets unprotectedLeft.state 'skipped' no
@@ -384,7 +389,7 @@ CONTROL_ALERT_TITLE = {'cannotStopComfortably': "Take Control", 'stopOverrun': "
                        'carStoppedNote': "Car Stopped", 'stallLift': "Stalled: Finishing the Turn",
                        'lightGreenNotMoving': "Light Green: Car Not Moving", 'unstickLift': "Going On",
                        'pedestrianWaiting': "Waiting for Pedestrian", 'turnpilotResumed': "TurnPilot Resumed",
-                       'lightNotRead': "Stopped at the Light"}
+                       'lightNotRead': "Stopped at the Light", 'signalUnseen': "Waiting for Green"}
 # the route's stop signs (route_notice.py, STOP_SIGNS.md 3.4), said engaged or not: the text is turnpilotPlan.routeNotice
 ROUTE_NOTICE_TITLE = {'routeAvoidsStops': "Route Avoids Stop Signs", 'routeDetour': "Long Detour Around Stop Signs",
                       'stopsNeedYou': "Stop Signs Need You", 'firstStopNeedsYou': "First Stop Needs You",
@@ -405,8 +410,10 @@ def turnpilot_control_prompt_alert(CP: car.CarParams, CS: car.CarState, sm: mess
   if prompt in TAKE_CONTROL_PROMPTS:
     return Alert(plan.reason or CONTROL_PROMPT_TITLE.get(prompt, "Take Control"), CONTROL_PROMPT_TEXT.get(prompt, ''),
                  AlertStatus.critical, AlertSize.mid, Priority.MID, VisualAlert.steerRequired, AudibleAlert.tpHandback, .1)
-  # a stop sign's wait is silent but for its info chime, once a WAIT_INFO_S (stop_go.py: stopGo.chime)
-  chime = prompt not in SILENT_PROMPTS or (prompt == 'waitingForCross' and plan.stopGo.chime)
+  # a stop sign's wait is silent but for its info chime, once a WAIT_INFO_S (stop_go.py: stopGo.chime); the left's long waits
+  # likewise once a wait, as each one's old handback bound passes (unprotectedLeft.chime: SF-4, review 2026-11-07)
+  chime = prompt not in SILENT_PROMPTS or (prompt == 'waitingForCross' and plan.stopGo.chime) or \
+    (prompt in ('waitingForGap', 'creepingForView') and plan.unprotectedLeft.chime)
   return Alert(plan.reason if plan is not None and plan.reason else CONTROL_PROMPT_TITLE.get(prompt, "TurnPilot"),
                CONTROL_PROMPT_TEXT.get(prompt, ''), AlertStatus.userPrompt, AlertSize.mid, Priority.LOW, VisualAlert.none,
                AudibleAlert.prompt if chime else AudibleAlert.none, .1)
