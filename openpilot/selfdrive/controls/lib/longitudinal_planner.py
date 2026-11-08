@@ -110,8 +110,10 @@ class LongitudinalPlanner:
     # TurnPilot's turn speed and scene limits (a faulted plan's too), reported as a cruise limit
     tp_candidate = (plan_accel(tp.accelCap, tp.speedCap, v_ego), tp.shouldStop) if tp is not None else None
     # TurnPilot's bounded go (turnpilot/go_override.py): for a go turnpilotd certifies, and only while the model alone holds
-    # the car, the e2e candidate lifted to +0.5 m/s^2 at most and its stop dropped, 3 s at most, under 3 m/s. Every other
-    # candidate stays in the min() and the any()
+    # the car, the e2e candidate lifted to +0.5 m/s^2 at most and its stop dropped, 3 s at most, under 3 m/s. The one
+    # exception is a committed unprotected left's carry: the e2e candidate lifted to the left's post-go profile (1.5 m/s^2 at
+    # most, toward 4.3 m/s at most), its stop kept, with no window, until turnpilotd ends it across the oncoming lanes. Every
+    # other candidate stays in the min() and the any()
     model_t = getattr(sm, 'logMonoTime', {}).get('modelV2')
     output_a_target_e2e, output_should_stop_e2e = self.go_lift.update(
       sm, v_ego, (output_a_target_mpc, output_should_stop_mpc), (self.a_cruise, cruise_should_stop), tp_candidate,

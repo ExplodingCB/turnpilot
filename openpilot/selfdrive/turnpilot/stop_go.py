@@ -68,12 +68,30 @@ the live machinery above runs, and only the certification gates are bypassed: th
 stamp, S1's camera fields (the noMask zero) and launchVerified. In their place the vision gate (geometry, skew, unknown legs,
 an override, the side views on for the drive, the light at the line: certify._assess_vision) and a reach floor per lane
 (stop_rules.reach_needed_vision on the walk's raw reach, PV1's optimistic row, no mask needed). After dark it runs as by day
-(Kellen, 2026-11-07: "why the hell do we care about dark?"): the light at the line is glare alone, and night, dusk and no clock
-walk the day table (stop_rules.walk_row), the side views' live sectors zeroing any bearing that reads washed, frozen or
-degraded (a dark or blocked sector never, at any lighting row: every side view reads so at a night stand, and a dim still
-one by day, review 2026-11-07 LS-3 and LS-3-R1, visibility.LiveVisibility.lanes); until then the gate failed every stop after dark ("Stop sign:
-night at ETA +0 min: take control", H9) and the walk on the 'night' row, which has no table, read every lane's reach 0
-(the note above stop_rules.DARK_ROWS). Every lane is judged as
+(Kellen, 2026-11-07: "why the hell do we care about dark?"): night, dusk and no clock walk the day table (stop_rules.walk_row),
+the side views' live sectors zeroing only a bearing that reads washed or frozen (the camera seeing nothing there; a dark,
+blocked or degraded sector never, at any lighting row: every side view reads dark at a night stand, a dim still one by day
+blocked, and ordinary footage at 70-85 deg degraded; review 2026-11-07 LS-3 and LS-3-R1, wf7 verify:LS-3-R1 point 4,
+visibility.VISION_ACCEPT); until then the gate failed every stop after dark ("Stop sign: night at ETA +0 min: take control",
+H9) and the walk on the 'night' row, which has no table, read every lane's reach 0 (the note above stop_rules.DARK_ROWS). The
+light at the line (low sun, the sun ahead) is no gate either since the review of 2026-11-08 (VISION_VIEW_REASONS): the walk
+zeroes the glare's bearings and the views judge the rest, a side view's sector that reads washed out or frozen inside the
+sun's zone, short of a lane's floor, that lane's why as on a plain day (visibility.LiveVisibility.lanes: glare is never less
+careful than no glare).
+
+A lane short of its floor under vision (the review of 2026-11-08; Kellen, 2026-11-07: "no, no handbacks", a vision-based go like
+early Autopilot, imperfect OK, not aggressive) is what a careful driver does about it, never H3: a wait on reach alone is the
+creep for a view VISION_CREEP_AFTER_S into it (_view_step: VIEW_CREEP_M at a time on the latch's creep path at VIEW_CREEP_V,
+Creeping for view, whether or not the walk predicts a step helps, never while creep_blocked, never closer to the closest
+plausible edge than a go from there needs to stop short of it with a step's run-on to spare), each stand judged again for the window (the go on its own
+once every lane meets its floor), and once no further step can start (_view_limit: no room, no latch, a step that didn't move
+the car) the car goes on what it sees (view_limited): each lane judged by its tracks and raw boxes alone, a car seen in one
+holding the go (and on the launch withdrawing it), the long look's window and "Look both ways" before the go. A bearing the
+camera sees nothing at (washed out, frozen: visibility.CAMERA_BLIND) is never gone on: a wait with no bound once the creep is
+at its limit, said, until it reads again; a side view whose every sector reads frozen is its feed stuck, the camera fault (H1).
+A stand with no room for a go that could stop short of the closest plausible edge
+goes committed from there (_rest_go) once the window has run, never H5; a vehicle or a person standing in the junction or just
+ahead, and the car yawed off its approach, hold the go as waits with no bound, never H3. Every lane is judged as
 possibly not stopping (the tracked test for every track, no on-site downgrade), a car at its line on an approach the map says
 stops is a shield (stop_evidence's vision_shield), and the go comes after VISION_CLEAR_S, announced VISION_ANNOUNCE_S before
 ("Going"). A conflicting approach over 25 mph or of unknown speed is the long look (owner direction 2026-10-30 19:15-19:55):
@@ -94,13 +112,19 @@ toward our axis over its matches, beyond the camera's drift on a standing car we
 (_rail_motion, _corridor), and the hard tier is scene_policy's TrackEvidence.confirmed, steadiness included.
 
 Faults (7.1), each stopSignTakeControl with its reason, the car held (by the latch, or by the decider's own stop once the latch
-has let go): H1 a needed view without a run for DET_FAULT_S (held: cameraPaused for FAULT_GRACE_S first; moving before commit,
+has let go): H1 a needed view without a run for DET_FAULT_S (under vision a side run whose every sector reads frozen, its
+feed stuck, counts as none; held: cameraPaused for FAULT_GRACE_S first; moving before commit,
 the capped abort first), H2 the position unknown (no or a failed junctionInfo, navd's fixes spread over 2 x POS_ERR_M on the
 last 20 m before the latch, or the latch more than H2_LINE_M from a surveyed stop point with no queue; held: junctionUncertain
 for FAULT_GRACE_S first), H3, H5, H7 (a person in the 0-3 m front zone not
-seen leaving, across views, FRONT_ZONE_MAX_S). Every hold on a standing car is scene_policy.stop(confirmed=False); every abort
-is the capped stop; nothing here asks for less than -2.0 m/s^2. The decider survives faults as the latch does (turnpilotd
-rebuilds it only in reset(detector=True)); the driver disengaging during the launch ends its encounter (O6, O7).
+seen leaving, across views, FRONT_ZONE_MAX_S: the hold is the rail, the handback asks the driver to look where no camera
+can). Under vision what is left of H3 and H5 is a fault's (the side views' maps recalibrating past CAL_WAIT_S, no conflicting
+approach to judge by, the driver's signal against the ladder's other turn, the model not taking over a go or a roll-up, the car
+stalled in the junction) and of H9 the gate's structure (geometry, skew, an unknown leg, an override, the side views off for
+the drive, no visibility file, a lens mismatch, no sidecar: H8); none is a judgement of what the cameras can see. Every hold
+on a standing car is scene_policy.stop(confirmed=False); every abort is the capped stop; nothing here asks for less than -2.0
+m/s^2. The decider survives faults as the latch does (turnpilotd rebuilds it only in reset(detector=True)); the driver
+disengaging during the launch ends its encounter (O6, O7).
 
 A one-way cross road (G9, V22): only its legal approach conflicts for cars, and its illegal side (a leg cars only leave by,
 stop_rules.wrong_way_lanes) is watched: a track there not yet trusted, or coming toward our path, blocks the go (a driver
@@ -138,6 +162,7 @@ from openpilot.selfdrive.turnpilot.scene_policy import ENTER_T_S, PATH_HALF_WIDT
 from openpilot.selfdrive.turnpilot.stop_evidence import APPROACH_V, DOWNGRADE_V, DOWNGRADE_WINDOW_M, MOVE_TOL_M, StopEvidence, class_name, \
   junction_lanes
 from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP
+from openpilot.selfdrive.turnpilot.visibility import CAMERA_BLIND, stuck_run
 
 MODES = ce.MODES                # off, shadow, trial, auto, vision (TurnPilotStopSignGo)
 MODE_DEFAULT = 'auto'           # decision D4: acting only with its data, else as shadow, said
@@ -238,7 +263,8 @@ STOP_SIGN_REASON = "Stop sign: take control to proceed"  # map_controls' handbac
 # from the left" (control_text reads glare and a blocked view from them for its title, and drops the brackets for its detail);
 # one with no plain words says nothing more (review 2026-11-07, LS-3: "(sector)", an internal term, was on the H3 alert)
 REACH_WORDS = {'sunAhead': 'sun glare', 'lowSun': 'low sun glare', 'occluder': 'view blocked', 'sector': 'side camera unclear',
-               'noView': 'side camera not seeing', 'frameEdge': 'out of the camera\'s view'}
+               'noView': 'side camera not seeing', 'frameEdge': 'out of the camera\'s view', 'washed': 'side camera washed out',
+               'frozen': 'side camera frozen'}
 
 
 def reach_text(role: str, why: str) -> str:
@@ -250,6 +276,9 @@ UNAVOIDABLE = 'unavoidable'
 ROUTE_KNOWN_REASON = "this stop needs you"
 ALT_VETOED_REASON = "turn cancelled"  # H3's detail: a turn signal veto of the other turn (Frame.signal_veto with self.alt)
 VIEW_CREEP_REASON = "Creeping for view"
+# under vision, the window once the creep for a view has reached its limit (view_limited): the go on what the cameras see,
+# never "Cross traffic clear", which a lane short of its reach can't say
+LIMITED_WAIT_REASON = "Waiting: view limited, looking for cross traffic"
 STALLED_REASON = "Stalled in junction"
 ALT_REASON = {'right': "Turning right instead", 'left': "Turning left instead", 'straight': "Going straight instead"}
 # go conditions the same for every maneuver at the junction (the other-turn rung reads them from this frame's own evaluation)
@@ -286,6 +315,9 @@ GOING_REASON = "Going"
 NO_LIFT_REASON = "signal at the junction: the car's own go"  # V7
 VISION_GATE_TEXT = {'table': "no visibility file", 'sideViews': "side cameras off", 'H8': "map data unavailable",
                     'lens': "camera lens mismatch"}
+# certify's vision checks that are the live view's to judge at the line, never the gate's: the route-time reach (the live walk
+# replaces it) and the light (glare: the walk's sun zeroes and the sectors' washed test)
+VISION_VIEW_REASONS = ('reach', 'light')
 # SAT-11 (SAT_VALIDATION row 11, BeamNG at 263065a, stop_allway_out_of_turn under vision): a car standing 4.4 m back of its
 # assumed line read U2 'far' at the go, which _known_moved judged only by its go-time distance less its go-time speed (0.08
 # m/s) carried on: its start 0.5 s after our go withdrew nothing, the band skipped it as still, and the cars touched. Under
@@ -552,6 +584,7 @@ class StopGo:
     self.chime_t = 0.
     self.cal_wait_s = 0.
     self.view_age = dict.fromkeys(FORWARD + SIDE_VIEWS, 0.)  # s since each view's last run (the encounter's start a grace)
+    self.view_stuck: set = set()   # under vision, the side views whose last run read every sector frozen (its feed stuck)
     self.needed: set = set()
     self.paused_s = 0.
     self.h2_s = 0.
@@ -602,6 +635,10 @@ class StopGo:
     self.said_t = None              # decider clock this go's line and chime were first said, said every frame since (None: not)
     self.vision_top = ''            # the top hold's key last logged (stop_go_vision_wait)
     self.vision_creep_tried = False  # V9: the creep for a view started on a reach-only wait
+    # the creep for a view has reached its limit (_view_limit: no room for another step, no latch to creep from, a step that
+    # didn't move the car): from here every lane is judged on what the cameras see (_lane_holds), the window is the long look's
+    self.view_limited = False
+    self.view_no = ''               # the last reason a step couldn't start now, logged once
     self.look_crept = False         # the long look's creep to the best view tried
     self.no_lift = False            # V7: a signal head here: the go releases the latch with no G5 lift
     self.no_lift_said = False       # ...its first go said, the later ones silent (the info chime)
@@ -1059,7 +1096,10 @@ class StopGo:
     if not side_views_live(f.side_status):
       return 'sideViews', VISION_GATE_TEXT['sideViews'], None
     v = self.certified(f)
-    if v.certification != 'certifiable' and v.reason != 'reach':
+    # the light at the line (low sun, the sun ahead with the veil unmeasured) is a view, never a gate (the review of
+    # 2026-11-08: no handbacks): the walk zeroes the glare's bearings (sunAhead, lowSun), the side views' sectors read washed
+    # where the sun or headlights fill the lens, and the creep for a view and its limit judge the rest, as for reach
+    if v.certification != 'certifiable' and v.reason not in VISION_VIEW_REASONS:
       return v.reason, v.detail or v.reason, v
     return None
 
@@ -1126,9 +1166,16 @@ class StopGo:
     self._on_site(f, pos)
     for k in self.view_age:
       self.view_age[k] += f.dt
-    for key, _t, raw, _sectors in f.runs or ():
+    for key, _t, raw, sectors in f.runs or ():
       if key in self.view_age:
-        self.view_age[key] = 0.
+        if self.vision and key in SIDE_VIEWS and stuck_run(sectors):
+          # the feed itself stuck (every sector frozen: detector/sideview, the luma plane repeated bit for bit): a run with no
+          # new image is no run, so the view ages to the camera fault (DET_FAULT_S, then FAULT_GRACE_S and H1) as one that
+          # stopped running does (the review of 2026-11-08: a stuck feed is a fault, said, never a wait with no bound)
+          self.view_stuck.add(key)
+        else:
+          self.view_stuck.discard(key)
+          self.view_age[key] = 0.
       if key in FORWARD and raw is not None:
         self.lights.append(self._head_seen(raw, pos))
     if not self.signal_seen and sum(self.lights) >= SIGNAL_HEAD_RUNS:
@@ -1407,7 +1454,8 @@ class StopGo:
       return
     if self.view_creep is not None:
       self._view_creeping(f, d, holds, pos, ctl, acting, standing)
-    elif self.vision and acting and f.enabled and not holds and self.long_look and not self.look_crept and ctl is not None and standing:
+    elif self.vision and acting and f.enabled and not holds and self.long_look and not self.look_crept and ctl is not None and standing \
+        and not self.view_limited:
       # the long look (module docstring): the creep to the best view first, wherever the walk predicts a step gains the lane
       # with the least margin (on a perpendicular cross road the stop point usually is the best view: no creep), then the window
       self.look_crept = True
@@ -1450,14 +1498,20 @@ class StopGo:
       return
     room = self.edges.d_min - pos
     need = self._go_room(f)
-    if room < need - 1e-6 and self.rest_held:
-      self._rest_go(f, d, pos, room)
+    if room < need - 1e-6 and (self.rest_held or (self.vision and not self.no_lift)):
+      # under vision a stand with no room for a go that could stop short of the closest plausible edge (a withdrawn go's rest,
+      # the confirm round's C3; an overshoot past the line, the re-run's R7 at 1.8 m; a stop point inside the band of a wide
+      # cross road: dEdgeMin -0.4 m at two lanes each way, unsurveyed) goes committed from there once its window has run and
+      # been said, never H5 (the review of 2026-11-08: no handbacks); at a signal head (V7: no lift) H5 as before
+      self._rest_go(f, d, pos, room, ctl)
       return
     if room < need - 1e-6:
       self._fault('H5', f, d, f"no room for a go: {room:.2f} m to the closest edge, {need:.2f} needed")
       return
+    if self.vision:
+      self.view_creep = None  # a creep for a view's stand gone from: a withdrawn go observes again from scratch
     self.go = {'pos': pos, 't': self.t, 'reach': {(x.role, x.index): x.r_seen for x in self.last_lanes},
-               'tracks': self._known_tracks(f), 'said': not (self.no_lift and self.no_lift_said)}
+               'tracks': self._known_tracks(f), 'said': not (self.no_lift and self.no_lift_said), 'limited': self.view_limited}
     self.curb_until = self.curb_cap_until()  # D3: past a curb person's crosswalk at STOP_GO_V_MAX at most
     if self.curb_until is not None:
       cloudlog.event("turnpilot.stop_go_curb_cap", key=list(self.key), until=round(self.curb_until, 2), people=sorted(self.curb))
@@ -1483,13 +1537,16 @@ class StopGo:
                    vision=self.vision, need_s=need_s, noLift=self.no_lift, longLook=[r for r, _ in self.long_look],
                    margins=[(x.role, x.index, round(x.r_seen - x.r_req, 1)) for x in self.last_lanes])
 
-  def _rest_go(self, f: Frame, d: StopGoDecision, pos: float, room: float) -> None:
-    """The go from a withdrawn go's rest with no room for another (rest_held, the confirm round's C3): every go condition held
-    for the window and the go said, as any vision go, but committed from here, since no go from here can stop short of the
-    closest edge: the band abort's stand's (241d36d) clearBox lift (_vision_stall's, VISION_BOX_LIFT_M until the model takes
-    over), the in-path rail, the start watch and the band's threat test after it, H5 only at VISION_STALL_H5_S standing."""
+  def _rest_go(self, f: Frame, d: StopGoDecision, pos: float, room: float, ctl=None) -> None:
+    """The go from a stand with no room for a go that could stop short of the closest edge (a withdrawn go's rest, rest_held,
+    the confirm round's C3; under vision any stand: _observe): every go condition held for the window and the go said, as any
+    vision go, but committed from here, since no go from here can stop short of the closest edge: the latch let go if it
+    still holds the car (a first stand), the band abort's stand's (241d36d) clearBox lift (_vision_stall's, VISION_BOX_LIFT_M
+    until the model takes over), the in-path rail, the start watch and the band's threat test after it, H5 only at
+    VISION_STALL_H5_S standing."""
     self.go = {'pos': pos, 't': self.t, 'reach': {(x.role, x.index): x.r_seen for x in self.last_lanes},
-               'tracks': self._known_tracks(f), 'said': True}
+               'tracks': self._known_tracks(f), 'said': True, 'limited': self.view_limited}
+    self.view_creep = None
     self.curb_until = self.curb_cap_until()  # D3: past a curb person's crosswalk at STOP_GO_V_MAX at most
     self.takeover.reset()
     self.takeover_s, self.uncommit_s, self.stall_s = -1., 0., 0.
@@ -1497,6 +1554,7 @@ class StopGo:
     self.rest_held, self.band_held = False, True
     self.clear_boxes += 1
     self.box_next = STALL_BOX_S
+    d.release = (self.key, 'clear') if ctl is not None else None
     d.go_cause, d.prompt, d.reason, d.ledger = 'clearBox', 'stopGo', GOING_REASON, 'none'
     d.action, d.committed, d.detector_view, d.stops = 'committed', True, 'stopSweepGo', []
     self.said_t = None
@@ -1506,14 +1564,19 @@ class StopGo:
   def _need_s(self) -> float:
     """s every go condition must hold for the go: VISION_LONG_CLEAR_S for the long look, VISION_CLEAR_S under vision, else
     CLEAR_S."""
-    self.need_s = (sr.VISION_LONG_CLEAR_S if self.long_look else sr.VISION_CLEAR_S) if self.vision else sr.CLEAR_S
+    self.need_s = (sr.VISION_LONG_CLEAR_S if self.long_look or self._limited_now() else sr.VISION_CLEAR_S) if self.vision else sr.CLEAR_S
     return self.need_s
+
+  def _limited_now(self) -> bool:
+    """Under vision, the go on what the cameras see this frame: the creep for a view at its limit (view_limited) and a lane
+    short of its floor that is judged on what is seen (this frame's lanes: one whose view has come back since goes as any)."""
+    return self.vision and self.view_limited and any(x.r_seen + 1e-9 < x.r_req and not x.shielded for x in self.last_lanes)
 
   def _announce(self, d: StopGoDecision, need_s: float) -> None:
     """Vision's go said before it comes (guard 5): the stopGo prompt (its chime) with "Going", or "Look both ways" for the
-    long look so the supervisor checks both ways; a hold inside it starts the window again and the wait's words come back. Each
-    line is logged once, a re-engage's its own."""
-    d.prompt, d.reason = 'stopGo', LOOK_REASON if self.long_look else GOING_REASON
+    long look and for a go on a limited view (_limited_now) so the supervisor checks both ways; a hold inside it starts the
+    window again and the wait's words come back. Each line is logged once, a re-engage's its own."""
+    d.prompt, d.reason = 'stopGo', LOOK_REASON if self.long_look or self._limited_now() else GOING_REASON
     if self.said_t is None:
       self.said_t = self.t
       cloudlog.event("turnpilot.stop_go_vision_announce", key=list(self.key), clear_s=round(self.clear_s, 2), need_s=need_s,
@@ -1783,7 +1846,9 @@ class StopGo:
     # yaw and the wheel say whether it curled the car); V8: under vision the heading decides, the wheel a sanity bound
     yaw_go, steer_go = (VISION_YAW_GO_DEG, VISION_STEER_SANITY_DEG) if self.vision else (YAW_GO_DEG, STEER_GO_DEG)
     if not launch and (abs(f.yaw20_deg) > yaw_go or abs(f.steer_deg) > steer_go or (f.desire_out and not self.went)):
-      holds.append(Hold('yaw', "the car isn't straight on its approach", STATIC))
+      # under vision a wait with no bound (the review of 2026-11-08: no handbacks): the lanes are placed on the approach, so
+      # the car doesn't go on a geometry it doesn't have, and it never hands back for it
+      holds.append(Hold('yaw', "the car isn't straight on its approach", DYNAMIC if self.vision else STATIC))
     # 2 the views the maneuver needs, fresh on camera time (the side views while the speed gate runs them); E7, E8
     holds += self._view_holds(f)
     # 4 every conflicting lane: reach or a shield, its tracks, its raw boxes
@@ -1826,7 +1891,9 @@ class StopGo:
     live = f.live
     dead = sorted(k for k in needed if self.view_age[k] >= DET_FAULT_S - 1e-6)
     stale = sorted(k for k in needed if live is None or not live.fresh_key(k))
-    if dead:
+    if dead and all(k in self.view_stuck for k in dead):
+      out.append(Hold('camera', "side camera frozen (" + ', '.join(k[4:].lower() for k in dead) + ")", FAULT))
+    elif dead:
       out.append(Hold('camera', "cross-traffic camera paused (" + ', '.join(dead) + ")", FAULT))
     elif stale:
       out.append(Hold('stale', "views catching up (" + ', '.join(stale) + ")", DYNAMIC))
@@ -1876,9 +1943,12 @@ class StopGo:
         shielded = bool(seen.shields)
       idx = next((i for i, a in enumerate(self.junction.approaches) if a is ln.approach), 0)
       seen_lanes.append(LaneStatus(ln.role, ln.index, idx, r_seen, r_req, seen.why, shielded))
-      if r_seen + 1e-9 < r_req and not shielded:
+      if r_seen + 1e-9 < r_req and not shielded and not self._seen_enough(seen.why, launch):
         moving = any((e.role, e.index) == (ln.role, ln.index) and e.v_nom > MOVING_V for e in self.ev.values())
-        holds.append(Hold(f'reach:{ln.role}{ln.index}', reach_text(ln.role, seen.why), DYNAMIC if moving else STATIC))
+        # under vision, once the creep for a view is at its limit, a bearing the camera can't see at all (washed out, frozen)
+        # is a wait with no bound: the sector reading again ends it, never a handback
+        blind = self.vision and self.view_limited and seen.why in CAMERA_BLIND
+        holds.append(Hold(f'reach:{ln.role}{ln.index}', reach_text(ln.role, seen.why), DYNAMIC if moving or blind else STATIC))
       if launch:
         # objects are judged from where the car is now (only reach keeps the go position's geometry, D13)
         raw = [b for b in self._blockers(f, ln, seen.need_m, rot, pos) if not raw_known(b, still)]
@@ -1909,6 +1979,22 @@ class StopGo:
                              sr.V_CROSS_FACTOR * ln.limit):
         holds.append(Hold(f'tracked:{tid}', f"a {e.cls} {side_word(ln.role)}", DYNAMIC))
     return holds
+
+  def _seen_enough(self, why: str, launch: bool) -> bool:
+    """Under vision, a lane short of its floor that is judged on what the cameras see, never held for its reach: once the
+    creep for a view has reached its limit (view_limited), and on the launch of a go made there (its 'limited'), whatever
+    ended its walk but the camera seeing nothing there (washed out, frozen: CAMERA_BLIND). Its tracks and raw boxes judge it
+    as any lane's, and on the launch a new one withdraws the go."""
+    if not self.vision or why in CAMERA_BLIND:
+      return False
+    return bool(self.go is not None and self.go.get('limited')) if launch else self.view_limited
+
+  def _view_wait(self, holds: list[Hold]) -> bool:
+    """Under vision, a wait the creep for a view is for: every cause a lane short of its reach, or the turn order held
+    behind one (an earlier arrival not taking its turn while we can't judge a lane: the deadlock's creep needs every other
+    go condition met), and one lane short at least."""
+    return any(h.key.startswith('reach:') for h in holds) and \
+      all(h.key.startswith('reach:') or (h.key == 'turn' and h.kind == STATIC) for h in holds)
 
   def _reach_report(self, f: Frame, lanes: list, at: float, ahead_m: float = 0.):
     """visibility.LiveVisibility.lanes for lanes from at (m past the stop point), with this frame's lighting, survey, stamp,
@@ -2273,15 +2359,18 @@ class StopGo:
     bumper (a track or a raw box of a fresh view)."""
     holds = []
     x0, x1 = self._x(self.edges.d_min, pos), self._x(self._far_edge(), pos)
+    # under vision a vehicle standing in the box or just ahead holds the go for as long as it stands, a wait with no bound
+    # (the review of 2026-11-08: no handbacks; V6's exit leg likewise): it moving off ends it
+    still = DYNAMIC if self.vision else STATIC
     for o in f.objects or ():
       cls = class_name(o.cls)
       x, y = float(o.x), float(o.y)
       v = math.hypot(float(o.vx), float(o.vy))
       if cls in MOTOR + CYCLISTS and x0 <= x <= x1 and -BOX_RIGHT_M <= y <= BOX_LEFT_M:
         holds.append(Hold(f'box:{o.trackId}', f"a {cls} in the junction" + ('' if v > MOVING_V else ", stopped"),
-                          DYNAMIC if v > MOVING_V else STATIC))
+                          DYNAMIC if v > MOVING_V else still))
       elif 0. <= x - self.setback <= BOX_HOLD_M and abs(y) <= PATH_HALF_WIDTH_M + 0.5:
-        holds.append(Hold(f'near:{o.trackId}', f"a {cls} just ahead", DYNAMIC if v > MOVING_V else STATIC))
+        holds.append(Hold(f'near:{o.trackId}', f"a {cls} just ahead", DYNAMIC if v > MOVING_V else still))
     if f.live is not None:
       for key, frame in f.live.raw.items():
         if key == 'far' or not f.live.fresh_key(key):
@@ -2340,8 +2429,10 @@ class StopGo:
         continue  # at a curb, standing (D3, P15): the curb rule's, never a person standing in the road
       where = zone(x * (1. - PED_RANGE_BAND), x * (1. + PED_RANGE_BAND), y)
       if where:
+        # a person standing in the road holds the go for as long as they stand: under vision a wait with no bound (no
+        # handbacks, 2026-11-08), the hold itself unchanged
         v = math.hypot(float(o.vx), float(o.vy))
-        holds.append(Hold(f'ped:{o.trackId}', f"a person in {where}", DYNAMIC if v > PED_STILL_V else STATIC))
+        holds.append(Hold(f'ped:{o.trackId}', f"a person in {where}", DYNAMIC if v > PED_STILL_V or self.vision else STATIC))
     holds += self._curb_holds(launch)
     if f.live is not None:
       for key, frame in f.live.raw.items():
@@ -2622,8 +2713,9 @@ class StopGo:
 
   def _ledger(self, f: Frame, d: StopGoDecision, holds: list[Hold], acting: bool, pos: float = 0.) -> None:
     """4.6: every held state says why (waitingForCross, its reason) and has a bound or a dynamic cause. Dynamic: no bound, an
-    info chime at WAIT_INFO_S and every WAIT_INFO_S after. Static (every hold static): STATIC_WAIT_S, then the ladder (H3).
-    A fault's: its grace, then its handback. As shadow, only said (the latch's own handback stands)."""
+    info chime at WAIT_INFO_S and every WAIT_INFO_S after. Static (every hold static): STATIC_WAIT_S, then the ladder (H3);
+    under vision a static wait on reach alone is the creep for a view's instead (_view_step, then the go on what the cameras
+    see), never the ladder. A fault's: its grace, then its handback. As shadow, only said (the latch's own handback stands)."""
     d.prompt = 'waitingForCross'
     # the wait's clock (the info chime's) runs from the arrival to the go, whatever comes and goes meanwhile
     self.dynamic_s += f.dt
@@ -2631,8 +2723,9 @@ class StopGo:
       self.next_chime += WAIT_INFO_S
       self.chime_t = INFO_CHIME_S
     if not holds:
-      # clear, CLEAR_S not yet run: the static clock keeps its count (a static cause that flickers still meets its bound)
-      d.ledger, d.reason = 'none', "Cross traffic clear"
+      # clear, CLEAR_S not yet run: the static clock keeps its count (a static cause that flickers still meets its bound);
+      # under vision at the creep's limit, nothing seen within the reach it has, said as such
+      d.ledger, d.reason = 'none', LIMITED_WAIT_REASON if self._limited_now() else "Cross traffic clear"
       self.paused_s = self.h2_s = 0.
       return
     top = holds[0]
@@ -2689,18 +2782,20 @@ class StopGo:
     route_known = f.route_cert == 'uncertifiable' and top.key.startswith('cert:') and not self.vision  # V1
     if acting and route_known:
       self._fault('H3', f, d, ROUTE_KNOWN_REASON)
-    elif acting and self.vision and self.view_creep is None and not self.vision_creep_tried and \
-        self.static_s >= sr.VISION_CREEP_AFTER_S - 1e-6 and all(h.key.startswith('reach:') for h in holds):
-      # V9 (spec C11): the creep for a view after VISION_CREEP_AFTER_S of a wait on reach alone, not STATIC_WAIT_S
-      self.vision_creep_tried = True
-      self._view_creep_start(f, d, holds, pos)
+    elif acting and self.vision and self._view_wait(holds):
+      # V9 (spec C11) and the review of 2026-11-08 (no handbacks: where TurnPilot can't judge something it acts on its best
+      # judgement of what it can see): a wait on reach alone is the creep for a view's, VISION_CREEP_AFTER_S into it, step by
+      # step to its limit (_view_step), then the go on what the cameras see (view_limited); never the ladder, never H3
+      if not self.view_limited and self.view_creep is None and self.static_s >= sr.VISION_CREEP_AFTER_S - 1e-6:
+        self._view_step(f, d, pos)
     elif acting and self.static_s >= STATIC_WAIT_S - 1e-6:
       self._ladder_rungs(f, d, holds, top, pos)
 
   def _ladder_rungs(self, f: Frame, d: StopGoDecision, holds: list[Hold], top: Hold, pos: float) -> None:
     """7.1, the static wait's bound: rung 1, the creep for a view where 2.5 predicts a closer point helps the binding lane
     and the creep floor allows it (_view_creep_start; while one is in hand, crept or measuring, the ladder waits on it); rung
-    3, H3 with the reason."""
+    3, H3 with the reason. Under vision a wait on reach alone never comes here (_ledger: _view_step), so what reaches rung 3
+    there is a fault's static cause (the side views recalibrating past CAL_WAIT_S, no conflicting approach to judge by)."""
     vc = self.view_creep
     if vc is not None and vc['phase'] in ('creep', 'measure'):
       return
@@ -2779,6 +2874,59 @@ class StopGo:
     d.creep, d.action, d.reason = (self.view_creep['target'], VIEW_CREEP_V), 'creeping', VIEW_CREEP_REASON
     return True
 
+  def _view_step(self, f: Frame, d: StopGoDecision, pos: float) -> bool:
+    """Under vision, one step of the creep for a view (the review of 2026-11-08: what a careful driver does where he can't see
+    far enough): VIEW_CREEP_M on the latch's creep path at VIEW_CREEP_V, one G5 go (cause creep) at its start for a model that
+    holds, said (Creeping for view), whether or not the walk predicts it helps (a sector, the frame's edge or glare predict
+    nothing, an occluder only by its ground range), never while creep_blocked (V12, V13: tried again each frame, said once in
+    the log), and never closer to the closest plausible edge than a go from there needs to stop short of it (the go's own
+    room, _go_room, and the run-on of one abort delay more at VIEW_CREEP_V: a step that runs on past its target still leaves a
+    go that can be withdrawn). Each stand is judged again for the window (_view_creeping's measure: the go comes on its own once
+    every lane meets its floor), and the next step taken from there; with no room for another step, or no latch to creep
+    from, the creep has reached its limit (_view_limit). True: a step started."""
+    self.vision_creep_tried = True
+    if f.control is None:
+      self._view_limit(f, 'no latch to creep from', pos)
+      return False
+    # a step's target is shortened by the run-on the known delay gives (run_on below), so an actuator slower than the decider
+    # knows runs the car on past it: the review of 2026-11-08 found a last stand 0.02 m inside the go's room (known 0.3 s,
+    # actual 0.6 s), its go committed (clearBox, no launch withdraw) on the limited view. The run-on of one delay more covers an
+    # actuator twice as slow as the decider knows
+    need = self._go_room(f) + VIEW_CREEP_V * f.t_abort
+    room = self.edges.d_min - pos - VIEW_CREEP_M
+    if room < need - 1e-6:
+      self._view_limit(f, f"no room for another step: {room + VIEW_CREEP_M:.2f} m to the closest edge, {need:.2f} a go needs after one", pos)
+      return False
+    # openpilot disengaged (the driver's pedal) or another go in hand: the step waits for it, never a step that can't move
+    blocked = 'not engaged' if not f.enabled else 'a go in hand' if f.go_active != 'none' else self.creep_blocked(f, pos)
+    if blocked:
+      if blocked != self.view_no:
+        self.view_no = blocked
+        cloudlog.event("turnpilot.stop_go_view_creep_no", key=list(self.key), why=blocked, room=round(room, 2), need=round(need, 2))
+      return False
+    self.view_no = ''
+    b = self._binding()
+    moved = float(getattr(f.control.state, 'moved_m', 0.))
+    v = VIEW_CREEP_V
+    run_on = max(v * (f.t_abort - DT_MDL - 0.1) + v * v / 2. - CREEP_AT_M, 0.)
+    self.view_creep = {'phase': 'creep', 'target': moved + max(VIEW_CREEP_M - run_on, CREEP_AT_M + 0.1), 't': self.t, 'went': False,
+                       'from': moved, 'moved': False, 'margin0': b.r_seen - b.r_req if b is not None else 0.,
+                       'lane': (b.role, b.index) if b is not None else None, 'known': self._known_tracks(f), 'look': False, 'view': True}
+    cloudlog.event("turnpilot.stop_go_view_creep", key=list(self.key), lane=list(self.view_creep['lane'] or ()), pos=round(pos, 2),
+                   now=round(self.view_creep['margin0'], 2), room=round(room, 2), need=round(need, 2), steps=self.view_steps, vision=True)
+    d.creep, d.action, d.reason = (self.view_creep['target'], VIEW_CREEP_V), 'creeping', VIEW_CREEP_REASON
+    return True
+
+  def _view_limit(self, f: Frame, why: str, pos: float) -> None:
+    """The creep for a view at its limit (_view_step): from here the car goes on what the cameras see (view_limited, the
+    review of 2026-11-08): each lane short of its floor is judged by its tracks and raw boxes (_seen_enough), a car seen in
+    one still holding the go and, on the launch, withdrawing it; the window is the long look's (VISION_LONG_CLEAR_S, from
+    here) and the go is said with "Look both ways" first (_announce). A bearing the camera sees nothing at (washed out, frozen)
+    still holds, a wait with no bound."""
+    self.view_limited, self.view_creep, self.clear_s = True, None, 0.
+    cloudlog.event("turnpilot.stop_go_view_limited", key=list(self.key), why=why, pos=round(pos, 2), steps=self.view_steps,
+                   lanes=[(x.role, x.index, round(x.r_seen, 1), round(x.r_req, 1), x.binding) for x in self.last_lanes])
+
   def _look_lanes(self) -> list:
     """The long look's lanes a creep could help (this frame's LaneStatus): the cross lanes (left, right) of an approach over 25
     mph or of unknown speed whose walk reaches less than that approach's own floor would ask (unknown: any). The opposite lane
@@ -2831,6 +2979,20 @@ class StopGo:
       self.view_creep = None
       if not vc['moved'] or not self._view_creep_start(f, d, holds, pos, look=True):
         cloudlog.event("turnpilot.stop_go_look_crept", key=list(self.key), pos=round(pos, 2), steps=self.view_steps)
+      return
+    if vc['phase'] == 'measure' and vc.get('view'):
+      # vision's creep for a view (_view_step): the window from this stand (the go on its own if every lane now meets its
+      # floor); still short, the next step, or the limit where none can start or the last didn't move the car. Anything else
+      # holding now hands the creep back: it goes on once the wait is the view's again
+      if self.t - vc['t_measure'] < self._need_s() - 1e-6 or not holds:
+        return
+      self.view_creep = None
+      if not self._view_wait(holds):
+        return
+      if not vc['moved']:
+        self._view_limit(f, "the last step didn't move the car", pos)
+        return
+      self._view_step(f, d, pos)
       return
     if vc['phase'] != 'measure' or self.t - vc['t_measure'] < self._need_s() - 1e-6 or not holds:
       return
@@ -2996,7 +3158,8 @@ class StopGo:
     d.log = {'state': self.state, 'mode': d.mode, 'why': why, 'clear_s': round(self.clear_s, 2), 'rank': self.rank,
              'retries': self.retries, 'pos': round(d.position_m, 2), 'reason': d.reason, 'would_go': d.would_go}
     if self.vision:
-      d.log.update(vision=True, need_s=self.need_s, gate=self.gate[0] if self.gate else '', longLook=[r for r, _ in self.long_look])
+      d.log.update(vision=True, need_s=self.need_s, gate=self.gate[0] if self.gate else '', longLook=[r for r, _ in self.long_look],
+                   viewLimited=self.view_limited)
 
 
 def side_word(role: str) -> str:

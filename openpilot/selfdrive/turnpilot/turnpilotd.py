@@ -179,7 +179,9 @@ go is lifted only from LEFT_LIFT_ROOM_M or more short of the oncoming lanes (its
 them only by a launch (unprotected_left.LEFT_LAUNCH_SPEED, left_launch_armed): short of it with LEFT_LAUNCH_ROOM_M left to
 stop short of them it is judged again for the launch the car shows, as the go is (on the band the camera covers out to that
 launch's R_req): kept driving where nothing is seen there, withdrawn to the left's own wait short of them where a car is,
-never a handback (review 2026-11-07, L3: withdrawn and handed back until then).
+never a handback (review 2026-11-07, L3: withdrawn and handed back until then). Kept driving and committed short of
+LEFT_LAUNCH_SPEED, a lifted left is carried across them (left_carry: a go of its own, go_override's carry, the lift to the
+left's post-go profile and never past it; review 2026-11-08: a coast on the lift's 0.78 m/s spent about 15 s in them).
 Standing engaged with nothing of TurnPilot's holding the car (no shouldStop, no cap biting), no lead from the model within
 STOPPED_LEAD_M that the live scene corroborates (one further on doesn't hold a standing car, nor one nothing in the scene
 shows: a phantom, a mailbox), gas and brake off, the model stopped on its own: said, with one info chime a stand (carStoppedNote; none
@@ -230,7 +232,7 @@ from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.selfdrive.turnpilot.desire_timing import (CURB_TURN_PULSE_M, ENTRY_M, TURN_STARTED_DEG, DesireTiming, curb_side_turn,
                                                           first_pulse_by, keep_last, pulse_distance)
 from openpilot.selfdrive.turnpilot.control_text import STOPPED_NOTE, calibration_reason
-from openpilot.selfdrive.turnpilot.go_override import GO_ACCEL, GO_CLEAR_M, GO_WINDOW_S, GoCertifier, Takeover
+from openpilot.selfdrive.turnpilot.go_override import CARRY_SPEED, GO_ACCEL, GO_CLEAR_M, GO_WINDOW_S, GoCertifier, Takeover
 from openpilot.selfdrive.turnpilot.handback import Handback
 from openpilot.selfdrive.turnpilot.hooks import (ABORT_HOLD_S, CLEAR_DESIRE, CONTROL_STATUS_ALERTS, KEEP_FOLLOW, KEEP_REROUTED, TAKE_CONTROL_PROMPTS,
                                                   shows_alert)
@@ -269,7 +271,7 @@ from openpilot.selfdrive.turnpilot.turn_skip import (CURB_FIRST_PULSE_M, STOP_BE
 from openpilot.selfdrive.turnpilot.turn_speed import (LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT, POST_GO_PROFILES, TURN_CAP_LEAD_M, PostGo,
                                                       turn_done_deg, turn_speed_cap)
 from openpilot.selfdrive.turnpilot.darkness import EXPOSURE_LOG_S, LEAVE_MOVING_V, SUN_EVERY_S, car_fix, dark_filter_for, sun_elevation
-from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, DRIVEN, FULL_PASS_RANGE_M, LEFT_LAUNCH_ROOM_M, LIGHT_RED_MAX_S, OFF,
+from openpilot.selfdrive.turnpilot.unprotected_left import (AUTO, CLEAR_PATH_PAST_M, DRIVEN, FULL_PASS_RANGE_M, LEFT_LAUNCH_ROOM_M, LIGHT_RED_MAX_S, OFF,
                                                            ROAD_RANGE_M, STAND_UNDECIDED_S, LeftInput, UnprotectedLeft, left_mode_for,
                                                            left_reach, range_param, route_range)
 
@@ -1110,6 +1112,9 @@ class TurnPilot:
       self.go_cert_id: int | None = None   # ...as this go (GoCertifier.id)
       self.go_moved = False                # ...and the car has rolled since (no_move)
       self.left_launch_armed = False       # ...an unprotected left's, checked for its launch until its commit (left_launch)
+      self.left_carry_tried = False        # ...its carry across the oncoming lanes certified, once a go (left_carry)...
+      self.left_carry_id: int | None = None  # ...as this go (GoCertifier.id)
+      self.left_carry_said: set[str] = set()  # ...or refused, each reason said once a go
       self.go_left = False                 # ...is the unprotected left's: it keeps its own hold (LEFT-06), never a release's rules
       self.go_straight = False             # ...is a straight release's (no turn): judged at the junction it stands at
       self.rel_lift_m = 0.                 # under the switch, the release's lifts' metres by odometer (RELEASE_LIFT_M)...
@@ -1622,6 +1627,7 @@ class TurnPilot:
     if sg.go_cause != 'none' and acting:
       self.certify_stop_go(sm, cs, available, objects, raw, decision, took_over, sg)
     self.left_launch(sm)
+    self.left_carry(sm, cs, v_ego, acting, available, objects, raw, decision, took_over, rf.distance)
     withdrawn = self.no_move(sm, cs, v_ego, acting, decision)
     if withdrawn:
       self.go_cert.withdraw('noMove')
@@ -3071,6 +3077,7 @@ class TurnPilot:
     self.go_moved, self.go_clock_again = False, False
     # the left's go from its line followed into the oncoming lanes only by a launch (left_launch)
     self.left_launch_armed = left and at_line and distance - ONCOMING_ENTRY_M >= LEFT_LIFT_ROOM_M
+    self.left_carry_tried, self.left_carry_said = False, set()  # its carry, once this go (left_carry)
     cloudlog.event("turnpilot.post_go", profile=name, unprotected=left, turned_deg=round(turned_deg, 1), distance=round(distance, 1),
                    at_line=at_line)
 
@@ -3447,6 +3454,66 @@ class TurnPilot:
     left = self.left_now
     if self.left_launch_armed and (not sm['carControl'].enabled or left is None or left.state != 'go'):
       self.left_launch_armed = False
+
+  def left_carry(self, sm, cs, v_ego: float, acting: bool, available: bool, objects, raw, decision, took_over: bool,
+                 distance: float) -> None:
+    """The unprotected left committed short of a launch after a slow one it judged on (LeftDecision.carry: it can no longer
+    stop short of the oncoming lanes) is carried across them at its post-go profile, not at the model's crawl: a go of its
+    own certified for plannerd's lift (go_override's carry: the e2e candidate lifted to the profile's accel, never past
+    CARRY_ACCEL nor toward more than CARRY_SPEED, every rail of the lift's but its window, speed and takeover). Review
+    2026-11-08 (round 2's trade, 'G5's coast'): a model that only kept the lift's 0.78 m/s, the band clear, crossed them in
+    about 15 s where R_req assumed under 3, so a car outside the camera's band at the go could arrive while the car was still
+    in them. Only the left's lifted go (go_lifted: one plannerd wouldn't lift, at a signal on the car, crosses with the
+    model), certified once a go, through go_refused's checks but the lift's room (the car is past where its nudge mattered:
+    committed), its post-go profile in force, once the go from its line is over, however that go ended (review 2026-11-08: a
+    go withdrawn before the model's takeover, a one-frame lead, left no_move's clock running and the carry never came, 21.8
+    s in the lanes, nothing said); withdrawn across the lanes (R_req's path, CLEAR_PATH_PAST_M past the maneuver point,
+    however far the car has turned: the profile's own 1.5 m/s^2 and 4.3 m/s past its 45 deg, under the corner's cap), turned
+    to its angle (DesireTiming's done: on the exit road), the turn missed or skipped, or the left no longer committed
+    (withdraw_go's rails every frame besides). Withdrawn by one of those rails that this gate checks again every frame (a
+    lead, a road user in the path, a hold, the scene, a person, the light), it is certified again, a go of its own, once that
+    rail clears (review 2026-11-08: a 0.5 s phantom lead at the commit withdrew it on its first frame and the car crawled 14
+    s in the lanes); never after the driver, a handback or its own ends. Its plannerd ends (the model slowing, braking or
+    stopping, a lead only the radar sees) never withdraw it here, so they stay for good: the same go, its lift over. A carry
+    the commit asked for and that doesn't come is said, each reason once a go (left_carry_refused: why), but for the go from
+    the line still out (its own end, GO_WINDOW_S at most) or the car at CARRY_SPEED by itself. Never steering; a car seen in
+    the band before the commit still withdraws the go while the car can stop (unprotected_left: _after_go)."""
+    left, gc, d = self.left_now, self.go_cert, self.desires
+    turned = d.maneuver_id == self.follower.maneuver_id and d.done  # turned to its angle: on the exit road, out of the lanes
+    missed = self.missed_t > 0. or (self.skip.skipped and self.skip.maneuver_id == self.follower.maneuver_id)
+    if gc.active and gc.id == self.left_carry_id:
+      why = 'left' if left is None or left.state != 'committed' or not left.carry else 'missed' if missed else \
+        'turned' if turned else 'across' if distance <= -CLEAR_PATH_PAST_M else ''
+      if why:
+        cloudlog.event("turnpilot.left_carry_end", why=why, go_id=gc.id, v=round(v_ego, 2), distance=round(distance, 1),
+                       turned_deg=round(d.turned_deg, 1), t=round(gc.t, 2))
+        gc.withdraw(f"carry {why}")
+      return
+    if self.left_carry_tried and gc.id == self.left_carry_id and gc.end in ('lead', 'inPath', 'hold', 'scene', 'personFront',
+                                                                            'light', 'heads'):
+      self.left_carry_tried = False  # withdrawn by a rail checked below every frame: certified again once it clears
+    if self.left_carry_tried or not acting or left is None or left.state != 'committed' or not left.carry:
+      return
+    if (gc.active and gc.id == self.go_cert_id) or v_ego >= CARRY_SPEED:
+      return  # the go from the line still out (its own end, GO_WINDOW_S at most), or the car at the profile's speed by itself
+    pg = self.post_go
+    # only the left's lifted go is carried: one plannerd wouldn't lift (a signal, HR-2, the param) crosses with the model
+    why = 'unlifted' if not (self.go_left and self.go_lifted) else 'missed' if missed else 'turned' if turned else \
+      'across' if distance <= -CLEAR_PATH_PAST_M else 'profile' if pg is None or not pg.profile.capped else \
+      'over' if pg.over else 'goOut' if gc.active else 'param' if not self.go_override else \
+      self.go_blocked(sm, cs, available, objects, raw, decision, took_over)
+    if not why:
+      why = self.release_blocked(distance, 'unprotectedLeft', certifying=False)  # its go's frame decided the heads clause
+    if why:
+      if why not in self.left_carry_said:  # a fault but for the left plannerd wouldn't lift and the turn's own ends
+        self.left_carry_said.add(why)
+        cloudlog.event("turnpilot.left_carry_refused", error=why not in ('unlifted', 'missed', 'turned', 'across', 'over'),
+                       why=why, v=round(v_ego, 2), distance=round(distance, 1), turned_deg=round(self.desires.turned_deg, 1))
+      return
+    if gc.start('unprotectedLeft', carry=True, distance=round(distance, 1), v=round(v_ego, 2), turned_deg=round(pg.turned_deg, 1)):
+      self.left_carry_tried, self.left_carry_id = True, gc.id
+      cloudlog.event("turnpilot.left_carry", go_id=gc.id, v=round(v_ego, 2), distance=round(distance, 1),
+                     turned_deg=round(pg.turned_deg, 1))
 
   def stalled_in_turn(self, sm, cs, v_ego: float, acting: bool, decision, mapd, objects=(), raw=None, available: bool = False,
                       took_over: bool = False, right_hand_traffic: bool = True) -> bool:

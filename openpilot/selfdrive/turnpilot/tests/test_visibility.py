@@ -16,7 +16,7 @@ from openpilot.selfdrive.turnpilot import visibility_table as vt
 from openpilot.selfdrive.turnpilot.scene.tracker import RawBox, RawFrame
 from openpilot.selfdrive.turnpilot.stop_evidence import junction_lanes
 from openpilot.selfdrive.turnpilot.tests.test_stop_evidence import junction
-from openpilot.selfdrive.turnpilot.visibility import LiveVisibility, ray_lane_d
+from openpilot.selfdrive.turnpilot.visibility import CAMERA_BLIND, VISION_ACCEPT, LiveVisibility, ray_lane_d
 
 SETBACK, HEIGHT = 1.9, 1.3
 ROT = sr.angle_bound(False)  # 3.5 deg: section 2.8's unsurveyed geometry
@@ -580,15 +580,34 @@ def test_without_vision_the_shipped_file_still_sees_nothing():
   assert all(x.reach_m == 0. and x.why == 'noMask' for x in rep.lanes)
 
 
-def test_vision_a_sector_not_ok_the_sun_ahead_and_low_sun_still_zero_the_walk():
-  base = lane_of(vision_report(live()), 'left').reach_m
-  bad = lane_of(vision_report(live(bad=72.)), 'left')
-  assert bad.why == 'sector' and bad.reach_m < base - 5.
+def test_vision_a_degraded_sector_is_judged_by_the_walk_a_washed_or_frozen_one_the_sun_ahead_and_low_sun_still_zero_it():
+  # the review of 2026-11-08 (wf7 verify:LS-3-R1 point 4): a degraded sector (contrast under 0.5 of the 10-35 deg band's, what
+  # ordinary sunny footage reads at 70-85 deg) zeroed its bearing, so the far lane of an ordinary stop fell short and the car
+  # handed back. Under vision it is judged as an ok one is (its boxes and tracks judge the lane); washed and frozen, where the
+  # camera sees nothing, still zero it, the walk's why saying which (CAMERA_BLIND). The other modes as they were: 'sector'
+  base = lane_of(vision_report(live()), 'left')
+  deg = lane_of(vision_report(live(bad=72.)), 'left')
+  assert deg.why == base.why and deg.reach_m == pytest.approx(base.reach_m)
+  assert lane_of(vision_report(live(bad=72., quality='degraded')), 'left').reach_m == pytest.approx(base.reach_m)
+  for q in CAMERA_BLIND:
+    bad = lane_of(vision_report(live(bad=72., quality=q)), 'left')
+    assert bad.why == q and bad.reach_m < base.reach_m - 5., q
+    assert lane_of(report(live(bad=72., quality=q)), 'left').why == 'sector'
+  assert lane_of(report(live(bad=72.)), 'left').why == 'sector'  # a degraded one zeroes under the other modes, as it did
   sun = lane_of(vision_report(live(), lighting='sunAhead'), 'left')
   assert sun.why == 'sunAhead' and sun.reach_m < 20.
   low = lane_of(vision_report(live(), low_sun_sides=('left',)), 'left')
   assert low.why == 'lowSun' and low.reach_m < 15.
   assert all(x.reach_m == 0. for x in vision_report(live(), lighting='night').lanes)  # night has no table
+
+
+def test_sector_bad_says_why_a_bearing_isnt_ok_the_cameras_blindness_first():
+  lv = live(bad=70., quality='washed')  # the 67.5-72.5 deg sector
+  assert lv.sector_bad('left', 70.) == 'washed' and not lv.sector_ok('left', 70.)
+  assert lv.sector_bad('left', 70., VISION_ACCEPT) == 'washed' and lv.sector_bad('left', 63.) == '' and lv.sector_ok('left', 63.)
+  assert live(bad=70.).sector_bad('left', 70.) == 'degraded' and live(bad=70.).sector_bad('left', 70., VISION_ACCEPT) == ''
+  assert live(bad=70., quality='frozen').sector_bad('right', 70.) == 'frozen'
+  assert live(views=('road', 'full')).sector_bad('left', 70.) == 'none'  # no run of that view: nothing read
 
 
 def test_vision_a_stale_side_view_and_a_scene_gone_see_nothing_past_the_full_pass():

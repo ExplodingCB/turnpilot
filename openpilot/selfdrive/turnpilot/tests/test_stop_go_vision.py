@@ -258,15 +258,22 @@ def test_vision_side_views_off_for_the_drive_is_the_1_s_handback_saying_so(tmp_p
   assert d.reason == "Stop sign: side cameras off: take control" and d.fault == 'H9'
 
 
-@pytest.mark.parametrize('wall_t, heading, words', [
-  (utc(2026, 10, 28, 22, 0), 0., 'low sun along an approach at ETA +0 min'),
-  (utc(2026, 10, 28, 17, 0), 180., 'sun ahead at ETA +0 min (veil unmeasured)')])
-def test_vision_low_sun_and_the_sun_ahead_hand_back_saying_which(tmp_path, wall_t, heading, words):
-  # glare, by day; night, dusk and no clock go as by day since 2026-11-07 (tests/test_stop_go_night.py)
-  w = vworld(tmp_path, j=vision_junction(heading_in=heading), wall_t=wall_t)
-  out = w.run(4.)
-  d = gate_fault(out)
-  assert d is not None and first_go(out) is None and d.reason.startswith('Stop sign: ') and words in d.reason, d.reason
+@pytest.mark.parametrize('wall_t, heading, words, why', [
+  (utc(2026, 10, 28, 22, 0), 0., 'low sun along an approach at ETA +0 min', 'lowSun'),
+  (utc(2026, 10, 28, 17, 0), 180., 'sun ahead at ETA +0 min (veil unmeasured)', 'sunAhead')])
+def test_vision_low_sun_and_the_sun_ahead_are_judged_by_the_walk_never_the_gates_handback(tmp_path, wall_t, heading, words, why):
+  # glare, by day (night, dusk and no clock go as by day since 2026-11-07: tests/test_stop_go_night.py). Until the review of
+  # 2026-11-08 the gate handed back 1 s after the full stop saying which ("Stop sign: low sun ...: take control", H9); now the
+  # walk's own glare zeroes judge it (and the sectors' washed test, where the sun fills a lens): the wait on reach, the creep
+  # for a view, then the go on what the cameras see. certify still says which, for navd's route
+  j = vision_junction(heading_in=heading)
+  v = ce.assess(j, 'straight', SHIPPED, [], wall_t, ce.Runtime(mode='vision', side_views=True, window=(0., 0.)))
+  assert v.reason == 'light' and words in v.detail, v.detail
+  w = vdrive(tmp_path, j=j, wall_t=wall_t)
+  out = w.run(45.)
+  assert gate_fault(out) is None and not any(d.fault or d.prompt == 'stopSignTakeControl' for d in out)
+  assert any(x.binding == why for d in out for x in d.lanes)
+  assert first_go(out) is not None and any(d.state in ('inLane', 'done') for d in out)
 
 
 def test_vision_without_the_sidecar_is_h8(tmp_path):
@@ -387,12 +394,15 @@ def test_vision_a_later_arrival_at_its_line_on_a_stop_mapped_approach_shields_it
 
 def test_vision_a_car_standing_down_a_two_ways_through_road_is_no_shield(tmp_path):
   # on an approach the map doesn't say stops, a car standing 6 m down the lane at the corner is likelier parked: never a shield;
-  # its box caps the lane behind it (the static wait, the creep for a view, H3 at the bound), never a go
-  w = vdrive(tmp_path, j=two_way_junction(20), behaviour='holds')
+  # its box caps the lane behind it: the static wait, the creep for a view to its limit, then (the review of 2026-11-08, no
+  # handbacks; before it H3 at the bound) the go on what the cameras see, never on the parked car as a shield
+  w = vdrive(tmp_path, j=two_way_junction(20))
   w.tracks = vcars((3, 'left', standing(10.), 2, 0.05))  # at the near edge of the lane band: a bearing-only occluder
-  out = w.run(sg.STATIC_WAIT_S + 8.)
-  assert first_go(out) is None and not any(x.shielded for d in out for x in d.lanes)
-  assert out[-1].fault in ('H3',) and "can't see far enough" in out[-1].reason
+  out = w.run(sg.STATIC_WAIT_S + 20.)
+  i = first_go(out)
+  assert not any(x.shielded for d in out for x in d.lanes)
+  assert any("can't see far enough from the left" in d.reason for d in out[:i])
+  assert i is not None and out[i].log['viewLimited'] and not any(d.fault for d in out)
 
 
 # ------------------------------------------------------------------------------------------------ ALWAYS_DRIVE V2-V9
@@ -666,14 +676,17 @@ def test_vision_a_person_turnpilot_lost_in_front_is_the_front_zone_no_go_and_h7_
 
 # ------------------------------------------------------------------------------------- the stand past the line (re-run R7)
 
-@pytest.mark.parametrize('past_m,goes', [(1.01, True), (0.2, True), (1.8, False)])
-def test_vision_a_stand_past_the_line_still_goes_across_an_empty_junction(tmp_path, past_m, goes):
+@pytest.mark.parametrize('past_m,withdrawable', [(1.01, True), (0.2, True), (1.8, False)])
+def test_vision_a_stand_past_the_line_still_goes_across_an_empty_junction(tmp_path, past_m, withdrawable):
   # the re-run at 6ba8582 (R7, stop_allway_empty): the bridge's low-speed overshoot (-4.9 measured for -2.0 asked) stood the car
   # 1.01 m past the mapped line, 2.29 m from dEdgeMin (3.30 unsurveyed); the junction read clear, "Going" was said, and the go
   # handed back on its frame (H5 "no room for a go: 2.29 m to the closest edge, 2.48 needed"). Under vision a go needs the room
   # for its abort after a VISION_NUDGE_M nudge, the gate point judged live on the launch as ever: from 1.01 m past (and the
-  # morning's 0.2 m) it goes across, every stop -2.0 or gentler; from 1.8 m past (1.5 m left) no go can start: H5, held. The
-  # run's live view is the sim's cross oracle (every lane seen to 60 m, as R7's decider read it)
+  # morning's 0.2 m) it goes across, every stop -2.0 or gentler. From 1.8 m past (1.5 m left) no go can stop short of the
+  # closest plausible edge: until the review of 2026-11-08 that was H5, held; now (no handbacks) the go is committed from
+  # there once its window has run and been said (the clearBox lift, the in-path rail and the band's threat test after it), as
+  # a withdrawn go's rest already was. The run's live view is the sim's cross oracle (every lane seen to 60 m, as R7's decider
+  # read it)
   w = vdrive(tmp_path, 25, d0=-past_m)
   w.kw['live'] = OracleLive(60.)
   out = w.run(20.)
@@ -682,8 +695,12 @@ def test_vision_a_stand_past_the_line_still_goes_across_an_empty_junction(tmp_pa
   if past_m > 1.:
     assert room < sr.go_room_m(w.kw['t_abort'])  # R7's own shortfall
   assert all(s.accel_cap >= -2. - 1e-9 for d in out for s in d.stops)
-  if goes:
-    assert first_go(out) is not None and not any(d.fault for d in out), [(d.state, d.fault, d.reason) for d in out[::20]]
-    assert any(d.state == 'done' for d in out)
+  assert not any(d.fault or d.prompt == 'stopSignTakeControl' for d in out), [(d.state, d.fault, d.reason) for d in out[::20]]
+  assert any(d.state == 'done' for d in out)
+  if withdrawable:
+    assert first_go(out) is not None
   else:
-    assert first_go(out) is None and out[-1].fault == 'H5' and out[-1].prompt == 'stopSignTakeControl'
+    assert room < sr.go_room_vision_m(w.kw['t_abort'])
+    k = next(k for k, d in enumerate(out) if d.go_cause == 'clearBox')
+    assert out[k].state == 'committed' and out[k].release is not None and out[k].reason == sg.GOING_REASON
+    assert (k - arrived_at(out)) * DT_MDL == pytest.approx(sr.VISION_CLEAR_S, abs=0.11) and out[k - 1].prompt == 'stopGo'

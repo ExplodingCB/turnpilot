@@ -22,6 +22,18 @@ the full wide frame's 10-35 deg band as envelope_thresholds.json defined it: ok,
 The contrast thresholds were derived on moving frames (envelope.md: stopped-frame ratios swung 0.04-2.9 with the scene and
 were unused), and at a stop line the car is standing, so their validity there waits on step S3's logs. This reads the
 same-frame gradient (no temporal mean exists at a standstill).
+
+What each says (the review of 2026-11-08). Washed: saturated (the sun or headlights in the lens), or lifted far over the
+reference with no contrast left: the camera sees nothing there. Frozen: the feed itself stuck (the luma plane repeated bit for
+bit for FROZEN_S: every sector of the view reads frozen, whatever else it would read), or a band that isn't dark unchanging
+for FROZEN_S (no sensor noise: unexplained). A still band clipped black in a live feed (an unlit night stand) reads dark or
+blocked, which is what it is, never frozen. Degraded: only low contrast against the reference band, which is what an empty
+far road, open sky at the horizon or a blank wall look like; the envelope study's same-frame ratios on ordinary sunny footage
+were 0.13-0.31 at 70-85 deg, and a lit junction at night reads degraded where an unlit one reads dark, so it is no sign the
+detector can't box a car there. Dark and blocked (static and dark): dim, not blind. Under TurnPilotStopSignGo=vision the
+stop-sign decider judges a dark, blocked or degraded bearing on the boxes and tracks it still yields and zeroes only a washed
+or frozen one (visibility.VISION_ACCEPT, CAMERA_BLIND); a run whose every sector reads frozen carries no new image, so it
+counts as no run at all (stop_go: the camera fault, H1, as for a view that stopped running).
 """
 import json
 from collections import deque
@@ -59,6 +71,10 @@ WASHED_SAT = 0.3              # or this share of pixels saturated (SAT_DN and up
 SAT_DN = 250.
 DARK_LUMA_DN = 45.            # median under this: dark, until step S1 sets visibility.json's darkThreshold
 FROZEN_MAD_DN, FROZEN_S = 0.5, 1.0  # mean absolute change from the sector's last sample under this for this long: frozen
+# the feed itself stuck (the review of 2026-11-08): every STUCK_STRIDE-th byte of the wide frame's luma plane bit for bit the
+# same over FROZEN_S of a sweep's runs. A live sensor's noise moves some of them every frame, even at night (the headlit road,
+# the hood), so only frames repeated whole read so; then every sector of the view reads frozen, before any other quality
+STUCK_STRIDE = 97
 STATIC_STD_DN, STATIC_MEAN_DN, STATIC_FRAC = 4.0, 45., 0.5  # this share of pixels static (temporal std) and dark: blocked
 HISTORY_S = 1.0               # the samples blocked's temporal std is taken over
 GAP_S = 1.0                   # a sector's samples further apart than this start its history over (a new sweep)
@@ -247,11 +263,14 @@ class SectorQuality:
     self.dark_dn = dark_threshold() if dark_dn is None else dark_dn
     self.history: dict[tuple, deque] = {}    # (view, inner) -> (t, luma) samples within HISTORY_S
     self.changed_t: dict[tuple, float] = {}  # (view, inner) -> when it last changed by FROZEN_MAD_DN or more
+    self.feed: tuple | None = None           # (t, the luma plane's STUCK_STRIDE sample) of the last run, any view
+    self.feed_changed_t = 0.                 # when that sample last differed from the run before
 
   def update(self, geom: SideGeometry, name: str, frame: np.ndarray, t: float) -> list[tuple[float, float, str]]:
     """frame: the wide camera's NV12 host copy (flat uint8); t: its camera time, s. Returns (inner, outer, quality) per
     sector of the view."""
     stride = geom.stride
+    stuck = self._stuck(frame[:stride * geom.y_height], t)
     ref = full_range(frame[geom.ref_idx])
     ref_g = float(gradient(frame, geom.ref_idx, stride).mean()) if len(ref) else 0.
     ref_p5 = float(np.percentile(ref, 5)) if len(ref) else 0.
@@ -268,15 +287,29 @@ class SectorQuality:
       hist.append((t, vals))
       while hist and t - hist[0][0] > HISTORY_S + 1e-6:
         hist.popleft()
-      out.append((s.inner, s.outer, self._quality(vals, ratio, ref_p5, hist, t - self.changed_t[key])))
+      out.append((s.inner, s.outer, 'frozen' if stuck else self._quality(vals, ratio, ref_p5, hist, t - self.changed_t[key])))
     return out
+
+  def _stuck(self, luma: np.ndarray, t: float) -> bool:
+    """The feed stuck: the luma plane's STUCK_STRIDE sample unchanged, bit for bit, for FROZEN_S of runs no further apart than
+    GAP_S. A copy is kept: the host buffer is camerad's, refilled under us."""
+    sample = luma[::STUCK_STRIDE].copy()
+    last = self.feed
+    if last is None or t - last[0] > GAP_S or not np.array_equal(sample, last[1]):
+      self.feed_changed_t = t
+    self.feed = (t, sample)
+    return t - self.feed_changed_t >= FROZEN_S - 1e-6
 
   def _quality(self, vals: np.ndarray, ratio: float, ref_p5: float, hist: deque, still_s: float) -> str:
     if float((vals >= SAT_DN).mean()) >= WASHED_SAT:
       return 'washed'
     # frozen before blocked (review 2026-11-07, LS-3): under vision a blocked sector after dark is judged by the walk's other
-    # rules (static and dark is every side view at a night stand), so a stuck feed, static too, must still read frozen
-    if still_s >= FROZEN_S:
+    # rules (static and dark is every side view at a night stand), so a stuck feed, static too, must still read frozen: the
+    # whole feed's is (_stuck, every sector). In a live feed a still band clipped black (an unlit night stand: under the dark
+    # threshold, so no noise lifts it) is the dark it looks like, never frozen (the review of 2026-11-08: under vision a dark
+    # band is judged on its boxes, where a frozen one waited with no bound): blocked or dark below. A still band that isn't
+    # dark stays frozen
+    if still_s >= FROZEN_S and float(np.median(vals)) >= self.dark_dn:
       return 'frozen'
     if len(hist) >= MIN_STATIC_SAMPLES:
       stack = np.stack([h[1] for h in hist])

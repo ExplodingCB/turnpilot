@@ -1423,3 +1423,52 @@ def test_route_range_refuses_no_left_and_still_says_its_reach_and_bend():
   assert rc.reach == pytest.approx(208.5, abs=0.5) and rc.bent and not rc.out_of_range
   rc = route_range(left(opposing_speed=0., opposing_lanes=0, opposing_straight_m=0.), None, 210.)
   assert rc.bent and not rc.out_of_range
+
+
+def launch_from_the_line(j, a, v_max=math.inf, boxes=lambda d: [], seconds=15.):
+  """j's go, then the car launching evenly at a m/s^2 from its line up to v_max (a coast at the lift's speed: v_max 0.78),
+  armed for its launch (turnpilotd's left_launch_armed), road runs every frame of boxes(distance): (the decisions, the left's
+  events)."""
+  go(j)
+  v, out, stopping = 0., [], False
+  for _ in range(round(seconds / DT_MDL)):
+    stopping = stopping or bool(out and out[-1].stops)  # withdrawn: the car stops where its hold asks (STOP_DECEL)
+    v = max(v - ul.STOP_DECEL * DT_MDL, 0.) if stopping else min(v + a * DT_MDL, v_max)
+    d = j.step(boxes(j.distance), v=v, distance=j.distance - v * DT_MDL, launch_armed=j.left.state == 'go')
+    out.append(d)
+    if d.state == 'committed' and j.distance < -10.:
+      break
+  return out
+
+
+@pytest.mark.parametrize('a,v_max,carried', [(0.5, 0.78, True), (0.3, math.inf, True), (0.5, math.inf, True),
+                                             (1.08, math.inf, False), (1.3, math.inf, False), (1.5, math.inf, False),
+                                             (1.9, math.inf, False)])
+def test_a_slow_launch_judged_on_is_carried_only_where_it_commits_short_of_a_launch(log_events, a, v_max, carried):
+  """Review 2026-11-08 (round 2's trade, 'G5's coast'): a slow launch judged on (L3: the band it needs clear) crossed the
+  oncoming lanes at the car's own pace, a coast on the lift's 0.78 m/s for about 15 s. Committing short of LEFT_LAUNCH_SPEED
+  after that judgement it is now carried (LeftDecision.carry: turnpilotd's left_carry, go_override's carry). This car's own
+  launches never are: 1d's gentlest (1.08 m/s^2 equivalent, 2.0 m/s in 1.85 m) is judged on from LINE_D at 1.94 m/s and
+  commits at about 2.5; the others (1.3-1.9) are never judged; the left's own A_GO never is."""
+  j = Junction()
+  ds = launch_from_the_line(j, a, v_max)
+  slow = [kw for name, kw in log_events if name == 'turnpilot.left_not_launched']
+  committed = [kw for name, kw in log_events if name == 'turnpilot.left_committed']
+  assert len(committed) == 1 and committed[0]['carry'] == carried, committed
+  assert (committed[0]['v'] < ul.LEFT_LAUNCH_SPEED) == carried
+  assert bool(slow) == (a < 1.2) and all(kw['on'] for kw in slow), slow
+  after = [d for d in ds if d.state == 'committed']
+  assert after and all(d.carry == carried for d in after) and not any(d.carry for d in ds if d.state != 'committed')
+  assert not any(d.stops for d in after) and not any(str(d.prompt) in TAKE_CONTROL_PROMPTS for d in ds)
+
+
+def test_a_slow_launch_with_a_car_seen_in_its_band_is_withdrawn_and_never_carried(log_events):
+  """L3's rail: a car seen in the band the slow launch needs (165 m up, its width's floor 137 m: outside the A_GO launch's
+  band from its first motion on, inside the coast's out to the camera's 150 m) withdraws the go to the left's own wait while
+  the car can still stop short of the oncoming lanes. Nothing is carried; it is never committed."""
+  j = Junction()
+  ds = launch_from_the_line(j, 0.5, 0.78, boxes=lambda d: [raw(165., 3.6)] if d < HOLD_D - 0.5 else [], seconds=8.)  # once moving
+  slow = [kw for name, kw in log_events if name == 'turnpilot.left_not_launched']
+  assert len(slow) == 1 and not slow[0]['on'] and slow[0]['seen'], slow
+  assert not any(d.state == 'committed' or d.carry for d in ds)
+  assert any(d.state == 'waitGap' and d.stops for d in ds) and j.left.hold_here

@@ -59,6 +59,33 @@ EDGE_EST_MAX_DEG = 60.
 EDGE_EST_V = 2.                 # m/s across our path a car must make to count for the edge estimate
 MOTOR = ('car', 'truck', 'bus', 'motorcycle')
 CLASS_NAMES = {0: 'pedestrian', 1: 'cyclist', 2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
+# Under TurnPilotStopSignGo=vision a side-view bearing counts whose sectors read ok, dark, blocked (static and dark) or
+# degraded (low contrast): each is judged by what the walk's other rules and the boxes and tracks it still yields see, never
+# zeroed for itself (lanes()). Washed (saturated: the sun or headlights in the lens) and frozen (its pixels unchanging, not
+# dark: detector/sideview reads a band clipped black as dark) are the camera seeing nothing there: zeroed, and the walk's why
+# says which (CAMERA_BLIND), so the decider never goes on one as a limited view (stop_go: it waits for the sector to read
+# again); a run whose every sector reads frozen is the feed itself stuck (stuck_run: stop_go counts it as no run, the camera
+# fault)
+VISION_ACCEPT = ('ok', 'dark', 'blocked', 'degraded')
+CAMERA_BLIND = ('washed', 'frozen')
+GLARE = ('sunAhead', 'lowSun')  # the walk's glare zeroes (the sun ahead, low sun along an approach): a prediction, not a read
+
+
+def sector_rows(sectors) -> list:
+  """A side run's sectorQuality (tuples of (inner, outer, quality) in deg left of the axis, or the capnp list) as (lo, hi,
+  quality) in unsigned deg."""
+  rows = []
+  for sec in sectors or ():
+    inner, outer, q = (sec.inner, sec.outer, str(sec.quality)) if hasattr(sec, 'inner') else sec
+    rows.append((min(abs(inner), abs(outer)), max(abs(inner), abs(outer)), str(q)))
+  return rows
+
+
+def stuck_run(sectors) -> bool:
+  """A side run whose every sector reads frozen: the feed itself stuck (detector/sideview.SectorQuality: the luma plane
+  repeated bit for bit), the run carrying no new image."""
+  rows = sector_rows(sectors)
+  return bool(rows) and all(q == 'frozen' for _, _, q in rows)
 
 
 @dataclass
@@ -137,12 +164,8 @@ class LiveVisibility:
         h.popleft()
     side = {'sideLeft': 'left', 'sideRight': 'right'}.get(key)
     if side is not None:
-      rows = []
-      for sec in sectors or ():
-        inner, outer, q = (sec.inner, sec.outer, str(sec.quality)) if hasattr(sec, 'inner') else sec
-        rows.append((min(abs(inner), abs(outer)), max(abs(inner), abs(outer)), str(q)))
       w = self.sectors[side]
-      w.append((t, rows))
+      w.append((t, sector_rows(sectors)))
       while w and w[0][0] < t - sr.CLEAR_S - 1e-9:
         w.popleft()
 
@@ -167,16 +190,24 @@ class LiveVisibility:
   def sector_ok(self, side: str, bearing: float, accept=('ok',)) -> bool:
     """Every run of side's view in the CLEAR_S window listed a sector covering bearing (deg, unsigned) of a quality in
     accept (ok, by default), and one did."""
+    return not self.sector_bad(side, bearing, accept)
+
+  def sector_bad(self, side: str, bearing: float, accept=('ok',)) -> str:
+    """'' when sector_ok; else why not: a quality outside accept that a run in the window read there ('washed' or 'frozen'
+    before any other, the camera seeing nothing there), or 'none' (no run in the window, or a run without a sector covering
+    it)."""
     if self.newest_t is None:
-      return False
+      return 'none'
     frames = [rows for t, rows in self.sectors[side] if t >= self.newest_t - sr.CLEAR_S - 1e-9]
     if not frames:
-      return False
+      return 'none'
+    bad = set()
     for rows in frames:
       cover = [q for lo, hi, q in rows if lo - 1e-9 <= bearing <= hi + 1e-9]
-      if not cover or any(q not in accept for q in cover):
-        return False
-    return True
+      if not cover:
+        bad.add('none')
+      bad.update(q for q in cover if q not in accept)
+    return next((q for q in CAMERA_BLIND if q in bad), None) or min(bad, default='')
 
   def steady(self, key: str, box) -> bool:
     """box held still in its view's runs for STEADY_S (module docstring)."""
@@ -209,18 +240,24 @@ class LiveVisibility:
     stop-sign decider's creep for a view, STOP_SIGNS.md 2.5): d_stop already the nearer point's, and every occluder with a
     ground position re-seen from there (occluders()); the views, sectors and sun as they are now. vision
     (TurnPilotStopSignGo=vision): the PV1 optimistic row, and no mask, survey, stamp or rule 5 needed: the walk runs with the
-    file's mask where it has one (none on the shipped file: the side views' sector quality is the live stand-in, a dark or
-    static bearing zeroed), its frame edge (DEFAULT_EDGE_DEG without a lens fit) and every live rule (the sun, low sun, the
-    sectors, freshness, occluders); need_m stays the two-way need, which blockers() reads. Under vision a sector that reads
-    dark or blocked (static and dark) is judged by what the walk's other rules see, never zeroed for its darkness alone, at
-    every lighting row: review 2026-11-07 (LS-3), the wide camera's own exposure median read 31-33 raw DN at night (1d, 1e:
+    file's mask where it has one (none on the shipped file: the side views' sector quality is the live stand-in), its frame
+    edge (DEFAULT_EDGE_DEG without a lens fit) and every live rule (the sun, low sun, the sectors, freshness, occluders);
+    need_m stays the two-way need, which blockers() reads. Under vision a sector that reads dark, blocked (static and dark) or
+    degraded (low contrast) is judged by what the walk's other rules see, never zeroed for itself, at every lighting row
+    (VISION_ACCEPT): review 2026-11-07 (LS-3), the wide camera's own exposure median read 31-33 raw DN at night (1d, 1e:
     17-22 full-range DN, against the 45 the sectors' dark and blocked tests read), so every side bearing was zeroed at every
     night stop and the car waited 15 s and handed back (H3), unwarned, the night gate gone from certify and the walk (Kellen,
-    2026-11-07: "why the hell do we care about dark?"); and LS-3-R1, a blocked sector still zeroed by day (the lighting row
+    2026-11-07: "why the hell do we care about dark?"); LS-3-R1, a blocked sector still zeroed by day (the lighting row
     deciding what the same camera read meant), so a dim still band at a stand (an overcast morning: the wide camera's AE
-    median on route 0f p50 38 full-range DN) waited and handed back H3 where the same read at 23:00 went. A washed, frozen or
-    degraded sector still zeroes its bearing; raw boxes, tracks and the launch's withdraw rail judge the rest. The trade: a
-    dark van beside the camera the detector never boxes no longer holds the go, as a light one reading ok never did."""
+    median on route 0f p50 38 full-range DN) waited and handed back H3 where the same read at 23:00 went; and wf7
+    verify:LS-3-R1 point 4, a degraded far sector, which is low texture, not blindness: its contrast ratio against the 10-35
+    deg band was measured on moving frames (sideview's docstring: stopped-frame ratios swung 0.04-2.9 with the scene), the
+    envelope study's same-frame ratios on ordinary sunny footage were 0.13-0.31 at 70-85 deg (an empty far road, the sky at
+    the horizon), and a lit junction at night read degraded where an unlit one read dark, so the far sectors of an ordinary
+    stop zeroed the far lane and the car handed back H3 by day and at night. A washed or frozen sector still zeroes its
+    bearing, its why saying which (CAMERA_BLIND: the camera sees nothing there); raw boxes, tracks and the launch's withdraw
+    rail judge the rest. The trade: a dark van beside the camera the detector never boxes no longer holds the go, as a light
+    one reading ok never did, and a car in fog or behind a smeared lens the detector doesn't box isn't seen either."""
     height = cam_height if cam_height is not None else (vis.height if vis.height is not None else 1.3)
     lns = [replace(ln, s_min=ln.s_min + d_stop, s_max=ln.s_max + d_stop) for ln in lanes_at_stop]
     edges_now = sr.Edges(edges.d_min + d_stop, edges.d_max + d_stop, None if edges.nominal is None else edges.nominal + d_stop)
@@ -229,25 +266,42 @@ class LiveVisibility:
     veil_ok = vis.veil in sr.VEIL_OK
     rows = vis.views(lighting, bound='optimistic' if vision else 'conservative', use='allWay') if lighting in ('day', 'sunAhead') else {}
 
-    accept = ('ok', 'dark', 'blocked') if vision else ('ok',)
+    accept = VISION_ACCEPT if vision else ('ok',)
+
+    def camera(side: str, bearing: float):
+      if bearing >= sr.INNER_BAND_LO_DEG and self.fresh('side', side):  # a stale side view covers nothing anyway (noView)
+        for b in (bearing, bearing - rot_deg):
+          bad = self.sector_bad(side, max(b, sr.INNER_BAND_HI_DEG + 0.1), accept)
+          if bad:
+            # under vision the camera seeing nothing there (washed out, frozen) says so: never gone on as a limited view
+            return bad if vision and bad in CAMERA_BLIND else 'sector'
+      return False
 
     def zero(side: str, bearing: float):
       if lighting == 'sunAhead' and not veil_ok and sr.sun_ahead_zero(side, bearing):
         return 'sunAhead'
       if side in low_sun_sides and bearing >= sr.INNER_BAND_HI_DEG:
         return 'lowSun'
-      if bearing >= sr.INNER_BAND_LO_DEG and self.fresh('side', side):  # a stale side view covers nothing anyway (noView)
-        for b in (bearing, bearing - rot_deg):
-          if not self.sector_ok(side, max(b, sr.INNER_BAND_HI_DEG + 0.1), accept):
-            return 'sector'
-      return False
+      return camera(side, bearing)
 
     sight = vis.sight(rows, zero=zero, fresh=self.fresh, occluders=occ)
+    # under vision, what the walk would see with no glare zero: the side views' own sectors (the review of 2026-11-08)
+    cam_sight = vis.sight(rows, zero=camera, fresh=self.fresh, occluders=occ) if vision else None
     out = []
     for ln in lns:
       need = lane_need(ln, edges_now, a_launch)
       if vision:
         reach, why = sr.reach_walk_why(ln, sight, rot_deg) if self.available else (0., 'noView')
+        if why in GLARE and cam_sight is not None:
+          # the glare zero ends the walk where the sun's zone starts, so a sector beyond it that reads washed or frozen (the
+          # sun in the lens) would never be read, and the lane would be gone on as a limited view (judged by its boxes alone)
+          # where on a plain day the same sectors would hold the go. Walked again on the sectors alone: where the camera goes
+          # blind short of the lane's vision floor (stop_go's R_req) the lane's why is that (CAMERA_BLIND: a wait until it
+          # reads), its reach still the glare walk's; blind only beyond the floor, or the walk ending first on range, an
+          # occluder or the frame's edge, it stays the glare's, as a plain day's walk would have gone on it
+          r_cam, why_cam = sr.reach_walk_why(ln, cam_sight, rot_deg)
+          if why_cam in CAMERA_BLIND and r_cam + 1e-9 < sr.reach_needed_vision(ln.limit, ln.approach):
+            why = why_cam
       elif not vis.mask or vis.height is None:
         reach, why = 0., 'noMask'
       elif not self.available:

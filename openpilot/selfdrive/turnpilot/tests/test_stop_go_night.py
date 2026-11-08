@@ -178,8 +178,9 @@ def test_vision_with_the_side_views_blocked_a_car_the_detector_boxes_still_holds
 def test_vision_a_washed_or_frozen_side_view_still_holds_the_go_until_it_reads_again_by_day_and_at_night(tmp_path, monkeypatch,
                                                                                                          when, quality):
   # a washed sector (the sun or headlights in the lens) or a frozen one (the view's frames not changing) is a bearing not seen,
-  # by day and at night: the lane behind it short of reach, the go waits, said in plain words; once the sectors read ok the
-  # window runs and the car goes. The sim's sectors only: no real side view has been read at night
+  # by day and at night: the lane behind it short of reach, the go waits, said in plain words (which of the two: the review of
+  # 2026-11-08, never gone on as a limited view: tests/test_stop_go_view.py); once the sectors read ok the window runs and the
+  # car goes. The sim's sectors only: no real side view has been read at night
   clear_at, world = [104.], []  # camera time (World starts at 100)
 
   def lit_or_not(view):
@@ -191,7 +192,7 @@ def test_vision_a_washed_or_frozen_side_view_still_holds_the_go_until_it_reads_a
   a, i = arrived_at(out), first_go(out)
   assert i is not None and (i + 1) * DT_MDL >= (clear_at[0] - 100.) + sr.VISION_CLEAR_S - 0.11, quality
   waits = [d for d in out[a:i] if d.holds and all(h.key.startswith('reach:') for h in d.holds)]
-  assert waits and any(sg.REACH_WORDS['sector'] in d.reason for d in waits), {d.reason for d in out[a:i]}
+  assert waits and any(sg.REACH_WORDS[quality] in d.reason for d in waits), {d.reason for d in out[a:i]}
   assert not any('(sector)' in d.reason for d in out)  # the driver's words, never the walk's
   assert not any(d.fault for d in out) and gate_fault(out) is None
 

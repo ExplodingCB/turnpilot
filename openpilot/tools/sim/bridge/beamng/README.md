@@ -400,7 +400,9 @@ dropped, for 3 s at most, under 3 m/s, and only while nothing else holds the car
 the mpc and cruise candidates not holding, no pedal). Lead, cruise and TurnPilot's caps stay in the min(). The lift ends
 once the model takes over (its shouldStop false and its planned speed 0.5 m/s or more from 1 s to 2 s ahead, held 0.3 s),
 and at once on a brake or gas press, a road user in the path within 15 m (a track or a raw box), a lead, a hold, or the
-go withdrawn. Alone it moves the car 2.25 m at most, at 1.5 m/s at most.
+go withdrawn. Alone it moves the car 2.25 m at most, at 1.5 m/s at most. The one exception is a committed unprotected
+left's carry across the oncoming lanes (`turnpilot.left_carry`, below): lifted to the left's post-go profile, 1.5 m/s^2 and
+4.3 m/s at most, its shouldStop kept, with no window.
 
 A `turnRelease` go (a turn TurnPilot's own hold let go of: its walker cleared, its red went green) certifies only that
 TurnPilot's blocker left the path, never why the model still holds the car, so it rests on its junction's own
@@ -427,7 +429,11 @@ of where its next go is judged is judged again for the launch it shows (`turnpil
 the band the camera covers out to that launch's R_req: kept driving where nothing is seen there, withdrawn to the left's own
 wait short of the lanes where a car is, its next go's gap for that launch (since 2026-11-07, L3: withdrawn and handed back
 before; 2026-11-08: an R_req past the camera's reach no longer withdraws it). A model that only keeps the speed the lift gave
-it satisfies the takeover predicate, and with nothing seen in that band it now coasts across at under 1 m/s. A car standing
+it satisfies the takeover predicate, and with nothing seen in that band it coasted across at under 1 m/s (about 15 s in the
+oncoming lanes) until 2026-11-08; now a left committed under 2.0 m/s after that judgement is carried across at the left's
+post-go profile (`turnpilot.left_carry`: the planner's lift to 1.5 m/s^2 and 4.3 m/s at most, ended for good by a pedal or
+the model slowing, braking or planning a stop; a lead the model sees, a hold or a road user in the path withdraws it until
+it clears; a carry the commit asked for that doesn't come says why, `turnpilot.left_carry_refused`). A car standing
 there yawed past the band's edge in the road camera (about 28 deg) is judged on what the camera frames and says so once
 (`turnpilot.left_yaw_view`), never the `yaw` handback.
 
@@ -436,7 +442,8 @@ there yawed past the band's edge in the road camera (about 28 deg) is judged on 
 | `TurnPilotGoOverride` | BOOL: TurnPilot's go certified for the planner's lift | `1` (on); a build that doesn't know the key is on |
 
 The planner logs `longitudinalPlan.turnpilotGoLift` (lifted this frame) and `turnpilotGoEnd` (why the last lift ended:
-`window`, `takeover`, `speed`, `driver`, `lead`, `holder`, `modelBrake`, `withdrawn`, `replaced`; it keeps the last go's
+`window`, `takeover`, `speed`, `driver`, `lead`, `holder`, `modelBrake`, `withdrawn`, `replaced`, and for the left's carry
+`modelStop`, `modelSlow` and `left`; it keeps the last go's
 reason until the next go starts), and cloudlog events
 `turnpilot.go_lift` and `turnpilot.go_lift_end`. turnpilotd logs `turnpilot.go_certified`, `turnpilot.go_not_certified`
 (with why), `turnpilot.go_end` and `turnpilot.go_not_moving`.

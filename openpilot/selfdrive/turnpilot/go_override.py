@@ -5,7 +5,8 @@ ever lower the car's accel. At a standstill the driving model holding the car (i
 under 0.1) keeps it there whatever TurnPilot lets go of: in BeamNG (G0, 2026-10-28) 14 of 24 tapless goes stood 20 s, the
 model's shouldStop true in 0.95-1.0 of their frames. Owner (2026-10-28): no gas taps anywhere, and the autonomous left and the
 stop sign's go go by themselves; "we don't want to kill Chase but we do want a good demo". This is the one upward path, and
-it is bounded:
+it is bounded as below. The left's carry (its own paragraph further down) is the one exception to the speed, accel and
+window bounds:
 
 - Only for a go turnpilotd certifies (turnpilotPlan.goCertified: its cause and id, asserted on every frame of the go; GoCertifier
   below), read from an active plan (hooks.active_plan: fresh, valid, not shadow, not disabled), so a faulted plan, which
@@ -30,6 +31,26 @@ car where a hard brake is needed, and the left can withdraw its go throughout it
 model drives, not the lift. A stop sign's go (STOP_SIGNS.md v3 section 2.5) stands 3.3 m or more from the closest plausible
 edge, which the 2.25 m nudge doesn't reach.
 
+The left's carry (review 2026-11-08, the round 2 trade 'G5's coast'): the unprotected left's gap is certified for its own
+launch (unprotected_left.A_GO to V_GO, the 'left' post-go profile), but a model that only keeps the speed the lift gave it
+(0.78 m/s: its takeover predicate holds, so the lift ends) crossed the oncoming lanes in about 15 s, where R_req assumed
+under 3. So a left that is committed (it can no longer stop short of the oncoming lanes) after a slow launch the left judged
+on, entering them short of a launch (unprotected_left: LeftDecision.carry), gets a second go of its own: cause
+unprotectedLeft, certified with the plan's unprotectedLeft.state committed (so never the go from the line, which the lift's
+nudge alone never commits: LEFT_LIFT_ROOM_M), carry=True in GoCertifier. plannerd lifts the e2e candidate to carry_accel at
+most: the TurnPilot candidate's own accel (the post-go profile's caps, in the min() anyway) and never past the 'left'
+profile's accel cap (CARRY_ACCEL, 1.5 m/s^2) or toward more than its speed (CARRY_SPEED, 4.3 m/s), its shouldStop never
+dropped. It has no window, speed end or takeover end (a coasting model's plan is the takeover); turnpilotd ends it across
+the lanes (turnpilotd.left_carry: R_req's path, or the turn turned or missed). Every other end stays and is for good: a
+pedal, a disengage, a lead within GO_CLEAR_M, a holder (TurnPilot's shouldStop: a person in the path), the model braking
+harder than GO_MODEL_BRAKE or planning a stop, the model slowing at all (its accel under CARRY_MODEL_SLOW: in motion its
+shouldStop comes only near a standstill, so a gentle stop for something the detector doesn't score was lifted over at +1.5
+m/s^2; review 2026-11-08), the left no longer committed, the go withdrawn (for that go: turnpilotd certifies a new carry
+once a rail of its own that withdrew one clears; an end only plannerd sees, the model slowing, braking or planning a stop or
+a lead only the radar has, stays for good, the same go out). It only ever raises a model that is
+coasting or speeding up, to the profile's accel and never more, and ending it brakes nothing: the model's own plan is back
+that frame.
+
 The takeover predicate (model_takes_over) is the one function the stop-sign decider imports for its gate (section 2.6).
 Every lift is logged at its start and its end with the reason (turnpilot.go_lift, turnpilot.go_lift_end), and every go
 turnpilotd certifies or ends (turnpilot.go_certified, turnpilot.go_end), as every hard brake is.
@@ -40,7 +61,8 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.drive_helpers import should_stop
 from openpilot.selfdrive.modeld.constants import ModelConstants
-from openpilot.selfdrive.turnpilot.hooks import active_plan
+from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_TAU, active_plan
+from openpilot.selfdrive.turnpilot.turn_speed import LEFT_GO_PROFILE, POST_GO_PROFILES
 
 GO_ACCEL = 0.5          # m/s^2: the e2e candidate is lifted to this at most
 GO_WINDOW_S = 3.        # s from the go
@@ -59,6 +81,14 @@ TAKEOVER_T_S = 2.
 TAKEOVER_S = 0.3
 TAKEOVER_SAMPLES = np.linspace(TAKEOVER_FROM_S, TAKEOVER_T_S, 5)
 CAUSES = ('turnRelease', 'unprotectedLeft', 'stopSign', 'rollUp', 'creep', 'clearBox', 'unstick')  # TurnpilotPlan.GoCertified.Cause
+# the left's carry (module docstring): never past the 'left' post-go profile's accel cap, never toward more than its speed
+CARRY_ACCEL = POST_GO_PROFILES[LEFT_GO_PROFILE].accel_cap  # m/s^2 (unprotected_left.A_GO)
+CARRY_SPEED = POST_GO_PROFILES[LEFT_GO_PROFILE].v_end      # m/s (unprotected_left.V_GO)
+# m/s^2: the model's own accel under this in the carry is the model slowing, which ends the carry for good (GO_MODEL_BRAKE is
+# the bounded nudge's, from a stand). On the 11-06 drives (1d, 1e: engaged, no pedal, 0.5-4.3 m/s) the model's
+# desiredAcceleration was never under +0.28 while the car sped up (aEgo over 0.3) on a moving plan, nor ever under -0.3 with
+# the car speeding up
+CARRY_MODEL_SLOW = -0.3
 
 
 def model_takes_over(model) -> bool:
@@ -101,6 +131,15 @@ def holds(v_ego: float, candidate) -> bool:
   return bool(stop) or should_stop(v_ego, accel)
 
 
+def carry_accel(v_ego: float, tp) -> float:
+  """The most the left's carry lifts the e2e candidate to at v_ego (module docstring): the TurnPilot candidate's accel (tp:
+  its post-go profile's caps, which stay in the min() anyway), never past CARRY_ACCEL nor toward more than CARRY_SPEED (at
+  SPEED_CAP_TAU, as a speed cap is), whatever the plan's caps; no TurnPilot candidate, no carry."""
+  if tp is None:
+    return -np.inf
+  return min(float(tp[0]), CARRY_ACCEL, (CARRY_SPEED - v_ego) / SPEED_CAP_TAU)
+
+
 class GoLift:
   """plannerd's side (longitudinal_planner.py): the e2e candidate for this frame, lifted or not (module docstring)."""
   def __init__(self):
@@ -112,12 +151,39 @@ class GoLift:
     self.elapsed = 0.
     self.end = ''                  # why the last go's lift ended
     self.takeover = Takeover()
+    self.carry = False             # the go last seen is the left's carry (module docstring), read at its first frame
 
   def _end(self, reason: str, v_ego: float) -> None:
     if self.active:
       cloudlog.event("turnpilot.go_lift_end", cause=self.key[0], go_id=self.key[1], reason=reason, t=round(self.elapsed, 2),
-                     v=round(v_ego, 2))
+                     v=round(v_ego, 2), carry=self.carry)
       self.active, self.end = False, reason
+
+  def _carry(self, sm, plan, v_ego: float, mpc, cruise, tp, e2e):
+    """The left's carry this frame (module docstring): no window, speed or takeover end; every other end for good."""
+    cs = sm['carState']
+    if str(plan.unprotectedLeft.state) != 'committed':
+      reason = 'left'
+    elif cs.brakePressed or cs.gasPressed or not sm['selfdriveState'].enabled:
+      reason = 'driver'
+    elif lead_within(sm):
+      reason = 'lead'
+    elif holds(v_ego, mpc) or holds(v_ego, cruise) or (tp is not None and holds(v_ego, tp)):
+      reason = 'holder'
+    elif e2e[0] < GO_MODEL_BRAKE:
+      reason = 'modelBrake'
+    elif holds(v_ego, e2e):
+      reason = 'modelStop'  # the model means to stop: never lifted over it in motion
+    elif e2e[0] < CARRY_MODEL_SLOW:
+      reason = 'modelSlow'  # the model slowing, its shouldStop not out yet in motion: never lifted over it, for good
+    else:
+      target = carry_accel(v_ego, tp)
+      if target <= float(e2e[0]):
+        return e2e  # the model at the profile's pace or faster, or the car at its speed: untouched
+      self.lifting = True
+      return target, False
+    self._end(reason, v_ego)
+    return e2e
 
   def update(self, sm, v_ego: float, mpc, cruise, tp, e2e, dt: float = DT_MDL, now: float | None = None):
     """The e2e candidate (accel, shouldStop) for this frame. mpc, cruise, e2e: the planner's (accel, shouldStop) candidates,
@@ -133,12 +199,17 @@ class GoLift:
       self._end('replaced', v_ego)
       self.key, self.active, self.frames, self.t0, self.end = key, True, 0, now, ''
       self.takeover.reset()
-      cloudlog.event("turnpilot.go_lift", cause=key[0], go_id=key[1], v=round(v_ego, 2), plan_t=round(float(go.t), 2))
+      # the left's carry: its go certified with the left committed, which the go from its line never is (module docstring)
+      self.carry = key[0] == 'unprotectedLeft' and str(plan.unprotectedLeft.state) == 'committed'
+      cloudlog.event("turnpilot.go_lift", cause=key[0], go_id=key[1], v=round(v_ego, 2), plan_t=round(float(go.t), 2),
+                     carry=self.carry)
     if not self.active:
       return e2e
     self.frames += 1
     clock = now - self.t0 if now is not None and self.t0 is not None else 0.
     self.elapsed = max((self.frames - 1) * dt, float(go.t), clock)
+    if self.carry:
+      return self._carry(sm, plan, v_ego, mpc, cruise, tp, e2e)
     cs = sm['carState']
     taken_over = self.takeover.update(sm['modelV2'], dt)
     if self.elapsed >= GO_WINDOW_S - 1e-6:
@@ -168,7 +239,8 @@ class GoCertifier:
   predicate, which is the go followed: taken_over), or when turnpilotd withdraws it (withdraw: its reason). A go asked for
   while another is out is refused: the next starts only after the previous one ended. A release's later go (relift,
   ALWAYS_DRIVE.md ST-13: certified from a standstill after its first) is followed only on the takeover predicate: its speed
-  end isn't the model following it."""
+  end isn't the model following it. The left's carry (carry, module docstring) has no end of its own: turnpilotd withdraws
+  it."""
   def __init__(self):
     self.id = 0                # the last go's id; never repeated while turnpilotd runs
     self.cause = 'none'        # the go out, 'none' with none
@@ -176,24 +248,26 @@ class GoCertifier:
     self.taken_over = False    # the last go ended on the model taking over (or GO_END_SPEED, but for a relift): followed
     self.end = ''              # why the last go ended
     self.relift = False        # the go in hand (or the last) is a release's later go (start's relift)
+    self.carry = False         # ...or the left's carry (start's carry)
     self.takeover = Takeover()
 
   @property
   def active(self) -> bool:
     return self.cause != 'none'
 
-  def start(self, cause: str, relift: bool = False, **evidence) -> bool:
+  def start(self, cause: str, relift: bool = False, carry: bool = False, **evidence) -> bool:
     """A certified go (cause: CAUSES) from now, or False while one is out. A cause the schema hasn't: ValueError (turnpilotd's
-    fault path, out loud), never a go. relift: a release's later go, whose GO_END_SPEED end isn't followed."""
+    fault path, out loud), never a go. relift: a release's later go, whose GO_END_SPEED end isn't followed. carry: the left's
+    carry across the oncoming lanes (module docstring), out until withdrawn."""
     if cause not in CAUSES:
       raise ValueError(f"no such go cause: {cause!r}")
     if self.active:
       cloudlog.event("turnpilot.go_refused", cause=cause, out=self.cause, go_id=self.id, t=round(self.t, 2))
       return False
     self.id += 1
-    self.cause, self.t, self.taken_over, self.end, self.relift = cause, 0., False, '', relift
+    self.cause, self.t, self.taken_over, self.end, self.relift, self.carry = cause, 0., False, '', relift, carry
     self.takeover.reset()
-    cloudlog.event("turnpilot.go_certified", cause=cause, go_id=self.id, relift=relift, **evidence)
+    cloudlog.event("turnpilot.go_certified", cause=cause, go_id=self.id, relift=relift, carry=carry, **evidence)
     return True
 
   def _end(self, reason: str, followed: bool = False) -> None:
@@ -205,6 +279,8 @@ class GoCertifier:
     if not self.active:
       return
     self.t += dt
+    if self.carry:
+      return  # the left's carry: no window, speed or takeover end (a coasting model's plan is the takeover), withdrawn only
     if self.takeover.update(model, dt):
       self._end('takeover', followed=True)
     elif v_ego >= GO_END_SPEED:

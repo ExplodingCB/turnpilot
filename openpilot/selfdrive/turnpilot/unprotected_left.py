@@ -147,7 +147,9 @@ while it can (withdrawable: a frame on, VETO_MARGIN_M to spare), and hands back 
 where the comfortable curve stops it, short of the oncoming lanes. It is committed only by its own go and motion (or the
 driver's release of the junction, driving it), never by a reading: a scene commit before its go, the car rolling up to its
 line or standing held, is a 'position' fault.
-Committed, nothing here ever stops the car (a pedestrian in the path still does: scene_policy). A lifted go the car hasn't
+Committed, nothing here ever stops the car (a pedestrian in the path still does: scene_policy); committed short of a launch
+after a slow one judged on (LEFT_LAUNCH_SPEED), it is carried across the oncoming lanes at its post-go profile (carry,
+go_override's: plannerd's lift, never steering, never more than the profile). A lifted go the car hasn't
 moved on within turnpilotd's LEFT_NO_MOVE_S is withdrawn and handed back there (the model holding the car under G5's bounded
 go). An unlifted one with the model planning no motion that long goes back to a wait at its line (go_unfollowed: its own hold,
 a fresh window, never a handback, LS-2); with the model planning motion, the go still out and nothing holding the car,
@@ -196,7 +198,12 @@ V_GO = 4.3                 # m/s
 # handed back there until then, a give-up handback; round 2, 2026-11-08: kept on only where that R_req was within the camera's
 # reach, stricter than the go, so on the car's 98 m full pass every judged launch at 25 mph or faster was withdrawn). From
 # LINE_D an even launch reaches that point short of LEFT_LAUNCH_SPEED below 1.2 m/s^2 (one at 0.8 m/s^2 at 1.8 m/s); the
-# left's own A_GO at 2.1 m/s, never judged
+# left's own A_GO at 2.1 m/s, never judged. Kept on, it still crossed at the car's own pace: a coast on the lift's speed spent
+# about 15 s in the oncoming lanes where R_req assumed under 3, so a car outside the camera's band at the go could arrive while
+# it was still in them (review 2026-11-08, round 2's trade 'G5's coast'). So such a launch committing short of
+# LEFT_LAUNCH_SPEED (it can no longer stop short of the lanes) is carried across (LeftDecision.carry: go_override's carry,
+# plannerd's lift to the 'left' post-go profile, A_GO to V_GO, never more); this car's own launches (11-06, four engaged from
+# a stand: committing at 2.6-3.0 m/s from LINE_D) never are
 LEFT_LAUNCH_SPEED = 2.
 LEFT_LAUNCH_ROOM_M = 1.5
 LAUNCH_A_MIN = 0.1
@@ -470,6 +477,7 @@ class LeftDecision:
   withdrawable: bool = False      # go: a veto read next frame still withdraws it short of the oncoming lanes (VETO_MARGIN_M)
   chime: bool = False             # a long wait's chime is due (WAIT_CHIME_S from its _said; SF-4)
   crossed: str = ''               # the frame the driver took the car past its own hold: the cause (map_controls.Driven's)
+  carry: bool = False             # committed: carried across the oncoming lanes at the left's post-go profile (CARRY_SPEED)
 
 
 def hold_caps(v: float) -> tuple[float, float]:
@@ -794,6 +802,7 @@ class UnprotectedLeft:
     self.launch_a = A_GO          # the launch its clear time is for: A_GO, or the slower one the car showed (L3)
     self.go_d = 0.                # m to the maneuver point at its go
     self.launch_on = False        # ...a slow launch judged on for this go: the band it covers clear for it (L3)
+    self.carry = False            # ...and committed short of a launch after it: carried across (LeftDecision.carry)
     self.road_boxes: list = []    # the last road run's boxes, its occluders' own out
     self.range_eff = 0.           # the band's reach this frame: the full pass's, or the far slot's past it
 
@@ -933,9 +942,13 @@ class UnprotectedLeft:
     past = inp.committed or inp.released or committed_past_line(inp.distance, inp.v_ego, True)
     if self.state == 'committed' or (self.went and self.moved and past) or (inp.released and not self.went and not standing):
       if self.state != 'committed':
-        cloudlog.event("turnpilot.left_committed", distance=round(inp.distance, 1), v=round(inp.v_ego, 2))
+        # a slow launch judged on (launch_on: the band it needs clear on every road run while the car could stop) committing
+        # short of a launch: carried across at the left's post-go profile (CARRY_SPEED), not left to cross at its crawl
+        self.carry = self.went and self.moved and self.launch_on and inp.v_ego < LEFT_LAUNCH_SPEED and not inp.released
+        cloudlog.event("turnpilot.left_committed", distance=round(inp.distance, 1), v=round(inp.v_ego, 2), carry=self.carry,
+                       band=self.blocked)
       self.state, self.hold_here = 'committed', False
-      out.state, out.alert = 'committed', 'none'
+      out.state, out.alert, out.carry = 'committed', 'none', self.carry
       return out
     if self.state == 'undecided':
       return self._undecided(out, self.why, inp.v_ego)

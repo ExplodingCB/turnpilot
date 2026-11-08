@@ -153,11 +153,13 @@ def test_a_right_whose_far_lane_the_line_walks_as_its_cross_movement_certifies_a
 
 
 @pytest.mark.parametrize('when', ['day', 'night'])
-def test_a_stop_on_a_cross_road_of_two_lanes_each_way_is_short_at_the_line_too_so_navd_still_routes_round_it(tmp_path, when):
+def test_a_stop_on_a_cross_road_of_two_lanes_each_way_is_short_at_the_line_and_goes_on_what_it_sees_never_handed_back(tmp_path, when):
   # review of the 11-06 repairs: navd's route-time 'reach' here (the near lane 17.2 of 37.6 m on the lines the line walks) is
-  # the line's own: it waits on reach, creeps for a view and hands back 15 s after the full stop, day or night. This is what
-  # navd routes round, and says "Stop sign ahead needs you" for when it can't (routing/tests/test_avoid_night.py); a rule that
-  # kept every vision 'reach' stop on the route left the driver this handback unwarned
+  # the line's own, so navd still routes round it, and says "Stop sign ahead needs you" where it can't. Until the review of
+  # 2026-11-08 the line waited on reach and handed back 15 s after the full stop, day or night ("can't see far enough from the
+  # left"). Now (no handbacks: the go on what the cameras see) the stop point already stands inside the room a go needs from
+  # the closest plausible edge of so wide a cross road, so the creep for a view is at its limit where it stands: the long
+  # look's window, "Look both ways", and the go committed from there, across, never a handback
   j = vision_junction(25)
   for a in j.approaches:
     if a.role in ('left', 'right'):
@@ -170,9 +172,15 @@ def test_a_stop_on_a_cross_road_of_two_lanes_each_way_is_short_at_the_line_too_s
       leg['lanesIn'] = leg['lanesOut'] = 2
   at(sim, WHEN[when])
   run_to_line(sim)
-  sim.run(20.)
+  held_s = sim.s
+  sim.run(24.)
   plans = sim.plans()
-  a, back = arrived(plans), handed_back(plans)
-  assert go_frame(sim) is None and back, [(str(p.stopGo.state), p.reason) for p in plans[-400::40]]
-  k = plans.index(back[0])
-  assert (k - a) * DT_MDL == pytest.approx(15., abs=0.6) and "can't see far enough from the left" in plans[k].reason, plans[k].reason
+  a = arrived(plans)
+  k = next((i for i, p in enumerate(plans) if str(p.goCertified.cause) in ('stopSign', 'clearBox')), None)
+  assert k is not None, [(str(p.stopGo.state), p.reason) for p in plans[-400::40]]
+  assert any("can't see far enough from the left" in plans[i].reason for i in range(a, k))
+  said = [i for i in range(a, k) if plans[i].controlPrompt == 'stopGo']
+  assert said and all(plans[i].reason == sg.LOOK_REASON for i in said)
+  assert (k - a) * DT_MDL <= sr.VISION_CREEP_AFTER_S + sr.VISION_LONG_CLEAR_S + 1.
+  assert not handed_back(plans) and not any(p.stopGo.fault for p in plans) and caps_ok(plans)
+  assert sim.s > held_s + 15. and any(str(p.stopGo.state) in ('inLane', 'done') for p in plans)

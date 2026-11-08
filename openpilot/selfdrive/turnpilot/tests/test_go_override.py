@@ -1,6 +1,7 @@
 """TurnPilot's bounded go (go_override.py; DESIGN phase 4 decision 1 and its stop-sign amendment, G5): plannerd lifts the
 e2e model's hold on a standing car only for a go turnpilotd certifies, at most +0.5 m/s^2, for at most 3 s, under 3 m/s,
-and only while nothing else holds the car."""
+and only while nothing else holds the car. The committed unprotected left's carry, the one exception (the left's post-go
+profile, no window), is tested in test_go_override_carry.py."""
 import random
 from collections import deque
 import time

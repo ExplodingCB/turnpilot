@@ -351,8 +351,10 @@ struct TurnpilotPlan @0x81c2f05a394cf4af {
   unprotectedLeft @31 :UnprotectedLeftStatus;
   # TurnPilot's certified go (selfdrive/turnpilot/go_override.py; DESIGN phase 4 decision 1, G5): asserted on every frame of
   # the go, from the go until it ends (GO_WINDOW_S at most) or is withdrawn. plannerd lifts the e2e model's hold on the car
-  # for it, bounded: +0.5 m/s^2 at most, 3 s at most, under 3 m/s, only while nothing else holds the car. One go at a time,
-  # each a new id; clearing it (cause none) ends the lift that frame
+  # for it, bounded: +0.5 m/s^2 at most, 3 s at most, under 3 m/s, only while nothing else holds the car. The one exception is
+  # a committed unprotected left's carry (cause unprotectedLeft with unprotectedLeft.state committed): lifted to the left's
+  # post-go profile (1.5 m/s^2 at most, toward 4.3 m/s at most), its stop kept, with no window, until turnpilotd ends it
+  # across the oncoming lanes. One go at a time, each a new id; clearing it (cause none) ends the lift that frame
   struct GoCertified {
     enum Cause {
       none @0;
