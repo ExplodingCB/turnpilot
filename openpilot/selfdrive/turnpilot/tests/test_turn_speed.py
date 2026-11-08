@@ -4,9 +4,10 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.route_follower import NOMINAL_ANGLE_DEG, Maneuver, classify
 from openpilot.selfdrive.turnpilot.hooks import plan_accel
 from openpilot.selfdrive.turnpilot.scene_policy import NO_ACCEL_CAP
+from openpilot.selfdrive.turnpilot.desire_timing import CURB_TURN_PULSE_M
 from openpilot.selfdrive.turnpilot.turn_speed import (CORNER_CURB_M, CORNER_M, LEFT_GO_PROFILE, NO_SPEED_CAP, POST_GO_DEFAULT,
                                                       POST_GO_MAX_M, POST_GO_PROFILES, TURN_CAP_LEAD_M, V_CORNER, V_CORNER_CURB, V_TURN_MAX,
-                                                      V_TURN_MIN, PostGo, post_go_caps, turn_speed_cap, turn_target_speed)
+                                                      V_TURN_MIN, PostGo, corner_speed, post_go_caps, turn_speed_cap, turn_target_speed)
 
 
 def maneuver(mtype, modifier):
@@ -88,13 +89,16 @@ def test_car_reaches_turn_speed_by_the_desire():
 
 
 def test_corner_curve_at_real_angles():
-  # a right whose bearings turn 70 degrees still slows to its corner speed by its corner distance, as the nominal 90 did, a
-  # left to its own; a slight keep doesn't
+  # a right whose bearings turn 70 degrees slows to its own corner speed by CORNER_CURB_M (2026-11-07: the corner's, over the
+  # right angle's V_CORNER_CURB; before, 3.0 m/s by 20 m at every angle), one of 90 or sharper to V_CORNER_CURB, a left to its
+  # own by CORNER_M; a slight keep doesn't
   for angle in (70., 85., 90., 120.):
     real = Maneuver(*classify("turn", "right"), "turn", "right", angle, geometry=True)
-    assert turn_speed_cap(real, CORNER_CURB_M, 3.) == V_CORNER_CURB, angle
+    assert math.isclose(turn_speed_cap(real, CORNER_CURB_M, 3.), corner_speed(angle, True)), angle
     left = Maneuver(*classify("turn", "left"), "turn", "left", angle, geometry=True)
-    assert turn_speed_cap(left, CORNER_M, 4.) == V_CORNER, angle
+    assert math.isclose(turn_speed_cap(left, CORNER_M, 4.), corner_speed(angle, False)), angle
+    assert (corner_speed(angle, True) > V_CORNER_CURB + 0.1) == (angle < 85.) and (corner_speed(angle, False) > V_CORNER) == (angle < 90.)
+  assert corner_speed(120., True) == V_CORNER_CURB and corner_speed(120., False) == V_CORNER
   keep = Maneuver(*classify("turn", "slight right"), "turn", "slight right", 30., geometry=True)
   assert turn_speed_cap(keep, CORNER_M, 4.) > V_CORNER
 
@@ -114,15 +118,18 @@ def approach(modifier, until_m, v=15., d=300., right_hand_traffic=True):
 def test_a_curb_side_turn_comes_to_its_corner_at_the_speed_the_model_takes_it_from():
   """BeamNG right_green and red_right's junction (DR435_1), 2026-10-30 to 11-01: every right taken came to it at 3.5 m/s or
   less from 15 m out and started round 12 m out; every right lost (S3, C5, F3) came at 4.6-4.7 m/s, the 4.3 cap binding,
-  started round 4-6 m out and was given up (F3 abandoned at 14 deg), stood in the corner or driven straight. A curb-side
-  turn comes to 15 m out at no more than 3.5 m/s on the same gentle braking, and through its corner at V_CORNER_CURB; a
-  far-side one keeps V_CORNER (its wider arc); traffic keeping left mirrors it."""
+  started round 4-6 m out and was given up (F3 abandoned at 14 deg), stood in the corner or driven straight. A right-angle
+  curb-side turn comes to its one pulse (desire_timing.CURB_TURN_PULSE_M) at its corner speed, V_CORNER_CURB (one_pulse_speed:
+  the 3.0 those rights were taken at, which its sum lands on), on the same gentle braking, and is at 3.5 m/s or less from 15 m out
+  (2026-11-07: by CORNER_M, no longer 3.0 by 20 m, module docstring); a far-side one comes to CORNER_M at V_CORNER (its wider
+  arc); traffic keeping left mirrors it."""
   v, min_a = approach("right", 15.)
   assert v <= 3.5 and min_a > -1.6, (v, min_a)
-  assert approach("right", 0.)[0] <= V_CORNER_CURB + 0.1
+  assert approach("right", CURB_TURN_PULSE_M)[0] <= V_CORNER_CURB + 0.1
+  assert approach("right", 0.)[0] <= V_CORNER_CURB + 0.05
   v, _ = approach("left", 15.)
   assert V_CORNER - 0.3 < v < V_CORNER + 0.6, v
-  assert approach("left", 15., right_hand_traffic=False)[0] <= 3.5
+  assert approach("left", CURB_TURN_PULSE_M, right_hand_traffic=False)[0] <= V_CORNER_CURB + 0.1
 
 
 def test_post_go_cap_shape_by_angle():
@@ -210,8 +217,9 @@ def test_post_go_ends_where_a_shallow_turn_is_done():
 
 def test_the_caps_braking_curve_is_its_own_not_the_desires_lead(monkeypatch):
   """2026-11-06: a curb-side turn's one pulse goes 8 m out and a far-side one's lead comes in with speed (desire_timing.turn_lead),
-  so the cap's braking curve has its own anchor, TURN_CAP_LEAD_M, and the caps are what they were: 6.9 m/s by 40 m for any
-  junction turn, the curb side's 3 m/s by 20 m, the far side's 4.3 by 15 m; the car under them reaches those speeds there."""
+  so the cap's braking curve has its own anchor, TURN_CAP_LEAD_M, and the caps don't move with the far side's lead: 6.9 m/s by
+  40 m for any junction turn, the far side's V_CORNER by 15 m, and the curb side's V_CORNER_CURB by 15 m too (CORNER_CURB_M,
+  2026-11-07: 3 m/s by 20 m before), so by its one pulse; the car under them reaches those speeds there."""
   import openpilot.selfdrive.turnpilot.desire_timing as dt
   assert TURN_CAP_LEAD_M == 40.
   right, left = maneuver("turn", "right"), maneuver("turn", "left")
@@ -219,10 +227,11 @@ def test_the_caps_braking_curve_is_its_own_not_the_desires_lead(monkeypatch):
   monkeypatch.setattr(dt, 'TURN_DESIRE_LEAD_M', 25.)  # nothing in the cap reads the desire's lead
   assert before == [turn_speed_cap(m, d, v) for m in (right, left) for d in (300., 100., 60., 40., 30., 20., 15., 8., 0.) for v in (0., 3., 6.9, 12.)]
   assert math.isclose(turn_speed_cap(left, 40., 6.9), V_TURN_MIN) and math.isclose(turn_speed_cap(right, 40., 6.9), V_TURN_MIN)
-  assert math.isclose(turn_speed_cap(right, CORNER_CURB_M, 3.), V_CORNER_CURB) and CORNER_CURB_M == 20.
+  assert math.isclose(turn_speed_cap(right, CORNER_CURB_M, 3.), V_CORNER_CURB)
+  assert CORNER_CURB_M == CORNER_M == 15.
   assert math.isclose(turn_speed_cap(left, CORNER_M, 4.), V_CORNER)
   for modifier in ("right", "left"):
     v40, _ = approach(modifier, 40.)
     assert V_TURN_MIN - 0.5 < v40 < V_TURN_MIN + 0.25, (modifier, v40)
-  v20, _ = approach("right", 20.)
-  assert v20 < V_CORNER_CURB + 0.6, v20
+  v_pulse, _ = approach("right", CURB_TURN_PULSE_M)
+  assert v_pulse < V_CORNER_CURB + 0.1, v_pulse
