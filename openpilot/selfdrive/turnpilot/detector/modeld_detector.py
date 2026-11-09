@@ -217,8 +217,8 @@ from openpilot.cereal import custom, log, messaging
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.common.params import UnknownKeyName
-from openpilot.selfdrive.turnpilot.detector.decoder import (decode, decode_far, decode_far_lights, decode_lights, decode_side,
-                                                           decode_signs, fill_detections, fill_far, fill_signs)
+from openpilot.selfdrive.turnpilot.detector.decoder import (LIGHT_READ_CONF, decode, decode_far, decode_far_lights, decode_lights,
+                                                           decode_side, decode_signs, fill_detections, fill_far, fill_signs)
 from openpilot.selfdrive.turnpilot.detector.graph import (FAR_CROP_SIZE, NATIVE_MODES, NATIVE_SIZES, SIDE_INPUT_SIZE, Crop, crop_at,
                                                          crop_views, detector_pkl_path, far_detector_pkl_path, letterbox,
                                                          native_detector_pkl_path, side_detector_pkl_path, side_input_specs)
@@ -1734,7 +1734,7 @@ class ModeldDetector:
     t0 = time.perf_counter()
     try:
       i = self.cameras['road']
-      heads, status = self.lights.read(model_state.frames[i], metas[i], decode_lights(raw, self.lb))
+      heads, status = self.lights.read(model_state.frames[i], metas[i], decode_lights(raw, self.lb, LIGHT_READ_CONF))
     except Exception:
       td.lightStatus = light_failed(self, "lights")
       return

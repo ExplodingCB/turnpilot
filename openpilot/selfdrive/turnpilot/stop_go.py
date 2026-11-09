@@ -153,6 +153,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.turnpilot import stop_rules as sr
 from openpilot.selfdrive.turnpilot.go_override import GO_WINDOW_S, Takeover
+from openpilot.selfdrive.turnpilot.detector.light_state import ASSUMED_HEAD_M
 from openpilot.selfdrive.turnpilot.map_controls import CREEP_AT_M, CREEP_SPEED, CROSSED_CAUSES, YIELD_STOP_REASON, is_stop
 from openpilot.selfdrive.turnpilot.maps import surveys as survey_file
 from openpilot.selfdrive.turnpilot.routing import certify as ce
@@ -221,6 +222,15 @@ ALERT_S = 2.0                   # s an alert of the decider's is held (hooks.ABO
 STOP_SWEEP_M = 30.
 SIGNAL_HEAD_RUNS, SIGNAL_HEAD_OF = 3, 5
 SIGNAL_SPAN_M = 8.              # m either side of our path the junction's region reaches, for a class-9 head
+# ...and along it (the review of 2026-11-08: a head anywhere up the road ahead within the span's cone made the junction a
+# signal, the next junction's heads 25-40 m past this one's line on 3 of 5 runs): a head is this junction's only from
+# SIGNAL_BEFORE_M short of its stop point (a near-side head on a post at the line) to SIGNAL_PAST_M past the far side of its
+# farthest cross lane (_far_edge: a far-side head over the far lanes or on the far corner's post, a sidewalk beyond). Ranged
+# from its elevation as the light reader ranges it (light_state.read_head: ASSUMED_HEAD_M over the road, the camera's height
+# under it), whose error the margins carry: a head 1 m off the assumed height reads about 20% off its range
+SIGNAL_BEFORE_M = 5.
+SIGNAL_PAST_M = 8.
+RED_HOLD_REASON = "red light read at the junction"
 YAW_GO_DEG = 3.                 # deg the car may be yawed off its approach at a go (2.4 item 3)
 STEER_GO_DEG = 10.              # deg of steering wheel angle still straight
 H2_SPREAD_M = 2. * sr.POS_ERR_M
@@ -282,7 +292,7 @@ LIMITED_WAIT_REASON = "Waiting: view limited, looking for cross traffic"
 STALLED_REASON = "Stalled in junction"
 ALT_REASON = {'right': "Turning right instead", 'left': "Turning left instead", 'straight': "Going straight instead"}
 # go conditions the same for every maneuver at the junction (the other-turn rung reads them from this frame's own evaluation)
-SHARED_HOLDS = ('signal', 'yaw', 'camera', 'stale', 'calibration', 'box', 'near', 'nearRaw', 'hide', 'lead', 'front', 'turn',
+SHARED_HOLDS = ('signal', 'light', 'yaw', 'camera', 'stale', 'calibration', 'box', 'near', 'nearRaw', 'hide', 'lead', 'front', 'turn',
                 'deadlockCreep')
 REASONS = {
   'H1': "Cross-traffic camera unavailable: take control",
@@ -318,6 +328,11 @@ VISION_GATE_TEXT = {'table': "no visibility file", 'sideViews': "side cameras of
 # certify's vision checks that are the live view's to judge at the line, never the gate's: the route-time reach (the live walk
 # replaces it) and the light (glare: the walk's sun zeroes and the sectors' washed test)
 VISION_VIEW_REASONS = ('reach', 'light')
+# certify's checks that are a stop sign's rules of who goes when, no gate at a junction a signal head was seen at (C20,
+# _vision_gate): the skew (an all-way's order), an override (the signalSeen override written for it is one), and an unknownLeg
+# that is an approach's control unknown (a signal's legs often are). Never the geometry, nor an unknownLeg of a junction that
+# failed or has no conflicting approach known: there the cross traffic has nothing to be judged by
+SIGNAL_DROPS = ('skew', 'override')
 # SAT-11 (SAT_VALIDATION row 11, BeamNG at 263065a, stop_allway_out_of_turn under vision): a car standing 4.4 m back of its
 # assumed line read U2 'far' at the go, which _known_moved judged only by its go-time distance less its go-time speed (0.08
 # m/s) carried on: its start 0.5 s after our go withdrew nothing, the band skipped it as still, and the cars touched. Under
@@ -422,7 +437,63 @@ class Frame:
   # the scene's person-may-be-in-front latch (scene_policy.person_front, WARGAME_FIXES WF-13): a person TurnPilot saw lost in
   # front of the car, read as the front zone occupied (P6: no go, H7 at FRONT_ZONE_MAX_S)
   person_front: bool = False
+  # the junction is one the camera has seen a signal head at this drive (turnpilotd's signal_junctions): its encounter starts
+  # with the head seen (signal_seen, C20), as if seen on this approach, so under vision its gate is no handback from the start
+  signal_junction: bool = False
+  # the camera's governing heads acting (turnpilotd's camera_read, never its shadow): (state, m ahead of the camera, ranged as
+  # the reader ranges them). At a junction a signal head is seen at (signal_seen), a red or yellow on one of this junction's
+  # (_head_here) holds the go: the full stop is kept there whatever is read (the review of 2026-11-08), the light too
+  heads: tuple = ()
   dt: float = DT_MDL
+
+
+# m between two junction nodes (MapJunction.lat/lon) that are one junction to SignalJunctions: navd's node is Valhalla's end of
+# the control's edge, the same node every lookup of the same approach, and a divided junction's nodes lie a carriageway apart
+SIGNAL_SAME_M = 30.
+
+
+def junction_point(info) -> tuple[int, float, float]:
+  """(OSM node, lat, lon) of a stop or yield control's junction: a TrackedControl's junction_info dict (MapJunction.to_dict(),
+  camelCase), a stop_rules.Junction, or None ((0, 0., 0.): nothing to key it by)."""
+  if info is None:
+    return 0, 0., 0.
+  if isinstance(info, dict):
+    return int(info.get('osmNodeId', 0) or 0), float(info.get('lat', 0.) or 0.), float(info.get('lon', 0.) or 0.)
+  return int(getattr(info, 'osm_node_id', 0) or 0), float(getattr(info, 'lat', 0.) or 0.), float(getattr(info, 'lon', 0.) or 0.)
+
+
+class SignalJunctions:
+  """The junctions mapped as a stop or yield that the camera has seen a signal head at (2.4 item 9, C20), for the rest of the
+  drive: one held by turnpilotd for the process, never reset by a fault or a reroute. TurnPilotJunctionOverrides (signalSeen)
+  needs the junction's OSM node and its ways, which navd doesn't always have (route 29, 2026-11-08, 126-164 s: a junction
+  mapped as a stop sign, really a signal, osmNodeId 0, the write failed and 'Stop sign ahead needs you' was said); here it is
+  keyed by the node when there is one and by its position (MapJunction.lat/lon, SIGNAL_SAME_M) either way, so a reroute's
+  lookup of the same junction (a new routeCount and control id) is still it. Nothing is written to disk: the next drive learns
+  it again on sight, unless the override was written."""
+
+  def __init__(self):
+    self.seen: list[tuple[int, float, float]] = []
+
+  def add(self, info) -> bool:
+    """Remember the junction (junction_point's info); True when it is new, False when already known or with nothing to key
+    it by (no node, no position)."""
+    node, lat, lon = junction_point(info)
+    if (not node and not (lat or lon)) or self.matches(info):
+      return False
+    self.seen.append((node, lat, lon))
+    return True
+
+  def matches(self, info) -> bool:
+    node, lat, lon = junction_point(info)
+    for n, la, lo in self.seen:
+      if node and n == node:
+        return True
+      if (lat or lon) and (la or lo):
+        dy = (lat - la) * 111_320.
+        dx = (lon - lo) * 111_320. * math.cos(math.radians((lat + la) / 2.))
+        if math.hypot(dx, dy) <= SIGNAL_SAME_M:
+          return True
+    return False
 
 
 @dataclass
@@ -732,6 +803,9 @@ class StopGo:
       return StopGoDecision(state='off', mode=self._mode(f)[0])
     if cur is not None and cur.state is self.token:
       self.key, self.control = cur.key, cur
+    if f.signal_junction and not self.signal_seen:
+      self.signal_seen = True  # seen on an earlier pass this drive (no second override write, nor its hook)
+      cloudlog.event("turnpilot.stop_go_signal_junction", key=list(self.key) if self.key else [])
     if (f.mode == VISION) != self.vision and self.state in WAITING + ('approach', 'off'):
       self._set_lanes(f, f.mode == VISION)  # the mode changed before any go: the lanes as the mode now judges them
     self.t += f.dt
@@ -1096,6 +1170,16 @@ class StopGo:
     if not side_views_live(f.side_status):
       return 'sideViews', VISION_GATE_TEXT['sideViews'], None
     v = self.certified(f)
+    if self.signal_seen and (v.reason in SIGNAL_DROPS or (v.reason == 'unknownLeg' and v.detail.endswith("control is unknown"))):
+      # a signal head seen at the junction (C20): a signal the map has as a stop sign. The stop sign's own rules of who goes
+      # when (the skew, an approach's control unknown, an override: the signalSeen override itself is one) govern nothing
+      # there, the light does, so they are no gate and no handback: the full stop is kept, and the decider's go stands on
+      # what the cameras see of the cross traffic, with no lift (V7, no_lift: the model's own go and red-light stop), and a
+      # red or yellow read on this junction's heads holds it (go_holds). Route 29 (2026-11-08, 158-164 s): a signal mapped as
+      # a stop, the gate failed on skew 29 m out as the heads were seen. The review of 2026-11-08: every other check stands
+      # (a geometry no cross-traffic judgement covers, a junction whose conflicting approaches aren't known), as do the
+      # gate's own checks above (the side views, the sidecar)
+      return None
     # the light at the line (low sun, the sun ahead with the veil unmeasured) is a view, never a gate (the review of
     # 2026-11-08: no handbacks): the walk zeroes the glare's bearings (sunAhead, lowSun), the side views' sectors read washed
     # where the sun or headlights fill the lens, and the creep for a view and its limit judge the rest, as for reach
@@ -1177,7 +1261,7 @@ class StopGo:
           self.view_stuck.discard(key)
           self.view_age[key] = 0.
       if key in FORWARD and raw is not None:
-        self.lights.append(self._head_seen(raw, pos))
+        self.lights.append(self._head_seen(raw, pos, f.vis.height if f.vis is not None and f.vis.height is not None else 1.3))
     if not self.signal_seen and sum(self.lights) >= SIGNAL_HEAD_RUNS:
       self.signal_seen = True
       j = self.junction
@@ -1291,15 +1375,25 @@ class StopGo:
       cloudlog.event("turnpilot.stop_go_stop_event", key=list(self.key), track=int(tid), cls=e.cls, role=e.role,
                      wayId=int(e.lane.approach.way_id) if e.lane is not None and e.lane.approach is not None else 0, cameraTimeS=round(float(e.t), 3))
 
-  def _head_seen(self, raw, pos: float) -> bool:
-    """A class-9 head in the junction's region on this forward run: above the horizon, its bearing within SIGNAL_SPAN_M of
-    our path at the cross road's near edge (RawFrame.lights: (bearing deg, elevation deg, conf))."""
+  def _head_seen(self, raw, pos: float, height: float) -> bool:
+    """A class-9 head at this junction on this forward run (RawFrame.lights: (bearing deg, elevation deg, conf)): above the
+    horizon, ranged from its elevation (ASSUMED_HEAD_M over the road, the camera height under it) inside the junction's
+    region along our path (_head_here), its bearing within SIGNAL_SPAN_M of our path at that range. Until the review of
+    2026-11-08 the bearing alone, at the cross road's near edge: the next junction's heads up the road made this one a signal."""
     lights = getattr(raw, 'lights', None) or ()
-    if not lights:
-      return False
-    s = max(self.edges.d_min - pos + self.setback, 1.)
-    span = math.degrees(math.atan2(SIGNAL_SPAN_M, s))
-    return any(elev > 0. and abs(bearing) <= span for bearing, elev, _conf in lights)
+    rise = max(ASSUMED_HEAD_M - height, 0.5)
+    for bearing, elev, _conf in lights:
+      if elev <= 0.:
+        continue
+      d = rise / math.tan(math.radians(elev))
+      if self._head_here(d, pos) and abs(bearing) <= math.degrees(math.atan2(SIGNAL_SPAN_M, max(d, 1.))):
+        return True
+    return False
+
+  def _head_here(self, d: float, pos: float) -> bool:
+    """A head d m ahead of the camera is this junction's: from SIGNAL_BEFORE_M short of the stop point to SIGNAL_PAST_M past
+    the far side of its farthest cross lane, the bumper pos m past the stop point."""
+    return self._x(-SIGNAL_BEFORE_M, pos) <= d <= self._x(self._far_edge() + SIGNAL_PAST_M, pos)
 
   # ------------------------------------------------------------------------------------------------------------ states
 
@@ -1842,6 +1936,11 @@ class StopGo:
     if self.signal_seen and not self.vision:
       holds.append(Hold('signal', "signal at junction", STATIC))
     self.no_lift = self.vision and self.signal_seen
+    if self.signal_seen and not launch and any(st in ('red', 'yellow') and self._head_here(d, pos) for st, d in f.heads):
+      # the review of 2026-11-08: the control stays a stop sign at a signal it was mapped as (its full stop always made), and
+      # a red or yellow the camera reads on this junction's heads holds its go for as long as it is read (the hard rail), a
+      # wait the light ends by itself; a green or nothing read leaves the go to the cross traffic the cameras see
+      holds.append(Hold('light', RED_HOLD_REASON, DYNAMIC))
     # 3 straight on its approach, no turn desire before our first go (our own go's pulse is that go's: after a withdrawn go the
     # yaw and the wheel say whether it curled the car); V8: under vision the heading decides, the wheel a sanity bound
     yaw_go, steer_go = (VISION_YAW_GO_DEG, VISION_STEER_SANITY_DEG) if self.vision else (YAW_GO_DEG, STEER_GO_DEG)

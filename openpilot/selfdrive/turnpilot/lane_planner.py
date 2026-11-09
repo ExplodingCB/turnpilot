@@ -59,10 +59,13 @@ Before the paint, a change toward the curb before a junction turn put the car in
 How a change goes (LanePlanner): once the same change is wanted for LC_CONFIRM_FRAMES, the driver is warned LC_WARN_S
 ahead: laneChangeOffer says the side (selfdrived raises turnpilotLaneChangeLeft/Right, a chime) and laneChangeCountdown the
 seconds left. On cars where openpilot can't signal (the Tesla: opendbc has no blinker command), the driver's stalk is the
-go-ahead, at any point in the countdown or up to LC_SIGNAL_TIMEOUT_S after it; elsewhere the request goes when the
-countdown ends. The request is the lane change itself: DesireHelper takes it with no blinker or nudge and none of
-the driver's 20 mph floor, only a moving car (NAV_LANE_CHANGE_SPEED_MIN), and still waits for the car's own blind spot
-signal (Tesla DAS_status). Until DesireHelper starts the change, every frame checks it
+go-ahead, at any point in the countdown or after it until the window's end, the side's chime repeating (since 2026-11-08:
+8 s after it before, which a driver who hadn't noticed the prompt ran out on, route 29); elsewhere the request goes when the
+countdown ends. On the driver's path the driver's blinker on the offered side confirms the lane: a frame read short of
+broken white with nothing contrary, or read by nobody, no longer holds the request back (_follow_up). The request is the
+lane change itself: DesireHelper takes it with no blinker or nudge and none of the driver's 20 mph floor, only a moving
+car (NAV_LANE_CHANGE_SPEED_MIN), and still waits for the car's own blind spot signal (Tesla DAS_status).
+Until DesireHelper starts the change, every frame checks it
 again, and any failure aborts it, with laneChangeAbort saying why for ABORT_HOLD_S (selfdrived raises
 turnpilotLaneChangeAborted): the line read solid, yellow (held included) or none, or the lane no longer valid (a line read
 short of broken white with nothing contrary, its kind or colour unknown, or broken white by the white hold alone, a frame
@@ -87,7 +90,7 @@ would have asked for in laneChangePaintRule.
 Under TurnPilotAlwaysDrive (ALWAYS_DRIVE.md step S4; LanePlanner.always_drive, handed over every frame), Kellen's blind spot
 rule. A blind spot that reads occupied once a change is offered holds it instead of aborting it (LC-01): the offer stays up
 (laneChangeHold blindspot, its line silent), any request is withdrawn, so DesireHelper, which starts a requested change the
-instant the blind spot clears, never goes on its own, and neither LC_REQUEST_TIMEOUT_S nor LC_SIGNAL_TIMEOUT_S runs while it
+instant the blind spot clears, never goes on its own, and LC_REQUEST_TIMEOUT_S doesn't run while it
 reads occupied (LC-02). Once it has read clear LC_HOLD_CLEAR_S the change is said again, with the lane change chime, and
 counted down LC_RELEASE_S (laneChangeHold clear) before the request: the driver hears it when a held change goes. Occupied
 again inside the countdown, it is held again with nothing sent. With the driver signalling, the stalk let go while only the
@@ -206,7 +209,9 @@ LC_EXTRA_LANE_S = 8.        # each change past the first starts this much earlie
 LC_SPEED_MARGIN = 0.5       # m/s above DesireHelper's minimum, so a request never waits below it
 LC_CONFIRM_FRAMES = 10      # the same need this many frames in a row before the warning
 LC_WARN_S = 3.              # the warning (chime, countdown) comes this long before the change may go
-LC_SIGNAL_TIMEOUT_S = 8.    # after the countdown, the driver has this long to signal before the change is aborted
+# after the countdown the driver's signal is waited for, the side's chime on repeat (hooks: "Signal LEFT Now"), until the
+# window's end (tooLate, then LC-03): no clock of its own. Route 29 (2026-11-08, 187-198 s): 8 s here aborted a change noSignal
+# at 80 m with 150 m of window left, the driver's lamp lit since 190 s (the port hid it from carState: tesla/car_signal.py)
 LC_COOLDOWN_S = 3.          # after any lane change, ours or the driver's, for the model's lane lines to settle
 LC_ABORT_COOLDOWN_S = 6.    # after an abort, before the same change is offered again
 LC_REQUEST_TIMEOUT_S = 8.   # DesireHelper waiting this long (blindspot) aborts the request
@@ -1534,6 +1539,21 @@ class LanePlanner:
     goes on an unsure frame, so the model's lane count isn't asked on it (the edge's std flickering over EDGE_STD_MAX at night
     would abort the offer on noLane there too); the request frame asks it, passing by its own read."""
     d = _direction(self.offer)
+    # the driver's blinker on the offered side, on the driver's path: the driver, looking, confirms the lane the planner offered
+    # (it was offered only on LC_CONFIRM_FRAMES frames that passed by their own read). An unsure frame then waits on nothing:
+    # read but unsure, read by nobody (the wide camera, a stop sweep) or no lane by the model's count alone, the request goes on
+    # it, as openpilot's own lane change goes on the driver's blinker. Every contrary read and every rail still aborts it (a line
+    # read solid, yellow, held yellow or none; an edge the model is sure of, the list's none, an oncoming or stopped car, a car
+    # in the target lane), and the blind spot holds it. Route 29 (2026-11-08, 521-523 s): offered at 78 m on broken white, the
+    # driver signalling since 89 m, then the left line read white of unknown kind, so nothing was requested, tooLate at 58 m
+    signaled = left_blinker if d == LEFT else right_blinker
+    # the review of 2026-11-08: only a line this frame read white (broken, or its kind unknown) is the lane the driver
+    # confirms; a line of no colour or an unknown one (a yellow's dashes at night read colourless too) waits as before, and
+    # the unsure clock below runs while it is confirmed, so the wait stays LC_UNSURE_MAX_S from the last broken white read
+    p = (paint if own is None else own)
+    p = p[1 if d == LEFT else 2] if read and len(p) == 4 else None
+    confirmed = driver_signals and signaled and self.phase in (Phase.WARN, Phase.WAIT, Phase.REQUEST) and \
+      p is not None and p.color == 'white' and p.kind in ('broken', 'unknown')
     if not self.paint_rule:
       return self._abort('turnedOff')
     if not inputs_valid:
@@ -1559,8 +1579,8 @@ class LanePlanner:
       edge = lanes.left == 0 and lanes.left_known if d == LEFT else lanes.right == 0 and lanes.right_known
       reason = 'noLane' if (room is not None and room <= 0) or oncoming_in_lane(objects, d, lanes.width) or edge else \
         'laneParked' if stopped_in_lane(objects, d, lanes.width) else ''
-      if not occupied:  # a car in the blind spot hides the line beside it: the clock stops while it holds the change (LC-02)
-        self._unsure_t += dt
+      if not occupied:      # a car in the blind spot hides the line beside it: the clock stops while it holds the change
+        self._unsure_t += dt  # (LC-02); the driver's own signal on a white line requests on it (below), the clock running
       if not reason and self._unsure_t >= LC_UNSURE_MAX_S - 1e-6:
         reason = waited  # no frame has passed for LC_UNSURE_MAX_S: the lamp goes out, said
     elif not reason:
@@ -1574,7 +1594,6 @@ class LanePlanner:
     if target_lane_blocked(objects, d, v_ego, lanes.width):
       return self._abort('carInLane')
 
-    signaled = left_blinker if d == LEFT else right_blinker
     if not driver_signals and car_block and self.phase in (Phase.WARN, Phase.REQUEST):
       return self._abort('noSignal')  # the driver's lamp the other way, or hazards: the driver declines the change
     if self._hold != 'none':
@@ -1594,8 +1613,6 @@ class LanePlanner:
         self._wait_t += dt
       if signaled:
         self.phase = Phase.REQUEST
-      elif self._wait_t > LC_SIGNAL_TIMEOUT_S:
-        return self._abort('noSignal')
     elif self.phase == Phase.REQUEST:
       if driver_signals and not signaled:
         return self._abort('noSignal')  # the blinker went off before the change started: never change unsignaled
@@ -1608,7 +1625,7 @@ class LanePlanner:
       return self._decision(HOLD_REASON, prompt=driver_signals)
     if self.phase == Phase.REQUEST:
       self.countdown = 0.
-      if unsure:  # waits for a frame that reads the line broken white: nothing requested on this one
+      if unsure and not confirmed:  # waits for a frame that reads the line broken white: nothing requested on this one
         return self._decision(LINE_UNSURE_REASON, prompt=driver_signals)
       return self._decision(request=True, prompt=driver_signals)
     return self._decision(prompt=driver_signals)

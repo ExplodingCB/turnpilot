@@ -230,6 +230,40 @@ class TestNightLamps(OpenpilotTestCase):
       _, r = night_read([(672, self.at(0.5), color)], self.BOX, r=8., up=8., side=4., down=10.)
       assert r.state == 'unknown', (color, r)
 
+  def test_a_night_green_boxed_round_its_glow_reads_green(self):
+    # route 29 (2026-11-08): every night green the light samples' crops show was boxed round its glow, the housing unseen, its
+    # lamp at 0.55-0.60 of the box (32x72, 38x86): positionMismatch in the middle third, and the car waited at greens. In the
+    # lower half it is the green lamp
+    for box, frac, kw in (((660, 200, 692, 272), 0.57, {'r': 7., 'up': 6., 'side': 6., 'down': 8.}),
+                          ((660, 200, 698, 286), 0.59, {'r': 8., 'up': 7., 'side': 7., 'down': 9.})):
+      _, r = night_read([((box[0] + box[2]) / 2, box[1] + frac * (box[3] - box[1]), 'green')], box, **kw)
+      assert (r.state, r.reason) == ('green', 'read'), (box, r)
+
+  def test_a_night_red_glowing_its_box_full_reads_red(self):
+    # route 29: the governing red the car stood at, close, its glow over the top and middle thirds and its core at 0.37:
+    # positionMismatch. In the upper half it is the red lamp
+    box = (660, 200, 693, 268)
+    _, r = night_read([(676.5, 200 + 0.37 * 68, 'red')], box, r=7., up=8., side=7., down=12.)
+    assert (r.state, r.reason) == ('red', 'read'), r
+
+  def test_a_night_glow_box_wider_than_a_head_is_read(self):
+    # route 29: the governing red the car waited 25 s at was boxed 34x58 (1.71) on every run, round its glow: aspect, never
+    # read. A box near square (a doghouse, a pedestrian signal) stays aspect
+    _, r = night_read([(677, 200 + 0.33 * 58, 'red')], (660, 200, 694, 258), r=6., up=4., side=5., down=6.)
+    assert (r.state, r.reason) == ('red', 'read'), r
+    _, r = night_read([(680, 200 + 0.3 * 48, 'red')], (660, 200, 700, 248), r=6., up=4., side=5., down=6.)
+    assert (r.state, r.reason) == ('unknown', 'aspect'), r
+
+  def test_a_colour_at_the_far_end_from_its_lamp_is_unknown(self):
+    # what the halves keep out: a green in the top third, a red below the middle, a yellow at the bottom (route 29's
+    # streetlight blob at 0.82, hue yellow), a lamp at the box's middle (MID_BAND: the box no guide)
+    box = (660, 200, 692, 272)
+    glow = {'r': 7., 'up': 6., 'side': 6., 'down': 8.}
+    for color, frac, kw in (('green', 0.25, glow), ('red', 0.6, glow), ('yellow', 0.82, {'r': 6., 'up': 4., 'side': 5., 'down': 4.}),
+                            ('green', 0.5, glow), ('red', 0.5, glow)):
+      _, r = night_read([(676, 200 + frac * 72, color)], box, **kw)
+      assert (r.state, r.reason) == ('unknown', 'positionMismatch'), (color, frac, r)
+
   def test_the_core_not_the_fuller_third_places_the_lamp(self):
     # a lamp's glow trailing 22 px below it fills the next third more than the lamp's own: the third with the most lamp
     # pixels put a red in the middle and a yellow at the bottom (positionMismatch); the core's centre is the lamp's, and so is
@@ -397,6 +431,18 @@ class TestReader(OpenpilotTestCase):
     for i in range(VOTE_N):
       out = reader.read(i * 0.1, frame, STRIDE, Y_HEIGHT, LEVEL, 1.22, boxes)
     assert reader.governing_state(out) == 'unknown'
+
+  def test_a_box_under_the_detectors_threshold_is_published_once_it_reads_a_colour(self):
+    # route 29 (2026-11-08): the reader reads class 9 down to LIGHT_READ_CONF for an earlier red; such a box is a head only
+    # once it reads a colour (or holds a vote), so a low box over no lamp is never a head downstream (the left's heads here)
+    reader = LightReader(LENS)
+    frame, boxes = scene([head(0, 'red'), head(None, 'red', x0=900), head(0, 'red', x0=400)])
+    boxes[:, 4] = [0.25, 0.25, 0.4]
+    out = reader.read(0., frame, STRIDE, Y_HEIGHT, LEVEL, 1.22, boxes)
+    assert sorted((round(h.conf, 2), h.read, h.reason) for h in out) == [(0.25, 'red', 'read'), (0.4, 'red', 'read')]
+    frame, boxes = scene([head(None, 'red', x0=400)])
+    boxes[:, 4] = 0.4
+    assert [h.reason for h in reader.read(0.1, frame, STRIDE, Y_HEIGHT, LEVEL, 1.22, boxes)] == ['dark']  # at MIN_CONF: a head
 
   def test_gated_boxes_are_not_published(self):
     reader = LightReader(LENS)

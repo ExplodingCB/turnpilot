@@ -639,11 +639,22 @@ def test_unprotected_left_approach_reason_and_engage():
   assert out.stops[0].reason == "Unprotected left ahead" and out.shown.kind == UNPROTECTED
 
 
-def test_a_signal_at_the_junction_leaves_the_left_unprotected():
-  # signals don't hold, and a green ball can't be told from an arrow (SIGNAL_PROTECTS_LEFT): the left stops at its hold line
+def test_a_signal_at_the_junction_leaves_the_left_unprotected_held_in_the_junctions_mouth_past_its_line():
+  # signals don't hold, and a green ball can't be told from an arrow (SIGNAL_PROTECTS_LEFT): the left is unprotected. Drive 29
+  # (2026-11-08): on a green it isn't held at its hold line 9 m short (where every left at a signal was held, the driver
+  # driving them all) but rolls past the signal's line to the junction's mouth, SIGNAL_LEFT_HOLD_M short, and is judged there
+  from openpilot.selfdrive.turnpilot.map_controls import SIGNAL_LEFT_HOLD_M
   car = left_car([(250. - 11., 'signal')])
   out, dec = car.run_until(held, lights=lambda car: lights('green', 239. - car.s))
-  assert out.shown.kind == UNPROTECTED and -2. < 250. - HOLD_LINE_M - 1. - car.s < 5.
+  assert out.shown.kind == UNPROTECTED and -2. < 250. - SIGNAL_LEFT_HOLD_M - car.s < 2., 250. - car.s
+  assert car.s > 239. and car.policy.left_hold_m(car.turn[1], 250. - car.s) == SIGNAL_LEFT_HOLD_M
+
+
+def test_a_red_at_a_signalized_lefts_junction_stops_the_car_at_the_signals_line():
+  # ...a red read there (the hard rail) is the signal's own stop at its line, short of the junction
+  car = left_car([(250. - 11., 'signal')])
+  out, dec = car.run_until(held, lights=lambda car: lights('red', 239. - car.s))
+  assert out.shown.kind == 'signal' and -2. < 239. - car.s < 3.
 
 
 @pytest.mark.parametrize("kind", ['stop'])

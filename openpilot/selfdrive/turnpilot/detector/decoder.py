@@ -21,6 +21,11 @@ PLAQUE_BELOW = 0.8      # the plaque crop: this many sign heights below the sign
 PLAQUE_WIDEN = 0.2      # ...and this much of its width wider on each side
 PLAQUE_MAX = (96, 64)   # at most this many pixels (w, h), subsampled to fit
 MIN_CONF = 0.35
+# the light reader's class-9 boxes (decode_lights for light_state.LightReader; lightBoxes stay MIN_CONF): route 29 (2026-11-08),
+# a red read only at its line, the governing heads first boxed at MIN_CONF 40 m out (twice, then nothing for 1.7 s) where the
+# full pass had them at 0.2-0.33 from about 60 m on the qcamera replayed through yolo26n. A head from a box under MIN_CONF is
+# published only once it reads a colour (LightReader.read): what reads no lamp stays as before
+LIGHT_READ_CONF = 0.2
 MAX_DETECTIONS = 64  # the message never carries more than this, highest confidence first
 MAX_LIGHTS = 16      # traffic light boxes, apart, highest confidence first
 # our own hood (and on the wide camera, the dashboard) reads as a car: a box at least this wide (fraction of the frame)

@@ -212,7 +212,9 @@ The rules (Kellen, 2026-10-27; /private/tmp/claude-501/stop_design.md):
   protected once seen so, after its control drops out behind the car). A signal there doesn't protect it
   (SIGNAL_PROTECTS_LEFT): a left on a green ball is unprotected. turnpilotd hands it in each frame (update()'s turn) and
   it becomes a control of its own, kind unprotectedTurn, at the junction's hold line less
-  MAP_MARGIN_M: the curve, the latch and the stop sign's rules. Held, it does what the unprotected left asks (update()'s
+  MAP_MARGIN_M, or where a signal is mapped there in the junction's mouth (SIGNAL_LEFT_HOLD_M, 2026-11-08: a left on a green
+  ball rolls up to the junction and judges the oncoming lanes there, the signal's own control stopping the car at its line
+  for a red or yellow read): the curve, the latch and the stop sign's rules. Held, it does what the unprotected left asks (update()'s
   left, a LeftCommand from unprotected_left.py through turnpilotd; TurnPilotAutoLeft): auto (the default; Kellen,
   2026-10-28, "No it has to ship taking the turn", no intervention) holds it, never handing back but for the left's fault
   (leftUndecidedTakeControl), creeps its stop point on to where the left asks (CREEP_SPEED, CREEP_ACCEL; still the latch,
@@ -384,6 +386,17 @@ JUNCTION_LINES_KEPT = 4
 # A signal at the junction doesn't protect a left (DESIGN phase 4, decision 4): signals don't hold now, and nothing here can
 # tell a green arrow from a green ball, so a left at a signal is unprotected. True: a signal protects it, as a stop sign does
 SIGNAL_PROTECTS_LEFT = False
+# ...but it isn't held at the stop line either (Kellen, 2026-11-08, drive 29: every left at a green ball held at a 9 m line
+# and the driver drove them all): at a junction where a signal is mapped, the left's hold is where a driver waits on a green
+# ball, in the junction's mouth, this far before the maneuver point: CREEP_SHORT_M short of where the left's full creep
+# stands the car (unprotected_left: ONCOMING_ENTRY_M + CREEP_SHORT_M) and 1.5 m past its position fault (HELD_MIN_M), so
+# the latch's own stopping spread never reads as one. The approach is the model's (no stop at the line on a green: the
+# mapped signal's own control stops the car at its line for a red or yellow read, as at any signal), the car rolls up to the
+# mouth and judges the oncoming lanes from there (the gap rule, unprotected_left.py), and goes when they are clear. A red
+# read too late for the signal's line is still a stop short of the oncoming lanes at the mouth (2026-11-08 cause 6: overrun
+# at the line). Where no signal is mapped (none, or one only the camera boxes) the hold stays at the line
+# (left_hold_m): there the left's hold is the only stop the junction has (_camera_signal's own_turn gate)
+SIGNAL_LEFT_HOLD_M = ONCOMING_ENTRY_M + 2.
 
 STOP_SIGN_REASON = "Stop sign: take control to proceed"
 # A stop sign's line or an unprotected turn's hold line crossed with no go of TurnPilot's (its latch let go as the driver's,
@@ -514,9 +527,13 @@ def needed(v_ego: float, d: float) -> float:
   return -v_ego ** 2 / (2. * max(d, HARD_STOP_MIN_M))
 
 
-def turn_stop_feasible(v_ego: float, distance: float) -> bool:
-  """An unprotected turn distance m ahead can be stopped for at its hold line at MAP_DECEL_MAX or gentler."""
-  return needed(max(v_ego, 0.), distance - HOLD_LINE_M - MAP_MARGIN_M) >= MAP_DECEL_MAX - 1e-9
+LEFT_LINE_M = HOLD_LINE_M + MAP_MARGIN_M  # m before the maneuver point an unprotected turn's hold is with no signal mapped
+
+
+def turn_stop_feasible(v_ego: float, distance: float, hold_m: float = LEFT_LINE_M) -> bool:
+  """An unprotected turn distance m ahead can be stopped for at its hold (hold_m before it: MapControlPolicy.left_hold_m) at
+  MAP_DECEL_MAX or gentler."""
+  return needed(max(v_ego, 0.), distance - hold_m) >= MAP_DECEL_MAX - 1e-9
 
 
 def signal_stopping(st) -> bool:
@@ -816,6 +833,9 @@ class MapControlPolicy:
     self._junction_d: tuple | None = None
     self._turn_floor: float | None = None  # m, dead-reckoned: its stop point read behind where the car can stop at the floor
     self._turn_raw = 0.  # m to its stop point as last read, before that floor
+    self._turn_hold_m = LEFT_LINE_M  # m before its junction the unprotected turn's hold is (left_hold_m)
+    self._signal_hold_id: int | None = None  # the maneuver a mapped signal at its junction moved its hold to the mouth for
+    self._signal_line: tuple | None = None  # (maneuver id, m before its junction) of the mapped signal's own line there
     self.turn_name = 'left'
     self._protected_id: int | None = None  # the maneuver a stop sign, signal or yieldStop of its junction protected: it stays so
     self._off_cap: float | None = None  # m/s: the off-route cap while the stops ahead are unknown (module docstring)
@@ -874,6 +894,35 @@ class MapControlPolicy:
     (BUILD_FINDINGS D4) for its log line alone: no left is skipped or rerouted on it since 2026-11-06. The rule is
     line_setback_at's, which navd's log line of the route's lefts shares (routing/lefts.py)."""
     return line_setback_at(distance, self.tracker.controls.values())
+
+  def left_hold_m(self, maneuver_id: int, distance: float, controls=None) -> float:
+    """m before the junction distance m ahead the unprotected turn maneuver_id holds (SIGNAL_LEFT_HOLD_M): in the junction's
+    mouth where a signal is mapped there (PROTECT_BEFORE_M before it to PROTECT_PAST_M past it; once seen, the maneuver's for
+    good: a mapped signal drops out of the controls 15 m behind the car), else at its line (LEFT_LINE_M). A signal only the
+    camera reads there (camera_signal, the left's own red latch) leaves it at the line: there its hold is the junction's only
+    stop. controls: this frame's (the tracker's by default)."""
+    if self._signal_hold_id == maneuver_id:
+      return SIGNAL_LEFT_HOLD_M
+    cs = self.tracker.controls.values() if controls is None else controls
+    if any(c.kind == 'signal' and c.key[0] != CAMERA_ROUTE and distance - PROTECT_BEFORE_M <= c.d <= distance + PROTECT_PAST_M
+           for c in cs):
+      if self._signal_hold_id != maneuver_id:
+        cloudlog.event("turnpilot.left_signal_hold", maneuver_id=maneuver_id, distance=round(distance, 1),
+                       hold_m=SIGNAL_LEFT_HOLD_M)
+      self._signal_hold_id = maneuver_id
+      return SIGNAL_LEFT_HOLD_M
+    return LEFT_LINE_M
+
+  def signal_line_m(self, maneuver_id: int, distance: float) -> float | None:
+    """m before the junction distance m ahead of the unprotected turn maneuver_id that the stop line of the signal mapped
+    there lies (its control's own d; PROTECT_BEFORE_M before the junction to PROTECT_PAST_M past it, never the camera's own
+    line), kept for the maneuver once seen (the control drops out 15 m behind the car); None with none mapped. The left judges
+    the car past that line by it (unprotected_left: the review of 2026-11-08, until then by LINE_D, 9 m, whatever the line)."""
+    cs = [c for c in self.tracker.controls.values() if c.kind == 'signal' and c.key[0] != CAMERA_ROUTE and
+          distance - PROTECT_BEFORE_M <= c.d <= distance + PROTECT_PAST_M]
+    if cs:
+      self._signal_line = (maneuver_id, distance - min(cs, key=lambda c: abs(distance - c.d)).d)
+    return self._signal_line[1] if self._signal_line is not None and self._signal_line[0] == maneuver_id else None
 
   def turn_engaged(self, maneuver_id: int) -> bool:
     """The unprotected turn of this maneuver is engaged (stopping for it, held at it, or released from it)."""
@@ -973,10 +1022,15 @@ class MapControlPolicy:
     mid, dist = int(turn[0]), float(turn[1])
     if self._left_red is not None and self._left_red[0] != mid:
       self._left_red = None
-    if any(c.kind == 'signal' and dist - PROTECT_BEFORE_M <= c.d <= dist + PROTECT_PAST_M
-           for c in controls if c.key[0] != CAMERA_ROUTE):
+    mapped = [c for c in controls if c.kind == 'signal' and c.key[0] != CAMERA_ROUTE and
+              dist - PROTECT_BEFORE_M <= c.d <= dist + PROTECT_PAST_M]
+    if mapped and (self._signal_hold_id != mid or any(c.d > 0. for c in mapped)):
       self._left_red = None  # a mapped signal there: its own stop in force is the left's light
       return
+    # ...but past that signal's line, a left held in the junction's mouth (left_hold_m: SIGNAL_LEFT_HOLD_M, 2026-11-08) stands
+    # where the signal's stop is never made (behind the car) nor in force: a red read there is the left's until a steady
+    # green as at a junction with no signal mapped, never forgotten the moment it goes unread (a Sim run: read at 45 s, lost
+    # at 55 s, the left gone on the band at 58.5 s through the red no longer read)
     line = dist - CONTROL_LINE_M
     lo, hi = line - CAMERA_ASSOC_BEFORE_M, line + CAMERA_ASSOC_PAST_M
     states = {st for st, d in (lights.lights or []) if lo <= d <= hi}
@@ -1070,7 +1124,7 @@ class MapControlPolicy:
     tc = self.turn
     if tc is not None and tc.held:
       if isinstance(turn, tuple):
-        self._turn_raw = turn[1] - HOLD_LINE_M - MAP_MARGIN_M  # kept current: a release must not read the car's moves as a jump
+        self._turn_raw = turn[1] - self._turn_hold_m  # kept current: a release must not read the car's moves as a jump
       return tc  # position-free: only its release lets go
     if isinstance(turn, str):
       if tc is not None:
@@ -1093,7 +1147,8 @@ class MapControlPolicy:
     if tc is None:
       self._turn_floor = None
     if want:
-      d = turn[1] - HOLD_LINE_M - MAP_MARGIN_M
+      self._turn_hold_m = self.left_hold_m(int(turn[0]), turn[1], controls)
+      d = turn[1] - self._turn_hold_m
       raw, was_raw = d, self._turn_raw - v * dt
       self._turn_raw = raw
       if tc is None:
@@ -1788,12 +1843,12 @@ class MapControlPolicy:
     # TurnPilot's own metres (asked_m), and never at a signal: its stop is the light's, which a crawl doesn't change
     # (residual-check-1, d)
     # at an unprotected turn, short of the reach too, the driver having moved the car this hold, once it is in the oncoming
-    # lanes (ONCOMING_ENTRY_M before its junction, HOLD_LINE_M + MAP_MARGIN_M past the stop point as latched) or a hold
+    # lanes (ONCOMING_ENTRY_M before its junction, left_hold_m past the stop point as latched) or a hold
     # taken up by a re-engage could no longer stand it short of them (it carries a rolling car on as reengage_stop_m, the
     # latch's own braking): the left's full creep stands the car CREEP_SHORT_M short of them, where the reach (LATCH_PAST_M
     # past it) is 1 m inside them (the invariant: never a TurnPilot hold there). Inside the ask too: the driver's gas inside
     # a creep can leave the car too fast for any hold to stand it short (skeptic round 1)
-    room = c.d + HOLD_LINE_M + MAP_MARGIN_M - ONCOMING_ENTRY_M
+    room = c.d + self._turn_hold_m - ONCOMING_ENTRY_M
     # the reach and the lanes reached only on the driver's own frame, a car too fast for a hold only at the re-engage, judged
     # from its frame's speed and where the car is before the latch brakes it: never let go engaged on the latch's own
     # metres, which drove a car re-engaged inside the creep on into the junction, the full check (c) skipped (skeptic round

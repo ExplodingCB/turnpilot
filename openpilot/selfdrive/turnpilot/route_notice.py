@@ -23,6 +23,14 @@ stop's logged failure the light check (the first that fails); re-certified now, 
 5 are short of reach at their line (a far or third cross lane 0.7-7.7 m short): routed round where the budget allows, said
 where it can't.
 
+Since 2026-11-08 (route 29: a junction mapped as a stop sign, really a signal, "Stop sign ahead needs you" at 126 s): a stop
+or yield at a junction the camera has seen a signal head at this drive (turnpilotd's signal_junctions, stop_go.SignalJunctions,
+keyed by its node or its position) is never said, and one queued is dropped; and the notice knows the mode: under
+TurnPilotStopSignGo=vision a stop navd couldn't certify for reach or the light at the line (certReason reach, light) is no
+handback (the line waits, creeps for a view and goes on what the cameras see: stop_go.VISION_VIEW_REASONS), so it isn't said
+either. One that fails on what vision still hands back (geometry, skew, an unknown leg, an override) is: a skewed junction
+(route 29's, -21 deg off straight on) is the 1 s handback after its full stop (H9), so "needs you" is the truth there.
+
 Each is said only where the plan's alert slot is free (turnpilotd: nothing that outranks it is up), and used up only on the
 frames it is said: held back behind another alert, it and its remaining time wait for the slot, never lost. A stop-ahead
 notice for a stop passed (or rerouted off) while it waited is dropped, logged, never said late."""
@@ -38,6 +46,7 @@ AHEAD_M = 300.            # m before a stop the route couldn't avoid: "Stop sign
 DETOUR_WARN_FRAC = 0.5    # avoidance adding more than this of the route without it...
 DETOUR_WARN_MIN_S = 300.  # ...or this, whichever is larger, is said with a chime
 STOP_KINDS = ('stop', 'yield')
+VISION_GOES = ('reach', 'light')  # certReasons a stop under vision is no handback for (stop_go.VISION_VIEW_REASONS)
 CHIMES = ('routeDetour', 'stopsNeedYou', 'firstStopNeedsYou', 'stopRoutingFailed', 'stopAheadNeedsYou')
 NOTICES = ('routeAvoidsStops',) + CHIMES
 
@@ -68,13 +77,15 @@ class RouteNotices:
     return kind in CHIMES
 
   def update(self, nav, updated: bool, valid: bool, v_ego: float, engaged: bool, dt: float = DT_MDL,
-             free: bool = True) -> tuple[str, str]:
+             free: bool = True, signal_at=None, vision: bool = False) -> tuple[str, str]:
     """(controlAlert kind, text) to say this frame, ('none', '') with none. nav: the latest navInstruction (None when none this
     frame), updated: it arrived this frame, valid: its valid flag; free: the plan's alert slot is free this frame, so what is
-    returned is said. Not free: nothing is used up (the notice being said and its remaining time wait) and ('none', '')."""
+    returned is said. signal_at: junction info dict (osmNodeId, lat, lon) -> True where the camera has seen a signal head this
+    drive (none: none seen); vision: TurnPilotStopSignGo is vision. Not free: nothing is used up (the notice being said and
+    its remaining time wait) and ('none', '')."""
     if updated and nav is not None and valid:
       self._route(nav, v_ego, engaged)
-      self._ahead(nav)
+      self._ahead(nav, signal_at, vision)
     else:
       self.no_route_s += dt  # no message this frame, or an invalid one (off the route): the gap counts on
     if not free:
@@ -118,11 +129,16 @@ class RouteNotices:
                      added_s=round(float(nav.avoidAddedS), 1), status=str(nav.avoidStatus))
     self.queue = [(k, t, None) for k, t in out] + [q for q in self.queue if q[0] == 'stopAheadNeedsYou']
 
-  def _ahead(self, nav) -> None:
+  def _ahead(self, nav, signal_at=None, vision: bool = False) -> None:
     ahead = set()
     for c in nav.controls:
       if str(c.kind) not in STOP_KINDS or not c._has('junctionInfo') or str(c.junctionInfo.certification) != 'unavoidable':
         continue
+      ji = c.junctionInfo
+      if vision and str(ji.certReason) in VISION_GOES:
+        continue  # no handback under vision: nothing to say (a queued one is dropped below, as for a stop passed)
+      if signal_at is not None and signal_at({'osmNodeId': int(ji.osmNodeId), 'lat': float(ji.lat), 'lon': float(ji.lon)}):
+        continue  # a signal the camera saw there: not a stop sign
       ident = int(c.junctionInfo.osmNodeId) or (int(nav.routeCount), int(c.id))
       if float(c.distance) > 0.:
         ahead.add(ident)

@@ -133,6 +133,7 @@ class Junction:
     self.distance, self.v, self.t = HOLD_D, 0., 0.
     self.held = True
     self.decisions = []
+    self.wide_every = 0  # every this many frames the run is the wide camera's (roadAndWide), 0 never
 
   def step(self, boxes=(), objects=(), road=True, raw_new=True, v=None, distance=None, far=None, cover=FULL_COVER, **kw):
     """far: the far crop's boxes on this frame (None: no far run), its run covering cover (deg, right and left)."""
@@ -141,6 +142,8 @@ class Junction:
       self.v = v
     if distance is not None:
       self.distance = distance
+    if self.wide_every and len(self.decisions) % self.wide_every == self.wide_every - 1:
+      road = False
     fr = frame(boxes, 'road' if road else 'wide', self.t) if raw_new else None
     if far is not None:
       kw['far'] = far_frame(far, cover, self.t)
@@ -549,14 +552,32 @@ def test_a_scene_commit_before_any_go_is_a_fault_moving_or_standing_and_only_the
     j.held = True
     assert j.step(committed=True).state == 'undecided'
   # the driver releasing the junction (a gas press at the line: scene_policy's released_id) and driving on is theirs: committed,
-  # nothing said; standing with it, where the car is isn't known, as before
+  # nothing said
   j = Junction()
   j.held = False
   d = j.step(v=2., distance=HOLD_D - 1., released=True)
   assert d.state == 'committed' and d.prompt == 'none' and not d.stops
+
+
+@pytest.mark.parametrize('how', ['released', 'disengaged'])
+def test_a_left_the_driver_takes_from_its_line_is_driven_never_the_position_fault(how):
+  # drive 29 (2026-11-08, cause 4): every left the driver took at its line said 'Junction position unsure: take control'
+  # (leftUndecidedTakeControl, the handback chime) on the frame the scene released the hold under their gas (467.0 s), the
+  # latch letting go as driverWent 0.9 s later. The driver taking it is no fault of TurnPilot's: driven, said as the crossing
+  # it is (its own words, never a take-control of the left's), and the left is done
   j = Junction()
   j.wait(1.)
-  assert j.step(released=True).why == 'position'
+  assert j.decisions[-1].state == 'waitGap'
+  kw = {'released': True} if how == 'released' else {'committed': True, 'enabled': False, 'v': 1.5}
+  d = j.step(**kw)
+  assert d.state == 'undecided' and d.why == ul.DRIVEN and d.why != 'position'
+  assert d.prompt not in TAKE_CONTROL_PROMPTS and d.reason == ul.DRIVEN_REASON[LEFT] and not d.go and not d.stops
+  d = j.step(v=3., distance=HOLD_D - 2., driven=True)
+  assert d.why == ul.DRIVEN and d.prompt not in TAKE_CONTROL_PROMPTS and not d.go
+  # engaged, a scene commit by a reading before any go is still the position fault (the test above)
+  j = Junction()
+  j.wait(1.)
+  assert j.step(committed=True).why == 'position'
 
 
 def test_a_left_lc03_placed_in_the_wrong_lane_is_driven_from_its_lane_never_handed_back():
@@ -1472,3 +1493,98 @@ def test_a_slow_launch_with_a_car_seen_in_its_band_is_withdrawn_and_never_carrie
   assert len(slow) == 1 and not slow[0]['on'] and slow[0]['seen'], slow
   assert not any(d.state == 'committed' or d.carry for d in ds)
   assert any(d.state == 'waitGap' and d.stops for d in ds) and j.left.hold_here
+
+
+def ranged_box(x, y, box):
+  b = raw(x, y)
+  return RawBox(b.camera, b.cls, b.conf, b.bearing_deg, b.span_deg, b.xy, b.near_m, box)
+
+
+def test_a_car_parked_past_the_junction_hides_no_lane_of_a_one_lane_road():
+  # route 29 (2026-11-08) seg 7: a car parked at the far curb 26 m past the maneuver point, 7.2 m to the turn side, standing
+  # and trusted, was an occluder whose bearings LANE_FAR_M (9 m, two lanes) took for the oncoming lanes': view blocked 25 s
+  # at an empty junction, the window never started. One opposing lane (1.8-5.4 m): it hides only the curb behind it
+  parked = oncoming(HOLD_D + 26., 7.2, vx=0., trackId=69, box=[0.32, 0.55, 0.38, 0.63], camera='road')
+  box = ranged_box(HOLD_D + 26., 7.2, (0.32, 0.55, 0.38, 0.63))
+  j = Junction(lanes=1)
+  j.wait(CLEAR_WINDOW_S + 0.5, boxes=[box], objects=[parked])
+  assert not any(x.view_blocked for x in j.decisions) and any(x.go for x in j.decisions)
+  # two opposing lanes (to 9 m): the same car stands in the outer lane, and hides it
+  j = Junction(lanes=2)
+  d = j.wait(CLEAR_WINDOW_S + 0.5, boxes=[box], objects=[parked])
+  assert d.view_blocked and not any(x.go for x in j.decisions)
+  # the opposing left-turner in its lane by the junction still blocks a one-lane road's view
+  turner = oncoming(HOLD_D + 12., 3.6, vx=0., trackId=7, box=[0.5, 0.4, 0.6, 0.5], camera='road')
+  j = Junction(lanes=1)
+  d = j.wait(1., boxes=[ranged_box(HOLD_D + 12., 3.6, (0.5, 0.4, 0.6, 0.5))], objects=[turner])
+  assert d.view_blocked and not d.go
+
+
+def test_a_red_read_in_the_junctions_mouth_clears_the_junction_on_the_gap():
+  # Kellen, 2026-11-08: a left waiting in a signal's junction mouth (past its stop line, SIGNAL_LEFT_HOLD_M short of the
+  # maneuver point) when the light goes red or yellow clears the junction like a driver: on the gap, an oncoming car seen
+  # holding it until it passes, no handback. Until then it held there through the red ('Light changed: holding in the
+  # junction', LS-4 option b)
+  mouth = ONCOMING_ENTRY_M + 2.
+  j = Junction()
+  j.distance, j.wide_every = mouth, 3  # the wide camera's runs: the cross road's view (CROSS_VIEW_FRESH_S)
+  j.wait(2., line_m=mouth, light='green')  # a steady green read standing in the mouth (CAMERA_GREEN_STEADY_S)
+  approaching = [raw(120., 3.6)]
+  j.wait(2., boxes=approaching, line_m=mouth, light='yellow')
+  d = j.wait(2., boxes=approaching, line_m=mouth, light='red')
+  assert d.clearing and not any(x.go for x in j.decisions) and d.state == 'waitGap'  # the car seen holds it
+  assert d.reason == ul.LIGHT_CHANGED_REASON
+  ds = [j.step(line_m=mouth, light='red') for _ in range(round((CLEAR_WINDOW_S + 0.5) / DT_MDL))]
+  go = next(i for i, x in enumerate(ds) if x.go)
+  assert CLEAR_WINDOW_S - 0.1 < go * DT_MDL < CLEAR_WINDOW_S + 0.3
+  assert not any(x.state == 'undecided' or x.prompt in TAKE_CONTROL_PROMPTS for x in j.decisions)
+  # the model's hold for the red (left_lift_refused 'light', the frame before turnpilotd lifts it) restarts no window; the
+  # go override off ('param': nothing lifts it) still holds it
+  j = Junction()
+  j.distance, j.wide_every = mouth, 3
+  j.wait(2., line_m=mouth, light='green')
+  ds = [j.step(line_m=mouth, light='red', model_holds='light') for _ in range(round((CLEAR_WINDOW_S + 0.5) / DT_MDL))]
+  assert any(x.go for x in ds)
+  j = Junction()
+  j.distance, j.wide_every = mouth, 3
+  j.wait(2., line_m=mouth, light='green')
+  ds = [j.step(line_m=mouth, light='red', model_holds='param') for _ in range(round((CLEAR_WINDOW_S + 0.5) / DT_MDL))]
+  assert not any(x.go for x in ds)
+
+
+def test_a_red_read_rolling_into_the_mouth_holds_and_one_after_a_stand_there_clears_even_mid_creep():
+  """The review of 2026-11-08: the clearing only for a car that stood past its line on a light not red before the spell. A red
+  first read rolling into the mouth (never stood there) holds for the green; one read after a steady green there clears, the
+  car creeping for a view when it came (LS-4: a creep into the near cross lanes); one read after CLEAR_STAND_S of an unread
+  stand there clears, and a shorter stand doesn't."""
+  mouth = ONCOMING_ENTRY_M + 2.
+  j = Junction()
+  j.distance, j.wide_every = mouth, 3
+  d = j.step(line_m=mouth, light='red', v=2., signal_line_m=mouth + 3.)
+  d = j.wait(2., line_m=mouth, light='red', v=0., signal_line_m=mouth + 3.)
+  assert not d.clearing and d.reason == ul.LIGHT_WAIT_REASON['red'] and not any(x.go for x in j.decisions)
+  j = Junction()
+  j.distance, j.wide_every = mouth, 3
+  j.wait(2., line_m=mouth, light='green', signal_line_m=mouth + 3.)
+  d = j.step(line_m=mouth, light='yellow', v=0.8, signal_line_m=mouth + 3.)
+  assert d.clearing
+  for stand, clears in ((ul.CLEAR_STAND_S + 0.5, True), (ul.CLEAR_STAND_S - 1., False)):
+    j = Junction()
+    j.distance, j.wide_every = mouth, 3
+    j.wait(stand, line_m=mouth, light='none', signal_line_m=mouth + 3.)
+    d = j.step(line_m=mouth, light='red', signal_line_m=mouth + 3.)
+    assert d.clearing == clears, stand
+
+
+def test_a_red_read_with_the_car_at_its_line_still_holds_it_there():
+  # the hard rail: a red read before the car passed its stop line (held at the line, LINE_D) keeps it there, never cleared
+  j = Junction()
+  j.wait(1., light='green')
+  d = j.wait(10., light='red')
+  assert not d.clearing and not any(x.go for x in j.decisions) and d.reason == ul.LIGHT_WAIT_REASON['red']
+  # read red while still short of the mouth's stop line (rolling up at a mapped signal): no clearing for that spell either
+  j = Junction()
+  j.distance = HOLD_D + 3.
+  j.step(line_m=ONCOMING_ENTRY_M + 2., light='red')
+  d = j.wait(10., distance=ONCOMING_ENTRY_M + 2., line_m=ONCOMING_ENTRY_M + 2., light='red')
+  assert not d.clearing and not any(x.go for x in j.decisions)

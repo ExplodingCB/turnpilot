@@ -9,7 +9,8 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.route_notice import AHEAD_M, DETOUR_WARN_MIN_S, NOTICE_S, RouteNotices, detour_warn_s
 
 
-def nav(route=1, status='clean', avoided=0, added=0., remaining=600., controls=(), valid=True, unavoidable=None, origin=None):
+def nav(route=1, status='clean', avoided=0, added=0., remaining=600., controls=(), valid=True, unavoidable=None, origin=None,
+        controls_status=None):
   """A navInstruction reader: controls [(id, kind, m, certification[, osmNodeId])] near the car; unavoidable: the whole route's
   count (default: the unavoidable ones in controls), origin: the first of them on the route's first edge (default: the
   first unavoidable in controls under 200 m)."""
@@ -17,6 +18,8 @@ def nav(route=1, status='clean', avoided=0, added=0., remaining=600., controls=(
   ni = msg.navInstruction
   ni.routeCount, ni.avoidStatus, ni.avoidedControls, ni.avoidAddedS = route, status, avoided, added
   ni.timeRemaining = remaining
+  if controls_status is not None:
+    ni.controlsStatus = controls_status
   mine = sorted((c for c in controls if c[3] == 'unavoidable'), key=lambda c: c[2])
   ni.unavoidableControls = len(mine) if unavoidable is None else unavoidable
   ni.firstUnavoidableOnOrigin = (bool(mine) and mine[0][2] < 200.) if origin is None else origin
@@ -25,6 +28,8 @@ def nav(route=1, status='clean', avoided=0, added=0., remaining=600., controls=(
     c.id, c.kind, c.distance = spec[0], spec[1], spec[2]
     c.junctionInfo.status, c.junctionInfo.certification = 'ok', spec[3]
     c.junctionInfo.osmNodeId = spec[4] if len(spec) > 4 else 1000 + spec[0]
+    if len(spec) > 5:  # (lat, lon, certReason)
+      c.junctionInfo.lat, c.junctionInfo.lon, c.junctionInfo.certReason = spec[5]
   return msg.as_reader().navInstruction, valid
 
 
@@ -170,3 +175,50 @@ def test_a_notice_held_back_behind_another_alert_is_said_in_full_once_free_and_o
       got = [send(rn, nav(route=1, status='unavoidable', controls=[(0, 'stop', 150., 'unavoidable', 77)]), 13., True)[0]
              for _ in range(3)]
       assert 'stopAheadNeedsYou' in got
+
+
+def ahead_said(signal_at=None, vision=False, reason='skew', node=0, frames=None):
+  """The stop-ahead notices said for one unavoidable stop 250 m ahead (node 0: navd had no OSM node, keyed by position)."""
+  rn = RouteNotices()
+  n = nav(controls=[(0, 'stop', 250., 'unavoidable', node, (40.0, -86.0, reason))])
+  out = []
+  for k in range(frames or round((AHEAD_M / 10.) / DT_MDL)):
+    got = rn.update(n[0] if k % 20 == 0 else None, k % 20 == 0, True, 10., True, signal_at=signal_at, vision=vision)
+    if got[0] == 'stopAheadNeedsYou' and (not out or out[-1] != k - 1):
+      out.append(k)
+  return out
+
+
+def test_a_stop_at_a_junction_the_camera_saw_a_signal_at_is_never_said():
+  """Route 29 (2026-11-08, 126 s): 'Stop sign ahead needs you' for a junction mapped as a stop sign that was really a signal,
+  navd with no OSM node for it. Once the camera has seen a signal head there (turnpilotd's signal_junctions, keyed by the node
+  or the junction's position), the stop-ahead notice for it is never said, nor one already queued."""
+  from openpilot.selfdrive.turnpilot.stop_go import SignalJunctions
+  seen = SignalJunctions()
+  assert ahead_said(signal_at=seen.matches)  # nothing seen there yet: said, as on route 29
+  assert seen.add({'osmNodeId': 0, 'lat': 40.0001, 'lon': -86.0001})  # the heads seen at it, ~14 m from navd's node
+  assert not ahead_said(signal_at=seen.matches)
+  # elsewhere (a junction 200 m on) is still a stop sign
+  far = SignalJunctions()
+  far.add({'osmNodeId': 0, 'lat': 40.0018, 'lon': -86.0})
+  assert ahead_said(signal_at=far.matches)
+  # queued behind another alert, then the heads are seen: dropped, never said late
+  rn = RouteNotices()
+  n = nav(controls=[(0, 'stop', 250., 'unavoidable', 0, (40.0, -86.0, 'skew'))], controls_status='ok')
+  rn.update(n[0], True, True, 10., True, free=False)
+  assert [q[0] for q in rn.queue].count('stopAheadNeedsYou') == 1
+  rn.update(n[0], True, True, 10., True, free=False, signal_at=seen.matches)
+  assert 'stopAheadNeedsYou' not in [q[0] for q in rn.queue]
+  heard = {rn.update(None, False, True, 10., True)[0] for _ in range(round(3 * NOTICE_S / DT_MDL))}
+  assert 'stopAheadNeedsYou' not in heard
+
+
+@pytest.mark.parametrize('reason, vision, told', [('skew', True, True), ('geometry', True, True), ('override', True, True),
+                                                  ('reach', True, False), ('light', True, False), ('reach', False, True),
+                                                  ('notSurveyed', False, True)])
+def test_the_stop_ahead_notice_knows_the_mode(reason, vision, told):
+  """Under TurnPilotStopSignGo=vision a stop navd couldn't certify for reach or the light at the line is no handback (the line
+  waits, creeps for a view and goes on what it sees), so 'needs you' would tell the driver more than the car will ask: not
+  said. What vision still hands back (geometry, skew: route 29's junction, -21 deg; an unknown leg, an override) is said, and
+  under every other mode as before."""
+  assert bool(ahead_said(vision=vision, reason=reason, node=77)) == told

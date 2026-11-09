@@ -289,6 +289,18 @@ def test_vision_geometry_hands_back_saying_which(tmp_path, changes, words):
   assert d is not None and d.reason == f"Stop sign: {words}: take control"
 
 
+@pytest.mark.parametrize('changes, words', [({'divided': True}, 'a divided cross road'), ({'rail_distance': 20.}, 'a rail crossing 20 m away')])
+def test_vision_a_signal_head_drops_only_the_stop_signs_rules_never_the_geometry(tmp_path, changes, words):
+  """The review of 2026-11-08: with a signal head seen at the junction (C20) _vision_gate passed whatever certify said, so a
+  rail crossing or a divided cross road (no cross-traffic judgement covers it) went on the vision go. Now only the stop sign's
+  own rules of who goes when (skew, an override, an approach's control unknown) are dropped there: these still hand back."""
+  w = vworld(tmp_path, j=vision_junction(**changes))
+  w.run(0.05)
+  w.sg.signal_seen = True
+  d = gate_fault(w.run(4.))
+  assert d is not None and d.reason == f"Stop sign: {words}: take control"
+
+
 def test_vision_a_yield_says_yield_v10(tmp_path):
   from openpilot.selfdrive.turnpilot.map_controls import YIELD_STOP
   w = vworld(tmp_path, side='off')

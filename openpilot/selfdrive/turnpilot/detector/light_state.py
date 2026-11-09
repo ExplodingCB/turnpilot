@@ -36,11 +36,13 @@ gates is a head, and its state is read (its reason the published Light.reason: r
   demo route the green lamps' pixels lie at 166-181 (1-99%) and the sky's at 195-216, which up to 210 counted as a green
   lamp (a box over a head with sky in its bottom third read green; sky beside a green ball called it an arrow). The night
   green lamp's glow (1d 5:05 thumbnail) is 159-168.
-- positionMismatch: the colour isn't the one its lamp shows (red top, yellow middle, green bottom). Unknown. The thirds stay
-  strict: a box drawn round a glow, its housing unseen, can put a lamp in the middle third, and then it is unknown, never
-  a guess (1d 4:06, the same head, standing: the box's bottom moved 14 px lower and its top held, the lamp changing it
-  seems, and no colour was read until the car left at 4:24; a green may have sat in its middle third. No frame shows it:
-  the samples below will).
+- positionMismatch: the lit lamp sits where its colour's lamp can't (LAMP_SPAN): a red in the lower half of the box, a green
+  in the upper half, a yellow out of the middle third. Unknown. Until 2026-11-08 each colour had to sit in its own third,
+  and at night that rejected the greens: the box is drawn round the lamp's glow, the housing as dark as the sky, so the lamp
+  sits near the box's middle (route 29's light samples, the crops themselves: every night green at 0.55-0.59 of the box,
+  in the middle third, and the governing reds the car stood at glowing the box full, at 0.37; the 1d 4:06 head of 11-06,
+  its box's bottom 14 px lower with the light changed, likely the same). Its own side of the middle still tells the lamp,
+  and the colour is the hue's alone, so a red never reads green for it.
 - arrow: the lit lamp's pixels aren't mirror-symmetric left to right about their own centre, as a ball is and a turn
   arrow is not. A green arrow is unknown: it is never a permission. A yellow arrow is unknown too: a flashing yellow
   arrow is a permissive left, and blocking on it would stall the autonomous left in the phase it is built for. A red
@@ -52,6 +54,9 @@ gates is a head, and its state is read (its reason the published Light.reason: r
   of a yellow ball and 25 of a green ball arrows, so a red arrow must never turn unknown on it alone (the sky in the
   lamp's third made most of the green and yellow balls' arrows: since 2026-11-07 15 of the green and 2 of the yellow
   reads there read their colour).
+The reader reads boxes down to decoder.LIGHT_READ_CONF, under the detector's MIN_CONF (route 29, 2026-11-08: a red read only
+at its line, its heads first boxed at MIN_CONF 40 m out and then not for 1.7 s; the full pass had them at 0.2-0.33 from about
+60 m), and a head from a box under MIN_CONF is published only once it reads a colour or holds a vote.
 A head's state is its vote: VOTE_N of its last VOTE_M reads (a frame it wasn't seen in counts as unknown), which also
 rides out LED flicker. A head governs the car's lane when its bearing lies within GOVERN_BEARING_DEG of the lane's (the
 driving model's path at the head's distance), and the governing state is what all governing heads with a state agree
@@ -74,11 +79,16 @@ import numpy as np
 
 from openpilot.common.params import UnknownKeyName
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.turnpilot.detector.decoder import MIN_CONF
 from openpilot.selfdrive.turnpilot.scene.ranging import Lens, calib_from_view
 
 HEAD_MIN_H_PX = 24          # full-frame px
 MIN_ELEVATION_DEG = 1.0     # the box's bottom edge above the calibrated horizon
-MIN_ASPECT, MAX_ASPECT = 1.8, 4.5  # a vertical 3-lamp head's height over width
+# a vertical 3-lamp head's height over width. 1.8 until 2026-11-08: at night the box is drawn round the lit lamp's glow, the
+# housing as dark as the sky, and is wider than the head (route 29: the governing red the car waited 25 s at boxed 1.65-1.77
+# on every run, a governing green 1.43, a red at 99 m 1.53); a doghouse, a pedestrian signal and a horizontal head stay under
+# 1.4 (about 1.0-1.3, and under 1)
+MIN_ASPECT, MAX_ASPECT = 1.4, 4.5
 INNER_X = 0.15              # each side of the box left out of the lamp counts (pole, backplate edge, sky)
 LIT_V = 150                 # HSV value (0-255) of a lamp pixel...
 LIT_S = 0.35                # ...with this saturation in a lamp hue...
@@ -104,7 +114,16 @@ MIN_COLOR_PX = 3            # saturated pixels in the lit lamp to read a colour 
 COLOR_SHARE = 0.6           # of them, this share in one hue range
 # green to 195, not 210: the sky is 195-216 and green lamps 166-181 (module docstring, noColor)
 HUES = {'red': ((330., 360.), (0., 18.)), 'yellow': ((18., 65.),), 'green': ((120., 195.),)}
-LAMP = {'red': 0, 'yellow': 1, 'green': 2}  # top, middle, bottom of a vertical head
+# where a colour's lit lamp may sit: its core's centre, a share of the box's height down from its top. A vertical head's red is
+# its top lamp, yellow its middle, green its bottom; by day the box is the housing and each lamp sits in its third. At night
+# the box is drawn round the lamp's glow, the housing unseen, and the lamp sits near the box's middle, still on its own side of
+# it (route 29, 2026-11-08: every night green the crops show sat at 0.55-0.59, positionMismatch in the middle third, the one
+# read green at 0.74; reds glowing the box full at 0.37-0.38; the accepted reds 0.12-0.31). So red is the upper half, green
+# the lower, yellow the middle third, and a lamp within MID_BAND of the middle says neither (a glow boxed alone, the box no
+# guide): a colour is never read from the far end of the head from its lamp (a green in the top third, a red in the bottom),
+# and the colour itself is always the hue's (a red lamp never reads green here)
+MID_BAND = 0.03
+LAMP_SPAN = {'red': (0., 0.5 - MID_BAND), 'yellow': (1 / 3, 2 / 3), 'green': (0.5 + MID_BAND, 1.)}
 ARROW_MIN_PX = 10           # lamp pixels needed to judge the lamp's shape; fewer is unknown (tooFewLampPx)
 SYMMETRY_MIN = 0.6          # the lamp's mask against its mirror image about its own centre (IoU): a ball, not an arrow
 ASSUMED_HEAD_M = 5.5        # m, a head's centre over the road (MUTCD clearance 15-19 ft to its bottom)
@@ -270,7 +289,6 @@ def read_head(nv12: np.ndarray, stride: int, y_height: int, lens: Lens, rpy_cali
     return out
   runs = lamp_runs(lamp[:, inner], value[:, inner])
   r0, r1, n, centre, core_rows = max(runs, key=lambda r: r[2])
-  lit = min(int(3 * centre / h), 2)
   # the lamp's colour and shape are read on its run grown through the rows next to it that hold any lamp pixel, never into
   # another run: an arrow's thin head and its glow's thin edge are under ROW_REL, and are the lamp's
   prof = lamp[:, inner].sum(axis=1)
@@ -298,7 +316,8 @@ def read_head(nv12: np.ndarray, stride: int, y_height: int, lens: Lens, rpy_cali
   if color is None:
     out.reason = 'noColor'
     return out
-  if LAMP[color] != lit:
+  lo, hi = LAMP_SPAN[color]
+  if not lo <= centre / h <= hi:
     out.reason = 'positionMismatch'
     return out
   mask = lamp[rows]
@@ -470,7 +489,9 @@ class LightReader:
     if out and (self.sample_t is None or not 0. <= t - self.sample_t < SAMPLE_S):
       self.sample_t = t
       self.sample(t, nv12, stride, y_height, out)
-    return out
+    # a box under the detector's MIN_CONF (decoder.LIGHT_READ_CONF, read for an earlier red) is a head only once it reads a
+    # colour or holds a vote: the boxes that read no lamp stay unpublished, as before, so nothing downstream counts them as heads
+    return [h for h in out if h.conf >= MIN_CONF or h.read != 'unknown' or h.state != 'unknown']
 
   def sample(self, t: float, nv12: np.ndarray, stride: int, y_height: int, heads: list[LightHead]) -> None:
     """Log up to SAMPLE_HEADS of this frame's heads, the governing first, then the unread, then the tallest: each one's read,

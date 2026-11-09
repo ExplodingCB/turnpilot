@@ -18,7 +18,7 @@ from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import Sim
 from openpilot.selfdrive.turnpilot.turn_speed import POST_GO_PROFILES
 from openpilot.selfdrive.turnpilot.turnpilotd import GO_LINE_M, LEFT_NO_MOVE_S, NO_MOVE_S, TurnPilot, auto_left_for, left_range_for
 from openpilot.selfdrive.turnpilot import unprotected_left as ul_mod
-from openpilot.selfdrive.turnpilot.unprotected_left import (CLEAR_WINDOW_S, CREEP_STALL_S, HELD_MIN_M, LIGHT_IN_JUNCTION_REASON,
+from openpilot.selfdrive.turnpilot.unprotected_left import (CLEAR_WINDOW_S, CREEP_STALL_S, HELD_MIN_M, LIGHT_CHANGED_REASON, LIGHT_IN_JUNCTION_REASON,
                                                            LIGHT_RED_MAX_S, LIGHT_WAIT_REASON,
                                                            LONG_WAIT_REASON, ROAD_RANGE_M, STALE_UNDECIDED_S, STAND_UNDECIDED_S,
                                                            r_req, t_req)
@@ -61,6 +61,20 @@ def road_runs(cars=lambda sim: ()):
     boxes = [raw_box(*car_frame(sim, s - sim.s, y)) for s, y in cars(sim) if -5. < s - sim.s < 400.]
     return RawFrame(boxes, 'road', sim.t)
   return raw
+
+
+def with_wide(raw):
+  """raw's runs, and on every third frame it has none a wide camera run seeing nothing (the left's roadAndWide: one wide run
+  in WIDE_EVERY): the cross road's view a red's clearing needs (unprotected_left.CROSS_VIEW_FRESH_S)."""
+  gaps = [0]
+
+  def runs(sim):
+    r = raw(sim)
+    if r is not None:
+      return r
+    gaps[0] += 1
+    return RawFrame([], 'wide', sim.t) if gaps[0] % 3 == 0 else None
+  return runs
 
 
 def left_sim(cars=lambda sim: (), runs=True, sim_cls=Sim):
@@ -880,10 +894,11 @@ def test_a_red_at_the_junction_never_gets_a_go():
   # skeptic G4 (blocker 2), DESIGN G4 go condition 5: a left on a green ball counts as unprotected, so it stands at its line
   # under the red with the band empty (the opposing traffic stopped at its own red). It sent leftGo at 31.75 s and stood in
   # 'go' through the red. Now it waits, silently, and never pulses
+  # (drive 29, 2026-11-08: the signal's own stop at its line holds it there, the left's hold in the junction's mouth beyond)
   sim = signal_sim()
   plans = run_objects(sim, 60.)
   assert not any(str(p.controlPrompt) == 'leftGo' or p.desire == Desire.turnLeft for p in plans)
-  assert sim.s < LINE + 1. and str(plans[-1].unprotectedLeft.state) == 'waitGap'
+  assert sim.s < LINE + 1. and str(plans[-1].unprotectedLeft.state) in ('approach', 'waitGap') and plans[-1].shouldStop
   assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
 
 
@@ -976,8 +991,42 @@ def camera_signal_sim(read):
       sim.sm.put('turnpilotDetections', light_detections(state, JUNCTION + 15. - sim.s, shadow=False))
     return none
   sim.lights = lights
-  sim.raw = road_runs(lambda sim: ((JUNCTION + 60. + V_25 * (3. * (int(sim.t / 3.) + 1) - sim.t), 3.6),) if sim.t < 50. else ())
+  sim.raw = with_wide(road_runs(lambda sim: ((JUNCTION + 60. + V_25 * (3. * (int(sim.t / 3.) + 1) - sim.t), 3.6),) if sim.t < 50. else ()))
   return sim
+
+
+def clearing_go(sim, red_at, words, clear_at, objects=lambda sim: (), seconds=80.):
+  """Kellen, 2026-11-08: a left waiting past its line (the junction's mouth at a mapped signal, or crept for a view) when a red
+  or yellow is first read clears the junction like a driver, on its gap: run sim to seconds, the model stopping from red_at
+  for the red it sees (its shouldStop: on the car it does; turnpilotd lifts the left's go over it, left_clearing). Asserts
+  the car stood held (a blocked view crept for, short of the oncoming lanes), its line words, from the red to its go; the
+  go only once the band was clear CLEAR_WINDOW_S from
+  clear_at (an oncoming car seen holds it until it passes; a view blocked until it opens), lifted over the model's hold
+  (unprotectedLeft certified), the car turned across and out; heard once at the red, never a handback. Returns the plans."""
+  lifted = []
+  plans = []
+  t0, n0 = sim.t, len(sim.trace)
+  for _ in range(int(round(seconds / DT_MDL))):
+    sim.model_holds = sim.t >= red_at and sim.s < JUNCTION  # the model stops for the red it sees, until in the turn
+    turning = sim.tp.desires.started and abs(JUNCTION - sim.s) < 12. and sim.v > 0.3
+    plans.append(sim.step(objects(sim), engaged=True, yaw_rate=sim.v / 8. if turning else 0.))
+    if sim.tp.go_cert.active and sim.tp.go_cert.cause == 'unprotectedLeft':
+      lifted.append(len(plans) - 1)
+  i_red = max(int(round((red_at + 0.5 - t0) / DT_MDL)), 0)
+  go = next(i for i, p in enumerate(plans) if str(p.controlPrompt) == 'leftGo')
+  assert clear_at + CLEAR_WINDOW_S - 0.2 < t0 + go * DT_MDL < clear_at + CLEAR_WINDOW_S + 4., t0 + go * DT_MDL
+  held = plans[i_red:go]
+  # held until the gap, saying it; a view blocked by a turner still creeps for it, short of the oncoming lanes
+  view = ("Creeping for a view", ul_mod.LONG_WAIT_REASON['view'])
+  assert held and all(p.shouldStop and p.reason in (words,) + view for p in held[2:]), sorted({p.reason for p in held})
+  assert any(p.reason == words for p in held)
+  assert all(JUNCTION - s > ONCOMING_ENTRY_M for s, _, _ in sim.trace[n0:n0 + go])
+  assert lifted and lifted[0] >= go  # the go lifted over the model's red hold
+  assert any(p.desire == Desire.turnLeft for p in plans[go:]) and sim.s > JUNCTION + 5.
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS or str(p.unprotectedLeft.state) == 'undecided' for p in plans)
+  spells = heard_spells(selfdrived_alerts(plans), max(int(round((red_at - t0) / DT_MDL)) - 1, 0))
+  assert len(spells) >= 1 and abs(t0 + spells[0][0] * DT_MDL - red_at) < 1.5, spells
+  return plans
 
 
 @pytest.mark.parametrize('green_first', [True, False])
@@ -997,25 +1046,35 @@ def test_a_camera_red_lost_at_the_line_is_waited_for_as_the_lights_said_once_and
   sim = camera_signal_sim(read)
   said = []
   monkeypatch.setattr(ul_mod.cloudlog, 'event', lambda name, *a, **kw: said.append((round(sim.t, 1), name)))
+  if green_first:
+    # drive 29 (2026-11-08): waiting for its gap on the green in the junction's mouth (SIGNAL_LEFT_HOLD_M), past the signal's
+    # line, where the signal's own stop is never made. Until 2026-11-08 the red read there held the car in the junction
+    # until a steady green (LS-4's words). Kellen's ruling: like a driver it clears the junction on its gap, the model
+    # stopping for the red it sees (its hold lifted: left_clearing), the oncoming car every 3 s to 50 s holding it until
+    # the band is clear, said once (left_light_changed), never a handback
+    clearing_go(sim, red_at, LIGHT_CHANGED_REASON, 50.)
+    assert [name for _, name in said if name in ('turnpilot.left_light_changed', 'turnpilot.left_light_wait',
+                                                  'turnpilot.left_no_gap')] == ['turnpilot.left_light_changed']
+    return
   plans = run_objects(sim, green_at)
-  at_line = next(i for i, p in enumerate(plans) if str(p.unprotectedLeft.state) == 'waitGap')
   unseen_i = int(round((lost_at + SIGNAL_UNSEEN_S + 2.) / DT_MDL))  # (a lost read is carried CAMERA_STALE_S first)
-  held = plans[max(at_line, int(round((red_at + 1.) / DT_MDL))):int(round((lost_at + SIGNAL_UNSEEN_S) / DT_MDL))]
-  assert held and all(p.reason == LIGHT_WAIT_REASON['red'] and p.shouldStop for p in held), \
-    {p.reason for p in held}  # never "Waiting for a gap" while the stop for the red holds the car
-  # the red no longer read SIGNAL_UNSEEN_S: said as a through signal's is (AL-2), still held for a green
-  assert all(p.reason == SIGNAL_UNSEEN_REASON and p.shouldStop for p in plans[unseen_i:]), {p.reason for p in plans[unseen_i:]}
-  assert sim.s < LINE + 1. and str(plans[-1].unprotectedLeft.state) == 'waitGap'
-  assert not any(p.desire == Desire.turnLeft or str(p.controlPrompt) == 'leftGo' for p in plans)
-  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS or str(p.unprotectedLeft.state) == 'undecided' for p in plans)
   waits = [(t, name) for t, name in said if name in ('turnpilot.left_light_wait', 'turnpilot.left_light_changed', 'turnpilot.left_light_unseen',
                                                      'turnpilot.left_no_gap', 'turnpilot.left_far_wait')]
-  assert [name for _, name in waits] == (['turnpilot.left_light_changed'] if green_first else []) + ['turnpilot.left_light_unseen']
-  assert 0. < waits[-1][0] - (lost_at + SIGNAL_UNSEEN_S) < 2.
-  # the camera's steady green releases TurnPilot's own stop (CAMERA_GREEN_STEADY_S), then a fresh window on the empty band
-  plans = run_objects(sim, 15.)
+  # arrived on the red (read before the car passed its line): the signal's own stop at its line holds the car, short of the
+  # junction (the left's hold in the mouth beyond it is never reached), its read lost said as any through signal's is, held
+  # for a green
+  stood = int(round(30. / DT_MDL))
+  assert all(p.shouldStop and str(p.mapControl.kind) == 'signal' for p in plans[stood:]), {str(p.mapControl.kind) for p in plans[stood:]}
+  assert all(p.reason == SIGNAL_UNSEEN_REASON for p in plans[unseen_i:]), {p.reason for p in plans[unseen_i:]}
+  assert sim.s < LINE + 1.
+  assert waits == []
+  assert not any(p.desire == Desire.turnLeft or str(p.controlPrompt) == 'leftGo' for p in plans)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS or str(p.unprotectedLeft.state) == 'undecided' for p in plans)
+  # the camera's steady green releases TurnPilot's own stop (CAMERA_GREEN_STEADY_S), then a fresh window on the empty band (from
+  # the signal's line, after the roll up to the mouth)
+  plans = run_objects(sim, 20.)
   go = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
-  assert CAMERA_GREEN_STEADY_S + CLEAR_WINDOW_S - 0.2 < go * DT_MDL < CAMERA_GREEN_STEADY_S + CLEAR_WINDOW_S + 2.
+  assert CAMERA_GREEN_STEADY_S + CLEAR_WINDOW_S - 0.2 < go * DT_MDL < CAMERA_GREEN_STEADY_S + CLEAR_WINDOW_S + (2. if green_first else 8.)
   assert sim.s > JUNCTION + 10. and not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
 
 
@@ -1240,9 +1299,11 @@ def test_a_long_wait_at_the_line_that_wont_end_on_its_own_is_heard_once_never_a_
   assert abs((spells[0][0] - held) * DT_MDL - STAND_UNDECIDED_S) < 1.
   assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
   # the camera's red read at the line all along: the light's wait, heard once at its old bound (LIGHT_RED_MAX_S); lost, it is
-  # said as a through signal's is, at SIGNAL_UNSEEN_S from the loss (the next test), and only that once
+  # said as a through signal's is, at SIGNAL_UNSEEN_S from the loss (the next test), and only that once. At a junction with no
+  # signal mapped, where the left's own hold at its line is the junction's (a mapped signal's own stop holds the car at its
+  # line on a red, the left's hold being in the junction's mouth beyond it: drive 29, 2026-11-08)
   for read, at_s in ((lambda t: 'red', None), (lambda t: 'red' if t < 55. else None, 55. + SIGNAL_UNSEEN_S)):
-    sim = camera_signal_sim(read)
+    sim = unmapped_camera_sim(read)
     plans = run_objects(sim, 230.)
     held = next(i for i, p in enumerate(plans) if p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap')
     spells = heard_spells(selfdrived_alerts(plans), held)
@@ -1255,14 +1316,12 @@ def test_a_long_wait_at_the_line_that_wont_end_on_its_own_is_heard_once_never_a_
   assert heard_spells(selfdrived_alerts(plans), held) == []
 
 
-def test_a_light_changing_with_the_car_crept_into_the_junction_is_said_and_heard_and_the_car_held():
+def test_a_light_changing_with_the_car_crept_into_the_junction_clears_it_on_the_gap():
   """Review 2026-11-07 (LS-4): a signalized left on a green with an opposing left-turner standing in the junction: the car
   crept 4 m for a view, the nose about 3.3 m from the junction's centre; the light went yellow, then red, and it was held
-  there for the whole red (the read red's rail), "Waiting for a Gap / Waiting for the light", never heard: on a cross road of
-  two lanes or more each way that is in the near cross lanes through their green. The hold is kept (going on the band as
-  a driver clearing the junction would is Kellen's call): said in plain words, heard once, never a handback; the next green
-  and the gap, it goes."""
-  from openpilot.selfdrive.turnpilot.unprotected_left import LIGHT_CHANGED_REASON
+  there for the whole red (the read red's rail), never heard: on a cross road of two lanes or more each way that is in the
+  near cross lanes through their green. LS-4 kept the hold, said and heard once. Kellen, 2026-11-08: clear the junction like
+  a driver: the turner's view held until it leaves, then the gap, the go lifted over the model's red hold; said once."""
   yellow_at, red_at, green_at, occ_leaves = 50., 54., 130., 57.
 
   def light_at(t):
@@ -1276,22 +1335,15 @@ def test_a_light_changing_with_the_car_crept_into_the_junction_is_said_and_heard
     if frame[0] % 2:
       return None
     return RawFrame([raw_box(JUNCTION + 6. - sim.s, 3.6)] if sim.t < occ_leaves else [], 'road', sim.t)
-  sim.raw = raw
+  sim.raw = with_wide(raw)
 
   def occluder(sim):
     return ({'cls': 'car', 'x': JUNCTION + 6. - sim.s, 'y': 3.6, 'vx': 0., 'vy': 0., 'age': 40, 'trackId': 7, 'conf': 0.8,
              'camera': 'road'},) if sim.t < occ_leaves else ()
-  plans = run_objects(sim, green_at, occluder)
-  i_red = round((red_at + 1.) / DT_MDL)
+  plans = run_objects(sim, yellow_at, occluder)
   assert sim.s > LINE + 2.  # crept for the view on the green
-  held = plans[round((yellow_at + 0.5) / DT_MDL):]
-  assert all(p.shouldStop and p.reason == LIGHT_CHANGED_REASON for p in held[10:]), sorted({p.reason for p in held})
-  assert all(v < 0.05 for _, v, _ in sim.trace[i_red:])  # held where it stands, never on into the oncoming lanes
-  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS or p.desire == Desire.turnLeft for p in plans)
-  spells = heard_spells(selfdrived_alerts(plans), round(yellow_at / DT_MDL))
-  assert len(spells) == 1 and spells[0][0] * DT_MDL < yellow_at + 1.5, spells
-  plans = run_objects(sim, 15.)
-  assert any(p.desire == Desire.turnLeft for p in plans) and sim.s > JUNCTION + 5.
+  plans += clearing_go(sim, yellow_at, LIGHT_CHANGED_REASON, occ_leaves, occluder, seconds=25.)
+  assert not any(p.desire == Desire.turnLeft for p in plans[:round((occ_leaves + CLEAR_WINDOW_S - 0.2) / DT_MDL)])
 
 
 @pytest.mark.parametrize('after', [None, 'unknown'])
@@ -1309,6 +1361,16 @@ def test_a_lefts_red_no_longer_read_is_said_and_heard_as_a_through_signals_is_an
   sim = camera_signal_sim(read) if mapped else unmapped_camera_sim(read)
   plans = run_objects(sim, 120.)
   lost = int(round(55. / DT_MDL))
+  if mapped:
+    # drive 29 (2026-11-08): a mapped signal's own stop holds the car at its line on the red (the left's hold is in the
+    # junction's mouth beyond it): its lost read said as the through signal's own, heard once, the car held for a green
+    held = next(i for i, p in enumerate(plans) if p.shouldStop and sim.trace[i][1] < 0.05)
+    spells = heard_spells(selfdrived_alerts(plans), held)
+    assert len(spells) == 1 and 0. < (spells[0][0] - lost) * DT_MDL < SIGNAL_UNSEEN_S + 2., spells
+    assert plans[-1].reason == SIGNAL_UNSEEN_REASON and str(plans[-1].mapControl.kind) == 'signal'
+    assert all(p.shouldStop for p in plans[held:]) and sim.s < LINE + 1.
+    assert not any(p.desire == Desire.turnLeft or str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+    return
   held = next(i for i, p in enumerate(plans) if p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap')
   assert held < lost
   shown = selfdrived_alerts(plans)
@@ -1325,7 +1387,7 @@ def test_a_lefts_red_no_longer_read_is_said_and_heard_as_a_through_signals_is_an
 def crept_at_a_light(before):
   """camera_signal_sim with an opposing left-turner standing 6 m past the junction (an occluder: the car creeps 3.8 m for the
   view) until 57 s; the light read as before until 50 s (None: nothing read), yellow to 54 s, red to 130 s, then green.
-  Returns (sim, plans to 130 s)."""
+  Returns (sim, its occluder's objects, plans to 50 s)."""
   yellow_at, red_at, green_at, occ_leaves = 50., 54., 130., 57.
 
   def light_at(t):
@@ -1338,44 +1400,49 @@ def crept_at_a_light(before):
     if frame[0] % 2:
       return None
     return RawFrame([raw_box(JUNCTION + 6. - sim.s, 3.6)] if sim.t < occ_leaves else [], 'road', sim.t)
-  sim.raw = raw
+  sim.raw = with_wide(raw)
 
   def occluder(sim):
     return ({'cls': 'car', 'x': JUNCTION + 6. - sim.s, 'y': 3.6, 'vx': 0., 'vy': 0., 'age': 40, 'trackId': 7, 'conf': 0.8,
              'camera': 'road'},) if sim.t < occ_leaves else ()
-  return sim, run_objects(sim, green_at, occluder)
+  return sim, occluder, run_objects(sim, yellow_at, occluder)
 
 
 @pytest.mark.parametrize('before', [None, 'unknown'])
-def test_a_red_read_with_the_car_crept_into_the_junction_on_an_unread_light_is_said_and_heard(before):
-  """Review 2026-11-07 (LEFTS-3): LS-4's cue (the car crept for a view, then a red: said, heard once) fired only after a
-  green was read at the line, but a mapped signal with no colour read is 'none' to the left (turn_light), so it creeps for a
-  view on an unread light, at night the norm (no governing head's colour read on 11-06). The yellow, then the red, read with
-  the nose 3.3 m from the junction's centre: "Waiting for the light" on every frame of the red, nothing heard, the car stood
-  in the near cross lanes through their green. Now the first red or yellow of the hold with the car past its line is said
-  in plain words (no change was read: "Red light: holding in the junction") and heard once, the car held where it stands."""
-  sim, plans = crept_at_a_light(before)
-  yellow_at, red_at = 50., 54.
+def test_a_red_read_with_the_car_crept_into_the_junction_on_an_unread_light_clears_it_on_the_gap(before):
+  """Review 2026-11-07 (LEFTS-3): LS-4's cue fired only after a green was read at the line, but a mapped signal with no colour
+  read is 'none' to the left (turn_light), so it creeps for a view on an unread light, at night the norm. The yellow, then
+  the red, read with the nose 3.3 m from the junction's centre: "Waiting for the light", nothing heard, the car stood in the
+  near cross lanes through their green. LEFTS-3 said it and kept the hold. Kellen, 2026-11-08: it clears the junction on
+  the gap, "Red light: clearing the junction" (no change was read) heard once, the turner's view held until it leaves."""
+  sim, occluder, plans = crept_at_a_light(before)
   assert sim.s > LINE + 2.  # crept for the view on the unread light
-  held = plans[round((yellow_at + 0.5) / DT_MDL):]
-  assert all(p.shouldStop and p.reason == LIGHT_IN_JUNCTION_REASON for p in held[10:]), sorted({p.reason for p in held})
-  assert all(v < 0.05 for _, v, _ in sim.trace[round((red_at + 1.) / DT_MDL):])  # held where it stands
-  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS or p.desire == Desire.turnLeft for p in plans)
-  spells = heard_spells(selfdrived_alerts(plans), round(yellow_at / DT_MDL))
-  assert len(spells) == 1 and spells[0][0] * DT_MDL < yellow_at + 1.5, spells
-  plans = run_objects(sim, 15.)
-  assert any(p.desire == Desire.turnLeft for p in plans) and sim.s > JUNCTION + 5.
+  clearing_go(sim, 50., LIGHT_IN_JUNCTION_REASON, 57., occluder, seconds=25.)
 
 
 def test_a_red_read_with_the_car_standing_at_its_line_is_no_hold_in_the_junction():
   """LEFTS-3's key is the car past its line (the nearer of its first latch and LINE_D), never the metres since the latch: a
   car held at its line when the red comes (nothing crept) is waiting for the light, not holding in the junction, and heard
   only at the long wait's bound."""
-  sim = camera_signal_sim(lambda t: None if t < 40. else 'red')
+  # at a junction with no signal mapped the hold is at its line (a mapped one's is in the junction's mouth: below)
+  sim = unmapped_camera_sim(lambda t: None if t < 40. else 'red')
+  sim.raw = road_runs(lambda sim: ((JUNCTION + 60. + V_25 * (3. * (int(sim.t / 3.) + 1) - sim.t), 3.6),) if sim.t < 50. else ())
   plans = run_objects(sim, 80.)
   held = plans[round(41. / DT_MDL):]
   assert sim.s < LINE + 1. and all(p.reason == LIGHT_WAIT_REASON['red'] for p in held), {p.reason for p in held}
   assert heard_spells(selfdrived_alerts(plans), round(40. / DT_MDL)) == []
+
+
+def test_a_red_read_with_the_car_waiting_in_a_signalized_junctions_mouth_clears_the_junction_on_the_gap():
+  """Drive 29 (2026-11-08): at a mapped signal the left waits for its gap in the junction's mouth (SIGNAL_LEFT_HOLD_M), past
+  the signal's line: a red read there (no green read before it: the car's night) is a red with the car in the junction.
+  Until 2026-11-08 held where it stood (LS-4's words, heard once). Kellen: like a driver, clear the junction: the oncoming
+  car every 3 s to 50 s holds it until the band is clear, then it goes, lifted over the model's red hold, said and heard
+  once (LIGHT_IN_JUNCTION_REASON), no handback."""
+  sim = camera_signal_sim(lambda t: None if t < 40. else 'red')
+  run_objects(sim, 40.)
+  assert sim.s > LINE + 1. and JUNCTION - sim.s > ONCOMING_ENTRY_M  # in the mouth, past the signal's line
+  clearing_go(sim, 40., LIGHT_IN_JUNCTION_REASON, 50., seconds=25.)
 
 
 def test_a_signal_held_with_its_light_unseen_is_heard_once_and_still_held():
@@ -2202,3 +2269,124 @@ def test_a_go_withdrawn_in_its_launch_has_its_pulse_cleared_while_the_hold_brake
   assert first is not None and str(plans[first].unprotectedLeft.state) == 'go', "no fresh pulse at the next go"
   assert not any(p.desire == CLEAR_DESIRE for p in plans[:first])
   assert sim.s > JUNCTION + 10.
+
+
+# --- drive 29 (2026-11-08): a left at a signal rolls up to the junction's mouth on the model and judges there ---
+
+def mouth():
+  from openpilot.selfdrive.turnpilot.map_controls import SIGNAL_LEFT_HOLD_M
+  return JUNCTION - SIGNAL_LEFT_HOLD_M
+
+
+@pytest.mark.parametrize('oracle', [True, False], ids=['green', 'unread'])
+@pytest.mark.parametrize('dark', [False, True], ids=['day', 'night'])
+def test_a_left_on_a_green_ball_is_never_held_at_the_line_and_goes_from_the_junctions_mouth(oracle, dark):
+  """Drive 29 (cause 1): every left at a signal was held at a hold line 9 m short (SIGNAL_PROTECTS_LEFT False, the
+  unprotected hold's stop there on a green too), the oncoming lanes judged from behind the stop line, and the driver drove
+  every one. Now at a mapped signal on a green, read (an accepted source's) or not read at all (the car's night: no accepted
+  source, its reader's greens rejected), the car rolls past the line to the junction's mouth (SIGNAL_LEFT_HOLD_M), judges
+  the oncoming band there and goes when it is clear; never a stand at the line, never a take-control."""
+  from openpilot.selfdrive.turnpilot.darkness import DarkFilter
+  sim = signal_sim(red_until=0., oracle=oracle)
+  sim.tp.dark_filter = DarkFilter(dark=dark)
+  plans = run_objects(sim, 60.)
+  go = next(i for i, p in enumerate(plans) if str(p.controlPrompt) == 'leftGo')
+  stands = [s for s, v, _ in sim.trace[:go] if v < 0.3 and s > JUNCTION - 40.]
+  assert stands and min(stands) > LINE + 1.5, f"stood {JUNCTION - min(stands):.1f} m short of the junction"
+  assert mouth() - 1.5 <= sim.trace[go][0] < JUNCTION - ONCOMING_ENTRY_M
+  assert sim.s > JUNCTION + 10. and not any(p.turnMissed for p in plans)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  assert not any(str(p.unprotectedLeft.state) == 'undecided' for p in plans)
+
+
+def test_a_left_at_a_signal_waits_for_its_gap_in_the_junctions_mouth_and_goes_after_the_stream():
+  """Drive 29 (cause 1): the oncoming band busy at a mapped signal, no light read (the car's config: no accepted source):
+  the car waits in the junction's mouth, short of the oncoming lanes, never at the stop line, and goes once the stream ends."""
+  sim = signal_sim(oracle=False)
+  stream_until = 40.
+  sim.raw = road_runs(lambda sim: ((JUNCTION + 60. + V_25 * (3. * (int(sim.t / 3.) + 1) - sim.t), 3.6),) if sim.t < stream_until else ())
+  plans = run_objects(sim, 75.)
+  go = next(i for i, p in enumerate(plans) if str(p.controlPrompt) == 'leftGo')
+  assert go * DT_MDL > stream_until
+  waited = [s for s, v, p in sim.trace[:go] if v < 0.05 and str(p.unprotectedLeft.state) == 'waitGap']
+  assert waited and all(mouth() - 1.5 <= s < JUNCTION - ONCOMING_ENTRY_M for s in waited)
+  assert sim.s > JUNCTION + 10.
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+
+
+def test_a_red_read_on_the_approach_to_a_signalized_left_stops_the_car_at_the_stop_line():
+  """The hard rail at the mouth's hold: a red read (an accepted source's here) stops the car at the signal's own line, short
+  of the junction, and the left never goes while it is read (its line the light's wait); on the green it rolls up to the
+  mouth and goes."""
+  sim = signal_sim(red_until=50.)
+  plans = run_objects(sim, 80.)
+  red = sim.trace[:round(50. / DT_MDL)]
+  assert not any(p.desire == Desire.turnLeft or str(p.unprotectedLeft.state) in ('go', 'committed') for _, _, p in red)
+  assert max(s for s, _, _ in red) < JUNCTION - 8. and red[-1][1] < 0.05
+  assert sim.s > JUNCTION + 10.
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+
+
+def test_a_red_read_too_late_for_the_signals_line_holds_the_left_in_the_mouth_never_overrun():
+  """Drive 29 (cause 6): the camera's red first read with the car at the signal's line, rolling (483 s: 'stop' decided 0.2 m
+  from the line at 4.3 m/s, infeasible, overrun) and the left's hold crossed as an overrun, 'Unprotected left not checked'.
+  A red read with no room left at the line still has room at the left's hold in the mouth: the car stops there, short of the
+  oncoming lanes, the left waiting for the light, never driven nor gone, and it goes on the green."""
+  line = JUNCTION - 8.5
+  light = {'state': 'green'}
+
+  def lights(sim):
+    if light["state"] == "green" and sim.s >= line - 0.3 and sim.t < 40.:
+      light['state'] = 'red'
+    if sim.t >= 40.:
+      light['state'] = 'green'
+    msg = messaging.new_message('turnpilotLights')
+    msg.turnpilotLights.source = 'simOracle'
+    msg.turnpilotLights.lights = [{'state': light['state'], 'distance': line - sim.s, 'instance': 'trafficLight 1'}]
+    return msg.as_reader().turnpilotLights
+  sim = signal_sim(oracle=True)
+  sim.lights = lights
+  plans = run_objects(sim, 70.)
+  red_i = next(i for i, (s, _, _) in enumerate(sim.trace) if s >= line - 0.3)
+  assert sim.trace[red_i][1] > 1.  # rolling when the red came
+  assert any(str(p.mapControl.kind) == 'signal' and str(p.mapControl.action) == 'infeasible' for p in plans)  # too late for its line
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)  # never 'Unprotected left not checked'
+  during = sim.trace[red_i:round(40. / DT_MDL)]
+  stood = [s for s, v, _ in during if v < 0.05]
+  assert stood and max(stood) < JUNCTION - ONCOMING_ENTRY_M
+  assert not any(p.desire == Desire.turnLeft or str(p.unprotectedLeft.state) in ('go', 'committed', 'undecided')
+                 for _, _, p in during)
+  assert sim.s > JUNCTION + 10.
+
+
+@pytest.mark.parametrize('tap_s, tracks', [(0.1, False), (0.3, False), (1.0, False), (0.3, True)])
+def test_a_gas_tap_at_the_line_in_an_oncoming_stream_never_releases_the_left(tap_s, tracks):
+  """The review of 2026-11-08 (probe_gas_tap, a regression pin: no misbehaviour found): waiting for its gap at the line in an
+  unbroken oncoming stream, a gas tap of 0.1-1 s with openpilot engaged moves the car nowhere, releases nothing (no driver's
+  release, no turn desire), and the left goes on waiting for its gap, short of the oncoming lanes."""
+  stream = [JUNCTION + 60. + k * 3. * V_25 for k in range(40)]
+  t0 = [None]
+
+  def cars(sim):
+    if t0[0] is None and JUNCTION - sim.s < 60.:
+      t0[0] = sim.t
+    dt = sim.t - t0[0] if t0[0] is not None else 0.
+    return [(s - V_25 * dt, 3.6) for s in stream]
+  sim = left_sim(cars)
+
+  def objs():
+    if not tracks:
+      return ()
+    return tuple({'cls': 'car', 'x': s - sim.s, 'y': y, 'vx': -V_25, 'vy': 0., 'age': 60, 'trackId': 50 + k, 'conf': 0.8,
+                  'camera': 'road'} for k, (s, y) in enumerate(cars(sim)) if -5. < s - sim.s < 150.)
+  while not (sim.tp.left_now is not None and sim.tp.left_now.state == 'waitGap' and sim.v < 0.05):
+    sim.step(objs(), engaged=True)
+    assert sim.t < 120.
+  for _ in range(int(3. / DT_MDL)):
+    sim.step(objs(), engaged=True)
+  s0 = sim.s
+  tap = [sim.step(objs(), engaged=True, gas=True) for _ in range(int(tap_s / DT_MDL))]
+  assert sim.s - s0 < 0.05 and all(p.shouldStop for p in tap)
+  plans = [sim.step(objs(), engaged=True) for _ in range(int(20. / DT_MDL))]
+  assert sim.tp.scene.released_id is None and sim.tp.left.state == 'waitGap'
+  assert JUNCTION - sim.s > ONCOMING_ENTRY_M and not any(p.desire == Desire.turnLeft for p in plans)

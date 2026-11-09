@@ -22,7 +22,7 @@ from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import (LEFT_AT_A_RED, 
                                                                  go_from_a_red, go_from_the_hold, junction_of, oracle_lights, stand, stop_at,
                                                                  walker_stops_the_car)
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import (JUNCTION, LEFT_25, TEST_RANGE_M, V_25, drive, left_sim, road_runs,
-                                                                      run_objects, signal_sim)
+                                                                      run_objects, signal_sim, unmapped_camera_sim)
 from openpilot.selfdrive.turnpilot.turnpilotd import (GO_OVERRIDE_DEFAULT, LEFT_NO_MOVE_S, LEFT_LIFT_ROOM_M, NO_MOVE_REASON, NO_MOVE_S,
                                                        RELEASE_UNSIGNALIZED, STALL_PROMPT_S, go_override_for)
 from openpilot.selfdrive.turnpilot.unprotected_left import (LEFT_LAUNCH_SPEED, LINE_D, LONG_WAIT_REASON, MODEL_HOLD_REASON, WITHDRAWN_REASON,
@@ -523,7 +523,9 @@ def slow_launch(a, lifted, cars=lambda sim: (), seconds=40., radius_m=8.):
   from openpilot.selfdrive.turnpilot import unprotected_left as ul
   from openpilot.selfdrive.turnpilot.unprotected_left import FULL_PASS_RANGE_M
   with mock.patch.object(ul.cloudlog, 'event') as event:
-    sim = left_sim(cars) if lifted else signal_sim(oracle=False)
+    # unlifted: a junction the camera boxes a light at (HR-2); a mapped signal's left goes from the junction's mouth since
+    # drive 29 (2026-11-08), too near the oncoming lanes for a launch to be judged (launch_armed)
+    sim = left_sim(cars) if lifted else unmapped_camera_sim(lambda t: 'unknown')
     if not lifted:
       sim.raw = road_runs(cars)
     sim.tp.full_pass_range_m = FULL_PASS_RANGE_M
@@ -821,7 +823,8 @@ def committed_left_stopped_by_a_walker(signal=False):
   assert go(plans[-1])[0] in ('unprotectedLeft', 'none')
   attach_planner(sim, holding)
   stand(sim, 2.5, objects=WALKER)  # stand pins the car where the walker stops it
-  assert JUNCTION - sim.s - ONCOMING_ENTRY_M > 1.
+  # short of the oncoming lanes (at a signal the go is from the junction's mouth since drive 29, 2026-11-08: nearer them)
+  assert JUNCTION - sim.s - ONCOMING_ENTRY_M > (0.5 if signal else 1.)
   state['car'], state['t'] = sim.s + 45., sim.t
   s0 = sim.s
   return sim, [sim.step(WALKER_CLEAR, engaged=True)] + drive(sim, 6. - DT_MDL), s0, lambda: state['car'] - V_25 * (sim.t - state['t'])
@@ -1171,7 +1174,6 @@ def test_a_head_first_boxed_mid_lift_at_an_unsignalized_left_never_ends_its_lift
   go: a head first boxed mid-lift (a streetlight read as one as the car turns, a far-side head on the cross road coming into
   frame) never ends that lift at a junction with no signal, which would stand the car and hand it back (no_move); a red read
   there still withdraws it (test_a_shadow_camera_red_coming_mid_go_withdraws_it)."""
-  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import unmapped_camera_sim
   st = {'go_t': None}
 
   def read(t):
@@ -1201,22 +1203,66 @@ def test_a_left_with_the_cameras_red_at_an_unmapped_signal_is_never_gone_nor_lif
   assert sim.s - s_hold < 0.1 and str(plans[-1].unprotectedLeft.state) == 'waitGap'
 
 
-def test_the_lefts_lift_stays_on_an_accepted_green_or_where_no_signal_is():
-  """The lift is unchanged where the light is an accepted source's green (the sim's oracle) or there is no signal at all."""
-  for unsignalized in (True, False):
-    sim = left_sim()
-    if not unsignalized:
-      sim = Sim(LEFT_25, controls=[(JUNCTION - 8.5, 'signal')])
-      sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps = 'auto', TEST_RANGE_M, False
-      sim.answers_prompt = True  # the driver signals the left when prompted: it goes only with a lamp lit (LEFT_GO_NEEDS_SIGNAL, tp/blinker)
-      sim.tp.oracle_ok, sim.lights = True, oracle_lights('green', JUNCTION - 8.5)
-      sim.raw = road_runs()
-    while not (sim.trace and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
-      drive(sim, DT_MDL)
-      assert sim.t < 60.
-    attach_planner(sim, holding)
-    plans = []
-    while not any(go(p)[0] != 'none' for p in plans[-1:]):
-      plans += drive(sim, DT_MDL)
-      assert sim.t < 90.
-    assert go(plans[-1])[0] == 'unprotectedLeft'
+def test_the_lefts_lift_stays_where_no_signal_is_and_a_signalized_left_goes_from_the_mouth_with_the_model():
+  """The lift is unchanged where there is no signal at all. Drive 29 (2026-11-08): at a mapped signal on an accepted source's
+  green the left goes from the junction's mouth (SIGNAL_LEFT_HOLD_M), too near the oncoming lanes for the lift's nudge
+  ('room'), so its go only lets TurnPilot's latch go and the model, planning motion at the green it sees, pulls away: never
+  lifted over the model at a light."""
+  sim = left_sim()
+  while not (sim.trace and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
+    drive(sim, DT_MDL)
+    assert sim.t < 60.
+  attach_planner(sim, holding)
+  plans = []
+  while not any(go(p)[0] != 'none' for p in plans[-1:]):
+    plans += drive(sim, DT_MDL)
+    assert sim.t < 90.
+  assert go(plans[-1])[0] == 'unprotectedLeft'
+  sim = Sim(LEFT_25, controls=[(JUNCTION - 8.5, 'signal')])
+  sim.tp.auto_left, sim.tp.left_range_m, sim.go_taps = 'auto', TEST_RANGE_M, False
+  sim.answers_prompt = True  # the driver signals the left when prompted: it goes only with a lamp lit (LEFT_GO_NEEDS_SIGNAL, tp/blinker)
+  sim.tp.oracle_ok, sim.lights = True, oracle_lights('green', JUNCTION - 8.5)
+  sim.raw = road_runs()
+  while not (sim.trace and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
+    drive(sim, DT_MDL)
+    assert sim.t < 60.
+  assert sim.s > JUNCTION - 8.5  # past the signal's line, in the junction's mouth
+  attach_planner(sim, moving_from_rest)
+  plans = drive(sim, 20.)
+  assert any(p.desire == Desire.turnLeft for p in plans) and sim.s > JUNCTION + 5.
+  assert all(go(p)[0] == 'none' for p in plans) and not any(lifted for _, _, lifted in sim.planned)
+
+
+@pytest.mark.parametrize('mapped', [True, False], ids=['mappedSignal', 'boxedHead'])
+def test_a_left_the_model_waits_on_without_stopping_goes_and_the_model_follows_its_pulse(mapped):
+  from openpilot.selfdrive.turnpilot import unprotected_left as ul_mod
+  """Drive 29 (2026-11-08, 461-467 s): at a signal turned green, the model planning motion only in flickers (its takeover
+  predicate under TAKEOVER_S) and not stopping (no shouldStop), the left's window never counted (LeftInput.model_holds: the
+  predicate not held at a light) and its go never came: "Waiting for the car to pull away" until the driver drove it. The
+  model waits for the turn the go pulses. Now only the model's own stop (shouldStop: a red it sees) holds the left; its plan
+  standing without one, the left judges its gap and goes, unlifted (never over the model at a light), and the model takes
+  the pulse."""
+  def model(sim):
+    if sim.tp.desires.started:
+      return moving_from_rest(sim)
+    return model_v2(*sim.model_lanes, holds=True, should_stop=False, **sim.model_kw)  # standing, no stop of its own
+  sim = signal_sim(oracle=False) if mapped else unmapped_camera_sim(lambda t: 'unknown')
+  while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
+    run_objects(sim, DT_MDL)
+    assert sim.t < 60.
+  assert sim.tp.left_lift_refused(sim.tp.follower.distance) != ''  # never lifted there
+  attach_planner(sim, model)
+  plans = run_objects(sim, 20.)
+  go_i = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
+  assert go_i * DT_MDL < ul_mod.CLEAR_WINDOW_S + 1.5
+  assert sim.s > JUNCTION + 5. and all(go(p)[0] == 'none' for p in plans) and not any(l for _, _, l in sim.planned)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  # the model stopping (a red it sees) still holds it: never a go
+  sim = signal_sim(oracle=False) if mapped else unmapped_camera_sim(lambda t: 'unknown')
+  while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
+    run_objects(sim, DT_MDL)
+    assert sim.t < 60.
+  attach_planner(sim, holding)
+  plans = run_objects(sim, 20.)
+  assert not any(p.desire == Desire.turnLeft for p in plans)
+  assert all(p.reason == MODEL_HOLD_REASON['light'] for p in plans[round(1. / DT_MDL):]), {p.reason for p in plans}

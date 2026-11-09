@@ -21,8 +21,15 @@ line says why, the log has it once, and the safety driver supervises.
 A missing frame is never clear. Never a handback for what the camera can't see (Kellen, 2026-11-07: "no, no handbacks. that
 kinda thing is for the final public build, we just NEED to be ready to test"; a safety driver supervises every drive): an
 R_req past the camera's reach, by day or after dark, or past where the opposing road bends out of the band, is judged on the
-band the camera covers (out to the smaller of its reach, R_req and the straight run), a car seen there holding the left; and
-a left in a lane it doesn't leave from (LC-03) is driven from the lane it is in. turnpilot.left_reach logs, once per hold at
+band the camera covers (out to the smaller of its reach, R_req and the straight run), a car seen there holding the left. A
+left in a lane it doesn't leave from (LC-03) is skipped out loud and rerouted by turnpilotd (Kellen, 2026-11-08, drive 29:
+never taken across a lane from the wrong one; driven from the lane it was in from 2026-11-07, LN-5), but for one LC-03
+flags only once the car stands held at its line (wrong_lane, crossed_lanes, a car beside holding it: LS-1, LEFTS-2).
+At a mapped signal the hold is in the junction's mouth (map_controls.SIGNAL_LEFT_HOLD_M, LeftInput.line_m; drive 29: every
+left at a green ball was held 9 m short, the driver driving them all): the approach is the model's, the signal's own control
+stops the car at its line for a red or yellow read, and on a green, read or not, the car rolls up to the mouth and the gap
+rule judges the oncoming lanes from there. Its stop line is behind it there, so a red read while it waits is a red in the
+junction (LS-4's words), and the car clears the junction on its gap (2026-11-08). turnpilot.left_reach logs, once per hold at
 the line, how far that band reached against R_req and what it fell short for. The paragraphs below that say 'hands back'
 for range, night or curve describe the build before.
 
@@ -96,7 +103,8 @@ map_controls.release_light), so the model's own red-light hold stays and a shado
 only add one). A signal mapped there with no colour read is 'none' to the left (turn_light, Kellen, 2026-11-07: an unread light
 is no reason to wait), so SIGNAL_NEEDS_GREEN holds only where navd can't say whether a signal is there ('unknown'). A red or
 yellow read keeps the left waiting at its line for as long as it is read, the light changing from the green it waited on too
-(lightChange): held where it stands, short of the oncoming lanes, its window starting over. A red or yellow that raised
+(lightChange): held where it stands, short of the oncoming lanes, its window starting over; but one first read with the car
+past its line clears the junction on its gap (below: 2026-11-08). A red or yellow that raised
 TurnPilot's own signal stop there (the camera's add-only, the car's only source, or an accepted source's) stays the left's
 light once no longer read, for as long as that stop is in force (turn_light; a light gone unread keeps a stop): gone on the
 green that releases it (a steady camera green for the camera's, an accepted one for an accepted red's). At a junction the map
@@ -109,14 +117,23 @@ LIGHT_RED_MAX_S handed back; now each is said once (left_light_changed, left_lig
 nothing read (LeftInput.light_read false: the stop in force, the latch) is said as a through signal's light unseen is,
 SIGNAL_UNSEEN_S from the loss, its line SIGNAL_UNSEEN_REASON and one chime (left_light_unseen; review 2026-11-07 AL-2: it
 was "Waiting for the light" and silent to LIGHT_RED_MAX_S from the hold, 124 s after the loss); LIGHT_RED_MAX_S is a red still
-read. A red or yellow read with the car crept past its line (into the junction for a view) is said and heard once, the car
-held where it stands: "Light changed: holding in the junction" after a green it stood on, "Red light: holding in the
-junction" on a light it never read green (LS-4, LEFTS-3).
+read. A red or yellow first read with the car past its line (in a signal's junction mouth, or crept into the junction for a
+view) is said and heard once, and the car clears the junction as a driver does (Kellen, 2026-11-08; held where it stood
+until then): the light is no hold of the left's for that spell (LeftDecision.clearing: turnpilotd lifts its go over the
+light and the model's red hold), the go on its gap, a car seen in the band holding it until it passes. "Light changed:
+clearing the junction" after a green it stood on, "Red light: clearing the junction" on a light it never read green (LS-4,
+LEFTS-3). A red read with the car short of its line, or at it, holds it there for the green as before. Since the review of
+2026-11-08 only a car that stood past the line (the mapped signal's own: signal_line_m) on a light not red before the spell
+clears (a steady green read there, or CLEAR_STAND_S with no red read); a red first read as it rolls in holds it where its
+hold is, for the green; and the clearing go waits for the cross road too (cross_closing: nothing closing within the time it
+needs to be out; with no wide camera run, no view of it, a plain-words wait in the mouth, never a handback).
 Where plannerd wouldn't lift the go over the model's own hold (turnpilotd.left_lift_refused: at a signal with no accepted
 green, which on the car is every signal; where the camera boxes a light with none mapped, HR-2; too near the oncoming lanes
 for the lift's nudge; TurnPilotGoOverride off), the go only lets TurnPilot's latch go, so the model has to pull away itself:
-there the model planning no motion (its takeover predicate not held: LeftInput.model_holds) holds the left at its line, its
-window starting over, its line the light's ("Waiting at the light") where a light is known or boxed at the junction, else
+there the model's own stop (modelV2.action.shouldStop: a red it sees; LeftInput.model_holds; until 2026-11-08 its takeover
+predicate not held, which kept the window from counting at a green where the model waits for the turn the go pulses: drive
+29, 461-467 s) holds the left at its line, its window starting over, its line the light's ("Waiting at the light") where a
+light is known or boxed at the junction, else
 "Waiting for the car to pull away" (a head boxed on the approach alone: LEFTS-4), and its go comes once the model's plan
 moves, with the model (review 2026-11-07, LS-2: the go came at the model's red and cantStartTakeControl held the car 1 s later
 until a disengage, at every mapped signal on the car). A go of the hold the model then didn't follow is retried the same
@@ -179,7 +196,8 @@ from dataclasses import dataclass, field
 
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
-from openpilot.selfdrive.turnpilot.map_controls import LATCH_PAST_M, SIGNAL_UNSEEN_REASON, SIGNAL_UNSEEN_S, reengage_stop_m, unprotected_turn
+from openpilot.selfdrive.turnpilot.map_controls import (CAMERA_GREEN_STEADY_S, LATCH_PAST_M, SIGNAL_UNSEEN_REASON, SIGNAL_UNSEEN_S,
+                                                        reengage_stop_m, unprotected_turn)
 from openpilot.selfdrive.turnpilot.route_follower import UNCERTAIN_M
 from openpilot.selfdrive.turnpilot.scene_policy import (CROSSWALK_X_AFTER_M, CROSSWALK_X_BEFORE_M, ONCOMING_ENTRY_M, ONCOMING_PAST_M,
                                                         ONCOMING_Y_FAR_M, ONCOMING_Y_NEAR_M, STOP_DECEL, VEHICLES, box_overlap,
@@ -380,10 +398,35 @@ LIGHT_RED_MAX_S = 150.
 # is a signal (navd's controls failing)
 LIGHT_WAIT_REASON = {'red': "Waiting for the light", 'yellow': "Waiting for the light",
                      'unknown': "Waiting: can't tell if there's a light"}
-# ...and while a red or yellow read after it stood on a green holds it crept past its line (LS-4): heard once as it starts
-LIGHT_CHANGED_REASON = "Light changed: holding in the junction"
-# ...or one read with it crept past its line on a light it never read green (LEFTS-3: no change was read, so none is said)
-LIGHT_IN_JUNCTION_REASON = "Red light: holding in the junction"
+# ...and while a red or yellow read after it stood on a green, with the car past its line, has it clear the junction on its
+# gap (LS-4; Kellen, 2026-11-08: no longer held there): heard once as it starts
+LIGHT_CHANGED_REASON = "Light changed: clearing the junction"
+# ...or one read with it past its line on a light it never read green (LEFTS-3: no change was read, so none is said)
+LIGHT_IN_JUNCTION_REASON = "Red light: clearing the junction"
+# The review of 2026-11-08: the clearing fired on a red first read late, the car still rolling over the line (a red it never
+# stood on a green for), and its go judged the oncoming band alone, the cross road (which has the green on our red) unlooked
+# at. Now the car clears only when it stood past the line on a light not red before the spell: a steady green read there
+# (CAMERA_GREEN_STEADY_S, the camera stop's own release: a one-frame green flicker between reds arms nothing), or
+# CLEAR_STAND_S standing there with no red or yellow read and the model not holding. CLEAR_STAND_S: the camera reads at ~5 Hz
+# on road runs and a head's state is VOTE_N of its last VOTE_M reads (light_state: 4 of 5, a red in view is said within
+# about 1 s), carried CAMERA_STALE_S (1 s) between runs: a steady red in view the whole stand would have been read by 2 s;
+# 3 s of stand with no red read is a light that changed during it, not one read late. Only before any red this hold: after
+# one, only a steady green there arms it again (an unread spell between reds is the same red; on the car map_controls keeps
+# such a red in force anyway). Once armed a creep for a view keeps it; a red first read otherwise (rolling in, short of the
+# stand) holds the car where its hold is, for the green
+CLEAR_STAND_S = 3.
+CLEAR_STAND_V = 0.3        # m/s: standing, for that stand (the decider's own standing speed, under the creep's)
+# ...and before its go (and while it can still stop after it) nothing closing in the cross lanes: a vehicle track within
+# CROSS_X_M of the maneuver point along our approach, moving across our path (|vy| over CROSS_MOVING_V and over |vx|) toward
+# it, there within the time the car needs to be out of the junction (t_req on one lane: the go's latency, the launch through
+# the junction, PET_S), or already across it. Judged only with a view of the cross road: a wide camera run (the full wide or a
+# side view: the left asks roadAndWide, one wide run in WIDE_EVERY of the detector's) within CROSS_VIEW_FRESH_S, three of
+# those runs missed; without one the car holds where it stands, said in plain words, never a handback
+CROSS_X_M = 12.            # a four-lane cross road's half width (7 m), the junction's spread and our position's error
+CROSS_MOVING_V = 1.
+CROSS_PATH_HALF_M = 1.5    # m either side of our path a crossing vehicle's centre is in it
+CROSS_VIEW_FRESH_S = 1.
+CROSS_REASON = {'view': "Red light: no view of the cross road, waiting", 'traffic': "Red light: cross traffic coming, waiting"}
 GO_PROMPT_S = 1.5          # leftGo is shown this long
 WAIT_CHIME_S = 2.          # a long wait's chime is due this long (LeftDecision.chime: hooks.ABORT_HOLD_S, the house onset)
 # m to spare short of the oncoming lanes for a veto of the go (DESIGN phase4/blinker 6.6): the intent reads this frame's
@@ -393,6 +436,8 @@ WAIT_CHIME_S = 2.          # a long wait's chime is due this long (LeftDecision.
 VETO_MARGIN_M = 1.
 ALERT_S = 2.               # oncomingHolding
 DRIVEN = 'driven'          # undecided's why once the driver took the car past its line or its own hold (module docstring)
+DRIVER_MOVING_SPEED = 0.3  # m/s: a disengaged car the scene committed moving this fast is the driver's (update(): driven)
+DRIVEN_REASON = {1: "Unprotected left not checked: take control", -1: "Unprotected right not checked: take control"}  # by side
 VIEW_FROM_M = 60.          # the road camera from this far out (the window starts on the approach)
 
 OFF, AUTO, ANNOUNCE = 'off', 'auto', 'announce'
@@ -437,18 +482,24 @@ class LeftInput:
   driven: bool = False           # its hold line's latch was let go as the driver's (map_controls.Driven for this maneuver)
   dark: bool = False             # after dark (turnpilotd's darkness.DarkFilter): logged (left_reach), never a cap (2026-11-07)
   wrong_lane: bool = False       # the lane planner's LC-03 placed the car in a lane the left doesn't leave from (its change
-                                 # blocked or unreachable): driven from the lane it is in, logged (left_reach), no handback
+                                 # blocked or unreachable) once it stood held at its line (turnpilotd skips and reroutes one
+                                 # flagged before, 2026-11-08): judged from the lane it is in, logged (left_reach)
   crossed_lanes: int = 1         # ...the lanes of ours it crosses to the turn's: the changes LC-03 left unmade (its want; one
                                  # with no lane list, where LC-03 wants one change at a time), LEFTS-2
   launch_armed: bool = False     # turnpilotd: this go from LEFT_LIFT_ROOM_M or more short of the oncoming lanes is followed
                                  # into them only by a launch (LEFT_LAUNCH_SPEED, L3)
   model_holds: str = ''          # the go wouldn't be lifted over the model's own hold (turnpilotd.left_lift_refused: 'light'
-                                 # at a signal, 'room', 'param') and the model plans no motion (its takeover predicate not
-                                 # held, last frame): a hold, the left waits with the model (MODEL_HOLD_S, review 2026-11-07 LS-2)
+                                 # at a signal, 'room', 'param') and the model stops (its shouldStop, its takeover predicate
+                                 # not held, last frame): a hold, the left waits with the model (review 2026-11-07 LS-2;
+                                 # 2026-11-08: a model standing with no stop of its own waits for the go's pulse, no hold)
   go_unfollowed: bool = False    # turnpilotd: its unlifted go stood LEFT_NO_MOVE_S with the model planning no motion: the go
                                  # goes back to a wait at the line (its own hold, a fresh window), never a handback (LS-2)
   light_read: bool = True        # light's red or yellow read at the junction now (map_controls.turn_light_read); False: the
                                  # stop it raised still in force, or the left's own red latch, with nothing read (AL-2)
+  line_m: float = 9.             # m before the maneuver point its hold is (map_controls.left_hold_m): LINE_D, or in the
+                                 # junction's mouth where a signal is mapped (SIGNAL_LEFT_HOLD_M, 2026-11-08)
+  signal_line_m: float | None = None  # m before the maneuver point of the mapped signal's own stop line (map_controls.
+                                 # signal_line_m: its control's d), None with none mapped: past it the car is in the junction
 
 
 @dataclass
@@ -478,6 +529,8 @@ class LeftDecision:
   chime: bool = False             # a long wait's chime is due (WAIT_CHIME_S from its _said; SF-4)
   crossed: str = ''               # the frame the driver took the car past its own hold: the cause (map_controls.Driven's)
   carry: bool = False             # committed: carried across the oncoming lanes at the left's post-go profile (CARRY_SPEED)
+  clearing: bool = False          # a red or yellow read with the car past its line: it clears the junction on its gap, the
+                                  # light no hold of its own (turnpilotd lifts its go over the light and the model's red hold)
 
 
 def hold_caps(v: float) -> tuple[float, float]:
@@ -703,23 +756,36 @@ def matches(b: RawBox, obj) -> bool:
   return abs(along) <= MATCH_GATE_M + MATCH_GATE_FRAC * rng and abs(across) <= MATCH_LATERAL_M
 
 
-def view_blocked(occ, heading_deg: float, side: int, reach_m: float) -> bool:
-  """An occluder's bearings cover some of the oncoming lanes beyond it, out to reach_m."""
+def lanes_far_m(lanes=None) -> float:
+  """m to the turn side of the oncoming lanes' far edge: lanes of them (navd's opposing_lanes) LANE_W_M each past
+  LANE_NEAR_M, LANE_FAR_M (two) where the count isn't known."""
+  return LANE_NEAR_M + LANE_W_M * lanes if lanes else LANE_FAR_M
+
+
+def view_blocked(occ, heading_deg: float, side: int, reach_m: float, lanes=None) -> bool:
+  """An occluder's bearings cover some of the oncoming lanes beyond it, out to reach_m: lanes of them (the opposing road's,
+  navd's opposing_lanes) LANE_W_M each past LANE_NEAR_M, LANE_FAR_M's two where the count isn't known. Drive 29 (2026-11-08,
+  seg 7): a car parked at the far curb of a one-lane opposing road, 26 m past the maneuver point and 7.2 m to the turn
+  side, read as hiding the outer of two lanes the road doesn't have: the view blocked 25 s at an empty junction."""
+  lane_far = lanes_far_m(lanes)
   for obj in occ:
     x, y = road_xy(obj, heading_deg, side)
     if x <= 0.:
       continue
     lo, hi = math.atan2(y - OCCLUDER_WIDTH_M / 2., x), math.atan2(y + OCCLUDER_WIDTH_M / 2., x)
-    lanes_lo, lanes_hi = math.atan2(LANE_NEAR_M, reach_m), math.atan2(LANE_FAR_M, x)
+    lanes_lo, lanes_hi = math.atan2(LANE_NEAR_M, reach_m), math.atan2(lane_far, x)
     if lo < lanes_hi and hi > lanes_lo:
       return True
   return False
 
 
-def exit_blockers(objects, heading_deg: float, side: int, distance: float, occ, spread_m: float = 0.) -> list:
+def exit_blockers(objects, heading_deg: float, side: int, distance: float, occ, spread_m: float = 0., lanes=None) -> list:
   """The pedestrians in the exit crosswalk and the vehicles but an occluder in the junction box (module docstring), each zone
-  stretched over the readings of the junction (spread_m past the nearest)."""
-  ids = {o.trackId for o in occ}
+  stretched over the readings of the junction (spread_m past the nearest). An occluder is exempt only standing in the
+  oncoming lanes (to lanes_far_m: the opposing left-turner, whose hidden lanes view_blocked waits on): one standing beyond
+  them in the box (the exit lane) is an exit blocker, as it was only by view_blocked's two lanes until drive 29's lanes."""
+  lane_far = lanes_far_m(lanes)
+  ids = {o.trackId for o in occ if road_xy(o, heading_deg, side)[1] <= lane_far}
   spread = max(spread_m, 0.)
   out = []
   for obj in objects:
@@ -734,9 +800,25 @@ def exit_blockers(objects, heading_deg: float, side: int, distance: float, occ, 
   return out
 
 
-def exit_clear(objects, heading_deg: float, side: int, distance: float, occ, spread_m: float = 0.) -> bool:
+def exit_clear(objects, heading_deg: float, side: int, distance: float, occ, spread_m: float = 0., lanes=None) -> bool:
   """No pedestrian in the exit crosswalk, and no vehicle but an occluder in the junction box (exit_blockers)."""
-  return not exit_blockers(objects, heading_deg, side, distance, occ, spread_m)
+  return not exit_blockers(objects, heading_deg, side, distance, occ, spread_m, lanes)
+
+
+def cross_closing(objects, distance: float, t_bound: float) -> list:
+  """The vehicle tracks closing on our path in the cross road (CROSS_X_M of the maneuver point distance m ahead, moving
+  across our path toward it) that reach it within t_bound s, or are across it now (the clearing's go: CROSS_REASON)."""
+  out = []
+  for o in objects:
+    if str(o.cls) not in VEHICLES:
+      continue
+    x, y, vx, vy = float(o.x), float(o.y), float(o.vx), float(o.vy)
+    if abs(x - distance) > CROSS_X_M or abs(vy) < CROSS_MOVING_V or abs(vy) < abs(vx):
+      continue
+    gap = abs(y) - CROSS_PATH_HALF_M
+    if gap <= 0. or (y * vy < 0. and gap / abs(vy) <= t_bound):
+      out.append(o)
+  return out
 
 
 def stands_still(obj) -> bool:
@@ -796,6 +878,14 @@ class UnprotectedLeft:
     self.light_kind = ''          # the light wait counted (light_s): 'red' (or yellow), 'unknown' or 'model'
     self.changed_crept = False    # a red or yellow read with the car crept past its line (LS-4, LEFTS-3), said once a red
     self.changed_read = False     # ...after it stood on a green (a change read: LIGHT_CHANGED_REASON)
+    self.clearing = False         # a red or yellow spell first read with the car past its line: it clears the junction (LS-4)
+    self.red_prev = False         # last frame's light a red or yellow
+    self.mouth_green_s = 0.       # s standing past its line on a green read (CAMERA_GREEN_STEADY_S arms the clearing)
+    self.mouth_stand_s = 0.       # s standing past its line with no red or yellow read (CLEAR_STAND_S arms it)
+    self.mouth_armed = False      # ...armed: a red or yellow first read now clears the junction (the review of 2026-11-08)
+    self.red_this_hold = False    # a red or yellow read this maneuver: only a steady green arms the clearing from here
+    self.wide_age = math.inf      # s since the last wide camera run (the cross road's view, CROSS_VIEW_FRESH_S)
+    self.cross = ''               # this frame's cross-road hold on the clearing: 'view' (none fresh), 'traffic' (closing)
     self.line_d: float | None = None  # m to the maneuver point of its line this hold: the nearer of its first latch and LINE_D
     self.unseen_s = 0.            # s its light's red has held it with nothing read (SIGNAL_UNSEEN_S, AL-2)
     self.quiet_go = False         # a go of this hold the model didn't follow: its retries silent until the car moves (AL-1)
@@ -888,19 +978,59 @@ class UnprotectedLeft:
       self.clear_s = 0.  # the far slot's age alone: near_clear_s goes on (R2)
     if not inp.scene_clear:
       self.clear_s = self.near_clear_s = 0.
-    blocked_view = view_blocked(occ, inp.heading_deg, side, rreq)
+    blocked_view = view_blocked(occ, inp.heading_deg, side, rreq, inp.opposing_lanes)
     if blocked_view:
       self.clear_s = self.near_clear_s = 0.  # the lanes behind the occluder weren't seen: the window counts only with the view open
-    light_go = inp.light in ('none', 'green') or (inp.light == 'unknown' and not SIGNAL_NEEDS_GREEN)
+    # a red or yellow first read with the car past its line (in the junction's mouth at a mapped signal, or crept past it
+    # for a view): it clears the junction as a driver does, on its gap (Kellen, 2026-11-08: the oncoming band clear on what
+    # the camera sees, a car seen there holding it until it passes), never held there through the cross road's green nor
+    # handed back. Until 2026-11-08 held where it stood (LS-4's option b). A red read with the car short of its line, or at
+    # it, still holds it there for the green (the hard rail): the spell's first frame decides, for as long as it is read
+    # The review of 2026-11-08: past the line is judged from the mapped signal's own line (signal_line_m), else from its
+    # first latch or LINE_D, and only a car that stood there on a light not red before the spell clears (CLEAR_STAND_S)
+    red_now = inp.light in ('red', 'yellow')
+    past = self._past_line_m(inp) > CREEP_DONE_M
+    standing_past = past and self.latch_d is not None and inp.v_ego < CLEAR_STAND_V
+    if red_now:
+      if not self.red_prev:
+        self.clearing = past and self.mouth_armed  # armed only standing there: a creep for a view since keeps it
+        if past and not self.clearing:
+          cloudlog.event("turnpilot.left_red_unstood", past_m=round(self._past_line_m(inp), 2), v=round(inp.v_ego, 2),
+                         stand_s=round(self.mouth_stand_s, 1), green_s=round(self.mouth_green_s, 1), red_before=self.red_this_hold,
+                         distance=round(inp.distance, 1), maneuver_id=inp.maneuver_id)
+      self.red_this_hold, self.mouth_armed = True, False
+      self.mouth_green_s = self.mouth_stand_s = 0.
+    else:
+      self.clearing = False
+      if standing_past:
+        self.mouth_green_s = self.mouth_green_s + dt if inp.light == 'green' else 0.
+        self.mouth_stand_s = self.mouth_stand_s + dt if not inp.model_holds else 0.
+        if self.mouth_green_s >= CAMERA_GREEN_STEADY_S - 1e-6 or (not self.red_this_hold and self.mouth_stand_s >= CLEAR_STAND_S - 1e-6):
+          self.mouth_armed = True
+      else:
+        self.mouth_green_s = self.mouth_stand_s = 0.
+    self.red_prev = red_now
+    self.wide_age += dt
+    if inp.raw is not None and inp.raw.camera == 'wide':
+      self.wide_age = 0.
+    closing = cross_closing(inp.objects, inp.distance, t_req(d_far, 1, latency, self.launch_a)) if self.clearing else []
+    self.cross = '' if not self.clearing else 'view' if self.wide_age > CROSS_VIEW_FRESH_S else 'traffic' if closing else ''
+    if self.cross:
+      self._said('cross:' + self.cross, "turnpilot.left_clearing_cross", inp, why=self.cross, wide_age=round(min(self.wide_age, 99.), 2),
+                 closing=[(str(o.cls), round(float(o.x), 1), round(float(o.y), 1), round(float(o.vy), 1)) for o in closing])
+    light_go = inp.light in ('none', 'green') or (inp.light == 'unknown' and not SIGNAL_NEEDS_GREEN) or self.clearing
     no_signal = LEFT_GO_NEEDS_SIGNAL and inp.mode == AUTO and not inp.signal_lit
     # something else keeps it where it is: no go, no creep. The model's own hold where the go wouldn't be lifted over it
     # (model_holds) is one (review 2026-11-07, LS-2): a go there only lets TurnPilot's latch go, so with the model planning no
     # motion it stood LEFT_NO_MOVE_S and handed back (cantStartTakeControl) at every mapped signal on the car, the model holding
     # for its red; it now waits for the model's plan to move, then judges a fresh window (the turn goes with the model)
-    held_else = inp.other_hold or not light_go or no_signal or bool(inp.model_holds)
+    # clearing, the model's hold for the light (or the mouth's short room) is lifted by turnpilotd (left_clearing) from the
+    # frame after the red is first read: never a window started over for that one frame; with the lift off ('param') it holds
+    model_hold = '' if self.clearing and inp.model_holds != 'param' else inp.model_holds
+    held_else = inp.other_hold or not light_go or no_signal or bool(model_hold) or bool(self.cross)
     if held_else:
       self.clear_s = self.near_clear_s = 0.  # the window counts only from where nothing else holds it (hold, then judge)
-    exits = exit_blockers(inp.objects, inp.heading_deg, side, inp.distance, occ, inp.spread_m) + beside
+    exits = exit_blockers(inp.objects, inp.heading_deg, side, inp.distance, occ, inp.spread_m, inp.opposing_lanes) + beside
     crosswalk = not exits
     if not crosswalk:
       self.clear_s = self.near_clear_s = 0.  # everything the go is certified on holds for the whole window (DESIGN G4)
@@ -917,7 +1047,7 @@ class UnprotectedLeft:
     out = LeftDecision(t_req=treq, r_req=rreq, v_limit=v_limit, clear_s=self.clear_s, view_blocked=blocked_view,
                        crosswalk_clear=crosswalk, blockers=len(raw_blockers or ()), far_needed=far_needed,
                        far_blockers=len(far_blockers or ()), far_bearing=far_aim(inp.heading_deg, side, inp.range_m),
-                       far_range_m=inp.far_range_m if inp.far_live else 0.)
+                       far_range_m=inp.far_range_m if inp.far_live else 0., clearing=self.clearing)
     self.alert_t = max(self.alert_t - dt, 0.)
     if self.alert_t > 0.:
       out.alert = 'oncomingHolding'
@@ -933,7 +1063,9 @@ class UnprotectedLeft:
     if inp.driven and self.why != DRIVEN:
       return self._driven(inp, out, '')
     if self.why == DRIVEN:
-      return self._undecided(out, DRIVEN)
+      out = self._undecided(out, DRIVEN)
+      out.reason = DRIVEN_REASON.get(inp.side, '')  # every frame until the map's Driven says it (no 'waiting for a gap' flicker)
+      return out
 
     standing = inp.held or self.hold_here
     # committed by its own go and motion, or by the driver driving it (their release, moving): never by a reading before its
@@ -952,15 +1084,26 @@ class UnprotectedLeft:
       return out
     if self.state == 'undecided':
       return self._undecided(out, self.why, inp.v_ego)
-    if (inp.committed or inp.released) and not self.went:
-      # the scene committed to the junction before the left's own go, the car rolling up to its line or standing held short of
-      # it (or the driver's release with the car still standing): where the car is isn't known. Out loud, never a freeze
+    drivers_move = not inp.enabled and inp.v_ego >= DRIVER_MOVING_SPEED  # openpilot disengaged, the car moving: their pedals
+    if not self.went and not self.hold_here and \
+       (inp.released or (drivers_move and (inp.committed or (standing and inp.distance < HELD_MIN_M)))):
+      # the driver took it: their gas at its line (the scene's release, the latch still holding the car this frame), or the
+      # car moving into the junction under their own pedals (openpilot disengaged: a scene commit, or the latch's car taken
+      # under HELD_MIN_M, the replay's 511 s). Driven, said as the crossing it is (the
+      # latch lets go as theirs a frame or more later: map_controls' Driven), never a fault of TurnPilot's (2026-11-08, drive
+      # 29 cause 4: 'Junction position unsure: take control' at every left the driver took, on the frame the scene released
+      # the hold, the latch letting go as driverWent 0.9 s later). Its own hold after a withdrawn go has its own release rule
+      # (_hold_driven: the owner decisions' metres), above
+      return self._driven(inp, out, '')
+    if inp.committed and not self.went:
+      # the scene committed to the junction before the left's own go by a reading, engaged, the car rolling up to its line or
+      # standing held short of it: where the car is isn't known. Out loud, never a freeze
       return self._undecided(out, 'position')
 
     if self.went:
-      why = 'band' if raw_blockers or far_blockers else 'beside' if beside else 'crosswalk' if not crosswalk else \
+      why = 'band' if raw_blockers or far_blockers else 'beside' if beside else 'cross' if closing else 'crosswalk' if not crosswalk else \
         'view' if blocked_view else 'hold' if inp.other_hold or not inp.scene_clear else \
-        'light' if inp.light in ('red', 'yellow') else ''
+        'light' if inp.light in ('red', 'yellow') and not self.clearing else ''
       return self._after_go(inp, out, why, len(raw_blockers or ()) + len(far_blockers or ()), dt)
 
     if not standing:
@@ -970,7 +1113,9 @@ class UnprotectedLeft:
     if self.latch_d is None:
       # held at the line: the window starts here (hold, then judge), never carried over from the approach
       self.latch_d, self.clear_s, self.far_stale, self.far_only_s = inp.distance, 0., 0., 0.
-      self.line_d = min(inp.distance, LINE_D)
+      # its stop line: at a left held in the junction's mouth (line_m, a mapped signal) the car stands past it, and a red read
+      # there is said as a red in the junction is (LS-4's words, heard once), and the car clears the junction on its gap
+      self.line_d = LINE_D if inp.line_m < LINE_D else min(inp.distance, LINE_D)
       self.band_stand_s = self.exit_stand_s = self.wait_s = self.near_clear_s = 0.
       self.far_behind = False
       self.said = set()
@@ -987,8 +1132,8 @@ class UnprotectedLeft:
                      distance=round(inp.distance, 1), maneuver_id=inp.maneuver_id)
     certified = self.clear_s >= CLEAR_WINDOW_S - 1e-6 and not blocked_view and crosswalk and inp.scene_clear and not held_else
     out.view = 'roadAndWide'
-    # a left LC-03 placed in a lane it doesn't leave from (wrong_lane) is driven from the lane it is in, never handed back for
-    # it (Kellen, 2026-11-07: "no handbacks"); turnpilotd never skips nor reroutes it (review LN-5)
+    # a left LC-03 placed in a lane it doesn't leave from (wrong_lane) once held at its line is judged from the lane it is in,
+    # never handed back for it; one flagged before that turnpilotd skips and reroutes (2026-11-08, drive 29)
     if inp.signal_veto:  # the driver's lamp the other way, hazards or our lamp put out, at the line: a handback, car held
       return self._undecided(out, 'driverSignal')
     # no lamp lit on its side: it waits at its line, the side's chime repeating (car_signals' prompt), and goes on a gap once
@@ -1004,12 +1149,12 @@ class UnprotectedLeft:
       return self._undecided(out, 'position')
     # held short of its line (the latch reaches LATCH_NEAR_M short of it), where the longer crossing puts R_req past the
     # range: rolled up to the line first (the latch's creep), where it is judged (BeamNG: held 16 m out, R_req 164 m)
-    short = inp.distance - LINE_D
+    short = inp.distance - inp.line_m
     roll_up = inp.mode == AUTO and rreq > range_eff and short > ROLL_UP_M and not self.hold_here
     if roll_up and not held_else:
       self.roll_stall = self.roll_stall + dt if inp.v_ego < 0.3 else 0.
       if self.roll_stall < ROLL_UP_STALL_S - 1e-6:
-        self.creep_to = max(self.latch_d - LINE_D, 0.)
+        self.creep_to = max(self.latch_d - inp.line_m, 0.)
         out.state = self.state = 'creep'
         out.prompt, out.reason, out.creep_m = 'creepingForView', "Rolling up to the line", self.creep_to
         return out
@@ -1050,12 +1195,13 @@ class UnprotectedLeft:
         crept_m = self.latch_d - inp.distance if self.latch_d is not None else 0.
         cloudlog.event("turnpilot.left_light_changed", light=inp.light, distance=round(inp.distance, 1), creep_m=round(self.creep_to, 1),
                        crept_m=round(crept_m, 2), v=round(inp.v_ego, 2), maneuver_id=inp.maneuver_id)
-      past_m = self.line_d - inp.distance if self.line_d is not None else 0.
-      if red_now and not self.changed_crept and past_m > CREEP_DONE_M:
+      past_m = self._past_line_m(inp)
+      if red_now and not self.changed_crept and self.clearing:
         # review 2026-11-07 (LS-4): crept for a view on the green, the car's nose 3-7 m from the junction's centre, held
         # where it stands through the red (the read red's rail) with "Waiting for a Gap / Waiting for the light", silent:
         # on a cross road of 2 lanes or more each way that is in the near cross lanes through their green. Said in plain
-        # words with a chime for the safety driver, the hold kept (never a handback; going on the band is Kellen's call).
+        # words with a chime for the safety driver, never a handback. Kellen, 2026-11-08: it clears the junction on its gap
+        # (self.clearing: the light no hold, its go lifted over it), a car seen in the band holding it until it passes.
         # LEFTS-3: on a light it never read green too (a mapped signal with no colour read is 'none': it creeps on it, at
         # night the norm), the first red or yellow with the car past its line (line_d, never the metres since the latch: a
         # roll-up to the line is no creep into the junction); its words then say what was read, no change
@@ -1152,7 +1298,8 @@ class UnprotectedLeft:
     # the 300 ft arm, then the silent "Unprotected left: waiting for the turn signal" from the line on). Its line says the wait
     out.prompt, out.creep_m = 'none' if no_signal else 'waitingForGap', self.creep_to
     in_junction = LIGHT_CHANGED_REASON if self.changed_read else LIGHT_IN_JUNCTION_REASON
-    out.reason = NO_SIGNAL_REASON if no_signal else in_junction if light_wait and self.changed_crept else \
+    out.reason = NO_SIGNAL_REASON if no_signal else CROSS_REASON[self.cross] if self.cross else \
+      in_junction if light_wait and self.changed_crept else \
       SIGNAL_UNSEEN_REASON if light_wait and self.unseen_s >= SIGNAL_UNSEEN_S - 1e-6 else \
       LIGHT_WAIT_REASON[inp.light] if light_wait else \
       MODEL_HOLD_REASON.get(inp.model_holds, MODEL_HOLD_REASON['']) if inp.model_holds and not inp.other_hold else \
@@ -1164,6 +1311,15 @@ class UnprotectedLeft:
       words = out.reason if out.reason == LONG_WAIT_REASON['yaw'] else self.hold_reason
       out.stops = [stop(inp.v_ego, 0., words, confirmed=False)]
     return out
+
+  def _past_line_m(self, inp: LeftInput) -> float:
+    """m the car is past its stop line: the mapped signal's own (signal_line_m), else the nearer of its first latch and LINE_D
+    (a left held in a signal's mouth, or crept past its line for a view)."""
+    if inp.signal_line_m is not None:
+      return inp.signal_line_m - inp.distance
+    line_d = self.line_d if self.latch_d is not None and self.line_d is not None else LINE_D if inp.line_m < LINE_D else \
+      min(max(inp.line_m, inp.distance), LINE_D)
+    return line_d - inp.distance
 
   def _said(self, key: str, event: str, inp: LeftInput, chime: bool = False, **fields) -> None:
     """A long wait at the line (the module docstring: what handed back until 2026-11-07), logged once for key as its old bound
@@ -1345,7 +1501,11 @@ class UnprotectedLeft:
     out.crossed = cause
     self.went = self.moved = self.hold_here = False
     self.alert_t = 0.
-    return self._undecided(out, DRIVEN)
+    out = self._undecided(out, DRIVEN)
+    # the crossing's own words (map_controls' Driven says them from its latch's let-go on), on any frame the latch still has
+    # the car under the driver's gas: never a fault's take-control (turnpilotd: no take_control for DRIVEN)
+    out.reason = DRIVEN_REASON.get(inp.side, '')
+    return out
 
   def _undecided(self, out: LeftDecision, why: str, v_ego: float = 0.) -> LeftDecision:
     """A fault's handback (UNDECIDED_FAULTS: never a wait, since 2026-11-07), the car held. After a withdrawn go (hold_here)
@@ -1390,6 +1550,7 @@ WITHDRAWN_REASON = {
   'model': "Waiting for the car to pull away",  # _after_go says MODEL_HOLD_REASON's for what holds it (AL-1)
   'beside': "Car beside, holding",
   'launch': "Car started too slowly, holding",
+  'cross': "Cross traffic coming, holding",
 }
 # the left's line while a car in the lane it crosses holds it (crossed_lane_cars, LS-1), by the turn's side (LEFT 1, RIGHT -1)
 BESIDE_REASON = {1: "Waiting: car beside on the left", -1: "Waiting: car beside on the right"}

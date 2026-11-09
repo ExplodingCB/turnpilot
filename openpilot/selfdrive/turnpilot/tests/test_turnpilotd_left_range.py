@@ -14,20 +14,19 @@ window's end) is never skipped and rerouted (Kellen, 2026-11-06: never route aro
 back: it is driven to its line and taken from the lane it is in, said once (turnpilot.left_wrong_lane).
 
 The shared Sim lifts the car's full-pass cap (its detector boxes every car at any range); the tests of the cap set it back."""
-from unittest import mock
 
 import pytest
 
 from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.turnpilot import turnpilotd
+from openpilot.selfdrive.turnpilot.hooks import TAKE_CONTROL_PROMPTS
 from openpilot.selfdrive.turnpilot.maps.defaults import CAR_LEFT_RANGE_M, FAR_CROP_LEFT_RANGE_M
 from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M
 from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import BROKEN_WHITE_LEFT, THREE_LANES_LEFT_TURN, Sim
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import (JUNCTION, LINE, STRAIGHT_M, TEST_RANGE_M, V_25, drive,
-                                                                      drive_answering_what_is_shown, far_runs,
+                                                                      far_runs,
                                                                      road_runs)
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_night import NIGHT_EV, NightSim
 from openpilot.selfdrive.turnpilot.turnpilotd import TurnPilot
@@ -328,11 +327,17 @@ def lane_left(sim_cls=Sim, paint=BROKEN_WHITE_LEFT, blind_left=True, **kw):
   return sim
 
 
-def assert_wrong_lane_go(sim, plans):
-  """Kellen, 2026-11-07 (no handbacks): taken from the lane it is in, never skipped and rerouted, never handed back; the blind
-  spot's car still held the change."""
-  assert_went(sim, plans)
+def assert_wrong_lane_skipped(sim, plans, reasons):
+  """Kellen, 2026-11-08 (drive 29: lefts driven across a lane from the wrong one after failed changes): a left whose turn lane
+  the car can't reach is skipped out loud and rerouted (turn_skip: tooFastToTurn, its reason), never taken across a lane
+  from the wrong one, never handed back; the blind spot's car still held the change."""
+  assert reasons & {'laneBlocked', 'laneUnreachable'}, reasons
+  assert any(p.tooFastToTurn for p in plans) and any(str(p.skipReason) in ('laneBlocked', 'laneUnreachable') for p in plans)
+  assert not any(p.desire == log.Desire.turnLeft for p in plans)
+  assert not any(str(p.unprotectedLeft.state) in ('go', 'committed') for p in plans)
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
   assert any(p.laneChangeWant == 1 for p in plans) and all(p.laneChange == 0 for p in plans)
+  assert sim.tp.left_lane_id is None  # never driven from its lane (turnpilot.left_wrong_lane)
 
 
 def through_reasons(sim):
@@ -344,129 +349,28 @@ def through_reasons(sim):
 
 
 @pytest.mark.parametrize("night", [False, True])
-def test_a_left_whose_lane_change_never_went_is_taken_from_its_lane_never_skipped(night):
-  """Review 2026-11-07 (LN-5): the change into the left's lane held by the blind spot to the window's end. LC-03 skipped the
-  left 'Can't Reach Turn Lane' about 60 m out and navd rerouted (the probe: laneBlocked at 59.5 m, by night and by day), the
-  reroute bringing the next left. Now it is driven to its line and taken from the lane it is in, said once."""
+def test_a_left_whose_lane_change_never_went_is_skipped_and_rerouted_never_taken_from_the_wrong_lane(night):
+  """Drive 29 (2026-11-08, cause 3): lefts LC-03 left in a lane they don't leave from (the change held to the window's end:
+  the blind spot here; lineNotBroken at night, noSignal, tooLate on the car) were driven from the lane the car was in, across
+  a lane at the junction (LN-5, 2026-11-07). The owner's ruling: skipped out loud and rerouted, never taken across a lane."""
   sim = lane_left(NightSim, ev=lambda s: NIGHT_EV) if night else lane_left()
-  with mock.patch.object(turnpilotd.cloudlog, 'event') as event:
-    plans, reasons = through_reasons(sim)
+  plans, reasons = through_reasons(sim)
   assert sim.tp.dark == night
-  assert_wrong_lane_go(sim, plans)
-  assert 'laneBlocked' not in reasons
-  said = [c.kwargs for c in event.call_args_list if c.args[0] == 'turnpilot.left_wrong_lane']
-  assert len(said) == 1 and said[0]['why'] == 'laneBlocked' and said[0]['want'] == 1 and said[0]['distance'] > 50.
+  assert_wrong_lane_skipped(sim, plans, reasons)
 
 
-def test_a_night_left_whose_paint_is_never_read_is_taken_from_its_lane_not_skipped():
-  # 1e's night (no change offered on 16,798 plan frames): the left line never read, so the change waits lineNotBroken to the
-  # window's end; LC-03 skipped it at 59.5 m. Now taken from the lane it is in (2026-11-07: no handbacks)
+def test_a_night_left_whose_paint_is_never_read_is_skipped_and_rerouted():
+  # 1e's night (no change offered on 16,798 plan frames), drive 29's lineNotBroken: the left line never read, so the change
+  # waits lineNotBroken to the window's end, the car in a lane the left doesn't leave from: skipped and rerouted (2026-11-08)
   sim = lane_left(NightSim, paint=(UNKNOWN, UNKNOWN, UNKNOWN, UNKNOWN), blind_left=False, ev=lambda s: NIGHT_EV)
-  plans, _ = through_reasons(sim)
+  plans, reasons = through_reasons(sim)
   assert sim.tp.dark and any(str(p.laneChangeWait) == 'lineNotBroken' for p in plans)
-  assert_wrong_lane_go(sim, plans)
+  assert_wrong_lane_skipped(sim, plans, reasons)
 
 
-@pytest.mark.parametrize("night", [False, True])
-def test_a_wrong_lane_left_waiting_dark_at_its_line_shows_the_prompt_to_signal_and_goes_once_lit(night):
-  """Review 2026-11-07 (SF-1): the left LC-03 now drives from the lane it is in waits at its line for the driver's lamp, its
-  own prompt standing aside for "Signal LEFT Now"; but plan_events fell through to the wrong lane (wrongLaneForTurn from
-  60 m out, the same Priority.LOW and newer), so selfdrived showed "Wrong Lane", silent, for the whole wait, and the left
-  never went: "Signal LEFT Now" was up 1.0 s by day and 6.4 s at night before it. Now the prompt to signal outranks the lane
-  lines: shown with the side's chime the whole wait at the line, and a driver who answers what the screen shows lights the
-  lamp and the left goes."""
-  sim = lane_left(NightSim, paint=(UNKNOWN, UNKNOWN, UNKNOWN, UNKNOWN), blind_left=False, ev=lambda s: NIGHT_EV) if night else lane_left()
-  plans, shown = drive_answering_what_is_shown(sim, 90., None, step=lambda sim: drive(sim, DT_MDL, yaw=False)[0])
-  held = next(i for i, p in enumerate(plans) if p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap')
-  assert all(str(p.turnSignal.prompt) == 'left' for p in plans[held:])
-  at_line = [f for frames in shown[held:] for f in frames]
-  assert all(f[0] == "Signal LEFT Now" and f[2] == 'tpSignalLeft' for f in at_line), sorted(set(at_line))
-  # the driver who signals once the screen asks (1.5 s of it) is asked, and the left goes
-  sim = lane_left(NightSim, paint=(UNKNOWN, UNKNOWN, UNKNOWN, UNKNOWN), blind_left=False, ev=lambda s: NIGHT_EV) if night else lane_left()
-  plans, _ = drive_answering_what_is_shown(sim, 90., 1.5, step=lambda sim: drive(sim, DT_MDL, yaw=False)[0])
-  assert any(p.desire == log.Desire.turnLeft for p in plans) and sim.s > JUNCTION + 10.
-
-
-def lane_left_with(cars, seconds, sim=None):
-  """lane_left (the change into the left's lane held by the blind spot: the left taken from the middle lane) driven seconds
-  with vehicle tracks cars(sim) -> [(absolute s, m left, vx, trackId)] (velocity trusted: age 60), in the car's frame."""
-  sim = sim or lane_left()
-  plans = []
-  for _ in range(int(round(seconds / DT_MDL))):
-    objs = tuple({'cls': 'car', 'x': s - sim.s, 'y': y, 'vx': vx, 'vy': 0., 'age': 60, 'trackId': tid, 'conf': 0.8,
-                  'camera': 'wide'} for s, y, vx, tid in cars(sim))
-    plans.append(sim.step(objs, engaged=True))
-  return sim, plans
-
-
-def test_a_wrong_lane_left_holds_for_a_car_beside_in_the_lane_it_crosses_and_goes_once_it_has_gone():
-  """Review 2026-11-07 (LS-1): the left LC-03 drives from the middle lane crosses the left lane before the junction, where
-  nothing of the go looked (the junction box and the occluder zone start about 4.25 m ahead of the car at its line): a car
-  standing level with ours there (the bay's first left-turner) and the go came at 31.8 s as on an empty road, and the model
-  swept left across its lane. Now a car the detector tracks in that lane, from 10 m behind the car to the junction box,
-  holds the left at its line, said in plain words; gone, the left goes on a fresh window."""
-  from openpilot.selfdrive.turnpilot.unprotected_left import BESIDE_REASON, CLEAR_WINDOW_S
-  stop_s = JUNCTION - HOLD_LINE_M - 1.25  # where the car stands at its line
-  leave_t = 60.
-  sim, plans = lane_left_with(lambda sim: [(stop_s + 0.5, 3.4, 0., 77)] if sim.t < leave_t else [], 90.)
-  held = next(i for i, p in enumerate(plans) if p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap')
-  wait = plans[held:round(leave_t / DT_MDL)]
-  assert wait and all(p.shouldStop and p.reason == BESIDE_REASON[1] for p in wait[5:]), {p.reason for p in wait}
-  assert not any(p.desire == log.Desire.turnLeft for p in plans[:round(leave_t / DT_MDL)])
-  go = next(i for i, p in enumerate(plans) if p.desire == log.Desire.turnLeft)
-  assert go * DT_MDL >= leave_t + CLEAR_WINDOW_S - 0.2 and sim.s > JUNCTION + 5.
-
-
-def test_a_car_coming_up_the_lane_a_wrong_lane_left_crosses_withdraws_its_go():
-  # LS-1: a car coming up the lane the left crosses from behind as the left goes (seen by the wide camera 9 m back): the go is
-  # withdrawn while the car can still stop short of the oncoming lanes, and the left goes again once it has passed
-  from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M
-  st = {'go': None}
-
-  def cars(sim):
-    left = sim.tp.left_now
-    if st['go'] is None and left is not None and left.state == 'go':
-      st['go'] = (sim.t, sim.s)
-    if st['go'] is None:
-      return []
-    t0, s0 = st['go']
-    return [(s0 - 9. + 6. * (sim.t - t0), 3.4, 6., 78)]
-  with mock.patch.object(turnpilotd.cloudlog, 'event') as event:
-    sim, plans = lane_left_with(cars, 70.)
-  assert st['go'] is not None
-  withdrawn = [c.kwargs for c in event.call_args_list if c.args[0] == 'turnpilot.left_go_withdrawn']
-  assert withdrawn and withdrawn[0]['why'] == 'beside', withdrawn
-  i0 = round(st['go'][0] / DT_MDL)
-  assert all(JUNCTION - s > ONCOMING_ENTRY_M for s, _, _ in sim.trace[i0:i0 + round(3. / DT_MDL)])
-  assert sim.s > JUNCTION + 5.  # gone again once it has passed and cleared the junction
-
-
-def two_lanes_off_left():
-  """THREE_LANES_LEFT_TURN with the car in the right lane (model_lanes (2, 0)): the plan wants two changes left (the map's
-  lane list), the left blind spot occupied the whole way, so LC-03 leaves the car two lanes off the left's lane."""
-  sim = left_on(V_25, full_pass=TEST_RANGE_M, sim_cls=Sim, nav_lanes={0: THREE_LANES_LEFT_TURN}, model_lanes=(2, 0),
-                paint=BROKEN_WHITE_LEFT)
-  sim.blindspot = lambda s: (True, False)
-  return sim
-
-
-def test_a_left_two_lanes_off_holds_for_a_car_in_the_further_lane_it_crosses_and_goes_once_it_has_gone():
-  """Review 2026-11-07 (LEFTS-2): LS-1's crossed lane was one lane wide (1.5-5.4 m to the turn side), but a left LC-03 leaves
-  two lanes off (laneChangeWant 2 on the map's lane list) crosses two lanes of ours, the further the left's own turn lane
-  where left-turners queue. A car standing there 3 m ahead of ours (67 deg off the camera axis: the wide camera's view, where
-  a track can be) was in no zone, and the go came at 31.75 s as on an empty road. Now the crossed band is as wide as the
-  lanes LC-03 left unmade: held, said in plain words, and gone on a fresh window once that car has left."""
-  from openpilot.selfdrive.turnpilot.unprotected_left import BESIDE_REASON, CLEAR_WINDOW_S
-  stop_s = JUNCTION - HOLD_LINE_M - 1.25  # where the car stands at its line
-  leave_t = 60.
-  sim, plans = lane_left_with(lambda sim: [(stop_s + 3., 7.2, 0., 77)] if sim.t < leave_t else [], 90., sim=two_lanes_off_left())
-  assert sim.tp.left_lane_id is not None and any(p.laneChangeWant == 2 for p in plans)
-  held = next(i for i, p in enumerate(plans) if p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap')
-  wait = plans[held:round(leave_t / DT_MDL)]
-  assert wait and all(p.shouldStop and p.reason == BESIDE_REASON[1] for p in wait[5:]), {p.reason for p in wait}
-  assert not any(p.desire == log.Desire.turnLeft for p in plans[:round(leave_t / DT_MDL)])
-  go = next(i for i, p in enumerate(plans) if p.desire == log.Desire.turnLeft)
-  assert go * DT_MDL >= leave_t + CLEAR_WINDOW_S - 0.2 and sim.s > JUNCTION + 5.
+# LS-1 and LEFTS-2 (a car beside in the lanes a wrong-lane left crosses holds it: unprotected_left.crossed_lane_cars) stay for
+# a left LC-03 flags only once the car stands held at its line, past where a skip could take it straight on (turnpilotd); the
+# band's width is tested here on its own
 
 
 def test_the_crossed_band_is_as_wide_as_the_lanes_the_left_crosses():
@@ -480,30 +384,10 @@ def test_the_crossed_band_is_as_wide_as_the_lanes_the_left_crosses():
   assert not in_crossed_lane(CROSSED_LANE_Y_FAR_M + 3.7, 2) and not in_crossed_lane(1.0, 2)
 
 
-def test_a_standing_car_ahead_in_the_lane_a_wrong_lane_left_crosses_is_no_view_to_creep_past():
-  # LS-1 (its skeptic): a velocity-trusted car standing 4.5 m ahead of ours in the lane the left crosses was an occluder to
-  # creep past ("Creeping for a view"), and with the camera losing it the left went with that car beside it. From a lane it
-  # doesn't leave from, a car there is in its path: held for, never crept past
-  stop_s = JUNCTION - HOLD_LINE_M - 1.25
-  sim, plans = lane_left_with(lambda sim: [(stop_s + 4.5, 3.4, 0., 79)], 70.)
-  held = next(i for i, p in enumerate(plans) if p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap')
-  assert not any(str(p.controlPrompt) == 'creepingForView' or p.unprotectedLeft.creepM > 0. for p in plans[held:])
-  assert not any(p.desire == log.Desire.turnLeft for p in plans) and sim.s < LINE + 1.
-
-
-def test_a_far_side_left_is_never_skipped_for_its_lane_even_with_the_mode_off():
-  # TurnPilotAutoLeft off: LC-03 skipped such a left out loud for its lane. 2026-11-07 (no handbacks, never route around a
-  # left): a far-side unprotected left is never skipped or rerouted for its lane, in hand or not
+def test_a_far_side_left_is_skipped_for_its_lane_with_the_mode_off_too():
+  # TurnPilotAutoLeft off: LC-03 skips such a left out loud for its lane, as it does every left since 2026-11-08 (drive 29)
   sim = lane_left()
   sim.tp.auto_left = 'off'
   plans = drive(sim, 40., yaw=False)
-  assert not any(p.tooFastToTurn or p.skipReason == 'laneBlocked' for p in plans)
-  # ...nor one the left held for its lane that it no longer has in hand (here the mode turned off on the approach)
-  sim = lane_left()
-  plans = []
-  while sim.tp.left_lane_id is None:
-    plans += drive(sim, DT_MDL, yaw=False)
-    assert sim.t < 60.
-  sim.tp.auto_left = 'off'
-  plans += drive(sim, 2., yaw=False)
-  assert not any(p.tooFastToTurn or p.skipReason == 'laneBlocked' for p in plans)
+  assert any(p.tooFastToTurn and str(p.skipReason) == 'laneBlocked' for p in plans)
+  assert not any(p.desire == log.Desire.turnLeft for p in plans)

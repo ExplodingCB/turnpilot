@@ -11,7 +11,7 @@ from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S
 from openpilot.selfdrive.turnpilot.lane_planner import (LANE_UNKNOWN_REASON, LANE_WIDTH, LATCHED_YELLOW, LC_HOLD_CLEAR_S, LC_RELEASE_S,
                                                         LC_ABORT_COOLDOWN_S, LC_ABORT_SETTLE_S, LC_CONFIRM_FRAMES, LC_COOLDOWN_S,
                                                         LC_REQUEST_TIMEOUT_S,
-                                                        LC_SIGNAL_TIMEOUT_S, LC_UNSURE_MAX_S, LC_WARN_S, YELLOW_HOLD_S, LanePlanner,
+                                                        LC_UNSURE_MAX_S, LC_WARN_S, YELLOW_HOLD_S, LanePlanner,
                                                         ModelLanes, Phase, offer_room_s,
                                                         slow_zone, BROKEN_WHITE_CONF_MIN, LINE_UNSURE_REASON, WHITE_HOLD_M, WHITE_HOLD_S,
                                                         BAY_CONTEST_S, BAY_YELLOW_CONF_MIN, BAY_YELLOW_READS, YELLOW_HOLD_M,
@@ -23,6 +23,7 @@ from openpilot.selfdrive.turnpilot.lane_planner import (LANE_UNKNOWN_REASON, LAN
 from openpilot.selfdrive.turnpilot.route_follower import LEFT, NOMINAL_ANGLE_DEG, RIGHT, Maneuver, classify
 from openpilot.selfdrive.turnpilot.scene.lane_paint import UNKNOWN, LinePaint
 from openpilot.selfdrive.turnpilot.tests.synthetic import car_state, model_v2, road, scene
+LC_SIGNAL_TIMEOUT_S = 8.  # WAIT's own clock before 2026-11-08 (route 29): now the wait lasts to the window's end
 
 LaneChange = custom.TurnpilotPlan.LaneChange
 THREE_LANES_LEFT_TURN = ((("left",), True), (("straight",), False), (("straight", "right"), False))
@@ -410,17 +411,36 @@ def test_tesla_stalk_during_the_countdown_is_the_go_ahead():
   assert drive.requests and drive.requests[0][2] - drive.offers[0][2] < LC_WARN_S and drive.lp.changes == 1
 
 
-def test_tesla_no_signal_aborts_and_offers_again_later():
+def test_tesla_no_signal_waits_to_the_windows_end_then_offers_again():
+  """Route 29 (2026-11-08, 187-198 s): the wait for the driver's signal had its own 8 s clock (LC_SIGNAL_TIMEOUT_S) and
+  aborted noSignal at 80 m with 150 m of window left, a driver who hadn't yet noticed the prompt (or, there, whose lamp the
+  port hid) out of time. Now the prompt stays up, its chime repeating, for as long as the window is open: a driver who
+  signals 20 s on still gets the change, and one who never does is aborted at the window's end (tooLate, then LC-03)."""
   drive = Drive(lanes_left=0, lanes_right=1, driver_signals=True)
   m = maneuver("turn", "right", TWO_LANES_RIGHT_TURN)
-  distance = drive.run(m, 250., LC_CONFIRM_FRAMES * DT_MDL + LC_WARN_S + LC_SIGNAL_TIMEOUT_S + 0.5, moving=False)
-  assert [a for a, _ in drive.aborts] == ['noSignal'] and not drive.requests
+  distance = drive.run(m, 250., LC_CONFIRM_FRAMES * DT_MDL + LC_WARN_S + 2. * LC_SIGNAL_TIMEOUT_S, moving=False)
+  assert not drive.aborts and not drive.requests and drive.lp.phase == Phase.WAIT
+  assert drive.decisions[-1].prompt == LaneChange.right  # still asking
+  drive.run(m, distance, 1., blinker=LaneChange.right, moving=False)
+  assert [r for r, _, _ in drive.requests] == [LaneChange.right] and not drive.aborts
+  # never signalled, moving: the prompt lasts to the window's end, then tooLate
+  drive = Drive(lanes_left=0, lanes_right=1, driver_signals=True)
+  start, end = lane_change_window(drive.v)
+  distance = drive.run(m, start - 1., (start - end) / drive.v + ABORT_HOLD_S + 1.)
+  assert [a for a, _ in drive.aborts] == ['tooLate'] and not drive.requests
   t_abort = drive.aborts[0][1]
-  drive.run(m, distance, LC_ABORT_COOLDOWN_S + 1., moving=False)
+  prompts = [d.prompt for d, t in zip(drive.decisions, np_times(drive), strict=True) if t < t_abort - 1e-6]
+  assert prompts[-1] == LaneChange.right
   held = [d.abort for d, t in zip(drive.decisions, np_times(drive), strict=True) if t >= t_abort - 1e-6]
   n = int(round(ABORT_HOLD_S / DT_MDL))
-  assert held[:n] == ['noSignal'] * n and held[n + 1] == 'none'  # held for the alert, then gone
-  assert len(drive.offers) == 2 and drive.offers[1][2] - t_abort >= LC_ABORT_COOLDOWN_S
+  assert held[:n] == ['tooLate'] * n  # held for the alert
+  # standing still with the offer aborted another way (the stalk the other way), the change is offered again after the cooldown
+  drive = Drive(lanes_left=0, lanes_right=1, driver_signals=True)
+  distance = drive.run(m, 250., LC_CONFIRM_FRAMES * DT_MDL + 1., moving=False)
+  drive.lp.cancel('handedBack')
+  t_abort = drive.t
+  drive.run(m, distance, LC_ABORT_COOLDOWN_S + 1., moving=False)
+  assert len(drive.offers) == 2 and drive.offers[1][2] - t_abort >= LC_ABORT_COOLDOWN_S - 2 * DT_MDL
 
 
 def np_times(drive):

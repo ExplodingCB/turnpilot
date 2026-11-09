@@ -20,7 +20,7 @@ from openpilot.selfdrive.turnpilot.hooks import SPEED_CAP_TAU, TAKE_CONTROL_PROM
 from openpilot.selfdrive.turnpilot.scene_policy import ONCOMING_ENTRY_M
 from openpilot.selfdrive.turnpilot.tests.synthetic import model_v2
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_go import attach_planner, coasting, holding, launching
-from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import JUNCTION, V_25, drive, left_sim, road_runs, signal_sim
+from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import JUNCTION, V_25, drive, left_sim, road_runs
 from openpilot.selfdrive.turnpilot.turnpilotd import TurnPilot
 from openpilot.selfdrive.turnpilot.unprotected_left import (A_GO, CLEAR_PATH_PAST_M, CONFLICT_PAST_M, FULL_PASS_RANGE_M, LEFT_LAUNCH_SPEED,
                                                            PET_S, SPEED_MARGIN, V_GO, WITHDRAWN_REASON)
@@ -198,9 +198,10 @@ def test_a_slow_launch_from_rest_is_carried_too_and_crosses_at_the_profiles_pace
 
 
 def test_an_unlifted_lefts_slow_launch_is_never_carried():
-  """A left plannerd wouldn't lift (a mapped signal with no accepted light source: every signal on the car) goes with the
-  model, and so does its crossing: a slow launch there committing short of a launch is never carried (go_lifted), and that
-  is said once (review 2026-11-08: a commit asking for a carry that never came said nothing)."""
+  """A left plannerd wouldn't lift (a junction the camera boxes a light at, HR-2; a mapped signal's left goes from the
+  junction's mouth since drive 29, 2026-11-08, too near the oncoming lanes for a launch to be armed) goes with the model,
+  and so does its crossing: a slow launch there committing short of a launch is never carried (go_lifted), and that is said
+  once (review 2026-11-08: a commit asking for a carry that never came said nothing)."""
   sim, plans, n0, said = run_left(from_rest(0.3), seconds=25., sim_fn=lambda: unlifted_sim())
   committed = named(said, 'turnpilot.left_committed')
   assert len(committed) == 1 and committed[0]['carry'], committed  # the left would have it carried...
@@ -211,7 +212,8 @@ def test_an_unlifted_lefts_slow_launch_is_never_carried():
 
 
 def unlifted_sim():
-  sim = signal_sim(oracle=False)
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import unmapped_camera_sim
+  sim = unmapped_camera_sim(lambda t: 'unknown')  # a governing head boxed at the junction, no colour read: never lifted
   sim.raw = road_runs()
   return sim
 

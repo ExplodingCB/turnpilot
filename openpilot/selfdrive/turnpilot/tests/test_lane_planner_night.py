@@ -443,19 +443,23 @@ def test_the_driver_holding_the_stalk_through_both_changes_is_asked_for_each():
 
 
 def test_an_unread_wait_says_why_and_never_requests():
-  """An offer up with the paint unread (the wide camera): it waits, the prompt kept, nothing requested on an unread frame,
-  even with the driver signalling; it goes on the first frame read broken white."""
-  drive = Drive(lanes_left=1, lanes_right=0, driver_signals=True)
-  m = maneuver("turn", "left")
-  distance = drive.run(m, 290., LC_CONFIRM_FRAMES * DT_MDL + 0.5)
-  assert drive.lp.phase == Phase.WARN
-  drive.paint = None
-  distance = drive.run(m, distance, 2., blinker=LaneChange.left)
-  assert not drive.requests and not drive.aborts and drive.prompts[-1] == LaneChange.left
+  """An offer up with the paint unread (the wide camera): it waits, the prompt kept, nothing requested on an unread frame
+  with or without the driver's blinker; it goes on the first frame read broken white. The driver's blinker confirms only a
+  line read white (the review of 2026-11-08: from 2026-11-08's route 29 fix until then it confirmed an unread frame too, so a
+  request went out on a line nobody looked at)."""
   from openpilot.selfdrive.turnpilot.tests.test_lane_planner import striped
-  drive.paint = striped
-  drive.run(m, distance, 5., blinker=LaneChange.left)
-  assert len(drive.requests) == 1 and drive.lp.changes == 1
+  m = maneuver("turn", "left")
+  for signals in (False, True):
+    drive = Drive(lanes_left=1, lanes_right=0, driver_signals=True)
+    distance = drive.run(m, 290., LC_CONFIRM_FRAMES * DT_MDL + 0.5)
+    assert drive.lp.phase == Phase.WARN
+    drive.paint = None
+    distance = drive.run(m, distance, 2., blinker=LaneChange.left if signals else None)
+    assert not drive.requests and not drive.aborts, signals
+    assert drive.prompts[-1] == LaneChange.left
+    drive.paint = striped
+    drive.run(m, distance, 5., blinker=LaneChange.left)
+    assert len(drive.requests) == 1 and drive.lp.changes == 1
   # waiting on a line unread or not made out, the lane ends (the road edge the model is sure of comes in beside the line):
   # aborted noLane at once, as on a frame read broken white, never a silent wait
   for p in (None, lambda left, right: paint(left=UNKNOWN, right=SW)):
@@ -707,3 +711,40 @@ def test_through_turnpilotd_paint_lost_under_an_offer_waits_then_says_why():
   assert all(p.laneChangeOffer == LaneChange.left and p.laneChange == LaneChange.none for p in waited)
   assert len(waited) * DT_MDL >= LC_UNSURE_MAX_S - 0.1
   assert plan.laneChangeAbort == 'lineNotBroken' and plan.laneChangeOffer == LaneChange.none and plan.laneChange == LaneChange.none
+
+
+def test_the_drivers_blinker_confirms_an_unsure_line_never_a_contrary_one():
+  """Route 29 (2026-11-08, 520-524 s): a left offered at 78 m on broken white, the driver's blinker on since 89 m, then the left
+  ego line read white of unknown kind (the dashes unmade-out at night) on every read frame: nothing was requested on an unsure
+  frame, and the offer died tooLate at 58 m. The driver's blinker on the offered side now confirms the lane: the request goes on
+  the unsure frame. A contrary read still aborts it whatever the driver signals (solid, yellow, no line), and so does an edge
+  the model is sure of. Only a line read white is confirmed (the review of 2026-11-08): one of no colour or an unknown one
+  (broken of unknown colour, nothing made out) waits for its read as without the blinker (test_the_drivers_blinker_never_
+  confirms_a_colourless_line_nor_stops_the_unsure_clock)."""
+  m = maneuver("turn", "left")
+  for line, signals, want in ((WHITE_UNKNOWN_KIND, True, 'request'), (WHITE_UNKNOWN_KIND, False, 'wait'), (UNKNOWN, True, 'wait'),
+                              (COLORLESS, True, 'wait'), (LinePaint('unknown', 'white', 0.1, 0.3), True, 'request'),
+                              (SW, True, 'lineNotBroken'), (SY, True, 'lineNotBroken'), (NONE_READ, True, 'lineNotBroken')):
+    drive = Drive(lanes_left=1, lanes_right=0, driver_signals=True)
+    distance = drive.run(m, 290., LC_CONFIRM_FRAMES * DT_MDL + 0.5)
+    assert drive.lp.phase == Phase.WARN
+    drive.paint = lambda left, right, p=line: paint(left=p, far_left=p if p.color != 'yellow' else UNKNOWN, right=SW)
+    drive.run(m, distance, 1., blinker=LaneChange.left if signals else None)
+    got = 'request' if drive.requests else drive.aborts[0][0] if drive.aborts else 'wait'
+    assert got == want, (line, signals, got)
+
+
+def test_the_drivers_blinker_never_confirms_a_colourless_line_nor_stops_the_unsure_clock():
+  """The review of 2026-11-08 (probe_lc): the driver's blinker confirmed a line read broken of unknown colour (a yellow's
+  dashes at night read so too) and stopped the LC_UNSURE_MAX_S clock while it did, so the offer requested on it and waited with
+  no bound. Now the blinker confirms only a line read white: on a colourless line the offer waits, nothing requested, and
+  aborts lineNotBroken LC_UNSURE_MAX_S after its last broken white read, the driver signalling the whole time."""
+  m = maneuver("turn", "left")
+  for line in (COLORLESS, LinePaint('solid', 'unknown', 0.9, 0.95), UNKNOWN):
+    drive = Drive(lanes_left=1, lanes_right=0, driver_signals=True)
+    distance = drive.run(m, 290., LC_CONFIRM_FRAMES * DT_MDL + 0.5)
+    assert drive.lp.phase == Phase.WARN
+    drive.paint = lambda left, right, p=line: paint(left=p, far_left=UNKNOWN, right=SW)
+    drive.run(m, distance, LC_UNSURE_MAX_S + 1., blinker=LaneChange.left)
+    assert not drive.requests, line
+    assert [a for a, _ in drive.aborts] == ['lineNotBroken'], (line, drive.aborts)

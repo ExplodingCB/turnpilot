@@ -668,6 +668,18 @@ class TestCameraLights(OpenpilotTestCase):
     assert str(light.read) == 'red' and light.reason == 'read'  # this frame's read and its reason
     assert pm.sent[1].lightStatus == LightStatus.wideCamera and len(pm.sent[1].lights.lights) == 0
 
+  def test_the_reader_reads_boxes_under_the_detectors_threshold_and_light_boxes_dont_carry_them(self):
+    # route 29 (2026-11-08): a red read only at its line, its heads first boxed at MIN_CONF 40 m out while the full pass had
+    # them at 0.2-0.33 from about 60 m. The reader takes class 9 down to LIGHT_READ_CONF; lightBoxes (the signal-head checks)
+    # stay at MIN_CONF
+    from openpilot.selfdrive.turnpilot.detector.decoder import LIGHT_READ_CONF, MIN_CONF
+    assert LIGHT_READ_CONF < 0.25 < MIN_CONF
+    det, pm = with_lights(make_detector()), PM()
+    det.run.raw[0, 2] = [*det.lb.to_input(800, 120), *det.lb.to_input(815, 165), 0.25, TRAFFIC_LIGHT]
+    det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(7), Meta(8)])
+    assert det.lights.calls == [('host0', 7, [TRAFFIC_LIGHT, TRAFFIC_LIGHT])]
+    assert [round(b.conf, 2) for b in pm.sent[0].lightBoxes] == [0.8]
+
   def test_add_only_mode_is_not_shadow(self):
     det, pm = with_lights(make_detector(), 'addOnly'), PM()
     det.step(pm, det.model_state, 0.010, 0.0, log.Desire.none, [Meta(1), Meta(2)])

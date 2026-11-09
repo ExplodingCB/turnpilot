@@ -2273,12 +2273,14 @@ def test_left_from_a_t_stem_or_a_right_has_no_unprotected_stop():
     assert sim.s > 320. and not any(p.shouldStop or p.controlPrompt != 'none' for _, _, p in sim.trace if p.maneuverDistance > -20.)
 
 
-def test_a_left_at_a_signal_is_unprotected_and_stops_at_its_hold_line():
-  # a signal at the junction holds nothing (SIGNAL_PROTECTS_LEFT): the left stops at its own hold line, not the signal's
+def test_a_left_at_a_signal_is_unprotected_and_stops_in_the_junctions_mouth():
+  # a signal at the junction holds nothing (SIGNAL_PROTECTS_LEFT): the left stops at its own hold, not the signal's line, and
+  # since drive 29 (2026-11-08) that hold is in the junction's mouth, past the signal's line (SIGNAL_LEFT_HOLD_M), not 9 m short
+  from openpilot.selfdrive.turnpilot.map_controls import SIGNAL_LEFT_HOLD_M
   sim = Sim(TURNS_AHEAD, controls=[(289., 'signal')])
   sim.go_taps = False
   plan = stop_at(sim, 289.)
-  assert plan.mapControl.kind == 'unprotectedTurn' and 300. - HOLD_LINE_M - 4. < sim.s < 300. - HOLD_LINE_M
+  assert plan.mapControl.kind == 'unprotectedTurn' and 300. - SIGNAL_LEFT_HOLD_M - 3. < sim.s < 300. - SIGNAL_LEFT_HOLD_M + 0.5
   assert not any(p.mapControl.kind == 'signal' and p.shouldStop for _, _, p in sim.trace)
 
 
