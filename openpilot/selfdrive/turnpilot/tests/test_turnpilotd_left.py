@@ -8,7 +8,7 @@ from openpilot.cereal import log, messaging
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.detector.light_state import LIGHT_MODE_DEFAULT
 from openpilot.selfdrive.turnpilot.hooks import CLEAR_DESIRE, TAKE_CONTROL_PROMPTS
-from openpilot.selfdrive.turnpilot.map_controls import CAMERA_GREEN_STEADY_S, SIGNAL_UNSEEN_REASON, SIGNAL_UNSEEN_S
+from openpilot.selfdrive.turnpilot.map_controls import CAMERA_GREEN_STEADY_S, RED_GONE_S, SIGNAL_UNSEEN_REASON, SIGNAL_UNSEEN_S
 from openpilot.selfdrive.turnpilot.maps.defaults import FAR_CROP_LEFT_RANGE_M
 from openpilot.selfdrive.turnpilot.scene.tracker import RawBox, RawFrame
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, ONCOMING_ENTRY_M
@@ -853,14 +853,15 @@ def test_a_go_after_a_nearer_reading_is_still_withdrawn_when_the_car_doesnt_move
   # the left goes only standing held at its line: after a nearer reading (the follower's distance under GO_LINE_M) its go is
   # still a go from the line, withdrawn and handed back when the car doesn't move, never taken for a go in the junction left
   # to the stall's handback. Unlifted there (too near the oncoming lanes for the lift's nudge), with the model planning
-  # motion (the Sim's drives on) and the car standing: a fault, said at NO_MOVE_S (review 2026-11-07, LS-2: the model's launch
-  # from a stand takes 0.9-1.6 s on this car, so LEFT_NO_MOVE_S is no bound for it)
+  # motion (the Sim's drives on) and the car standing: a fault, said at LEFT_LAUNCH_STAND_S (the model's launch from a stand
+  # takes 0.9-1.6 s on this car: NO_MOVE_S left 0.4 s of margin before a handback)
+  from openpilot.selfdrive.turnpilot.turnpilotd import LEFT_LAUNCH_STAND_S
   sim, plans, last = jump_run(4., 70., sim_cls=GoHeldSim)
   go = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
   assert sim.distance() < GO_LINE_M and not sim.tp.go_in_junction
   after = plans[go:]
   withdrawn = next(i for i, p in enumerate(after) if str(p.controlPrompt) == 'cantStartTakeControl')
-  assert withdrawn * DT_MDL <= NO_MOVE_S + 0.2 and after[-1].shouldStop and sim.s < LINE + 1.
+  assert NO_MOVE_S < withdrawn * DT_MDL <= LEFT_LAUNCH_STAND_S + 0.2 and after[-1].shouldStop and sim.s < LINE + 1.
 
 
 def signal_sim(red_until=None, oracle=True, line=JUNCTION - 8.5):
@@ -962,7 +963,11 @@ def test_a_hold_after_the_go_withdraws_it_and_the_car_waits_for_a_fresh_go():
   plans = run_objects(sim, 60., ped)
   gos = [i for i, p in enumerate(plans) if str(p.controlPrompt) == 'leftGo' and str(plans[i - 1].controlPrompt) != 'leftGo']
   assert len(gos) >= 2 and gos[1] * DT_MDL >= st['go_t'] + 3. + CLEAR_WINDOW_S - 0.2
-  assert all(v < 0.3 for _, v, _ in sim.trace[gos[0] + 2:gos[1]])  # never ran on the first go
+  # never ran on the first go: it comes as the car rolls in to its line (the approach's window), and the hold stops it within
+  # the last of that roll, where it stands until the fresh go
+  s_go = sim.trace[gos[0]][0]
+  assert all(s - s_go < 0.5 for s, _, _ in sim.trace[gos[0]:gos[1]])
+  assert all(v < 0.05 for _, v, _ in sim.trace[gos[0] + int(1. / DT_MDL):gos[1]])
   assert sim.s > JUNCTION + 10.
 
 
@@ -1097,17 +1102,18 @@ def unmapped_camera_sim(read, status=lambda t: 'read'):
   return sim
 
 
-@pytest.mark.parametrize('after', ['lost', 'unknown', 'disabled'])
+@pytest.mark.parametrize('after', ['lost', 'disabled'])
 def test_a_camera_red_at_a_junction_with_no_mapped_signal_holds_the_left_until_a_steady_green(after):
   # review 2026-11-07 (HR-1): at a junction the map has no signal for, the camera's own signal is never made at the left's own
   # junction (its own_turn gate), so a red the camera read there (add-only, the car's only source) was forgotten the moment it
-  # went unread: nothing read (a truck in front of the head), read 'unknown' (the 11-06 night's usual read), or the reader
-  # gone disabled. The left then went 2.6-3.5 s later on the oncoming band, empty at its own red, its go certified for
-  # plannerd's lift over the model's own red hold. Now the red stays the left's light until a steady camera green
+  # went unread: nothing read (a truck in front of the head) or the reader gone disabled. The left then went 2.6-3.5 s later
+  # on the oncoming band, empty at its own red, its go certified for plannerd's lift over the model's own red hold. Now the
+  # red stays the left's light until a steady camera green: a head nobody can see says nothing about its light (a head in
+  # view and no longer read red is the test below)
   lost_at, green_at = 40., 190.
 
   def read(t):
-    return 'red' if t < lost_at else 'green' if t >= green_at else None if after != 'unknown' else 'unknown'
+    return 'red' if t < lost_at else 'green' if t >= green_at else None
   sim = unmapped_camera_sim(read, lambda t: 'disabled' if after == 'disabled' and lost_at <= t < green_at else 'read')
   plans = run_objects(sim, green_at)
   at_line = next(i for i, p in enumerate(plans) if str(p.unprotectedLeft.state) == 'waitGap' and p.shouldStop)
@@ -1128,6 +1134,31 @@ def test_a_camera_red_at_a_junction_with_no_mapped_signal_holds_the_left_until_a
   assert CAMERA_GREEN_STEADY_S + CLEAR_WINDOW_S - 0.2 < go * DT_MDL < CAMERA_GREEN_STEADY_S + CLEAR_WINDOW_S + 2.
   assert not any(str(p.goCertified.cause) == 'unprotectedLeft' for p in plans)
   assert sim.s > JUNCTION + 10. and not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+
+
+@pytest.mark.parametrize('mapped', [True, False])
+def test_a_lefts_red_its_head_still_in_view_and_no_longer_read_red_is_gone_after_red_gone_s_never_sooner(mapped):
+  """A camera red at the left's junction, then its head still boxed on every road run and reading no colour (the light
+  changed to a green the reader can't read). Held for a green nobody reads, the left stands there for good, "Light not
+  seen: waiting for green". A head looked at RED_GONE_S on end with no
+  red read on it is no red: the stop it raised (a mapped signal's, or the left's own latch with none mapped) is let go, and
+  the left goes on its gap from a fresh window, never sooner, nothing said, no take-control. On route 29's stands at a red
+  the longest such run was 0.85 s on the car's logged votes and 0.1 s on this reader (the drive's video through it): a red
+  still red is read again long before. A head out of view (lost, the reader failing) never lets it go (the tests above)."""
+  lost_at = 55.
+
+  def read(t):
+    return 'red' if t < lost_at else 'unknown'
+  sim = camera_signal_sim(read) if mapped else unmapped_camera_sim(read)
+  plans = run_objects(sim, lost_at + RED_GONE_S - 0.3)
+  held = next(i for i, p in enumerate(plans) if p.shouldStop and sim.trace[i][1] < 0.05)
+  assert held * DT_MDL < lost_at and all(p.shouldStop for p in plans[held:]) and sim.s < LINE + 1.
+  assert not any(p.desire == Desire.turnLeft or str(p.unprotectedLeft.state) in ('go', 'committed') for p in plans)
+  plans = run_objects(sim, 20.)
+  go = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
+  assert CLEAR_WINDOW_S - 0.5 < go * DT_MDL < CLEAR_WINDOW_S + 4., go * DT_MDL  # its gap's own window, from the release
+  assert sim.s > JUNCTION + 10. and not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
+  assert not any(p.reason == SIGNAL_UNSEEN_REASON for p in plans)
 
 
 def test_a_red_far_short_of_the_lefts_junction_is_no_light_of_its_own():
@@ -1346,10 +1377,10 @@ def test_a_light_changing_with_the_car_crept_into_the_junction_clears_it_on_the_
   assert not any(p.desire == Desire.turnLeft for p in plans[:round((occ_leaves + CLEAR_WINDOW_S - 0.2) / DT_MDL)])
 
 
-@pytest.mark.parametrize('after', [None, 'unknown'])
+@pytest.mark.parametrize('after', [None])
 @pytest.mark.parametrize('mapped', [True, False])
 def test_a_lefts_red_no_longer_read_is_said_and_heard_as_a_through_signals_is_and_still_held(after, mapped):
-  """Review 2026-11-07 (AL-2): at a signalized left a camera red read, then lost (nothing read, or the night's usual 'unknown'),
+  """Review 2026-11-07 (AL-2): at a signalized left a camera red read, then lost (nothing read: its head out of view),
   stayed the left's red (turn_light: the stop it raised still in force, or the HR-1 latch with no signal mapped), counted
   against LIGHT_RED_MAX_S from the hold: "Waiting for the light" and silent for 124 s after the loss, where a through signal
   in the same state says "Light not seen: waiting for green" with a chime at SIGNAL_UNSEEN_S. A safety driver at a green the
@@ -1479,32 +1510,41 @@ def test_a_signal_held_with_its_light_unseen_is_heard_once_and_still_held():
   assert not plans[-1].shouldStop and sim.v > 1.
 
 
-def test_a_left_the_driver_hasnt_signalled_waits_at_its_line_prompting_the_side_on_repeat_and_goes_once_lit():
-  """IC 9-21-8-25 and LEFT_GO_NEEDS_SIGNAL: the left goes only with its side lit, and on this car (no vehicle-CAN tap) only
-  the driver can light it. Until 2026-11-07 it handed back after LEFT_SIGNAL_WAIT_S dark at its line ('unsignalled', "No turn
-  signal at the line: take control"), and from the line on selfdrived showed the left's own silent waitingForGap prompt over
-  "Signal LEFT Now", so the side's chime stopped as the car stood. Now (Kellen: no give-up handbacks; the driver prompted per
-  side with a repeating chime at any speed) the car waits at its line for as long as it is dark, "Signal LEFT Now" and its
-  own chime up the whole wait, never a take-control and never a go unsignalled; lit at last, it goes on its gap."""
+def test_a_left_the_driver_hasnt_signalled_waits_briefly_at_its_line_prompting_the_side_then_goes_on_its_gap():
+  """LEFT_GO_NEEDS_SIGNAL: the left's go waits for its side's lamp, the driver prompted per side with a repeating chime
+  ("Signal LEFT Now" over the left's own silent prompt, the whole wait). With no lamp it waits LEFT_SIGNAL_WAIT_S standing at
+  its line, never an unbounded stand for a lamp only the driver can light (it was, however long, until 2026-11-09), then
+  goes on its gap; never a take-control. (The public build's: never a go unsignalled.)"""
+  from openpilot.selfdrive.turnpilot.unprotected_left import LEFT_SIGNAL_WAIT_S
   sim = left_sim()
   sim.answers_prompt = False  # the driver never signals
   plans = []
-  while sim.t < 120.:
+  while sim.s < JUNCTION + 10. and sim.t < 120.:
     plans += drive(sim, DT_MDL)
   held = next(i for i, p in enumerate(plans) if p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap')
-  wait = plans[held:]
-  assert len(wait) * DT_MDL > 80. and all(p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap' for p in wait)
+  go = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
+  wait = plans[held:go - 1]
+  assert LEFT_SIGNAL_WAIT_S - 0.3 <= len(wait) * DT_MDL <= LEFT_SIGNAL_WAIT_S + 0.5, len(wait) * DT_MDL
+  assert all(p.shouldStop and str(p.unprotectedLeft.state) == 'waitGap' for p in wait)
   assert all(str(p.turnSignal.prompt) == 'left' and p.reason == "Unprotected left: waiting for the turn signal" for p in wait)
-  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS or p.desire == Desire.turnLeft for p in plans)
-  shown = [s for s in selfdrived_alerts(plans) if s[0] >= held]
-  assert all(s[1] == "Signal LEFT Now" and s[3] == 'tpSignalLeft' for s in shown), sorted({s[1:] for s in shown})
-  # the driver lights it: the window from the lamp, then the go
-  sim.answers_prompt = True
-  after = []
-  while sim.s < JUNCTION + 10. and sim.t < 180.:
-    after += drive(sim, DT_MDL)
-  assert any(p.desire == Desire.turnLeft for p in after) and sim.s > JUNCTION + 10.
-  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in after)
+  shown = [s for s in selfdrived_alerts(plans) if held <= s[0] < go - 1]
+  assert shown and all(s[1] == "Signal LEFT Now" for s in shown) and any(s[3] == 'tpSignalLeft' for s in shown), \
+    sorted({s[1:] for s in shown})
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans) and sim.s > JUNCTION + 10.
+
+
+def test_a_left_with_no_lamp_is_still_held_by_a_car_closing_in_the_band():
+  """The lamp's wait over, the gap rule still holds the left: a car closing in the oncoming band (nearer run by run) keeps it
+  at its line, and it goes only once that car has passed and the band has been clear a whole window."""
+  gone_t = 36.  # s: the oncoming car, 12 m/s up the opposing lane, reaches the junction (the car is at its line from 29 s)
+  sim = left_sim(lambda s: ((JUNCTION + 12. * (gone_t - s.t), 3.6),))
+  sim.answers_prompt = False
+  plans = []
+  while sim.s < JUNCTION + 10. and sim.t < 120.:
+    plans += drive(sim, DT_MDL)
+  go = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
+  assert go * DT_MDL >= gone_t + CLEAR_WINDOW_S - 0.3, go * DT_MDL
+  assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans) and sim.s > JUNCTION + 10.
 
 
 def route_time_left(range_m, controls=()):
@@ -2349,7 +2389,8 @@ def test_a_red_read_too_late_for_the_signals_line_holds_the_left_in_the_mouth_ne
   plans = run_objects(sim, 70.)
   red_i = next(i for i, (s, _, _) in enumerate(sim.trace) if s >= line - 0.3)
   assert sim.trace[red_i][1] > 1.  # rolling when the red came
-  assert any(str(p.mapControl.kind) == 'signal' and str(p.mapControl.action) == 'infeasible' for p in plans)  # too late for its line
+  # no room left short of the line: the car stops just over it, short of the lanes (below), and nothing says it can't
+  assert not any(str(p.controlAlert) in ('cannotStopComfortably', 'stopOverrun') for p in plans)
   assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)  # never 'Unprotected left not checked'
   during = sim.trace[red_i:round(40. / DT_MDL)]
   stood = [s for s, v, _ in during if v < 0.05]

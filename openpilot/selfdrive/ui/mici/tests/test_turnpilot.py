@@ -80,10 +80,10 @@ class TestTurnPilotOnroad(OpenpilotTestCase):
     assert self.tp.prompt_alert(plan(state='laneChange'), car_state()) is None
     alert = self.tp.prompt_alert(plan(state='laneChange', signalPrompt='right'), car_state())
     assert alert.text1 == 'Signal RIGHT to Change Lanes'
-    # the warning's countdown, before the change may go
+    # the driver signals this change: asked for the signal from the offer's first frame, the countdown still running
     counting = self.tp.prompt_alert(plan(state='laneChange', signalPrompt='right', laneChangeOffer='right', laneChangeCountdown=2.3),
                                     car_state())
-    assert counting.text1 == 'Lane Change Right in 3'
+    assert counting.text1 == 'Signal RIGHT to Change Lanes'
     assert alert.status == log.SelfdriveState.AlertStatus.userPrompt
     assert alert.alert_type.startswith('preLaneChangeRight/')  # upstream's turn signal icon on that side
     shadow = self.tp.prompt_alert(plan(state='laneChange', signalPrompt='left', shadow=True), car_state())

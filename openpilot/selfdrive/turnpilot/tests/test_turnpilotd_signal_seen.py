@@ -56,12 +56,16 @@ def took_control(plans):
   return [p.reason for p in plans if p.controlPrompt == 'stopSignTakeControl']
 
 
-def test_the_skewed_stop_sign_hands_back_at_1_s_as_before(tmp_path):
-  """No head seen: a stop sign whose opposite leg is 21 deg off is H9 under vision, as route 29's was."""
+def test_the_skewed_stop_sign_is_stopped_at_and_gone_from_never_handed_back(tmp_path):
+  """No head seen, the stop sign's opposite leg 21 deg off (route 29's): the skew is no gate (stop_go._vision_gate). The
+  full stop, then the go on what the cameras see."""
   sim = ssim(tmp_path)
   run_to_line(sim)
-  sim.run(3.)
-  assert took_control(sim.plans()) and '21 deg off straight on' in took_control(sim.plans())[-1]
+  stopped_at = sim.s
+  sim.run(14.)
+  plans = sim.plans()
+  assert abs(S_LINE - stopped_at) < 6. and not took_control(plans)
+  assert any(str(p.stopGo.state) in ('inLane', 'done') for p in plans)
 
 
 def test_heads_seen_on_the_approach_end_the_handback_and_the_junction_is_remembered_with_no_node(tmp_path):
@@ -160,13 +164,14 @@ def test_a_head_at_the_next_junction_is_no_signal_here_and_one_over_this_junctio
   far up the road: the next junction's heads made this stop sign a signal (its stop-sign rules no handback, its notice
   dropped, and with signal_controls its stop driven on their green). Now a head is this junction's only from its stop point
   to SIGNAL_PAST_M past its far side, ranged from its elevation: one 40 m past the line (the next junction's) is no signal
-  head here, so route 29's skewed stop sign hands back as a stop sign; one over the far lanes is, as on route 29."""
+  head here, so route 29's skewed stop sign is driven as a stop sign (its own lifted go); one over the far lanes is a signal
+  head here, as on route 29."""
   far = ssim(tmp_path, heads=head_at(40.))
   far.tp.params = None
   run_to_line(far)
-  far.run(3.)
-  assert not far.tp.signal_junctions.seen
-  assert took_control(far.plans()) and '21 deg off straight on' in took_control(far.plans())[-1]
+  far.run(8.)
+  assert not far.tp.signal_junctions.seen and not took_control(far.plans())
+  assert any(str(p.goCertified.cause) == 'stopSign' for p in far.plans())
   here = ssim(tmp_path, heads=head_at(14.))
   here.tp.params = None
   run_to_line(here)

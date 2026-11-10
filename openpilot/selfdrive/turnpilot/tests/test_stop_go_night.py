@@ -16,7 +16,7 @@ from openpilot.selfdrive.turnpilot.routing import certify as ce
 from openpilot.selfdrive.turnpilot.routing.tests.test_certify import ETA, LAT, LON, utc, vision_junction
 from openpilot.selfdrive.turnpilot.tests import test_stop_go as tsg
 from openpilot.selfdrive.turnpilot.tests.test_stop_go import arrived_at, first_go, lane_box
-from openpilot.selfdrive.turnpilot.tests.test_stop_go_vision import SHIPPED, gate_fault, vcars, vworld
+from openpilot.selfdrive.turnpilot.tests.test_stop_go_vision import SHIPPED, forward_cars, gate_fault, vcars, vworld
 from openpilot.selfdrive.turnpilot.tests.test_visibility import sectors
 
 NIGHT = ETA + 8 * 3600.          # 23:00 EDT, the sun -34 deg
@@ -175,31 +175,33 @@ def test_vision_with_the_side_views_blocked_a_car_the_detector_boxes_still_holds
 
 
 @pytest.mark.parametrize('when,quality', [(None, 'washed'), (None, 'frozen'), (NIGHT, 'washed'), (NIGHT, 'frozen')])
-def test_vision_a_washed_or_frozen_side_view_still_holds_the_go_until_it_reads_again_by_day_and_at_night(tmp_path, monkeypatch,
-                                                                                                         when, quality):
-  # a washed sector (the sun or headlights in the lens) or a frozen one (the view's frames not changing) is a bearing not seen,
-  # by day and at night: the lane behind it short of reach, the go waits, said in plain words (which of the two: the review of
-  # 2026-11-08, never gone on as a limited view: tests/test_stop_go_view.py); once the sectors read ok the window runs and the
-  # car goes. The sim's sectors only: no real side view has been read at night
-  clear_at, world = [104.], []  # camera time (World starts at 100)
-
-  def lit_or_not(view):
-    return sectors(view, bad=70., quality=quality) if world[0].t_cam < clear_at[0] else sectors(view)
-  monkeypatch.setattr(tsg, 'sectors', lit_or_not)
-  w = vworld(tmp_path) if when is None else vworld(tmp_path, wall_t=when)
-  world.append(w)
-  out = w.run(10.)
+def test_vision_a_washed_or_frozen_side_view_is_said_and_gone_on_by_day_and_at_night_and_a_car_coming_holds(tmp_path, monkeypatch,
+                                                                                                            when, quality):
+  # a washed sector (the sun, a streetlight or headlights in the lens) or a frozen one is a bearing that side camera doesn't
+  # see, by day and at night: the lane behind it short of reach, said in plain words (which of the two), then the long look
+  # and the go on what is seen (tests/test_stop_go_view.py); never a wait for as long as the light shines. A car the forward
+  # cameras see coming holds the go. The sim's sectors only: no real side view has been read at night
+  monkeypatch.setattr(tsg, 'sectors', lambda view: sectors(view, bad=70., quality=quality))
+  kw = {} if when is None else {'wall_t': when}
+  out = vworld(tmp_path, **kw).run(10.)
   a, i = arrived_at(out), first_go(out)
-  assert i is not None and (i + 1) * DT_MDL >= (clear_at[0] - 100.) + sr.VISION_CLEAR_S - 0.11, quality
+  assert i is not None and (i - a) * DT_MDL <= sr.VISION_CREEP_AFTER_S + sr.VISION_LONG_CLEAR_S + 0.6, quality
   waits = [d for d in out[a:i] if d.holds and all(h.key.startswith('reach:') for h in d.holds)]
   assert waits and any(sg.REACH_WORDS[quality] in d.reason for d in waits), {d.reason for d in out[a:i]}
+  assert out[i - 1].reason == sg.LOOK_REASON and out[i].log['viewLimited']
   assert not any('(sector)' in d.reason for d in out)  # the driver's words, never the walk's
   assert not any(d.fault for d in out) and gate_fault(out) is None
+  w = vworld(tmp_path, **kw)
+  w.tracks = forward_cars(w.j, (41, 'left', lambda t: None if t < 2. else 45. - 8. * (t - 2.)))
+  out = w.run(14.)
+  i = first_go(out)
+  held = [k for k, d in enumerate(out) if any(h.key == 'tracked:41' for h in d.holds)]
+  assert held and i is not None and i > max(held) and (i + 1) * DT_MDL >= 2. + 45. / 8.
 
 
-def test_vision_the_gate_at_night_is_glare_alone_and_geometry_still_hands_back(tmp_path):
-  # what vision's gate still refuses after dark is what it refuses by day (a divided cross road here): the 1 s handback
-  d = gate_fault(vworld(tmp_path, j=vision_junction(divided=True), wall_t=NIGHT).run(4.))
-  assert d is not None and d.reason == "Stop sign: a divided cross road: take control" and d.fault == 'H9'
+def test_vision_the_gate_at_night_is_the_days_a_rail_crossing_still_hands_back(tmp_path):
+  # what vision's gate still refuses after dark is what it refuses by day (a rail crossing at the junction): the 1 s handback
+  d = gate_fault(vworld(tmp_path, j=vision_junction(rail_distance=20.), wall_t=NIGHT).run(4.))
+  assert d is not None and d.reason == "Stop sign: a rail crossing 20 m away: take control" and d.fault == 'H9'
   v = ce.assess(vision_junction(), 'straight', SHIPPED, [], NIGHT, ce.Runtime(mode='vision', side_views=True, window=(0., 0.)))
   assert (v.certification, v.reason, v.rows) == ('certifiable', 'none', {'day'})

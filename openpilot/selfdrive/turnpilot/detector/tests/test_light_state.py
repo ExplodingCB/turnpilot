@@ -128,11 +128,14 @@ class TestReadHead(OpenpilotTestCase):
     for color, lamp in LAMPS.items():
       assert read([head(lamp, color, w=9, h=HEAD_MIN_H_PX)])[0].state == color
 
-  def test_colour_in_the_wrong_lamp_is_unknown(self):
-    # a red lit at the bottom is not a head's red: a tail light, a sign, glare
-    r = read([head(2, 'red')])[0]
-    assert (r.state, r.reason) == ('unknown', 'positionMismatch')
-    assert read([head(0, 'green')])[0].state == 'unknown'
+  def test_a_red_or_green_is_its_hue_wherever_it_sits(self):
+    # route 29: a governing red ball 23 m out sat at the bottom of its box and a governing green 35 m out at 0.30 of its
+    # (the box drawn round the glow, not the housing), and both went unread for where they sat. A yellow keeps its place:
+    # its hue is a streetlight's too
+    assert [(r.state, r.reason) for r in read([head(2, 'red')]) + read([head(0, 'green')])] == [('red', 'read'), ('green', 'read')]
+    for lamp in (0, 2):
+      r = read([head(lamp, 'yellow')])[0]
+      assert (r.state, r.reason) == ('unknown', 'positionMismatch'), (lamp, r)
 
   def test_two_lamps_or_none_is_unknown(self):
     assert read([head([0, 2], 'red')])[0].reason == 'twoLit'
@@ -224,11 +227,24 @@ class TestNightLamps(OpenpilotTestCase):
     assert read([head([0, 1], 'red', h=60)])[0].reason == 'twoLit'  # adjacent lamps by day: the housing between them
 
   def test_a_glow_with_no_head_around_it_is_unknown(self):
-    # a box drawn round the glow alone (the housing unseen, its top and bottom guessed): the lamp sits in its middle, and no
-    # red or green is read there
+    # a box drawn round the glow alone (the housing unseen, its top and bottom guessed), the glow most of it: no red or
+    # green is read there (a streak)
     for color in ('red', 'green'):
       _, r = night_read([(672, self.at(0.5), color)], self.BOX, r=8., up=8., side=4., down=10.)
       assert r.state == 'unknown', (color, r)
+
+  def test_a_glow_filling_its_box_is_a_streak_however_round(self):
+    # something lit that fills its box is no lamp, a round red or green one too: read as one (for a red ball 22 m out that
+    # glowed 0.62 of its box), it made a governing red on 210 of 561 frames of route 29's approach to a green
+    box = (660, 202, 688, 242)
+    for color in ('red', 'green', 'yellow'):
+      frame, r = night_read([(674., 220., color)], box, r=7., up=8., side=5., down=12.)
+      runs, widest = lit_run(frame, box)
+      r0, r1 = max(runs, key=lambda x: x[2])[:2]
+      assert RUN_MAX_REL * 40 < r1 - r0 + 1 <= 1.6 * widest  # round, and most of its box
+      assert (r.state, r.reason) == ('unknown', 'streak'), (color, r)
+    _, r = night_read([(668., 222., 'red')], (660, 200, 676, 250), r=3., up=18., side=1., down=22.)
+    assert (r.state, r.reason) == ('unknown', 'streak'), r
 
   def test_a_night_green_boxed_round_its_glow_reads_green(self):
     # route 29 (2026-11-08): every night green the light samples' crops show was boxed round its glow, the housing unseen, its
@@ -254,15 +270,16 @@ class TestNightLamps(OpenpilotTestCase):
     _, r = night_read([(680, 200 + 0.3 * 48, 'red')], (660, 200, 700, 248), r=6., up=4., side=5., down=6.)
     assert (r.state, r.reason) == ('unknown', 'aspect'), r
 
-  def test_a_colour_at_the_far_end_from_its_lamp_is_unknown(self):
-    # what the halves keep out: a green in the top third, a red below the middle, a yellow at the bottom (route 29's
-    # streetlight blob at 0.82, hue yellow), a lamp at the box's middle (MID_BAND: the box no guide)
+  def test_only_a_yellow_is_placed_by_its_box(self):
+    # a yellow out of the middle third is no head's yellow (route 29's streetlight blob at 0.82, hue yellow); a red or green
+    # glow is read wherever its box puts it
     box = (660, 200, 692, 272)
     glow = {'r': 7., 'up': 6., 'side': 6., 'down': 8.}
-    for color, frac, kw in (('green', 0.25, glow), ('red', 0.6, glow), ('yellow', 0.82, {'r': 6., 'up': 4., 'side': 5., 'down': 4.}),
-                            ('green', 0.5, glow), ('red', 0.5, glow)):
-      _, r = night_read([(676, 200 + frac * 72, color)], box, **kw)
-      assert (r.state, r.reason) == ('unknown', 'positionMismatch'), (color, frac, r)
+    _, r = night_read([(676, 200 + 0.82 * 72, 'yellow')], box, r=6., up=4., side=5., down=4.)
+    assert (r.state, r.reason) == ('unknown', 'positionMismatch'), r
+    for color, frac in (('green', 0.25), ('red', 0.6), ('green', 0.5), ('red', 0.5)):
+      _, r = night_read([(676, 200 + frac * 72, color)], box, **glow)
+      assert (r.state, r.reason) == (color, 'read'), (color, frac, r)
 
   def test_the_core_not_the_fuller_third_places_the_lamp(self):
     # a lamp's glow trailing 22 px below it fills the next third more than the lamp's own: the third with the most lamp
@@ -393,16 +410,20 @@ class TestVote(OpenpilotTestCase):
     return out
 
   def test_n_of_m(self):
-    assert VOTE_N == 4 and VOTE_M == 5
-    assert self.votes(['red'] * 3)[0].state == 'unknown'
-    assert self.votes(['red'] * 4)[0].state == 'red'
+    # the colour most of the last VOTE_M reads read, once VOTE_N did: one read is no colour, a tie is none
+    assert VOTE_N == 2 and VOTE_M == 5
+    assert self.votes(['red'])[0].state == 'unknown'
+    assert self.votes(['red'] * 2)[0].state == 'red'
     assert self.votes(['red', 'red', 'green', 'red', 'red'])[0].state == 'red'
-    assert self.votes(['red', 'green', 'red', 'green', 'red', 'red'])[0].state == 'unknown'
+    assert self.votes(['red', 'green', 'red', 'green'])[0].state == 'unknown'
+    assert self.votes(['red', 'red', 'green', 'green', 'green'])[0].state == 'green'
 
-  def test_a_missed_frame_counts_against(self):
-    assert self.votes(['red', 'red', None, 'red', 'red'])[0].state == 'red'
-    out = self.votes(['red', 'red', None, None, 'red'])
-    assert out == [] or out[0].state == 'unknown'
+  def test_a_red_read_in_two_of_five_runs_is_red(self):
+    # route 29's late red: boxed in two road runs 0.2 s apart 16 m from its line, then not for 1.7 s; four reads in five
+    # runs were only had at the line. A run it wasn't seen in is an unknown read, and five of those end the vote
+    assert self.votes(['red', None, 'red'])[0].state == 'red'
+    assert self.votes(['red', 'red', 'unknown', 'unknown', 'unknown'])[0].state == 'red'
+    assert self.votes(['red', 'red', 'unknown', 'unknown', 'unknown', 'unknown'])[0].state == 'unknown'
 
   def test_heads_kept_apart_and_dropped(self):
     v = HeadVoter()
@@ -460,8 +481,8 @@ class TestReader(OpenpilotTestCase):
       reader.read(i * 0.1, frame, STRIDE, Y_HEIGHT, LEVEL, 1.22, boxes)
     assert reader.boxes_seen()
     frames, gates, heads, colours = reader.take_counts()
-    assert frames == 3 and gates == {'small': 3, 'belowHorizon': 3} and heads == {'read': 3, 'positionMismatch': 3}
-    assert colours == {'red': 3}
+    assert frames == 3 and gates == {'small': 3, 'belowHorizon': 3} and heads == {'read': 6}
+    assert colours == {'red': 6}
     assert reader.take_counts() == (0, {}, {}, {}) and not reader.boxes_seen()
     reader.read(1., frame, STRIDE, Y_HEIGHT, LEVEL, 1.22, np.zeros((0, 6), np.float32))
     assert reader.take_counts()[0] == 1 and not reader.boxes_seen()

@@ -303,8 +303,9 @@ def test_stop_sign_go(tmp_path):
   for pkl in (pointer, tmp_path / 'missing.pkl'):
     c = preflight.check_stop_sign_go('vision', True, True, False, pkl)
     assert c.status == WARN and 'side views' in c.detail and 'hands back' in c.detail and c.fix
+  # under vision navd detours round no stop, so TurnPilotAvoidStops off is nothing to warn of
   c = preflight.check_stop_sign_go('vision', True, False, False, side)
-  assert c.status == WARN and 'TurnPilotAvoidStops' in c.detail and c.fix
+  assert c.status == INFO and 'TurnPilotAvoidStops' not in c.detail
   for mode in ('off', 'shadow'):
     c = preflight.check_stop_sign_go(mode, True, True, False, side)
     assert c.status == INFO and 'every stop sign and yield hands back after 1 s' in c.detail

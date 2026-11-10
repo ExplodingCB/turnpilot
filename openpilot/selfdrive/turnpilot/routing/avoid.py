@@ -25,11 +25,11 @@ The loop (run), with route(exclude) the router's status-neutral reroute, which n
     of the plain route, at least AVOID_ADD_MIN_S (a short trip may still go round a block) and at most AVOID_ADD_MAX_S;
   - otherwise it ends 'clean' (nothing uncertifiable left) or 'unavoidable' (only unavoidable controls left).
 Whatever ends it, every stop and yield still uncertifiable on the kept route becomes unavoidable: the driver needs to know.
-Under TurnPilotStopSignGo=vision what the certifier fails is what the line would refuse: since 2026-11-07 no stop for dark or
-a missing clock (certify._assess_vision), and its reach is the line's own walk (certify.vision_lanes), so a stop it finds
-short is one the line would wait at, creep for a view and hand back: in the closed loop a 25 mph stop on a cross road of 2
-lanes each way (route-time 'reach' on its cross lanes) hands back 15 s after its full stop, day or night. So every
-uncertifiable stop is routed round alike, and said ahead when it can't be: the driver is never handed one unwarned.
+Under TurnPilotStopSignGo=vision what the certifier fails is what the line hands back at, and nothing else: a mapped rail
+crossing or a missing visibility file (certify._assess_vision, stop_go._vision_gate: one rule). Dark, glare, a short reach,
+a skewed or unknown junction are driven at the line, so they certify and nothing is said for them.
+Under vision navd runs the loop with detour off (run): the line drives every stop it is given, so none is routed around, the
+route stays the one a driver would take, and the stops the certifier fails are marked unavoidable for the notices alone.
 
 The maneuvers the car refuses (routing/lefts.py: a Left, since 2026-11-06 only the route's U-turns, which the driving model
 can't drive) go round the same loop, excluded by their exit edge (that module says why not the approach), in the same set,
@@ -178,7 +178,7 @@ def stops(controls) -> list:
 def run(steps, controls, controls_status: str, avoid: AvoidSet, *, certify: Callable, reroute: Callable, route_controls: Callable,
         own_edge: Callable, cancelled: Callable, deadline: float, monotonic: Callable = time.monotonic, enabled: bool = True,
         max_iter: int = MAX_AVOID_ITER, headings: Callable = lambda points: [None for _ in points],
-        lefts: Callable = lambda steps, controls: []) -> AvoidResult:
+        lefts: Callable = lambda steps, controls: [], detour: bool = True) -> AvoidResult:
   """The loop (module docstring). certify(control, steps) -> (certification, reason), writing it to the control (steps: the
   route it is on, for its ETA); reroute(exclude)
   -> steps or None; route_controls(steps) -> (controls, status); own_edge() -> the car's edge key or None; cancelled() ->
@@ -188,7 +188,9 @@ def run(steps, controls, controls_status: str, avoid: AvoidSet, *, certify: Call
   can put 50 deg off the route's (Indianapolis way 17439639), and drops it, so the stop survives as 'failed'.
   A reroute past detour_budget_s of the plain route (steps, as given) is a failed iteration: its batch dropped, the best kept.
   lefts(steps, controls) -> [Left], the route's maneuvers the car refuses (routing/lefts.py: route_lefts; its U-turns since
-  2026-11-06, never an unprotected left)."""
+  2026-11-06, never an unprotected left). detour False (navd under TurnPilotStopSignGo=vision): no stop is routed around,
+  the route stays the one a driver would take and every stop the certifier fails is unavoidable (driven to its line, said
+  ahead where the line would ask for the driver); the U-turns still go round the loop."""
   first = duration(steps)
   budget = detour_budget_s(first)
   for c in stops(controls):
@@ -311,6 +313,11 @@ def run(steps, controls, controls_status: str, avoid: AvoidSet, *, certify: Call
     del added[mark_at:]
     cloudlog.info(f"turnpilot avoid: an earlier route with {len(turns)} lefts the car would skip is kept: as few, and quicker")
 
+  if not detour and live(controls_status):
+    for c in stops(controls):
+      if c.certification == 'uncertifiable':
+        mark(c, 'unavoidable')
+    status = 'unavoidable' if any(c.certification == 'unavoidable' for c in stops(controls)) else 'clean'
   # then the stops, as before; a reroute for them that brings more lefts the car would skip is a failed iteration
   while status is None:
     if bounded():

@@ -2,6 +2,8 @@
 shipped visibility file (PV1 tables, camera fields and mask null, the veil unmeasured), no surveys, the map's tiers (mapStrong
 at an all-way, no on a two-way's through road), the clock at 15:00 EDT with the sun behind a northbound car, the detector's held
 sweep with the side views' sectors ok. G5's lift as plannerd applies it, the car following its command an actuator lag late."""
+import math
+
 import pytest
 
 from openpilot.common.realtime import DT_MDL
@@ -20,7 +22,7 @@ MPH = sr.MPH
 SHIPPED = vt.load(vt.SHIPPED)
 
 
-def vinfo(mph=25., maneuver='straight', tiers=None, sidecar=True, kind_mph=None):
+def vinfo(mph=25., maneuver='straight', tiers=None, sidecar=True, kind_mph=None, rail=-1.):
   """The control's junctionInfo as Saturday's car meets it: no survey, the map's tiers (mapStrong: an all-way), each
   approach's assumedLimit (kind_mph: per role)."""
   t, per = tiers or {}, kind_mph or {}
@@ -32,7 +34,7 @@ def vinfo(mph=25., maneuver='straight', tiers=None, sidecar=True, kind_mph=None)
             'outbound': True, 'lanesIn': 1, 'lanesOut': 1, 'valhallaControl': 'stop' if tier != 'no' else 'none', 'tier': tier,
             'assumedLimit': v, 'wayId': way, 'bikeLane': False, 'shoulderM': -1.}
   return {'status': 'ok', 'osmNodeId': NODE, 'lat': LAT, 'lon': LON, 'stopPointDistance': 13., 'stopPointSource': 'default',
-          'headingIn': 0., 'maneuver': maneuver, 'turnAngle': 0., 'roundabout': False, 'divided': False, 'railDistance': -1.,
+          'headingIn': 0., 'maneuver': maneuver, 'turnAngle': 0., 'roundabout': False, 'divided': False, 'railDistance': rail,
           'sidecar': sidecar, 'suspected': False, 'surveyed': False,
           'approaches': [leg(270., -90., 'left', 11), leg(90., 90., 'right', 12), leg(0., 0., 'opposite', 13)]}
 
@@ -97,9 +99,9 @@ def test_vision_a_cross_road_over_25_mph_or_unknown_goes_after_the_4_s_long_look
 
 
 @pytest.mark.parametrize('mph, reason', [(25., sg.GOING_REASON), (35., sg.LOOK_REASON)])
-def test_vision_re_engaged_at_the_line_after_the_window_says_it_1_s_before_the_go(tmp_path, mph, reason):
+def test_vision_re_engaged_at_the_line_after_the_window_says_it_before_the_go(tmp_path, mph, reason):
   # the brake at the line through the whole window (openpilot disengaged), then re-engaged: the plan's stopGo prompt with its
-  # line ("Look both ways" at a long look), the car held, for 1 s before the latch lets go; never a go on the re-engaged frame
+  # line ("Look both ways" at a long look), the car held, VISION_ANNOUNCE_S before the latch lets go; never a go on the re-engaged frame
   sim = vsim(tmp_path, mph=mph)
   run_to_line(sim)
   sim.run(1.5)
@@ -111,16 +113,42 @@ def test_vision_re_engaged_at_the_line_after_the_window_says_it_1_s_before_the_g
   sim.run(6.)
   plans = sim.plans()
   k = go_frame(sim)
-  assert k is not None and (k - n0) * DT_MDL == pytest.approx(1.0, abs=0.06)  # VISION_ANNOUNCE_S after the re-engage
+  assert k is not None and (k - n0) * DT_MDL == pytest.approx(sr.VISION_ANNOUNCE_S, abs=0.06)  # after the re-engage
   assert all(plans[i].controlPrompt == 'stopGo' and plans[i].reason == reason and plans[i].shouldStop for i in range(n0, k))
   assert plans[k].reason == 'Going' and not plans[k].shouldStop
   assert not any(p.controlPrompt == 'stopSignTakeControl' for p in plans) and caps_ok(plans)
 
 
-@pytest.mark.parametrize('status', ['off', 'disabled', 'unset'])
-def test_vision_side_views_off_or_disabled_hands_back_at_1_s_saying_so(tmp_path, status):
+def went_never_handed_back(sim, held_s):
+  plans = sim.plans()
+  k = go_frame(sim)
+  assert k is not None, [(str(p.stopGo.state), p.reason) for p in plans[-300::40]]
+  assert not any(p.controlPrompt == 'stopSignTakeControl' or str(p.stopGo.fault) not in ('', 'none') for p in plans)
+  assert sim.s > held_s + 15. and any(str(p.stopGo.state) in ('inLane', 'done') for p in plans) and caps_ok(plans)
+  return plans, k
+
+
+@pytest.mark.parametrize('status', ['off', 'disabled', 'unset', 'idle'])
+def test_vision_with_the_side_views_off_the_car_stops_looks_and_goes_on_its_forward_cameras(tmp_path, status):
+  # the side views are used when they run and never needed: the stop is made, "Look both ways" is said, and the go comes on
+  # what the forward cameras see, never a take-control
   sim = vsim(tmp_path)
   sim.side_status = lambda s: status
+  run_to_line(sim)
+  held_s = sim.s
+  sim.run(16.)
+  plans, k = went_never_handed_back(sim, held_s)
+  a = arrived(plans)
+  assert (k - a) * DT_MDL <= sr.VISION_CREEP_AFTER_S + sr.VISION_LONG_CLEAR_S + 0.6
+  said = [i for i in range(a, k) if plans[i].controlPrompt == 'stopGo']
+  assert said and all(plans[i].reason == sg.LOOK_REASON and plans[i].shouldStop for i in said)
+  assert str(plans[k].stopGo.mode) == 'vision'
+
+
+@pytest.mark.parametrize('kind, words', [('stop', 'Stop sign'), ('yield', 'Yield')])
+def test_vision_a_rail_crossing_at_the_junction_hands_back_at_1_s_saying_so(tmp_path, kind, words):
+  # the gate's one handback of the map's: a train is nothing the cross-traffic judgement covers
+  sim = vsim(tmp_path, kind=kind, rail=20.)
   run_to_line(sim)
   sim.run(3.)
   plans = sim.plans()
@@ -128,7 +156,7 @@ def test_vision_side_views_off_or_disabled_hands_back_at_1_s_saying_so(tmp_path,
   handed = next(k for k, q in enumerate(plans) if q.controlPrompt == 'stopSignTakeControl')
   assert abs((handed - latched) * DT_MDL - 1.0) <= 2 * DT_MDL
   p = plans[-1]
-  assert p.reason == "Stop sign: side cameras off: take control" and go_frame(sim) is None and p.shouldStop
+  assert p.reason == f"{words}: a rail crossing 20 m away: take control" and go_frame(sim) is None and p.shouldStop
   assert p.stopGo.fault == 'H9' and str(p.stopGo.mode) == 'vision'
 
 
@@ -147,12 +175,13 @@ def test_vision_night_and_no_clock_go_after_the_window_as_by_day(tmp_path, dt_h)
   assert not any(p.controlPrompt == 'stopSignTakeControl' for p in plans) and caps_ok(plans)
 
 
-def test_vision_without_the_sidecar_hands_back_h8(tmp_path):
+def test_vision_without_the_sidecar_stops_and_goes_never_handed_back(tmp_path):
+  # no sidecar is no handback: the junction's legs are the control's own, and it is the stop, the window, the go
   sim = vsim(tmp_path, sidecar=False)
   run_to_line(sim)
-  sim.run(3.)
-  p = sim.plans()[-1]
-  assert p.controlPrompt == 'stopSignTakeControl' and p.reason == sg.REASONS['H8'] and go_frame(sim) is None
+  held_s = sim.s
+  sim.run(14.)
+  went_never_handed_back(sim, held_s)
 
 
 @pytest.mark.parametrize('traffic', [False, True])
@@ -175,12 +204,24 @@ def test_vision_a_yield_stops_at_its_line_and_goes_after_the_window(tmp_path, tr
   assert not any(p.controlPrompt == 'stopSignTakeControl' for p in plans) and caps_ok(plans)
 
 
-def test_vision_a_yield_with_its_side_views_off_says_yield(tmp_path):
+def test_vision_a_yield_with_its_side_views_off_stops_and_goes(tmp_path):
   sim = vsim(tmp_path, kind='yield')
   sim.side_status = lambda s: 'off'
   run_to_line(sim)
-  sim.run(3.)
-  assert sim.plans()[-1].reason == "Yield: side cameras off: take control"
+  held_s = sim.s
+  sim.run(16.)
+  went_never_handed_back(sim, held_s)
+
+
+def car_coming_up_the_near_lane(sim, v=1.5):
+  """sim.boxes: a car the left side view boxes 17 m down the near lane, coming toward our path at v m/s (its box moves run
+  to run: one that stays put for visibility.STEADY_S is a parked car's, an occluder and no blocker)."""
+  t0 = sim.t_cam
+
+  def boxes(s):
+    y = max(17. - v * (s.t_cam - t0), 2.)
+    return {view: [raw_box(math.degrees(math.atan2(y, 8.)), conf=0.5, xy=(8., y), view='sideLeft')] for view in CYCLE}
+  sim.boxes = boxes
 
 
 def test_vision_a_car_in_the_near_lane_during_the_launch_withdraws_the_go_short_of_d_edge_min(tmp_path):
@@ -193,11 +234,33 @@ def test_vision_a_car_in_the_near_lane_during_the_launch_withdraws_the_go_short_
       p = sim.step()
       if str(p.stopGo.state) == 'going' and sim.v > 1.0:
         break
-    sim.boxes = lambda s: {v: [raw_box(65., conf=0.5, xy=(8., 17.), view='sideLeft')] for v in CYCLE}
+    car_coming_up_the_near_lane(sim)
     sim.run(6.)
     plans = sim.plans()
     assert any(p.stopGo.withdrawn for p in plans), lag
     assert sim.s - s_stop - 0.5 <= plans[-1].stopGo.dEdgeMin + 0.6 and sim.v < 0.05 and caps_ok(plans)
+
+
+def test_vision_a_signal_head_at_a_junction_the_map_gives_no_node_for_is_remembered_and_logged_with_no_alert(tmp_path, monkeypatch):
+  # the car's own map data carries no OSM node on a control (routes 26 and 29): a head seen there leaves nothing to name in
+  # TurnPilotJunctionOverrides. The driver can do nothing with that, and the junction is remembered for the drive by its
+  # position: logged, never an alert. A write that fails for a junction that has its node is still said
+  # (test_turnpilotd_stop's C20)
+  import openpilot.selfdrive.turnpilot.turnpilotd as tpd
+  events = []
+  real = tpd.cloudlog.event
+  monkeypatch.setattr(tpd.cloudlog, 'event', lambda name, **kw: (events.append((name, kw)), real(name, **kw))[1])
+  sim = vsim(tmp_path)
+  s, kind, *rest, info = sim.navd.controls[0]
+  sim.navd.controls[0] = (s, kind, *rest, dict(info, osmNodeId=0))
+  sim.heads = lambda s: ((2., 12., 0.7),)  # over the junction, above the horizon
+  run_to_line(sim)
+  sim.run(6.)
+  plans = sim.plans()
+  failed = [kw for name, kw in events if name == 'turnpilot.override_write_failed']
+  assert failed and failed[0]['kind'] == 'signalSeen' and failed[0]['osmNodeId'] == 0
+  assert sim.tp.signal_junctions.matches({'osmNodeId': 0, 'lat': LAT, 'lon': LON})
+  assert not any(str(p.controlAlert) == 'overrideWriteFailed' for p in plans)
 
 
 def test_vision_publishes_mode_vision_and_side_views_live_for_navd(tmp_path):

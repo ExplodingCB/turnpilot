@@ -129,6 +129,14 @@ def car_blinkers(CP, enabled: bool, model_v2, sm) -> tuple[bool, bool]:
   return False, False
 
 
+def vehicle_can_seen(panda_states) -> bool:
+  """A panda has received a frame on bus 1: vehicle CAN reaches the comma (the add-on cable is fitted), the only bus the
+  body controller takes a turn signal request from on a car whose party bus carries none of its traffic (opendbc
+  tesla/car_signal.py). Without it the port still reads 'ready' off the party bus's stock frame, and a request no lamp
+  answers fails after its timeout."""
+  return any(ps.canState1.totalRxCnt > 0 for ps in panda_states)
+
+
 def driver_signals_for(status) -> bool:
   """The driver signals (prompted) unless the car's own signal is ready: every brand, every mode."""
   return status != Status.ready
@@ -427,7 +435,10 @@ class TurnSignalIntent:
 
   # ------------------------------------------------------------------ status (DESIGN 7.3)
 
-  def status_for(self, flags: int, mode: str, port, dt: float, unverified_why: str = '') -> int:
+  def status_for(self, flags: int, mode: str, port, dt: float, unverified_why: str = '', proven: bool = True) -> int:
+    """proven: the car's own lamp path is known to work on this car (turnpilotd: vehicle CAN seen on bus 1, a lamp-check
+    record matching it, or the sim). Until it is, a port that reads ready is not: the driver signals from the first
+    offer (waiting, then unavailable), nothing is asked of the car and nothing fails; proven later, the car takes over."""
     if flags & TeslaFlags.CAR_SIGNALS_CHECK:
       self.why = ''
       return Status.checking
@@ -439,12 +450,12 @@ class TurnSignalIntent:
       if p == 'verifying':
         self.why = str(port.checkWhy)
         return Status.verifying
-      if p in READY_PORT:
+      if p in READY_PORT and proven:
         self.waiting_s, self.why = 0., ''
         return Status.ready
       self.waiting_s += dt
       if self.waiting_s >= CAR_SIGNAL_WAIT_S:
-        self.why = "No body-control message"
+        self.why = "No vehicle CAN on bus 1" if p in READY_PORT else "No body-control message"
         return Status.unavailable
       self.why = ''
       return Status.waiting

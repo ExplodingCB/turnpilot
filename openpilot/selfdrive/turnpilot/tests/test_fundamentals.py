@@ -77,7 +77,7 @@ class Loop(Sim):
     self.n_lanes, self.y = lanes, (lane + 0.5) * W  # y: m right of the road's left line, the car's centre
     self.signals = signals
     if signals == 'car':
-      self.tp.car_signal_flags, self.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+      self.tp.car_signal_flags, self.tp.car_signal_mode, self.tp.car_signal_proven = int(TeslaFlags.CAR_SIGNALS), 'on', True
       self.car_signal = Loop.port
     self.dh = DesireHelper()
     self.lc_prob = 0.
@@ -390,13 +390,14 @@ def through(sim, junction: float, limit_s: float = 120.) -> None:
 
 
 def assert_went_on_green(sim, line: float, go_s: float = 4.):
-  """Stood at the light's line through its red, never creeping, and moving within go_s of its green: no stall."""
+  """Stood at the light's line through its red, never creeping, and moving within go_s of its green: no stall. A right
+  too: it never goes on a red it is reading, its way clear or not (map_controls: a curb-side turn at a signal)."""
   k = stood_at(sim, line)
-  green_t = sim.light['stood'] + WAIT_S
-  held = [f for f in sim.frames[k:] if f.t < green_t]
+  go_t = sim.light['stood'] + WAIT_S
+  held = [f for f in sim.frames[k:] if f.t < go_t]
   assert held and all(f.v < 0.05 for f in held), ("crept on the red", trace(sim))
-  moving = next((f for f in sim.frames if f.t > green_t and f.v > 1.), None)
-  assert moving is not None and moving.t - green_t < go_s, ("stalled on the green", trace(sim))
+  moving = next((f for f in sim.frames if f.t > go_t and f.v > 1.), None)
+  assert moving is not None and moving.t - go_t < go_s, ("stalled at the light", trace(sim))
   return k
 
 

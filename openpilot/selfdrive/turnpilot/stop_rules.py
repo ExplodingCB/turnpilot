@@ -22,7 +22,7 @@ reach from the conflict point, m.
 """
 import math
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 MPH = 0.44704
 
@@ -72,13 +72,14 @@ VISION_NUDGE_M = 0.5      # m, under vision the shortest nudge a go may start wi
 # sees live, no survey, validation stamp, camera fields or launch stamp
 VISION_MAX_LIMIT = 25. * MPH  # m/s: a conflicting lane at or under this posted (or class default) speed gets VISION_CLEAR_S
 VISION_LIMIT_TOL = 0.05   # m/s: a 40 km/h tag (24.9 mph) reads as 25 mph
-VISION_CLEAR_S = 2.5      # s every go condition holds before a vision go (CLEAR_S stays the sector and dropout window)
-# a lane over VISION_MAX_LIMIT, or of unknown speed (assumedLimit 0), no longer hands back (owner direction 2026-10-30
-# 19:15-19:55, "it needs to always drive"): the longer look, its floor judged at VISION_MAX_LIMIT (ALWAYS_DRIVE V12), the
-# window VISION_LONG_CLEAR_S on every view, and "Look both ways" said before the go
-VISION_LONG_CLEAR_S = 4.0
-VISION_ANNOUNCE_S = 1.0   # s before the go its line ("Going", or "Look both ways") and chime
-VISION_CREEP_AFTER_S = 2.0  # s of a wait on reach alone before the creep for a view (ALWAYS_DRIVE V9)
+# The windows are a confident driver's look, never a survey's: longer than T_LAT (a car coming is a track within it), short
+# enough that an empty junction is left about as a person leaves it
+VISION_CLEAR_S = 1.5      # s every go condition holds before a vision go (CLEAR_S stays the sector and dropout window)
+# a lane over VISION_MAX_LIMIT, or of unknown speed (assumedLimit 0), is the longer look: its floor judged at VISION_MAX_LIMIT
+# (ALWAYS_DRIVE V12), the window VISION_LONG_CLEAR_S on every view, and "Look both ways" said before the go
+VISION_LONG_CLEAR_S = 2.5
+VISION_ANNOUNCE_S = 0.5   # s before the go its line ("Going", or "Look both ways") and chime
+VISION_CREEP_AFTER_S = 1.0  # s of a wait on reach alone before the creep for a view, or the go on what the cameras see
 # D-V1, the reach each conflicting lane must show under vision: 'stop' (option A, built) an attentive driver at the limit,
 # first seen as we go, stops short of our path; 'allway' (option B) the all-way need on an approach the map says stops, and
 # no vision go on any other
@@ -146,7 +147,7 @@ VEIL_OK = ('none', 'withCover')
 # (1d, 1e: 31-33 raw DN, 17-22 full range) is under the sectors' 45 DN dark and blocked tests, so under vision neither zeroes
 # a bearing, after dark or by day (review 2026-11-07, LS-3: every night stop waited and handed back H3; LS-3-R1: a dim still
 # band by day read blocked and did the same). Low sun and the sun ahead stay (glare, by day): the walk's zeroes, never the
-# vision gate's handback since 2026-11-08 (stop_go.VISION_VIEW_REASONS)
+# vision gate's handback (stop_go._vision_gate)
 DARK_ROWS = ('night', 'dusk')
 DARK_WALK_ROW = 'day'
 
@@ -341,6 +342,19 @@ class Junction:
   approaches: list[Approach] = field(default_factory=list)
 
 
+def vision_rail_handback(rail_distance: float) -> str:
+  """Under TurnPilotStopSignGo=vision, the one thing about a stop's junction the line hands back for: a mapped rail crossing
+  at it (rail_distance m away, known: 0 or more; -1 none, -2 not known), as its text, else ''. One rule for the line's gate
+  (stop_go._vision_gate), navd's certifier (routing/certify._assess_vision) and the notices (vision_needs_driver)."""
+  return f"a rail crossing {rail_distance:.0f} m away" if rail_distance >= 0. else ''
+
+
+def vision_needs_driver(cert_reason: str, rail_distance: float) -> bool:
+  """A stop navd couldn't certify is one the line hands back at under vision: no visibility file (noTable: the gate's
+  table) or a mapped rail crossing. Every other stop is driven (the full stop, the look, the go), so nothing is said for it."""
+  return cert_reason == 'noTable' or bool(vision_rail_handback(rail_distance))
+
+
 def junction_from_control(control) -> Junction:
   """navd's Control (routing/controls.py) and its junction_info (routing/junctions.py). A control without one is failed."""
   info = getattr(control, 'junction_info', None)
@@ -371,6 +385,23 @@ def junction_from_capnp(control) -> Junction:
                                        bool(a.outbound), int(a.lanesIn), int(a.lanesOut), str(a.valhallaControl), str(a.tier),
                                        float(a.assumedLimit), int(a.wayId), bool(a.bikeLane), float(a.shoulderM))
                               for a in j.approaches])
+
+
+ASSUMED_LINE_M = 10.  # m from the node an assumed cross road's stop point lies when the control carries none
+
+
+def assumed_cross(j: Junction | None) -> Junction:
+  """A plain cross road at right angles with a road opposite, one lane each way, speeds unknown: what a stop sign's junction
+  is taken to be under vision when the map gives nothing to judge cross traffic by (its lookup failed, or no road it knows
+  comes in across our path). The control's own stop point, position and heading are kept where it has them. Every lane is
+  then judged from what the cameras see, as at any other junction: a car seen in one holds the go."""
+  base = j if j is not None else Junction(status='failed')
+  h = float(base.heading_in)
+  legs = [Approach(bearing=(h + rel) % 360., rel_bearing=rel, role=role, inbound=True, outbound=True, lanes_in=1, lanes_out=1,
+                   control='none', tier='unknown')
+          for role, rel in (('left', -90.), ('right', 90.), ('opposite', 0.))]
+  line = float(base.stop_point_distance)
+  return replace(base, status='ok', stop_point_distance=line if line > 0. else ASSUMED_LINE_M, approaches=legs)
 
 
 # --------------------------------------------------------------------------------------------------------- conflict sets

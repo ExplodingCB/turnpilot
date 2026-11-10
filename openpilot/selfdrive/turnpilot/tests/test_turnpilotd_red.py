@@ -1,12 +1,14 @@
-"""No turn or go on red, ever (SAT_VALIDATION row 14, red_right_g62; Kellen: "We do not have to support right on red, it
-should always stop on red"): a right, a left and straight on at a red, with and without the sim's 2 m creep over the line."""
+"""No turn or go on red (SAT_VALIDATION row 14, red_right_g62; the owner: "We do not have to support right on red, it
+should always stop on red"): a right, a left and straight on at a red, with and without the sim's 2 m creep over the line.
+A right never goes on a red it is reading; one whose red is no longer read by any source goes from its stand once it has
+looked (map_controls' module docstring: a curb-side turn at a signal)."""
 import pytest
 
 from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.desire_timing import CURB_FIRST_PULSE_M, CURB_GO_SLACK_M, CURB_TURN_PULSE_M
 from openpilot.selfdrive.turnpilot.hooks import plan_accel
-from openpilot.selfdrive.turnpilot.map_controls import RED_PAST_REASON
+from openpilot.selfdrive.turnpilot.map_controls import RED_PAST_REASON, RIGHT_RED_UNREAD_S
 from openpilot.selfdrive.turnpilot.tests.synthetic import junction_of
 from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import LEFT_AT_A_RED, Sim, oracle_lights
 
@@ -20,9 +22,7 @@ ROUTES = {'right': ([(300., "turn", "right", junction_of("right")), (2000., "tur
 CREEP_V = 1.1  # m/s: BeamNG's light brake below 3 m/s gains speed (g62: 0.68-1.1 m/s under -0.67 to -1.11 asked)
 
 
-@pytest.mark.parametrize("overrun", [0., 2.])
-@pytest.mark.parametrize("maneuver", ['right', 'left', 'straight'])
-def test_no_turn_desire_lift_or_go_comes_on_a_red(maneuver, overrun):
+def to_a_stand_at_the_red(maneuver, overrun):
   maneuvers, want = ROUTES[maneuver]
   sim = Sim(maneuvers, controls=[(S_SIGNAL, 'signal')])
   sim.go_taps = False
@@ -40,6 +40,44 @@ def test_no_turn_desire_lift_or_go_comes_on_a_red(maneuver, overrun):
   while not (sim.v < 0.01 and sim.s > S_SIGNAL - 30.):
     plans.append(sim.step(engaged=True))
     assert sim.t < 90., "never stood"
+  return sim, plans, light, want
+
+
+@pytest.mark.parametrize("overrun", [0., 2.])
+def test_a_right_at_a_red_no_longer_read_goes_from_its_stand_only_once_it_has_looked(overrun):
+  """A right never rolls a red (the 11-06 drive ran one at an unread light): it stops at the line with no turn desire out
+  and stands for as long as the red is read. The red no longer read by any source for RIGHT_RED_UNREAD_S, nobody and
+  nothing seen crossing, it goes from that stand, with no take-control, its one pulse rolling 8 m out."""
+  sim, plans, light, want = to_a_stand_at_the_red('right', overrun)
+  assert sim.s < S_SIGNAL + overrun + 1. and not any(p.desire in TURNS for p in plans), "a turn desire on the way to a red"
+  s_stand = sim.s
+  stood = [sim.step(engaged=True) for _ in range(int(15. / DT_MDL))]
+  assert all(p.shouldStop and p.desire == Desire.none and p.controlPrompt == 'none' for p in stood) and sim.s - s_stand < 0.3
+  assert not sim.tp.go_cert.active
+  light['state'] = 'unknown'
+  unread = []
+  while sim.trace[-1][2].shouldStop:
+    unread.append(sim.step(engaged=True))
+    assert len(unread) < 100
+  assert len(unread) * DT_MDL >= RIGHT_RED_UNREAD_S - 0.1 and sim.s - s_stand < 0.3
+  assert all(p.desire == Desire.none for p in unread[:-1]) and all(p.controlPrompt == 'none' for p in unread)
+  if J_TURN - sim.s > CURB_TURN_PULSE_M + CURB_GO_SLACK_M:
+    # let go further out than its one pulse: no desire at the go, the one pulse rolling, 8 m out
+    assert unread[-1].desire == Desire.none
+    rolled = []
+    while sim.trace[-1][2].desire != want:
+      rolled.append(sim.step(engaged=True))
+      assert J_TURN - sim.s > CURB_FIRST_PULSE_M and len(rolled) < 400, "the right's pulse never came"
+    assert all(p.desire == Desire.none for p in rolled[:-1]) and sim.v > 0.3 and J_TURN - sim.s <= CURB_TURN_PULSE_M + 0.5
+    assert not any(p.shouldStop or p.controlPrompt != 'none' for p in rolled)
+  else:
+    assert unread[-1].desire == want  # the go's pulse at standstill
+
+
+@pytest.mark.parametrize("overrun", [0., 2.])
+@pytest.mark.parametrize("maneuver", ['right', 'left', 'straight'])
+def test_no_turn_desire_lift_or_go_comes_on_a_red(maneuver, overrun):
+  sim, plans, light, want = to_a_stand_at_the_red(maneuver, overrun)
   s_stand = sim.s
   plans += [sim.step(engaged=True) for _ in range(int(15. / DT_MDL))]
   assert sim.v == 0. and sim.s - s_stand < 0.05 and s_stand < S_SIGNAL + overrun + 1.
@@ -53,8 +91,8 @@ def test_no_turn_desire_lift_or_go_comes_on_a_red(maneuver, overrun):
     go.append(sim.step(engaged=True))
     assert len(go) < 100
   if maneuver == 'right' and J_TURN - sim.s > CURB_TURN_PULSE_M + CURB_GO_SLACK_M:
-    # a right let go further out than its one pulse (the 10 m line; 2026-11-06, desire_timing CURB_TURN_PULSE_M): no desire
-    # at the go, the car pulls away straight on the model, and the one pulse goes rolling on the green, 8 m out
+    # a right let go further out than its one pulse (the 10 m line; desire_timing CURB_TURN_PULSE_M): no desire at the go,
+    # the car pulls away straight on the model, and the one pulse goes rolling on the green, 8 m out
     assert go[-1].desire == Desire.none
     rolled = []
     while sim.trace[-1][2].desire != want:

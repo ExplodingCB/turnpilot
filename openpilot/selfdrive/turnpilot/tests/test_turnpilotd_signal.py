@@ -27,6 +27,7 @@ def signal_sim(maneuvers=RIGHT_TURN, port=None, flags=int(TeslaFlags.CAR_SIGNALS
   sim = Sim(maneuvers, cruise=cruise, driver_signals=None)
   sim.tp.car_signal_flags = flags
   sim.tp.car_signal_mode = 'on'
+  sim.tp.car_signal_proven = True  # a car whose own lamp path works (vehicle CAN on bus 1, or its lamp check passed)
   state = {'status': 'ready'}
   if port is not None:
     state.update(port)
@@ -132,7 +133,7 @@ def test_lane_change_waits_for_the_lamp_lead():
   from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import BROKEN_WHITE_LEFT, THREE_LANES_LEFT_TURN
   sim = Sim([(700., "turn", "left"), (3000., "turn", "right")], cruise=15., nav_lanes={0: THREE_LANES_LEFT_TURN}, model_lanes=(2, 0),
             paint=BROKEN_WHITE_LEFT, driver_signals=None)
-  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode, sim.tp.car_signal_proven = int(TeslaFlags.CAR_SIGNALS), 'on', True
   lit = {'on': False}
 
   def port(s):
@@ -157,7 +158,7 @@ def releasing_sim(maneuvers, cruise, driver_left=None):
   whose 'on' puts the driver's left lamp up, our right lamp released with NONE for a few frames, then the port idle and
   blocked by the driver's lamp."""
   sim = Sim(maneuvers, cruise=cruise, driver_signals=None)
-  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode, sim.tp.car_signal_proven = int(TeslaFlags.CAR_SIGNALS), 'on', True
   state = driver_left if driver_left is not None else {'on': False}
   state['release'] = 0
 
@@ -275,7 +276,7 @@ def turn_of(turn: str):
 def signal_veto_sim(t):
   """The car signalling turn t (turn_of) through overruling_port: (sim, the port's state)."""
   sim = Sim(t.maneuvers, driver_signals=None)
-  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode, sim.tp.car_signal_proven = int(TeslaFlags.CAR_SIGNALS), 'on', True
   state = {'driver': 'none'}
   sim.car_signal = overruling_port(state, t.side)
   return sim, state
@@ -394,7 +395,7 @@ def test_overruled_at_an_unprotected_turns_line_keeps_its_handback():
   from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import TURNS_AHEAD
   sim = Sim(TURNS_AHEAD, driver_signals=None)
   sim.go_taps = False
-  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode, sim.tp.car_signal_proven = int(TeslaFlags.CAR_SIGNALS), 'on', True
   driver = {'right': False}
 
   def port(s):
@@ -602,7 +603,7 @@ def auto_left_at_its_line(driver, veto_s=3.):
     return [(s - V_25 * dt, 3.6) for s in stream]
   sim = left_sim(cars)
   sim.answers_prompt = False
-  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode, sim.tp.car_signal_proven = int(TeslaFlags.CAR_SIGNALS), 'on', True
   state = {'driver': 'none'}
   sim.car_signal = overruling_port(state, LaneChange.left)
   while not (sim.trace and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
@@ -648,7 +649,7 @@ def test_a_veto_at_g1s_line_never_relights_the_left():
   from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import TURNS_AHEAD
   sim = Sim(TURNS_AHEAD, driver_signals=None)
   sim.go_taps = False
-  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode, sim.tp.car_signal_proven = int(TeslaFlags.CAR_SIGNALS), 'on', True
   state = {'driver': 'none'}
   sim.car_signal = overruling_port(state, LaneChange.left)
   while not (sim.v < 0.05 and sim.s > 250.):
@@ -677,7 +678,7 @@ def veto_after_go(driver, delay_frames):
   from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import JUNCTION, drive, left_sim
   sim = left_sim()
   sim.answers_prompt = False
-  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode, sim.tp.car_signal_proven = int(TeslaFlags.CAR_SIGNALS), 'on', True
   state = {'driver': 'none'}
   sim.car_signal = overruling_port(state, LaneChange.left)
   while not (sim.trace and str(sim.trace[-1][2].unprotectedLeft.state) == 'go'):
@@ -729,7 +730,7 @@ def test_a_veto_at_the_lefts_go_past_its_point_of_no_return_finishes_it_out_loud
   from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import JUNCTION, drive, left_sim
   sim = left_sim()
   sim.answers_prompt = False
-  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode, sim.tp.car_signal_proven = int(TeslaFlags.CAR_SIGNALS), 'on', True
   state = {'driver': 'none'}
   sim.car_signal = overruling_port(state, LaneChange.left)
   while not (sim.trace and str(sim.trace[-1][2].unprotectedLeft.state) == 'go' and sim.v > 0.3 and
@@ -872,7 +873,7 @@ def test_a_veto_just_after_a_holds_go_finishes_the_turn():
   the car reaches STANDSTILL_SPEED is after the go, so the turn finishes and says so, as one a moment later does; never a
   skip that sends the car straight across the junction on the go it made for the turn."""
   sim = Sim([(300., "turn", "right"), (1500., "turn", "left")], driver_signals=None)
-  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode, sim.tp.car_signal_proven = int(TeslaFlags.CAR_SIGNALS), 'on', True
   state = {'driver': 'none'}
   sim.car_signal = overruling_port(state)
   walker = {'on': True}
@@ -904,7 +905,7 @@ def test_a_veto_at_rest_in_the_junction_the_scene_committed_to_finishes_the_turn
   sends the car straight on from inside the junction."""
   from openpilot.selfdrive.turnpilot.map_controls import PROTECT_PAST_M
   sim = Sim([(300., "turn", "right"), (1500., "turn", "left")], driver_signals=None)
-  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode, sim.tp.car_signal_proven = int(TeslaFlags.CAR_SIGNALS), 'on', True
   state = {'driver': 'none'}
   sim.car_signal = overruling_port(state)
   while sim.distance() > 7.8:
@@ -1079,7 +1080,7 @@ def test_a_veto_at_rest_in_the_junction_a_holds_go_rolled_into_finishes_the_turn
   rest again short of the hold line (GO_LINE_M out or more) spends the go."""
   from openpilot.selfdrive.turnpilot.turnpilotd import GO_LINE_M
   sim = Sim([(300., "turn", "right"), (1500., "turn", "left")], driver_signals=None)
-  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode, sim.tp.car_signal_proven = int(TeslaFlags.CAR_SIGNALS), 'on', True
   state = {'driver': 'none'}
   sim.car_signal = overruling_port(state)
   walker = {'on': True}
@@ -1130,7 +1131,7 @@ def veto_then_reroute(driver, rerouted_at=REROUTE_J, mtype="turn", modifier="rig
   jn = junction_of(modifier, angle=angle)
   sim = Sim([(REROUTE_J, mtype, modifier, jn), (REROUTE_NEXT, "turn", "left", junction_of("left"))], driver_signals=None,
             model_lanes=model_lanes)
-  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode, sim.tp.car_signal_proven = int(TeslaFlags.CAR_SIGNALS), 'on', True
   state = {'driver': 'none'}
   sim.car_signal = overruling_port(state)
 
@@ -1255,7 +1256,7 @@ def nearer_reading_at_the_left_line(driver, nearer_m):
     return [(s - V_25 * dt, 3.6) for s in stream]
   sim = left_sim(cars)
   sim.answers_prompt = False
-  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode, sim.tp.car_signal_proven = int(TeslaFlags.CAR_SIGNALS), 'on', True
   state = {'driver': 'none'}
   sim.car_signal = overruling_port(state, LaneChange.left)
   jumped = {'on': False, 'n': 0}
@@ -1490,7 +1491,7 @@ def test_a_reroute_after_a_veto_at_g1s_line_never_relights_the_left(driver):
   from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import TURNS_AHEAD
   sim = Sim(TURNS_AHEAD, driver_signals=None)
   sim.go_taps = False
-  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode, sim.tp.car_signal_proven = int(TeslaFlags.CAR_SIGNALS), 'on', True
   state = {'driver': 'none'}
   sim.car_signal = overruling_port(state, LaneChange.left)
   while not (sim.v < 0.05 and sim.s > 250.):
@@ -1541,3 +1542,46 @@ def test_hazards_holding_the_port_off_say_so_on_the_reason_line(turn, at):
   sim.port_state = {'status': 'ready'}
   off = [sim.step(engaged=True) for _ in range(3)]
   assert all(p.reason != "Hazards on: car not signalling" for p in off)
+
+
+def test_until_the_cars_lamp_path_is_proven_the_first_offer_asks_the_driver_at_once_and_nothing_is_asked_of_the_car():
+  """Route 29 (2026-11-08): no vehicle-CAN cable, so panda bus 1 carries no frames and the body controller takes no request,
+  yet the port reads 'ready' off the party bus's stock frame. The drive's first lane-change offer was made on the car's own
+  signal, failed 1.7 s later, and only then was the driver asked. Until the lamp path is proven (vehicle CAN seen on bus 1, a
+  lamp-check record, the sim: turnpilotd main) the status is never ready: the offer's first frame prompts the driver, no
+  side is commanded of the car, nothing fails. Proven later, the next offer is the car's."""
+  from openpilot.selfdrive.turnpilot.car_signals import CAR_SIGNAL_WAIT_S, command_side
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import BROKEN_WHITE_LEFT, THREE_LANES_LEFT_TURN
+
+  def run(proven):
+    sim = Sim([(700., "turn", "left"), (3000., "turn", "right")], cruise=15., nav_lanes={0: THREE_LANES_LEFT_TURN}, model_lanes=(2, 0),
+              paint=BROKEN_WHITE_LEFT, driver_signals=None)
+    sim.tp.car_signal_flags, sim.tp.car_signal_mode, sim.tp.car_signal_proven = int(TeslaFlags.CAR_SIGNALS), 'on', proven
+    sim.car_signal = lambda s: {'status': 'ready'}  # the port as on that car: ready, and no lamp ever answers
+    return sim, [sim.step(engaged=True) for _ in range(int(25. / DT_MDL))]
+  sim, plans = run(False)
+  first = next(i for i, p in enumerate(plans) if p.laneChangeOffer != LaneChange.none)
+  assert plans[first].signalPrompt == LaneChange.left  # asked on the offer's first frame
+  assert all(p.turnSignal.status in (Status.waiting, Status.unavailable) for p in plans)
+  assert all(command_side(p) == LaneChange.none for p in plans)
+  assert plans[int(CAR_SIGNAL_WAIT_S / DT_MDL) + 1].turnSignal.status == Status.unavailable
+  assert str(plans[-1].turnSignal.why) == "No vehicle CAN on bus 1"
+  # the same road with the lamp path proven: the car's own signal, the driver never asked
+  sim, plans = run(True)
+  first = next(i for i, p in enumerate(plans) if p.laneChangeOffer != LaneChange.none)
+  assert plans[first].signalPrompt == LaneChange.none and plans[first].turnSignal.status == Status.ready
+  assert any(command_side(p) == LaneChange.left for p in plans)
+  # proven mid-drive (the first bus 1 frame): ready from the next frame
+  sim, plans = run(False)
+  sim.tp.car_signal_proven = True
+  assert sim.step(engaged=True).turnSignal.status == Status.ready
+
+
+def test_vehicle_can_is_seen_on_any_pandas_bus_1():
+  from types import SimpleNamespace as NS
+  from openpilot.selfdrive.turnpilot.car_signals import vehicle_can_seen
+
+  def panda(rx1, rx0=5000, rx2=900):
+    return NS(canState0=NS(totalRxCnt=rx0), canState1=NS(totalRxCnt=rx1), canState2=NS(totalRxCnt=rx2))
+  assert not vehicle_can_seen([]) and not vehicle_can_seen([panda(0)])  # route 29: buses 0 and 2 busy, bus 1 silent
+  assert vehicle_can_seen([panda(3)]) and vehicle_can_seen([panda(0), panda(1)])

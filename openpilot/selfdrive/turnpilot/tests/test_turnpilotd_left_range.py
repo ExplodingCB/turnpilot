@@ -289,6 +289,7 @@ def test_a_car_only_the_far_crop_sees_at_150_m_holds_the_left_until_it_passes(mo
   assert not any(p.tooFastToTurn for p in plans)
 
 
+@pytest.mark.usefixtures('left_window_from_its_stand')  # about the stand at the line: as shipped a clear roll-in goes on arrival
 def test_a_far_crop_that_stops_reading_at_the_line_never_hands_back(monkeypatch):
   # the far crop reads on the car's cadence as the car comes to its line, then stops (a stall, a failure's backoff: farStatus
   # noRoom, then disabled): judged on the band the full pass covers after STALE_UNDECIDED_S without a far run over the band
@@ -391,3 +392,27 @@ def test_a_far_side_left_is_skipped_for_its_lane_with_the_mode_off_too():
   plans = drive(sim, 40., yaw=False)
   assert any(p.tooFastToTurn and str(p.skipReason) == 'laneBlocked' for p in plans)
   assert not any(p.desire == log.Desire.turnLeft for p in plans)
+
+
+def first_left_pulse_m(sim):
+  """m short of the junction the first turnLeft desire went out with TurnPilotAutoLeft off (None: never), and the skip reasons."""
+  sim.tp.auto_left = 'off'
+  at, reasons = None, set()
+  while sim.s < JUNCTION + 5. and sim.t < 60.:
+    for p in drive(sim, DT_MDL, yaw=False):
+      reasons.add(str(p.skipReason))
+      if p.desire == Desire.turnLeft and at is None:
+        at = JUNCTION - sim.s
+  return at, reasons
+
+
+def test_a_far_side_left_the_windows_end_would_not_call_blocked_pulses_at_its_lead_as_ever():
+  from openpilot.selfdrive.turnpilot.desire_timing import TURN_DESIRE_LEAD_M
+  # in the turn lane (the lane list's left one, two lanes to its right): nothing waits, the pulse at its lead as ever
+  at, reasons = first_left_pulse_m(left_on(V_25, full_pass=TEST_RANGE_M, nav_lanes={0: THREE_LANES_LEFT_TURN}, model_lanes=(0, 2)))
+  assert at is not None and TURN_DESIRE_LEAD_M - 1. < at <= TURN_DESIRE_LEAD_M and reasons == {''}
+  # a change wanted by the lane list that the window's end wouldn't judge blocked (no lane seen that way: the turn goes from
+  # the lane the car is in), and a left on a road with no lane list at all: nothing waits either, the pulse where it was
+  for kw in ({'nav_lanes': {0: THREE_LANES_LEFT_TURN}, 'model_lanes': (0, 1), 'paint': BROKEN_WHITE_LEFT}, {}):
+    at, reasons = first_left_pulse_m(left_on(V_25, full_pass=TEST_RANGE_M, **kw))
+    assert at is not None and TURN_DESIRE_LEAD_M - 1. < at <= TURN_DESIRE_LEAD_M and reasons == {''}, kw

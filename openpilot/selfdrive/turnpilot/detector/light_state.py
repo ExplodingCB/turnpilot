@@ -19,7 +19,10 @@ gates is a head, and its state is read (its reason the published Light.reason: r
   its colour and shape read on its rows grown through the rows next to them that hold any lamp pixel. twoLit: a second,
   separate run with SECOND_LIT_REL of its pixels (and LIT_FRAC_MIN of a third's). streak: the run's core (first to last
   row) is taller than STREAK_MAX of the run's widest row, or the run than RUN_MAX_REL of the box: a lit pole, a sign filling
-  the box, glare, never a lamp (a lamp's glow trailing below its face is the lamp's: STREAK_MAX). Unknown either way.
+  the box, glare, never a lamp (a lamp's glow trailing below its face is the lamp's: STREAK_MAX). Unknown either way. A
+  glow that fills its box stays a streak however round: read as a lamp it made a governing red of something red and round
+  on 210 of 561 frames of route 29's approach to a green (its video through the detector and this reader), and added no red
+  read at any of the drive's stands at a red.
   Until 2026-11-07 the lit third was the third holding the most lamp pixels and any other third with half its share was
   twoLit, and a lamp's glow made it two. On the 11-06 night drives 667 head reads gave no green and no
   colour on any head governing the car's lane (heads 36-86 px tall: not small; 32 reds, all on side heads 15-30 deg off
@@ -36,13 +39,9 @@ gates is a head, and its state is read (its reason the published Light.reason: r
   demo route the green lamps' pixels lie at 166-181 (1-99%) and the sky's at 195-216, which up to 210 counted as a green
   lamp (a box over a head with sky in its bottom third read green; sky beside a green ball called it an arrow). The night
   green lamp's glow (1d 5:05 thumbnail) is 159-168.
-- positionMismatch: the lit lamp sits where its colour's lamp can't (LAMP_SPAN): a red in the lower half of the box, a green
-  in the upper half, a yellow out of the middle third. Unknown. Until 2026-11-08 each colour had to sit in its own third,
-  and at night that rejected the greens: the box is drawn round the lamp's glow, the housing as dark as the sky, so the lamp
-  sits near the box's middle (route 29's light samples, the crops themselves: every night green at 0.55-0.59 of the box,
-  in the middle third, and the governing reds the car stood at glowing the box full, at 0.37; the 1d 4:06 head of 11-06,
-  its box's bottom 14 px lower with the light changed, likely the same). Its own side of the middle still tells the lamp,
-  and the colour is the hue's alone, so a red never reads green for it.
+- positionMismatch: a yellow whose lit lamp isn't in the box's middle third (YELLOW_SPAN). Unknown. Only a yellow: its hue
+  is a streetlight's and an amber sign's too. A red's and a green's colour is the hue's alone, wherever the lamp sits: at
+  night the box is drawn round the lamp's glow, the housing as dark as the sky, and the lamp sits anywhere in it.
 - arrow: the lit lamp's pixels aren't mirror-symmetric left to right about their own centre, as a ball is and a turn
   arrow is not. A green arrow is unknown: it is never a permission. A yellow arrow is unknown too: a flashing yellow
   arrow is a permissive left, and blocking on it would stall the autonomous left in the phase it is built for. A red
@@ -57,8 +56,8 @@ gates is a head, and its state is read (its reason the published Light.reason: r
 The reader reads boxes down to decoder.LIGHT_READ_CONF, under the detector's MIN_CONF (route 29, 2026-11-08: a red read only
 at its line, its heads first boxed at MIN_CONF 40 m out and then not for 1.7 s; the full pass had them at 0.2-0.33 from about
 60 m), and a head from a box under MIN_CONF is published only once it reads a colour or holds a vote.
-A head's state is its vote: VOTE_N of its last VOTE_M reads (a frame it wasn't seen in counts as unknown), which also
-rides out LED flicker. A head governs the car's lane when its bearing lies within GOVERN_BEARING_DEG of the lane's (the
+A head's state is its vote: the colour most of its last VOTE_M reads read, once VOTE_N did (a frame it wasn't seen in
+counts as unknown), which also rides out LED flicker. A head governs the car's lane when its bearing lies within GOVERN_BEARING_DEG of the lane's (the
 driving model's path at the head's distance), and the governing state is what all governing heads with a state agree
 on, else unknown.
 
@@ -114,21 +113,20 @@ MIN_COLOR_PX = 3            # saturated pixels in the lit lamp to read a colour 
 COLOR_SHARE = 0.6           # of them, this share in one hue range
 # green to 195, not 210: the sky is 195-216 and green lamps 166-181 (module docstring, noColor)
 HUES = {'red': ((330., 360.), (0., 18.)), 'yellow': ((18., 65.),), 'green': ((120., 195.),)}
-# where a colour's lit lamp may sit: its core's centre, a share of the box's height down from its top. A vertical head's red is
-# its top lamp, yellow its middle, green its bottom; by day the box is the housing and each lamp sits in its third. At night
-# the box is drawn round the lamp's glow, the housing unseen, and the lamp sits near the box's middle, still on its own side of
-# it (route 29, 2026-11-08: every night green the crops show sat at 0.55-0.59, positionMismatch in the middle third, the one
-# read green at 0.74; reds glowing the box full at 0.37-0.38; the accepted reds 0.12-0.31). So red is the upper half, green
-# the lower, yellow the middle third, and a lamp within MID_BAND of the middle says neither (a glow boxed alone, the box no
-# guide): a colour is never read from the far end of the head from its lamp (a green in the top third, a red in the bottom),
-# and the colour itself is always the hue's (a red lamp never reads green here)
-MID_BAND = 0.03
-LAMP_SPAN = {'red': (0., 0.5 - MID_BAND), 'yellow': (1 / 3, 2 / 3), 'green': (0.5 + MID_BAND, 1.)}
+# where a yellow's lit lamp may sit: its core's centre, a share of the box's height down from its top, the middle third. Only a
+# yellow's: its hue is a streetlight's, an amber sign's and a pedestrian hand's too, and the head's middle lamp is what tells it.
+# A red's and a green's colour is the hue's alone, wherever the lamp sits in its box: at night the box is drawn round the lamp's
+# glow and whatever is lit near it, never the housing, and the lamp sits anywhere in it (route 29's crops: a governing red ball
+# 23 m out at the bottom of its box, a governing green ball 35 m out at 0.30 of its, the greens the car waited at 0.55-0.59)
+YELLOW_SPAN = (1 / 3, 2 / 3)
 ARROW_MIN_PX = 10           # lamp pixels needed to judge the lamp's shape; fewer is unknown (tooFewLampPx)
 SYMMETRY_MIN = 0.6          # the lamp's mask against its mirror image about its own centre (IoU): a ball, not an arrow
 ASSUMED_HEAD_M = 5.5        # m, a head's centre over the road (MUTCD clearance 15-19 ft to its bottom)
 MAX_RANGE = 150.            # m, the farthest distance it says
-VOTE_M, VOTE_N = 5, 4       # a state takes VOTE_N of a head's last VOTE_M reads
+# a head's state is the colour most of its last VOTE_M reads read, once VOTE_N of them did (a tie is unknown). Two, not four: at
+# night a head is boxed in some runs only and forgotten after HEAD_DROP_S unseen, and four reads in five runs came 2.3 s after
+# the first red read of route 29's late red (16 m from its line then, at it by the vote), 0.8 s after the other's
+VOTE_M, VOTE_N = 5, 2
 MATCH_HEIGHTS = 1.5         # a read is the same head when its box centre is within this many box heights
 HEAD_DROP_S = 0.6           # a head not seen this long is forgotten
 # a head within this of the lane's bearing governs it. Kept at 10 after the 11-06 night, though every red it read was a side
@@ -316,8 +314,7 @@ def read_head(nv12: np.ndarray, stride: int, y_height: int, lens: Lens, rpy_cali
   if color is None:
     out.reason = 'noColor'
     return out
-  lo, hi = LAMP_SPAN[color]
-  if not lo <= centre / h <= hi:
+  if color == 'yellow' and not YELLOW_SPAN[0] <= centre / h <= YELLOW_SPAN[1]:
     out.reason = 'positionMismatch'
     return out
   mask = lamp[rows]
@@ -342,13 +339,13 @@ class Head:
   @property
   def state(self) -> str:
     counts = Counter(self.reads)
-    best = max(STATES, key=lambda s: counts[s])
-    return best if counts[best] >= VOTE_N else 'unknown'
+    first, second = sorted((counts[s] for s in STATES), reverse=True)[:2]
+    return max(STATES, key=lambda s: counts[s]) if first >= VOTE_N and first > second else 'unknown'
 
   @property
   def votes(self) -> int:
     counts = Counter(self.reads)
-    return counts[self.state] if self.state != 'unknown' else max((counts[s] for s in STATES), default=0)
+    return max((counts[s] for s in STATES), default=0)
 
 
 def centre(box) -> tuple[float, float]:

@@ -99,11 +99,16 @@ def replay(frames=None, until=None):
   return out
 
 
-def test_run11_replay_reproduces_the_logged_go_at_16_9_s():
-  # the harness itself: up to the go the replay's states are the run's own, frame for frame (approach, stopped, observe, going)
+LOGGED_CLEAR_S = 2.5  # s: VISION_CLEAR_S on the build the run was logged on (263065a)
+
+
+def test_run11_replay_reproduces_the_logged_run_up_to_its_go_which_comes_as_much_sooner_as_the_window_is_shorter():
+  # the harness itself: the replay's states are the run's own, frame for frame (approach, stopped, observe), up to the
+  # decider's go: the run's went at 16.95 s on a 2.5 s window, the shipped window's go is that much sooner and no other
   out = replay(until=16.95)
-  assert [fr['state'] for _, fr, _ in out] == [d.state for _, _, d in out]
-  assert out[-1][2].state == 'going' and abs(out[-1][0] - 16.95) < 0.03
+  k = next(i for i, (_, _, d) in enumerate(out) if d.state == 'going')
+  assert [fr['state'] for _, fr, _ in out[:k]] == [d.state for _, _, d in out[:k]]
+  assert out[k][0] == pytest.approx(16.95 - (LOGGED_CLEAR_S - sr.VISION_CLEAR_S), abs=0.06)
 
 
 def test_run11_the_car_from_the_left_starting_withdraws_the_go_before_the_logged_commit():

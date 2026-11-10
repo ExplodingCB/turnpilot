@@ -95,10 +95,10 @@ class TestFarCrop(OpenpilotTestCase):
     assert abs(pm.far[0].crop[1] + FAR_HORIZON_ROW - v) <= 1 and abs(v - 380) > 15
 
   def test_never_on_a_frame_the_full_pass_is_due_or_forced(self):
-    # no room for the full pass (10 ms beside a model 1 ms under the budget: a 9 ms debt), room for the far crop (3 ms: 2):
-    # the full pass is due on every frame and the far crop never takes them, up to the full pass's forced run; on the
-    # frame after it, the far crop runs
-    det, pm = far_detector(far_time=0.003, det_time=0.010), FarPM()
+    # no room for the full pass (20 ms beside a model 1 ms under the budget: a 19 ms debt, past FORCE_SKIP_LATE_S), room for
+    # the far crop (3 ms: 2): the full pass is due on every frame and the far crop never takes them, up to the full pass's
+    # forced run; on the frame after it, the far crop runs
+    det, pm = far_detector(far_time=0.003, det_time=0.020), FarPM()
     steps(det, pm, FORCE_RUN_FRAMES - RUN_EVERY - 1, model_time=STEP_BUDGET_S - 0.001)
     assert pm.full == [] and pm.far == [] and det.since_run == FORCE_RUN_FRAMES - 1
     steps(det, pm, 2, model_time=STEP_BUDGET_S - 0.001, start=100)

@@ -12,24 +12,18 @@ stands disengaged: never a reroute while driving, however long it was off the ro
   decision D5: the demo starts on a through street). The first one's street isn't on the bus, so it isn't said.
 Then, on any route, AHEAD_M before each stop or yield navd marks unavoidable (junctionInfo.certification), or at once where it
 is first seen closer: "Stop sign ahead needs you" (stopAheadNeedsYou, a chime), once per junction. At the line the decider
-hands it back right after the full stop (stop_go.py: 7.1); under vision one its gate refuses (geometry, skew, an unknown leg,
-the side views off, an override) 1 s after it (H9). Since the review of 2026-11-08 one navd found short of reach on the line's
-own walk (routing/certify.vision_lanes) or in glare (low sun, the sun ahead) is no handback under vision: the line waits on
-reach, creeps for a view to the creep's limit and goes on what the cameras see ("Look both ways" first). navd still routes
-round those and this still says "Stop sign ahead needs you" where it can't (its certReason is navd's, the mode the decider's):
-the supervisor told more than the car will ask, the safe side, until the notice learns the mode. Since 2026-11-07 a dark stop
-certifies under vision, so it is never said: on the 11-06 night drive (1e) this said "Stop sign ahead needs you" 6 times, each
-stop's logged failure the light check (the first that fails); re-certified now, 2 of the 7 stops those routes kept certify and
-5 are short of reach at their line (a far or third cross lane 0.7-7.7 m short): routed round where the budget allows, said
-where it can't.
+hands it back right after the full stop (stop_go.py: 7.1).
 
-Since 2026-11-08 (route 29: a junction mapped as a stop sign, really a signal, "Stop sign ahead needs you" at 126 s): a stop
-or yield at a junction the camera has seen a signal head at this drive (turnpilotd's signal_junctions, stop_go.SignalJunctions,
-keyed by its node or its position) is never said, and one queued is dropped; and the notice knows the mode: under
-TurnPilotStopSignGo=vision a stop navd couldn't certify for reach or the light at the line (certReason reach, light) is no
-handback (the line waits, creeps for a view and goes on what the cameras see: stop_go.VISION_VIEW_REASONS), so it isn't said
-either. One that fails on what vision still hands back (geometry, skew, an unknown leg, an override) is: a skewed junction
-(route 29's, -21 deg off straight on) is the 1 s handback after its full stop (H9), so "needs you" is the truth there.
+Under TurnPilotStopSignGo=vision the line drives every stop it is given (the full stop, the look, the creep where it shows
+more, the go on what the cameras see) and hands back only for a mapped rail crossing at the junction or a missing visibility
+file (stop_go._vision_gate). The notice goes by the same rule (stop_rules.vision_needs_driver, on the junction's own
+railDistance and certReason, whatever navd's certifier of the day marked it): a stop the line drives is never said, so
+"needs you" is said only where the car will ask for the driver. navd's certifier under vision fails only those too
+(routing/certify._assess_vision), and its route-start count (unavoidableControls) counts only them.
+
+A stop or yield at a junction the camera has seen a signal head at this drive (turnpilotd's signal_junctions,
+stop_go.SignalJunctions, keyed by its node or its position) is never said, and one queued is dropped: a junction mapped as a
+stop sign that is really a signal.
 
 Each is said only where the plan's alert slot is free (turnpilotd: nothing that outranks it is up), and used up only on the
 frames it is said: held back behind another alert, it and its remaining time wait for the slot, never lost. A stop-ahead
@@ -38,6 +32,7 @@ from dataclasses import dataclass, field
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.turnpilot.stop_rules import vision_needs_driver
 
 NOTICE_S = 3.             # s each notice is held, one after another
 ROUTE_GAP_S = 5.          # s with no valid route before a route is a route start
@@ -46,7 +41,6 @@ AHEAD_M = 300.            # m before a stop the route couldn't avoid: "Stop sign
 DETOUR_WARN_FRAC = 0.5    # avoidance adding more than this of the route without it...
 DETOUR_WARN_MIN_S = 300.  # ...or this, whichever is larger, is said with a chime
 STOP_KINDS = ('stop', 'yield')
-VISION_GOES = ('reach', 'light')  # certReasons a stop under vision is no handback for (stop_go.VISION_VIEW_REASONS)
 CHIMES = ('routeDetour', 'stopsNeedYou', 'firstStopNeedsYou', 'stopRoutingFailed', 'stopAheadNeedsYou')
 NOTICES = ('routeAvoidsStops',) + CHIMES
 
@@ -135,8 +129,8 @@ class RouteNotices:
       if str(c.kind) not in STOP_KINDS or not c._has('junctionInfo') or str(c.junctionInfo.certification) != 'unavoidable':
         continue
       ji = c.junctionInfo
-      if vision and str(ji.certReason) in VISION_GOES:
-        continue  # no handback under vision: nothing to say (a queued one is dropped below, as for a stop passed)
+      if vision and not vision_needs_driver(str(ji.certReason), float(ji.railDistance)):
+        continue  # driven under vision, no handback: nothing to say (a queued one is dropped below, as for a stop passed)
       if signal_at is not None and signal_at({'osmNodeId': int(ji.osmNodeId), 'lat': float(ji.lat), 'lon': float(ji.lon)}):
         continue  # a signal the camera saw there: not a stop sign
       ident = int(c.junctionInfo.osmNodeId) or (int(nav.routeCount), int(c.id))

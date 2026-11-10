@@ -103,8 +103,7 @@ def test_at_night_a_crossing_car_seen_holds_the_go_until_it_has_passed_then_the_
 
 def test_at_night_a_car_crossing_during_the_launch_withdraws_the_go_short_of_d_edge_min(tmp_path):
   # the hard rail is the same after dark: a car the side views see in the near lane once the car is moving withdraws the go
-  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_stop import CYCLE
-  from openpilot.selfdrive.turnpilot.tests.test_visibility import raw_box
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_vision import car_coming_up_the_near_lane
   sim = at(vsim(tmp_path), NIGHT)
   run_to_line(sim)
   s_stop = sim.s
@@ -112,7 +111,7 @@ def test_at_night_a_car_crossing_during_the_launch_withdraws_the_go_short_of_d_e
     p = sim.step()
     if str(p.stopGo.state) == 'going' and sim.v > 1.0:
       break
-  sim.boxes = lambda s: {v: [raw_box(65., conf=0.5, xy=(8., 17.), view='sideLeft')] for v in CYCLE}
+  car_coming_up_the_near_lane(sim)
   sim.run(6.)
   plans = sim.plans()
   assert any(p.stopGo.withdrawn for p in plans)
@@ -154,10 +153,10 @@ def test_a_right_whose_far_lane_the_line_walks_as_its_cross_movement_certifies_a
 
 @pytest.mark.parametrize('when', ['day', 'night'])
 def test_a_stop_on_a_cross_road_of_two_lanes_each_way_is_short_at_the_line_and_goes_on_what_it_sees_never_handed_back(tmp_path, when):
-  # review of the 11-06 repairs: navd's route-time 'reach' here (the near lane 17.2 of 37.6 m on the lines the line walks) is
-  # the line's own, so navd still routes round it, and says "Stop sign ahead needs you" where it can't. Until the review of
-  # 2026-11-08 the line waited on reach and handed back 15 s after the full stop, day or night ("can't see far enough from the
-  # left"). Now (no handbacks: the go on what the cameras see) the stop point already stands inside the room a go needs from
+  # the near lane is short on the lanes the line walks (17.2 of 37.6 m), which navd's certifier notes and no longer fails:
+  # the line drives this stop, so nothing is said ahead of it. Until the review of 2026-11-08 the line waited on reach and
+  # handed back 15 s after the full stop, day or night ("can't see far enough from the left").
+  # Now (no handbacks: the go on what the cameras see) the stop point already stands inside the room a go needs from
   # the closest plausible edge of so wide a cross road, so the creep for a view is at its limit where it stands: the long
   # look's window, "Look both ways", and the go committed from there, across, never a handback
   j = vision_junction(25)
@@ -165,7 +164,7 @@ def test_a_stop_on_a_cross_road_of_two_lanes_each_way_is_short_at_the_line_and_g
     if a.role in ('left', 'right'):
       a.lanes_in = a.lanes_out = 2
   v = ce.assess(j, 'straight', SHIPPED, [], WHEN[when], ce.Runtime(mode='vision', side_views=True))
-  assert (v.certification, v.reason) == ('uncertifiable', 'reach') and 'left lane 1 cross' in v.detail, v.detail
+  assert (v.certification, v.reason) == ('certifiable', 'none') and 'left lane 1 cross' in v.detail, v.detail
   sim = vsim(tmp_path)
   for leg in sim.navd.controls[0][5]['approaches']:
     if leg['role'] in ('left', 'right'):

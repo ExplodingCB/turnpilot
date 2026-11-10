@@ -12,7 +12,7 @@ from openpilot.selfdrive.turnpilot import stop_go as sg
 from openpilot.selfdrive.turnpilot import stop_rules as sr
 from openpilot.selfdrive.turnpilot import visibility_table as vt
 from openpilot.selfdrive.turnpilot.routing import certify as ce
-from openpilot.selfdrive.turnpilot.routing.tests.test_certify import two_way_junction, utc, vision_junction, visibility
+from openpilot.selfdrive.turnpilot.routing.tests.test_certify import lanes_junction, two_way_junction, utc, vision_junction, visibility
 from openpilot.selfdrive.turnpilot.stop_evidence import CAR_HALF_LEN_M, DEFAULT_LINE_M, junction_lanes
 from openpilot.selfdrive.turnpilot.tests.test_stop_evidence import track as ev_track
 from openpilot.selfdrive.turnpilot.tests.test_stop_go import Drive, World, arrived_at, first_go, raw_box, rolling
@@ -64,6 +64,17 @@ def vcars(*specs):
   return tracks
 
 
+def forward_cars(j, *specs):
+  """vcars on junction j's lanes (a World whose own junction is none, or failed), each track seen by the full pass (the
+  forward wide camera) rather than a side view."""
+  def tracks(w):
+    out = vcars(*specs)(SimpleNamespace(t_cam=w.t_cam, sg=w.sg, odo=w.odo, control=w.control, j=j))
+    for t in out:
+      t.view = 'full'
+    return out
+  return tracks
+
+
 def standing(d=LINE_V, t0=-10.):
   return lambda t: None if t < t0 else d
 
@@ -73,6 +84,12 @@ def watch(w, seconds=2.):
   out = w.run(seconds, approach=w.control)
   w.control.held = True
   return out
+
+
+def any_go(out):
+  """The frame of the decider's go: from the line (stopSign), or from a stand inside the edge band, committed there (clearBox:
+  an assumed cross road's stop point lies 10 m from its node, inside the band of a road whose lanes aren't known)."""
+  return next((i for i, d in enumerate(out) if d.go_cause in ('stopSign', 'clearBox')), None)
 
 
 def gate_fault(out):
@@ -145,9 +162,9 @@ def announced(events):
 
 
 @pytest.mark.parametrize('mph, reason', [(25, sg.GOING_REASON), (35, sg.LOOK_REASON), (0, sg.LOOK_REASON)])
-def test_vision_re_engaged_at_the_line_with_the_window_run_says_it_1_s_before_the_go(tmp_path, monkeypatch, mph, reason):
+def test_vision_re_engaged_at_the_line_with_the_window_run_says_it_before_the_go(tmp_path, monkeypatch, mph, reason):
   # the driver's brake or gas at the line disengages openpilot for the whole window, which counts on meanwhile; re-engaged,
-  # the go's line and chime come first ("Look both ways" at a long look), 1 s of engaged frames, then the go: never a go on
+  # the go's line and chime come first ("Look both ways" at a long look), VISION_ANNOUNCE_S of engaged frames, then the go: never a go on
   # the re-engaged frame with nothing said
   events = []
   monkeypatch.setattr(sg.cloudlog, 'event', lambda name, **kw: events.append((name, kw)))
@@ -159,13 +176,13 @@ def test_vision_re_engaged_at_the_line_with_the_window_run_says_it_1_s_before_th
   out = w.run(3.)
   i = first_go(out)
   assert i is not None and out[i].reason == 'Going' and out[i].release == ((0, 1), 'clear')
-  assert i * DT_MDL == pytest.approx(1.0, abs=0.06)  # VISION_ANNOUNCE_S: the line said on engaged frames this long first
+  assert i * DT_MDL == pytest.approx(sr.VISION_ANNOUNCE_S, abs=0.06)  # the line said on engaged frames this long first
   assert all(out[k].prompt == 'stopGo' and out[k].reason == reason and out[k].release is None for k in range(i))
   assert len(announced(events)) == n + 1 and announced(events)[-1]['reason'] == reason  # the re-engage's own line, logged
 
 
-def test_vision_disengaged_inside_the_announcement_says_it_again_for_1_s_before_the_go(tmp_path, monkeypatch):
-  # a brake tap 0.5 s into "Going": the go is not 0.2 s after the re-engage on the old line, it is said again for 1 s
+def test_vision_disengaged_inside_the_announcement_says_it_again_before_the_go(tmp_path, monkeypatch):
+  # a brake tap halfway into "Going": the go doesn't come on the old line right after the re-engage, it is said again in full
   events = []
   monkeypatch.setattr(sg.cloudlog, 'event', lambda name, **kw: events.append((name, kw)))
   w = vworld(tmp_path, 25)
@@ -173,27 +190,28 @@ def test_vision_disengaged_inside_the_announcement_says_it_again_for_1_s_before_
   while pre[-1].prompt != 'stopGo':
     pre.append(w.step())
     assert len(pre) < round(6. / DT_MDL)
-  pre += w.run(0.5)
+  pre += w.run(sr.VISION_ANNOUNCE_S / 2.)
   assert first_go(pre) is None and len(announced(events)) == 1
   w.run(0.3, enabled=False)
   out = w.run(3.)
   i = first_go(out)
-  assert i is not None and i * DT_MDL == pytest.approx(1.0, abs=0.06)
+  assert i is not None and i * DT_MDL == pytest.approx(sr.VISION_ANNOUNCE_S, abs=0.06)
   assert all(out[k].prompt == 'stopGo' and out[k].reason == sg.GOING_REASON for k in range(i))
   assert len(announced(events)) == 2
 
 
 def test_vision_disengaged_short_of_the_announcement_goes_on_the_window_as_before(tmp_path):
-  # re-engaged with the window not yet at its line: nothing changes, the line 1 s before, the go 2.5 s after the arrival
+  # re-engaged with the window not yet at its line: nothing changes, the line VISION_ANNOUNCE_S before, the go VISION_CLEAR_S
+  # after the arrival
   w = vworld(tmp_path, 25)
-  out = w.run(1.5)
+  out = w.run(1.2)
   a = arrived_at(out)
-  out += w.run(0.5, enabled=False)
+  out += w.run(0.2, enabled=False)
   out += w.run(4.)
   i = first_go(out)
-  assert i is not None and (i - a) * DT_MDL == pytest.approx(2.5, abs=0.11)
+  assert i is not None and (i - a) * DT_MDL == pytest.approx(sr.VISION_CLEAR_S, abs=0.11)
   said = [k for k in range(a, i) if out[k].prompt == 'stopGo']
-  assert said and (i - said[0]) * DT_MDL == pytest.approx(1.0, abs=0.06)
+  assert said and (i - said[0]) * DT_MDL == pytest.approx(sr.VISION_ANNOUNCE_S, abs=0.06)
 
 
 def test_vision_an_unknown_speed_lane_is_watched_as_a_fast_one(tmp_path):
@@ -249,13 +267,97 @@ def test_vision_the_long_look_creeps_for_a_fast_far_lane_while_the_near_one_keep
 
 # ------------------------------------------------------------------------------------------------------------ the gate
 
-@pytest.mark.parametrize('status', ['off', 'disabled', 'unset'])
-def test_vision_side_views_off_for_the_drive_is_the_1_s_handback_saying_so(tmp_path, status):
-  w = vworld(tmp_path, side=status)
-  out = w.run(4.)
-  d = gate_fault(out)
-  assert d is not None and first_go(out) is None
-  assert d.reason == "Stop sign: side cameras off: take control" and d.fault == 'H9'
+def went_on_the_forward_views(w, out):
+  """No fault and no handback, the side views said out, no creep (a step forward shows no more of a lane the frame's edge
+  binds), and the go on what the forward cameras see, "Look both ways" said first."""
+  i = first_go(out)
+  assert gate_fault(out) is None and not any(d.fault or d.prompt == 'stopSignTakeControl' for d in out)
+  assert i is not None and w.sg.side_out, [(d.state, d.reason) for d in out[::20]]
+  assert not any(d.creep is not None for d in out[:i])
+  assert any(d.reason == sg.LOOK_REASON for d in out[:i])
+  return i
+
+
+@pytest.mark.parametrize('status', ['off', 'disabled', 'unset', 'idle', 'mapsStale', 'noCalibration'])
+def test_vision_with_the_side_views_not_running_the_car_stops_looks_and_goes_on_its_forward_cameras(tmp_path, status):
+  # the side views have never been seen running on the car. Off for the drive, idle and never starting, or their maps
+  # waiting for a calibration: before, the 1 s handback ("Stop sign: side cameras off: take control"), H1 at 12 s, or the
+  # calibration's wait and H3. Now the stop is made, the lanes read to the frame's edge, and the go comes on what is seen
+  w = vdrive(tmp_path, side=status)
+  out = w.run(12.)
+  i = went_on_the_forward_views(w, out)
+  a = arrived_at(out)
+  assert (i - a) * DT_MDL <= sr.VISION_CREEP_AFTER_S + sr.VISION_LONG_CLEAR_S + 0.3  # no wait for views that never come
+  assert any(d.state in ('inLane', 'done') for d in out)
+
+
+def test_vision_with_the_side_views_not_running_a_car_the_forward_cameras_see_coming_still_holds_the_go(tmp_path):
+  # the hard rail on the limited view: a car coming down the left lane, seen by the full pass, holds the go until it is by
+  w = vworld(tmp_path, side='idle')
+  w.tracks = forward_cars(w.j, (7, 'left', lambda t: 40. - 8. * t))
+  out = w.run(12.)
+  i = first_go(out)
+  held = [k for k, d in enumerate(out) if any(h.key == 'tracked:7' for h in d.holds)]
+  assert held and i is not None and i > max(held) and not any(d.fault for d in out)
+
+
+def gone_then_a_car_comes(w, delay=0.3, d0=25., v=8.):
+  """Drive w to its go, then a car the forward cameras track comes down the left lane (from d0 m at v m/s, delay s after
+  the go). Returns (the go's decision, the decisions after it, the car's speed at each, the frame the car reaches our path)."""
+  pre = [w.step()]
+  while pre[-1].go_cause not in ('stopSign', 'clearBox'):
+    pre.append(w.step())
+    assert len(pre) < round(20. / DT_MDL)
+  t_go = w.t_cam - 100.
+  real = w.j if w.j is not None and w.j.status == 'ok' else vision_junction(25)  # a real cross road's lanes, never the assumed
+  w.tracks = forward_cars(real, (7, 'left', lambda t: None if t < t_go + delay else d0 - v * (t - t_go - delay)))
+  out, vs = [], []
+  for _ in range(round(8. / DT_MDL)):
+    out.append(w.step())
+    vs.append(w.v)
+  return pre[-1], out, vs, round((delay + d0 / v) / DT_MDL)
+
+
+def test_vision_on_the_forward_cameras_alone_a_car_seen_coming_after_the_go_withdraws_it_and_the_car_waits(tmp_path):
+  # the rail on the launch as the car will meet it (no side views): the go withdrawn the frame the car is a track, the car
+  # stopped short of the closest plausible edge and held for it until it is by, then the go again
+  w = vdrive(tmp_path, side='idle')
+  go, out, vs, by = gone_then_a_car_comes(w)
+  assert go.go_cause == 'stopSign' and any(d.withdraw == 'new:7' for d in out[:round(0.5 / DT_MDL)])
+  assert max(d.position_m for d in out[:by]) < w.sg.edges.d_min and max(vs[round(1.5 / DT_MDL):by]) < 0.05
+  assert any(h.key == 'tracked:7' for d in out[:by] for h in d.holds)
+  again = [k for k, d in enumerate(out) if d.go_cause == 'stopSign']
+  assert again and again[0] > by and not any(d.fault for d in out)
+
+
+@pytest.mark.parametrize('delay', [0.3, 1.5])
+def test_vision_on_an_assumed_cross_road_a_car_seen_coming_after_the_go_stops_the_car_short_of_its_lane(tmp_path, delay):
+  # the assumed cross road's stop point lies inside its edge band, so its go is committed from the stand (clearBox): no
+  # withdrawable launch. The band's threat test is its rail: the car coming is the band abort, the car stopped within a
+  # metre of its line (the near lane 6 m on) and standing as the car goes by, then lifted again once the lanes are clear
+  w = vdrive(tmp_path)
+  w.j = None
+  go, out, vs, by = gone_then_a_car_comes(w, delay=delay)
+  assert go.go_cause == 'clearBox' and w.sg.assumed
+  assert any(d.withdraw == 'bandAbort' for d in out[:round((delay + 0.5) / DT_MDL)])
+  assert max(d.position_m for d in out[:by + 1]) < 1.0 and vs[by] < 0.05
+  assert not any(d.fault for d in out) and any(d.go_cause == 'clearBox' for d in out[by:])
+
+
+def test_vision_the_forward_cameras_stopping_is_still_the_camera_fault(tmp_path):
+  # a real fault stays one: no forward run for DET_FAULT_S is cameraPaused, then H1 at FAULT_GRACE_S
+  w = vworld(tmp_path)
+  w.run(0.5)
+  real, observe = w.frame, w.live.observe_run
+  # no forward run reaches the decider or the live view from here (the side views run on)
+  w.live.observe_run = lambda view, *a, **kw: None if view in sg.FORWARD else observe(view, *a, **kw)
+
+  def frozen(**kw):
+    f = real(**kw)
+    return sg.replace(f, runs=tuple(r for r in f.runs if r[0] not in sg.FORWARD))
+  w.frame = frozen
+  out = w.run(sg.DET_FAULT_S + sg.FAULT_GRACE_S + 1.)
+  assert first_go(out) is None and out[-1].fault == 'H1'
 
 
 @pytest.mark.parametrize('wall_t, heading, words, why', [
@@ -265,10 +367,10 @@ def test_vision_low_sun_and_the_sun_ahead_are_judged_by_the_walk_never_the_gates
   # glare, by day (night, dusk and no clock go as by day since 2026-11-07: tests/test_stop_go_night.py). Until the review of
   # 2026-11-08 the gate handed back 1 s after the full stop saying which ("Stop sign: low sun ...: take control", H9); now the
   # walk's own glare zeroes judge it (and the sectors' washed test, where the sun fills a lens): the wait on reach, the creep
-  # for a view, then the go on what the cameras see. certify still says which, for navd's route
+  # for a view, then the go on what the cameras see. certify agrees (certifiable: nothing said ahead) and notes which
   j = vision_junction(heading_in=heading)
   v = ce.assess(j, 'straight', SHIPPED, [], wall_t, ce.Runtime(mode='vision', side_views=True, window=(0., 0.)))
-  assert v.reason == 'light' and words in v.detail, v.detail
+  assert v.certification == 'certifiable' and words in v.detail, v.detail
   w = vdrive(tmp_path, j=j, wall_t=wall_t)
   out = w.run(45.)
   assert gate_fault(out) is None and not any(d.fault or d.prompt == 'stopSignTakeControl' for d in out)
@@ -276,37 +378,91 @@ def test_vision_low_sun_and_the_sun_ahead_are_judged_by_the_walk_never_the_gates
   assert first_go(out) is not None and any(d.state in ('inLane', 'done') for d in out)
 
 
-def test_vision_without_the_sidecar_is_h8(tmp_path):
-  w = vworld(tmp_path, j=vision_junction(sidecar=False))
-  d = gate_fault(w.run(4.))
-  assert d is not None and d.reason == sg.REASONS['H8'] and d.fault == 'H8'
+def skewed(deg=-21.):
+  """route 29's junction (2026-11-08, 158 s): the road opposite 21 deg off straight on, which certify fails as skew."""
+  j = vision_junction(35)
+  for a in j.approaches:
+    if sr.effective_role(a) == 'opposite':
+      a.rel_bearing, a.bearing = deg, deg % 360.
+  return j
 
 
-@pytest.mark.parametrize('changes, words', [({'divided': True}, 'a divided cross road'), ({'roundabout': True}, 'a roundabout'),
-                                            ({'rail_distance': 20.}, 'a rail crossing 20 m away')])
-def test_vision_geometry_hands_back_saying_which(tmp_path, changes, words):
-  d = gate_fault(vworld(tmp_path, j=vision_junction(**changes)).run(4.))
-  assert d is not None and d.reason == f"Stop sign: {words}: take control"
+def unknown_control():
+  j = vision_junction()
+  j.approaches[0].control = 'unknown'
+  return j
 
 
-@pytest.mark.parametrize('changes, words', [({'divided': True}, 'a divided cross road'), ({'rail_distance': 20.}, 'a rail crossing 20 m away')])
-def test_vision_a_signal_head_drops_only_the_stop_signs_rules_never_the_geometry(tmp_path, changes, words):
-  """The review of 2026-11-08: with a signal head seen at the junction (C20) _vision_gate passed whatever certify said, so a
-  rail crossing or a divided cross road (no cross-traffic judgement covers it) went on the vision go. Now only the stop sign's
-  own rules of who goes when (skew, an override, an approach's control unknown) are dropped there: these still hand back."""
-  w = vworld(tmp_path, j=vision_junction(**changes))
+def overridden():
+  j = vision_junction()
+  j.approaches[0].overridden = True
+  return j
+
+
+@pytest.mark.parametrize('make, why', [(skewed, 'skew'), (unknown_control, 'unknownLeg'), (overridden, 'override'),
+                                       (lambda: vision_junction(divided=True), 'geometry'),
+                                       (lambda: vision_junction(roundabout=True), 'geometry'),
+                                       (lambda: vision_junction(sidecar=False, rail_distance=-2.), 'geometry')])
+def test_vision_a_junction_the_other_modes_fail_is_stopped_at_looked_at_and_gone_from_and_certify_agrees(tmp_path, make, why):
+  # before: the gate failed on certify's verdict and the latch handed back 1 s after the full stop ("Stop sign: the opposite
+  # approach -21 deg off straight on: take control" on route 29, 29 m out), or H8 with no sidecar. The lanes are placed on
+  # each approach's own bearing and judged from what the cameras see, so none of these is a reason to stand
+  # certify under vision says what the line does (certifiable: no "needs you" for a stop the car drives), the other modes'
+  # failure in its detail
+  j = make()
+  v = ce.assess(j, 'straight', SHIPPED, [], None, ce.Runtime(mode='vision', side_views=True, window=(0., 0.)))
+  assert v.certification == 'certifiable' and (why in v.detail or why == 'override'), (v.reason, v.detail)
+  w = vdrive(tmp_path, j=j)
+  out = w.run(20.)
+  assert gate_fault(out) is None and not any(d.fault or d.prompt == 'stopSignTakeControl' for d in out)
+  assert first_go(out) is not None and any(d.state in ('inLane', 'done') for d in out)
+
+
+@pytest.mark.parametrize('seen', [False, True])
+def test_vision_a_rail_crossing_at_the_junction_is_still_the_gates_handback(tmp_path, seen):
+  # a train is nothing the cross-traffic judgement covers: the one check of certify's that still hands back, a signal head
+  # seen there or not
+  j = vision_junction(rail_distance=20.)
+  v = ce.assess(j, 'straight', SHIPPED, [], None, ce.Runtime(mode='vision', side_views=True, window=(0., 0.)))
+  assert (v.certification, v.reason, v.detail) == ('uncertifiable', 'geometry', "a rail crossing 20 m away")  # the gate's own rule
+  w = vworld(tmp_path, j=j)
   w.run(0.05)
-  w.sg.signal_seen = True
+  w.sg.signal_seen = seen
   d = gate_fault(w.run(4.))
-  assert d is not None and d.reason == f"Stop sign: {words}: take control"
+  assert d is not None and d.reason == "Stop sign: a rail crossing 20 m away: take control" and d.fault == 'H9'
+
+
+@pytest.mark.parametrize('j', [sr.Junction(status='failed'), None,
+                               sr.Junction(status='ok', stop_point_distance=13., rail_distance=-1., sidecar=True)])
+def test_vision_a_junction_the_map_has_nothing_for_is_judged_as_a_plain_cross_road(tmp_path, j):
+  # before: "the junction's position isn't known" (junctionUncertain, H2 at 10 s) for a failed lookup, and "no conflicting
+  # approach to judge by" (H3 at 15 s) for a junction with no road across our path. A plain cross road is assumed, its lanes
+  # judged from the cameras: the car goes when they are clear, and a car seen coming in one holds the go
+  w = vdrive(tmp_path)
+  w.j = j
+  out = w.run(1.2)
+  assert w.sg.assumed and {x.role for x in out[-1].lanes} >= {'left', 'right'}
+  out += w.run(20.)
+  assert not any(d.fault or d.prompt == 'stopSignTakeControl' or d.alert == 'junctionUncertain' for d in out)
+  assert any_go(out) is not None and any(d.state in ('inLane', 'done') for d in out)
+  # the rail, with the car placed on a real cross road's lanes (a mapped junction's, never the assumed one's own): it is
+  # coming down the left lane 8 m/s from 40 m, and the go waits until it is by
+  for real in (sr.assumed_cross(j), vision_junction(25), lanes_junction(35, left=2, right=2)):
+    w = vworld(tmp_path)
+    w.j = j
+    w.tracks = forward_cars(real, (7, 'left', lambda t: 40. - 8. * t))
+    out = w.run(12.)
+    i = any_go(out)
+    held = [k for k, d in enumerate(out) if any(h.key == 'tracked:7' for h in d.holds)]
+    assert held and i is not None and i > max(held) and i * DT_MDL > 5., (i, held[:1], held[-1:])
 
 
 def test_vision_a_yield_says_yield_v10(tmp_path):
   from openpilot.selfdrive.turnpilot.map_controls import YIELD_STOP
-  w = vworld(tmp_path, side='off')
+  w = vworld(tmp_path, j=vision_junction(rail_distance=20.))
   w.control.kind, w.state.mode = 'yield', YIELD_STOP  # a yield that became a stop (yieldStop): the decider's
   d = gate_fault(w.run(4.))
-  assert d is not None and d.reason == "Yield: side cameras off: take control"
+  assert d is not None and d.reason == "Yield: a rail crossing 20 m away: take control"
 
 
 def test_vision_the_lens_check_runs_only_with_a_fitted_file(tmp_path):
@@ -333,24 +489,31 @@ def test_vision_the_gate_failing_after_the_first_go_is_a_held_h9_never_shadow_c1
   out = w.run(6.)
   i = first_go(out)
   assert i is not None
-  # replay to just after the go, then the side views fail during the launch
+  # replay to just after the go, then the visibility file is gone during the launch (nothing left to read the cameras by)
   w = vdrive(tmp_path, behaviour='holds')
   w.run((i + 4) * DT_MDL)
   assert w.sg.state == 'going'
-  w.side = 'disabled'
+  w.vis = None
   out = w.run(4.)
   assert any(d.withdraw for d in out) and out[-1].fault == 'H9' and out[-1].state == 'ladder'
-  assert out[-1].reason == "Stop sign: side cameras off: take control" and out[-1].prompt == 'stopSignTakeControl'
+  assert out[-1].reason == "Stop sign: no visibility file: take control" and out[-1].prompt == 'stopSignTakeControl'
   assert not any(d.latch == 'shadow' for d in out)
   assert out[-1].stops and out[-1].stops[0].should_stop  # the decider's own hold, the latch long gone
   assert all(s.accel_cap >= -2. - 1e-9 for d in w.trace for s in d.stops)
 
 
-def test_vision_maps_stale_waits_its_calibration_bound_not_h1_at_10_s(tmp_path):
-  w = vworld(tmp_path, side='mapsStale')
-  out = w.run(sg.CAL_WAIT_S + 2.)
-  assert first_go(out) is None and not any(d.fault == 'H1' for d in out)
-  assert any(h.key == 'calibration' for h in out[round(5. / DT_MDL)].holds)
+def test_vision_the_side_views_going_out_during_the_launch_withdraw_nothing(tmp_path):
+  # before: the gate failed on it after the first go, the go withdrawn and H9 handed back. The launch goes on, its lanes
+  # judged on the views still running
+  w = vdrive(tmp_path)
+  out = w.run(6.)
+  i = first_go(out)
+  w = vdrive(tmp_path)
+  w.run((i + 4) * DT_MDL)
+  assert w.sg.state == 'going'
+  w.side = 'disabled'
+  out = w.run(8.)
+  assert not any(d.fault for d in out) and any(d.state in ('inLane', 'done') for d in out)
 
 
 # ----------------------------------------------------------------------------------------- traffic, the order, the shield
@@ -509,29 +672,33 @@ def test_vision_v7_a_signal_head_releases_the_latch_with_no_lift_and_never_hands
   assert loud and max(loud) < first_out
 
 
-@pytest.mark.parametrize('yaw, goes', [(2., True), (5., True), (8., False)])
-def test_vision_v8_the_car_yawed_up_to_8_deg_is_straight_enough_reach_deciding(tmp_path, yaw, goes):
+@pytest.mark.parametrize('yaw, limited', [(2., False), (5., False), (8., True), (12., True)])
+def test_vision_v8_the_cars_yaw_is_no_hold_reach_deciding_and_a_short_view_no_steps_help_is_gone_on(tmp_path, yaw, limited):
+  # the yaw rotates every lane toward the frame's edge (angle_bound): at 8 deg the lanes read short and no step forward shows
+  # enough more, so the go is the limited view's ("Look both ways"), with no creep
   w = vworld(tmp_path, 15)
   out = w.run(6., yaw20_deg=yaw, steer_deg=20.)
+  i = first_go(out)
+  assert not any(h.key == 'yaw' for d in out for h in d.holds) and not any(d.go_cause == 'creep' for d in out)
+  assert i is not None and out[i].log['viewLimited'] == limited and (out[i - 1].reason == sg.LOOK_REASON) == limited
+  if limited:
+    a = arrived_at(out)
+    assert any(h.key.startswith('reach:') for d in out[a:i] for h in d.holds)  # honest: the walk's reach, never the yaw
+
+
+@pytest.mark.parametrize('yaw, steer', [(1.2, 30.1), (1.2, -45.), (9., 0.), (12., 0.), (1.2, 95.)])
+def test_vision_the_cars_heading_and_wheel_at_the_line_never_hold_the_go(tmp_path, yaw, steer):
+  """SAT_VALIDATION row 8 (stop_allway_empty): standing within 1.2 deg of the approach with the wheel at 30.1 deg (the model's
+  last-metres curvature), the yaw hold never let the go come. And a car standing yawed past 8 deg (a curved approach under 145
+  m radius reads that over its last 20 m) waited with no bound, since standing changes no heading. Under vision neither holds:
+  the walk's rotation bound takes the yaw in, and what the lanes then can't show is the view's to judge."""
+  w = vdrive(tmp_path, 15)
+  out = w.run(20., yaw20_deg=yaw, steer_deg=steer)
+  assert first_go(out) is not None and not any(d.fault for d in out)
   assert not any(h.key == 'yaw' for d in out for h in d.holds)
-  assert (first_go(out) is not None) == goes
-  if not goes:
-    assert any(h.key.startswith('reach:') for h in out[-1].holds)  # honest: the walk's reach, never the yaw
 
 
-@pytest.mark.parametrize('yaw, steer, goes', [(1.2, 30.1, True), (1.2, -45., True), (9., 0., False), (1.2, 95., False)])
-def test_vision_straight_is_the_cars_heading_against_its_approach_the_wheel_only_a_sanity_bound(tmp_path, yaw, steer, goes):
-  """SAT_VALIDATION row 8 (stop_allway_empty): standing with its heading within 1.2 deg of the approach, the car's wheel sat at
-  30.1 deg (the model's last-metres curvature), over VISION_STEER_GO_DEG 30, and the yaw hold never let the go come. Under
-  vision the car is straight on its approach by its heading (yaw20_deg, the heading change over its last 20 m: against the
-  approach it drove in on) within VISION_YAW_GO_DEG; the wheel is a sanity bound only (VISION_STEER_SANITY_DEG)."""
-  w = vworld(tmp_path, 15)
-  out = w.run(6., yaw20_deg=yaw, steer_deg=steer)
-  assert (first_go(out) is not None) == goes
-  assert any(h.key == 'yaw' for d in out for h in d.holds) == (not goes)
-
-
-def test_vision_v9_a_corner_occluder_starts_the_creep_for_a_view_after_2_s(tmp_path):
+def test_vision_v9_a_corner_occluder_starts_the_creep_for_a_view(tmp_path):
   # a car standing at the corner 10 m down the near lane hides the lane behind it: a static wait on reach alone, and the
   # creep for a view's rung is tried VISION_CREEP_AFTER_S into it (STATIC_WAIT_S under the other modes); a bearing-only
   # occluder a step never helps, so the walk says no step (logged) and the wait goes on to its bound
@@ -547,7 +714,8 @@ def test_vision_v9_a_corner_occluder_starts_the_creep_for_a_view_after_2_s(tmp_p
   static = next(k for k, d in enumerate(out) if d.state == 'observe' and d.ledger == 'static')
   assert all(h.key.startswith('reach:') for h in out[static].holds)
   tried = [t for name, t, kw in events if name in ('turnpilot.stop_go_view_creep', 'turnpilot.stop_go_view_creep_no')]
-  assert w.sg.vision_creep_tried and tried and tried[0] - static * DT_MDL <= sr.VISION_CREEP_AFTER_S + 0.3
+  # ...once the corner car has stood long enough to be no shield in the making (SETTLE_S)
+  assert w.sg.vision_creep_tried and tried and tried[0] - static * DT_MDL <= sr.VISION_CREEP_AFTER_S + sg.SETTLE_S + 0.3
   assert all(s.accel_cap >= -2. - 1e-9 for d in out for s in d.stops)
 
 
@@ -642,10 +810,14 @@ def test_vision_logs_its_gate_its_waits_its_announce_and_its_go(tmp_path, monkey
   go = next(kw for n, kw in events if n == 'turnpilot.stop_go_go')
   assert go['vision'] and go['need_s'] == sr.VISION_LONG_CLEAR_S and go['margins']
   assert 'turnpilot.stop_go_vision_wait' in names or 'turnpilot.stop_go_vision_announce' in names
-  w = vworld(tmp_path, side='off')
+  w = vworld(tmp_path, j=vision_junction(rail_distance=20.))
   w.run(3.)
   fail = [kw for n, kw in events if n == 'turnpilot.stop_go_vision_gate' and kw['verdict'] == 'fail']
-  assert fail and fail[-1]['reason'] == 'sideViews' and fail[-1]['sideViewStatus'] == 'off'
+  assert fail and fail[-1]['reason'] == 'geometry' and fail[-1]['detail'] == 'a rail crossing 20 m away'
+  w = vworld(tmp_path, side='off')
+  w.run(4.)
+  out = [kw for n, kw in events if n == 'turnpilot.stop_go_side_views']
+  assert out and out[-1]['out'] and out[-1]['sideViewStatus'] == 'off'
 
 
 def test_vision_the_other_modes_are_unchanged_by_its_branch(tmp_path):

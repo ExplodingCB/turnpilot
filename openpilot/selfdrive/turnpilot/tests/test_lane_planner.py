@@ -466,18 +466,27 @@ def test_tesla_blinker_off_before_the_change_starts_aborts():
 def test_aborts_before_the_change_starts():
   m = maneuver("turn", "right", TWO_LANES_RIGHT_TURN)
 
-  def offered(**kw):
+  def offered(m=m, **kw):
     drive = Drive(lanes_left=0, lanes_right=1, **kw)
     distance = drive.run(m, 290., 1.5)
     assert drive.lp.phase == Phase.WARN
     return drive, distance
 
   # the line turns solid, yellow or none; read unknown, or not read at all, it waits (test_an_offer_waits_out_an_unsure_line)
-  for p in (SW, SY, BY, NO_LINE, LinePaint('solid', 'unknown', 0.3, 0.9), LinePaint('unknown', 'yellow', 0.2, 0.)):
+  for p in (SY, BY, NO_LINE, LinePaint('solid', 'unknown', 0.3, 0.9), LinePaint('unknown', 'yellow', 0.2, 0.)):
     drive, distance = offered()
     drive.paint = lambda left, right, p=p: paint(right=p)
     drive.run(m, distance, 1.)
     assert [a for a, _ in drive.aborts] == ['lineNotBroken'] and not drive.requests, p
+  # solid white: an abort where no lane list names the lane beyond it; into the turn lane the list names, the offer stands
+  drive, distance = offered(maneuver("turn", "right"))
+  drive.paint = lambda left, right: paint(right=SW)
+  drive.run(maneuver("turn", "right"), distance, 1.)
+  assert [a for a, _ in drive.aborts] == ['lineNotBroken'] and not drive.requests
+  drive, distance = offered()
+  drive.paint = lambda left, right: paint(right=SW)
+  drive.run(m, distance, 1.)
+  assert not drive.aborts and drive.lp.phase == Phase.WARN
   drive, distance = offered()
   drive.paint = None  # no paint read (the wide camera): no give-up for lack of a read, nothing requested
   drive.run(m, distance, 1.)
@@ -868,11 +877,11 @@ def test_a_curb_side_change_on_less_than_paint_needs_this_frames_paint_read():
     # so the window's end skips nothing, under the switch as off it
     drive = Drive(0, 1, paint=yellow_then_unread({'n': 0}))
     drive.lp.always_drive = on
-    distance = drive.run(m, start + 30., 17., blindspot=LaneChange.right)
+    distance = drive.run(m, start + 30., 19., blindspot=LaneChange.right)
     assert distance < end and not drive.offers and not drive.decisions[-1].blocked, on
   # the curb line read unknown on every frame (4.10's less than paint), the blind spot held: placed, and skipped at the end
   drive = always(Drive(0, 1, paint=lambda left, right: paint(left=SY, right=UNKNOWN)))
-  assert drive.run(m, start + 30., 17., blindspot=LaneChange.right) < end
+  assert drive.run(m, start + 30., 19., blindspot=LaneChange.right) < end
   assert not drive.offers and drive.decisions[-1].blocked
   # an offer on less than paint under way, then nothing read: it waits, never requested on a frame nobody read (before
   # 2026-11-07 the first such frame aborted it), and aborts once LC_UNSURE_MAX_S have passed with nothing read
@@ -880,7 +889,9 @@ def test_a_curb_side_change_on_less_than_paint_needs_this_frames_paint_read():
   drive.paint = lambda left, right: paint(left=SY, right=UNKNOWN) if not drive.offers else ()
   drive.run(m, start - 10., LC_UNSURE_MAX_S + 1.)
   assert len(drive.offers) == 1 and [a for a, _ in drive.aborts] == ['lineNotBroken'] and not drive.requests
-  assert drive.aborts[0][1] - drive.offers[0][2] == pytest.approx(LC_UNSURE_MAX_S, abs=2.5 * DT_MDL)
+  # (the last read is carried PAINT_CARRY_S first, and the countdown over by then, the abort settles LC_ABORT_SETTLE_S)
+  from openpilot.selfdrive.turnpilot.lane_planner import LC_ABORT_SETTLE_S, PAINT_CARRY_S
+  assert drive.aborts[0][1] - drive.offers[0][2] == pytest.approx(LC_UNSURE_MAX_S + PAINT_CARRY_S + LC_ABORT_SETTLE_S, abs=2.5 * DT_MDL)
 
 
 def test_driver_lane_change_gets_a_cooldown_too():
@@ -1227,17 +1238,17 @@ def test_with_no_room_before_the_stop_the_change_goes_after_its_go():
 
 
 def test_with_no_room_before_the_stop_nor_after_it_the_lane_is_unreachable_and_said():
-  """A stop 75 m before the turn, seen 45 m ahead: not enough road after its go to get up to speed and change. Too close
+  """A stop 48 m before the turn, seen 52 m ahead: not enough road after its go to get up to speed and change. Too close
   to it at speed for one before it. The turn's lane can't be reached: unreachable, never a late change."""
-  drive = StopDrive(2, 0, cruise=11., stop_at=75.)
+  drive = StopDrive(2, 0, cruise=10., stop_at=48.)
   m = maneuver("turn", "left", THREE_LANES_LEFT_TURN)
-  drive.drive(m, 120., 4.)
+  drive.drive(m, 100., 4.)
   d = drive.decisions[-1]
   assert not drive.offers and d.wait == 'unreachable' and d.unreachable and d.want == 2
   assert 'reach' in d.reason
   # without the map's lane list the car's lane isn't known to be wrong: said, never a skip
-  drive = StopDrive(1, 0, cruise=11., stop_at=75.)
-  drive.drive(maneuver("turn", "left"), 120., 4.)
+  drive = StopDrive(1, 0, cruise=10., stop_at=48.)
+  drive.drive(maneuver("turn", "left"), 100., 4.)
   d = drive.decisions[-1]
   assert d.wait == 'unreachable' and not d.unreachable
 
@@ -1556,7 +1567,8 @@ def test_a_change_the_lane_list_still_wants_at_the_windows_end_is_blocked_for_an
   from, and the change it needs hasn't gone by the window's end, whatever held it: the turn is skipped and rerouted
   (turnpilotd, skipReason laneBlocked), never pulsed from that lane. Each reason here: a car in the blind spot, a car in the
   target lane, too slow for DesireHelper (never offered), no signal from the driver, DesireHelper waiting too long, the
-  lane parked, the line solid. With TurnPilotAlwaysDrive off as well as on (step S4)."""
+  lane parked, the line solid (of no colour read: one read solid white into the turn lane the list names may be crossed,
+  change_blocker's bay, and that change is made). With TurnPilotAlwaysDrive off as well as on (step S4)."""
   beside = scene([{'cls': 'car', 'x': -3., 'y': -3.6, 'vx': 15.}]).objects
   parked = scene([{'cls': 'car', 'x': 50., 'y': -3.6, 'vx': 0.}]).objects
   cases = {
@@ -1565,7 +1577,7 @@ def test_a_change_the_lane_list_still_wants_at_the_windows_end_is_blocked_for_an
     'tooSlow': (Drive(0, 1, v=2.), {}),
     'noSignal': (Drive(0, 1, driver_signals=True), {}),
     'laneParked': (Drive(0, 1), {'objects': parked}),
-    'lineNotBroken': (Drive(0, 1, paint=lambda left, right: paint(right=SW)), {}),
+    'lineNotBroken': (Drive(0, 1, paint=lambda left, right: paint(right=LinePaint('solid', 'unknown', 0.9, 0.95))), {}),
   }
   for why, (drive, kw) in cases.items():
     drive.lp.always_drive = always_drive
@@ -2104,8 +2116,40 @@ def test_a_lane_the_model_counts_beyond_the_line_opens_the_bay():
   for _ in range(4):  # the hold run out, a frame nobody read: the raw count is no lane of ours (the oncoming lane)
     lp.update(m, 400., beyond, *args, ())
   assert lp.bay.shut and lp.yellow.apply(()) == ()
+  # the hold run out, the paint read: the line is still the one read yellow (marked), so the lane counted beyond it is the
+  # oncoming one and the latch stays shut; white reads of the line (a bay's own line, where the centre line was) open it
+  lp.update(m, 400., beyond, *args, paint(left=UNKNOWN, right=SW))
+  assert lp.bay.shut
+  lp.update(m, 400., beyond, *args, paint(left=BW, right=SW))
+  assert not lp.bay.shut
+  # a line never read yellow or solid: the counted lane opens the latch, as before
+  lp = LanePlanner()
+  lp.bay.shut = True
   lp.update(m, 400., beyond, *args, paint(left=UNKNOWN, right=SW))
   assert not lp.bay.shut
+
+
+def test_a_centre_line_read_solid_with_no_colour_keeps_the_bay_shut():
+  """Route 29 (2026-11-08, 216-243 s), a left with [left, straight] on a one-lane approach at night: the centre line read
+  yellow 330 m out (the latch shut), then solid of no colour from 305 m to 88 m, the model counting the oncoming lane beyond
+  it. With the yellow hold run out that count opened the latch 156 m out, the turn wanted a change across the solid line for
+  the rest of the approach, and LC-03 skipped the left at the window's end. A line marked yellow or solid is never counted
+  over: no change wanted, nothing skipped."""
+  m = maneuver("turn", "left", LEFT_BAY)
+  one, beyond = model_lanes(*road(0, 0)), model_lanes(*road(1, 0))
+  solid = LinePaint('solid', 'unknown', 1., 0.95)
+  lp = LanePlanner()
+  args = (LaneChangeState.off, 13., False, False, (), True, True, DT_MDL)
+  distance = 330.
+  for _ in range(BAY_YELLOW_READS):
+    lp.update(m, distance, one, *args, paint(left=SY, right=UNKNOWN))
+    distance -= 13. * DT_MDL
+  assert lp.bay.shut
+  decisions = []
+  while distance > 20.:
+    decisions.append(lp.update(m, distance, beyond, *args, paint(left=solid, right=UNKNOWN)))
+    distance -= 13. * DT_MDL
+  assert lp.bay.shut and all(d.want == 0 for d in decisions) and not any(d.blocked for d in decisions)
 
 
 def test_the_real_bays_yellow_still_shuts_it():
@@ -2207,31 +2251,31 @@ def test_a_lane_by_the_white_hold_alone_never_places_the_car_for_lc03():
 
 def test_a_shut_bay_is_no_wrong_lane_for_its_turn():
   """lane_mismatch said wrongLaneForTurn ('Wrong Lane: This lane doesn't turn with the route') on a shut-bay approach that
-  TurnPilot drives the turn from: [left (active), straight, straight], one lane, 50 m out at 10 m/s (inside the window's end,
-  60 m), the left line yellow, the plan wanting no change. Now the same judgement as desired_changes' bay rule (_bay_waits):
+  TurnPilot drives the turn from: [left (active), straight, straight], one lane, 40 m out at 10 m/s (inside the window's end,
+  45 m), the left line yellow, the plan wanting no change. Now the same judgement as desired_changes' bay rule (_bay_waits):
   nothing said while it holds, and as before once it doesn't."""
   m = maneuver("turn", "left", LEFT_BAY)
   one_lane = model_lanes(*road(0, 0))
-  assert lane_change_window(10.)[1] > 50.
-  assert lane_mismatch(m, 50., (), 0., one_lane, 10.) == LaneMismatch.wrongLaneForTurn, "nothing said of the bay: as before"
+  assert lane_change_window(10.)[1] > 40.
+  assert lane_mismatch(m, 40., (), 0., one_lane, 10.) == LaneMismatch.wrongLaneForTurn, "nothing said of the bay: as before"
   for yellow in (SY, BY, LATCHED_YELLOW):
     assert desired_changes(m, one_lane, paint=paint(left=yellow)) == 0, yellow
-    assert lane_mismatch(m, 50., (), 0., one_lane, 10., paint=paint(left=yellow)) == LaneMismatch.none, yellow
+    assert lane_mismatch(m, 40., (), 0., one_lane, 10., paint=paint(left=yellow)) == LaneMismatch.none, yellow
   for other in (BW, UNKNOWN, SW, LinePaint('unknown', 'yellow', 0.35, 0.3)):
     assert desired_changes(m, one_lane, paint=paint(left=other)) == 2, other
-    assert lane_mismatch(m, 50., (), 0., one_lane, 10., paint=paint(left=other)) == LaneMismatch.wrongLaneForTurn, other
+    assert lane_mismatch(m, 40., (), 0., one_lane, 10., paint=paint(left=other)) == LaneMismatch.wrongLaneForTurn, other
   # the planner's latch, as turnpilotd hands it over, over the frame's own paint
-  assert lane_mismatch(m, 50., (), 0., one_lane, 10., bay_shut=True) == LaneMismatch.none
-  assert lane_mismatch(m, 50., (), 0., one_lane, 10., paint=paint(left=SY), bay_shut=False) == LaneMismatch.wrongLaneForTurn
+  assert lane_mismatch(m, 40., (), 0., one_lane, 10., bay_shut=True) == LaneMismatch.none
+  assert lane_mismatch(m, 40., (), 0., one_lane, 10., paint=paint(left=SY), bay_shut=False) == LaneMismatch.wrongLaneForTurn
   # only for the bay's turn: another list's wrong lane is said whatever the latch, and so is a turn-only lane going straight
   mid = maneuver("turn", "left", ((("straight",), False), (("left",), True), (("straight",), False)))
-  assert lane_mismatch(mid, 50., (), 0., one_lane, 10., paint=paint(left=SY), bay_shut=True) == LaneMismatch.wrongLaneForTurn
+  assert lane_mismatch(mid, 40., (), 0., one_lane, 10., paint=paint(left=SY), bay_shut=True) == LaneMismatch.wrongLaneForTurn
   assert lane_mismatch(None, 500., LEFT_ONLY_AND_THROUGH, 40., model_lanes(*road(0, 2)), 10., paint=paint(left=SY), bay_shut=True) == \
          LaneMismatch.turnOnlyGoingStraight
   # left-hand traffic: the far side is the right
   rht_bay = maneuver("turn", "right", ((("straight",), False), (("straight",), False), (("right",), True)))
-  assert lane_mismatch(rht_bay, 50., (), 0., one_lane, 10., False, paint=paint(right=SY)) == LaneMismatch.none
-  assert lane_mismatch(rht_bay, 50., (), 0., one_lane, 10., False) == LaneMismatch.wrongLaneForTurn
+  assert lane_mismatch(rht_bay, 40., (), 0., one_lane, 10., False, paint=paint(right=SY)) == LaneMismatch.none
+  assert lane_mismatch(rht_bay, 40., (), 0., one_lane, 10., False) == LaneMismatch.wrongLaneForTurn
   # through the planner, as turnpilotd asks every frame: the centre line yellow on a frame in three and unknown on the rest
   # (1e seg 5), then a broken white read opening the bay. Inside the window's end the banner and the plan agree on every
   # frame: wrong lane exactly when a change is wanted
@@ -2323,3 +2367,175 @@ def test_an_unsure_wait_is_bounded_and_the_lamp_goes_out():
   drive.run(m, distance, 2. * LC_UNSURE_MAX_S)
   assert [a for a, _ in drive.aborts] == ['lineNotBroken'] and not drive.requests
   assert LC_UNSURE_MAX_S - 2 * DT_MDL < drive.aborts[0][1] - clear < LC_UNSURE_MAX_S + LC_ABORT_SETTLE_S + 2 * DT_MDL
+
+
+def test_frames_between_two_paint_reads_go_by_the_last_read():
+  """Route 29 (2026-11-08): the lane paint came on 35% of plan frames, two read then two to four not (the detector's road
+  camera runs). A frame between two reads counted as one nobody read, so the confirm count took twice as long (521 s: a left
+  100 m out, offered 1.0 s after its first passing frame) and, with the driver signalling, the request went out on each
+  read and was withdrawn on each frame between, 11 times in 2.1 s. Such a frame goes by the last read (PAINT_CARRY_S)."""
+  from openpilot.selfdrive.turnpilot.lane_planner import PAINT_CARRY_S
+  m = maneuver("turn", "left")
+  for unread in (2, 4):
+    drive = Drive(lanes_left=1, lanes_right=0, driver_signals=True)
+    n = {'k': 0}
+    def cadence(left, right, n=n, unread=unread):
+      n['k'] += 1
+      return striped(left, right) if (n['k'] - 1) % (2 + unread) < 2 else ()
+    drive.paint = cadence
+    assert unread * DT_MDL <= PAINT_CARRY_S
+    distance = drive.run(m, 290., LC_CONFIRM_FRAMES * DT_MDL)
+    assert len(drive.offers) == 1 and drive.offers[0][2] == pytest.approx((LC_CONFIRM_FRAMES - 1) * DT_MDL), unread
+    k = len(drive.decisions)
+    drive.run(m, distance, 6., blinker=LaneChange.left)
+    # asked for once and held until DesireHelper starts it: never withdrawn on a frame between two reads
+    asked = [d.lane_change == LaneChange.left for d in drive.decisions[k:] if d.offer == LaneChange.left]
+    assert asked and all(asked) and len(drive.requests) == 1 and drive.lp.changes == 1 and not drive.aborts, unread
+
+
+def test_a_read_older_than_the_carry_is_no_read():
+  """The carry bridges the reader's own cadence, nothing longer: a wide camera run past PAINT_CARRY_S is a frame nobody
+  read, as before (kept, never counted), and the last read of the lane the car left is never carried into the next."""
+  from openpilot.selfdrive.turnpilot.lane_planner import PAINT_CARRY_S
+  m = maneuver("turn", "left")
+  drive = Drive(lanes_left=1, lanes_right=0, driver_signals=True)
+  n = {'k': 0}
+  def two_reads(left, right):
+    n['k'] += 1
+    return striped(left, right) if n['k'] <= 2 else ()
+  drive.paint = two_reads
+  drive.run(m, 290., 2.)
+  assert not drive.offers and drive.decisions[-1].wait == 'lineNotBroken'
+  assert drive.lp._confirm == 2 + int(round(PAINT_CARRY_S / DT_MDL))
+
+
+def test_a_change_may_start_as_late_as_a_driver_starts_one():
+  """Route 29, 519-530 s: a left on a 100 m leg, the driver's lamp on 92 m out and the line crossed 40-25 m out at 6-7 m/s.
+  The window's end was 60 m at any city speed, so the offer made 82 m out died tooLate 2 s later and the left was skipped.
+  The end is LC_END_S of travel, LC_END_MIN_M at least."""
+  from openpilot.selfdrive.turnpilot.lane_planner import LC_END_MIN_M, LC_END_S
+  assert lane_change_window(10.)[1] == pytest.approx(LC_END_S * 10.) and lane_change_window(10.)[1] <= 45.
+  assert lane_change_window(5.)[1] == LC_END_MIN_M <= 35.
+  m = maneuver("turn", "left")
+  drive = Drive(lanes_left=1, lanes_right=0, v=10., driver_signals=True)
+  distance = drive.run(m, 100., LC_CONFIRM_FRAMES * DT_MDL)
+  drive.run(m, distance, 7., blinker=LaneChange.left)
+  assert drive.offers and drive.requests and drive.lp.changes == 1 and not drive.aborts
+  assert not any(d.blocked for d in drive.decisions)
+
+
+def test_an_aborted_change_is_offered_again_soon():
+  """An abort keeps the same change back LC_ABORT_COOLDOWN_S, then the confirm count: 3 s, not 6 (80 m at 13 m/s)."""
+  from openpilot.selfdrive.turnpilot.lane_planner import LC_ABORT_COOLDOWN_S
+  m = maneuver("turn", "left")
+  drive = Drive(lanes_left=1, lanes_right=0, v=13., driver_signals=True)
+  from types import SimpleNamespace
+  distance = drive.run(m, 250., LC_CONFIRM_FRAMES * DT_MDL)
+  assert len(drive.offers) == 1
+  car = [SimpleNamespace(x=5., y=LANE_WIDTH, vx=13.)]
+  distance = drive.run(m, distance, DT_MDL, objects=car)
+  assert [a for a, _ in drive.aborts] == ['carInLane']
+  drive.run(m, distance, 4.)
+  assert len(drive.offers) == 2
+  assert drive.offers[1][2] - drive.aborts[0][1] == pytest.approx(LC_ABORT_COOLDOWN_S + LC_CONFIRM_FRAMES * DT_MDL, abs=2 * DT_MDL)
+  assert LC_ABORT_COOLDOWN_S <= 3.
+
+
+TURN_BAY = ((("left",), True), (("straight",), False))  # route 29's 216-243 s left: the bay and the one through lane
+SOLID_NO_COLOUR = LinePaint('solid', 'unknown', 1., 0.95)
+
+
+def test_which_change_is_into_a_named_bay():
+  from openpilot.selfdrive.turnpilot.lane_planner import bay_named
+  assert bay_named(maneuver("turn", "left", TURN_BAY), 1)
+  assert bay_named(maneuver("turn", "right", TWO_LANES_RIGHT_TURN), -1)
+  assert not bay_named(maneuver("turn", "left", THREE_LANES_LEFT_TURN), 2), "the first of two lands in a through lane"
+  assert not bay_named(maneuver("turn", "left", TURN_BAY), 0)
+  assert not bay_named(maneuver("turn", "left"), 1), "no lane list names it"
+  assert not bay_named(maneuver("turn", "left", (((), False), ((), False))), 1), "a list that marks no lane for the turn"
+  assert not bay_named(maneuver("off ramp", "slight right", TWO_LANES_RIGHT_TURN), -1), "an exit is no turn bay"
+  assert not bay_named(None, 1)
+
+
+def test_a_named_bays_solid_white_line_may_be_crossed_and_nothing_else():
+  """The owner's ruling (2026-11-09): a change into a lane the lane list marks for the coming turn may cross a single line
+  read solid white where the model sees the lane there and it is free. Never yellow, never a solid line of no colour (toward
+  the far side it can be the centre line), and with no bay named a solid line is no change, as before."""
+  lane, night = model_lanes(*road(1, 0)), model_lanes(*road(1, 0, shoulder=0.5)[:1], [0.05, 0.9, 0.9, 0.05], *road(1, 0)[2:])
+  assert lane.left == 1 and night.left == 0 and night.left_open
+  for lanes in (lane, night):  # the lane counted from its painted line, or a lane's room to a trusted edge beyond the white
+    assert change_blocker(LEFT, lanes, paint(left=SW), nav_room=1, bay=True) == ''
+    assert change_blocker(LEFT, lanes, paint(left=SW), nav_room=1) == 'lineNotBroken', "no bay named: unchanged"
+    assert change_blocker(LEFT, lanes, paint(left=SW)) == 'lineNotBroken'
+  for line in (SY, BY, LATCHED_YELLOW, LinePaint('solid', 'yellow', 0.3, 0.95), LinePaint('unknown', 'yellow', 0.35, 0.)):
+    assert change_blocker(LEFT, lane, paint(left=line), nav_room=1, bay=True) == 'lineNotBroken', line
+    assert change_blocker(RIGHT, model_lanes(*road(0, 1)), paint(right=line), nav_room=1, bay=True) == 'lineNotBroken', line
+  assert change_blocker(LEFT, lane, paint(left=SOLID_NO_COLOUR), nav_room=1, bay=True) == 'lineNotBroken', "colourless: maybe the centre line"
+  assert change_blocker(LEFT, lane, paint(left=LinePaint('solid', 'white', 0.4, 0.95)), nav_room=1, bay=True) == 'lineNotBroken'
+  assert change_blocker(LEFT, lane, paint(left=NO_LINE), nav_room=1, bay=True) == 'lineNotBroken'
+  # the yellow hold over a line now read solid white: still yellow
+  hold = YellowHold()
+  hold.update(paint(left=SY), 10., DT_MDL, False)
+  assert change_blocker(LEFT, lane, hold.update(paint(left=SW), 10., DT_MDL, False), nav_room=1, bay=True) == 'lineNotBroken'
+  # the model sees no lane there, the list has none, or it isn't free
+  assert change_blocker(LEFT, model_lanes(*road(0, 0)), paint(left=SW), nav_room=1, bay=True) == 'noLane'
+  assert change_blocker(LEFT, lane, paint(left=SW), nav_room=0, bay=True) == 'noLane'
+  oncoming, parked = scene_obj(30., LANE_WIDTH, -8.), scene_obj(30., LANE_WIDTH, 0.)
+  assert change_blocker(LEFT, lane, paint(left=SW), (oncoming,), nav_room=1, bay=True) == 'noLane'
+  assert change_blocker(LEFT, lane, paint(left=SW), (parked,), nav_room=1, bay=True) == 'laneParked'
+  # toward the curb side the same: a right turn's bay behind solid white
+  assert change_blocker(RIGHT, model_lanes(*road(0, 1)), paint(right=SW), nav_room=1, bay=True) == ''
+  assert change_blocker(RIGHT, model_lanes(*road(0, 1)), paint(right=SOLID_NO_COLOUR), nav_room=1, bay=True) == 'lineNotBroken'
+
+
+def scene_obj(x, y, vx):
+  from types import SimpleNamespace
+  return SimpleNamespace(x=x, y=y, vx=vx)
+
+
+def solid_bay_drive(line, lanes=TURN_BAY, v=8.):
+  """A left 90 m ahead from the through lane beside its bay, the bay's line reading `line`, the driver signalling left."""
+  drive = Drive(1, 0, v=v, driver_signals=True, paint=lambda left, right: paint(left=line if left else SY, right=SW))
+  m = maneuver("turn", "left", lanes)
+  distance = 90.
+  while distance > 20.:
+    drive.step(m, distance, blinker=LaneChange.left)
+    distance -= v * DT_MDL
+  return drive
+
+
+def test_the_car_changes_into_a_named_bay_across_solid_white():
+  """Route 29 (2026-11-08, 239-241 s): a left's bay opened 48 m out behind a line read solid white 0.76-0.91, the lane list
+  [left, straight]; the planner never crosses solid, wanted the change to the window's end and LC-03 skipped the left. The
+  driver crossed it."""
+  drive = solid_bay_drive(SW)
+  assert [o for o, _, _ in drive.offers] == [LaneChange.left] and [r for r, _, _ in drive.requests] == [LaneChange.left]
+  assert drive.lp.changes == 1 and not drive.aborts and not any(d.blocked for d in drive.decisions)
+
+
+FAINT_YELLOW = LinePaint('solid', 'yellow', 0.4, 0.95)  # under the bay latch's bar: the change stays wanted, the line refuses it
+
+
+@pytest.mark.parametrize("line, lanes", [(SY, TURN_BAY), (BY, TURN_BAY), (FAINT_YELLOW, TURN_BAY), (SOLID_NO_COLOUR, TURN_BAY), (SW, ())])
+def test_no_change_across_yellow_colourless_or_unnamed_solid(line, lanes):
+  """Yellow: never. A solid line of no colour leftwards: never. Solid white with no bay named by the lane list: as before."""
+  drive = solid_bay_drive(line, lanes)
+  if line is FAINT_YELLOW:
+    assert not drive.lp.bay.shut and any(d.want == 1 for d in drive.decisions)
+  assert not drive.offers and not drive.requests and drive.lp.changes == 0
+
+
+def test_a_bay_never_entered_is_still_skipped_at_the_windows_end():
+  """The wrong-lane rail (LC-03) with the bay's grant: the bay's line read solid white, the model seeing no lane beyond it,
+  is noLane under the grant, and noLane at the window's end lets a turn go from the lane the car is in. LC-03 judges without
+  the grant: the left's lane not reached, the left is skipped."""
+  lp = LanePlanner()
+  m = maneuver("turn", "left", TURN_BAY)
+  no_lane = model_lanes(*road(0, 0))
+  assert change_blocker(LEFT, no_lane, paint(left=SW), nav_room=1, bay=True) == 'noLane'
+  distance, decisions = 60., []
+  while distance > 25.:
+    decisions.append(lp.update(m, distance, no_lane, LaneChangeState.off, 8., True, False, (), True, True, DT_MDL, paint(left=SW, right=SW)))
+    distance -= 8. * DT_MDL
+  assert all(d.want == 1 for d in decisions) and not any(int(d.offer) for d in decisions)
+  assert decisions[-1].blocked

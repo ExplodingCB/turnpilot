@@ -30,6 +30,10 @@ from openpilot.selfdrive.turnpilot.unprotected_left import (LEFT_LAUNCH_SPEED, L
 
 Desire = messaging.log.Desire
 
+# stand_lit: every scenario here is a go from a stand with plannerd attached to a car already standing at its line (the lift
+# over the model's hold from rest). As shipped a clear roll-in with its lamp lit goes as the car reaches its line, before the
+# harness has attached plannerd, so the sims' driver lights the lamp only once the car stands (answers_prompt)
+
 
 def held_at_the_red(**kw):
   sim = Sim(LEFT_AT_A_RED, controls=[(290., 'signal')], **kw)
@@ -300,9 +304,11 @@ def test_the_unprotected_lefts_lifted_go_never_reaches_the_oncoming_lanes_unfoll
   at a 0.3 s lag, so its no-move withdrawal doesn't come; the model never takes over, and the window's end withdraws
   it: the car stops short of the oncoming lanes (ONCOMING_ENTRY_M before the maneuver point) and is handed back."""
   sim = left_sim()
+  sim.answers_prompt = False  # no lamp until it stands (stand_lit)
   while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
     drive(sim, DT_MDL)
     assert sim.t < 60.
+  sim.answers_prompt = True
   attach_planner(sim, holding)
   plans = []
   while not any(p.desire == Desire.turnLeft for p in plans[-1:]):
@@ -345,9 +351,11 @@ def launching(sim):
 
 def left_go_with(model_fn):
   sim = left_sim()
+  sim.answers_prompt = False  # no lamp until it stands (stand_lit)
   while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
     drive(sim, DT_MDL)
     assert sim.t < 60.
+  sim.answers_prompt = True
   attach_planner(sim, model_fn)
   plans = []
   while not any(p.desire == Desire.turnLeft for p in plans[-1:]):
@@ -382,9 +390,11 @@ def test_a_lifted_lefts_go_the_car_never_moves_on_is_still_the_no_move_fault():
 def left_go_with_lag(model_fn, lag_s):
   """left_go_with at plannerd's lag lag_s: the unsignalized left (its go lifted) from its stand to its go's frame."""
   sim = left_sim()
+  sim.answers_prompt = False  # no lamp until it stands (stand_lit)
   while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
     drive(sim, DT_MDL)
     assert sim.t < 60.
+  sim.answers_prompt = True
   attach_planner(sim, model_fn, lag_s)
   plans = []
   while not any(p.desire == Desire.turnLeft for p in plans[-1:]):
@@ -400,9 +410,11 @@ def coast_with(cars=lambda sim: (), seconds=25.):
   from openpilot.selfdrive.turnpilot import unprotected_left as ul
   with mock.patch.object(ul.cloudlog, 'event') as event:
     sim = left_sim(cars)
+    sim.answers_prompt = False  # no lamp until it stands (stand_lit)
     while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
       drive(sim, DT_MDL)
       assert sim.t < 60.
+    sim.answers_prompt = True
     attach_planner(sim, coasting)
     plans = drive(sim, seconds)
   return sim, plans, [(c.args[0], c.kwargs) for c in event.call_args_list if c.args]
@@ -466,9 +478,11 @@ def left_events(cars, seconds=30., yaw=True):
   from openpilot.selfdrive.turnpilot import unprotected_left as ul
   with mock.patch.object(ul.cloudlog, 'event') as event:
     sim = left_sim(cars)
+    sim.answers_prompt = False  # no lamp until it stands (stand_lit)
     while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
       drive(sim, DT_MDL)
       assert sim.t < 60.
+    sim.answers_prompt = True
     attach_planner(sim, gentle)
     plans = drive(sim, seconds, yaw=yaw)
   return sim, plans, [(c.args[0], c.kwargs) for c in event.call_args_list if c.args]
@@ -529,9 +543,11 @@ def slow_launch(a, lifted, cars=lambda sim: (), seconds=40., radius_m=8.):
     if not lifted:
       sim.raw = road_runs(cars)
     sim.tp.full_pass_range_m = FULL_PASS_RANGE_M
+    sim.answers_prompt = False  # no lamp until it stands (stand_lit)
     while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
       drive(sim, DT_MDL)
       assert sim.t < 60.
+    sim.answers_prompt = True
     attach_planner(sim, lambda sim: model_v2(*sim.model_lanes, accel=a, **sim.model_kw))
     plans = []
     for _ in range(int(round(seconds / DT_MDL))):
@@ -612,6 +628,7 @@ def test_a_stand_yawed_past_what_the_road_camera_frames_is_judged_on_what_it_fra
   assert any(str(p.unprotectedLeft.state) == 'committed' for p in plans) and sim.s > JUNCTION
 
 
+@pytest.mark.usefixtures('left_window_from_its_stand')  # its harness needs the stand's own window (conftest)
 def test_a_left_go_nearer_the_oncoming_lanes_than_the_lifts_nudge_is_never_lifted():
   """A left crept for a view goes 1 m short of the oncoming lanes: the lift's 2.25 m nudge would carry the car past where it
   can stop short of them with the model never having gone, so that go is never certified (why 'room'): G4's go, as before.
@@ -722,6 +739,7 @@ def test_turn_release_is_certified_on_an_accepted_green_only():
   for maneuvers, s_stop, s_signal in ((LEFT_AT_A_RED, 289., 290.), (RIGHT_AT_A_SIGNAL, 300. - HOLD_LINE_M - 0.5, 292.)):
     case, kw = (maneuvers[0][2], s_stop), {'controls': ((s_signal, 'signal'),), 'maneuvers': maneuvers, 's_stop': s_stop}
     assert certified(oracle('green', s_signal=s_signal), **kw) == {'turnRelease'}, case
+    # a red read: never certified, the left's or the right's (map_controls: a right never goes on a red it is reading)
     assert certified(oracle('red', s_signal=s_signal), **kw) == set(), case
     assert certified(oracle('green', camera='red', s_signal=s_signal), **kw) == set(), case
     assert certified(None, **{**kw, 'controls': ()}) == set(), case
@@ -871,6 +889,7 @@ def test_a_curb_side_turn_released_in_the_junction_at_a_green_is_certified_and_a
   assert any(p.controlPrompt == 'stalledTakeControl' for p in plans)
 
 
+@pytest.mark.usefixtures('left_window_from_its_stand')  # its harness needs the stand's own window (conftest)
 def test_a_release_of_a_turn_across_the_oncoming_road_is_never_certified():
   """A turn across the oncoming road goes only on the left's own go (unprotectedLeft, its gap certified): a release of
   TurnPilot's hold there, even from its line at a green, is never a turnRelease (why unprotected)."""
@@ -923,6 +942,7 @@ def held_then_goes(hold_s):
   return model
 
 
+@pytest.mark.usefixtures('left_window_from_its_stand')  # its harness needs the stand's own window (conftest)
 def test_a_signalized_lefts_go_on_the_cameras_shadow_green_is_never_lifted():
   """Skeptic G5 (residual): at a mapped signal the left goes on any source's green (turn_light), the camera's shadow reader's
   too, and certify_go checked the light only for turnRelease, so a shadow green certified unprotectedLeft and plannerd lifted
@@ -960,9 +980,11 @@ def test_a_signalized_left_waits_with_the_model_through_its_red_and_goes_on_its_
   red of 3 s or more, the model's own green included. Now the left goes only once the model's plan moves, unlifted, and the
   car turns: never a take-control."""
   sim = signal_sim(oracle=False)
+  sim.answers_prompt = False  # no lamp until it stands (stand_lit)
   while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
     run_objects(sim, DT_MDL)
     assert sim.t < 60.
+  sim.answers_prompt = True
   attach_planner(sim, held_then_goes(red_s))
   plans = run_objects(sim, red_s + 20.)
   go_i = next(i for i, p in enumerate(plans) if p.desire == Desire.turnLeft)
@@ -985,9 +1007,11 @@ def test_a_signalized_lefts_go_the_model_stops_following_goes_back_to_its_wait_n
       return holding(sim)
     return model_v2(*sim.model_lanes, accel=1.5, **sim.model_kw)  # the left's own launch (left_launch)
   sim = signal_sim(oracle=False)
+  sim.answers_prompt = False  # no lamp until it stands (stand_lit)
   while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
     run_objects(sim, DT_MDL)
     assert sim.t < 60.
+  sim.answers_prompt = True
   attach_planner(sim, model)
   t0 = sim.t
   plans = run_objects(sim, 40.)
@@ -1016,9 +1040,11 @@ def left_withdrawn_before_motion(model_fn, lag_s, car_for_s, seconds=40.):
     return [(sim.s + 90. - V_25 * (sim.t - st['go_t']), 3.6)]
   sim = signal_sim(oracle=False)
   sim.raw = road_runs(cars)
+  sim.answers_prompt = False  # no lamp until it stands (stand_lit)
   while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
     run_objects(sim, DT_MDL)
     assert sim.t < 60.
+  sim.answers_prompt = True
   attach_planner(sim, lambda s: model_fn(s, st), lag_s)
   plans = []
   for _ in range(round(seconds / DT_MDL)):
@@ -1060,11 +1086,15 @@ def test_an_unlifted_lefts_go_the_model_yields_on_then_moves_again_is_never_hand
 
 def test_an_unlifted_lefts_go_the_car_doesnt_answer_is_still_the_no_move_fault():
   """What LEFTS-1's gate keeps: the left's go out, the model planning motion, nothing holding the car, and the car standing
-  (an actuator that doesn't answer): NO_MOVE_S of it is the no-move fault, said, the car held."""
+  (an actuator that doesn't answer): LEFT_LAUNCH_STAND_S of it is the no-move fault, said, the car held (this car's launches
+  take 0.9-1.6 s to first motion, so NO_MOVE_S left 0.4 s of margin)."""
+  from openpilot.selfdrive.turnpilot.turnpilotd import LEFT_LAUNCH_STAND_S
   sim = signal_sim(oracle=False)
+  sim.answers_prompt = False  # no lamp until it stands (stand_lit)
   while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
     run_objects(sim, DT_MDL)
     assert sim.t < 60.
+  sim.answers_prompt = True
   attach_planner(sim, moving_from_rest)
   sim.accel = lambda sim, plan: 0.  # the car never answers
   plans, go_i = [], None
@@ -1075,7 +1105,7 @@ def test_an_unlifted_lefts_go_the_car_doesnt_answer_is_still_the_no_move_fault()
       go_i = len(plans) - 1
   assert go_i is not None
   handed = next(i for i, p in enumerate(plans) if str(p.controlPrompt) == 'cantStartTakeControl')
-  assert abs((handed - go_i) * DT_MDL - NO_MOVE_S) <= 0.15 and plans[-1].shouldStop
+  assert abs((handed - go_i) * DT_MDL - LEFT_LAUNCH_STAND_S) <= 0.15 and plans[-1].shouldStop
 
 
 def held_at_the_signal_with(model_fn, seconds):
@@ -1090,6 +1120,7 @@ def held_at_the_signal_with(model_fn, seconds):
   return sim, pre, run_objects(sim, seconds)
 
 
+@pytest.mark.usefixtures('left_window_from_its_stand')  # its harness needs the stand's own window (conftest)
 def test_a_lefts_go_the_model_wont_follow_is_heard_once_a_hold_and_never_says_turning_with_the_car_standing():
   """Review 2026-11-07 (AL-1): an unlifted left's go the model doesn't follow goes back to a wait (LS-2) and the left goes
   again once the model's plan moves; every go said "Turning / Turning across oncoming traffic" with a chime. A model that
@@ -1115,6 +1146,7 @@ def test_a_lefts_go_the_model_wont_follow_is_heard_once_a_hold_and_never_says_tu
   assert sim.v < 0.05 and not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
 
 
+@pytest.mark.usefixtures('left_window_from_its_stand')  # its harness needs the stand's own window (conftest)
 def test_a_retry_the_model_does_follow_is_said_and_heard_as_the_car_moves():
   from openpilot.selfdrive.turnpilot.tests.test_turnpilotd_left import heard_spells, selfdrived_alerts
   st = {'gos': 0, 'was': ''}
@@ -1157,9 +1189,11 @@ def test_a_left_refused_its_lift_only_for_a_head_boxed_on_the_approach_never_say
     return none
   sim.lights = lights
   sim.raw = road_runs()
+  sim.answers_prompt = False  # no lamp until it stands (stand_lit)
   while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
     run_objects(sim, DT_MDL)
     assert sim.t < 60.
+  sim.answers_prompt = True
   attach_planner(sim, holding)
   plans = run_objects(sim, 30.)
   assert sim.tp.left_lift_refused(sim.tp.follower.distance) != ''  # the refusal stands (HR-2)
@@ -1179,9 +1213,11 @@ def test_a_head_first_boxed_mid_lift_at_an_unsignalized_left_never_ends_its_lift
   def read(t):
     return 'unknown' if st['go_t'] is not None and t >= st['go_t'] + 0.5 else None
   sim = unmapped_camera_sim(read)
+  sim.answers_prompt = False  # no lamp until it stands (stand_lit)
   while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
     drive(sim, DT_MDL)
     assert sim.t < 60.
+  sim.answers_prompt = True
   attach_planner(sim, launching)
   plans = []
   for _ in range(round(20. / DT_MDL)):
@@ -1203,6 +1239,7 @@ def test_a_left_with_the_cameras_red_at_an_unmapped_signal_is_never_gone_nor_lif
   assert sim.s - s_hold < 0.1 and str(plans[-1].unprotectedLeft.state) == 'waitGap'
 
 
+@pytest.mark.usefixtures('left_window_from_its_stand')  # its harness needs the stand's own window (conftest)
 def test_the_lefts_lift_stays_where_no_signal_is_and_a_signalized_left_goes_from_the_mouth_with_the_model():
   """The lift is unchanged where there is no signal at all. Drive 29 (2026-11-08): at a mapped signal on an accepted source's
   green the left goes from the junction's mouth (SIGNAL_LEFT_HOLD_M), too near the oncoming lanes for the lift's nudge
@@ -1247,9 +1284,11 @@ def test_a_left_the_model_waits_on_without_stopping_goes_and_the_model_follows_i
       return moving_from_rest(sim)
     return model_v2(*sim.model_lanes, holds=True, should_stop=False, **sim.model_kw)  # standing, no stop of its own
   sim = signal_sim(oracle=False) if mapped else unmapped_camera_sim(lambda t: 'unknown')
+  sim.answers_prompt = False  # no lamp until it stands (stand_lit)
   while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
     run_objects(sim, DT_MDL)
     assert sim.t < 60.
+  sim.answers_prompt = True
   assert sim.tp.left_lift_refused(sim.tp.follower.distance) != ''  # never lifted there
   attach_planner(sim, model)
   plans = run_objects(sim, 20.)
@@ -1259,9 +1298,11 @@ def test_a_left_the_model_waits_on_without_stopping_goes_and_the_model_follows_i
   assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
   # the model stopping (a red it sees) still holds it: never a go
   sim = signal_sim(oracle=False) if mapped else unmapped_camera_sim(lambda t: 'unknown')
+  sim.answers_prompt = False  # no lamp until it stands (stand_lit)
   while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
     run_objects(sim, DT_MDL)
     assert sim.t < 60.
+  sim.answers_prompt = True
   attach_planner(sim, holding)
   plans = run_objects(sim, 20.)
   assert not any(p.desire == Desire.turnLeft for p in plans)

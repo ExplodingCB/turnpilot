@@ -1,4 +1,5 @@
 """The detector comes back: after slow runs, after failures, after TurnPilot is turned on mid-drive, after a model fallback."""
+import sys
 import time
 from collections import deque
 
@@ -422,11 +423,33 @@ class TestCarTimeBudget:
     assert max(debts) <= modeld_detector.DEBT_CAP_S + jitter_s + 1e-9
 
   def test_a_slower_host_backs_off_to_forced_runs(self, monkeypatch):
-    # a 45 ms driving model (modeld's measured time): the full pass would leave 11 ms of debt, past DEBT_CAP_S, so only the
-    # forced runs, every FORCE_RUN_FRAMES, each paid back by the frames after it
+    # a 45 ms driving model (modeld's measured time): the full pass would leave 11 ms of debt, past DEBT_CAP_S but inside
+    # FORCE_SKIP_LATE_S, so forced runs, each as soon as the last one's debt is paid back (2 ms a frame), never
+    # FORCE_RUN_FRAMES apart
     det, clock = car_detector(monkeypatch, 0.0026)
     pm, ran, debts = car_drive(det, clock, 400, 0.045)
     gaps = gaps_of(ran)
-    assert gaps and set(gaps) == {FORCE_RUN_FRAMES}
+    assert gaps and set(gaps) == {7}
     at = [k for k, r in enumerate(ran) if r]
-    assert max(debts) < modeld_detector.CYCLE_S and all(min(debts[a:b]) == 0. for a, b in zip(at, at[1:], strict=False))
+    assert max(debts) <= modeld_detector.FORCE_SKIP_LATE_S and \
+      all(min(debts[a:b]) == 0. for a, b in zip(at, at[1:], strict=False))
+
+  def test_a_full_pass_a_little_too_slow_skips_one_due_run_never_more(self, monkeypatch):
+    # route 29: 'no room for 0.79 s at 21 ms, model 39, debt 0' three times in a row, 0.8 s gaps in the scene. A full pass
+    # that would make its step 10 ms late (no frame dropped) runs on every second due frame, the debt paid back between
+    monkeypatch.setattr(sys.modules[__name__], 'CAR_DET_S', 0.018)
+    det, clock = car_detector(monkeypatch, 0.0026)
+    pm, ran, debts = car_drive(det, clock, 400, CAR_MODEL_S)
+    gaps = gaps_of(ran)
+    assert gaps and set(gaps[1:]) == {modeld_detector.FORCE_SKIP_FRAMES} and gaps[0] <= modeld_detector.FORCE_SKIP_FRAMES
+    assert modeld_detector.FORCE_SKIP_FRAMES == 2 * RUN_EVERY  # one due run skipped
+    at = [k for k, r in enumerate(ran) if r]
+    assert max(debts) <= modeld_detector.FORCE_SKIP_LATE_S and \
+      all(min(debts[a:b]) == 0. for a, b in zip(at, at[1:], strict=False))
+
+  def test_a_full_pass_too_slow_to_skip_one_keeps_the_long_wait(self, monkeypatch):
+    # a run that would make its step later than a third of a frame keeps FORCE_RUN_FRAMES between forced runs
+    monkeypatch.setattr(sys.modules[__name__], 'CAR_DET_S', 0.030)
+    det, clock = car_detector(monkeypatch, 0.0026)
+    pm, ran, debts = car_drive(det, clock, 400, CAR_MODEL_S)
+    assert set(gaps_of(ran)) == {FORCE_RUN_FRAMES}

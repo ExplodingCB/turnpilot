@@ -5,11 +5,12 @@ import pytest
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot.hooks import ABORT_HOLD_S, SPEED_CAP_ACCEL_MIN, plan_accel
-from openpilot.selfdrive.turnpilot.map_controls import (CAMERA_GREEN_STEADY_S, COMMIT_SPEED, DRIVEN_THROUGH_M, STOP_SIGN_HANDBACK_S,
-                                                         GREEN_STEADY_S, LIGHT_STALE_S, MAP_DECEL_MAX, NO_LIGHTS,
-                                                         OFF_ROUTE_DRIVE_REASON, OFF_ROUTE_DRIVE_SPEED,
-                                                         OFF_ROUTE_REASON, OFF_ROUTE_SPEED, T_LAT, UNPROTECTED, YIELD_SPEED, CameraLights,
-                                                         Lights, MapControlPolicy, StopCommand, engage_distance, light_input, unprotected_turn)
+from openpilot.selfdrive.turnpilot.map_controls import (CAMERA_GREEN_STEADY_S, COMMIT_SPEED, DRIVEN_PROMPT, DRIVEN_THROUGH_M,
+                                                        GREEN_STEADY_S, LEFT_LINE_M, LIGHT_STALE_S, MAP_DECEL_MAX, NO_LIGHTS,
+                                                        OFF_ROUTE_DRIVE_REASON, OFF_ROUTE_REASON, OFF_ROUTE_SPEED, OVERRUN_PAST_M,
+                                                        RED_DECEL, RED_PAST_M, STOP_SIGN_HANDBACK_S, T_LAT, UNPROTECTED, YIELD_SPEED,
+                                                        CameraLights, LeftCommand, Lights, MapControlPolicy, StopCommand, engage_distance,
+                                                        light_input, red_stop_fits, unprotected_turn)
 from openpilot.selfdrive.turnpilot.route_follower import make_maneuver
 from openpilot.selfdrive.turnpilot.scene_policy import HOLD_LINE_M, NO_ACCEL_CAP, ScenePolicy, decide
 from openpilot.selfdrive.turnpilot.tests.synthetic import nav_instruction
@@ -31,6 +32,7 @@ class Car:
     self.lead_stop: float | None = None  # a lead stopped here: the car stops 0.5 m short of it
     self.turn: tuple | None = None  # (s of the junction, maneuver id, 'left'): a far-side turn there, unprotected-shaped
     self.junction: tuple | None = None  # (s of the junction, maneuver id): the route's turn there, any side (update()'s junction)
+    self.right = None  # that turn is a curb-side one in hand: its way clear now (bool, or a function of the car), update()'s right
     self.off_route = None  # off the route (nav_valid False): navd's lookup ahead, [(s, kind)], or None for none (no destination)
     self.off_status = 'ok'
     self.rows = []
@@ -56,6 +58,9 @@ class Car:
     turn = None if self.turn is None else (self.turn[1], self.turn[0] - self.s, self.turn[2])
     if self.junction is not None:
       kw.setdefault('junction', (self.junction[1], self.junction[0] - self.s))
+      if self.right is not None:
+        clear = self.right(self) if callable(self.right) else self.right
+        kw.setdefault('right', (self.junction[1], bool(clear), '' if clear else "Right on red: waiting for cross traffic"))
     out = self.policy.update(self.nav() if due else None, due, self.nav_valid, self.v, gas, lights, DT_MDL, turn=turn, **kw)
     dec = decide(out.stops, self.v)
     dec.accel_cap = self.scene.ramp(dec.accel_cap, DT_MDL)
@@ -368,7 +373,7 @@ def test_a_red_crossed_faster_than_commit_speed_is_still_the_cars_going():
   car = Car([(200., 'signal')], v=6., cruise=6.)
   car.s = 150.
   car.run_until(lambda out, dec: out.stops, lights=oracle('red'))
-  car.run_until(lambda out, dec: car.s > 203., max_s=40., lights=oracle('red'), accel=0., engaged=True)
+  car.run_until(lambda out, dec: car.s > 200. + RED_PAST_M + 3., max_s=40., lights=oracle('red'), accel=0., engaged=True)
   alerts = [car.step(lights=oracle('red'))[0].alert for _ in range(20)]
   out, dec, _ = car.step(lights=oracle('red'))
   assert 'stopOverrun' in alerts and not out.stops and car.v > 5.
@@ -948,42 +953,32 @@ class LimitCar(Car):
     return b.as_reader()
 
 
-@pytest.mark.parametrize("limit, floor", [(0., OFF_ROUTE_DRIVE_SPEED), (8.9, 8.9), (20., OFF_ROUTE_DRIVE_SPEED)])
-def test_off_route_under_always_drive_the_cap_is_25_mph_or_the_last_limit_and_it_keeps_saying_so(limit, floor):
-  """ALWAYS_DRIVE.md R17 (S3), under TurnPilotAlwaysDrive: off the route with the stops ahead unknown the cap comes down to
-  11.2 m/s (25 mph), or to the last valid navInstruction.speedLimit before the route was lost where that is lower (none, 0,
-  is unknown), not to 5 m/s: the crawl that makes the driver take over. Said once at onset (offRouteStopsUnknown, held
-  ABORT_HOLD_S), then a status line (mapControlsUnavailable) for as long as it lasts; the words still say the map stops are
-  unknown and the car won't stop for signs or signals there, and no longer say take control. Never braked harder than the
-  gentle ramp, never a stop."""
+@pytest.mark.parametrize("limit", [0., 8.9, 20.])
+def test_off_route_under_always_drive_nothing_is_capped_and_one_quiet_line_says_so(limit):
+  """Under TurnPilotAlwaysDrive, off the route with the stops ahead unknown (no GPS fix yet, a reroute running, the start
+  heading unchecked: 146 s of the 11-06 drive and 32 s of the 11-08 one), the car drives on uncapped as stock openpilot does:
+  a 25 mph cap on whatever road it is on, with offRouteStopsUnknown's chime at each onset, is a limit for "can't know". One
+  status line with no sound (mapControlsUnavailableSilent) says the map stops are unknown, never take control; a stop that is
+  known (a held latch, a lookup's control) still stops the car."""
   car = LimitCar([(400., 'signal')], v=15.)
   car.policy.always_drive = True
   car.speed_limit = limit
   car.run(2.)
   car.nav_valid, car.off_route, car.off_status = False, [], 'failed'
-  car.speed_limit = 30.  # off the route navd's messages are invalid: whatever they carry is no limit
   out, dec, _ = car.run(1.)
   assert out.alert == 'none'  # the grace, as with the switch off
-  onset = car.run_until(lambda out, dec: out.alert != 'none', max_s=3.)[0]
-  assert onset.alert == 'offRouteStopsUnknown' and onset.reason == OFF_ROUTE_DRIVE_REASON
+  car.run_until(lambda out, dec: out.alert != 'none', max_s=3.)
   start = len(car.rows)
   car.run(25.)
-  alerts = [r[5].alert for r in car.rows[start - 1:]]
-  said = alerts.index('mapControlsUnavailable')
-  assert abs(said * DT_MDL - ABORT_HOLD_S) <= 2 * DT_MDL and set(alerts[:said]) == {'offRouteStopsUnknown'}
-  assert set(alerts[said:]) == {'mapControlsUnavailable'}  # the status line from then on: no second onset
-  reasons = {r[5].reason for r in car.rows[start:]}
-  assert reasons == {OFF_ROUTE_DRIVE_REASON}
-  assert 'map stops unknown' in OFF_ROUTE_DRIVE_REASON.lower() and "won't stop for signs or signals" in OFF_ROUTE_DRIVE_REASON
-  assert 'take control' not in OFF_ROUTE_DRIVE_REASON.lower()
-  assert OFF_ROUTE_DRIVE_REASON in [s.reason for s in car.rows[-1][5].stops]
-  assert abs(car.v - floor) < 0.3, (limit, car.v)
-  assert min(r[2] for r in car.rows[start:]) > floor - 0.3 and not any(r[4].should_stop for r in car.rows)
-  assert all(r[3] >= -1.0 - 1e-6 for r in car.rows)
-  car.nav_valid = True  # rerouted: nothing off the route, the cap gone
+  assert {r[5].alert for r in car.rows[start - 1:]} == {'mapControlsUnavailableSilent'}  # no chime, at onset or after
+  assert {r[5].reason for r in car.rows[start:]} == {OFF_ROUTE_DRIVE_REASON}
+  assert 'map stops unknown' in OFF_ROUTE_DRIVE_REASON.lower() and 'take control' not in OFF_ROUTE_DRIVE_REASON.lower()
+  assert not any(r[5].stops for r in car.rows) and not any(r[4].should_stop for r in car.rows)  # no cap, no stop
+  assert abs(car.v - 15.) < 0.1 and min(r[2] for r in car.rows) > 14.9
+  car.nav_valid = True  # rerouted: nothing off the route
   car.speed_limit = limit
   out, dec, _ = car.run(1.5)
-  assert out.alert == 'none' and not any(s.reason == OFF_ROUTE_DRIVE_REASON for s in out.stops)
+  assert out.alert == 'none' and out.reason == ''
   # the switch off: 5 m/s, offRouteStopsUnknown for as long as it lasts, the take-control words
   car = LimitCar([(400., 'signal')], v=15.)
   car.speed_limit = limit
@@ -1028,13 +1023,35 @@ def test_a_red_seen_inside_the_engage_distance_stops_on_a_seeded_curve():
   assert -2. < 260. - car.s < 5.
 
 
-def test_a_red_too_close_to_stop_for_gently_brakes_at_minus_2_and_says_so():
-  car = Car([(250., 'signal')])
-  car.run_until(lambda out, dec: car.s > 220.)
+def test_a_red_read_late_is_stopped_for_firmly_over_its_line_or_gone_through_and_said():
+  # route 29's late red: first read 16 m from its line at 8.9 m/s. At the -2.0 floor the car crossed the line at 3.2 m/s,
+  # the stop was dropped (stopOverrun) and nothing held it at the red. At a red's own floor it stands by the line, held
+  car = Car([(250., 'signal')], v=8.9, cruise=8.9)
+  car.run_until(lambda out, dec: car.s > 234.)
+  out, dec = car.run_until(held, lights=oracle('red'))
+  assert held(out, dec) and 250. - 1. < car.s < 250. + RED_PAST_M
+  assert -RED_DECEL - 1e-6 <= min(r[3] for r in car.rows) < MAP_DECEL_MAX
+  assert not {r[5].alert for r in car.rows} & {'stopOverrun', 'cannotStopComfortably'}
+  # read where no stop short of the crossing lanes is left (10 m out at 13 m/s): through it, said, never braked at
+  car = Car([(250., 'signal')], v=13., cruise=13.)
+  car.run_until(lambda out, dec: car.s > 240.)
+  assert not red_stop_fits(car.v, 250. - car.s)
   out, dec, _ = car.step(lights=oracle('red'))
-  assert out.alert == 'cannotStopComfortably' and out.stops
-  car.run(4., lights=oracle('red'))
-  assert all(r[3] >= MAP_DECEL_MAX - 1e-6 for r in car.rows)
+  assert out.alert == 'cannotStopComfortably' and not out.stops
+  out, dec, _ = car.run(0.5, lights=oracle('red'))
+  assert not out.stops and car.v > 12. and car.policy.signal_went(250. - car.s)
+
+
+def test_a_late_red_the_car_stops_at_after_all_is_held_there():
+  # gone through on a red read too late, then slowed to a crawl just over the line (the driver's brake, the model's own):
+  # the car didn't go, and the red still read holds it where it stands
+  car = Car([(250., 'signal')], v=13., cruise=13.)
+  car.run_until(lambda out, dec: car.s > 240.)
+  car.step(lights=oracle('red'))
+  car.run_until(lambda out, dec: car.v < 0.2, lights=oracle('red'), accel=-8., engaged=False)
+  assert 250. < car.s < 250. + RED_PAST_M
+  out, dec, _ = car.run(1., lights=oracle('red'), engaged=True)
+  assert held(out, dec) and car.v < 0.1
 
 
 def test_yellow_decel_param_never_takes_a_light_stop_past_minus_2():
@@ -2065,3 +2082,27 @@ def test_the_map_stops_status_chimes_once_a_status_and_again_only_worse_under_al
   assert 'mapControlsUnavailable' in alerts_for(car, 4.)
   off = Car([], status='partial')
   assert set(alerts_for(off, 20.)) == {'mapControlsUnavailable'}
+
+
+@pytest.mark.parametrize("kind", ['stop', 'left'])
+def test_a_stop_driven_past_at_speed_under_the_drivers_foot_is_gone_while_the_foot_is_still_down(kind):
+  """Route 29 (2026-11-08): the driver drove three held lefts under the gas, and the turn's stop stayed in the plan (speed
+  cap 0, accel cap -2.0, "Unprotected left ahead") for 6-8 s, 52-78 m past the junction, until navd's maneuver moved on: it
+  was dropped only when the gas lifted. Past its line by OVERRUN_PAST_M faster than COMMIT_SPEED the driver went: the stop
+  is gone on that frame, its crossing said as any line crossed with no go."""
+  car = Car([(250., 'stop')] if kind == 'stop' else [], v=9., cruise=9.)
+  kw = {}
+  if kind == 'left':
+    car.turn = (250. + LEFT_LINE_M, 3, 'left')  # its hold line at 250
+    kw = {'left': LeftCommand('auto')}
+  car.run_until(lambda out, dec: out.stops and car.s > 235., **kw)
+  seen = []
+  while car.s < 250. + 60.:
+    out, dec, _ = car.step(gas=True, accel=1.0, **kw)
+    seen.append((car.s, out))
+  assert car.v > 9.
+  assert all(not o.stops for s, o in seen if s > 250. + OVERRUN_PAST_M + 1.), [round(s, 1) for s, o in seen if o.stops][-1]
+  assert any(o.stops for s, o in seen if s < 250.)  # under the gas short of the line it is still a stop ahead
+  assert any(o.prompt in DRIVEN_PROMPT.values() for s, o in seen)  # crossed with no go: said
+  out, dec, _ = car.run(1.0, **kw)  # the gas lifted, openpilot engaged: nothing brakes the car
+  assert not out.stops and car.v > 8.5 and out.alert != 'stopOverrun'

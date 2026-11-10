@@ -441,9 +441,34 @@ def test_held_short_of_its_line_it_rolls_up_before_judging_the_reach():
   assert any(x.go for x in j.decisions) and not any(x.state == 'undecided' for x in j.decisions)
 
 
+def test_the_window_counts_on_the_approach_and_a_clear_roll_in_goes_as_the_car_reaches_its_line():
+  # as shipped (WINDOW_FROM_APPROACH): the band clear on every road run of the last CLEAR_WINDOW_S of the roll-in, the left
+  # goes on the frame it is held at its line, never a CLEAR_WINDOW_S stand at an empty road
+  j = Junction()
+  j.held = False
+  j.wait(CLEAR_WINDOW_S + 1., distance=30., v=5.)
+  j.held = True
+  d = j.step(distance=HOLD_D, v=0.)
+  assert d.go and d.clear_s >= CLEAR_WINDOW_S
+  # a car seen in the band on the roll-in (closing: nearer run by run) starts the window over: no go at the line until the
+  # band has been clear a whole window after it
+  j = Junction()
+  j.held = False
+  for k in range(int(3. / DT_MDL)):
+    j.step([raw(120. - 15. * k * DT_MDL, 3.6)], distance=30., v=5.)
+  j.held = True
+  d = j.step([raw(74., 3.6)], distance=HOLD_D, v=0.)
+  assert not d.go and d.clear_s == 0.
+  j.wait(CLEAR_WINDOW_S - 0.2, distance=HOLD_D)
+  assert not any(x.go for x in j.decisions)
+  j.wait(0.4, distance=HOLD_D)
+  assert any(x.go for x in j.decisions)
+
+
+@pytest.mark.usefixtures('left_window_from_its_stand')
 def test_the_window_starts_at_the_hold_line():
-  # DESIGN's flow is hold, then judge: the clear window the approach ran up never carries into the hold, so the car stands
-  # at its line CLEAR_WINDOW_S at least before a go, never going on the frame it latches
+  # the stand-and-judge path (WINDOW_FROM_APPROACH False, the public build's): the clear window the approach ran up never
+  # carries into the hold, so the car stands at its line CLEAR_WINDOW_S at least before a go, never going on the frame it latches
   j = Junction()
   j.held = False
   j.wait(CLEAR_WINDOW_S + 1., distance=30., v=5.)
@@ -740,31 +765,31 @@ def test_held_short_of_its_line_under_a_red_it_waits_where_it_is():
 
 # ------------------------------------------------------------------- the turn signal (car_signals.py, DESIGN phase4/blinker 6.7)
 
-def test_no_go_and_no_creep_without_the_signal_and_it_waits_for_it_never_handed_back(log_events):
-  """The left goes only with its side lit (LEFT_GO_NEEDS_SIGNAL: IC 9-21-8-25, and a car standing dark in a left-turn position
-  invites a pass into its path). On this car only the driver can light it, prompted per side on repeat (car_signals.py).
-  Until 2026-11-07 the left handed back after LEFT_SIGNAL_WAIT_S dark ('unsignalled'); now it waits at its line saying so,
-  logged once, never gone unsignalled however long, and goes on a gap once lit."""
+def test_the_go_waits_a_few_seconds_for_the_signal_then_goes_on_its_gap(log_events):
+  """The left's go waits for a lamp on its side (LEFT_GO_NEEDS_SIGNAL), prompted per side on repeat (car_signals.py), but only
+  LEFT_SIGNAL_WAIT_S at its line: then it goes on its gap, said once, never an unbounded stand for a lamp only the driver
+  can light. The window counts while it waits, so a lamp lit in time goes at once. (The public build: never unsignalled.)"""
   from openpilot.selfdrive.turnpilot.unprotected_left import LEFT_SIGNAL_WAIT_S, NO_SIGNAL_REASON
+  assert LEFT_SIGNAL_WAIT_S <= 3.
   j = Junction()
-  d = j.wait(CLEAR_WINDOW_S + 1., signal_lit=False)
-  assert not any(x.go for x in j.decisions) and d.state == 'waitGap' and d.reason == NO_SIGNAL_REASON and d.creep_m == 0.
-  d = j.wait(LEFT_SIGNAL_WAIT_S + 120., signal_lit=False)
+  d = j.wait(LEFT_SIGNAL_WAIT_S - 0.2, signal_lit=False)
   # its own prompt stands aside for car_signals' "Signal LEFT Now" and its chime (the module's no_signal comment)
-  assert d.state == 'waitGap' and d.prompt == 'none' and d.reason == NO_SIGNAL_REASON
-  assert not any(x.go or x.state == 'undecided' or x.prompt in TAKE_CONTROL_PROMPTS for x in j.decisions)
+  assert not any(x.go for x in j.decisions) and d.state == 'waitGap' and d.prompt == 'none' and d.reason == NO_SIGNAL_REASON
+  assert d.clear_s >= CLEAR_WINDOW_S  # the window counted meanwhile
+  j.wait(0.4, signal_lit=False)
+  assert any(x.go for x in j.decisions) and not any(x.state == 'undecided' or x.prompt in TAKE_CONTROL_PROMPTS for x in j.decisions)
   said = [kw for name, kw in log_events if name == 'turnpilot.left_unsignalled']
   assert len(said) == 1 and abs(said[0]['unsignalled_s'] - LEFT_SIGNAL_WAIT_S) < 0.1, said
-  # lit at last: the window counts from the lamp, then it goes
-  n = len(j.decisions)
-  j.wait(CLEAR_WINDOW_S - 0.3, signal_lit=True)
-  assert not any(x.go for x in j.decisions[n:])
-  j.wait(0.5, signal_lit=True)
-  assert any(x.go for x in j.decisions[n:])
-  # lit: the window counts from the lamp, then it goes
+  # a car in the band still holds it past the lamp's wait
   j = Junction()
-  j.wait(2., signal_lit=False)
-  j.wait(CLEAR_WINDOW_S + 0.2, signal_lit=True)
+  for _ in range(int((LEFT_SIGNAL_WAIT_S + 5.) / DT_MDL)):
+    j.step([raw(60., 3.6)], signal_lit=False)
+  assert not any(x.go for x in j.decisions)
+  # lit before the wait is out: it goes on the window it already has
+  j = Junction()
+  j.wait(CLEAR_WINDOW_S, signal_lit=False)
+  assert not any(x.go for x in j.decisions)
+  j.wait(2 * DT_MDL, signal_lit=True)
   assert any(x.go for x in j.decisions)
 
 
@@ -1588,3 +1613,65 @@ def test_a_red_read_with_the_car_at_its_line_still_holds_it_there():
   j.step(line_m=ONCOMING_ENTRY_M + 2., light='red')
   d = j.wait(10., distance=ONCOMING_ENTRY_M + 2., line_m=ONCOMING_ENTRY_M + 2., light='red')
   assert not d.clearing and not any(x.go for x in j.decisions)
+
+
+# ------------------------------------------------------------------- RawBox.motion (scene/tracker.py BoxMotion): what is no traffic
+
+def moving(box, motion):
+  return dataclasses.replace(box, motion=motion)
+
+
+def test_a_box_going_away_or_standing_outside_the_opposing_lanes_is_no_oncoming_car():
+  """Drive 29, a held left (seg 7): two cars parked at the far-left curb 40-70 m up and our own direction's car ahead were
+  far-crop band blockers on every far run for 30 s. A box the tracker says is receding never blocks; one standing blocks
+  unless it is wholly beyond the opposing lanes' far edge (one opposing lane: 5.4 m to the turn side) or wholly on our side
+  of the car's centre line. Unknown and closing boxes block wherever they are."""
+  far_curb, ahead, oncoming_lane = raw(60., 7.5), raw(110., -2.8), raw(60., 3.6)
+  for box in (far_curb, ahead, oncoming_lane):
+    for motion in ('unknown', 'closing'):
+      assert band_blockers([moving(box, motion)], 0., LEFT, math.inf, HOLD_D, lanes=1), (box.xy, motion)
+    assert not band_blockers([moving(box, 'receding')], 0., LEFT, math.inf, HOLD_D, lanes=1), box.xy
+  assert not band_blockers([moving(far_curb, 'standing')], 0., LEFT, math.inf, HOLD_D, lanes=1)
+  assert not band_blockers([moving(ahead, 'standing')], 0., LEFT, math.inf, HOLD_D, lanes=1)
+  # standing in the opposing lanes (a queue at its light, about to launch): it blocks
+  assert band_blockers([moving(oncoming_lane, 'standing')], 0., LEFT, math.inf, HOLD_D, lanes=1)
+  # two opposing lanes (9 m): 7.5 m out is their outer lane, where a standing car blocks; unmapped lanes count as two
+  assert band_blockers([moving(far_curb, 'standing')], 0., LEFT, math.inf, HOLD_D, lanes=2)
+  assert band_blockers([moving(far_curb, 'standing')], 0., LEFT, math.inf, HOLD_D)
+  # unranged, it can't be placed outside the lanes: it blocks
+  assert band_blockers([moving(raw(60., 7.5, ranged=False), 'standing')], 0., LEFT, math.inf, HOLD_D, lanes=1)
+
+
+def test_the_held_left_goes_past_parked_and_departing_far_boxes_and_is_held_by_one_closing():
+  """The decider on the same scene: a far crop needed (45 mph), far boxes standing at the far curb and receding up the road
+  on every far run. The left goes on its window. The same boxes with no verdict (unknown), or one of them closing, hold it."""
+  parked = [moving(raw(60., 7.5), 'standing'), moving(raw(45., 7.6), 'standing'), moving(raw(115., -2.8), 'receding')]
+  j = Junction(v_limit=V_45)
+  assert far_wait(j, CLEAR_WINDOW_S + 1., far=parked, far_range_m=300., far_live=True).go
+  j = Junction(v_limit=V_45)
+  d = far_wait(j, CLEAR_WINDOW_S + 3., far=[moving(b, 'unknown') for b in parked], far_range_m=300., far_live=True)
+  assert not d.go and d.clear_s == 0. and d.far_blockers == 3
+  j = Junction(v_limit=V_45)
+  d = far_wait(j, CLEAR_WINDOW_S + 3., far=parked[:2] + [moving(raw(200., 3.6), 'closing')], far_range_m=300., far_live=True)
+  assert not d.go and d.clear_s == 0. and d.far_blockers == 1
+
+
+def test_a_car_standing_then_launching_blocks_again_inside_the_windows_freshness():
+  """Through the tracker's own BoxMotion (scene/tests/test_box_motion.py's runs: the full pass and the far crop alternating,
+  pixel noise). A car standing in the opposing lanes blocks on every run, standing or launching: a queue at its light is
+  never cleared, whatever the verdict's lag. One standing beyond them (the far curb) is exempt while it stands and blocks
+  again within 2 s of pulling out toward the car: a go given in those 2 s is caught by the band's re-check on every road
+  run while the car can still stop (_after_go), as any car that appears after a go is."""
+  from openpilot.selfdrive.turnpilot.scene.tests import test_box_motion as bm
+  for y, exempt_standing in ((5., False), (8.5, True)):
+    for seed in range(3):
+      tracker, cal = bm.SceneTracker(bm.CAMS, 'mici'), bm.calibration()
+      seen = bm.drive(tracker, cal, lambda t, y=y: (bm.launch_after_stand(t)[0], y), seconds=6., noise_px=0.5, seed=seed)
+      blocks = [(t - 100., bool(band_blockers([b], 0., LEFT, math.inf, HOLD_D, lanes=1)), b.motion) for t, b in seen]
+      if not exempt_standing:
+        assert all(blk for _, blk, _ in blocks), (y, seed, [x for x in blocks if not x[1]])
+        continue
+      assert any(not blk for t, blk, _ in blocks if 1.5 < t < 3.), (y, seed)  # exempt once it reads standing
+      again = next(t for t, blk, _ in blocks if t > 3. and blk)
+      assert again - 3. <= 2.0, (y, seed, again)
+      assert all(blk for t, blk, _ in blocks if t >= again), (y, seed)

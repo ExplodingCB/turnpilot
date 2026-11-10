@@ -30,12 +30,12 @@ STEPS = [{'distance': 400., 'duration': 60.}, {'distance': 600., 'duration': 90.
 WHEN = {'day': ETA, 'night': NIGHT}
 
 
-def stop(n, route_m, mph=25, maneuver='straight', divided=False, left=1, right=1):
+def stop(n, route_m, mph=25, maneuver='straight', divided=False, left=1, right=1, rail=-1.):
   """A stop on the shipped files as the car meets it: no survey, the map's tiers (an all-way), each approach mph; the exit leg
   by the maneuver; left (right) lanes each way on the cross road's left (right) leg."""
   exit_role = {'straight': 'opposite', 'right': 'right', 'left': 'left'}[maneuver]
   legs = [(270., -90., 'left', 11, left), (90., 90., 'right', 12, right), (0., 0., 'opposite', 13, 1)]
-  info = Junction(osm_node_id=NODE + n, lat=LAT, lon=LON, stop_point_distance=13., rail_distance=-1., surveyed=False, sidecar=True,
+  info = Junction(osm_node_id=NODE + n, lat=LAT, lon=LON, stop_point_distance=13., rail_distance=rail, surveyed=False, sidecar=True,
                   divided=divided, maneuver=maneuver, approaches=[
                     Approach(b, rel, 'exit' if role == exit_role else role, 'residential', 'road', True, True, lanes, lanes, 'stop', 'stop',
                              'mapStrong', mph * MPH, mph * MPH, 'tagged', way) for b, rel, role, way, lanes in legs])
@@ -98,44 +98,38 @@ def test_a_right_whose_far_lane_the_line_walks_as_its_cross_movement_certifies_a
 
 @pytest.mark.parametrize('when', list(WHEN))
 @pytest.mark.parametrize('maneuver', ['straight', 'right'])
-def test_a_stop_the_line_is_short_at_too_is_routed_round_under_vision_and_said_when_it_cant_be(maneuver, when):
-  # review of the 11-06 repairs: a 25 mph stop on a cross road of 2 lanes each way is 'reach' at route time on the lanes the
-  # line walks (the near lane 17.2 of 37.6 m), and at the line it waits, creeps and hands back 15 s after the full stop, day
-  # or night (tests/test_turnpilotd_stop_night.py). A rule that kept every vision 'reach' stop on the route left it there
-  # unannounced (no reroute, nothing said, then the handback): it is routed round as by day...
-  a = stop(1, 250., maneuver=maneuver, left=2, right=2)
-  r, router = run([a], WHEN[when])
-  assert (a.certification, a.cert_reason) == ('uncertifiable', 'reach') and 'left lane 1 cross' in a.junction_info.cert_detail
-  assert len(router.calls) == 1 and (r.avoided, r.status) == (1, 'clean') and r.controls == []
-  assert notices(r, {}) == [('routeAvoidsStops', "Route avoids 1 stop sign (+0 min)")]
-  # ...and when it can't be, it needs the driver and the driver is told, at route start and before it
+def test_a_stop_short_of_reach_on_the_route_time_walk_is_driven_never_routed_round_or_said(maneuver, when):
+  # a 25 mph stop on a cross road of 2 lanes each way is short on the lanes the line walks (the near lane 17.2 of 37.6 m). The
+  # line drives it all the same (the full stop, the creep for a view, the go on what the cameras see: stop_go._vision_gate
+  # hands back for no such thing), so it certifies, stays on the route and nothing is said, the short lanes in its detail
   a = stop(1, 250., maneuver=maneuver, left=2, right=2)
   r, router = run([a], WHEN[when], around=False)
-  assert len(router.calls) == 1 and a.certification == 'unavoidable'
-  out = notices(r, {1: 250.})
-  assert ('stopsNeedYou', "1 stop sign on this route needs you") in out and ('stopAheadNeedsYou', "Stop sign ahead needs you") in out
+  assert (a.certification, a.cert_reason) == ('certifiable', 'none') and 'left lane 1 cross' in a.junction_info.cert_detail
+  assert router.calls == [] and (r.avoided, r.status) == (0, 'clean')
+  assert notices(r, {1: 250.}) == []
 
 
-def test_what_vision_hands_back_at_its_line_is_still_routed_round_at_night_and_said_when_it_cant_be():
-  keep, divided = stop(1, 150.), stop(2, 300., divided=True)
-  r, router = run([keep, divided], NIGHT)
-  assert (divided.cert_reason, keep.certification) == ('geometry', 'certifiable')
+def test_only_what_vision_hands_back_at_its_line_is_routed_round_at_night_and_said_when_it_cant_be():
+  # a mapped rail crossing is the one junction the line hands back at; a divided cross road is driven
+  keep, divided, rail = stop(1, 150.), stop(2, 300., divided=True), stop(3, 350., rail=12.)
+  r, router = run([keep, divided, rail], NIGHT)
+  assert (rail.cert_reason, keep.certification, divided.certification) == ('geometry', 'certifiable', 'certifiable')
   assert len(router.calls) == 1 and len(router.calls[0]) == 1 and r.avoided == 1 and r.status == 'clean'
-  keep, divided = stop(1, 150.), stop(2, 250., divided=True)
-  r, router = run([keep, divided], NIGHT, around=False)
-  assert divided.certification == 'unavoidable' and keep.certification == 'certifiable'
-  out = notices(r, {1: 150., 2: 250.})
-  assert ('stopsNeedYou', "1 stop sign on this route needs you") in out and ('stopAheadNeedsYou', "Stop sign ahead needs you") in out
+  keep, divided, rail = stop(1, 150.), stop(2, 200., divided=True), stop(3, 250., rail=12.)
+  r, router = run([keep, divided, rail], NIGHT, around=False)
+  assert rail.certification == 'unavoidable' and keep.certification == divided.certification == 'certifiable'
+  out = notices(r, {1: 150., 2: 200., 3: 250.})
+  assert ('stopsNeedYou', "1 stop sign on this route needs you") in out
+  assert [k for k, _ in out].count('stopAheadNeedsYou') == 1
 
 
-def test_the_11_06_shape_at_night_the_rights_the_line_drives_stay_and_one_it_is_short_at_is_routed_round():
-  # 1e's kept stops were all rights at 25 mph stops; re-certified now, 2 of the 7 certify (a 1/1 right here, and one at 20 mph)
-  # and 5 are short at their line on a far or third cross lane (here 3 lanes from the left: its third lane short)
+def test_the_11_06_shape_at_night_every_stop_is_driven_none_routed_round_or_said():
+  # 1e's kept stops were all rights at 25 mph stops, 5 of the 7 short at their line on a far or third cross lane (here 3 lanes
+  # from the left: its third lane short). The line creeps for those and goes, so all stay on the route with nothing said
   stops = [stop(1, 200.), stop(2, 450., maneuver='right'), stop(3, 700., maneuver='right', mph=20),
            stop(4, 900., maneuver='right', left=3)]
   r, router = run(stops, NIGHT)
-  assert [c.certification for c in stops[:3]] == ['certifiable'] * 3
-  assert stops[3].cert_reason == 'reach' and 'left lane 3 cross' in stops[3].junction_info.cert_detail
-  assert len(router.calls) == 1 and [round(p['lat'], 6) for p in router.calls[0]] == [0.0004] and r.avoided == 1
-  assert r.status == 'clean' and not any(c.certification == 'unavoidable' for c in r.controls)
-  assert notices(r, {1: 200., 2: 450., 3: 700.}) == [('routeAvoidsStops', "Route avoids 1 stop sign (+0 min)")]
+  assert [c.certification for c in stops] == ['certifiable'] * 4
+  assert 'left lane 3 cross' in stops[3].junction_info.cert_detail
+  assert router.calls == [] and r.avoided == 0 and r.status == 'clean'
+  assert notices(r, {1: 200., 2: 450., 3: 700., 4: 900.}) == []

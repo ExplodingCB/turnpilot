@@ -28,8 +28,11 @@ def nav(route=1, status='clean', avoided=0, added=0., remaining=600., controls=(
     c.id, c.kind, c.distance = spec[0], spec[1], spec[2]
     c.junctionInfo.status, c.junctionInfo.certification = 'ok', spec[3]
     c.junctionInfo.osmNodeId = spec[4] if len(spec) > 4 else 1000 + spec[0]
-    if len(spec) > 5:  # (lat, lon, certReason)
-      c.junctionInfo.lat, c.junctionInfo.lon, c.junctionInfo.certReason = spec[5]
+    c.junctionInfo.railDistance = -1.  # none mapped (navd always fills it)
+    if len(spec) > 5:  # (lat, lon, certReason[, railDistance])
+      c.junctionInfo.lat, c.junctionInfo.lon, c.junctionInfo.certReason = spec[5][:3]
+      if len(spec[5]) > 3:
+        c.junctionInfo.railDistance = spec[5][3]
   return msg.as_reader().navInstruction, valid
 
 
@@ -177,10 +180,10 @@ def test_a_notice_held_back_behind_another_alert_is_said_in_full_once_free_and_o
       assert 'stopAheadNeedsYou' in got
 
 
-def ahead_said(signal_at=None, vision=False, reason='skew', node=0, frames=None):
+def ahead_said(signal_at=None, vision=False, reason='skew', node=0, frames=None, rail=-1.):
   """The stop-ahead notices said for one unavoidable stop 250 m ahead (node 0: navd had no OSM node, keyed by position)."""
   rn = RouteNotices()
-  n = nav(controls=[(0, 'stop', 250., 'unavoidable', node, (40.0, -86.0, reason))])
+  n = nav(controls=[(0, 'stop', 250., 'unavoidable', node, (40.0, -86.0, reason, rail))])
   out = []
   for k in range(frames or round((AHEAD_M / 10.) / DT_MDL)):
     got = rn.update(n[0] if k % 20 == 0 else None, k % 20 == 0, True, 10., True, signal_at=signal_at, vision=vision)
@@ -213,12 +216,14 @@ def test_a_stop_at_a_junction_the_camera_saw_a_signal_at_is_never_said():
   assert 'stopAheadNeedsYou' not in heard
 
 
-@pytest.mark.parametrize('reason, vision, told', [('skew', True, True), ('geometry', True, True), ('override', True, True),
-                                                  ('reach', True, False), ('light', True, False), ('reach', False, True),
-                                                  ('notSurveyed', False, True)])
-def test_the_stop_ahead_notice_knows_the_mode(reason, vision, told):
-  """Under TurnPilotStopSignGo=vision a stop navd couldn't certify for reach or the light at the line is no handback (the line
-  waits, creeps for a view and goes on what it sees), so 'needs you' would tell the driver more than the car will ask: not
-  said. What vision still hands back (geometry, skew: route 29's junction, -21 deg; an unknown leg, an override) is said, and
-  under every other mode as before."""
-  assert bool(ahead_said(vision=vision, reason=reason, node=77)) == told
+@pytest.mark.parametrize('reason, rail, vision, told', [
+  ('skew', -1., True, False), ('geometry', -1., True, False), ('geometry', -2., True, False), ('override', -1., True, False),
+  ('unknownLeg', -1., True, False), ('reach', -1., True, False), ('light', -1., True, False),
+  ('geometry', 12., True, True), ('noTable', -1., True, True),
+  ('skew', -1., False, True), ('reach', -1., False, True), ('notSurveyed', -1., False, True)])
+def test_the_stop_ahead_notice_is_said_under_vision_only_for_a_stop_the_line_hands_back_at(reason, rail, vision, told):
+  """Under TurnPilotStopSignGo=vision the line drives every stop but one at a mapped rail crossing or with no visibility
+  file (stop_go._vision_gate), so 'needs you' for any other tells the driver more than the car will ask (route 29 at 124 s: a
+  skewed junction, driven): not said, whatever navd's certifier marked it for. The rule is the gate's own
+  (stop_rules.vision_needs_driver). Under every other mode an unavoidable stop is said as before."""
+  assert bool(ahead_said(vision=vision, reason=reason, node=77, rail=rail)) == told

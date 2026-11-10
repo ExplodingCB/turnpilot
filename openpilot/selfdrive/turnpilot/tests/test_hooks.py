@@ -389,3 +389,20 @@ def test_a_keep_followed_under_always_drive_is_a_status_line_and_its_reroute_tak
   assert events(**rerouted, handback='detectorStopped') == []
   # any other keep reason is the skip as today, at its own rank
   assert events(tooFastToTurn=True, skipReason='keepNoLine', controlPrompt='yieldAhead') == ['turnpilotTooFastToTurn']
+
+
+def test_the_driver_is_asked_to_signal_from_the_offers_first_frame():
+  """Where the driver signals a lane change, the offer said 'Lane Change Left in 3' for LC_WARN_S and only then asked for
+  the signal the change waits on: the ask, and its chime, 3 s late. Asked at once; the countdown is the car's own path's."""
+  def offered(prompt, countdown, lane_change='none'):
+    msg = messaging.new_message('turnpilotPlan')
+    p = msg.turnpilotPlan
+    p.laneChangeOffer, p.laneChangeCountdown, p.laneChange, p.signalPrompt = 'left', countdown, lane_change, prompt
+    return msg.as_reader().turnpilotPlan
+  assert lane_change_text(offered('left', 3.), 'left') == 'Signal LEFT to Change Lanes'
+  assert lane_change_text(offered('left', 0.), 'left') == 'Signal LEFT to Change Lanes'
+  # the driver's lamp lit, or the request out: nothing to ask
+  assert lane_change_text(offered('left', 2.), 'left', lit=True) == 'Lane Change Left in 2'
+  assert lane_change_text(offered('left', 0., 'left'), 'left', lit=True) == 'Changing Lanes Left Once Clear'
+  # the car signals this one: its countdown, as before
+  assert lane_change_text(offered('none', 2.2), 'left') == 'Lane Change Left in 3'

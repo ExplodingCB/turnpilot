@@ -274,11 +274,18 @@ TIME_WINDOW = 5            # the detector time estimate is the median of this ma
 # (a loaded host runs the driving model below 20 Hz), it runs anyway and the estimate starts over from that run: a burst
 # of slow runs under load can't keep it off once the load has gone. The wait never grows: turnpilotd hands back
 # DETECTOR_DEADLINE_S (1.5 s) after the last detections, so a forced run must land well inside (DETECTOR_DEADLINE_S -
-# STALE_S) of the one before; each may leave a debt past DEBT_CAP_S, one in 16 frames while nothing fits, which the frames
+# STALE_S) of the one before; each may leave a debt past DEBT_CAP_S, one in 16 frames while nothing fits (one in 4 where
+# it is only a little too slow: FORCE_SKIP_FRAMES), which the frames
 # after it pay back. A detector that can't run in time even so (a forced run itself too slow, failures) is a loud handback
 # in turnpilotd, never quietly off.
 FORCE_RUN_FRAMES = 16      # 0.8 s at 20 Hz
 FORCE_RUN_S = 0.8
+# A full pass a little too slow to fit (route 29: 21 ms beside a 39 ms model, 13 ms of lateness past STEP_BUDGET_S) ran only
+# every FORCE_RUN_S, 0.8 s gaps several in a row, the scene stale 0.3 s each. Where the run would make its step late by
+# FORCE_SKIP_LATE_S or less (a third of a frame: no frame dropped) and the last forced run's debt is paid back, it skips one
+# due run and runs on the next: FORCE_SKIP_FRAMES. Slower than that keeps FORCE_RUN_FRAMES.
+FORCE_SKIP_FRAMES = 2 * RUN_EVERY
+FORCE_SKIP_LATE_S = CYCLE_S / 3
 RETRY_S = 1.0              # a failed run is retried after this, doubled for each failure in a row...
 RETRY_MAX_S = 60.          # ...to this
 PARAM_CHECK_S = 1.0        # TurnPilotEnabled is read this often
@@ -731,7 +738,7 @@ class FarCrop:
     back to the warm-up's and a frame with room for that measures it again (said at most once in BUDGET_WARN_S)."""
     if self.wanted_t is None:
       self.wanted_t = now
-    if now - self.wanted_t >= FAR_FORCE_S and self.costs:
+    if now - self.wanted_t >= FAR_FORCE_S - 1e-9 and self.costs:  # monotonic()'s ~1e5 s magnitude rounds the difference
       ms = 1e3 * float(np.median(self.costs))
       self.costs.clear()
       self.wanted_t = now
@@ -1177,10 +1184,15 @@ class ModeldDetector:
     if self.far_first and cam != 'wide' and self.road_overdue(time.monotonic()):
       return True
     waited_s = time.monotonic() - self.last_run_t if self.last_run_t is not None else 0.
-    if self.since_run < FORCE_RUN_FRAMES and waited_s < FORCE_RUN_S:
+    # a run that would only make this step late by a third of a frame or less, the last one's debt paid back, skips one
+    # due run, never more (FORCE_SKIP_FRAMES)
+    skip_one = self.debt <= 0. and self.debt_after(model_execution_time, estimate) <= FORCE_SKIP_LATE_S
+    frames, wait_s = (FORCE_SKIP_FRAMES, FORCE_SKIP_FRAMES * CYCLE_S) if skip_one else (FORCE_RUN_FRAMES, FORCE_RUN_S)
+    if self.since_run < frames and waited_s < wait_s:
       return False
     model_ms, debt_ms = 1e3 * model_execution_time, 1e3 * self.debt
-    cloudlog.info(f"turnpilot detector: no room for {waited_s:.2f} s at {1e3 * estimate:.0f} ms, model {model_ms:.0f}, debt {debt_ms:.0f}; measuring again")
+    if not skip_one:  # the skip-one runs measure again too, every few frames: said only for the long wait
+      cloudlog.info(f"turnpilot detector: no room for {waited_s:.2f} s at {1e3 * estimate:.0f} ms, model {model_ms:.0f}, debt {debt_ms:.0f}; measuring again")
     self.times.clear()
     return True
 

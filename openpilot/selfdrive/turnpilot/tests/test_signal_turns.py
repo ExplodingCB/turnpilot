@@ -10,8 +10,10 @@ import pytest
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot import map_controls
 from openpilot.selfdrive.turnpilot.control_tracker import TrackedControl
-from openpilot.selfdrive.turnpilot.map_controls import (CAMERA_ASSOC_PAST_M, CAMERA_GREEN_STEADY_S, CAMERA_STALE_S, CONTROL_LINE_M,
-                                                         GREEN_STEADY_S, MAP_DECEL_MAX, NO_LIGHTS, OVERRUN_PAST_M,
+from openpilot.selfdrive.turnpilot.map_controls import (RIGHT_RED_CLEAR_S, RIGHT_RED_DWELL_S, RIGHT_RED_LOOKING_REASON,
+                                                         RIGHT_RED_UNREAD_S, RIGHT_RED_WAIT_REASON,
+                                                         CAMERA_ASSOC_PAST_M, CAMERA_GREEN_STEADY_S, CAMERA_STALE_S, CONTROL_LINE_M,
+                                                         GREEN_STEADY_S, MAP_DECEL_MAX, NO_LIGHTS, OVERRUN_PAST_M, RED_GONE_S,
                                                          PROTECT_BEFORE_M, SIGNAL_UNSEEN_REASON,
                                                          SIGNAL_UNSEEN_S, TURN_HEAD_GAP_S, TURN_UNSEEN_S, UNPROTECTED, CameraLights,
                                                          ControlState, LeftCommand, Lights)
@@ -53,8 +55,9 @@ def held_at(car, s_line, **kw):
 # --- the turn stops at the line unless a steady green is read first ---
 
 @pytest.mark.parametrize("light", [None, 'unknown'])
-def test_a_right_at_a_mapped_signal_with_no_light_read_goes_with_the_model(light):
-  # Kellen, 2026-11-07: a turn at a light is a through signal's: no stop for want of a green, no handback for an unread light
+def test_a_turn_at_a_mapped_signal_that_is_no_curb_side_turn_in_hand_goes_with_the_model_on_no_light_read(light):
+  # a turn at a light is a through signal's: no stop for want of a green, no handback for an unread light. Not a curb-side
+  # turn TurnPilot is taking (update()'s right: the right-on-red procedure, below)
   car = right_at_a_signal()
   kw = {} if light is None else {'lights': cam(light)}
   for _ in range(int(40. / DT_MDL)):
@@ -74,18 +77,70 @@ def test_a_right_at_a_mapped_signal_on_a_camera_red_holds_without_a_handback_whi
   for _ in range(int(60. / DT_MDL)):
     out, dec, _ = car.step(lights=cam('red'))
     assert held(out, dec) and out.prompt == 'none'
-  # the red lost (night, the reader blind): the red's stand, SIGNAL_UNSEEN_S, then said and still held for a green (until
-  # 2026-11-07 its handback, signalUnseenTakeControl), however long: a turn desire out is never let go on a red nobody saw end
-  out, dec, _ = car.run(SIGNAL_UNSEEN_S - 0.5, lights=cam('unknown'))
+  # the red no longer read (the light changed to a green the reader can't read, as most of route 29's night greens): held
+  # through a gap in its reads, let go RED_GONE_S after the last, never stood at a light nobody reads red
+  out, dec, _ = car.run(RED_GONE_S - 0.2, lights=cam('unknown'))
   assert held(out, dec) and out.prompt == 'none'
-  out, dec, _ = car.run(1., lights=cam('unknown'))
-  assert held(out, dec) and out.prompt == 'none' and out.stops[0].reason == SIGNAL_UNSEEN_REASON
-  for _ in range(int(90. / DT_MDL)):
-    out, dec, _ = car.step(lights=cam('unknown'))
-    assert held(out, dec) and out.prompt == 'none' and out.stops[0].reason == SIGNAL_UNSEEN_REASON
-  # the camera's steady green read at last: TurnPilot's own stop let go (the model's own hold, if any, its own)
-  out, dec, _ = car.run(CAMERA_GREEN_STEADY_S + 0.2, lights=cam('green'))
-  assert not held(out, dec)
+  out, dec, _ = car.run(0.4, lights=cam('unknown'))
+  assert not held(out, dec) and not out.stops and out.prompt == 'none' and out.alert == 'none'
+  assert st.mode == 'go' and car.policy.stop_ahead() is None
+
+
+def test_a_red_read_again_inside_its_gap_keeps_the_stop():
+  car = right_at_a_signal()
+  held_at(car, LINE, lights=cam('red'))
+  for _ in range(10):  # the red in and out of the reads, each gap under RED_GONE_S (route 29: 1.7 s at most in a 25 s stand)
+    out, dec, _ = car.run(RED_GONE_S - 0.5, lights=cam('unknown'))
+    assert held(out, dec)
+    out, dec, _ = car.run(0.2, lights=cam('red'))
+    assert held(out, dec)
+
+
+def no_heads(car):
+  return Lights(camera=CameraLights([], False, 'read'))
+
+
+def other_heads(car):
+  return Lights(camera=CameraLights([('unknown', HEAD + 150. - car.s), ('green', HEAD + 150. - car.s)], False, 'read'))
+
+
+@pytest.mark.parametrize('lights', [NO_LIGHTS, no_heads, other_heads], ids=['noRead', 'noHeads', 'nextSignalsHeads'])
+def test_a_red_whose_heads_are_out_of_view_is_never_let_go_as_gone(lights):
+  """No head of the signal in view (a truck ahead, the heads out of the frame at the line, the reader not reading) is not its
+  red gone: the stop a read red raised stands, however long, until its heads are in view RED_GONE_S on end and not read red
+  (or read green)."""
+  car = right_at_a_signal()
+  out, dec = held_at(car, LINE, lights=cam('red'))
+  st = car.policy.tracker.controls[(1, 0)].state
+  out, dec, _ = car.run(RED_GONE_S - 0.5, lights=cam('unknown'))  # most of the way to gone, then hidden
+  for _ in range(int(60. / DT_MDL)):
+    out, dec, _ = car.step(lights=lights)
+    assert held(out, dec) and st.mode == 'stop'
+  for _ in range(20):  # in view and unread in bursts, out of view between them (a head boxed on some runs only): never gone
+    out, dec, _ = car.run(RED_GONE_S - 0.5, lights=cam('unknown'))
+    assert held(out, dec)
+    out, dec, _ = car.run(0.3, lights=lights)
+    assert held(out, dec)
+  out, dec, _ = car.run(RED_GONE_S - 0.2, lights=cam('unknown'))  # in view again and unread, its whole run from the start
+  assert held(out, dec)
+  out, dec, _ = car.run(0.4, lights=cam('unknown'))
+  assert not held(out, dec) and not out.stops
+
+
+def test_a_red_on_the_approach_whose_heads_go_out_of_view_still_stops_the_car():
+  car = right_at_a_signal()
+  car.run_until(lambda out, dec: out.stops, lights=cam('red'))
+  assert car.v > 5. and car.s < LINE - 20.
+  out, dec = held_at(car, LINE, lights=no_heads)
+  assert held(out, dec)
+
+
+def test_a_red_gone_on_the_approach_lets_the_car_go_before_it_stops():
+  car = right_at_a_signal()
+  car.run_until(lambda out, dec: out.stops, lights=cam('red'))
+  assert car.v > 5. and car.s < LINE - 20.
+  out, dec, _ = car.run(RED_GONE_S + 0.2, lights=cam('unknown'))
+  assert not out.stops and car.v > 2. and car.s < LINE
 
 
 def test_a_steady_camera_green_before_the_stopping_point_means_no_stop():
@@ -137,7 +192,21 @@ def test_a_camera_green_never_releases_a_stop_an_accepted_red_made():
 def test_a_camera_green_with_a_red_head_still_read_is_no_green():
   car = right_at_a_signal()
   held_at(car, LINE, lights=cam('red'))
-  out, dec, _ = car.run(5., lights=heads('green', 'red'))  # the heads disagree: unknown
+  out, dec, _ = car.run(5., lights=heads('green', 'red'))  # one green, one red: no green
+  assert held(out, dec) and not out.released_stopped and out.prompt == 'none'
+
+
+def test_a_stop_is_let_go_by_more_green_heads_than_red():
+  # route 29, 8:46: three green balls over the lanes and a left-turn head still red beside them. The heads disagree, so no
+  # green was the signal's, and a car stopped at that light's red would have stood at its greens for good
+  car = right_at_a_signal()
+  held_at(car, LINE, lights=heads('red', 'red', 'red', 'red'))
+  out, dec, _ = car.run(CAMERA_GREEN_STEADY_S + 0.2, lights=heads('green', 'green', 'green', 'red'))
+  assert not held(out, dec) and not out.stops
+  # a lone green beside more reds (a green left arrow read as a ball, the balls red) lets nothing go, however long
+  car = right_at_a_signal()
+  held_at(car, LINE, lights=heads('red', 'red', 'red'))
+  out, dec, _ = car.run(20., lights=heads('green', 'red', 'red'))
   assert held(out, dec) and not out.released_stopped and out.prompt == 'none'
 
 
@@ -328,11 +397,13 @@ def test_a_red_read_over_the_line_on_the_drivers_go_is_never_a_stop_in_the_junct
 
 
 def test_a_reds_stop_driven_through_under_the_gas_keeps_its_overrun(monkeypatch):
-  # a red read made the stop: the gas never makes that the driver's go, and the line crossed at speed is said
+  # a red read made the stop: the gas never makes that the driver's go. Lifted where the stop no longer fits short of the
+  # crossing lanes (15 m out at 11 m/s), the car goes through and says so, never braked at into the junction
   ev = Events(monkeypatch)
   car = right_at_a_signal(v=11.)
   rows = gas_until(car, LINE - 15., lights=cam('red'))
-  assert 'stopOverrun' in {r[3] for r in rows} and ev.named('turnpilot.map_stop_overrun')
+  assert 'cannotStopComfortably' in {r[3] for r in rows} and min(r[2] for r in rows) >= 0.
+  assert [e['why'] for e in ev.named('turnpilot.map_signal_decided') if e['decision'] == 'go'] == ['driven']
   assert not ev.named('turnpilot.signal_turn_driven')
 
 
@@ -843,4 +914,239 @@ def test_turnpilotd_the_drivers_gas_through_a_rights_stop_lifted_near_the_line_i
 
 
 
+
+
+
+def test_a_red_read_too_late_for_its_line_is_not_said_where_the_lefts_own_hold_stops_the_car_just_past_it():
+  """Route 29's late red at a left: the car was braking for the left's hold in the junction's mouth when the red was first
+  read, too late for the signal's own line short of it. It stops at the mouth all the same, so cannotStopComfortably ("can't
+  stop") over a stop the car is making is noise; with no hold of the left's past the line it is still said."""
+  line = JUNCTION - 22.  # a line set back of the junction: the left's hold is in the mouth, 16 m past it
+
+  def run(with_left):
+    car = Car([(line, 'signal', True)], v=11., cruise=11.)
+    if with_left:
+      car.turn = (JUNCTION, 7, 'left')
+    car.junction = (JUNCTION, 7)
+    kw = {'left': LeftCommand('auto')} if with_left else {}
+    alerts, late_v = set(), None
+    for _ in range(int(40. / DT_MDL)):
+      late = line - car.s < 2.
+      if late and late_v is None:
+        late_v = car.v
+      out, dec, _ = car.step(lights=cam('red', s_head=JUNCTION + 15.) if late else NO_LIGHTS, **kw)
+      alerts.add(out.alert)
+      if (held(out, dec) and car.v < 0.1) or car.s > JUNCTION + 20.:
+        break
+    return car, out, dec, alerts, late_v
+  car, out, dec, alerts, late_v = run(True)
+  assert not map_controls.red_stop_fits(late_v, 2.)  # too late for the signal's own line
+  assert held(out, dec) and line + 10. < car.s < JUNCTION - 4.  # stood in the mouth, at the left's hold
+  assert not {'cannotStopComfortably', 'stopOverrun'} & alerts
+  car, out, dec, alerts, late_v = run(False)
+  assert car.s > JUNCTION and 'cannotStopComfortably' in alerts
+
+
+# --- a curb-side turn at a signal: through on a green, the right-on-red procedure on a red or an unread light ---
+
+def right_in_hand(clear=True, v=13.4):
+  car = right_at_a_signal(v=v)
+  car.right = clear
+  return car
+
+
+@pytest.mark.parametrize("light", [NO_LIGHTS, cam('unknown')], ids=['noRead', 'unknown'])
+def test_a_right_at_a_signal_nobody_reads_stops_at_the_line_looks_and_goes(light, monkeypatch):
+  """Routes 29 and 26: three rights at signals the reader boxed no head of, the lamps red in the video, the driver standing
+  12-25 s at each; the planner drove each at the corner's speed, and on 11-06 ran a right on red so. A right flows through
+  only on a green. On an unread light: a stop at the line, a stand of RIGHT_RED_DWELL_S, then its go once the way has been
+  clear RIGHT_RED_CLEAR_S, never a handback."""
+  ev = Events(monkeypatch)
+  car = right_in_hand()
+  out, dec = held_at(car, LINE, lights=light)
+  st = car.policy.tracker.controls[(1, 0)].state
+  assert out.prompt == 'none' and out.stops[0].reason == RIGHT_RED_LOOKING_REASON and car.policy.stop_ahead() == 0.
+  assert not car.policy.right_on_red(JUNCTION - car.s)
+  t_held = car.t
+  out, dec = car.run_until(lambda out, dec: not held(out, dec), max_s=10., lights=light)
+  assert RIGHT_RED_DWELL_S - 2 * DT_MDL <= car.t - t_held <= RIGHT_RED_DWELL_S + 0.2
+  assert st.done == 'released' and st.cause == 'rightOnRed' and car.policy.right_on_red(JUNCTION - car.s)
+  assert [e for e in ev.named('turnpilot.map_stop_released') if e['cause'] == 'rightOnRed']
+  for _ in range(int(8. / DT_MDL)):  # on through the junction: never stopped again, nothing said
+    out, dec, _ = car.step(lights=light)
+    assert not out.stops and out.prompt == 'none' and out.alert == 'none'
+  assert car.s > JUNCTION and car.policy.stop_ahead() is None
+  assert not ev.named('turnpilot.signal_unseen')
+
+
+def test_a_right_never_goes_on_a_red_it_is_reading_and_goes_after_its_look_once_none_is_read(monkeypatch):
+  """The owner's standing line: "it should always stop on red". The look is the forward cameras' tracks (it misses some
+  crossing cars) and no "no turn on red" sign is read, so a right at a red that stays read stands for as long as it is read,
+  its way clear the whole time, its line saying it waits for the green; nothing is said or handed back. Once no red or yellow
+  has been read for RIGHT_RED_UNREAD_S (the reader's dropouts are shorter) it goes on its look."""
+  ev = Events(monkeypatch)
+  car = right_in_hand()
+  out, dec = held_at(car, LINE, lights=cam('red'))
+  st = car.policy.tracker.controls[(1, 0)].state
+  for i in range(int(40. / DT_MDL)):
+    # the reader dropping the red for 1.3 s at a time, as on the logs, is still the red
+    light = cam('unknown') if 200 <= i % 400 < 200 + int(1.3 / DT_MDL) else cam('red')
+    out, dec, _ = car.step(lights=light)
+    assert held(out, dec) and out.prompt == 'none' and out.alert == 'none' and out.stops[0].reason == RIGHT_RED_WAIT_REASON
+    assert not car.policy.right_on_red(JUNCTION - car.s)
+  assert not st.done and not ev.named('turnpilot.signal_unseen')
+  t_unread = car.t
+  out, dec = car.run_until(lambda out, dec: not held(out, dec), max_s=10., lights=cam('unknown'))
+  assert RIGHT_RED_UNREAD_S - 2 * DT_MDL <= car.t - t_unread <= RIGHT_RED_UNREAD_S + 0.2
+  assert st.done == 'released' and st.cause == 'rightOnRed' and car.policy.right_on_red(JUNCTION - car.s)
+
+
+def test_a_right_at_a_read_red_goes_on_its_green():
+  car = right_in_hand()
+  out, dec = held_at(car, LINE, lights=cam('red'))
+  for _ in range(int(10. / DT_MDL)):
+    out, dec, _ = car.step(lights=cam('red'))
+    assert held(out, dec)
+  out, dec = car.run_until(lambda out, dec: not held(out, dec), max_s=5., lights=cam('green'))
+  assert not held(out, dec) and car.t < 60.
+  for _ in range(int(8. / DT_MDL)):
+    out, dec, _ = car.step(lights=cam('green'))
+    assert not out.stops
+  assert car.s > JUNCTION
+
+
+def test_a_right_on_a_steady_green_flows_through_unslowed():
+  base, car = Car([(LINE, 'signal', True)]), right_in_hand()  # base: the same signal going straight
+  for _ in range(int(25. / DT_MDL)):
+    a, b = base.step(), car.step(lights=cam('green'))
+    assert a[0].stops == b[0].stops == [] and a[2] == b[2]
+  assert car.s > JUNCTION
+
+
+def test_a_right_held_by_what_is_seen_waits_for_it_and_goes_once_it_is_clear():
+  """A crossing vehicle or a person seen holds the right's go for as long as it is seen (turnpilotd's look: update()'s
+  right): the one wait there is, said on its line, never a take-control, never the unseen-light chime; and heads in view
+  that read no red never let its stop go as a red gone (RED_GONE_S), the light unread as it is."""
+  car = right_in_hand(clear=False)
+  out, dec = held_at(car, LINE, lights=cam('unknown'))
+  for _ in range(int(40. / DT_MDL)):
+    out, dec, _ = car.step(lights=cam('unknown'))
+    assert held(out, dec) and out.prompt == 'none' and out.alert == 'none'
+    assert out.stops[0].reason == "Right on red: waiting for cross traffic"
+  car.right = True
+  out, dec, _ = car.run(RIGHT_RED_CLEAR_S - 0.2, lights=cam('unknown'))  # clear on end first: one clear frame is no go
+  assert held(out, dec)
+  car.right = False
+  car.run(0.2, lights=cam('unknown'))
+  car.right = True
+  out, dec, _ = car.run(RIGHT_RED_CLEAR_S - 0.2, lights=cam('unknown'))
+  assert held(out, dec)
+  out, dec, _ = car.run(0.4, lights=cam('unknown'))
+  assert not held(out, dec) and not out.stops
+
+
+def test_a_right_whose_signal_is_first_known_too_close_to_stop_for_goes_with_the_model():
+  car = right_in_hand(v=13.4)
+  car.controls = []
+  car.run_until(lambda out, dec: LINE - car.s < 15.)
+  car.controls = [(LINE, 'signal', True)]  # listed late (a tile loaded late): 15 m out at 13.4 m/s is past any stop at -2.0
+  alerts = set()
+  for _ in range(int(6. / DT_MDL)):
+    out, dec, _ = car.step()
+    alerts.add(out.alert)
+    assert not out.stops
+  assert car.s > JUNCTION and alerts == {'none'}
+
+
+def obj(cls, x, y, vx=0., vy=0., age=20, conf=0.8):
+  from types import SimpleNamespace
+  return SimpleNamespace(cls=cls, x=x, y=y, vx=vx, vy=vy, age=age, conf=conf, trackId=1)
+
+
+def test_the_right_on_red_look_holds_for_what_the_scene_sees_and_nothing_else():
+  from openpilot.selfdrive.turnpilot.map_controls import (RIGHT_RED_BLIND_REASON, RIGHT_RED_CROSS_REASON, RIGHT_RED_PERSON_REASON,
+                                                           right_red_blocked)
+  from openpilot.selfdrive.turnpilot.route_follower import RIGHT
+
+  def look(objects, available=True, person=False):
+    return right_red_blocked(objects, available, person, 10., RIGHT)
+  assert look([]) == ''
+  assert look([], available=False) == RIGHT_RED_BLIND_REASON  # no live scene is no look
+  assert look([], person=True) == RIGHT_RED_PERSON_REASON
+  assert look([obj('pedestrian', 12., -5.)]) == RIGHT_RED_PERSON_REASON  # in the turn's crosswalk
+  assert look([obj('car', 14., 30., vy=-9.)]) == RIGHT_RED_CROSS_REASON  # closing from the left on the cross road
+  assert look([obj('car', 14., 60., vy=-13.)]) == RIGHT_RED_CROSS_REASON
+  assert look([obj('car', 14., -8., vy=-9.)]) == RIGHT_RED_CROSS_REASON  # crossing in the junction, just past the car's nose
+  assert look([obj('cyclist', 12., 6., vy=-4.)]) == RIGHT_RED_CROSS_REASON
+  assert look([obj('car', 14., 30., vy=0., age=3)]) == RIGHT_RED_CROSS_REASON  # on the cross road, too new to say where it goes
+  assert look([obj('car', 14., 30., vy=0., age=40)]) == ''  # ...seen standing there: parked, or waiting to turn
+  assert look([obj('car', 1., 3.5, vy=0., age=3)]) == ''  # a car beside this one at the same light
+  assert look([obj('car', 14., -40., vy=-9., age=40)]) == ''  # driving away down the road the car turns into
+  assert look([obj('car', 8., 0., vx=0., age=40)]) == ''  # a lead: the planner's own, and the go's in-path check
+
+
+def test_turnpilotd_a_right_at_a_signal_nobody_reads_green_stops_looks_and_goes_certified_over_the_models_hold():
+  """Through turnpilotd as the build ships (TurnPilotAlwaysDrive on): the right stops at its signal's line on an unread head
+  or no head at all, stands for its look and is let go with no prompt and no alert; the model still holding the car there,
+  TurnPilot's go is certified for plannerd's lift (turnRelease) on that look, never the no-move handback."""
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import stand
+  for state in (None, 'unknown'):
+    sim = turn_sim(right_turn(), state=state)
+    sim.tp.always_drive = True
+    while sim.t < 60. and not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05):
+      sim.step(engaged=True)
+    assert 286. < sim.s < 291. and str(sim.trace[-1][2].mapControl.kind) == 'signal', (state, sim.s)
+    assert all(int(p.desire) == 0 for _, _, p in sim.trace)  # no turn desire on the way to the line
+    plans = stand(sim, 6.)
+    causes = [str(p.goCertified.cause) for p in plans]
+    go = next(i for i, c in enumerate(causes) if c != 'none')
+    assert causes[go] == 'turnRelease' and go * DT_MDL < RIGHT_RED_DWELL_S + 0.5, (state, go)
+    assert not plans[go].shouldStop and all(p.shouldStop for p in plans[:go - 1])
+    every = [p for _, _, p in sim.trace]
+    assert all(str(p.controlPrompt) == 'none' and str(p.controlAlert) == 'none' for p in every), state
+    assert sim.tp.map_controls.right_on_red(300. - sim.s)
+
+
+def test_turnpilotd_a_right_at_a_red_that_stays_read_stands_with_nothing_certified():
+  """Through turnpilotd: the right stops at its line on a read red and stands for as long as it is read, its way clear: no
+  turn desire, no go certified (no lift over the model's hold at the red), no prompt and no alert."""
+  from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import stand
+  sim = turn_sim(right_turn(), state='red')
+  sim.tp.always_drive = True
+  while sim.t < 60. and not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05):
+    sim.step(engaged=True)
+  assert 286. < sim.s < 291. and str(sim.trace[-1][2].mapControl.kind) == 'signal', sim.s
+  plans = stand(sim, 20.)
+  assert all(p.shouldStop and str(p.goCertified.cause) == 'none' and int(p.desire) == 0 for p in plans)
+  assert all(str(p.controlPrompt) == 'none' and str(p.controlAlert) == 'none' for _, _, p in sim.trace)
+  assert not sim.tp.map_controls.right_on_red(300. - sim.s)
+
+
+def test_turnpilotd_a_rights_certified_go_is_taken_back_when_a_car_is_seen_crossing():
+  """The look goes on through the lift: the go from the line is certified on the look of each frame (right_on_red), so a
+  car first seen coming along the cross road while the car is lifted on from its line ends the lift at once."""
+  def run(cross):
+    sim = turn_sim(right_turn(), state='unknown')
+    sim.tp.always_drive = True
+    while sim.t < 60. and not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05):
+      sim.step(engaged=True)
+    sim.model_holds, causes = True, []
+    for _ in range(int(4. / DT_MDL)):
+      sim.v = 0.
+      seen = cross and 'turnRelease' in causes
+      objects = ({'cls': 'car', 'x': 304. - sim.s, 'y': 25., 'vx': 0., 'vy': -8., 'age': 40, 'trackId': 7, 'conf': 0.8},) if seen else ()
+      causes.append(str(sim.step(objects, engaged=True).goCertified.cause))
+    return causes
+  free, crossed = run(False), run(True)
+  k = free.index('turnRelease')
+  assert free[k:k + 10] == ['turnRelease'] * 10  # the lift stands while the road stays clear
+  assert crossed[k] == 'turnRelease' and all(c == 'none' for c in crossed[k + 3:k + 20]), crossed[k:k + 20]
+
+
+def test_turnpilotd_a_right_on_a_steady_camera_green_is_never_slowed_for_its_signal():
+  sim = turn_sim(right_turn(), state='green')
+  sim.tp.always_drive = True
+  while sim.s < 320. and sim.t < 60.:
+    sim.step(engaged=True)
+  assert sim.s >= 320. and not any(p.shouldStop or str(p.mapControl.action) in ('braking', 'held') for _, _, p in sim.trace)
 

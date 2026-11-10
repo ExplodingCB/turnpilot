@@ -56,7 +56,7 @@ def stop_turn_sim(tmp_path, maneuver, car_signals=True, auto_left='auto', model=
 def car_signals_on(sim):
   """A verified Tesla whose lamp lights on the plan's side at once; sim.veto, when set, is the port's carSignal instead."""
   sim.veto = getattr(sim, 'veto', None)
-  sim.tp.car_signal_flags, sim.tp.car_signal_mode = int(TeslaFlags.CAR_SIGNALS), 'on'
+  sim.tp.car_signal_flags, sim.tp.car_signal_mode, sim.tp.car_signal_proven = int(TeslaFlags.CAR_SIGNALS), 'on', True
 
   def port(s):
     if s.veto is not None:

@@ -299,6 +299,9 @@ def test_soft_block():
     assert not soft_block(LEFT, blocker, lanes, paint(left=BW)), blocker
 
 
+from openpilot.selfdrive.turnpilot.lane_planner import PAINT_CARRY_S
+
+
 def offer_frame(frames, lanes_fn, m=None, blindspots=()):
   """The frame index the planner offers a left on, frames: paint per frame, lanes_fn(k): the model's lanes on frame k."""
   lp = LanePlanner()
@@ -348,17 +351,18 @@ def test_the_want_of_a_read_or_a_count_keeps_the_confirm_count():
   # broken white read, the lane counted on every other frame
   flicker = lambda k: seen if k % 2 == 0 else unseen  # noqa: E731
   assert offer_frame([paint(left=BW)] * 40, flicker) == 2 * (LC_CONFIRM_FRAMES - 1)
-  # frames nobody read between the reads: kept
-  frames = [paint(left=BW)] * 5 + [()] * 20 + [paint(left=BW)] * 20
-  assert offer_frame(frames, lambda k: seen) == 25 + LC_CONFIRM_FRAMES - 5 - 1
+  # frames nobody read between the reads: the first PAINT_CARRY_S of them go by the last read and count, the rest are kept
+  carried = int(round(PAINT_CARRY_S / DT_MDL))
+  frames = [paint(left=BW)] * 2 + [()] * 20 + [paint(left=BW)] * 20
+  assert offer_frame(frames, lambda k: seen) == 22 + LC_CONFIRM_FRAMES - 2 - carried - 1
   # a contrary read starts it over; so does LC_UNSURE_MAX_S with nothing passing
   frames = [paint(left=BW)] * 5 + [paint(left=SW)] + [paint(left=BW)] * 20
   assert offer_frame(frames, lambda k: seen) == 6 + LC_CONFIRM_FRAMES - 1
   gap = int(round(LC_UNSURE_MAX_S / DT_MDL)) + 1
-  frames = [paint(left=BW)] * 5 + [()] * gap + [paint(left=BW)] * 20
-  assert offer_frame(frames, lambda k: seen) == 5 + gap + LC_CONFIRM_FRAMES - 1
+  frames = [paint(left=BW)] * 2 + [()] * (gap + carried) + [paint(left=BW)] * 20
+  assert offer_frame(frames, lambda k: seen) == 2 + gap + carried + LC_CONFIRM_FRAMES - 1
   # never offered on a soft frame, the count made: the next frame that passes
-  frames = [paint(left=BW)] * (LC_CONFIRM_FRAMES - 1) + [()] * 5 + [paint(left=BW)]
+  frames = [paint(left=BW)] * (LC_CONFIRM_FRAMES - 1 - carried) + [()] * (carried + 5) + [paint(left=BW)]
   assert offer_frame(frames, lambda k: seen) == LC_CONFIRM_FRAMES + 4
 
 
@@ -443,10 +447,10 @@ def test_the_driver_holding_the_stalk_through_both_changes_is_asked_for_each():
 
 
 def test_an_unread_wait_says_why_and_never_requests():
-  """An offer up with the paint unread (the wide camera): it waits, the prompt kept, nothing requested on an unread frame
-  with or without the driver's blinker; it goes on the first frame read broken white. The driver's blinker confirms only a
-  line read white (the review of 2026-11-08: from 2026-11-08's route 29 fix until then it confirmed an unread frame too, so a
-  request went out on a line nobody looked at)."""
+  """An offer up with the paint unread (the wide camera): without the driver's blinker it waits, the prompt kept, nothing
+  requested; it goes on the first frame read broken white. With the driver's blinker on a line last read white the request
+  goes on the unread frames too: the driver, looking, confirms the lane the planner offered on its own reads, and nothing
+  has read against it since. A line last read with no colour still waits (test_the_drivers_signal_confirms_only_a_white_line)."""
   from openpilot.selfdrive.turnpilot.tests.test_lane_planner import striped
   m = maneuver("turn", "left")
   for signals in (False, True):
@@ -455,8 +459,12 @@ def test_an_unread_wait_says_why_and_never_requests():
     assert drive.lp.phase == Phase.WARN
     drive.paint = None
     distance = drive.run(m, distance, 2., blinker=LaneChange.left if signals else None)
-    assert not drive.requests and not drive.aborts, signals
-    assert drive.prompts[-1] == LaneChange.left
+    assert not drive.aborts, signals
+    if signals:
+      assert len(drive.requests) == 1 and drive.lp.changes == 0  # asked for once, never withdrawn: under way
+      assert all(d.lane_change == LaneChange.left for d in drive.decisions if d.offer == LaneChange.left and d.countdown == 0.)
+    else:
+      assert not drive.requests and drive.prompts[-1] == LaneChange.left
     drive.paint = striped
     drive.run(m, distance, 5., blinker=LaneChange.left)
     assert len(drive.requests) == 1 and drive.lp.changes == 1

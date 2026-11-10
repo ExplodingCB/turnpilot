@@ -2,6 +2,8 @@
 skips (DESIGN phase4/blinker 7.7)."""
 import types
 
+import pytest
+
 from opendbc.car.tesla.values import TeslaFlags
 from opendbc.car.structs import car
 from openpilot.cereal import log, messaging
@@ -92,7 +94,9 @@ def test_two_chimes_at_once_each_aired():
   lines = run(ev, int(3. / DT), plan('failed', prompt='left'), port('failed', 'lampLost'), ON)
   n = int(round(hooks.CHIME_S / DT))
   assert all(line[0] == "Car Signal Failed" and line[2] == 'prompt' for line in lines[:n])
-  assert all(line == ("Signal LEFT Now", "Turn LEFT ahead: put your left signal on", 'tpSignalLeft') for line in lines[n:])
+  assert all(line == ("Signal LEFT Now", "Turn LEFT ahead: put your left signal on", 'tpSignalLeft') for line in lines[n:2 * n])
+  # its chime once, then the line stays silent until the repeat (PROMPT_REPEAT_S)
+  assert all(line == ("Signal LEFT Now", "Turn LEFT ahead: put your left signal on", 'none') for line in lines[2 * n:])
   # the prompt over before the fault's hold: the fault's line back, its chime already heard: silent
   lines = run(ev, 20, plan('failed'), port('failed', 'lampLost'), ON)
   assert all(line[0] == "Car Signal Failed" and line[2] == 'none' for line in lines)
@@ -225,3 +229,21 @@ def test_alerts():
   a = turnpilot_too_fast_to_turn_alert(car.CarParams.new_message(), car.CarState.new_message(), FakeSM(p.as_reader().turnpilotPlan),
                                        False, 0, None)
   assert (a.alert_text_1, a.alert_text_2) == ("Turn Cancelled: Hazards On", "Rerouting")
+
+
+def test_the_prompt_chimes_once_then_again_only_each_repeat():
+  """soundd loops the side's chime for as long as the alert carries it, and the prompt carried it for its whole life: 65 s
+  of it at one held left (starthere's risk 6). One chime (CHIME_S on air, under the sound's 1.15 s, so one play), the line
+  staying up silent, and one more each PROMPT_REPEAT_S while the lamp is still dark."""
+  ev = CarSignalEvents()
+  lines = run(ev, int(round(20. / DT)), plan(prompt='right'), port())
+  assert all(line[:2] == ("Signal RIGHT Now", "Turn RIGHT ahead: put your right signal on") for line in lines)
+  on = [k * DT for k, line in enumerate(lines) if line[2] == 'tpSignalRight']
+  n = int(round(hooks.CHIME_S / DT))
+  starts = [t for t, prev in zip(on, [-1.] + on[:-1], strict=True) if t - prev > 2 * DT]
+  assert starts == pytest.approx([0., hooks.PROMPT_REPEAT_S, 2 * hooks.PROMPT_REPEAT_S], abs=2 * DT)
+  assert abs(len(on) - 3 * n) <= 3 and hooks.CHIME_S < 1.15 and hooks.PROMPT_REPEAT_S >= 5.
+  # every chime reaches soundd whatever its phase
+  for start in starts:
+    k = int(round(start / DT))
+    assert all(any(line[2] == 'tpSignalRight' for line in lines[k + phase:k + n:SOUNDD_EVERY]) for phase in range(SOUNDD_EVERY))

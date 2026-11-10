@@ -276,6 +276,9 @@ WIDTH_FLOOR_M = {'car': 1.5, 'truck': 1.5, 'bus': 1.5, 'motorcycle': 0.6, 'cycli
 WIDTH_FLOOR_DEFAULT_M = 0.4
 BAND_TOL_DEG = 2.          # the band's near edge widens with range by this (heading error, the road's curve)
 CLEAR_WINDOW_S = 2.5       # the band clear on road runs this long (CRITIQUE REQUIRED 2: 2-3 s, 3x the longest dropout)
+# the window counts on the approach too, so a band clear through the last CLEAR_WINDOW_S of the roll-in goes as the car comes
+# to its stand at the line. False (the public build's): it starts over at the hold, a CLEAR_WINDOW_S stand at every left
+WINDOW_FROM_APPROACH = True
 # road runs further apart than this start the window over; needed, far runs covering the band too. What the gap rule can spare
 # between two runs: a car at SPEED_MARGIN x the limit just past R_req on the last run is inside it by that travel at the go,
 # out of PET_S's margin, so a quarter of PET_S (13 m at 45 mph x 1.3), the window still 5 runs or more and the gap under a
@@ -387,7 +390,9 @@ SIGNAL_NEEDS_GREEN = True
 # go unsignalled would break the law and invite the pass this rule is for, and the chime asks the one person who can light
 # it). Until 2026-11-07 it handed back here. False restores STOP_SIGNS D15's rule (the prompt never gates the go)
 LEFT_GO_NEEDS_SIGNAL = True
-LEFT_SIGNAL_WAIT_S = 10.
+# ...for this long standing at its line (the side's prompt has chimed since the approach): then it goes on its gap, said
+# once (turnpilot.left_unsignalled). The public build's: no go unsignalled, ever
+LEFT_SIGNAL_WAIT_S = 3.
 NO_SIGNAL_REASON = "Unprotected left: waiting for the turn signal"
 # s at its line with its light read unknown (navd's controls failing: SIGNAL_NEEDS_GREEN), or red or yellow: said once a wait
 # (turnpilot.left_light_wait), waited through, never handed back (until 2026-11-07: 'light', "Can't read the light"). A red
@@ -644,12 +649,18 @@ def nearest_range(b) -> float:
   return min(b.near_m, WIDTH_FLOOR_M.get(b.cls, WIDTH_FLOOR_DEFAULT_M) / (2. * math.tan(ang / 2.)))
 
 
-def band_blockers(boxes, heading_deg: float, side: int, reach_m: float, distance: float, exempt=()) -> list:
+def band_blockers(boxes, heading_deg: float, side: int, reach_m: float, distance: float, exempt=(), lanes=None) -> list:
   """The road camera's raw vehicle boxes at RAW_CONF or more in the oncoming band within reach_m (module docstring), by
-  their nearest plausible range (nearest_range). exempt: boxes that are an occluder's (not traffic)."""
+  their nearest plausible range (nearest_range). exempt: boxes that are an occluder's (not traffic). A box the tracker
+  says is going away up the road (RawBox.motion receding: our own direction's traffic) is no oncoming car, and neither is
+  one standing wholly outside the opposing lanes: beyond their far edge (lanes_far_m of lanes, view_blocked's bound: parked
+  at the far curb) or wholly on our side of the car's own centre line (our direction's traffic standing ahead, in the band
+  only by BAND_TOL_DEG). One standing in the opposing lanes blocks as any other: a queue there launches, and the tracker
+  reads a launched car standing for 0.6-3 s more. The far edge is navd's lane count (two lanes where it has none)."""
   out = []
+  lane_far = lanes_far_m(lanes)
   for b in boxes:
-    if b.camera != 'road' or b.cls not in VEHICLES or b.conf < RAW_CONF or b in exempt:
+    if b.camera != 'road' or b.cls not in VEHICLES or b.conf < RAW_CONF or b in exempt or b.motion == 'receding':
       continue
     edges = sorted(turn_bearing(e, heading_deg, side) for e in b.span_deg)
     tol = math.radians(BAND_TOL_DEG)
@@ -660,6 +671,8 @@ def band_blockers(boxes, heading_deg: float, side: int, reach_m: float, distance
     rng = math.hypot(*b.xy)
     lat_far, lat_near = rng * math.sin(math.radians(edges[1])), rng * math.sin(math.radians(edges[0]))
     x = rng * math.cos(math.radians(turn_bearing(b.bearing_deg, heading_deg, side)))
+    if b.motion == 'standing' and (lat_near >= lane_far or lat_far <= 0.):
+      continue
     if nearest_range(b) <= reach_m and x > distance - ONCOMING_PAST_M and lat_far > ONCOMING_Y_NEAR_M - rng * math.tan(tol) and \
        lat_near < ONCOMING_Y_FAR_M + rng * math.tan(tol):
       out.append(b)
@@ -831,6 +844,7 @@ class UnprotectedLeft:
   def __init__(self):
     self.maneuver_id: int | None = None
     self.always_drive = False  # TurnPilotAlwaysDrive, handed over every frame (turnpilotd.hand_always_drive; ALWAYS_DRIVE.md section 1)
+    self.window_from_approach = WINDOW_FROM_APPROACH
     self._reset()
 
   def _reset(self):
@@ -906,6 +920,7 @@ class UnprotectedLeft:
     side = inp.side
     v_limit = inp.v_limit if inp.v_limit is not None and inp.v_limit > 0. else DEFAULT_OPPOSING_SPEED
     latency = not self.moved
+    light = inp.light
     # the path and the conflict point at the furthest reading of the junction: the hold line is at the nearest (BeamNG: 13 m
     # apart, the car 22 m out certifying a 9 m line's path)
     d_far = inp.distance + max(inp.spread_m, 0.)
@@ -920,7 +935,7 @@ class UnprotectedLeft:
     raw_blockers = None
     if inp.raw is not None and inp.raw.camera == 'road':
       exempt = [b for b in inp.raw.boxes if any(matches(b, o) for o in occ)]
-      raw_blockers = band_blockers(inp.raw.boxes, inp.heading_deg, side, rreq, inp.distance, exempt)
+      raw_blockers = band_blockers(inp.raw.boxes, inp.heading_deg, side, rreq, inp.distance, exempt, inp.opposing_lanes)
       self.road_boxes = [b for b in inp.raw.boxes if b not in exempt]  # the last road run's, for a slow launch's look (L3)
       stands = [o for o in inp.objects if str(o.cls) in VEHICLES and stands_still(o)]
       if any(matches(b, o) for b in raw_blockers for o in stands):
@@ -951,7 +966,8 @@ class UnprotectedLeft:
     far_blockers = None
     if inp.far is not None and inp.far.view == 'far' and inp.far.camera == 'road':
       exempt = [b for b in inp.far.boxes if any(matches(b, o) for o in occ)]
-      far_blockers = band_blockers(inp.far.boxes, inp.heading_deg, side, math.inf if far_needed else rreq, inp.distance, exempt)
+      far_blockers = band_blockers(inp.far.boxes, inp.heading_deg, side, math.inf if far_needed else rreq, inp.distance, exempt,
+                                   inp.opposing_lanes)
       self.far_blocked, self.far_run_age = bool(far_blockers), 0.
       if far_blockers:
         self.far_block_age = 0.
@@ -988,7 +1004,7 @@ class UnprotectedLeft:
     # it, still holds it there for the green (the hard rail): the spell's first frame decides, for as long as it is read
     # The review of 2026-11-08: past the line is judged from the mapped signal's own line (signal_line_m), else from its
     # first latch or LINE_D, and only a car that stood there on a light not red before the spell clears (CLEAR_STAND_S)
-    red_now = inp.light in ('red', 'yellow')
+    red_now = light in ('red', 'yellow')
     past = self._past_line_m(inp) > CREEP_DONE_M
     standing_past = past and self.latch_d is not None and inp.v_ego < CLEAR_STAND_V
     if red_now:
@@ -1003,7 +1019,7 @@ class UnprotectedLeft:
     else:
       self.clearing = False
       if standing_past:
-        self.mouth_green_s = self.mouth_green_s + dt if inp.light == 'green' else 0.
+        self.mouth_green_s = self.mouth_green_s + dt if light == 'green' else 0.
         self.mouth_stand_s = self.mouth_stand_s + dt if not inp.model_holds else 0.
         if self.mouth_green_s >= CAMERA_GREEN_STEADY_S - 1e-6 or (not self.red_this_hold and self.mouth_stand_s >= CLEAR_STAND_S - 1e-6):
           self.mouth_armed = True
@@ -1018,8 +1034,10 @@ class UnprotectedLeft:
     if self.cross:
       self._said('cross:' + self.cross, "turnpilot.left_clearing_cross", inp, why=self.cross, wide_age=round(min(self.wide_age, 99.), 2),
                  closing=[(str(o.cls), round(float(o.x), 1), round(float(o.y), 1), round(float(o.vy), 1)) for o in closing])
-    light_go = inp.light in ('none', 'green') or (inp.light == 'unknown' and not SIGNAL_NEEDS_GREEN) or self.clearing
-    no_signal = LEFT_GO_NEEDS_SIGNAL and inp.mode == AUTO and not inp.signal_lit
+    light_go = light in ('none', 'green') or (light == 'unknown' and not SIGNAL_NEEDS_GREEN) or self.clearing
+    # no lamp on its side: its go waits LEFT_SIGNAL_WAIT_S at the line for it (counted below), the window counting meanwhile
+    dark = LEFT_GO_NEEDS_SIGNAL and inp.mode == AUTO and not inp.signal_lit
+    no_signal = dark and self.unsignalled_s < LEFT_SIGNAL_WAIT_S - 1e-6
     # something else keeps it where it is: no go, no creep. The model's own hold where the go wouldn't be lifted over it
     # (model_holds) is one (review 2026-11-07, LS-2): a go there only lets TurnPilot's latch go, so with the model planning no
     # motion it stood LEFT_NO_MOVE_S and handed back (cantStartTakeControl) at every mapped signal on the car, the model holding
@@ -1027,9 +1045,10 @@ class UnprotectedLeft:
     # clearing, the model's hold for the light (or the mouth's short room) is lifted by turnpilotd (left_clearing) from the
     # frame after the red is first read: never a window started over for that one frame; with the lift off ('param') it holds
     model_hold = '' if self.clearing and inp.model_holds != 'param' else inp.model_holds
-    held_else = inp.other_hold or not light_go or no_signal or bool(model_hold) or bool(self.cross)
-    if held_else:
-      self.clear_s = self.near_clear_s = 0.  # the window counts only from where nothing else holds it (hold, then judge)
+    holds = inp.other_hold or not light_go or bool(model_hold) or bool(self.cross)
+    held_else = holds or no_signal
+    if holds:
+      self.clear_s = self.near_clear_s = 0.  # the window counts only while nothing else holds the car
     exits = exit_blockers(inp.objects, inp.heading_deg, side, inp.distance, occ, inp.spread_m, inp.opposing_lanes) + beside
     crosswalk = not exits
     if not crosswalk:
@@ -1103,7 +1122,7 @@ class UnprotectedLeft:
     if self.went:
       why = 'band' if raw_blockers or far_blockers else 'beside' if beside else 'cross' if closing else 'crosswalk' if not crosswalk else \
         'view' if blocked_view else 'hold' if inp.other_hold or not inp.scene_clear else \
-        'light' if inp.light in ('red', 'yellow') and not self.clearing else ''
+        'light' if light in ('red', 'yellow') and not self.clearing else ''
       return self._after_go(inp, out, why, len(raw_blockers or ()) + len(far_blockers or ()), dt)
 
     if not standing:
@@ -1111,15 +1130,17 @@ class UnprotectedLeft:
       out.view = 'road' if inp.distance <= VIEW_FROM_M else 'none'
       return out
     if self.latch_d is None:
-      # held at the line: the window starts here (hold, then judge), never carried over from the approach
-      self.latch_d, self.clear_s, self.far_stale, self.far_only_s = inp.distance, 0., 0., 0.
+      # held at the line. The window is the approach's too (WINDOW_FROM_APPROACH): a band clear on every road run of the last
+      # CLEAR_WINDOW_S of the roll-in, nothing else holding the car, goes as it comes to its stand
+      self.latch_d, self.far_stale, self.far_only_s = inp.distance, 0., 0.
+      if not self.window_from_approach:
+        self.clear_s = self.near_clear_s = out.clear_s = 0.
+        self.far_behind = False
       # its stop line: at a left held in the junction's mouth (line_m, a mapped signal) the car stands past it, and a red read
       # there is said as a red in the junction is (LS-4's words, heard once), and the car clears the junction on its gap
       self.line_d = LINE_D if inp.line_m < LINE_D else min(inp.distance, LINE_D)
-      self.band_stand_s = self.exit_stand_s = self.wait_s = self.near_clear_s = 0.
-      self.far_behind = False
+      self.band_stand_s = self.exit_stand_s = self.wait_s = 0.
       self.said = set()
-      out.clear_s = 0.
       # once per hold at its line: how far the band it is judged on reaches against R_req (the camera's reach, the road's
       # straight run), and what it would once have handed back for ('night', 'range', 'farUnmeasured', 'farOff', 'curve')
       band_m = min(range_eff, rreq, inp.distance + max(inp.straight_m, 0.))
@@ -1138,10 +1159,10 @@ class UnprotectedLeft:
       return self._undecided(out, 'driverSignal')
     # no lamp lit on its side: it waits at its line, the side's chime repeating (car_signals' prompt), and goes on a gap once
     # the driver lights it; said once a dark spell past LEFT_SIGNAL_WAIT_S, never handed back nor gone unsignalled (the constants)
-    self.unsignalled_s = self.unsignalled_s + dt if no_signal else 0.
+    self.unsignalled_s = self.unsignalled_s + dt if dark else 0.
     if self.unsignalled_s >= LEFT_SIGNAL_WAIT_S - 1e-6:
       self._said('unsignalled', "turnpilot.left_unsignalled", inp, unsignalled_s=round(self.unsignalled_s, 1))
-    elif not no_signal:
+    elif not dark:
       self.said.discard('unsignalled')  # lit: a later dark spell as long is another, said again
     if inp.junction_uncertain or inp.distance < HELD_MIN_M:
       # where the car is isn't known: before anything is judged from it (a roll-up included); or a reading puts the junction
@@ -1164,8 +1185,6 @@ class UnprotectedLeft:
     # left at its line (turnpilot.left_reach)
     if self.road_age > STALE_UNDECIDED_S:
       return self._undecided(out, 'stale')
-    if far_needed and self.far_stale > STALE_UNDECIDED_S:
-      return self._undecided(out, 'farStale')  # judged from here on the far crop's runs, which see nothing of the band
     # yawed past what the road camera frames of the band (after a withdrawn go): judged at the measured heading on what it does
     # frame, said once a hold, heard (YAW_VIEW_DEG; the 'yaw' handback until 2026-11-08)
     yaw_view = abs(inp.heading_deg) > YAW_VIEW_DEG
@@ -1180,12 +1199,12 @@ class UnprotectedLeft:
     # stands: at its line or its creep, CREEP_SHORT_M or more short of the oncoming lanes, never into them on a red
     # the model's own hold (model_holds) is a light wait too, said once at STAND_UNDECIDED_S (the plain long wait's bound): a
     # wait that changes kind (a red, then the model holding at the green) is another, counted afresh
-    light_wait_now = inp.light in ('red', 'yellow') or (inp.light == 'unknown' and SIGNAL_NEEDS_GREEN)
-    red_now = inp.light in ('red', 'yellow')
-    if inp.light == 'green':
+    light_wait_now = light in ('red', 'yellow') or (light == 'unknown' and SIGNAL_NEEDS_GREEN)
+    red_now = light in ('red', 'yellow')
+    if light == 'green':
       self.saw_green, self.changed_crept, self.changed_read = True, False, False
     if light_wait_now or inp.model_holds:
-      kind = ('red' if red_now else inp.light) if light_wait_now else 'model'
+      kind = ('red' if red_now else light) if light_wait_now else 'model'
       if kind != self.light_kind:
         self.light_kind, self.light_s = kind, 0.
         self.said.discard('light')
@@ -1193,7 +1212,7 @@ class UnprotectedLeft:
       if changed:
         self.saw_green = False  # said once a change: the next green, then a red, is another
         crept_m = self.latch_d - inp.distance if self.latch_d is not None else 0.
-        cloudlog.event("turnpilot.left_light_changed", light=inp.light, distance=round(inp.distance, 1), creep_m=round(self.creep_to, 1),
+        cloudlog.event("turnpilot.left_light_changed", light=light, distance=round(inp.distance, 1), creep_m=round(self.creep_to, 1),
                        crept_m=round(crept_m, 2), v=round(inp.v_ego, 2), maneuver_id=inp.maneuver_id)
       past_m = self._past_line_m(inp)
       if red_now and not self.changed_crept and self.clearing:
@@ -1207,7 +1226,7 @@ class UnprotectedLeft:
         # roll-up to the line is no creep into the junction); its words then say what was read, no change
         self.changed_crept, self.changed_read = True, changed
         self.chime_t = WAIT_CHIME_S
-        cloudlog.event("turnpilot.left_light_in_junction", light=inp.light, changed=changed, past_m=round(past_m, 2),
+        cloudlog.event("turnpilot.left_light_in_junction", light=light, changed=changed, past_m=round(past_m, 2),
                        distance=round(inp.distance, 1), v=round(inp.v_ego, 2), maneuver_id=inp.maneuver_id)
       self.light_s += dt
       # review 2026-11-07 (AL-2): its red no longer read (the stop it raised in force, or the left's own latch: turn_light) is
@@ -1215,13 +1234,13 @@ class UnprotectedLeft:
       # unseen words while it lasts, the car still held for a green; LIGHT_RED_MAX_S is for a red still read
       self.unseen_s = self.unseen_s + dt if red_now and not inp.light_read else 0.
       if self.unseen_s >= SIGNAL_UNSEEN_S - 1e-6:
-        self._said('unseen', "turnpilot.left_light_unseen", inp, chime=True, light=inp.light, unseen_s=round(self.unseen_s, 1),
+        self._said('unseen', "turnpilot.left_light_unseen", inp, chime=True, light=light, unseen_s=round(self.unseen_s, 1),
                    light_s=round(self.light_s, 1))
       elif self.unseen_s == 0.:
         self.said.discard('unseen')  # read again: a later loss as long is another, said again
       bound = LIGHT_RED_MAX_S if kind == 'red' else LIGHT_UNKNOWN_S if kind == 'unknown' else STAND_UNDECIDED_S
       if self.light_s >= bound - 1e-6 and (kind != 'red' or inp.light_read):
-        self._said('light', "turnpilot.left_light_wait", inp, chime=True, light=inp.light if light_wait_now else 'model',
+        self._said('light', "turnpilot.left_light_wait", inp, chime=True, light=light if light_wait_now else 'model',
                    light_s=round(self.light_s, 1))
     else:
       self.light_s, self.light_kind, self.unseen_s = 0., '', 0.
@@ -1291,7 +1310,7 @@ class UnprotectedLeft:
                  far_blockers=len(far_blockers or ()), r_req=round(rreq, 1))
     self.creep_to = min(self.creep_to, max(crept, 0.))
     out.state = self.state = 'waitGap'
-    light_wait = inp.light in ('red', 'yellow') or (inp.light == 'unknown' and SIGNAL_NEEDS_GREEN)
+    light_wait = light in ('red', 'yellow') or (light == 'unknown' and SIGNAL_NEEDS_GREEN)
     # waiting for the driver's lamp, the left's own prompt stands aside for car_signals' "Signal LEFT Now" and its chime on
     # repeat: the waitingForGap prompt is selfdrived's newer alert at the same priority, and over a wait at the line it hid the
     # side's prompt and silenced its chime (a Sim run through selfdrived's AlertManager, 2026-11-07: "Signal LEFT Now" from
@@ -1301,7 +1320,7 @@ class UnprotectedLeft:
     out.reason = NO_SIGNAL_REASON if no_signal else CROSS_REASON[self.cross] if self.cross else \
       in_junction if light_wait and self.changed_crept else \
       SIGNAL_UNSEEN_REASON if light_wait and self.unseen_s >= SIGNAL_UNSEEN_S - 1e-6 else \
-      LIGHT_WAIT_REASON[inp.light] if light_wait else \
+      LIGHT_WAIT_REASON[light] if light_wait else \
       MODEL_HOLD_REASON.get(inp.model_holds, MODEL_HOLD_REASON['']) if inp.model_holds and not inp.other_hold else \
       BESIDE_REASON[side] if beside else LONG_WAIT_REASON['yaw'] if yaw_view and long_wait in ('', 'noGap') else \
       LONG_WAIT_REASON.get(long_wait, "Waiting for a gap")
@@ -1414,7 +1433,7 @@ class UnprotectedLeft:
       self.launch_a = min(self.launch_a, max(launch_a, LAUNCH_A_MIN))
       d_far = inp.distance + max(inp.spread_m, 0.)
       rreq = r_req(out.v_limit, t_req(d_far, inp.opposing_lanes, False, self.launch_a), d_far)
-      seen = band_blockers(self.road_boxes, inp.heading_deg, inp.side, rreq, inp.distance) or \
+      seen = band_blockers(self.road_boxes, inp.heading_deg, inp.side, rreq, inp.distance, lanes=inp.opposing_lanes) or \
         (self.far_blocked and self.far_run_age <= CLEAR_WINDOW_S)
       self.launch_on = not seen
       cloudlog.event("turnpilot.left_not_launched", error=not self.launch_on, on=self.launch_on, v=round(inp.v_ego, 2),

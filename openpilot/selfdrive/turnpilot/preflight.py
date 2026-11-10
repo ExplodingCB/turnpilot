@@ -262,7 +262,7 @@ VISION_SAYS = ' '.join(("vision: goes by itself at stop signs and yields with ev
 
 def check_stop_sign_go(mode: str, known: bool, avoid_on: bool, camera_ready: bool, side_pkl: Path) -> Check:
   """TurnPilotStopSignGo as this build acts on it (stop_go.py): vision goes by itself from the live cameras, which needs the
-  side views' pkl (PF-07) and keeps on the route only the stops it can take while TurnPilotAvoidStops is on; auto and trial
+  side views' pkl (PF-07), every stop kept on the route (navd detours round none under vision); auto and trial
   act only with step S1's camera measurements (none on the shipped file), else as shadow; off and shadow hand every stop
   back. Never a failure: the car drives whatever it says, the stops handed back."""
   name = "stop-sign go"
@@ -275,10 +275,7 @@ def check_stop_sign_go(mode: str, known: bool, avoid_on: bool, camera_ready: boo
       why = "empty or a pointer" if side_pkl.is_file() else "missing"
       return Check(name, WARN, f"vision, but {side_pkl.name} is {why}: no side views, so every vision stop hands back after 1 s (PF-07)",
                    "update to a branch that carries it (compile_detector.py --side builds it on the Mac)")
-    if not avoid_on:
-      return Check(name, WARN, "vision with TurnPilotAvoidStops off: the stops vision can't take stay on the route and hand back",
-                   "preflight --set TurnPilotAvoidStops=1")
-    return Check(name, INFO, VISION_SAYS)
+    return Check(name, INFO, VISION_SAYS)  # under vision navd routes around no stop, whatever TurnPilotAvoidStops says
   if mode in ('off', 'shadow'):
     return Check(name, INFO, f"{mode}: every stop sign and yield hands back after 1 s")
   if not camera_ready:

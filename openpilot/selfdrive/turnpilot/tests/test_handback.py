@@ -52,10 +52,23 @@ def test_detector_stopped_soft_disables_and_blocks_engaging():
   assert sd.run(plan(), 0.1, engage=True)[-1] == State.enabled
 
 
-def test_detector_back_during_the_countdown_still_disengages():
+def test_detector_back_during_the_countdown_stays_engaged():
+  # the detector's scheduler pauses it 0.8 s at a time on every logged drive; a stall that just passes the deadline and
+  # ends is no reason to disengage: openpilot's own soft disable, which goes back to enabled once its event clears
+  for handback in (Handback.detectorStopped, Handback.noDetector):
+    sd = Selfdrived()
+    assert set(sd.run(plan(handback), 0.5)) == {State.softDisabling}
+    states = sd.run(plan(), SOFT_DISABLE_TIME + 1.)
+    assert set(states) == {State.enabled}
+    # one that stays out still disengages, SOFT_DISABLE_TIME from its start
+    states = sd.run(plan(handback), SOFT_DISABLE_TIME + 1.)
+    assert states[0] == State.softDisabling and states[-1] == State.disabled
+
+
+def test_model_fallback_that_blinks_back_still_disengages():
   sd = Selfdrived()
-  sd.run(plan(Handback.detectorStopped), 0.5)
-  states = sd.run(plan(), SOFT_DISABLE_TIME)  # it blinks back: the handback is still finished, not aborted halfway
+  sd.run(plan(Handback.modelFellBack), 0.5)
+  states = sd.run(plan(), SOFT_DISABLE_TIME)  # latched: the model swapped under the driver, finished, not aborted halfway
   assert states[-1] == State.disabled and State.enabled not in states
 
 

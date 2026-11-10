@@ -32,7 +32,7 @@ from openpilot.selfdrive.turnpilot import stop_rules as sr
 from openpilot.selfdrive.turnpilot.routing.tests.test_certify import ETA, lanes_junction, two_way_junction, utc, vision_junction
 from openpilot.selfdrive.turnpilot.tests import test_stop_go as tsg
 from openpilot.selfdrive.turnpilot.tests.test_stop_go import arrived_at, first_go, lane_box
-from openpilot.selfdrive.turnpilot.tests.test_stop_go_vision import standing, vcars, vdrive, vworld, watch
+from openpilot.selfdrive.turnpilot.tests.test_stop_go_vision import forward_cars, standing, vcars, vdrive, vworld, watch
 
 NIGHT = ETA + 8 * 3600.  # 23:00 EDT, the sun -34 deg
 WHEN = {'day': ETA, 'night': NIGHT}
@@ -223,29 +223,39 @@ def test_a_cross_road_of_two_lanes_each_way_with_no_room_to_creep_goes_on_what_i
 
 # ---------------------------------------------------------------------- washed out or frozen: the camera can't see there
 
+def goes_on_what_it_sees(out, words=None):
+  """The stand ends in the go on what the cameras see: no creep or wait for a view that won't come, the lane's words said,
+  "Look both ways" before the go, the long look's window from the stand's first second, never a handback. Returns the go."""
+  a, i = arrived_at(out), first_go(out)
+  assert i is not None, [(round(k * DT_MDL, 1), d.state, d.reason) for k, d in enumerate(out)][a::40]
+  assert (i - a) * DT_MDL <= sr.VISION_CREEP_AFTER_S + sr.VISION_LONG_CLEAR_S + 0.6
+  assert words is None or any(words in d.reason for d in out[a:i]), {d.reason for d in out[a:i]}
+  assert out[i].log['viewLimited'] and look_said(out, i) and no_handback(out) and crossed(out)
+  return i
+
+
+def held_for_a_car_coming(w, seconds=14.):
+  """The rail on a limited view: a car the forward cameras track coming down the left lane (8 m/s, from 45 m, 2 s into the
+  stand) holds the go until it is by."""
+  w.tracks = forward_cars(w.j, (41, 'left', lambda t: None if t < 2. else 45. - 8. * (t - 2.)))
+  out = w.run(seconds)
+  i = first_go(out)
+  held = [k for k, d in enumerate(out) if any(h.key == 'tracked:41' for h in d.holds)]
+  assert held and i is not None and i > max(held) and (i + 1) * DT_MDL >= 2. + 45. / 8., (i, held[:1], held[-1:])
+  return out
+
+
 @pytest.mark.parametrize('quality', ['washed', 'frozen'])
 @pytest.mark.parametrize('when', list(WHEN))
-def test_a_washed_out_or_frozen_side_view_waits_with_no_bound_and_no_handback_then_goes_once_it_reads(tmp_path, monkeypatch, when,
-                                                                                                      quality):
-  # a washed sector (the sun or headlights in the lens) or a frozen one (its pixels not changing, not dark: sideview reads a
-  # band clipped black as dark) is a bearing the camera can't see at all: never gone on as a limited view. The car creeps for
-  # a view and waits there, said in plain words, past STATIC_WAIT_S with no handback; once the sectors read again it goes
-  clear_at, world = [100. + 40.], []
-
-  def fn(view):
-    return far_sectors(quality, 62.5)(view) if world[0].t_cam < clear_at[0] else far_sectors('ok', 90.)(view)
-  monkeypatch.setattr(tsg, 'sectors', fn)
-  w = vdrive(tmp_path, wall_t=WHEN[when])
-  world.append(w)
-  out = w.run(56.)
-  a, i = arrived_at(out), first_go(out)
-  assert i is not None and (i + 1) * DT_MDL >= 40. + sr.VISION_CLEAR_S - 0.11, [(round(k * DT_MDL, 1), d.state, d.reason)
-                                                                                   for k, d in enumerate(out)][a::80]
-  waits = out[a + round(sg.STATIC_WAIT_S / DT_MDL):round(39. / DT_MDL)]
-  assert waits and all(d.state == 'observe' and d.prompt == 'waitingForCross' for d in waits)
-  assert all(d.ledger == 'dynamic' for d in waits[round(10. / DT_MDL):])  # its bound gone: a wait on the camera, no clock
-  assert any(sg.REACH_WORDS[quality] in d.reason for d in waits), {d.reason for d in waits}
-  assert no_handback(out) and crossed(out)
+def test_a_washed_out_or_frozen_side_view_is_said_and_the_car_goes_on_what_its_cameras_see(tmp_path, monkeypatch, when, quality):
+  # a washed sector (the sun, a streetlight or headlights in the lens) or a frozen one is a bearing that side camera can't
+  # see, for as long as the light shines. The lane is short as behind any occluder: said in plain words, no creep (a step
+  # forward shows no more), then the long look and the go on what is seen. A car seen coming still holds the go
+  monkeypatch.setattr(tsg, 'sectors', far_sectors(quality, 62.5))
+  out = vdrive(tmp_path, wall_t=WHEN[when]).run(20.)
+  goes_on_what_it_sees(out, sg.REACH_WORDS[quality])
+  assert not creeps(out)
+  held_for_a_car_coming(vworld(tmp_path, wall_t=WHEN[when]))
 
 
 # --------------------------------------------------------------------------------- the light at the line: glare, no gate
@@ -282,14 +292,17 @@ def test_a_car_stopped_in_the_junction_holds_the_go_with_no_bound_and_the_car_go
   assert i is not None and i * DT_MDL > 30. and no_handback(out)
 
 
-def test_a_car_yawed_past_8_deg_at_its_line_waits_said_and_never_hands_back(tmp_path):
-  # before: "the car isn't straight on its approach", a static wait, H3 at 15 s. Its lanes are placed on its approach, so the
-  # car doesn't go on a geometry it doesn't have: it waits, said, with no bound
-  w = vworld(tmp_path, 15)
+def test_a_car_yawed_past_8_deg_at_its_line_is_no_hold_and_the_car_goes(tmp_path):
+  # a standing car's heading doesn't change by waiting, so its yaw is no hold. It is the walk's rotation bound: the lanes
+  # read shorter (the road opposite 4.8 m), and no step forward can show enough of them (0.25 m a step), so there is no
+  # creep: the long look and the go on what is seen. A car seen coming still holds the go
+  w = vdrive(tmp_path, 15)
   out = w.run(30., yaw20_deg=12.)
-  assert first_go(out) is None and no_handback(out)
-  assert any(h.key == 'yaw' for h in out[-1].holds) and out[-1].reason == "Waiting: the car isn't straight on its approach"
-  assert out[-1].ledger == 'dynamic'
+  goes_on_what_it_sees(out)
+  assert not creeps(out) and not any(h.key == 'yaw' for d in out for h in d.holds)
+  w = vworld(tmp_path, 15)
+  w.kw['yaw20_deg'] = 12.
+  held_for_a_car_coming(w, 30.)
 
 
 def test_a_person_in_front_still_holds_and_is_still_handed_back_at_30_s(tmp_path):
@@ -317,30 +330,17 @@ GLARE = {'lowSun': (LOW_SUN, {}, (('washed', 62.5), ('ok', 90.))),
 
 
 @pytest.mark.parametrize('glare', list(GLARE))
-def test_glare_with_a_side_camera_washed_out_inside_the_suns_zone_waits_said_with_no_bound_then_goes_once_it_reads(tmp_path, monkeypatch,
-                                                                                                                  glare):
-  # the glare zero ended the walk where the sun's zone starts, so the washed sectors beyond were never read: the lanes read
-  # 'lowSun' (6.0 of 37.6 m) or 'sunAhead' (10.5 and 16.5 m), and at the creep's limit the car went 25.15 s after its stop on
-  # boxes from a saturated camera, where the same sectors on a plain day waited. Now it waits as on a plain day, said, with no
-  # bound and no handback, and goes once the sectors read
+def test_glare_with_a_side_camera_washed_out_inside_the_suns_zone_goes_on_what_it_sees_and_a_car_coming_holds(tmp_path, monkeypatch,
+                                                                                                              glare):
+  # the sun in a side lens: the lanes read short (the glare's zero, the washed sectors), which is a view, never a wait with
+  # no bound: the long look and the go on what is seen, and a car the forward cameras see coming holds it
   wall_t, jkw, (left, right) = GLARE[glare]
-  clear_at, world = [100. + 40.], []
-
-  def fn(view):
-    return side_sectors(left, right)(view) if world[0].t_cam < clear_at[0] else far_sectors('ok', 90.)(view)
-  monkeypatch.setattr(tsg, 'sectors', fn)
-  w = vdrive(tmp_path, wall_t=wall_t, j=vision_junction(**jkw))
-  world.append(w)
-  out = w.run(56.)
-  a, i = arrived_at(out), first_go(out)
-  assert i is not None and (i + 1) * DT_MDL >= 40. + sr.VISION_CLEAR_S - 0.11, [(round(k * DT_MDL, 1), d.state, d.reason)
-                                                                                   for k, d in enumerate(out)][a::80]
-  waits = out[a + round(sg.STATIC_WAIT_S / DT_MDL):round(39. / DT_MDL)]
-  assert waits and all(d.state == 'observe' and d.prompt == 'waitingForCross' for d in waits)
-  assert all(d.ledger == 'dynamic' for d in waits[round(10. / DT_MDL):])
-  assert any(sg.REACH_WORDS['washed'] in d.reason for d in waits), {d.reason for d in waits}
-  assert any(x.binding == 'washed' for d in waits for x in d.lanes)
-  assert no_handback(out) and crossed(out)
+  monkeypatch.setattr(tsg, 'sectors', side_sectors(left, right))
+  out = vdrive(tmp_path, wall_t=wall_t, j=vision_junction(**jkw)).run(30.)
+  i = first_go(out)
+  assert i is not None and any(x.r_seen < x.r_req for x in out[i - 1].lanes)
+  assert out[i].log['viewLimited'] and look_said(out, i) and no_handback(out) and crossed(out)
+  held_for_a_car_coming(vworld(tmp_path, wall_t=wall_t, j=vision_junction(**jkw)), 40.)
 
 
 def test_low_sun_with_a_washed_sector_the_lanes_walk_never_reaches_on_a_plain_day_still_goes_on_what_it_sees(tmp_path, monkeypatch):
@@ -378,23 +378,25 @@ def stuck(view):
 
 
 @pytest.mark.parametrize('when', list(WHEN))
-def test_a_stuck_side_camera_feed_is_the_camera_fault_said_then_handed_back_never_a_wait_with_no_bound(tmp_path, monkeypatch, when):
-  # before: every sector frozen zeroed the left lane, the creep went to its limit, and the car waited there with no bound and
-  # no take-control, an info chime a minute, for a fault. A run whose every sector reads frozen carries no new image, so the
-  # view ages as one that stopped running: the camera fault, said (cameraPaused, "side camera frozen (left)"), H1 after
-  # FAULT_GRACE_S, the old fault handback; never a go on it
+def test_a_stuck_side_camera_feed_is_no_fault_and_the_car_goes_on_its_other_cameras(tmp_path, monkeypatch, when):
+  # a side feed stuck (every sector frozen) is no camera fault: the side views are used when they run and never needed. The
+  # left lane is short (said: side camera frozen), the go comes on what the other cameras see, and the stuck feed is in the
+  # log (stop_go_side_views) once it has been out DET_FAULT_S
+  events = []
+  monkeypatch.setattr(sg.cloudlog, 'event', lambda name, **kw: events.append((name, kw)))
   monkeypatch.setattr(tsg, 'sectors', stuck)
   w = vdrive(tmp_path, wall_t=WHEN[when])
   out = w.run(16.)
-  k = next((n for n, d in enumerate(out) if d.fault), None)
-  assert k is not None and out[k].fault == 'H1', [(round(n * DT_MDL, 1), d.state, d.reason) for n, d in enumerate(out)][::40]
-  assert any(d.reason == "Waiting: side camera frozen (left)" and d.ledger == 'fault' for d in out[:k])
-  assert first_go(out) is None and not any(d.fault in ('H3', 'H5', 'H9') for d in out)
-  assert (k - arrived_at(out)) * DT_MDL <= sg.DET_FAULT_S + sg.FAULT_GRACE_S + sr.VISION_CREEP_AFTER_S + 0.6
+  goes_on_what_it_sees(out, sg.REACH_WORDS['frozen'])
+  assert not any(d.alert == 'cameraPaused' for d in out)
+  w = vworld(tmp_path, wall_t=WHEN[when])
+  out = held_for_a_car_coming(w, 16.)
+  said = [kw for name, kw in events if name == 'turnpilot.stop_go_side_views']
+  assert said and said[-1]['out'] and said[-1]['dead'] == ['sideLeft'] and not any(d.fault for d in out)
 
 
 def test_a_side_feed_stuck_for_a_moment_then_live_again_is_no_fault_and_the_car_goes(tmp_path, monkeypatch):
-  # a spell short of the fault's grace: said while it lasts, then judged as any view; a frozen spell that clears is no fault
+  # a frozen spell that clears: said while it lasts, no fault, and the car goes
   world = []
 
   def fn(view):
@@ -405,6 +407,6 @@ def test_a_side_feed_stuck_for_a_moment_then_live_again_is_no_fault_and_the_car_
   world.append(w)
   out = w.run(24.)
   i = first_go(out)
-  assert i is not None and i * DT_MDL >= 5.5, [(round(n * DT_MDL, 1), d.state, d.reason) for n, d in enumerate(out)][::40]
-  assert any(d.reason == "Waiting: side camera frozen (left)" for d in out[:i])
+  assert i is not None, [(round(n * DT_MDL, 1), d.state, d.reason) for n, d in enumerate(out)][::40]
+  assert any(sg.REACH_WORDS['frozen'] in d.reason for d in out[:i])
   assert not any(d.fault for d in out) and no_handback(out) and crossed(out)

@@ -256,7 +256,9 @@ def test_turn_only_lane_flagged_and_shown():
   sim.run(26.)
   mismatch = [(s, plan.laneMismatch) for s, _, plan in sim.trace]
   flagged = [s for s, m in mismatch if m == custom.TurnpilotPlan.LaneMismatch.turnOnlyGoingStraight]
-  assert flagged and 300. - 78. < flagged[0] < 300. - 78. + 20 * DT_MDL * 13. + 1.  # 1 s after the planner's last chance
+  # inside the lane planner's last chance (lane_change_window's end at the car's speed, slowing from 13 m/s)
+  from openpilot.selfdrive.turnpilot.lane_planner import LC_END_MIN_M, LC_END_S
+  assert flagged and 300. - LC_END_S * 13. - 1. < flagged[0] < 300. - LC_END_MIN_M
   assert max(flagged) < 301.
   assert all(m == custom.TurnpilotPlan.LaneMismatch.none for s, m in mismatch if s > 301.)
   plan = next(plan for s, _, plan in sim.trace if s == flagged[-1])

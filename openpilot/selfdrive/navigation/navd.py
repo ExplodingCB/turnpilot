@@ -429,7 +429,8 @@ class RouteJob(threading.Thread):
     deadline = engine.monotonic() + (AVOID_TIME_S if engine.onroad() else AVOID_TIME_PARKED_S)
     result = avoid.run(self.steps, self.controls, self.controls_status, self.avoid, certify=certify_one, reroute=reroute,
                        route_controls=router.controls, own_edge=own_edge, cancelled=self.cancel.is_set, deadline=deadline,
-                       monotonic=engine.monotonic, enabled=self.avoid_on, headings=headings, lefts=route_lefts)
+                       monotonic=engine.monotonic, enabled=self.avoid_on, headings=headings, lefts=route_lefts,
+                       detour=self.runtime.mode != certify.VISION)
     self.steps, self.controls, self.controls_status = result.steps, result.controls, result.controls_status
     self.avoid_status, self.avoided, self.avoid_added_s = result.status, result.avoided, result.added_s
     self.lefts_avoided, self.lefts_unavoidable = result.lefts_avoided, result.lefts_unavoidable
@@ -469,6 +470,7 @@ class RouteEngine:
     self.avoid_status, self.avoided, self.avoid_added_s = 'none', 0, 0.
     self.lefts_avoided, self.lefts_unavoidable = 0, 0  # TurnPilot: the route's lefts routed around and left on it (RouteJob)
     self.route_runtime = None
+    self.plan_runtime: tuple | None = None  # (mode, side views live) as turnpilotd's last valid plan said them (runtime_inputs)
     self.avoid_rerun = False
     self.route_always_drive = False  # TurnPilotAlwaysDrive as the route was made under it (always_drive_on; R1 to R3, S6)
 
@@ -740,8 +742,13 @@ class RouteEngine:
       try:
         go = self.sm['turnpilotPlan'].stopGo
         side, mode = bool(go.sideViewsLive), str(go.mode) or mode
+        self.plan_runtime = (mode, side)
       except Exception:
         pass
+    elif self.plan_runtime is not None and self.onroad():
+      # a plan gone invalid for a moment (its inputs' checks) says nothing new of the side views: what it last said stands,
+      # so the blip is no runtime change, and no reroute of the whole route for one
+      mode, side = self.plan_runtime
     return certify.Runtime(mode=mode, side_views=side, a_launch=stop_rules.a_launch_plan(self.params), clock_valid=system_time_valid())
 
   @staticmethod
@@ -1080,7 +1087,13 @@ class RouteEngine:
     msg.navInstruction.avoidAddedS = float(max(self.avoid_added_s, 0.)) if self.route is not None else 0.
     # the whole route's stops the avoidance couldn't route around, and whether the first is on its first edge (route start's
     # "M stop signs on this route need you", "First stop needs you": STOP_SIGNS.md 3.4)
-    stuck = sorted((c for c in (self.controls or []) if c.kind in ('stop', 'yield') and getattr(c, 'certification', '') == 'unavoidable'),
+    # under vision only a stop the line itself hands back at counts (stop_rules.vision_needs_driver): every other is driven
+    vision = self.route_runtime is not None and self.route_runtime[0] == certify.VISION
+    def needs_driver(c) -> bool:
+      rail = getattr(getattr(c, 'junction_info', None), 'rail_distance', -1.)
+      return not vision or stop_rules.vision_needs_driver(getattr(c, 'cert_reason', ''), rail)
+    stuck = sorted((c for c in (self.controls or []) if c.kind in ('stop', 'yield') and getattr(c, 'certification', '') == 'unavoidable' and
+                    needs_driver(c)),
                    key=lambda c: c.route_m) if self.route is not None else []
     msg.navInstruction.unavoidableControls = min(len(stuck), 65535)
     msg.navInstruction.firstUnavoidableOnOrigin = bool(stuck) and bool(getattr(stuck[0], 'first_edge', False))

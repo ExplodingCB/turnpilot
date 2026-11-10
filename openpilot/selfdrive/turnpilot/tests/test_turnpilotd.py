@@ -449,12 +449,12 @@ def test_a_far_side_turns_bay_not_open_yet_is_never_wrong_lane():
   one-lane approach, the centre line read yellow: once the latch has BAY_YELLOW_READS reads the plan wants no change (the car
   beside the centre line is in the far-most lane of its direction, the one the bay opens from) and turnpilotd's
   lane_mismatch goes by the same latch (bay.shut), so 'Wrong Lane: This lane doesn't turn with the route' is never said
-  inside the window's end (60 m at 10 m/s). Without the latch handed over it was, from 52 m to the line, every approach."""
+  inside the window's end (45 m at 10 m/s). Without the latch handed over it was, from there to the line, every approach."""
   SY, SW = LinePaint('solid', 'yellow', 0.9, 0.95), LinePaint('solid', 'white', 0.9, 0.95)
   sim = Sim([(400., 'turn', 'left', T_LEFT), (2000., 'turn', 'right')], cruise=10., nav_lanes={0: LEFT_BAY}, model_lanes=(0, 0),
             paint=(UNKNOWN, SY, SW, UNKNOWN))
   sim.v = 10.
-  assert lane_change_window(10.)[1] == 60.
+  assert lane_change_window(10.)[1] == 45.
   while sim.s < 395.:
     sim.step(engaged=True)
   assert sim.tp.lanes.bay.shut
@@ -2485,11 +2485,13 @@ def test_a_route_waiting_on_its_start_direction_says_it_starts_never_off_route(a
   was "Off route, map stops unknown: take control or wait for reroute" with offRouteStopsUnknown's chime at every route start,
   the car on no route at all. While navd says so, the status line says the route starts (ROUTE_STARTS_REASON standing,
   ROUTE_STARTING_REASON moving: a reroute made for the heading) with no sound (mapControlsUnavailableSilent), and the
-  off-route cap stays (map_controls OFF_ROUTE_SPEED, the switch's OFF_ROUTE_DRIVE_SPEED: nothing ahead is known). Without the
-  flag, off the route, the words and the alert are as they were."""
-  from openpilot.selfdrive.turnpilot.map_controls import OFF_ROUTE_DRIVE_REASON, OFF_ROUTE_DRIVE_SPEED, OFF_ROUTE_REASON, OFF_ROUTE_SPEED
+  off-route cap stays with the switch off (map_controls OFF_ROUTE_SPEED: nothing ahead is known); under the switch there is
+  no cap, the car pulls away as stock openpilot does. Without the flag, off the route, the words are the off-route ones, the
+  switch's with no sound, the cap's alert as it was with it off."""
+  from openpilot.selfdrive.turnpilot.map_controls import OFF_ROUTE_DRIVE_REASON, OFF_ROUTE_REASON, OFF_ROUTE_SPEED
+  from openpilot.selfdrive.turnpilot.turn_speed import NO_SPEED_CAP
   from openpilot.selfdrive.turnpilot.turnpilotd import ROUTE_STARTING_REASON, ROUTE_STARTS_REASON
-  floor = OFF_ROUTE_DRIVE_SPEED if always_drive else OFF_ROUTE_SPEED
+  floor = NO_SPEED_CAP if always_drive else OFF_ROUTE_SPEED
 
   def run(unverified, standing):
     sim = Sim([(400., "turn", "right"), (2000., "turn", "left")], cruise=13.)
@@ -2510,7 +2512,11 @@ def test_a_route_waiting_on_its_start_direction_says_it_starts_never_off_route(a
   sim, plans = run(False, False)
   off = OFF_ROUTE_DRIVE_REASON if always_drive else OFF_ROUTE_REASON
   assert all(p.reason == off for p in plans) and plans[0].speedCap <= floor + 1e-3
-  assert any(p.controlAlert == 'offRouteStopsUnknown' for _, _, p in sim.trace), "the off-route onset's alert, as before"
+  said = {str(p.controlAlert) for _, _, p in sim.trace}
+  if always_drive:  # no cap and no chime: the status line alone
+    assert 'offRouteStopsUnknown' not in said and 'mapControlsUnavailableSilent' in said and sim.v > OFF_ROUTE_SPEED + 2.
+  else:
+    assert 'offRouteStopsUnknown' in said, "the off-route onset's alert, as before"
 
 
 def late_signal(turn: str, at: float, v: float = 6.):
@@ -3990,13 +3996,13 @@ def test_a_turn_whose_lane_change_never_went_is_skipped_out_loud_never_turned_fr
             paint=BROKEN_WHITE_RIGHT)
   sim.tp.always_drive = always_drive
   sim.blindspot = lambda sim: (False, True)
-  sim.run(26.)
+  sim.run(30.)  # past the window's end (67.5 m at 15 m/s)
   plans, first = skipped_for_its_lane(sim, 400.)
   assert {str(p.laneChangeWait) for i, p in enumerate(plans[:first]) if 120. < 400. - sim.trace[i][0] < 280.} == {'blindspot'}
   sim = Sim([(160., 'turn', 'right'), (2000., 'turn', 'left')], cruise=1.8, nav_lanes={0: TWO_LANES_RIGHT_TURN}, model_lanes=(0, 1),
             paint=BROKEN_WHITE_RIGHT)
   sim.tp.always_drive = always_drive
-  sim.run(65.)
+  sim.run(75.)  # past the window's end (35 m at a crawl)
   plans, first = skipped_for_its_lane(sim, 160.)
   assert not any(p.laneChangeOffer != LaneChange.none for p in plans)
 
@@ -4022,7 +4028,7 @@ def test_a_curb_side_change_on_less_than_paint_never_goes_on_paint_nobody_read(s
   def drive(det, on=True):
     sim = Sim([(400., 'turn', 'right'), (2000., 'turn', 'left')], cruise=15., model_lanes=(0, 1), paint=plan_paint(det, True))
     sim.tp.always_drive = on
-    sim.run(26.)  # past the window's end, the car slowed for the turn
+    sim.run(30.)  # past the window's end, the car slowed for the turn
     return [p for _, _, p in sim.trace]
   read = drive(detections_paint('read', [UNKNOWN, LinePaint('solid', 'yellow', 0.875, 0.9375), UNKNOWN, UNKNOWN]))
   assert any(p.laneChangeOffer == LaneChange.right for p in read) and any(p.laneChange == LaneChange.right for p in read)

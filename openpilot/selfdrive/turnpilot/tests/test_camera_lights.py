@@ -8,8 +8,8 @@ import pytest
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.turnpilot import map_controls
 from openpilot.selfdrive.turnpilot.map_controls import (CAMERA_OFF_AGAIN_S, CAMERA_OFF_REASON, CAMERA_OFF_STILL_REASON,
-                                                         CAMERA_STALE_S, GREEN_STEADY_S, MAP_DECEL_MAX, NO_LIGHTS, CameraLights,
-                                                         Lights, MapControlPolicy, camera_light_input)
+                                                         CAMERA_STALE_S, GREEN_STEADY_S, MAP_DECEL_MAX, NO_LIGHTS, RED_DECEL,
+                                                         CameraLights, Lights, MapControlPolicy, camera_light_input)
 from openpilot.selfdrive.turnpilot.scene_policy import decide
 from openpilot.selfdrive.turnpilot.tests.test_map_controls import Car, held, lights, oracle
 
@@ -284,7 +284,7 @@ def test_add_only_camera_never_raises_a_candidate_or_removes_a_stop(seed):
     assert dec_b.accel_cap <= dec_a.accel_cap + 1e-9 and dec_b.speed_cap <= dec_a.speed_cap + 1e-9, (v, a.stops, b.stops)
     assert dec_b.should_stop or not dec_a.should_stop
     added = [s for s in b.stops if s not in a.stops]
-    assert all(s.accel_cap >= MAP_DECEL_MAX - 1e-9 for s in added)  # what it adds is never past -2.0
+    assert all(s.accel_cap >= -RED_DECEL - 1e-9 for s in added)  # what it adds is never past a red's floor
 
 
 # --- through turnpilotd: the camera's lights from turnpilotDetections ---
@@ -553,24 +553,47 @@ def right_sim(mode, state, controls=(), s_head=215.):
 
   def lights(sim):
     if int(round(sim.t / DT_MDL)) % 2 == 0:
-      sim.sm.put('turnpilotDetections', detections(state, s_head - sim.s, shadow=mode != 'addOnly'))
+      sim.sm.put('turnpilotDetections', detections(state['s'] if isinstance(state, dict) else state, s_head - sim.s,
+                                                   shadow=mode != 'addOnly'))
     return none
   sim.lights = lights
   return sim
 
 
-def test_turnpilotd_unmapped_right_on_a_camera_red_stops_at_the_line_and_holds():
+def test_turnpilotd_unmapped_right_on_a_camera_red_stops_at_the_line_and_holds_while_it_is_read():
+  """A right on a read red stops at the line (the 11-06 right rolled it) and stands for as long as the red is read, the way
+  clear or not: never a right on a red it is reading. The red no longer read for RIGHT_RED_UNREAD_S, it goes on its look,
+  and a vehicle the scene sees crossing holds it for as long as it is seen."""
   from openpilot.cereal import log
+  from openpilot.selfdrive.turnpilot.map_controls import RIGHT_RED_CROSS_REASON, RIGHT_RED_UNREAD_S, RIGHT_RED_WAIT_REASON
   from openpilot.selfdrive.turnpilot.tests.test_turnpilotd import stop_at
-  sim = right_sim('addOnly', 'red')
+  state = {'s': 'red'}
+  sim = right_sim('addOnly', state)
   plan = stop_at(sim, 190.)
   assert plan.shouldStop and -2. < 190. - sim.s < 6. and all(p.accelCap >= MAP_DECEL_MAX - 1e-6 for _, _, p in sim.trace)
   assert str(plan.mapControl.kind) == 'signal'
-  s_held = sim.s
-  sim.run(20.)
-  assert sim.s - s_held < 0.1 and all(p.shouldStop for _, _, p in sim.trace[-int(19. / DT_MDL):])
+  s_held, n = sim.s, len(sim.trace)
+
+  def crossing(sim):  # a car coming along the cross road from the left
+    return ({'cls': 'car', 'x': 200. + 4. - sim.s, 'y': 25., 'vx': 0., 'vy': -8., 'age': 40, 'trackId': 7, 'conf': 0.8},)
+  sim.run(20.)  # the road clear, the red read: held, waiting for the green, nothing certified
+  held = [p for _, _, p in sim.trace[n:]]
+  assert sim.s - s_held < 0.1 and all(p.shouldStop and p.reason == RIGHT_RED_WAIT_REASON for p in held[int(1. / DT_MDL):])
+  assert all(str(p.controlPrompt) == 'none' and str(p.goCertified.cause) == 'none' for p in held)
+  assert not sim.tp.map_controls.right_on_red(200. - sim.s)
   # no turn desire out while held at the red (the desire waits for the go)
   assert all(p.desire != log.Desire.turnRight for s, _, p in sim.trace if s < 190.)
+  state['s'], n = 'unknown', len(sim.trace)
+  sim.run(20., objects=crossing)  # the head no longer read red: the look's, a crossing car holding it
+  held = [p for _, _, p in sim.trace[n:]]
+  assert sim.s - s_held < 0.1 and all(p.shouldStop for p in held)
+  assert all(p.reason == RIGHT_RED_CROSS_REASON for p in held[int((RIGHT_RED_UNREAD_S + 0.5) / DT_MDL):])
+  assert all(str(p.controlPrompt) == 'none' for p in held)
+  n = len(sim.trace)
+  sim.run(3.)  # the road clear, no red read: its go
+  after = [p for _, _, p in sim.trace[n:]]
+  assert not after[-1].shouldStop and sim.s > s_held + 0.5 and all(str(p.controlPrompt) == 'none' for p in after)
+  assert sim.tp.map_controls.right_on_red(200. - sim.s)
 
 
 def test_turnpilotd_unmapped_right_camera_green_goes():

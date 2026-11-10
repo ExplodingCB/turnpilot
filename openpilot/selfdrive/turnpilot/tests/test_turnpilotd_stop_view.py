@@ -140,19 +140,19 @@ def test_on_a_limited_view_a_crossing_car_seen_holds_the_go_until_it_has_passed_
 
 
 @pytest.mark.parametrize('when', list(WHEN))
-def test_a_stuck_left_side_camera_feed_is_the_camera_fault_through_turnpilotd_said_then_handed_back(tmp_path, monkeypatch, when):
-  # the review of 2026-11-08: a side run whose every sector reads frozen (sideview: the feed's luma repeated bit for bit) carried
-  # into the decider through turnpilotd's runs counts as no run: "side camera frozen (left)", then the take-control (H1) at the
-  # fault's grace, never a go on it and never a wait with no bound
+def test_a_stuck_left_side_camera_feed_through_turnpilotd_is_no_fault_and_the_car_goes_on_its_other_cameras(tmp_path, monkeypatch, when):
+  # a side run whose every sector reads frozen (sideview: the feed's luma repeated bit for bit) carried into the decider
+  # through turnpilotd's runs: the left lane short, said ("side camera frozen"), then "Look both ways" and the go on what the
+  # other cameras see, no camera fault. The side views are used when they run, never needed
   def fn(view):
     return far_sectors('frozen', 0.)(view) if view == 'sideLeft' else far_sectors('ok', 90.)(view)
   monkeypatch.setattr(ts, 'sectors', fn)
   sim = at(vsim(tmp_path), WHEN[when])
   run_to_line(sim)
-  held_s = sim.s
   sim.run(16.)
   plans = sim.plans()
-  faults = [str(p.stopGo.fault) for p in plans if str(p.stopGo.fault) not in ('', 'none')]
-  assert faults and set(faults) == {'H1'}, sorted(set(faults))
-  assert any(p.reason == "Waiting: side camera frozen (left)" for p in plans), {p.reason for p in plans[-400::40]}
-  assert handed_back(plans) and go_frame(sim) is None and sim.s < held_s + 1. and caps_ok(plans)
+  k = go_frame(sim)
+  assert k is not None and not any(str(p.stopGo.fault) not in ('', 'none') for p in plans)
+  assert any(sg.REACH_WORDS['frozen'] in p.reason for p in plans[:k]), {p.reason for p in plans[-400::40]}
+  assert plans[k - 1].reason == sg.LOOK_REASON
+  assert not handed_back(plans) and caps_ok(plans) and across(plans)

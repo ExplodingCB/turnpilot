@@ -302,17 +302,17 @@ class TestModeldDetector(OpenpilotTestCase):
     assert det.run.calls == ['frame1'] and str(pm.sent[0].camera) == 'wide' and pm.sent[0].frameId == 2
 
   def test_budget(self):
-    # a run only where the debt it leaves (the step past STEP_BUDGET_S) stays within DEBT_CAP_S: a 10 ms detector beside a
-    # model 1 ms under the budget leaves 9 ms; 3 ms under, 7. The model alone fits, so no debt builds while it waits. On the
-    # simulated clock (SimClock), so the host's own time never decides it
+    # a run only where the debt it leaves (the step past STEP_BUDGET_S) stays within DEBT_CAP_S: a 20 ms detector beside a
+    # model 1 ms under the budget leaves 19 ms (past FORCE_SKIP_LATE_S too, so no skip-one run); 13 ms under, 7. The model
+    # alone fits, so no debt builds while it waits. On the simulated clock (SimClock), so the host's own time never decides it
     with sim_clock() as clock:
-      det, pm = make_detector(det_time=0.010), PM()
+      det, pm = make_detector(det_time=0.020), PM()
       for _ in range(10):
         clock.tick()
         det.step(pm, det.model_state, STEP_BUDGET_S - 0.001, 0.0, log.Desire.none, [Meta(1), Meta(2)])
       assert pm.sent == [] and det.debt == 0.  # no room this step, every step
       clock.tick()
-      det.step(pm, det.model_state, STEP_BUDGET_S - 0.003, 0.0, log.Desire.none, [Meta(1), Meta(2)])
+      det.step(pm, det.model_state, STEP_BUDGET_S - 0.013, 0.0, log.Desire.none, [Meta(1), Meta(2)])
       assert len(pm.sent) == 1  # the first frame with room runs, even if it's not on the N-frame grid
     assert 0.010 - 0.003 <= DEBT_CAP_S < 0.010 - 0.001
 

@@ -364,6 +364,10 @@ def lane_change_text(plan, side: str, lit: bool = False) -> str:
     return f'Changing Lanes {side.capitalize()} Once Clear'
   if hold == 'clear':
     return f'Clear: Lane Change {side.capitalize()} in {math.ceil(plan.laneChangeCountdown)}'
+  if str(plan.signalPrompt) == side and str(plan.laneChange) != side and not lit:
+    # the driver signals this change: asked from the offer's first frame. The countdown counts to nothing on that path (the
+    # change goes on the driver's lamp, whenever it comes), and showing it first put the ask LC_WARN_S later
+    return f'Signal {side.upper()} to Change Lanes'
   if plan.laneChangeCountdown > 0.:
     return f'Lane Change {side.capitalize()} in {math.ceil(plan.laneChangeCountdown)}'
   if str(plan.laneChange) == side:
@@ -437,6 +441,10 @@ PROMPT_QUIET_S = 10.  # the prompt's quiet time before the first; since 2026-11-
 # a chime goes ahead of the lines without one until it has been on air this long: longer than any of its sounds (0.75 s),
 # so the next chime never cuts it off, and many of soundd's 20 Hz reads of selfdriveState
 CHIME_S = 1.
+# the prompt to signal ("Signal LEFT Now") sounds its side's chime once, then again each PROMPT_REPEAT_S while the lamp stays
+# dark: soundd loops that sound for as long as the alert carries it, and it played the whole wait (65 s at one held left).
+# On air CHIME_S, under the sound's 1.15 s, so soundd plays it through once
+PROMPT_REPEAT_S = 8.
 SKIP_TITLE = {'hazards': "Turn Cancelled: Hazards On", 'signalLost': "Turn Cancelled: Signal Went Out",
               'sideUncertain': "Turn Side Uncertain"}
 CHECK_TITLE = {'waiting': None, 'reason': "Turn Signal Check", 'release': "Checking Left Signal", 'left': "Checking Left Signal",
@@ -459,8 +467,10 @@ class Chime:
   shows, as every other TurnPilot alert keeps its sound (one 10 ms frame was heard about 1 time in 5). A line put aside
   once its chime has been on air CHIME_S, or that ended after it was on air, comes back silent: chimed once, never again
   for the same line."""
-  def __init__(self, sound: str = 'none'):
+  def __init__(self, sound: str = 'none', repeat: float | None = None):
     self.sound = sound
+    self.repeat = repeat  # s: a looping sound is on air CHIME_S of each this long while its line shows (None: all of it)
+    self.shown_t = 0.
     self.aired = 0.
     self.on_air = False
     self.spent = sound == 'none'
@@ -473,6 +483,10 @@ class Chime:
   def shown(self, shown: bool, dt: float) -> str:
     """This frame's sound for the line, shown or not."""
     if shown and not self.spent:
+      on = self.repeat is None or self.shown_t % self.repeat < CHIME_S - 1e-6
+      self.shown_t += dt
+      if not on:
+        return 'none'  # between its chimes: the line stays, silent
       self.on_air = True
       self.aired += dt
       return self.sound
@@ -551,7 +565,7 @@ class CarSignalEvents:
       self._hold(("Car Signals Not Verified", str(ts.why) or "Run the turn signal check", 'prompt'), CAR_SIGNAL_ONCE_S)
     if status == 'unavailable' and 'unavailable' not in self._once:
       self._once.add('unavailable')
-      self._hold(("Car Can't Signal", "No body-control message: you signal", 'prompt'), CAR_SIGNAL_ONCE_S)
+      self._hold(("Car Can't Signal", (str(ts.why) or "No body-control message") + ": you signal", 'prompt'), CAR_SIGNAL_ONCE_S)
     if status == 'ready' and flags & TeslaFlags.CAR_SIGNALS and not flags & TeslaFlags.CAR_SIGNALS_RECHECK and \
        'notRechecked' not in self._once:
       self._once.add('notRechecked')
@@ -590,7 +604,7 @@ class CarSignalEvents:
         self._prompt_chime.ended()
         # repeating until the driver's lamp is lit (car_signals drops the prompt then): one soft chime was missed on 11-06
         # (Kellen, 2026-11-07: make it more obvious, and very clear left from right: the side's own chime, the side in capitals)
-        self._prompt_chime = Chime('tpSignalLeft' if prompt == 'left' else 'tpSignalRight')
+        self._prompt_chime = Chime('tpSignalLeft' if prompt == 'left' else 'tpSignalRight', PROMPT_REPEAT_S)
       self._prompt_side, self._prompt_quiet = prompt, 0.
       prompt_line = (f"Signal {prompt.upper()} Now", f"Turn {prompt.upper()} ahead: put your {prompt} signal on")
     else:

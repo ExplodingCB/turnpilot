@@ -2395,13 +2395,13 @@ class TestStopAvoidance(unittest.TestCase):
 
   # --- TurnPilotStopSignGo=vision (tp/vision-go): navd's avoidance keeps every stop and yield vision can take ---
 
-  def vision_stop(self, n, route_m, mph=25, kind='stop', divided=False):
+  def vision_stop(self, n, route_m, mph=25, kind='stop', divided=False, rail_distance=-1.):
     """A control on the shipped files as Saturday's car meets it: no survey, the map's tiers (an all-way), each approach mph."""
     from openpilot.selfdrive.turnpilot.routing.junctions import Approach, Junction
     from openpilot.selfdrive.turnpilot.stop_rules import MPH
     c = self.stop(n, route_m, kind=kind)
     legs = [(270., -90., 'left', 11), (90., 90., 'right', 12), (0., 0., 'opposite', 13)]
-    c.junction_info = Junction(osm_node_id=4242, lat=39.7684, lon=-86.1581, stop_point_distance=13., rail_distance=-1., surveyed=False,
+    c.junction_info = Junction(osm_node_id=4242, lat=39.7684, lon=-86.1581, stop_point_distance=13., rail_distance=rail_distance, surveyed=False,
                                sidecar=True, divided=divided, approaches=[
                                  Approach(b, rel, role, 'residential', 'road', True, True, 1, 1, 'stop', 'stop', 'mapStrong', mph * MPH,
                                           mph * MPH, 'tagged', way) for b, rel, role, way in legs])
@@ -2430,20 +2430,69 @@ class TestStopAvoidance(unittest.TestCase):
     self.assertEqual((str(ni.avoidStatus), ni.avoidedControls), ('clean', 0))
     self.assertEqual(len(self.engine.controls), 3)
 
-  def test_vision_still_routes_around_what_it_would_hand_back(self):
+  def test_vision_routes_around_no_stop_and_says_the_one_its_line_would_ask_for(self):
+    # route 29 (11-08): the loop took a 13 s detour round one stop and tried a 43 s one round two more, under vision, where
+    # the line drives the stop itself. The route stays Valhalla's; the one stop the line would still ask the driver for (a
+    # mapped rail crossing: stop_go._vision_gate) is said, a divided cross road it drives is not
     self.vision_engine()
-    keep, divided = self.vision_stop(1, 60.), self.vision_stop(2, 150., divided=True)
-    router = self.start([keep, divided], reroutes=[[keep]])
-    self.assertEqual((divided.certification, divided.cert_reason), ('uncertifiable', 'geometry'))
-    self.assertEqual(len(router.reroute_calls), 1)
-    self.assertEqual(len(router.reroute_calls[0][4]), 1)  # only the divided one excluded
+    keep, divided, rail = self.vision_stop(1, 60.), self.vision_stop(2, 150., divided=True), self.vision_stop(3, 170., rail_distance=12.)
+    router = self.start([keep, divided, rail], reroutes=[[keep]])
+    self.assertEqual(router.reroute_calls, [])
+    self.assertEqual((divided.certification, divided.cert_reason), ('certifiable', 'none'))
+    self.assertEqual((rail.certification, rail.cert_reason), ('unavoidable', 'geometry'))
+    ni = self.instruction()
+    self.assertEqual((str(ni.avoidStatus), ni.avoidedControls, ni.unavoidableControls), ('unavoidable', 0, 1))
+    self.assertEqual(len(self.engine.controls), 3)
 
-  def test_vision_with_the_side_views_off_avoids_every_stop(self):
+  def test_vision_with_the_side_views_off_routes_around_no_stop(self):
     self.vision_engine(side_views=False)
     a, y = self.vision_stop(1, 60.), self.vision_stop(2, 150., kind='yield')
     router = self.start([a, y], reroutes=[[]])
-    self.assertEqual([c.cert_reason for c in (a, y)], ['sideViews', 'sideViews'])
-    self.assertEqual(len(router.reroute_calls[0][4]), 2)
+    # driven on the forward views: certified, nothing counted for the driver
+    self.assertEqual([(c.certification, c.cert_reason) for c in (a, y)], [('certifiable', 'none')] * 2)
+    self.assertEqual(router.reroute_calls, [])
+    self.assertEqual(self.instruction().unavoidableControls, 0)
+
+  def test_vision_counts_only_a_stop_its_line_hands_back_at_as_needing_the_driver(self):
+    # whatever a certifier marked a stop for, under vision the route-start count goes by the line's own rule
+    # (stop_rules.vision_needs_driver): a mapped rail crossing or no visibility file. Reach, glare, skew are driven
+    def certifier(control, eta, runtime):
+      control.certification, control.cert_reason = 'uncertifiable', {1: 'reach', 2: 'light', 3: 'skew', 4: 'geometry', 5: 'noTable'}[control.id]
+      return control.certification, control.cert_reason
+    self.vision_engine()
+    self.engine.certifier = certifier
+    stops = [self.vision_stop(1, 60.), self.vision_stop(2, 150.), self.vision_stop(3, 170.), self.vision_stop(4, 190., rail_distance=12.),
+             self.vision_stop(5, 210.)]
+    router = self.start(stops, reroutes=[[]])
+    self.assertEqual(router.reroute_calls, [])
+    self.assertEqual([c.certification for c in stops], ['unavoidable'] * 5)
+    self.assertEqual(self.instruction().unavoidableControls, 2)  # the rail crossing and the missing file
+
+  def test_a_plan_invalid_for_a_moment_is_no_runtime_change_and_no_reroute(self):
+    # turnpilotPlan goes invalid whenever carState or modelV2 fail their checks for half a second: read as "side views off",
+    # each such blip rerouted the whole route twice (off, then on again), navd's messages invalid while each job ran
+    self.vision_engine()
+    router = self.start([self.vision_stop(1, 60.)])
+    self.engine.recompute_hold = RECOMPUTE_HOLD
+    self.engine.recompute_route(gps_ok=True)
+    self.assertEqual(router.call_count, 1)
+    self.sm.valid['turnpilotPlan'] = False
+    router.steps = self.route_with([self.vision_stop(1, 60.)])
+    self.engine.recompute_route(gps_ok=True)
+    self.assertEqual((router.call_count, self.engine.runtime_inputs().side_views), (1, True))
+    self.sm.valid['turnpilotPlan'] = True
+    self.engine.recompute_route(gps_ok=True)
+    self.assertEqual(router.call_count, 1)
+    # the side views really going off is still a change
+    self.sm.data['turnpilotPlan'].stopGo.sideViewsLive = False
+    self.engine.recompute_route(gps_ok=True)
+    self.assertEqual(router.call_count, 2)
+
+  def test_off_vision_the_loop_still_routes_around_a_stop_that_hands_back(self):
+    a = self.stop(1, 60.)
+    router = self.start([a], reroutes=[[]])
+    self.assertEqual(len(router.reroute_calls), 1)
+    self.assertEqual((self.engine.avoid_status, self.engine.avoided), ('clean', 1))
 
   def test_always_drive_changes_nothing_navd_certifies_keeps_or_avoids_under_vision_or_auto(self):
     """TurnPilotAlwaysDrive implies nothing about TurnPilotStopSignGo: at route time navd certifies, keeps and avoids the same

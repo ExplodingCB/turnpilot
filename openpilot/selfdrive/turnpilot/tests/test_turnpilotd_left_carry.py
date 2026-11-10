@@ -42,7 +42,9 @@ def profile_s(v0: float, d: float) -> float:
 def run_left(model_fn, cars=lambda sim: (), seconds=25., lag_s=0.3, range_m=None, sim_fn=None, carry=True):
   """A left held at its line, plannerd attached with model_fn at lag_s, driven seconds with the Sim's yaw: (sim, the plans,
   the index in sim.trace of the first planned frame, the events of turnpilotd, go_override and the left). range_m: the full
-  pass's (FULL_PASS_RANGE_M on the car); carry False: turnpilotd's left_carry a no-op (HEAD's crossing)."""
+  pass's (FULL_PASS_RANGE_M on the car); carry False: turnpilotd's left_carry a no-op (HEAD's crossing). The scenarios here
+  are about the crossing after the go and need the car standing at its line before plannerd is attached, so the sim's driver
+  lights the lamp only once it stands (as shipped a clear roll-in with the lamp lit goes as the car reaches its line)."""
   events = []
 
   def said(name, *a, **kw):
@@ -51,6 +53,7 @@ def run_left(model_fn, cars=lambda sim: (), seconds=25., lag_s=0.3, range_m=None
        mock.patch.object(ul.cloudlog, 'event', side_effect=said), \
        mock.patch.object(TurnPilot, 'left_carry', TurnPilot.left_carry if carry else lambda self, *a, **kw: None):
     sim = left_sim(cars) if sim_fn is None else sim_fn()
+    sim.answers_prompt = False  # no lamp until the car stands: as shipped a clear roll-in lit goes as it reaches its line
     if range_m is not None:
       sim.tp.full_pass_range_m = range_m
     while not (sim.trace and sim.trace[-1][2].shouldStop and sim.v < 0.05 and str(sim.trace[-1][2].unprotectedLeft.state) == 'waitGap'):
@@ -58,6 +61,7 @@ def run_left(model_fn, cars=lambda sim: (), seconds=25., lag_s=0.3, range_m=None
       assert sim.t < 60.
     n0 = len(sim.trace)
     attach_planner(sim, model_fn, lag_s)
+    sim.answers_prompt = True
     plans = drive(sim, seconds)
   return sim, plans, n0, events
 
@@ -339,3 +343,22 @@ def test_a_carry_withdrawn_by_a_phantom_lead_comes_back_once_it_clears():
   assert in_lanes_s(sim, n0) <= profile_s(v0, LANES_M) + 0.5 + 0.6 + 0.3, (in_lanes_s(sim, n0), profile_s(v0, LANES_M))
   assert not any(str(p.controlPrompt) in TAKE_CONTROL_PROMPTS for p in plans)
   assert sim.s > JUNCTION + CLEAR_PATH_PAST_M
+
+
+def test_a_red_read_once_the_left_is_committed_never_takes_its_go_or_carry_back():
+  """Committed, the left can no longer stop short of the oncoming lanes: a red or yellow read from there on (the light
+  turning as the car crosses) refuses no go or carry of the left's own (release_blocked), so it finishes the turn at the
+  profile's pace, never left to a crawl in the oncoming lanes. Short of the commit a red read still refuses it, and any
+  other turn's release is refused by it as before."""
+  sim, _, _, _ = run_left(coasting, seconds=0.5)
+  tp = sim.tp
+  d = sim.distance()
+  with mock.patch.object(tp.map_controls, 'release_light', return_value='red'):
+    assert tp.left.state != 'committed' and tp.release_blocked(d, cause='unprotectedLeft') == 'light'
+    with mock.patch.object(tp.left, 'state', 'committed'):
+      assert tp.left_committed()
+      assert tp.release_blocked(d, cause='unprotectedLeft') == ''
+      assert tp.release_blocked(d, cause='unprotectedLeft', certifying=False) == ''
+      assert tp.release_blocked(d) == 'light'  # a turnRelease: not the left's own go
+      with mock.patch.object(tp.left, 'maneuver_id', -1):  # another maneuver's left
+        assert tp.release_blocked(d, cause='unprotectedLeft') == 'light'

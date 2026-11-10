@@ -6,11 +6,14 @@ navigate on. It stops acting at once (no new desires, lane changes or turn caps;
 and selfdrived raises the matching event, whose SOFT_DISABLE is openpilot's standard "take control" disable: the alert
 and chime, then a disengage SOFT_DISABLE_TIME later, not an abrupt cut.
 
-Like upstream's bigModelFailed, the soft disable is latched on the handback starting while engaged and held until
-openpilot is disengaged, so a detector that blinks back during the countdown can't cancel it halfway. Engaging later
-goes by the event's other types: a stopped detector, or one that never started, blocks it (NO_ENTRY) while it stays so;
-after a model fallback openpilot engages again on the small model, without TurnPilot: paused, its route kept, until the
-big model is back and the driver engages again (turnpilotd.py), which no soft disable here holds up.
+A model fallback's soft disable is latched, like upstream's bigModelFailed: it starts while engaged and is held until
+openpilot is disengaged (TurnPilot stays paused until the next engagement anyway, turnpilotd.py). A detector handback is
+openpilot's soft disable as stock runs it: raised while the detector is out, so one that comes back inside
+SOFT_DISABLE_TIME leaves openpilot engaged and turnpilotd takes its maneuver up again (the detector's own scheduler pauses
+it 0.8 s at a time, several times in a row, on every logged drive: 0.7 s short of the deadline). Engaging later goes by the
+event's other types: a stopped detector, or one that never started, blocks it (NO_ENTRY) while it stays so; after a model
+fallback openpilot engages again on the small model, without TurnPilot: paused, its route kept, until the big model is
+back and the driver engages again (turnpilotd.py), which no soft disable here holds up.
 """
 from openpilot.cereal import custom, log
 
@@ -27,7 +30,7 @@ EVENTS = {
 class HandbackEvents:
   def __init__(self):
     self.prev = Handback.none
-    self.latched = None  # the handback being driven to a disengage
+    self.latched = None  # a model fallback being driven to a disengage
 
   def update(self, plan, enabled: bool) -> list:
     """The events to add this frame. plan: the fresh turnpilotPlan (hooks.fresh_plan, disabled ones too: a fault's plan
@@ -38,14 +41,15 @@ class HandbackEvents:
     self.prev = handback
     if not enabled:
       self.latched = None
-    elif started and self.latched is None:
+    elif started and self.latched is None and handback == Handback.modelFellBack:
       self.latched = handback
 
     events = []
     if self.latched is not None:
       events.append(EVENTS[self.latched])  # the soft disable, to the end
     elif started or handback in (Handback.detectorStopped, Handback.noDetector):
-      events.append(EVENTS[handback])  # disengaged: the alert once it starts, and no engaging while the detector is out
+      # the alert once it starts; while the detector is out, the soft disable engaged and no engaging disengaged
+      events.append(EVENTS[handback])
     return events
 
   def apply(self, events, plan, enabled: bool) -> None:
