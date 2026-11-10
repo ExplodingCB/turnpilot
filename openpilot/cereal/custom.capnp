@@ -783,8 +783,35 @@ struct CustomReserved16 @0xfc6241ed8877b611 {
 struct CustomReserved17 @0xa30662f84033036c {
 }
 
-struct CustomReserved18 @0xc86a3d38d13eb3ef {
+struct AlpamayoOutput @0xc86a3d38d13eb3ef {
+  # Published by alpamayod with every inference, alongside alpamayoModelV2.
+  frameId @0 :UInt32;
+  timestampEof @1 :UInt64;
+  inferenceTimeS @2 :Float32;
+  cot @3 :Text;            # reasoning text or <NOMINAL>
+  navText @4 :Text;
+  mapping @5 :Text;        # camera mapping used by the adapter
+  # raw model output, rear axle frame at timestampEof (x fwd, y left), 0.1 s steps
+  x @6 :List(Float32);
+  y @7 :List(Float32);
+  kappa @8 :List(Float32); # curvature per step, left positive
+  accel @9 :List(Float32);
+  backend @10 :Text;       # tinygrad device or torch
 }
 
-struct CustomReserved19 @0xa4f1eb3323f5f582 {
+struct AlpamayoState @0xa4f1eb3323f5f582 {
+  # Published by controlsd. The plan itself is in alpamayoModelV2.
+  mode @0 :Mode;
+  usingAlpamayo @1 :Bool;         # active mode and Alpamayo is steering right now
+  fallbackReason @2 :Text;        # ok, noPlan, stale, disagree, laneChange, invalid, warmup
+  planAgeS @3 :Float32;
+  disagreeM @4 :Float32;          # lateral gap vs stock plan at the compare horizon
+  desiredCurvature @5 :Float32;   # Alpamayo curvature (right positive), also in shadow mode
+  inferenceTimeS @6 :Float32;
+
+  enum Mode {
+    off @0;
+    shadow @1;
+    active @2;
+  }
 }

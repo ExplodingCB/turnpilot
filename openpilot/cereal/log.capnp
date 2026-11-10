@@ -142,6 +142,8 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     turnpilotControlAlert @115;     # TurnPilot map stop control: turnpilotPlan.controlAlert
     turnpilotRouteNotice @116;      # TurnPilot stop signs on the route (STOP_SIGNS.md 3.4): said engaged or not (turnpilotPlan.routeNotice)
     turnpilotCarSignal @117;        # TurnPilot's turn signal: turnpilotPlan.turnSignal (tp/blinker's, after tp/integrate's @116)
+    alpamayoFallback @118;          # Alpamayo active: stock steering took over (stale, disagree, invalid plan)
+    alpamayoUnavailable @119;       # Alpamayo active but no plan yet
 
     # TurnPilot: a planned lane change is coming (chime, countdown), and one was aborted before it started
     turnpilotLaneChangeLeft @110;
@@ -2933,6 +2935,8 @@ struct Event {
     bookmarkButton @148 :UserBookmark;
 
     lateralManeuverPlan @150 :LateralManeuverPlan;
+    # fork-local: Alpamayo 2 Edge plan in modelV2 format (alpamayod)
+    alpamayoModelV2 @154 :ModelDataV2;
 
     # *********** debug ***********
     testJoystick @52 :Joystick;
@@ -2975,8 +2979,8 @@ struct Event {
     customReserved15 @141 :Custom.CustomReserved15;
     customReserved16 @142 :Custom.CustomReserved16;
     customReserved17 @143 :Custom.CustomReserved17;
-    customReserved18 @144 :Custom.CustomReserved18;
-    customReserved19 @145 :Custom.CustomReserved19;
+    alpamayoOutput @144 :Custom.AlpamayoOutput;
+    alpamayoState @145 :Custom.AlpamayoState;
 
     # *********** legacy + deprecated ***********
     model @9 :Deprecated.ModelData; # TODO: rename modelV2 and mark this as deprecated

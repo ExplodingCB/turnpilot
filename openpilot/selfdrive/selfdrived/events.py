@@ -682,6 +682,22 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.PERMANENT: NormalPermanentAlert("TurnPilot Unavailable", "Detector not running: take control", duration=10.),
   },
 
+  EventName.alpamayoFallback: {
+    ET.WARNING: Alert(
+      "Alpamayo Paused: Stock Steering",
+      "",
+      AlertStatus.userPrompt, AlertSize.small,
+      Priority.MID, VisualAlert.none, AudibleAlert.prompt, .2),
+  },
+
+  EventName.alpamayoUnavailable: {
+    ET.WARNING: Alert(
+      "Alpamayo Not Running: Stock Steering",
+      "",
+      AlertStatus.normal, AlertSize.small,
+      Priority.LOW, VisualAlert.none, AudibleAlert.none, .2),
+  },
+
   EventName.turnpilotModelFellBack: {
     ET.SOFT_DISABLE: turnpilot_handback_alert("Big model stopped: TurnPilot paused"),
     ET.PERMANENT: NormalPermanentAlert("TurnPilot Paused", "Big model stopped: route kept", duration=10.),

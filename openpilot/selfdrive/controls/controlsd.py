@@ -20,6 +20,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_curvature import LatControlCurv
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
+from openpilot.selfdrive.alpamayo.controls_hook import AlpamayoLateral
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from openpilot.selfdrive.turnpilot.car_signals import car_blinkers
 
@@ -41,10 +42,12 @@ class Controls:
 
     self.sm = messaging.SubMaster(['lateralDelay', 'vehicleParameters', 'lateralTorqueParameters', 'modelV2', 'selfdriveState',
                                    'extrinsicsCalibration', 'deviceMotion', 'longitudinalPlan', 'lateralManeuverPlan', 'carState', 'carOutput',
-                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance', 'turnpilotPlan'], poll='selfdriveState',
+                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance', 'turnpilotPlan'] + AlpamayoLateral.SUBS,
+                                  poll='selfdriveState',
                                   ignore_alive=['turnpilotPlan'], ignore_avg_freq=['turnpilotPlan'],
                                   ignore_valid=['turnpilotPlan'])  # TurnPilot off: none
-    self.pm = messaging.PubMaster(['carControl', 'controlsState'])
+    self.pm = messaging.PubMaster(['carControl', 'controlsState'] + AlpamayoLateral.PUBS)
+    self.alpamayo = AlpamayoLateral(self.params)
 
     self.steer_limited_by_safety = False
     self.curvature = 0.0
@@ -125,8 +128,13 @@ class Controls:
       new_desired_curvature = self.sm['lateralManeuverPlan'].desiredCurvature if CC.latActive else self.curvature
     else:
       new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
-    self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
     lat_delay = self.sm["lateralDelay"].lateralDelay + LAT_SMOOTH_SECONDS
+    # Alpamayo (AlpamayoMode=active) only replaces the lateral target; clipping and limits below still apply
+    alpamayo_curvature = self.alpamayo.update(self.sm, CS, self.sm.logMonoTime['carState'], lat_delay,
+                                              self.calibrated_pose, CC.latActive and not self.sm.valid['lateralManeuverPlan'])
+    if alpamayo_curvature is not None:
+      new_desired_curvature = alpamayo_curvature
+    self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
 
     actuators.curvature = self.desired_curvature
     steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
@@ -218,6 +226,7 @@ class Controls:
       cs.lateralControlState.torqueState = lac_log
 
     self.pm.send('controlsState', dat)
+    self.alpamayo.publish(self.pm, self.sm)
 
     # carControl
     cc_send = messaging.new_message('carControl')

@@ -5,7 +5,7 @@ import threading
 
 import openpilot.cereal.messaging as messaging
 
-from openpilot.cereal import log
+from openpilot.cereal import custom, log
 from opendbc.car.structs import car
 from openpilot.cereal.visionipc import VisionStreamType
 from msgq.visionipc import VisionIpcClient
@@ -86,7 +86,8 @@ class SelfdriveD:
     # TODO: de-couple selfdrived with card/conflate on carState without introducing controls mismatches
     self.car_state_sock = messaging.sub_sock('carState', timeout=20)
 
-    ignore = self.sensor_packets + self.gps_packets + ['alertDebug', 'lateralManeuverPlan', 'turnpilotPlan']  # TurnPilot off: none
+    ignore = self.sensor_packets + self.gps_packets + ['alertDebug', 'lateralManeuverPlan', 'turnpilotPlan',  # TurnPilot off: none
+                                                       'alpamayoState']
     if SIMULATION:
       ignore += ['cabinCameraState', 'managerState']
     if REPLAY:
@@ -96,7 +97,7 @@ class SelfdriveD:
                                    'carOutput', 'driverMonitoringState', 'longitudinalPlan', 'deviceMotion', 'lateralDelay',
                                    'managerState', 'vehicleParameters', 'radarState', 'lateralTorqueParameters',
                                    'controlsState', 'carControl', 'driverAssistance', 'alertDebug', 'userBookmark',
-                                   'lateralManeuverPlan', 'turnpilotPlan'] + \
+                                   'lateralManeuverPlan', 'turnpilotPlan', 'alpamayoState'] + \
                                    self.camera_packets + self.sensor_packets + self.gps_packets,
                                   ignore_alive=ignore, ignore_avg_freq=ignore,
                                   ignore_valid=ignore, frequency=int(1/DT_CTRL))
@@ -346,6 +347,14 @@ class SelfdriveD:
     elif self.sm['modelV2'].meta.laneChangeState in (LaneChangeState.laneChangeStarting,
                                                     LaneChangeState.laneChangeFinishing):
       self.events.add(EventName.laneChange)
+
+    # Alpamayo active mode: tell the driver whenever stock steering takes over
+    alp = self.sm['alpamayoState']
+    if alp.mode == custom.AlpamayoState.Mode.active and self.enabled:
+      if alp.fallbackReason in ('stale', 'disagree', 'invalid'):
+        self.events.add(EventName.alpamayoFallback)
+      elif alp.fallbackReason == 'noPlan':
+        self.events.add(EventName.alpamayoUnavailable)
 
     for i, pandaState in enumerate(self.sm['pandaStates']):
       # All pandas must match the list of safetyConfigs, and if outside this list, must be silent or noOutput

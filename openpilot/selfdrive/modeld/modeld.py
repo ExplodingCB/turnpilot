@@ -447,6 +447,10 @@ def main(demo=False, successor: str | None = None):
 
   # a cable is a chestnut on its way, unless a USB host is on it
   CHESTNUT = link is not None or (chestnut_compiled() and (chestnut_present() or (cable_connected() and not usb_host_connected())))
+  # alpamayod owns the chestnut when Alpamayo is on (only allowed with TurnPilot off); stock modeld then runs on the device GPU
+  from openpilot.selfdrive.alpamayo.gate import alpamayo_owns_chestnut
+  if link is None and alpamayo_owns_chestnut(Params()):
+    CHESTNUT = False
   if CHESTNUT:
     from tinygrad.runtime.ops_amd import AMDDevice
     AMDDevice.wait_timeout_ms = 3000

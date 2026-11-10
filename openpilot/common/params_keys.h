@@ -9,6 +9,10 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"AccessToken", {CLEAR_ON_MANAGER_START | DONT_LOG, STRING}},
     {"AdbEnabled", {PERSISTENT, BOOL}},
     {"AlwaysOnDM", {PERSISTENT, BOOL}},
+    {"AlpamayoMode", {PERSISTENT, STRING, "off"}},  // off | shadow | active; needs TurnPilotEnabled off (chestnut)
+    {"AlpamayoMaxPlanAgeS", {PERSISTENT, FLOAT, "1.5"}},
+    {"AlpamayoMaxDisagreeM", {PERSISTENT, FLOAT, "1.5"}},
+    {"AlpamayoMaxSpeed", {PERSISTENT, FLOAT, "9.0"}},  // m/s, above it stock steers
     {"ApiCache_Device", {PERSISTENT, STRING}},
     {"ApiCache_FirehoseStats", {PERSISTENT, JSON}},
     {"AssistNowToken", {PERSISTENT, STRING}},
