@@ -148,7 +148,7 @@ class SlotMaps:
     return "wide" if (slot == FRONT or self.mapping == "wide_only") else "narrow"
 
   def update(self, rpy) -> None:
-    key = tuple(np.round(np.asarray(rpy, dtype=np.float64), 4))
+    key = tuple(np.round(np.asarray(rpy, dtype=np.float64), 3))  # 1e-3 rad is under 1 px; finer keys defeat the frame caches
     if key == self._key:
       return
     self._key = key

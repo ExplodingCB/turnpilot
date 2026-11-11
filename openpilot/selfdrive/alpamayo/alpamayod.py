@@ -339,8 +339,9 @@ def nav_from_instruction(sm) -> str:
 def main():
   config_realtime_process([5], 1)
   params = Params()
-  # fov_pinhole beat exact f-theta by 0.05 m lateral on the demo route (NOTES.md); revisit on the user drives
-  mapping = os.environ.get("ALPAMAYO_MAPPING", "fov_pinhole")
+  # exact f-theta ("fov") won on comma four + os04c10 + Model 3 footage (ADE@3 s 0.046 m better than fov_pinhole,
+  # 95% CI 0.030 to 0.063); fov_pinhole had won on a comma 3 Corolla route. NOTES.md.
+  mapping = os.environ.get("ALPAMAYO_MAPPING", "fov")
   pm = messaging.PubMaster(["alpamayoModelV2", "alpamayoOutput"])
   sm = messaging.SubMaster(["carState", "deviceMotion", "extrinsicsCalibration", "deviceState", "narrowRoadCameraState",
                             "lateralDelay", "navInstruction"], poll="carState")
