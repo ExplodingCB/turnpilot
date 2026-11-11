@@ -1,4 +1,5 @@
 from collections.abc import Callable
+import pyray as rl
 from openpilot.common.time_helpers import system_time_valid
 from openpilot.system.ui.widgets.scroller import NavScroller
 from openpilot.selfdrive.ui.mici.widgets.button import BigButton, BigToggle, BigParamControl, BigCircleParamControl, GreyBigButton
@@ -32,6 +33,7 @@ class DeveloperLayoutMici(NavScroller):
   def __init__(self):
     super().__init__()
     self._ssh_fetcher = SshKeyFetcher(ui_state.params)
+    self._alpamayo_status_t = 0.0
 
     def github_username_callback(username: str):
       if username:
@@ -91,6 +93,11 @@ class DeveloperLayoutMici(NavScroller):
                                                          "and holds for pedestrians and oncoming traffic. Turns on navigation.")
     self._turnpilot_shadow_toggle = BigParamControl("turnpilot shadow mode", "TurnPilotShadowMode",
                                                     description="TurnPilot plans and shows what it would do, but doesn't act on it.")
+    self._alpamayo_toggle = BigToggle("alpamayo steering", initial_state=self._alpamayo_on(),
+                                      toggle_callback=self._on_alpamayo,
+                                      description="Experimental: NVIDIA Alpamayo 2 Edge on the chestnut sets the steering target below " +
+                                                  "20 mph. Stock steering takes over whenever its plan is late or disagrees. " +
+                                                  "Turns TurnPilot off. Downloads 5.3 GB on Wi-Fi first.")
     self._pair_phone_btn = BigButton("pair phone", icon=gui_app.texture("icons_mici/settings/device/phone.png", 85, 64),
                                      description="Pair a phone to set TurnPilot destinations.")
     self._pair_phone_btn.set_click_callback(lambda: gui_app.push_widget(PairPhoneScroller()))
@@ -112,6 +119,7 @@ class DeveloperLayoutMici(NavScroller):
       self._turnpilot_toggle,
       self._turnpilot_shadow_toggle,
       self._pair_phone_btn,
+      self._alpamayo_toggle,
     ])
 
     # Toggle lists
@@ -129,9 +137,9 @@ class DeveloperLayoutMici(NavScroller):
     )
     onroad_blocked_toggles = (self._adb_toggle, self._joystick_toggle)
     release_blocked_toggles = (self._joystick_toggle, self._long_maneuver_toggle, self._lat_maneuver_toggle, self._alpha_long_toggle, self._navigation_toggle,
-                               self._turnpilot_toggle, self._turnpilot_shadow_toggle, self._pair_phone_btn)
+                               self._turnpilot_toggle, self._turnpilot_shadow_toggle, self._pair_phone_btn, self._alpamayo_toggle)
     engaged_blocked_toggles = (self._long_maneuver_toggle, self._lat_maneuver_toggle, self._alpha_long_toggle,
-                               self._turnpilot_toggle, self._turnpilot_shadow_toggle)
+                               self._turnpilot_toggle, self._turnpilot_shadow_toggle, self._alpamayo_toggle)
 
     # Hide non-release toggles on release builds
     for item in release_blocked_toggles:
@@ -155,6 +163,22 @@ class DeveloperLayoutMici(NavScroller):
   def _update_state(self):
     super()._update_state()
     self._ssh_fetcher.update()
+    if self._alpamayo_toggle.is_visible and rl.get_time() - self._alpamayo_status_t > 1.0:
+      self._alpamayo_status_t = rl.get_time()
+      on = self._alpamayo_on()
+      self._alpamayo_toggle.set_value((ui_state.params.get("AlpamayoStatus") or "on") if on else "")
+
+  @staticmethod
+  def _alpamayo_on() -> bool:
+    from openpilot.selfdrive.alpamayo.gate import alpamayo_mode
+    return alpamayo_mode(ui_state.params) == "active"
+
+  def _on_alpamayo(self, state: bool):
+    ui_state.params.put("AlpamayoMode", "active" if state else "off")
+    if state:  # one model on the chestnut at a time
+      ui_state.params.put_bool("TurnPilotEnabled", False, block=True)
+      ui_state.turnpilot_enabled = False
+      self._turnpilot_toggle.set_checked(False)
 
   def show_event(self):
     super().show_event()
@@ -183,6 +207,7 @@ class DeveloperLayoutMici(NavScroller):
     # Refresh toggles from params to mirror external changes
     for key, item in self._refresh_toggles:
       item.set_checked(ui_state.params.get_bool(key))
+    self._alpamayo_toggle.set_checked(self._alpamayo_on())
 
   def _on_joystick_debug_mode(self, state: bool):
     ui_state.params.put_bool("JoystickDebugMode", state, block=True)
@@ -208,6 +233,9 @@ class DeveloperLayoutMici(NavScroller):
     restart_needed_callback()
 
   def _on_turnpilot(self, state: bool):
+    if state:
+      ui_state.params.put("AlpamayoMode", "off")
+      self._alpamayo_toggle.set_checked(False)
     # BigParamControl writes the param after this callback, so set the flag here and "pair phone" enables at once
     ui_state.turnpilot_enabled = state
     if not state:  # turnpilot_web, which keeps the readiness alert, stops with TurnPilot: nothing is missing now

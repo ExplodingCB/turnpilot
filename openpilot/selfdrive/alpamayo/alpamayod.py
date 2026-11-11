@@ -16,8 +16,10 @@ import collections
 import io
 import math
 import os
+import json
 import socket
 import struct
+import threading
 import time
 
 import numpy as np
@@ -179,13 +181,71 @@ class TinygradRunner:
     return out | {"cot": out["cot_text"], "backend": f"tinygrad:{self.dev}"}
 
 
-def make_runner():
-  backend = os.environ.get("ALPAMAYO_BACKEND", "tinygrad")
-  if backend == "torch":
-    return TorchServerRunner()
-  from openpilot.selfdrive.modeld.helpers import chestnut_present
-  dev = os.environ.get("ALPAMAYO_DEV") or ("USB+AMD:LLVM" if chestnut_present() else "CPU:LLVM")
-  return TinygradRunner(dev)
+class Loader:
+  """Gets a runner ready off the main loop: weights on disk, chestnut check, model load.
+
+  status is shown in the 'Alpamayo Not Running' alert and logged in alpamayoOutput;
+  report is the self-test JSON (also kept in the AlpamayoSelfTest param).
+  """
+
+  def __init__(self, params: Params):
+    self.params = params
+    self.status = "starting"
+    self.report: dict = {}
+    self.runner = None
+    self.thread = threading.Thread(target=self._load, daemon=True)
+    self.thread.start()
+
+  def _load(self):
+    try:
+      backend = os.environ.get("ALPAMAYO_BACKEND", "tinygrad")
+      if backend == "torch":
+        self.runner = TorchServerRunner()
+        return
+      from openpilot.selfdrive.alpamayo.fetch import weights_ready
+      while not weights_ready():
+        self.status = self.params.get("AlpamayoStatus") or "waiting for weights download"
+        time.sleep(1)
+      from openpilot.selfdrive.modeld.helpers import chestnut_present
+      dev = os.environ.get("ALPAMAYO_DEV") or ("USB+AMD:LLVM" if chestnut_present() else None)
+      if dev is None:
+        self.status = "no chestnut found"
+        return
+      self.report["dev"] = dev
+      if dev.startswith("USB"):
+        from openpilot.selfdrive.alpamayo.selftest import usb_check
+        self.status = "checking chestnut USB"
+        usb = usb_check(dev)
+        self.report["usb"] = usb
+        self._save()
+        if not usb["ok"]:
+          self.status = "chestnut USB check failed"
+          return
+      self.status = "loading model onto chestnut"
+      t0 = time.monotonic()
+      runner = TinygradRunner(dev)
+      self.report["load_s"] = round(time.monotonic() - t0, 1)
+      self._save()
+      self.status = "warming up"
+      self.runner = runner
+    except Exception as e:
+      cloudlog.exception("alpamayod: load failed")
+      self.status = f"load failed: {type(e).__name__}: {e}"[:120]
+      self.report["error"] = self.status
+      self._save()
+
+  def note_inference(self, exec_time: float, ok: bool):
+    times = self.report.setdefault("infer_s", [])
+    if len(times) < 10:
+      times.append(round(exec_time, 2))
+      self.report["infer_ok"] = self.report.get("infer_ok", 0) + int(ok)
+      self._save()
+    if ok:
+      self.status = "ready"
+
+  def _save(self):
+    self.params.put("AlpamayoSelfTest", json.dumps(self.report))
+    cloudlog.warning(f"alpamayod: self-test {json.dumps(self.report)}")
 
 
 # ------------------------------------------------------------------ output
@@ -262,8 +322,9 @@ def main():
     while not c.connect(False):
       time.sleep(0.1)
   rings = {k: FrameRing() for k in clients}
-  runner = None
+  loader = Loader(params)
   maps = None
+  last_status_t = 0.0
   cloudlog.warning(f"alpamayod: streams up, mapping {mapping}")
 
   while True:
@@ -286,11 +347,20 @@ def main():
       maps = ca.SlotMaps(ca.CommaCams(dc.wide_road.intrinsics, dc.narrow_road.intrinsics,
                                       (dc.narrow_road.width, dc.narrow_road.height)), mapping,
                          wide_model="pinhole" if sim else "equidistant")
+    if loader.runner is None:
+      if time.monotonic() - last_status_t > 1.0:  # logged in qlogs and shown in the alert
+        last_status_t = time.monotonic()
+        o = messaging.new_message("alpamayoOutput")
+        o.valid = False
+        o.alpamayoOutput.status = loader.status
+        o.alpamayoOutput.selfTest = json.dumps(loader.report)
+        pm.send("alpamayoOutput", o)
+      time.sleep(0.01)
+      continue
+    runner = loader.runner
     if maps is None or not sm.seen["extrinsicsCalibration"]:
       time.sleep(0.01)
       continue
-    if runner is None:
-      runner = make_runner()
 
     maps.update(np.array(sm["extrinsicsCalibration"].rpyCalib))
     latest = rings["wide"].frames[-1] if rings["wide"].frames else None
@@ -311,6 +381,7 @@ def main():
       cloudlog.exception("alpamayod: inference failed")
       out, valid = None, False
     exec_time = time.monotonic() - st
+    loader.note_inference(exec_time, valid)
 
     lat_delay = sm["lateralDelay"].lateralDelay if sm.seen["lateralDelay"] else 0.2
     msg = messaging.new_message("alpamayoModelV2")
@@ -324,6 +395,9 @@ def main():
     ao = o.alpamayoOutput
     ao.frameId, ao.timestampEof, ao.inferenceTimeS = latest[1], latest[0], exec_time
     ao.navText, ao.mapping = nav, mapping
+    ao.status = loader.status
+    if len(loader.report.get("infer_s", [])) <= 10:
+      ao.selfTest = json.dumps(loader.report)
     if out is not None:
       ao.cot = out["cot"][:512]
       ao.backend = out["backend"]

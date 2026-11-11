@@ -12,6 +12,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"AlpamayoMode", {PERSISTENT, STRING, "off"}},  // off | shadow | active; needs TurnPilotEnabled off (chestnut)
     {"AlpamayoMaxPlanAgeS", {PERSISTENT, FLOAT, "1.5"}},
     {"AlpamayoMaxDisagreeM", {PERSISTENT, FLOAT, "1.5"}},
+    {"AlpamayoStatus", {CLEAR_ON_MANAGER_START, STRING}},  // download / load / self-test progress for the UI
+    {"AlpamayoSelfTest", {PERSISTENT, STRING}},  // JSON from the last chestnut self-test
     {"AlpamayoMaxSpeed", {PERSISTENT, FLOAT, "9.0"}},  // m/s, above it stock steers
     {"ApiCache_Device", {PERSISTENT, STRING}},
     {"ApiCache_FirehoseStats", {PERSISTENT, JSON}},

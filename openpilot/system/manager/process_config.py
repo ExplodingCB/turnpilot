@@ -67,6 +67,10 @@ def alpamayo(started: bool, params: Params, CP: car.CarParams) -> bool:
   from openpilot.selfdrive.alpamayo.gate import alpamayo_owns_chestnut
   return started and alpamayo_owns_chestnut(params)
 
+def alpamayo_fetch(started: bool, params: Params, CP: car.CarParams) -> bool:
+  from openpilot.selfdrive.alpamayo.gate import alpamayo_owns_chestnut
+  return alpamayo_owns_chestnut(params)
+
 def turnpilot(started: bool, params: Params, CP: car.CarParams) -> bool:
   return params.get_bool("TurnPilotEnabled")
 
@@ -134,6 +138,7 @@ procs = [
   PythonProcess("pigeond", "openpilot.system.ubloxd.pigeond", ublox, enabled=COMMA_HARDWARE),
   PythonProcess("plannerd", "openpilot.selfdrive.controls.plannerd", not_long_maneuver),
   PythonProcess("alpamayod", "openpilot.selfdrive.alpamayo.alpamayod", alpamayo),
+  PythonProcess("alpamayo_fetch", "openpilot.selfdrive.alpamayo.fetch", alpamayo_fetch, enabled=not PC),
   PythonProcess("maneuversd", "openpilot.tools.longitudinal_maneuvers.maneuversd", long_maneuver),
   PythonProcess("lateral_maneuversd", "openpilot.tools.lateral_maneuvers.lateral_maneuversd", lat_maneuver),
   PythonProcess("radard", "openpilot.selfdrive.controls.radard", only_onroad),

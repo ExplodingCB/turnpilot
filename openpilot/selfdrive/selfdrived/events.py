@@ -254,6 +254,12 @@ def turnpilot_unavailable_alert(CP: car.CarParams, CS: car.CarState, sm: messagi
   return NormalPermanentAlert("TurnPilot Unavailable", sm['turnpilotPlan'].reason or "TurnPilot is doing nothing")
 
 
+def alpamayo_unavailable_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
+  status = sm['alpamayoOutput'].status if sm.seen['alpamayoOutput'] else "alpamayod not started"
+  return Alert("Alpamayo Not Running: Stock Steering", status[:60],
+               AlertStatus.normal, AlertSize.mid, Priority.LOW, VisualAlert.none, AudibleAlert.none, .2)
+
+
 TURNPILOT_FAULT_ALERT_S = 3.  # a fault while engaged stays up this long: a one-frame fault is heard, and can be read
 
 
@@ -691,11 +697,7 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   },
 
   EventName.alpamayoUnavailable: {
-    ET.WARNING: Alert(
-      "Alpamayo Not Running: Stock Steering",
-      "",
-      AlertStatus.normal, AlertSize.small,
-      Priority.LOW, VisualAlert.none, AudibleAlert.none, .2),
+    ET.WARNING: alpamayo_unavailable_alert,
   },
 
   EventName.turnpilotModelFellBack: {

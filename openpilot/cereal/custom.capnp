@@ -797,6 +797,8 @@ struct AlpamayoOutput @0xc86a3d38d13eb3ef {
   kappa @8 :List(Float32); # curvature per step, left positive
   accel @9 :List(Float32);
   backend @10 :Text;       # tinygrad device or torch
+  status @11 :Text;        # waiting for weights, chestnut check, loading, warming up, ready, or the failure
+  selfTest @12 :Text;      # JSON: chestnut USB round-trip check, copy speeds, load and inference times
 }
 
 struct AlpamayoState @0xa4f1eb3323f5f582 {
