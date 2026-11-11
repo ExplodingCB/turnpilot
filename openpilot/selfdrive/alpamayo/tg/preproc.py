@@ -8,7 +8,7 @@ Replaces helper.prepare_model_inputs on the comma:
     block-major patch layout (bh, bw, mh, mw, ph, pw, c)
 """
 from __future__ import annotations
-import json
+import functools, json
 import numpy as np
 
 PATCH, MERGE = 16, 2
@@ -43,6 +43,7 @@ def _cubic(x: np.ndarray, a: float = -0.5) -> np.ndarray:
                   np.where(x < 2, (((x - 5) * x + 8) * x - 4) * a, 0.0))
 
 
+@functools.lru_cache(maxsize=16)
 def aa_bicubic_weights(n_in: int, n_out: int) -> np.ndarray:
   """Dense (n_out, n_in) float32 weight matrix, same taps/normalization as ATen's AA kernel."""
   scale = n_in / n_out
@@ -161,6 +162,18 @@ def canonical_order(cams: np.ndarray, ts: np.ndarray) -> np.ndarray:
   """sample.canonical_frame_order: stable sort by time, then stable sort by camera."""
   by_t = np.argsort(np.asarray(ts), kind="stable")
   return by_t[np.argsort(np.asarray(cams)[by_t], kind="stable")]
+
+
+def prepare_prompt(template: Template, camera_ids, timestamps_us, hw: tuple[int, int], nav_text: str) -> dict:
+  """Prompt only (no pixels): order, sorted cams, grids, input_ids (history placeholders), mm types."""
+  cams, ts = np.asarray(camera_ids, np.int64), np.asarray(timestamps_us, np.int64)
+  order = canonical_order(cams, ts)
+  cams_s, ts_s = cams[order].tolist(), ts[order]
+  sizes = [target_size(c, hw[0], hw[1]) for c in cams_s]
+  grids = np.array([(1, h // PATCH, w // PATCH) for h, w in sizes], np.int64)
+  n_tok = [int(t * h * w) // (MERGE * MERGE) for t, h, w in grids]
+  input_ids, mm = template.build(cams_s, time_labels(ts_s), n_tok, nav_text)
+  return dict(input_ids=input_ids, mm_token_type_ids=mm, image_grid_thw=grids, order=order, cams=cams_s, sizes=sizes)
 
 
 def prepare(template: Template, images: np.ndarray, camera_ids, timestamps_us, nav_text: str, device: str | None = None,

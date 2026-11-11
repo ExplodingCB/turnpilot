@@ -18,20 +18,22 @@ Fixed shapes for TinyJit: one JIT per (vision grid layout), one for the prompt l
 step JIT with a symbolic position, one expert step JIT with a symbolic prefix length.
 """
 from __future__ import annotations
-import math, os, time
+import collections, hashlib, math, os, time
 os.environ.setdefault("TC_OPT", "2")  # let tensor cores pad odd dims (comma's benchmark sets the same)
 from dataclasses import dataclass, field
 import numpy as np
 from tinygrad import Tensor, TinyJit, UOp, dtypes, Device
 from tinygrad.nn.state import safe_load
 
-from openpilot.selfdrive.alpamayo.tg import host
+try: from . import host  # package import (turnpilot selfdrive/alpamayo/tg)
+except ImportError: import host
 
 F32 = dtypes.float32
 _DT = {"bf16": dtypes.bfloat16, "fp16": dtypes.float16, "fp32": dtypes.float32}
 CDT = _DT[os.getenv("ALPA_CDT", "bf16")]
 ADT = _DT[os.getenv("ALPA_ACT", "bf16")]
-VISION_BATCH = int(os.getenv("ALPA_VISION_BATCH", "4"))
+VIS_PAD = int(os.getenv("ALPA_VIS_PAD", "16"))  # vision patch-count padding multiple
+VISION_CACHE = int(os.getenv("ALPA_VISION_CACHE", "128"))  # encoded frames kept on device (0 disables)
 
 # ---- architecture (config.json) ----
 V_LAYERS, V_DIM, V_HEADS, V_FF, V_EPS = 27, 1152, 16, 4304, 1e-6
@@ -138,6 +140,8 @@ class Alpamayo2EdgeTG:
         # realize one tensor at a time: big batched copies can trip tinygrad's 30 s device wait timeout
         self.w[k] = Tensor(np.ascontiguousarray(arr), device=self.device).bitcast(dtypes.bfloat16).contiguous().realize()
     self._jits: dict = {}
+    self._vis_jits: dict = {}
+    self._vis_pe: dict = {}
     self.layout: Layout | None = None
     # fourier frequencies, bf16-rounded like the reference's BF16 buffer
     fr = np.logspace(0, math.log10(FOURIER_MAXF), FOURIER_FEATS // 2).astype(np.float32)
@@ -150,44 +154,52 @@ class Alpamayo2EdgeTG:
   def setup(self, layout: Layout):
     if self.layout == layout: return
     self.layout = layout
-    self.cache = [Tensor.zeros(2, 1, T_KV, layout.max_ctx, T_HD, dtype=CDT, device=self.device).contiguous().realize()
+    # the last N_WP slots are the expert's scratch for its own action K/V (written each Euler step)
+    self.cache = [Tensor.zeros(2, 1, T_KV, layout.max_ctx + N_WP, T_HD, dtype=CDT, device=self.device).contiguous().realize()
                   for _ in range(T_LAYERS)]
-    # static image order: group same-size images so attention runs as batched blocks
-    off, segs = 0, []
-    for t, h, w in layout.grids:
-      n = t * h * w
-      segs.append((off, n, (h, w))); off += n
-    self.vis_segs = segs
-    self.vis_groups = {}
-    for i, (_, _, hw) in enumerate(segs): self.vis_groups.setdefault(hw, []).append(i)
-    self._jits = dict(vision=TinyJit(self._vision), prefill=TinyJit(self._prefill),
-                      decode=TinyJit(self._decode), expert=TinyJit(self._expert_step))
+    self._jits = dict(prefill=TinyJit(self._prefill), decode=TinyJit(self._decode), expert=TinyJit(self._expert_step))
 
   # ---------------- vision ----------------
-  def _vision(self, pixel_values: Tensor, pos_embed: Tensor) -> Tensor:
+  # One image per call, one JIT per grid size. Images are independent in the vision tower (attention
+  # is per image), so each encoded frame can be cached and reused by later plans: a frame seen at
+  # t0 is the -0.5 s frame of a plan 0.5 s later. Constant filler slots are encoded once.
+  def encode_image(self, pv: Tensor, grid: tuple[int, int, int], want_hidden: bool = False):
+    """pv (t*h*w, 768) for one image -> (embeds (t*h*w/4, 2048) ADT, hidden or None), fresh buffers."""
+    key = tuple(grid)
+    if key not in self._vis_jits:
+      self._vis_jits[key] = TinyJit(self._vision1)
+      pe = host.vision_pos_embed(self.pos_weight, [grid])
+      npad = -(-len(pe) // VIS_PAD) * VIS_PAD - len(pe)
+      self._vis_pe[key] = Tensor(np.concatenate([pe, np.zeros((npad, V_DIM), np.float32)]), device=self.device).realize()
+    # pad the patch count to a multiple of 64 so matmuls tile onto tensor cores (14x26=364 ran 4.5x
+    # slower than 20x36=720); pad keys are masked and pad rows dropped before the 2x2 merge
+    n = pv.shape[0]
+    npad = self._vis_pe[key].shape[0] - n
+    pvp = pv.cast(F32).pad(((0, npad), (0, 0))) if npad else pv.cast(F32)
+    hid, emb = self._vis_jits[key](pvp.contiguous().realize(), self._vis_pe[key], n)
+    # JIT outputs are reused buffers: copy before the next call overwrites them
+    return emb.clone().realize(), (hid.clone().realize() if want_hidden else None)
+
+  def _vision1(self, pixel_values: Tensor, pos_embed: Tensor, n_real: int):
     w = self.w
     p = "vlm.model.visual."
-    x = (mm(pixel_values, w[p + "embeddings.patch_embedding.weight"], w[p + "embeddings.patch_embedding.bias"]) + pos_embed).cast(ADT).realize()
-    out_parts: dict[int, Tensor] = {}
-    batches = [(hw, idxs[i:i + VISION_BATCH]) for hw, idxs in self.vis_groups.items() for i in range(0, len(idxs), VISION_BATCH)]
-    for hw, idxs in batches:
-      n = hw[0] * hw[1]
-      g = Tensor.cat(*[x[self.vis_segs[i][0]:self.vis_segs[i][0] + n] for i in idxs]).reshape(len(idxs), n, V_DIM)
-      for l in range(V_LAYERS):
-        q = f"{p}encoder.layers.{l}."
-        h = layernorm(g, w[q + "layer_norm1.weight"], w[q + "layer_norm1.bias"], V_EPS)
-        hd = V_DIM // V_HEADS
-        qs = mm(h, w[q + "self_attn.q_proj.weight"], w[q + "self_attn.q_proj.bias"]).reshape(len(idxs), n, V_HEADS, hd).transpose(1, 2)
-        ks = mm(h, w[q + "self_attn.k_proj.weight"], w[q + "self_attn.k_proj.bias"]).reshape(len(idxs), n, V_HEADS, hd).transpose(1, 2)
-        vs = mm(h, w[q + "self_attn.v_proj.weight"], w[q + "self_attn.v_proj.bias"]).reshape(len(idxs), n, V_HEADS, hd).transpose(1, 2)
-        a = attention(qs, ks, vs, hd ** -0.5).transpose(1, 2).reshape(len(idxs), n, V_DIM)
-        g = (g + mm(a, w[q + "self_attn.out_proj.weight"], w[q + "self_attn.out_proj.bias"])).realize()
-        h = layernorm(g, w[q + "layer_norm2.weight"], w[q + "layer_norm2.bias"], V_EPS)
-        h = mm(h, w[q + "mlp.fc1.weight"], w[q + "mlp.fc1.bias"]).cast(F32).gelu("tanh").cast(ADT)
-        g = (g + mm(h, w[q + "mlp.fc2.weight"], w[q + "mlp.fc2.bias"])).realize()
-      g = layernorm(g, w[p + "post_layernorm.weight"], w[p + "post_layernorm.bias"], V_EPS).realize()
-      for j, i in enumerate(idxs): out_parts[i] = g[j]
-    vis = Tensor.cat(*[out_parts[i] for i in range(len(self.vis_segs))])  # packed order (Np, 1152)
+    g = (mm(pixel_values, w[p + "embeddings.patch_embedding.weight"], w[p + "embeddings.patch_embedding.bias"]) + pos_embed).cast(ADT)
+    n = g.shape[0]
+    g = g.reshape(1, n, V_DIM).realize()
+    kmask = (Tensor.arange(n) >= n_real).where(-math.inf, 0.0).reshape(1, 1, 1, n) if n_real < n else None
+    for l in range(V_LAYERS):
+      q = f"{p}encoder.layers.{l}."
+      h = layernorm(g, w[q + "layer_norm1.weight"], w[q + "layer_norm1.bias"], V_EPS)
+      hd = V_DIM // V_HEADS
+      qs = mm(h, w[q + "self_attn.q_proj.weight"], w[q + "self_attn.q_proj.bias"]).reshape(1, n, V_HEADS, hd).transpose(1, 2)
+      ks = mm(h, w[q + "self_attn.k_proj.weight"], w[q + "self_attn.k_proj.bias"]).reshape(1, n, V_HEADS, hd).transpose(1, 2)
+      vs = mm(h, w[q + "self_attn.v_proj.weight"], w[q + "self_attn.v_proj.bias"]).reshape(1, n, V_HEADS, hd).transpose(1, 2)
+      a = attention(qs, ks, vs, hd ** -0.5, kmask).transpose(1, 2).reshape(1, n, V_DIM)
+      g = (g + mm(a, w[q + "self_attn.out_proj.weight"], w[q + "self_attn.out_proj.bias"])).realize()
+      h = layernorm(g, w[q + "layer_norm2.weight"], w[q + "layer_norm2.bias"], V_EPS)
+      h = mm(h, w[q + "mlp.fc1.weight"], w[q + "mlp.fc1.bias"]).cast(F32).gelu("tanh").cast(ADT)
+      g = (g + mm(h, w[q + "mlp.fc2.weight"], w[q + "mlp.fc2.bias"])).realize()
+    vis = layernorm(g, w[p + "post_layernorm.weight"], w[p + "post_layernorm.bias"], V_EPS).reshape(n, V_DIM)[:n_real].realize()
     # projector: per-patch LN, 2x2 merge, MLP with exact GELU
     q = "vlm.model.projector."
     y = layernorm(vis, w[q + "norm.weight"], w[q + "norm.bias"], 1e-6).reshape(-1, 4 * V_DIM)
@@ -267,8 +279,8 @@ class Alpamayo2EdgeTG:
     return mm(x, w["expert.action_out_proj.weight"], w["expert.action_out_proj.bias"]).cast(F32).contiguous()
 
   def _expert_layer(self, l, x, cos, sin, mask):
-    # noncausal attention over [full fixed-capacity VLM cache | own 64 action K/V]; the mask keeps
-    # only the CoT prefix of the cache (the reference crops the cache to it). No cache writes.
+    # noncausal attention over the fixed-capacity cache whose last 64 slots hold this step's action K/V; the mask keeps
+    # only the CoT prefix plus those 64 slots (the reference crops the cache to the prefix).
     w = self.w
     q = f"expert.expert.layers.{l}."
     h = rmsnorm(x, w[q + "input_layernorm.weight"], T_EPS)
@@ -277,8 +289,10 @@ class Alpamayo2EdgeTG:
     vs = mm(h, w[q + "self_attn.v_proj.weight"]).reshape(1, N_WP, T_KV, T_HD).transpose(1, 2)
     qs, ks = rope(qs, cos, sin), rope(ks, cos, sin)
     c = self.cache[l]
-    kk = c[0].cat(ks.cast(c.dtype), dim=2).repeat_interleave(T_HEADS // T_KV, dim=1)
-    vv = c[1].cat(vs.cast(c.dtype), dim=2).repeat_interleave(T_HEADS // T_KV, dim=1)
+    cap = c.shape[3] - N_WP
+    c[:, :, :, cap:, :].assign(Tensor.stack(ks, vs).cast(c.dtype)).realize()
+    kk = c[0].repeat_interleave(T_HEADS // T_KV, dim=1)
+    vv = c[1].repeat_interleave(T_HEADS // T_KV, dim=1)
     a = attention(qs, kk, vv, T_HD ** -0.5, mask).transpose(1, 2).reshape(1, N_WP, T_HEADS * T_HD)
     x = (x + mm(a, w[q + "self_attn.o_proj.weight"])).realize()
     h = rmsnorm(x, w[q + "post_attention_layernorm.weight"], T_EPS)
@@ -299,7 +313,8 @@ class Alpamayo2EdgeTG:
     """Core inference from processor-format inputs.
 
     input_ids: prompt ids with <|traj_history|> placeholders (history is fused here).
-    pixel_values: (Np, 768) normalized patches, ndarray or device Tensor. noise: (64, 2) initial
+    pixel_values: (Np, 768) normalized patches (ndarray or device Tensor), or a list of per-image
+    embeddings already produced by encode_image (in prompt order). noise: (64, 2) initial
     diffusion noise. forced_ids: teacher-forced CoT ending in <|traj_future_start|>. pad_to: right-pad
     the prompt to this length so different nav texts reuse one prefill JIT.
     Returns dict(action (64,2) normalized, xyz, rot, gen_ids)."""
@@ -333,17 +348,24 @@ class Alpamayo2EdgeTG:
       self.spans = spans
       self.setup(layout)
     dev = self.device
-    pv = pixel_values if isinstance(pixel_values, Tensor) else Tensor(np.asarray(pixel_values, np.float32), device=dev)
-    pe_t = Tensor(host.vision_pos_embed(self.pos_weight, grids), device=dev)
     txt = self.embed(np.where(is_img, 0, ids)).reshape(Lp, T_DIM)
     sel = np.zeros((Lp, 1), np.float32); sel[L - 1] = 1
     host_args = (Tensor(cos, device=dev), Tensor(sin, device=dev), Tensor(sel, device=dev))
-    Tensor.realize(pv, pe_t, txt, *host_args)
+    Tensor.realize(txt, *host_args)
     sync(); tm["host_prep"] = time.perf_counter() - t0
     log("host prep done", tm["host_prep"])
 
     t1 = time.perf_counter()
-    vis, img_emb = self._jits["vision"](pv.contiguous(), pe_t)
+    hidden = []
+    if isinstance(pixel_values, list): embs = pixel_values
+    else:
+      pv = pixel_values if isinstance(pixel_values, Tensor) else Tensor(np.asarray(pixel_values, np.float32), device=dev)
+      embs, off = [], 0
+      for g in grids:
+        n = g[0] * g[1] * g[2]
+        e, h = self.encode_image(pv[off:off + n], g, want_hidden=record is not None)
+        embs.append(e); hidden.append(h); off += n
+    img_emb = Tensor.cat(*embs).contiguous().realize() if len(embs) > 1 else embs[0]
     sync(); tm["vision"] = time.perf_counter() - t1
     log("vision done", tm["vision"])
     t1 = time.perf_counter()
@@ -352,7 +374,8 @@ class Alpamayo2EdgeTG:
     tm["prefill"] = time.perf_counter() - t1
     log("prefill done", tm["prefill"])
     if record is not None:
-      record["vision_hidden"] = vis.float().numpy(); record["image_embeds"] = img_emb.float().numpy()
+      if hidden: record["vision_hidden"] = np.concatenate([h.float().numpy() for h in hidden])
+      record["image_embeds"] = img_emb.float().numpy()
       record["prefill_last_hidden"] = last_h.numpy(); record["prefill_logits"] = lg.copy()
 
     # CoT decode (positions continue from the real prompt end, overwriting any pads)
@@ -366,7 +389,7 @@ class Alpamayo2EdgeTG:
       nxt = forced_ids[len(gen)] if forced_ids is not None else host.sample_token(lg, rng)
       gen.append(nxt)
       c, s = host.rope_cos_sin(np.full((3, 1), pos + delta, np.int64))
-      dmask = np.where(np.arange(cap) <= pos, 0.0, -np.inf).astype(np.float32)
+      dmask = np.where(np.arange(cap + N_WP) <= pos, 0.0, -np.inf).astype(np.float32)
       lg = self._jits["decode"](self.embed([nxt]), Tensor(c, device=dev), Tensor(s, device=dev), Tensor(dmask, device=dev),
                                 v_start.bind(pos)).numpy()[0]
       pos += 1
@@ -409,36 +432,75 @@ class AlpamayoTG:
 
     m = AlpamayoTG(weights_dir, device="USB+AMD:LLVM")
     out = m.run(images_uint8[N,540,960,3], camera_ids[N], timestamps_us[N], ego_xyz[20,3], ego_rot[20,3,3],
-                "Turn left in 30m", noise=None, seed=43)
+                "Turn left in 30m", noise=None, seed=43, frame_keys=None)
     out: xyz[64,3], rot[64,3,3], accel[64] (m/s^2), kappa[64] (1/m), cot_text, gen_ids, timings
 
   Camera sets: the 6-camera profile (0,1,2,3,5,6 with 3/5/3/3/3/5 frames) or front+tele only
-  (1 and 6, 5 frames each). Frames may be in any order; they are sorted by (camera, time) and labelled
-  relative to the last one like the reference. Nav text must be one of template.navs
-  ("Continue straight", "Turn left in {N}m", "Turn right in {N}m", N=1..40). noise=None draws
-  N(0,1) from numpy with `seed` (not bitwise equal to torch's generator).
+  (1 and 6, 5 frames each). `cameras=2` (env ALPA_CAMERAS) drops everything but slots 1 and 6 from a
+  6-camera call. Frames may be in any order; they are sorted by (camera, time) and labelled relative
+  to the last one like the reference. Nav text must be one of template.navs ("Continue straight",
+  "Turn left in {N}m", "Turn right in {N}m", N=1..40). noise=None draws N(0,1) from numpy with `seed`.
+
+  Vision cache: each frame's embeddings are kept on the device (LRU, ALPA_VISION_CACHE entries) and
+  reused when the same frame appears again. frame_keys[i] (any hashable, e.g. (camera, frame_id,
+  calibration version)) identifies frames; without keys the image bytes are hashed.
+  diffusion_steps (env ALPA_DIFFUSION_STEPS, default 10) sets the Euler steps.
   """
-  def __init__(self, weights_dir: str, device: str | None = None, template: str | None = None, emb_on_host: bool = True):
-    from openpilot.selfdrive.alpamayo.tg import preproc
+  def __init__(self, weights_dir: str, device: str | None = None, template: str | None = None, emb_on_host: bool = True,
+               cameras: int | None = None, diffusion_steps: int | None = None, vision_cache: int | None = None):
+    try: from . import preproc
+    except ImportError: import preproc
     self.pp = preproc
     self.tpl = preproc.Template(template or os.path.join(os.path.dirname(os.path.abspath(__file__)), "template.npz"))
     self.model = Alpamayo2EdgeTG(weights_dir, device, emb_on_host=emb_on_host)
     self.device = self.model.device
+    self.cameras = int(cameras or os.getenv("ALPA_CAMERAS", "6"))
+    self.steps = int(diffusion_steps or os.getenv("ALPA_DIFFUSION_STEPS", "10"))
+    self.cache_size = VISION_CACHE if vision_cache is None else vision_cache
+    self.vcache: collections.OrderedDict = collections.OrderedDict()
     # pad prompts to the longest nav chunk so every nav text shares one prefill JIT
     navc = [len(v) for k, v in self.tpl.chunks.items() if k.startswith("\nNavigation input is: ")]
     self.nav_pad = max(navc)
 
+  def _frame_key(self, img: np.ndarray, cam: int, key) -> tuple:
+    if key is not None: return ("k", cam, key)
+    return ("h", cam, img.shape, hashlib.blake2b(np.ascontiguousarray(img).data, digest_size=16).digest())
+
   def run(self, images, camera_ids, timestamps_us, ego_xyz, ego_rot, nav_text: str, noise=None, seed: int = 43,
-          forced_ids=None) -> dict:
+          forced_ids=None, frame_keys=None) -> dict:
     tm: dict = {}
     t0 = time.perf_counter()
-    p = self.pp.prepare(self.tpl, images, camera_ids, timestamps_us, nav_text, device=self.device, use_tinygrad=True)
+    images, camera_ids, timestamps_us = np.asarray(images), np.asarray(camera_ids), np.asarray(timestamps_us)
+    if self.cameras == 2:
+      keep = np.isin(camera_ids, (1, 6))
+      images, camera_ids, timestamps_us = images[keep], camera_ids[keep], timestamps_us[keep]
+      if frame_keys is not None: frame_keys = [k for k, m in zip(frame_keys, keep) if m]
+    p = self.pp.prepare_prompt(self.tpl, camera_ids, timestamps_us, images.shape[1:3], nav_text)
     nav_len = len(self.tpl.chunk(f"\nNavigation input is: {nav_text}\n{self.tpl.driving_task}"))
     tm["preprocess"] = time.perf_counter() - t0
+    # vision with the per-frame cache
+    t1 = time.perf_counter()
+    embs, hits = [], 0
+    for j, i in enumerate(p["order"]):
+      grid = tuple(int(v) for v in p["image_grid_thw"][j])
+      key = self._frame_key(images[i], p["cams"][j], None if frame_keys is None else frame_keys[i]) + (grid,)
+      if self.cache_size and key in self.vcache:
+        self.vcache.move_to_end(key); embs.append(self.vcache[key]); hits += 1
+        continue
+      pv, _ = self.pp.pixel_values_tg(images[i:i + 1], [p["cams"][j]], self.device)
+      e, _ = self.model.encode_image(pv, grid)
+      embs.append(e)
+      if self.cache_size:
+        self.vcache[key] = e
+        while len(self.vcache) > self.cache_size: self.vcache.popitem(last=False)
+    Device[self.device].synchronize()
+    tm["vision_encode"] = time.perf_counter() - t1
+    tm["vision_cache_hits"] = hits
+    tm["vision_new_frames"] = len(embs) - hits
     if noise is None: noise = np.random.default_rng(seed).standard_normal((N_WP, A_DIM)).astype(np.float32)
-    o = self.model.infer(p["input_ids"], p["mm_token_type_ids"], p["pixel_values"], p["image_grid_thw"],
+    o = self.model.infer(p["input_ids"], p["mm_token_type_ids"], embs, p["image_grid_thw"],
                          np.asarray(ego_xyz, np.float32), np.asarray(ego_rot, np.float32), noise,
-                         rng=np.random.default_rng(seed), forced_ids=forced_ids,
+                         rng=np.random.default_rng(seed), forced_ids=forced_ids, n_steps=self.steps,
                          pad_to=len(p["input_ids"]) + self.nav_pad - nav_len, timing=tm)
     tm["total"] = time.perf_counter() - t0
     a = o["action"]
