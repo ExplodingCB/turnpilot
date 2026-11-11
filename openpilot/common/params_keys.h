@@ -10,7 +10,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"AdbEnabled", {PERSISTENT, BOOL}},
     {"AlwaysOnDM", {PERSISTENT, BOOL}},
     {"AlpamayoMode", {PERSISTENT, STRING, "off"}},  // off | shadow | active; needs TurnPilotEnabled off (chestnut)
-    {"AlpamayoMaxPlanAgeS", {PERSISTENT, FLOAT, "1.5"}},
+    {"AlpamayoMaxPlanAgeS", {PERSISTENT, FLOAT, "4.0"}},  // plan age peaks near 2x inference time; chestnut ~1.5-2 s/plan est.
     {"AlpamayoMaxDisagreeM", {PERSISTENT, FLOAT, "1.5"}},
     {"AlpamayoStatus", {CLEAR_ON_MANAGER_START, STRING}},  // download / load / self-test progress for the UI
     {"AlpamayoSelfTest", {PERSISTENT, STRING}},  // JSON from the last chestnut self-test

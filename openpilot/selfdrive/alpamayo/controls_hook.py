@@ -50,7 +50,7 @@ class AlpamayoLateral:
         return float(v) if v is not None else default
       except (TypeError, ValueError):
         return default
-    return LateralSourceConfig(max_plan_age_s=f("AlpamayoMaxPlanAgeS", 1.5), max_disagree_m=f("AlpamayoMaxDisagreeM", 1.5),
+    return LateralSourceConfig(max_plan_age_s=f("AlpamayoMaxPlanAgeS", 4.0), max_disagree_m=f("AlpamayoMaxDisagreeM", 1.5),
                                max_speed=f("AlpamayoMaxSpeed", 9.0))
 
   def update(self, sm, CS, now_ns: int, lat_delay: float, calibrated_pose, lat_active: bool) -> float | None:

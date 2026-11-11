@@ -35,6 +35,14 @@ from openpilot.selfdrive.locationd.helpers import Pose, PoseCalibrator
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.alpamayo import camera_adapter as ca
 
+# chestnut setup like modeld, set before anything imports tinygrad. On the device, kernel search
+# results persist across drives in /data. 2 cameras: about 25% faster plans; latency matters most here.
+_ENV = {"GMMU": "0", "AM_POWER_LIMIT": "100", "JITBEAM": "2", "ALPA_CAMERAS": "2"}
+if os.path.isdir("/data/openpilot"):
+  _ENV["CACHEDB"] = "/data/tinygrad_alpamayo_cache.db"
+for _k, _v in _ENV.items():
+  os.environ.setdefault(_k, _v)
+
 HISTORY_S = 2.2
 # rear axle to comma mount, Tesla Model 3 default (wheelbase 2.875 m, mount ~1 m behind the front axle)
 DEV_TO_REAR_M = float(os.environ.get("ALPAMAYO_DEV_TO_REAR_M", "1.9"))
@@ -111,7 +119,7 @@ class FrameRing:
     return best
 
   def slot_image(self, frame, slot, maps: ca.SlotMaps):
-    key = (frame[1], slot)
+    key = (frame[1], slot, maps._key)
     if key not in self.slot_cache:
       w, h, stride, uv_off = frame[3]
       x, y = maps.maps[slot]
@@ -121,7 +129,7 @@ class FrameRing:
 
 def build_inputs(maps: ca.SlotMaps, rings, t0_ns):
   fill = np.full((*ca.SLOT_HW, 3), maps.filler_value(), np.uint8)
-  imgs, cams, stamps = [], [], []
+  imgs, cams, stamps, keys = [], [], [], []
   for cam in maps.slots():
     offsets = ca.FRONT_OFFSETS_US if cam in (ca.FRONT, ca.TELE) else ca.OTHER_OFFSETS_US
     for off in offsets:
@@ -132,11 +140,13 @@ def build_inputs(maps: ca.SlotMaps, rings, t0_ns):
           return None
         imgs.append(rings[maps.source(cam)].slot_image(f, cam, maps))
         stamps.append(f[0] // 1000)
+        keys.append((maps.source(cam), f[1], maps._key))
       else:
         imgs.append(fill)
         stamps.append(t // 1000)
+        keys.append(("fill", maps.filler_value()))
       cams.append(cam)
-  return np.stack(imgs), np.array(cams, dtype=np.int64), np.array(stamps, dtype=np.int64)
+  return np.stack(imgs), np.array(cams, dtype=np.int64), np.array(stamps, dtype=np.int64), keys
 
 
 # ------------------------------------------------------------------ backends
@@ -146,7 +156,7 @@ class TorchServerRunner:
   def __init__(self, path="/tmp/alpamayo_torch.sock"):
     self.path = path
 
-  def run(self, imgs, cams, stamps, ego_xyz, ego_rot, nav_text, mapping):
+  def run(self, imgs, cams, stamps, keys, ego_xyz, ego_rot, nav_text, mapping):
     buf = io.BytesIO()
     np.savez(buf, imgs=imgs, cams=cams, stamps=stamps, ego_xyz=ego_xyz, ego_rot=ego_rot,
              nav=np.array(nav_text), mapping=np.array(mapping))
@@ -176,9 +186,24 @@ class TinygradRunner:
     self.dev = dev
     self.m = AlpamayoTG(os.environ.get("ALPAMAYO_WEIGHTS", "/data/models/alpamayo2_edge"), dev)
 
-  def run(self, imgs, cams, stamps, ego_xyz, ego_rot, nav_text, mapping):
-    out = self.m.run(imgs, cams, stamps, ego_xyz, ego_rot, nav_text)
+  def run(self, imgs, cams, stamps, keys, ego_xyz, ego_rot, nav_text, mapping):
+    out = self.m.run(imgs, cams, stamps, ego_xyz, ego_rot, nav_text, frame_keys=keys)
     return out | {"cot": out["cot_text"], "backend": f"tinygrad:{self.dev}"}
+
+
+def warmup(runner) -> float:
+  """One inference on black frames from a straight 5 m/s history: compiles, and with JITBEAM searches kernels."""
+  cams, stamps = [], []
+  for cam in ca.CAM_IDS:
+    for off in (ca.FRONT_OFFSETS_US if cam in (ca.FRONT, ca.TELE) else ca.OTHER_OFFSETS_US):
+      cams.append(cam)
+      stamps.append(10_000_000 + off)
+  imgs = np.zeros((len(cams), *ca.SLOT_HW, 3), np.uint8)
+  xyz = np.stack([np.arange(-19, 1) * 0.5, np.zeros(20), np.zeros(20)], -1)
+  rot = np.repeat(np.eye(3)[None], 20, 0)
+  st = time.monotonic()
+  runner.run(imgs, np.array(cams), np.array(stamps), None, xyz, rot, NAV_DEFAULT, "warmup")
+  return time.monotonic() - st
 
 
 class Loader:
@@ -225,6 +250,12 @@ class Loader:
       t0 = time.monotonic()
       runner = TinygradRunner(dev)
       self.report["load_s"] = round(time.monotonic() - t0, 1)
+      self._save()
+      self.status = "tuning chestnut kernels (first start only, can take a long time)"
+      t0 = time.monotonic()
+      self.report["warmup_s"] = [round(warmup(runner), 2)]
+      self.report["warmup_s"].append(round(warmup(runner), 2))
+      self.report["tune_s"] = round(time.monotonic() - t0, 1)
       self._save()
       self.status = "warming up"
       self.runner = runner
